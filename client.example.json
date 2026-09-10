@@ -1,0 +1,5 @@
+{
+  "host": "beads-team",
+  "endpoint": "/home/beads/beads-team-kit/endpoint.py",
+  "root": "/home/beads/beads-runtime"
+}

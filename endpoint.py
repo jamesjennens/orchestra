@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""One SSH request per process. JSON on stdin/stdout; no contributor shell interpolation."""
+import argparse
+import fcntl
+import json
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from admin import environment,project_dir,root_path
+from render import render
+
+ALLOWED={'list','show','ready','search','count','create','update','close','reopen','comments','dep'}
+FORBIDDEN={'--directory','-C','--db','--repo','--global','--actor','--author','--profile','--graph','--config','--metadata'}
+FILE_FLAGS={'--body-file','--design-file','--file','-f'}
+
+def execute(root,request):
+    name=request['project'];path=project_dir(root,name)
+    if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+    actor=request.get('actor','')
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}',actor):raise ValueError('Supply a short contributor/session actor')
+    action=request.get('action','bd')
+    if action=='view':
+        target=request.get('path','CURRENT.md')
+        viewroot=(path/'views').resolve();view=(viewroot/target).resolve()
+        if not view.is_relative_to(viewroot) or view.suffix not in ('.md','.jsonl'):raise ValueError('Invalid view path')
+        return {'returncode':0,'stdout':view.read_text(encoding='utf-8'),'stderr':''}
+    if action=='refresh':
+        with (path/'.refresh.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','export','--all'],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
+            if p.returncode:return {'returncode':p.returncode,'stdout':p.stdout,'stderr':p.stderr}
+            rows=[json.loads(line) for line in p.stdout.splitlines() if line.strip()]
+            return {'returncode':0,'stdout':json.dumps(render(rows,path/'views'))+'\n','stderr':''}
+    if action!='bd':raise ValueError('Unknown action')
+    args=request.get('args',[])
+    if not isinstance(args,list) or not args or any(not isinstance(a,str) or '\0' in a for a in args):raise ValueError('Expected argument list')
+    if args[0] not in ALLOWED:raise ValueError('Command is outside the contributor interface; use admin.py for setup/maintenance')
+    if any(a.split('=',1)[0] in FORBIDDEN for a in args):raise ValueError('Connection/identity/file configuration flags are operator-only')
+    # Positional dep/comment IDs are fine; file inputs must be transported explicitly.
+    with tempfile.TemporaryDirectory(prefix='request-',dir=root) as tmp:
+        attachments=request.get('attachments',{})
+        final=[]
+        for i,a in enumerate(args):
+            if a.split('=',1)[0] in FILE_FLAGS:raise ValueError('Use client attachment transport; raw server file paths are not accepted')
+            if a.startswith('@attachment:'):
+                key=a.partition(':')[2]
+                item=attachments.get(key)
+                if not isinstance(item,dict) or item.get('flag') not in FILE_FLAGS or not isinstance(item.get('text'),str):raise ValueError('Invalid attachment')
+                dest=Path(tmp)/f'{i}.txt';dest.write_text(item['text'],encoding='utf-8')
+                final.extend([item['flag'],str(dest)])
+            else: final.append(a)
+        p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*final],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
+        return {'returncode':p.returncode,'stdout':p.stdout,'stderr':p.stderr}
+
+def main():
+    p=argparse.ArgumentParser();p.add_argument('--root',required=True);a=p.parse_args()
+    try:
+        text=sys.stdin.read(2_000_001)
+        if len(text)>2_000_000:raise ValueError('Request exceeds 2 MB')
+        answer=execute(root_path(a.root),json.loads(text))
+    except subprocess.TimeoutExpired:
+        answer={'returncode':124,'stdout':'','stderr':'Command timed out; mutation outcome may be uncertain. Inspect state before retrying.\n'}
+    except Exception as e:
+        answer={'returncode':2,'stdout':'','stderr':f'{type(e).__name__}: {e}\n'}
+    print(json.dumps(answer,ensure_ascii=False))
+
+if __name__=='__main__':main()
