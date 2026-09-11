@@ -7,6 +7,8 @@ The kit pins Beads 1.2.2 and Dolt 2.2.0, verifies release checksums, installs an
 ## Start here
 
 - Operators: [installation and recovery](docs/OPERATIONS.md).
+- Project direction and remaining work: [implementation plan](docs/PLAN.md).
+- Copilot and remote development: [office setup](docs/COPILOT_REMOTE_DEV.md).
 - Contributors and agents: [working agreement](docs/WORKFLOW.md).
 - Project owners: copy [project entry point](templates/READ_ME_FIRST.md) into your repository and fill in its placeholders. Reference it from both the repository README and AGENTS.md (and other agent instruction files you use).
 - Job authors: [job](templates/JOB.md), [task](templates/TASK.md), [report](templates/REPORT.md), [annotation](templates/ANNOTATION.md).
@@ -28,6 +30,8 @@ Subsequent work on an existing job normally gets another task. A replacement wor
 The `refresh` command builds current summaries, complete issue pages and daily journals with backlinks for later annotations. Beads is authoritative; Markdown is a dated projection. Refresh is an explicit step in the working agreement, not a transaction with the preceding update. A failed refresh can be repeated safely.
 
 ## Scope of the pilot
+
+This is an independent community kit built around Beads and Dolt, not an official distribution of either project. Public release preparation is in progress; the tested scope and pending features are explicit in the plan. Contributions use the [contribution guide](CONTRIBUTING.md).
 
 This is a trusted-team setup, with SSH access and repository merge permissions providing the access boundaries. Actor names provide attribution, not verified identity. Project databases separate queries and records, not access rights between contributors. There is no scheduler, automatic conflict detection, web UI, role system or automatic off-machine backup. Impact statements and human/agent judgment decide which work can proceed together.
 

@@ -16,7 +16,7 @@ Substitute that complete prefix for `b` (or define a shell wrapper).
 2. Compare declared files, interfaces, migrations and test/shared resources with currently claimed work. File lists are advisory; disjoint files can still change the same contract.
 3. Create a bounded child task if one does not exist. Record intent, plan, impact and acceptance before starting. Use templates/TASK.md as its description.
 4. Claim it with `b update TASK --claim --json`. If that fails, inspect the owner and choose other work or coordinate a handoff. Do not replace another assignee to bypass a claim.
-5. Record the actual branch/worktree and base commit in a comment, then refresh.
+5. Use a separate checkout/worktree and contribution branch containing the task ID. Record the branch and base commit in a comment, then refresh. Contributors sharing a server still need independent working directories.
 
 ```sh
 b create "Job: intended outcome" --type epic --body-file job.md --json
@@ -46,6 +46,8 @@ This is one required workflow with separate writes, not an atomic multi-record t
 
 ## Review and acceptance
 
-Link the exact repository, branch, commit SHA and PR URL in the report. Specify tests performed and remaining risks. An implementation task can close once its own acceptance condition (for example, PR ready) is met; the job stays open until its stated outcome is accepted. Use a separate review/merge task if that makes the pending work clearer.
+Link the exact repository, branch, commit SHA and PR URL in the report. Put the job/task references, resulting behavior, impact, tests and remaining risks in the PR. Push useful checkpoints to the permitted remote so another contributor can retrieve them; local commits alone are not a transferable handoff. PR creation through the forge's browser is fine; GitHub CLI and MCP are not required.
 
-Only the named project owner(s) accept the job under the project's agreement. Configure the repository's normal branch protection/merge permissions accordingly. Beads does not enforce this ownership convention and a closed issue does not prove a PR was merged. Once accepted, record the merge commit/evidence, close the relevant job, update any dependent tasks and refresh.
+Normally keep a coding task open until its PR merges, recording awaiting-review in current notes. An explicitly separate implementation task can close at PR-ready only with a remaining review/acceptance task. The job stays open until its stated outcome is accepted. PR closure without merge is not acceptance.
+
+Only the named project owner(s) accept the job under the project's agreement. Configure the repository's normal branch protection/merge permissions accordingly. Beads does not enforce this ownership convention and a closed issue does not prove a PR was merged. Once accepted, record the resulting merge/squash commit and evidence, close the relevant tasks/job, update dependencies and refresh. These updates are manual today; no PR webhook or automatic Git synchronization is installed.
