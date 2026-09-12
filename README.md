@@ -8,10 +8,12 @@ The kit pins Beads 1.2.2 and Dolt 2.2.0, verifies release checksums, installs an
 
 - Operators: [installation and recovery](docs/OPERATIONS.md).
 - Project direction and remaining work: [implementation plan](docs/PLAN.md).
+- Operational feedback and next priorities: [pilot follow-up](docs/PILOT_FEEDBACK.md).
 - Copilot and remote development: [office setup](docs/COPILOT_REMOTE_DEV.md).
 - Contributors and agents: [working agreement](docs/WORKFLOW.md).
 - Project owners: copy [project entry point](templates/READ_ME_FIRST.md) into your repository and fill in its placeholders. Reference it from both the repository README and AGENTS.md (and other agent instruction files you use).
 - Job authors: [job](templates/JOB.md), [task](templates/TASK.md), [report](templates/REPORT.md), [annotation](templates/ANNOTATION.md).
+- Decision authors: [decision template](templates/DECISION.md).
 - Evidence: [validation](reports/VALIDATION.md) and [machine-readable integration results](reports/integration.json).
 
 ## Model

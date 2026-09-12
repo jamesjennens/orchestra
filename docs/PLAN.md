@@ -39,7 +39,11 @@ A human-established Remote SSH workspace can avoid asking the agent to initiate 
 - Five unit checks on Windows/Linux and a disposable integration exercise covering independent clients, claim races, concurrent comments, project separation, restart and restore.
 - Generic job/task/report/annotation templates and operating instructions.
 
-## Next: make the office workflow easy
+## Next: address observed coordination costs
+
+The first operational pilot reported roughly thirty tasks across three agent types. Preserve the model, but prioritize queryable lifecycle facts, a single-export activity feed, enforced actor identity, concurrency-safe child IDs, merge coordination and generated summaries before broadening distribution. See [pilot feedback and acceptance criteria](PILOT_FEEDBACK.md) for the implementation order, verified native capabilities and migration boundaries. These improvements are planned, not yet shipped.
+
+## Then: make the office workflow easy
 
 1. **Local transport:** add an explicit transport selector while preserving existing SSH configuration. Local mode uses a subprocess argument array and the same JSON protocol; it must never silently switch hosts or databases. Test local/SSH parity, attachment handling, failure/timeout reporting and actor attribution.
 2. **Account access:** validate the simplest acceptable access arrangement for contributors' separate Linux accounts. Do not make runtime data world-readable or silently grant broad sudo access. The existing shared service-account pilot is a trusted-team boundary, not verified per-person authorization.
@@ -81,4 +85,4 @@ Public-source availability is separate from permission to publish any team's act
 
 ## Later, only if justified
 
-Automated view refresh/reconciliation; scheduled backup helpers; PR synchronization; a read-only dashboard; more operating systems/architectures; richer conflict hints. Strong multi-tenant isolation, job scheduling and replacing the repository's permissions are outside the small-team pilot.
+Scheduled backup helpers; PR synchronization; a read-only dashboard; more operating systems/architectures; richer conflict hints beyond the shared-path merge convention. View generation/reconciliation and lifecycle/activity visibility have moved into the next tranche based on operational feedback. Strong multi-tenant isolation, job scheduling and replacing the repository's permissions are outside the small-team pilot.
