@@ -12,6 +12,19 @@ python /path/to/client.py --config /path/to/client.local.json --project example 
 
 Substitute that complete prefix for `b` (or define a shell wrapper).
 
+## Comment activity from one saved export
+
+Read the export once per scan instead of one comments query per task: `b refresh` writes `views/issues.jsonl`, and `b view issues.jsonl` prints it. Save that output locally as UTF-8, then use the offline feed:
+
+```sh
+python /path/to/activity.py --export issues.jsonl --since 2026-09-11T00:00:00Z
+python /path/to/activity.py --export issues.jsonl --since 2026-09-11T00:00:00Z --json
+```
+
+`--since` must carry a timezone offset or `Z` and is inclusive: an entry exactly at the boundary is reported. A naive timestamp, a malformed export line or a missing export fails with a clear message and a non-zero exit instead of returning partial results. Each entry carries a stable entry ID (`ISSUE-cCOMMENT`), the issue ID and title, author, UTC timestamp and body, ordered by comment timestamp, then issue ID, then comment ID.
+
+Distinct entries that share a timestamp are all kept. To resume without losing ties, re-read with the same inclusive `--since` and drop only the entry IDs you already processed; never deduplicate by timestamp. The export is a local snapshot: its file timestamp is when the file was written, not an authoritative server mutation time, and a new comment does not necessarily advance `issue.updated_at`, so neither timestamp is a safe cursor. Refresh first and treat the feed as lagging evidence, not a complete audit log. A cursor/watermark feed is planned in [PILOT_FEEDBACK.md](PILOT_FEEDBACK.md).
+
 ## Before writing code
 
 1. Read the job, its open tasks and dependencies, and relevant recent comments.
