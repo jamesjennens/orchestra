@@ -61,4 +61,4 @@ Acceptance: two feature branches finish without coordination-summary merge confl
 
 This tranche changes the kit first, with disposable integration tests. The live project must receive a separately reviewed migration that reads its current files, respects active claims, preserves existing backup scheduling and records any new wrapper commands. The public kit must not gain private project histories or local configuration as examples.
 
-Currently the endpoint does not expose `state`, `set-state` or `merge-slot`; the renderer does not show these facts and there is no activity-since client command. The items above are implementation requirements, not claims that those features have shipped.
+The first bounded activity implementation is now available as `activity.py --export issues.jsonl --since TIME`, with inclusive timestamp filtering and stable IDs; see WORKFLOW.md. It reads a saved snapshot, has no durable cursor and covers comments only. Currently the endpoint does not expose `state`, `set-state` or `merge-slot`, and the renderer does not show these facts. Those remaining items above are implementation requirements, not claims that those features have shipped.

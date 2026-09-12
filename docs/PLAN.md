@@ -38,6 +38,7 @@ A human-established Remote SSH workspace can avoid asking the agent to initiate 
 - Native backup and restore into a separate database.
 - Five unit checks on Windows/Linux and a disposable integration exercise covering independent clients, claim races, concurrent comments, project separation, restart and restore.
 - Generic job/task/report/annotation templates and operating instructions.
+- First headless Cline/DeepSeek delegation: offline comment feed from a single export, independently reviewed with 17 passing unit checks. The recorded plan-ordering exception remains a workflow follow-up; see CLINE_WORKERS.md.
 
 ## Next: address observed coordination costs
 

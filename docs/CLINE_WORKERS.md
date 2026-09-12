@@ -21,7 +21,7 @@ The user reports that isolated data directories avoided coupling headless runs t
 ## Durable work and recovery
 
 - Create the self-contained task in canonical Beads first. Include owned files, exclusions, acceptance, runtime/test commands and the integration authority.
-- Use a separate checkout and unique actor. Have the worker claim, record its plan before editing, and leave checkpoints and a completion report.
+- Use a separate checkout and unique actor. Have the worker claim, record its plan before editing, and leave checkpoints and a completion report. Make a successful server acknowledgement of the plan a separate launch-phase barrier before enabling implementation; do not batch the plan write with the first edit.
 - Record the Cline session ID, runtime directory, checkout/base commit and Beads task ID outside public source content. A tool-event ID or conversation ID is not necessarily the resumable session ID.
 - Preserve the checkout and runtime after a timeout/disconnection. Inspect Git state, Beads comments, session history and the backend before assigning the task to another worker. Missing output does not prove that a write failed.
 - Resume with `--id SESSION_ID` using the original runtime/configuration and checkout, plus explicit provider/model flags. Do not point an existing session at a fresh empty data directory and expect its context to follow. Migrating runtime state needs a separately validated procedure; otherwise start a new session with an explicit Beads/Git handoff.
@@ -33,3 +33,5 @@ The CLI help says prompt mode enables tool auto-approval by default. Scope and f
 ## First delegation evidence
 
 A Windows headless Cline worker used the Linux-hosted Beads service over the existing SSH client, claimed a task, implemented the offline comment activity feed in an isolated checkout, and produced a local commit. The coordinator independently ran all 17 unit tests successfully. This validates cross-harness task consumption and reporting; it does not mean Cline ran on Linux or that a GitHub PR was opened.
+
+Workflow exception: the worker disclosed that its first draft preceded acknowledgement of its plan comment. Functional acceptance passed, but plan-before-edit did not fully pass. Keep that distinction in evaluation rather than labeling the entire workflow flawless.
