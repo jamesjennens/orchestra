@@ -1,6 +1,6 @@
 # Plan: portable team coordination
 
-Updated 2026-09-11. This document owns the kit's implementation roadmap. Project-specific work belongs in each project's Beads database.
+Updated 2026-09-13. This document preserves the earlier roadmap and operational context. The requirements-driven first slice is now tracked by BRD.md, requirements-baseline.json, SYSTEM_DESIGN.md and IMPLEMENTATION_PLAN.md, with canonical records in Beads. Do not maintain competing task acceptance here. Project-specific work belongs in each project's Beads database.
 
 ## Intended outcome
 
