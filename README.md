@@ -6,13 +6,13 @@ The kit pins Beads 1.2.2 and Dolt 2.2.0, verifies release checksums, installs an
 
 ## Start here
 
-We are now using the harness to develop the harness. Start with the [draft BRD](docs/BRD.md), its [exact requirement manifest](docs/requirements-baseline.json), the [proposed system design](docs/SYSTEM_DESIGN.md) and [first implementation sequence](docs/IMPLEMENTATION_PLAN.md). The workflow direction is accepted; the detailed baseline remains a review candidate. Requirements-driven publication/impact features are being specified, not claimed as already implemented.
+We are now using the harness to develop the harness. Start with the [draft BRD](docs/BRD.md), its [exact requirement manifest](docs/requirements-baseline.json), the [proposed system design](docs/SYSTEM_DESIGN.md) and [first implementation sequence](docs/IMPLEMENTATION_PLAN.md). The workflow direction is accepted; the detailed baseline remains a review candidate. The offline requirement validator and BRD publisher are implemented: see [usage and boundaries](docs/REQUIREMENTS.md). Native export adaptation and automatic change-impact tracking remain pending.
 
 - Operators: [installation and recovery](docs/OPERATIONS.md).
 - Project direction and remaining work: [implementation plan](docs/PLAN.md).
 - Operational feedback and next priorities: [pilot follow-up](docs/PILOT_FEEDBACK.md).
 - Copilot and remote development: [office setup](docs/COPILOT_REMOTE_DEV.md).
-- Optional headless workers: [Cline launch and recovery](docs/CLINE_WORKERS.md).
+- Optional headless workers: [Cline launch and recovery](docs/CLINE_WORKERS.md), [Hermes planning and resumption](docs/HERMES_WORKERS.md).
 - Contributors and agents: [working agreement](docs/WORKFLOW.md).
 - Project owners: copy [project entry point](templates/READ_ME_FIRST.md) into your repository and fill in its placeholders. Reference it from both the repository README and AGENTS.md (and other agent instruction files you use).
 - Job authors: [job](templates/JOB.md), [task](templates/TASK.md), [report](templates/REPORT.md), [annotation](templates/ANNOTATION.md).

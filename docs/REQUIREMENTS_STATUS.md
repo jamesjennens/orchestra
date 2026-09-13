@@ -15,6 +15,8 @@ First candidate: **draft-0.1**, created 2026-09-13. Current canonical project: `
 | Offline publisher prototype | kittrial-pth.19 |
 | Change impact/reassessment | kittrial-pth.20 |
 | Acknowledged planning barrier | kittrial-pth.21 |
+| Reconciled offline publication decision | kittrial-pth.22 |
+| Native export/revision adapter | kittrial-pth.23 |
 
 The BRD, exact source manifest, proposed design and implementation sequence are available for review. Local verification checked all twelve requirement hashes, narrative hash, overall manifest hash, unique IDs and inclusion of exact source text in the BRD. Baseline hash: `ef326e4d1376a2bd2d85887f69143ff785a7695693c9eae3d39e8d82f175e95f`.
 
@@ -24,4 +26,8 @@ No exact baseline acceptance is recorded. The user accepted the direction of usi
 
 Bootstrap publication was manually coordinated from canonical source records. Until a tested publisher is implemented, preserve this candidate and create a new named candidate for substantive corrections instead of replacing its content under the same baseline name. Record change rationale in Beads, and carry the revised source content/hashes into the next manifest. The exact old manifest must remain available through Git history or a retained baseline artifact.
 
-Next: implement and independently verify the validator/publisher slice against the draft contract. Owner acceptance of a baseline is a separate, content-specific record. Source code remains replaceable; its requirement and evidence references persist.
+Validator kittrial-pth.18 is implemented and integrated locally at `0252a7a`, after independent review. Publisher kittrial-pth.19 is integrated at `41d1915`, with coordinator corrections and recovery tests. The combined suite runs 124 tests: all pass on Linux; Windows passes with five symlink-privilege skips. Both platforms generate identical BRD and receipt bytes. See [usage](REQUIREMENTS.md) and [validation evidence](../reports/REQUIREMENTS_VALIDATION.md).
+
+The original draft-0.1 manifest hash is unchanged. The new publisher's BRD artifact hash is `9ed8004f9db51e16ea519c0175a7bf5bfca2947f3e778b154d938393432a4364`; its receipt hash is `237b2eb239691ebf81135fad92ea3bce6a39325350b8ea66c551a4f7a8da04b6`. These identify the new deterministic layout, not the earlier manually formatted BRD artifact.
+
+Next: native export adaptation (.23), change impact/reassessment (.20), and automatic planning-barrier enforcement (.21). Both worker launches demonstrated the separate acknowledged planning phase; the operator still enforces it. Owner acceptance of a baseline is a separate, content-specific record. Source code remains replaceable; its requirement and evidence references persist.

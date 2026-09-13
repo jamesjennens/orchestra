@@ -10,6 +10,8 @@ Register requirements and narrative in the canonical kit project, publish BRD dr
 
 This table is the roadmap, not a statement that all rows are in the first slice. The validator and offline publisher are the immediate implementation scope, governed by [REQUIREMENTS_CONTRACT.md](REQUIREMENTS_CONTRACT.md). The review dependency has been satisfied; exact baseline acceptance remains separate.
 
+Validator and publisher are now integrated locally and independently tested on Windows/Linux. Their first input is an explicit structured snapshot; native export adaptation is tracked separately as `kittrial-pth.23`. Usage: [REQUIREMENTS.md](REQUIREMENTS.md). The remaining rows below are still pending.
+
 | Work | Requirement coverage | Scope and checks |
 | --- | --- | --- |
 | Revision contract and record validator | R02, R03, R05 | Define payloads and canonical hashes; reject duplicate IDs, unresolved references and acceptance/revision inconsistencies; round-trip native exports |
