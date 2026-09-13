@@ -20,7 +20,7 @@ Capture the session ID and verify the plan comment independently. Only then resu
 hermes chat --resume SESSION_ID --provider deepseek --model deepseek-flash --max-turns 35 -Q -q "The coordinator verified the plan comment. Execute only the approved file scope, run the specified tests, post a report with evidence, and leave the task for coordinator acceptance."
 ```
 
-This is an operator-enforced launch boundary demonstrated in the validator and publisher trial. It is not yet an automatic policy enforced by the kit; that remains a separate task. A successful plan comment alone does not grant deployment or source-publication authority.
+The validator/publisher trial demonstrated this operator-enforced launch boundary. The kit now also supplies [worker_gate.py register/check/run](REQUIREMENTS_INTEGRATION.md), which verifies an exact canonical plan and claim before invoking the worker argv. Use it after the planning phase. A successful plan comment alone does not grant deployment or source-publication authority; the gate is not OS confinement.
 
 ## Reports and resumption
 

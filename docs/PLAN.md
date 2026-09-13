@@ -39,7 +39,8 @@ A human-established Remote SSH workspace can avoid asking the agent to initiate 
 - Five unit checks on Windows/Linux and a disposable integration exercise covering independent clients, claim races, concurrent comments, project separation, restart and restore.
 - Generic job/task/report/annotation templates and operating instructions.
 - First headless Cline/DeepSeek delegation: offline comment feed from a single export, independently reviewed with 17 passing unit checks. The recorded plan-ordering exception remains a workflow follow-up; see CLINE_WORKERS.md.
-- Hermes/DeepSeek validator and offline BRD publisher, with separate acknowledged planning phases and independent coordinator review. The combined suite runs 124 tests, all passing on Linux; Windows skips five privilege-dependent symlink checks. See [requirements usage](REQUIREMENTS.md) and [evidence](../reports/REQUIREMENTS_VALIDATION.md). Native export adaptation and impact propagation remain pending.
+- Hermes/DeepSeek validator and offline BRD publisher, with separate acknowledged planning phases and independent coordinator review. That first integration checkpoint passed 124 tests on Linux, with five Windows privilege-dependent skips. See [requirements usage](REQUIREMENTS.md) and [evidence](../reports/REQUIREMENTS_VALIDATION.md).
+- Native revision-comment adapter, multi-generation impact/reassessment view, and acknowledged-plan worker gate. The suite now has 161 tests; real native export reconstruction and a disposable canonical gate launch passed. See [integration usage](REQUIREMENTS_INTEGRATION.md). These CLI tools do not automatically update lifecycle dimensions or build a work graph from arbitrary issue prose.
 
 ## Next: address observed coordination costs
 

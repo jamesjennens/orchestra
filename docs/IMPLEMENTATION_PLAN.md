@@ -10,7 +10,7 @@ Register requirements and narrative in the canonical kit project, publish BRD dr
 
 This table is the roadmap, not a statement that all rows are in the first slice. The validator and offline publisher are the immediate implementation scope, governed by [REQUIREMENTS_CONTRACT.md](REQUIREMENTS_CONTRACT.md). The review dependency has been satisfied; exact baseline acceptance remains separate.
 
-Validator and publisher are now integrated locally and independently tested on Windows/Linux. Their first input is an explicit structured snapshot; native export adaptation is tracked separately as `kittrial-pth.23`. Usage: [REQUIREMENTS.md](REQUIREMENTS.md). The remaining rows below are still pending.
+Validator, publisher, native export adaptation (`kittrial-pth.23`), offline impact/reassessment (`.20`) and the acknowledged-plan CLI gate (`.21`) are now integrated locally and independently tested on Windows/Linux. Usage: [REQUIREMENTS.md](REQUIREMENTS.md) and [REQUIREMENTS_INTEGRATION.md](REQUIREMENTS_INTEGRATION.md). Lifecycle/activity integration and office/recovery work remain pending.
 
 | Work | Requirement coverage | Scope and checks |
 | --- | --- | --- |

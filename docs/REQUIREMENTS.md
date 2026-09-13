@@ -1,6 +1,6 @@
 # Working with requirements snapshots
 
-The first slice is an offline validator and publisher over explicit structured snapshots. Beads remains canonical for requirements, discussion and decisions. The tools do not yet turn arbitrary Beads exports into revision manifests or update server publication state.
+The validator and publisher operate over explicit structured snapshots. Beads remains canonical for requirements, discussion and decisions. The [integration workflow](REQUIREMENTS_INTEGRATION.md) now resolves versioned revision comments from a native export, computes impact/reassessment views and gates worker launches on canonical plan acknowledgement. Arbitrary prose is never guessed into revision fields; server publication acknowledgement remains explicit.
 
 The [BRD](BRD.md) and [source snapshot](requirements-baseline.json) are draft-0.1. They are not an accepted specification. The [contract](REQUIREMENTS_CONTRACT.md) records the implemented boundary and the disposition of the independent review.
 
@@ -44,4 +44,4 @@ Record the resulting receipt and manifest hashes back in Beads before describing
 
 An interruption before pointer replacement leaves the previous current publication intact. Retry the same inputs to finish a complete candidate that was written before interruption. Temporary staging directories are never current. Keep historical named publications; do not edit their files in place.
 
-When code exposes a problem, record a linked defect, ambiguity or scope-change proposal in Beads, with the affected requirement IDs/revisions and original assertion. An accepted change gets a new source revision and baseline; earlier snapshots remain reproducible. Automatic impact traversal and lifecycle tables are separate pending features. Unrecorded implementation/test/review/integration/deployment/live-verification facts remain unknown.
+When code exposes a problem, record a linked defect, ambiguity or scope-change proposal in Beads, with the affected requirement IDs/revisions and original assertion. An accepted change gets a new source revision and baseline; earlier snapshots remain reproducible. `requirement_impact.py` traverses an explicit work graph and emits reassessment results. Automatic writes of those results into task state and lifecycle tables remain separate pending features. Unrecorded implementation/test/review/integration/deployment/live-verification facts remain unknown.

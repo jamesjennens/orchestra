@@ -6,7 +6,7 @@ The kit pins Beads 1.2.2 and Dolt 2.2.0, verifies release checksums, installs an
 
 ## Start here
 
-We are now using the harness to develop the harness. Start with the [draft BRD](docs/BRD.md), its [exact requirement manifest](docs/requirements-baseline.json), the [proposed system design](docs/SYSTEM_DESIGN.md) and [first implementation sequence](docs/IMPLEMENTATION_PLAN.md). The workflow direction is accepted; the detailed baseline remains a review candidate. The offline requirement validator and BRD publisher are implemented: see [usage and boundaries](docs/REQUIREMENTS.md). Native export adaptation and automatic change-impact tracking remain pending.
+We are now using the harness to develop the harness. Start with the [draft BRD](docs/BRD.md), its [exact requirement manifest](docs/requirements-baseline.json), the [proposed system design](docs/SYSTEM_DESIGN.md) and [first implementation sequence](docs/IMPLEMENTATION_PLAN.md). The workflow direction is accepted; the detailed baseline remains a review candidate. The offline validator and BRD publisher are implemented: see [usage](docs/REQUIREMENTS.md). [Native export adaptation, revision impact views and an acknowledged-plan launch gate](docs/REQUIREMENTS_INTEGRATION.md) are also available through ordinary CLI commands.
 
 - Operators: [installation and recovery](docs/OPERATIONS.md).
 - Project direction and remaining work: [implementation plan](docs/PLAN.md).
