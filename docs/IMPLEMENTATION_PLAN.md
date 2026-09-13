@@ -8,6 +8,8 @@ Register requirements and narrative in the canonical kit project, publish BRD dr
 
 ## Bounded implementation work
 
+This table is the roadmap, not a statement that all rows are in the first slice. The validator and offline publisher are the immediate implementation scope, governed by [REQUIREMENTS_CONTRACT.md](REQUIREMENTS_CONTRACT.md). The review dependency has been satisfied; exact baseline acceptance remains separate.
+
 | Work | Requirement coverage | Scope and checks |
 | --- | --- | --- |
 | Revision contract and record validator | R02, R03, R05 | Define payloads and canonical hashes; reject duplicate IDs, unresolved references and acceptance/revision inconsistencies; round-trip native exports |

@@ -2,6 +2,8 @@
 
 Status: draft architecture for the first requirements-driven slice. The current runtime does not implement this design. The associated BRD remains a draft baseline, not an owner-approved specification.
 
+The first offline implementation is specified by [REQUIREMENTS_CONTRACT.md](REQUIREMENTS_CONTRACT.md), including review dispositions. It separates the content manifest, hash-bound acceptance evidence and artifact receipt; it consumes structured snapshots rather than inferring revisions from a native export. That narrower contract takes precedence for the prototype below.
+
 ## Authority and record types
 
 Beads is authoritative for requirements, narrative sections, decisions, change proposals and task state. Published BRD files are immutable/reproducible views of a selected baseline. Git records publication artifacts and implementation changes; it does not become a second editable requirement database.
