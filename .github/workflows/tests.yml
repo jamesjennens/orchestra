@@ -17,7 +17,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
-      - run: python -X utf8 -m unittest discover -s tests -v
+      - run: python -X utf8 tests/run_ci.py
   release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: unit
