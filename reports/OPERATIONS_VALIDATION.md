@@ -23,3 +23,5 @@ Recovery review identified that native database backups omit the new coordinatio
 The transfer drill used two independent services/credentials on the same Linux host. It did not simulate losing that host. The office's actual Copilot permissions and contributor-account arrangement were not exercised. Legacy project migration and existing backup schedules remain separate operator work.
 
 One integration attempt ran alongside a different refresh and observed different CURRENT/COORDINATION snapshots; the final operational run was isolated and passed. Generated files are individually atomic projections, not a multi-file read transaction. The native database remains authoritative.
+
+Initial GitHub CI passed Linux but exposed a Windows-only test assumption: the runner's short `RUNNER~1` temporary path differs textually from its resolved `runneradmin` path. The worker gate correctly resolved the path; the assertion now compares the resolved expected path. CI failures are emitted as individual annotations for diagnosis.

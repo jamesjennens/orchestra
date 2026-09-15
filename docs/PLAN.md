@@ -77,11 +77,11 @@ Public name: Orchestra. Destination: https://github.com/jamesjennens/orchestra. 
 
 - [x] Keep a standalone repository containing generic implementation, docs and synthetic validation only.
 - [x] Publish a candid README, contributor workflow, Copilot instructions/template and PR template locally for review.
-- [x] Distinguish implemented features from local transport, account integration and office tests that remain planned.
-- [ ] Confirm GitHub owner/organisation, name and license; add chosen LICENSE with correct attribution.
-- [ ] Review the exact tracked tree and history for credentials, host-specific/private project data and third-party notices. Archive only tracked files.
-- [ ] Add lightweight CI for portable unit tests; keep deployment integration explicitly opt-in on a disposable server.
-- [ ] Create the public repository, push reviewed commits, verify displayed files/links and configure normal review expectations.
+- [x] Distinguish implemented local transport from account integration and actual office tests that remain deployment-specific.
+- [x] Confirm GitHub owner/organisation, name and license; add chosen LICENSE with correct attribution.
+- [x] Review the tracked tree and history for credentials, host-specific/private project data and third-party notices. Archive only tracked files.
+- [x] Add lightweight CI for portable unit tests; keep deployment integration explicitly opt-in on a disposable server.
+- [x] Create the public repository and push reviewed commits. Contributor and PR instructions describe normal owner review; repository branch protections remain owner-managed.
 - [ ] Publish an initial pilot release with checksums and tested-platform notes. Download dependencies from upstream; do not bundle upstream binaries in this kit's source archive.
 
 Public-source availability is separate from permission to publish any team's actual coordination records. Runtime state, private client configuration and workplace histories stay out of this repository.
