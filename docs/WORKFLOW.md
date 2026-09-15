@@ -72,3 +72,7 @@ Link the exact repository, branch, commit SHA and PR URL in the report. Put the 
 Normally keep a coding task open until its PR merges, recording awaiting-review in current notes. An explicitly separate implementation task can close at PR-ready only with a remaining review/acceptance task. The job stays open until its stated outcome is accepted. PR closure without merge is not acceptance.
 
 Only the named project owner(s) accept the job under the project's agreement. Configure the repository's normal branch protection/merge permissions accordingly. Beads does not enforce this ownership convention and a closed issue does not prove a PR was merged. Once accepted, record the resulting merge/squash commit and evidence, close the relevant tasks/job, update dependencies and refresh. These updates are manual today; no PR webhook or automatic Git synchronization is installed.
+
+## Operational commands
+
+Use [the operational workflow](OPERATIONAL_WORKFLOW.md) for evidence-scoped lifecycle updates, durable child request IDs, the merge slot and activity cursors. Record mutable pointers in Beads; CURRENT.md and COORDINATION.md are generated and must not be edited on contribution branches. Keep stable authority/rules in READ_ME_FIRST.md. Decisions use the exact headings in templates/DECISION.md and can be checked with `lint ID --json`.

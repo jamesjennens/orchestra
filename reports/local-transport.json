@@ -1,0 +1,21 @@
+{
+  "suite": "Linux local transport and POSIX wrapper",
+  "checks": [
+    {
+      "check": "native endpoint without nested SSH",
+      "result": "PASS"
+    },
+    {
+      "check": "UTF-8 attachment and literal shell text preserved",
+      "result": "PASS"
+    },
+    {
+      "check": "wrapper and refresh work outside kit directory",
+      "result": "PASS"
+    },
+    {
+      "check": "explicit actor enforced",
+      "result": "PASS"
+    }
+  ]
+}

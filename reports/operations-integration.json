@@ -1,0 +1,21 @@
+{
+  "suite": "operational native integration",
+  "checks": [
+    {
+      "check": "concurrent native child allocation and durable retry",
+      "result": "PASS"
+    },
+    {
+      "check": "merge exclusivity nonholder refusal and interrupted-holder reacquisition",
+      "result": "PASS"
+    },
+    {
+      "check": "native lifecycle evidence correction and scope rollover",
+      "result": "PASS"
+    },
+    {
+      "check": "native decision validation and lint",
+      "result": "PASS"
+    }
+  ]
+}

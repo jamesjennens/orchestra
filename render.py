@@ -5,6 +5,7 @@ import re
 from collections import defaultdict
 from datetime import datetime,timezone
 from pathlib import Path
+from lifecycle import project_facts, DIMENSIONS
 
 def write(path,text):
     path.parent.mkdir(parents=True,exist_ok=True)
@@ -32,6 +33,20 @@ def render(rows,dest):
         for relation,target in re.findall(r'(?im)^(Supersedes|Contradicts|Supports|Comments-on):\s*([A-Za-z0-9_.-]+)\s*$',c.get('text','')):
             if target in entries:backlinks[target].append((relation.lower(),eid,date))
     current=['# Current project work\n\n',banner,'[Daily journal](journal/INDEX.md) | [All records](INDEX.md)\n\n']
+    facts=[r for r in project_facts(rows) if r['has_lifecycle']]
+    if facts:
+        def cell(value):return str(value or 'unknown').replace('|','\\|').replace('\n',' ')
+        current.extend(['## Lifecycle evidence\n\n','Facts apply only to the exact scope shown. Unknown includes missing, inconsistent or superseded evidence.\n\n',
+                        '| Task | '+' | '.join(DIMENSIONS)+' | Source commit | Integration commit | Release | Environment |\n',
+                        '| --- | '+' | '.join(['---']*10)+' |\n'])
+        for fact in sorted(facts,key=lambda r:r['id']):
+            scope=fact['scope'] or {}
+            values=[]
+            for dim in DIMENSIONS:
+                entry=fact['facts'][dim];value=entry['value']
+                values.append(f'[{value}](jobs/{entry["event_id"]}.md)' if entry['event_id'] else value)
+            current.append('| ['+fact['id']+'](jobs/'+fact['id']+'.md) | '+' | '.join(values+[cell(scope.get(k)) for k in ('source_commit','integration_commit','release_id','environment')])+' |\n')
+        current.append('\n')
     for r in sorted(rows,key=lambda x:x['id']):
         rid=r['id'];par=parent(r)
         body=f'# {rid}: {r["title"]}\n\n'+banner+f'**Status:** {r["status"]} | **Assignee:** {r.get("assignee") or "unassigned"}\n\n'
@@ -60,4 +75,5 @@ def render(rows,dest):
     write(dest/'INDEX.md','# All records\n\n'+banner+''.join(f'- [{r["id"]}: {r["title"]}](jobs/{r["id"]}.md) — {r["status"]}\n' for r in sorted(rows,key=lambda x:x['id'])))
     write(dest/'issues.jsonl',''.join(json.dumps(r,ensure_ascii=False)+'\n' for r in rows))
     write(dest/'CURRENT.md',''.join(current))
+    write(dest/'COORDINATION.md',''.join(current))
     return {'issues':len(rows),'comments':len(entries),'generated_at':stamp}

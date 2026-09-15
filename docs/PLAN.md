@@ -1,6 +1,6 @@
 # Plan: portable team coordination
 
-Updated 2026-09-13. This document preserves the earlier roadmap and operational context. The requirements-driven first slice is now tracked by BRD.md, requirements-baseline.json, SYSTEM_DESIGN.md and IMPLEMENTATION_PLAN.md, with canonical records in Beads. Do not maintain competing task acceptance here. Project-specific work belongs in each project's Beads database.
+Updated 2026-09-15. This document preserves the earlier roadmap and operational context. The requirements-driven first slice is now tracked by BRD.md, requirements-baseline.json, SYSTEM_DESIGN.md and IMPLEMENTATION_PLAN.md, with canonical records in Beads. Do not maintain competing task acceptance here. Project-specific work belongs in each project's Beads database.
 
 ## Intended outcome
 
@@ -24,7 +24,7 @@ Start with a few contributors across one or two projects. Keep MCP, vendor-speci
 | --- | --- | --- |
 | Local workstation, remote coordinator | Implemented and tested | Python client -> SSH -> endpoint -> canonical database |
 | VS Code Remote SSH workspace | Environment option; office validation pending | Human connects VS Code; workspace terminal commands run on development server |
-| Same-host local endpoint client | Planned | Python client -> local endpoint process, no nested SSH |
+| Same-host local endpoint client | Implemented; Linux trial | Python client -> local endpoint process, no nested SSH |
 | Separate Linux accounts on shared server | Design/validation pending | Explicit service access boundary; each account has its own checkout |
 | MCP adapter | Not required | Consider only if a future harness benefits from it |
 
@@ -44,13 +44,13 @@ A human-established Remote SSH workspace can avoid asking the agent to initiate 
 
 ## Next: address observed coordination costs
 
-The first operational pilot reported roughly thirty tasks across three agent types. Preserve the model, but prioritize queryable lifecycle facts, a single-export activity feed, enforced actor identity, concurrency-safe child IDs, merge coordination and generated summaries before broadening distribution. See [pilot feedback and acceptance criteria](PILOT_FEEDBACK.md) for the implementation order, verified native capabilities and migration boundaries. These improvements are planned, not yet shipped.
+The first operational pilot reported roughly thirty tasks across three agent types. Preserve the model, but prioritize queryable lifecycle facts, a single-export activity feed, enforced actor identity, concurrency-safe child IDs, merge coordination and generated summaries before broadening distribution. See [pilot feedback and acceptance criteria](PILOT_FEEDBACK.md) for the implementation order, verified native capabilities and migration boundaries. These improvements are implemented in the operational tranche. See OPERATIONAL_WORKFLOW.md and reports/OPERATIONS_VALIDATION.md for commands, evidence and remaining limits.
 
 ## Then: make the office workflow easy
 
-1. **Local transport:** add an explicit transport selector while preserving existing SSH configuration. Local mode uses a subprocess argument array and the same JSON protocol; it must never silently switch hosts or databases. Test local/SSH parity, attachment handling, failure/timeout reporting and actor attribution.
+1. **Local transport (implemented):** explicit transport selection preserves existing SSH configuration. Local mode uses a subprocess argument array and the same JSON protocol; it must never silently switch hosts or databases. Test local/SSH parity, attachment handling, failure/timeout reporting and actor attribution.
 2. **Account access:** validate the simplest acceptable access arrangement for contributors' separate Linux accounts. Do not make runtime data world-readable or silently grant broad sudo access. The existing shared service-account pilot is a trusted-team boundary, not verified per-person authorization.
-3. **Convenient commands:** add small PowerShell and POSIX wrappers around the common client. Keep project/actor configuration explicit and credentials out of the repository. Do not require GitHub CLI or MCP.
+3. **Convenient commands (implemented):** CMD and POSIX wrappers call the common client. Keep project/actor configuration explicit and credentials out of the repository. Do not require GitHub CLI or MCP.
 4. **Copilot onboarding:** ship repository instructions and run a smoke test in the actual permitted IDE: read instructions, list a task, claim a disposable task, save a plan/report, and verify another contributor can see it. Repeat in Remote SSH if local execution/connectivity is restricted.
 5. **Two-person office trial:** exercise parallel non-overlapping tasks, a deliberate overlap, an interrupted handoff and a complete PR/merge/acceptance cycle. Confirm private workspaces share the same coordination state.
 6. **Operations:** schedule off-machine backups through the team's chosen mechanism; test recovery on a replacement host. Record actual ownership and retention arrangements in deployment-local documentation.
@@ -73,7 +73,7 @@ No automatic PR creation, status synchronization, webhook or CI-driven task clos
 
 ## Public repository preparation
 
-Proposed name: beads-team-kit. Proposed license: MIT, subject to owner's confirmation. No public remote exists yet.
+Public name: Orchestra. Destination: https://github.com/jamesjennens/orchestra. The owner selected MIT and authorized the initial upload on 2026-09-15. The original draft BRD is preserved as historical baseline content; this dated decision supersedes its unresolved public-destination/license note.
 
 - [x] Keep a standalone repository containing generic implementation, docs and synthetic validation only.
 - [x] Publish a candid README, contributor workflow, Copilot instructions/template and PR template locally for review.

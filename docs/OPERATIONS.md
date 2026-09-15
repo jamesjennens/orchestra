@@ -53,7 +53,23 @@ Restore drills deliberately create a new project:
 python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime restore-new example examplerestore
 ```
 
-It refuses a populated destination, restores status and comments, and retains original issue IDs. Inspect records and comments before any cutover. Do not run both copies as live coordination trackers. A complete host-loss recovery requires reinstalling the pinned kit on a replacement host, placing the saved backup under its backups directory, using restore-new, verifying it, then updating client project/host settings. That cross-host procedure has not yet been tested; the automated drill covers restore into a new database on the same server.
+It refuses a populated destination, restores status and comments, and retains original issue IDs. Inspect records and comments before any cutover. Do not run both copies as live coordination trackers. A complete host-loss recovery requires reinstalling the pinned kit on a replacement host, placing the saved backup and its coordination sidecar under its backups directory, using restore-new, verifying it, then updating client project/host settings. A separate-deployment drill exercises backup transfer; actual replacement-host outage recovery remains an operator exercise.
+
+### Coordination journals and interrupted recovery
+
+`add-project` initializes and performs an initial backup. `backup` captures both the native backup directory and `backups/PROJECT.coordination.json`. The sidecar preserves pending child-request reservations and merge context outside Dolt. Keep this pair together. A pending marker is written before synchronization and becomes complete only after native sync succeeds; restore refuses an incomplete sidecar. Backup and restore serialize access to the pair, and backup excludes contributor writes through the endpoint. Direct operator/native writes bypass these locks and must be paused for backup.
+
+Copy a completed, quiescent backup pair off-machine using your normal encrypted backup system. Do not copy it during the next sync. This is not an atomic transaction across arbitrary filesystem copies; take a filesystem snapshot or hold the project's `backups/PROJECT.lock` while copying. Legacy backups without a sidecar warn that outstanding requests/merge context require reconciliation.
+
+If restore is interrupted, the new destination may exist with only part of the restore completed. Preserve it for inspection; retry recovery into another unused destination. Do not delete the source or force reuse of the partially restored target. Verify pending reservations, comments, lifecycle events, baselines and slot context before switching clients.
+
+### Optional scheduled backup
+
+Edit `templates/beads-backup.service` for the installation paths/project, then copy it and `templates/beads-backup.timer` into the service account's `~/.config/systemd/user/`. Enable with `systemctl --user daemon-reload` and `systemctl --user enable --now beads-backup.timer`. Check `systemctl --user list-timers` and the service journal; lingering must already be enabled for unattended operation. The timer performs same-host backup only. Configure off-machine copying and retention separately. These templates do not replace an existing team's backup schedule.
+
+### Local and Windows clients
+
+Use `client.local.example.json` for explicit Linux same-host execution, under an account with access to the runtime. Use `beads.cmd` on Windows or `sh beads.sh` on POSIX from any directory. The wrappers take the same required config/project/actor arguments as client.py; no PowerShell execution-policy change is required. See [operational examples](OPERATIONAL_WORKFLOW.md).
 
 ## Maintenance
 

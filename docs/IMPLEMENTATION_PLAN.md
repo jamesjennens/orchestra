@@ -10,7 +10,7 @@ Register requirements and narrative in the canonical kit project, publish BRD dr
 
 This table is the roadmap, not a statement that all rows are in the first slice. The validator and offline publisher are the immediate implementation scope, governed by [REQUIREMENTS_CONTRACT.md](REQUIREMENTS_CONTRACT.md). The review dependency has been satisfied; exact baseline acceptance remains separate.
 
-Validator, publisher, native export adaptation (`kittrial-pth.23`), offline impact/reassessment (`.20`) and the acknowledged-plan CLI gate (`.21`) are now integrated locally and independently tested on Windows/Linux. Usage: [REQUIREMENTS.md](REQUIREMENTS.md) and [REQUIREMENTS_INTEGRATION.md](REQUIREMENTS_INTEGRATION.md). Lifecycle/activity integration and office/recovery work remain pending.
+Validator, publisher, native export adaptation (`kittrial-pth.23`), offline impact/reassessment (`.20`) and the acknowledged-plan CLI gate (`.21`) are now integrated locally and independently tested on Windows/Linux. Usage: [REQUIREMENTS.md](REQUIREMENTS.md) and [REQUIREMENTS_INTEGRATION.md](REQUIREMENTS_INTEGRATION.md). Lifecycle/activity integration, terminal wrappers and operational recovery support are also implemented; see OPERATIONAL_WORKFLOW.md. Actual workplace validation remains pending.
 
 | Work | Requirement coverage | Scope and checks |
 | --- | --- | --- |
@@ -21,7 +21,7 @@ Validator, publisher, native export adaptation (`kittrial-pth.23`), offline impa
 | Worker planning barrier | R08 | Separate confirmed plan registration from executable work; demonstrate a worker cannot start implementation while plan write is failed/pending |
 | Office transport and operator recovery | R09, R11 | Same-host client, .cmd/POSIX entry points, canonical paths, separate-account access trial, off-machine recovery drill |
 
-R10 applies to review/integration of every code contribution. R12 applies to every public artifact. Current public owner/license decisions remain unresolved; none of these tasks authorizes publication of private state.
+R10 applies to review/integration of every code contribution. R12 applies to every public artifact. Public destination jamesjennens/orchestra and MIT were confirmed on 2026-09-15; none of these tasks authorizes publication of private state.
 
 ## Sequencing and acceptance
 
@@ -38,6 +38,6 @@ Use the kit's own baseline as the first publisher fixture, then demonstrate a re
 - Who besides the initiating owner may accept requirements/baselines, and is one joint owner sufficient or is joint approval required? Keep configurable; do not invent a role hierarchy.
 - Which requirements belong in the first accepted baseline versus later scope?
 - Approve or revise the exact requirement acceptance criteria after review; acceptance of the direction is not blanket acceptance of generated detail.
-- Confirm public repository destination and license separately.
+- Public destination and MIT license confirmed on 2026-09-15; retain the draft baseline unchanged until a new canonical revision is published.
 
 Exploratory design and draft tooling can proceed under the existing instruction to build the harness. Publishing an accepted baseline needs a concrete owner acceptance record tied to its content hash.

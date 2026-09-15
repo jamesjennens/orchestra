@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Orchestra backup
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=300
+Unit=beads-backup.service
+
+[Install]
+WantedBy=timers.target

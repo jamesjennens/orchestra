@@ -12,7 +12,9 @@ A person opens a Linux folder using VS Code Remote SSH. The integrated terminal 
 
 Each contributor should have a separate checkout and branch. A shared development server does not mean a shared mutable working tree. The source repository remote supplies commits/PRs; the canonical coordination service supplies task state.
 
-The kit currently always invokes SSH. A same-host local transport is planned; do not document or assume it already exists. It must also respect service-account permissions: simply logging into the same machine as another Linux user does not grant access to the runtime. If the development and coordination servers differ, network access is still needed between them.
+The explicit same-host local transport is available through client.local.example.json. It invokes the Linux endpoint directly with the same JSON protocol; it never silently falls back to SSH. It respects service-account permissions: simply logging into the same machine as another Linux user does not grant access to the runtime. Separate users can retain their own workspaces and individually revocable SSH access to the service account. If the development and coordination servers differ, network access is still needed between them. See [operational commands](OPERATIONAL_WORKFLOW.md).
+
+Windows contributors can use beads.cmd with ordinary Python and no PowerShell execution-policy change. POSIX contributors use `sh /path/to/orchestra/beads.sh`. Both wrappers locate client.py relative to themselves and work from another directory. Set BEADS_PYTHON to one executable path if Python is not on PATH.
 
 ## Repository onboarding
 

@@ -1,6 +1,6 @@
 # Requirements-driven coordination — proposed design
 
-Status: draft architecture for the first requirements-driven slice. The current runtime does not implement this design. The associated BRD remains a draft baseline, not an owner-approved specification.
+Status: draft architecture for the first requirements-driven slice. The offline requirements and operational slices implement parts of this design; current interfaces are documented in REQUIREMENTS_INTEGRATION.md and OPERATIONAL_WORKFLOW.md. The associated BRD remains a draft baseline, not an owner-approved specification.
 
 The first offline implementation is specified by [REQUIREMENTS_CONTRACT.md](REQUIREMENTS_CONTRACT.md), including review dispositions. It separates the content manifest, hash-bound acceptance evidence and artifact receipt; it consumes structured snapshots rather than inferring revisions from a native export. That narrower contract takes precedence for the prototype below.
 
@@ -46,4 +46,4 @@ Keep role enforcement in existing account/repository controls for the trusted-te
 
 One export supplies requirements, comments and current labels. Build BRD, lifecycle table and activity views locally rather than issuing one query per record. A lifecycle event schema must be verified before extending the comment-only activity feed.
 
-SSH remains the implemented client transport. Same-host execution and office Copilot validation are independent tasks and must not block an offline publisher prototype. Existing canonical task IDs, comments, backup paths and claims are preserved; no live project migration is part of this slice.
+SSH and explicit same-host execution are implemented client transports. Actual office Copilot validation remains an independent task and must not block an offline publisher prototype. Existing canonical task IDs, comments, backup paths and claims are preserved; no live project migration is part of this slice.

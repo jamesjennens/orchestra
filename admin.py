@@ -11,6 +11,7 @@ import socket
 import subprocess
 import time
 from pathlib import Path
+from contextlib import contextmanager
 from bootstrap import install as install_binaries
 
 def checked(cmd, **kwargs):
@@ -139,7 +140,68 @@ def add_project(root,name):
     for key,value in [('no-git-ops','true'),('dolt.auto-push','false'),('dolt.auto-commit','on'),('backup.git-push','false')]:
         run_bd(root,name,['config','set',key,value])
     run_bd(root,name,['backup','init',str(root/'backups'/name)])
+    backup_project(root,name)
     print(f'Created project {name}')
+
+@contextmanager
+def backup_lock(root,name):
+    import fcntl
+    validate_name(name)
+    with (root/'backups'/(name+'.lock')).open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        yield
+
+def validate_coordination_files(files):
+    if not isinstance(files,dict):raise ValueError('Invalid coordination files map')
+    for name,record in files.items():
+        if name!='.merge-context.json' and not re.fullmatch(r'\.coordination-requests/[a-f0-9]{64}\.json',name):raise ValueError('Invalid coordination backup path')
+        if not isinstance(record,dict):raise ValueError('Invalid coordination record')
+
+def backup_project(root,name):
+    import fcntl
+    from coordination import atomic
+    path=project_dir(root,name)
+    with (path/'.coordination.lock').open('a') as lock, backup_lock(root,name):
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        bundle=root/'backups'/(name+'.coordination.json')
+        atomic(bundle,{'schema_version':1,'status':'pending'})
+        files={}
+        if (path/'.coordination-requests').is_symlink() or (path/'.merge-context.json').is_symlink():raise ValueError('Coordination paths must not be symlinks')
+        for record in sorted((path/'.coordination-requests').glob('*.json')):
+            if record.is_symlink():raise ValueError('Coordination receipt must not be a symlink')
+            files['.coordination-requests/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
+        context=path/'.merge-context.json'
+        if context.exists():files[context.name]=json.loads(context.read_text(encoding='utf-8'))
+        validate_coordination_files(files)
+        output=run_bd(root,name,['backup','sync'])
+        atomic(bundle,{'schema_version':1,'status':'complete','files':files})
+        return output
+
+def coordination_backup(root,source):
+    validate_name(source)
+    bundle=root/'backups'/(source+'.coordination.json')
+    if not bundle.exists():
+        return None
+    if bundle.is_symlink():raise ValueError('Coordination backup must not be a symlink')
+    data=json.loads(bundle.read_text(encoding='utf-8'))
+    if not isinstance(data,dict) or data.get('schema_version')!=1 or data.get('status')!='complete':raise ValueError('Incomplete coordination backup; recover/reconcile source first')
+    validate_coordination_files(data.get('files'))
+    return data['files']
+
+def restore_coordination(root,source,destination):
+    from coordination import atomic
+    path=project_dir(root,destination)
+    files=coordination_backup(root,source)
+    if files is None:
+        print('Legacy backup has no coordination journal. Reconcile outstanding child requests and merge ownership before accepting writes.')
+        return
+    for name in files:
+        target=path/name
+        if target.is_symlink() or target.parent.is_symlink():raise ValueError('Coordination restore paths must not be symlinks')
+    for name,record in files.items():
+        target=project_dir(root,destination)/name
+        target.parent.mkdir(exist_ok=True)
+        atomic(target,record)
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('--root',required=True)
@@ -154,13 +216,17 @@ def main():
     if args.command=='install':install(root,args.port,args.unit)
     elif args.command=='add-project':add_project(root,args.project)
     elif args.command=='service':print(service(root,args.action))
-    elif args.command=='backup':print(run_bd(root,args.project,['backup','sync']))
+    elif args.command=='backup':print(backup_project(root,args.project))
     elif args.command=='restore-new':
         validate_name(args.project);validate_name(args.destination)
         backup=root/'backups'/args.project
         if not backup.is_dir():raise ValueError('Source backup missing')
-        add_project(root,args.destination)
-        print(run_bd(root,args.destination,['backup','restore',str(backup),'--force']))
+        if args.project==args.destination:raise ValueError('Restore requires a different destination')
+        with backup_lock(root,args.project):
+            coordination_backup(root,args.project)
+            add_project(root,args.destination)
+            print(run_bd(root,args.destination,['backup','restore',str(backup),'--force']))
+            restore_coordination(root,args.project,args.destination)
         print('Restored only into the newly created project; retained original issue IDs. Never use this clone as a second live tracker.')
 
 if __name__=='__main__':

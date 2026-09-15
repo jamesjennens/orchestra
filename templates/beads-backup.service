@@ -1,0 +1,8 @@
+# Edit paths/project before copying to the service account's user systemd directory.
+[Unit]
+Description=Back up one Orchestra project and coordination journals
+
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=/usr/bin/python3 /home/beads/orchestra/admin.py --root /home/beads/beads-runtime backup example

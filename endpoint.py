@@ -10,8 +10,9 @@ import tempfile
 from pathlib import Path
 from admin import environment,project_dir,root_path
 from render import render
+from lifecycle import apply_native
 
-ALLOWED={'list','show','ready','search','count','create','update','close','reopen','comments','dep'}
+ALLOWED={'list','show','ready','search','count','create','update','close','reopen','comments','dep','state','lint'}
 FORBIDDEN={'--directory','-C','--db','--repo','--global','--actor','--author','--profile','--graph','--config','--metadata'}
 FILE_FLAGS={'--body-file','--design-file','--file','-f'}
 
@@ -21,6 +22,21 @@ def execute(root,request):
     actor=request.get('actor','')
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}',actor):raise ValueError('Supply a short contributor/session actor')
     action=request.get('action','bd')
+    if action in ('lifecycle','coordinate'):
+        args=request.get('args',[])
+        if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):raise ValueError('Expected one JSON payload')
+        payload=json.loads(args[0])
+        def run(argv):
+            p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*argv],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
+            if p.returncode:raise ValueError(p.stderr or p.stdout)
+            return p.stdout
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            if action=='lifecycle':result=apply_native(payload,actor,run)
+            else:
+                from coordination import apply_native as coordinate
+                result=coordinate(payload,actor,run,path)
+        return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''}
     if action=='view':
         target=request.get('path','CURRENT.md')
         viewroot=(path/'views').resolve();view=(viewroot/target).resolve()
@@ -51,7 +67,9 @@ def execute(root,request):
                 dest=Path(tmp)/f'{i}.txt';dest.write_text(item['text'],encoding='utf-8')
                 final.extend([item['flag'],str(dest)])
             else: final.append(a)
-        p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*final],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*final],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
         return {'returncode':p.returncode,'stdout':p.stdout,'stderr':p.stderr}
 
 def main():

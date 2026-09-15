@@ -1,0 +1,56 @@
+{
+  "suite": "beads-team-kit disposable SSH integration",
+  "elapsed_seconds": 90.91,
+  "checks": [
+    {
+      "check": "cross-client plan and quoting",
+      "result": "PASS",
+      "detail": "Bob read exactly the UTF-8 plan written by Alice; shell metacharacters stayed data."
+    },
+    {
+      "check": "simultaneous claim",
+      "result": "PASS",
+      "detail": "Exactly one winner in each of three independent two-client races: bob,bob,alice"
+    },
+    {
+      "check": "comments and correction backlinks",
+      "result": "PASS",
+      "detail": "Both concurrent reports persisted; original entry links to the later correction."
+    },
+    {
+      "check": "project separation",
+      "result": "PASS",
+      "detail": "Second project query did not include first-project issue IDs."
+    },
+    {
+      "check": "structured completion",
+      "result": "PASS",
+      "detail": "Task closed while parent job remains open."
+    },
+    {
+      "check": "service restart",
+      "result": "PASS",
+      "detail": "Closed task and its state survived restart of the disposable service."
+    },
+    {
+      "check": "full backup restore",
+      "result": "PASS",
+      "detail": "Restored status and all three comments into a newly named database; a write there did not affect original."
+    }
+  ],
+  "versions": {
+    "platform": "linux-amd64",
+    "bd": {
+      "version": "1.2.2",
+      "url": "https://github.com/gastownhall/beads/releases/download/v1.2.2/beads_1.2.2_linux_amd64.tar.gz",
+      "sha256": "8140098a51d3b81d5548d1c5e6db1a2d9930e5d141efe2a4bff7d079c4d321e8",
+      "member": "bd"
+    },
+    "dolt": {
+      "version": "2.2.0",
+      "url": "https://github.com/dolthub/dolt/releases/download/v2.2.0/dolt-linux-amd64.tar.gz",
+      "sha256": "1f7ad8c2622995789420a3fb0f2d16b4aa7430000a825dd91d5938f36480cbf6",
+      "member": "dolt-linux-amd64/bin/dolt"
+    }
+  }
+}

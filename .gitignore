@@ -4,3 +4,8 @@ __pycache__/
 client.local.json
 *.private.json
 dist/
+client.*.private.json
+.coordination-requests/
+.merge-context.json
+*.coordination.json
+*.cursor.json

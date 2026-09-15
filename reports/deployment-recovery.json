@@ -1,0 +1,18 @@
+{
+  "suite": "independent deployment backup transfer",
+  "checks": [
+    {
+      "check": "pinned fresh deployment with independent credentials",
+      "result": "PASS"
+    },
+    {
+      "check": "native records comments labels and lifecycle descriptions preserved",
+      "result": "PASS"
+    },
+    {
+      "check": "pending request journal and merge context preserved",
+      "result": "PASS"
+    }
+  ],
+  "scope": "Two isolated Linux deployments on one physical host; actual host-loss and off-machine backup scheduling not exercised."
+}

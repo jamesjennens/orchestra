@@ -8,4 +8,4 @@ Run `python -m unittest discover -s tests -v`. Changes to server behavior should
 
 Maintainers review and merge contributions. Creating or closing a coordination task does not merge code or establish project acceptance. Keep platform claims tied to tested environments and label unfinished work clearly.
 
-Licensing is pending the repository owner's selection before initial public publication. Do not interpret this preparation document as a license grant.
+Orchestra is MIT licensed; see LICENSE. Upstream Beads and Dolt retain their own licenses.

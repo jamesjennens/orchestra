@@ -6,7 +6,7 @@ State the decision, scope, deciding authority and current applicability.
 
 Evidence, constraints and reasoning. Link source issues/comments and distinguish user direction from worker inference.
 
-## Alternatives
+## Alternatives Considered
 
 Options considered, including retaining the current behavior, and why they were not selected.
 
