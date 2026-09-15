@@ -117,7 +117,7 @@ class GateTests(unittest.TestCase):
         argv, kwargs = spawn.call_args.args[0], spawn.call_args.kwargs
         self.assertEqual(argv, HOSTILE)
         self.assertIs(kwargs["shell"], False)
-            self.assertEqual(kwargs["cwd"], str(self.root.resolve()))
+        self.assertEqual(kwargs["cwd"], str(self.root.resolve()))
 
     def test_worker_argv_never_enters_transport(self):
         with patch.object(worker_gate.subprocess, "run",
