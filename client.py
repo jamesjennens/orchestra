@@ -112,5 +112,10 @@ def main():
     sys.stdout.write(result['stdout']);sys.stderr.write(result['stderr']);return result['returncode']
 
 if __name__=='__main__':
+    # Keep redirected document/template output UTF-8 on Windows as well as POSIX.
+    # The remote transport already decodes UTF-8; the terminal pipe must not
+    # silently re-encode it using the workstation's legacy code page.
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
     try:sys.exit(main())
     except (ValueError,RuntimeError,OSError) as e:raise SystemExit(str(e))
