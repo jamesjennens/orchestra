@@ -16,6 +16,7 @@ We are now using the harness to develop the harness. Start with the [draft BRD](
 - Copilot and remote development: [office setup](docs/COPILOT_REMOTE_DEV.md).
 - Optional headless workers: [Cline launch and recovery](docs/CLINE_WORKERS.md), [Hermes planning and resumption](docs/HERMES_WORKERS.md).
 - Contributors and agents: [working agreement](docs/WORKFLOW.md).
+- Starting a new worker: [copy-paste prompt](templates/WORKER_PROMPT.md), with project placeholders and PowerShell/POSIX commands.
 - Project owners: copy [project entry point](templates/READ_ME_FIRST.md) into your repository and fill in its placeholders. Reference it from both the repository README and AGENTS.md (and other agent instruction files you use).
 - Job authors: [job](templates/JOB.md), [task](templates/TASK.md), [report](templates/REPORT.md), [annotation](templates/ANNOTATION.md).
 - Decision authors: [decision template](templates/DECISION.md).
