@@ -154,8 +154,9 @@ def backup_lock(root,name):
 def validate_coordination_files(files):
     if not isinstance(files,dict):raise ValueError('Invalid coordination files map')
     for name,record in files.items():
-        if name!='.merge-context.json' and not re.fullmatch(r'\.coordination-requests/[a-f0-9]{64}\.json',name):raise ValueError('Invalid coordination backup path')
+        if name not in ('.merge-context.json','ONBOARDING.md') and not re.fullmatch(r'\.coordination-requests/[a-f0-9]{64}\.json',name):raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
+        if name=='ONBOARDING.md' and (set(record)!={'text'} or not isinstance(record['text'],str) or not record['text'].strip() or len(record['text'].encode('utf-8'))>8000):raise ValueError('Invalid onboarding backup')
 
 def backup_project(root,name):
     import fcntl
@@ -172,6 +173,9 @@ def backup_project(root,name):
             files['.coordination-requests/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
         context=path/'.merge-context.json'
         if context.exists():files[context.name]=json.loads(context.read_text(encoding='utf-8'))
+        if (path/'ONBOARDING.md').exists() or (path/'ONBOARDING.md').is_symlink():
+            from onboarding import read_document, PROJECT_LIMIT
+            files['ONBOARDING.md']={'text':read_document(path,'ONBOARDING.md',PROJECT_LIMIT)}
         validate_coordination_files(files)
         output=run_bd(root,name,['backup','sync'])
         atomic(bundle,{'schema_version':1,'status':'complete','files':files})
@@ -201,13 +205,17 @@ def restore_coordination(root,source,destination):
     for name,record in files.items():
         target=project_dir(root,destination)/name
         target.parent.mkdir(exist_ok=True)
-        atomic(target,record)
+        if name=='ONBOARDING.md':
+            from onboarding import write_project
+            write_project(target,record['text'])
+        else:atomic(target,record)
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('--root',required=True)
     sub=p.add_subparsers(dest='command',required=True)
     a=sub.add_parser('install');a.add_argument('--port',type=int,default=13317);a.add_argument('--unit',default='beads-team.service')
     a=sub.add_parser('add-project');a.add_argument('project')
+    a=sub.add_parser('set-onboarding');a.add_argument('project');a.add_argument('--file',required=True)
     for command in ('backup','restore-new'):
         a=sub.add_parser(command);a.add_argument('project')
         if command=='restore-new':a.add_argument('destination')
@@ -215,6 +223,15 @@ def main():
     args=p.parse_args();root=root_path(args.root)
     if args.command=='install':install(root,args.port,args.unit)
     elif args.command=='add-project':add_project(root,args.project)
+    elif args.command=='set-onboarding':
+        import fcntl
+        from onboarding import write_project
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            write_project(path/'ONBOARDING.md',Path(args.file).read_text(encoding='utf-8-sig'))
+        print('Project onboarding installed; back up the project after changes.')
     elif args.command=='service':print(service(root,args.action))
     elif args.command=='backup':print(backup_project(root,args.project))
     elif args.command=='restore-new':

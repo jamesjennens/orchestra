@@ -1,5 +1,7 @@
 # New worker prompt
 
+Prefer [server-owned onboarding](../docs/ONBOARDING.md) when configured: start from an empty directory and run the installation's `worker.py ... onboard` SSH command, or `client.py ... -- onboard` with an existing client. The server returns current shared rules and project-specific setup. The longer prompt below is a reference for installations without that entry point.
+
 Fill in the project details below, then paste the **Worker instructions** section into your agent's session. This works with an agent running on a contributor's PC or in a remote development terminal. The client configuration selects SSH or explicit same-host transport; the agent does not need MCP or its own server installation.
 
 Use absolute paths accessible **from the agent's terminal**, which may differ from the user's desktop. Keep the populated prompt and client configuration private when they contain private project details. An existing project wrapper can replace the client prefix below if it forwards these commands and requires an explicit actor.

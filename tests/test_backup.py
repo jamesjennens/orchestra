@@ -75,6 +75,15 @@ class BackupTests(unittest.TestCase):
             with self.assertRaises(RuntimeError): admin.backup_project(self.root, 'source')
         self.assertEqual(json.loads(self.bundle.read_text())['status'], 'pending')
 
+    def test_onboarding_is_captured_in_backup_and_restored_as_text(self):
+        (self.source/'ONBOARDING.md').write_text('Private project instructions 漢',encoding='utf-8')
+        with patch.object(admin,'run_bd',return_value='synced'):
+            admin.backup_project(self.root,'source')
+        data=json.loads(self.bundle.read_text())
+        self.assertEqual(data['files']['ONBOARDING.md'],{'text':'Private project instructions 漢'})
+        admin.restore_coordination(self.root,'source','destination')
+        self.assertEqual((self.destination/'ONBOARDING.md').read_text(encoding='utf-8'),'Private project instructions 漢')
+
     def test_sidecar_completion_failure_leaves_pending_after_native_success(self):
         real_atomic = coordination.atomic
         def interrupted(path, data):
