@@ -41,6 +41,13 @@ class ClientTransportTests(unittest.TestCase):
         self.assertEqual(parameters['action'].default, 'bd')
         self.assertIsNone(parameters['path'].default)
 
+    def test_console_child_is_hidden_without_losing_captured_output(self):
+        with patch('client.subprocess.CREATE_NO_WINDOW', 0x08000000, create=True):
+            call = self.capture(SSH)
+        self.assertEqual(call.kwargs['creationflags'], 0x08000000)
+        self.assertTrue(call.kwargs['capture_output'])
+        self.assertFalse(call.kwargs['shell'])
+
     def test_ssh_command_is_unchanged_when_transport_is_absent(self):
         call = self.capture(SSH)
         self.assertEqual(call.args[0], ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',

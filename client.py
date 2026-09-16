@@ -89,7 +89,10 @@ def request(config,project,actor,args,action='bd',path=None):
     argv,label = _argv(config)
     wire = _wire(project,actor,args,action,path)
     try:
-        p = subprocess.run(argv,shell=False,input=wire,text=True,encoding='utf-8',capture_output=True,timeout=TIMEOUT)
+        # A captured console child can still flash a window when the client is
+        # launched by a GUI/agent on Windows. Preserve pipes and exit status.
+        p = subprocess.run(argv,shell=False,input=wire,text=True,encoding='utf-8',capture_output=True,timeout=TIMEOUT,
+                           creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
     except subprocess.TimeoutExpired:
         raise RuntimeError(f'{label} timed out; outcome may be uncertain. Inspect state; do not blindly retry mutations.') from None
     if p.returncode:raise RuntimeError(f'{label} failed ({p.returncode}); outcome may be uncertain. {p.stderr[:1000]}')
