@@ -18,6 +18,7 @@ We are now using the harness to develop the harness. Start with the [draft BRD](
 - Contributors and agents: [working agreement](docs/WORKFLOW.md).
 - Starting a new worker: [copy-paste prompt](templates/WORKER_PROMPT.md), with project placeholders and PowerShell/POSIX commands.
 - Starting from an empty directory: [server onboarding](docs/ONBOARDING.md). One SSH command returns shared rules and the private project entry point; no existing project checkout is required.
+- Practical isolation, preflight, contribution delivery and the review queue: [worker guide](docs/WORKER_GUIDE.md), also served as `docs worker-guide`.
 - Project owners: copy [project entry point](templates/READ_ME_FIRST.md) into your repository and fill in its placeholders. Reference it from both the repository README and AGENTS.md (and other agent instruction files you use).
 - Job authors: [job](templates/JOB.md), [task](templates/TASK.md), [report](templates/REPORT.md), [annotation](templates/ANNOTATION.md).
 - Decision authors: [decision template](templates/DECISION.md).

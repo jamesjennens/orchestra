@@ -27,6 +27,8 @@ Distinct entries that share a timestamp are all kept. To resume without losing t
 
 ## Before writing code
 
+Complete the [independent-worker preflight](WORKER_GUIDE.md) before claiming implementation: coordination/repository access, fresh source, writable workspace, your own environment and required imports in the actual execution context. Record the base revision and check overlapping ownership again before claiming.
+
 1. Read the job, its open tasks and dependencies, and relevant recent comments.
 2. Compare declared files, interfaces, migrations and test/shared resources with currently claimed work. File lists are advisory; disjoint files can still change the same contract.
 3. Create a bounded child task if one does not exist. Record intent, plan, impact and acceptance before starting. Use templates/TASK.md as its description.
@@ -68,6 +70,8 @@ When a task changes status or a decision changes:
 This is one required workflow with separate writes, not an atomic multi-record transaction. An interruption can leave a partial update. The next worker should reconcile the latest comments, issue state and repository evidence, then refresh. Journals contain explicit comments; they are not an automatically complete audit of every field change.
 
 ## Review and acceptance
+
+Follow [contribution delivery and the review-ready queue](WORKER_GUIDE.md). A handoff requires a retrievable remote branch/exact commit or an explicitly transferred Git bundle. Contribution-branch push permission is distinct from merge/deploy permission. Delivered implementations awaiting review use `review-ready`; coordinators query `list --label review-ready --limit 0 --json`. This label does not establish any lifecycle fact.
 
 Link the exact repository, branch, commit SHA and PR URL in the report. Put the job/task references, resulting behavior, impact, tests and remaining risks in the PR. Push useful checkpoints to the permitted remote so another contributor can retrieve them; local commits alone are not a transferable handoff. PR creation through the forge's browser is fine; GitHub CLI and MCP are not required.
 

@@ -3,6 +3,10 @@ Kind: checkpoint | completion | handoff | acceptance
 Intent and result:
 Changed files/interfaces:
 Repository / branch / exact commit / PR:
+Starting base commit and last fetch:
+Environment / dependency source / preflight execution context and results:
+Retrievable delivery (remote branch tip verified, or bundle location/checksum/recipient):
+Contribution push authorization (separate from merge/deploy authority):
 Verification performed and results:
 Implemented (status, source commit, evidence):
 Tested (status, tested commit, command/results):
@@ -14,4 +18,5 @@ Use unknown or not-applicable explicitly; do not infer these facts from task clo
 Uncommitted work location, if any:
 Open questions / blockers / risks:
 Next action and owner:
+Review queue (review-ready label, or reason delivery/review readiness is pending):
 Task status and parent job current-summary updates needed:

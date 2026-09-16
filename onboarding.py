@@ -4,6 +4,7 @@ from pathlib import Path
 DOCUMENTS = {
     'start': 'docs/WORKER_START.md',
     'workflow': 'docs/WORKFLOW.md',
+    'worker-guide': 'docs/WORKER_GUIDE.md',
     'briefings': 'docs/BRIEFINGS.md',
     'operations': 'docs/OPERATIONAL_WORKFLOW.md',
     'checkpoint-template': 'templates/CHECKPOINT.json',
