@@ -154,11 +154,16 @@ def backup_lock(root,name):
 def validate_coordination_files(files):
     if not isinstance(files,dict):raise ValueError('Invalid coordination files map')
     for name,record in files.items():
-        if name not in ('.merge-context.json','ONBOARDING.md','.sessions.json') and not re.fullmatch(r'\.coordination-requests/[a-f0-9]{64}\.json',name):raise ValueError('Invalid coordination backup path')
+        if name not in ('.merge-context.json','ONBOARDING.md','.sessions.json') and not re.fullmatch(r'(?:\.coordination-requests|\.handoffs)/[a-f0-9]{64}\.json',name):raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
         if name=='.sessions.json':
             from sessions import validate
             validate(record)
+        if name.startswith('.handoffs/'):
+            from handoff import validate_receipt
+            from requirements import content_hash
+            validate_receipt(record)
+            if name!='.handoffs/'+content_hash({'operation_id':record['identity']['payload']['operation_id']})+'.json':raise ValueError('Handoff receipt path mismatch')
         if name=='ONBOARDING.md' and (set(record)!={'text'} or not isinstance(record['text'],str) or not record['text'].strip() or len(record['text'].encode('utf-8'))>8000):raise ValueError('Invalid onboarding backup')
 
 def backup_project(root,name):
@@ -179,6 +184,11 @@ def backup_project(root,name):
         registry=path/'.sessions.json'
         if registry.is_symlink():raise ValueError('Session registry must not be a symlink')
         if registry.exists():files[registry.name]=json.loads(registry.read_text(encoding='utf-8'))
+        handoffs=path/'.handoffs'
+        if handoffs.is_symlink():raise ValueError('Handoff journal must not be a symlink')
+        for record in handoffs.glob('*.json'):
+            if record.is_symlink():raise ValueError('Handoff receipt must not be a symlink')
+            files['.handoffs/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
         if (path/'ONBOARDING.md').exists() or (path/'ONBOARDING.md').is_symlink():
             from onboarding import read_document, PROJECT_LIMIT
             files['ONBOARDING.md']={'text':read_document(path,'ONBOARDING.md',PROJECT_LIMIT)}
@@ -222,6 +232,7 @@ def main():
     a=sub.add_parser('install');a.add_argument('--port',type=int,default=13317);a.add_argument('--unit',default='beads-team.service')
     a=sub.add_parser('add-project');a.add_argument('project')
     a=sub.add_parser('set-onboarding');a.add_argument('project');a.add_argument('--file',required=True)
+    a=sub.add_parser('handoff');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     for command in ('backup','restore-new'):
         a=sub.add_parser(command);a.add_argument('project')
         if command=='restore-new':a.add_argument('destination')
@@ -239,6 +250,15 @@ def main():
             write_project(path/'ONBOARDING.md',Path(args.file).read_text(encoding='utf-8-sig'))
         print('Project onboarding installed; back up the project after changes.')
     elif args.command=='service':print(service(root,args.action))
+    elif args.command=='handoff':
+        import fcntl
+        from handoff import execute as handoff
+        path=project_dir(root,args.project)
+        payload=json.loads(Path(args.file).read_text(encoding='utf-8-sig'))
+        def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            print(json.dumps(handoff(path,args.actor,payload,run,operator=True)))
     elif args.command=='backup':print(backup_project(root,args.project))
     elif args.command=='restore-new':
         validate_name(args.project);validate_name(args.destination)

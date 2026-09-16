@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "operation": "contribute",
+  "operation_id": "contribution-001",
+  "task": "example-task",
+  "previous": null,
+  "supersedes": null,
+  "repository": "REPOSITORY_URL",
+  "commit": "REPLACE_WITH_FULL_COMMIT",
+  "base_commit": "REPLACE_WITH_FULL_BASE_COMMIT",
+  "delivery": {"kind":"bundle","path":"HOST:/absolute/contribution.bundle","sha256":"REPLACE_WITH_BUNDLE_SHA256"},
+  "summary": "Delivered change and verification pointers."
+}

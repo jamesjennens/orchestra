@@ -31,10 +31,22 @@ def execute(root,request):
             return p.stdout
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            result=session_execute(path,name,args,export)
+            result=session_execute(path,name,args,export,actor=actor)
         return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''}
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}',actor):raise ValueError('Supply a short contributor/session actor')
     action=request.get('action','bd')
+    if action in ('handoff','review','work'):
+        from work import execute as work_execute
+        args=request.get('args',[])
+        if not isinstance(args,list) or any(not isinstance(x,str) or '\0' in x for x in args):raise ValueError('Expected argument list')
+        def run(argv):
+            p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*argv],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
+            if p.returncode:raise ValueError(p.stderr or p.stdout)
+            return p.stdout
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            result=work_execute(path,actor,action,args,request.get('attachments',{}),run)
+        return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False,indent=2)+'\n','stderr':''}
     if action in ('onboard','docs'):
         from onboarding import execute as onboard
         return {'returncode':0,'stdout':onboard(Path(__file__).resolve().parent,path,name,actor,action,request.get('args',[])),'stderr':''}

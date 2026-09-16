@@ -9,7 +9,7 @@ from coordination import atomic
 UUID = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
 
 def validate(data):
-    if not isinstance(data,dict) or set(data)!={'schema_version','records'} or type(data['schema_version']) is not int or data['schema_version']!=1 or not isinstance(data['records'],dict):
+    if not isinstance(data,dict) or set(data) not in ({'schema_version','records'},{'schema_version','records','resumes'}) or type(data['schema_version']) is not int or data['schema_version']!=1 or not isinstance(data['records'],dict):
         raise ValueError('Invalid session registry')
     actors=set()
     for key,r in data['records'].items():
@@ -22,6 +22,16 @@ def validate(data):
         moment=datetime.fromisoformat(r['created_at'].replace('Z','+00:00'))
         if moment.tzinfo is None:raise ValueError('Session timestamp needs timezone')
         actors.add(r['actor'])
+    resumes=data.get('resumes',{})
+    if not isinstance(resumes,dict):raise ValueError('Invalid session resume records')
+    for key,event in resumes.items():
+        if not isinstance(key,str) or not UUID.fullmatch(key) or not isinstance(event,dict) or set(event)!={'request_id','actor','timestamp'}:
+            raise ValueError('Invalid session resume record')
+        if event['request_id']!=key or not isinstance(event['actor'],str) or event['actor'] not in actors:
+            raise ValueError('Resume actor must have a session registration')
+        if not isinstance(event['timestamp'],str):raise ValueError('Invalid resume timestamp')
+        moment=datetime.fromisoformat(event['timestamp'].replace('Z','+00:00'))
+        if moment.tzinfo is None:raise ValueError('Resume timestamp needs timezone')
     return data
 
 def check_name(name):
@@ -41,12 +51,13 @@ def used_actors(value):
 class Parser(argparse.ArgumentParser):
     def error(self,message):raise ValueError(message)
 
-def execute(path, project, args, export):
+def execute(path, project, args, export, *, actor=None):
     """Caller holds .coordination.lock, including native writes and backup."""
     parser=Parser(add_help=False)
     sub=parser.add_subparsers(dest='operation',required=True)
     p=sub.add_parser('register',add_help=False);p.add_argument('--name',required=True);p.add_argument('--request-id',required=True)
     p=sub.add_parser('show',add_help=False);p.add_argument('actor')
+    p=sub.add_parser('resume',add_help=False);p.add_argument('--request-id',required=True)
     a=parser.parse_args(args)
     file=path/'.sessions.json'
     if file.is_symlink() or file.with_suffix('.tmp').is_symlink():raise ValueError('Session registry paths must not be symlinks')
@@ -55,6 +66,18 @@ def execute(path, project, args, export):
         found=[r for r in data['records'].values() if r['actor']==a.actor]
         if not found:raise ValueError('Actor not registered in this project; legacy actors have no registration record')
         return dict(project=project,session=found[0])
+    if a.operation=='resume':
+        if not UUID.fullmatch(a.request_id):raise ValueError('request-id must be a lowercase UUID')
+        found=[r for r in data['records'].values() if r['actor']==actor]
+        if not found:raise ValueError('Resume requires a registered actor in this project; legacy actors may use onboard, or request an explicit authorized handoff')
+        resumes=data.setdefault('resumes',{})
+        old=resumes.get(a.request_id)
+        if old:
+            if old['actor']!=actor:raise ValueError('Resume request-id already used by a different actor')
+            return dict(project=project,session=found[0],resume=old,reconciled=True)
+        event=dict(request_id=a.request_id,actor=actor,timestamp=datetime.now(timezone.utc).isoformat())
+        resumes[a.request_id]=event;validate(data);atomic(file,data)
+        return dict(project=project,session=found[0],resume=event,reconciled=False)
     check_name(a.name)
     if not UUID.fullmatch(a.request_id):raise ValueError('request-id must be a lowercase UUID')
     old=data['records'].get(a.request_id)

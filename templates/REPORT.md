@@ -19,4 +19,6 @@ Uncommitted work location, if any:
 Open questions / blockers / risks:
 Next action and owner:
 Review queue (review-ready label, or reason delivery/review readiness is pending):
+Structured contribution comment ID / superseded contribution ID:
+Review requests addressed (request comment/item IDs and response evidence):
 Task status and parent job current-summary updates needed:

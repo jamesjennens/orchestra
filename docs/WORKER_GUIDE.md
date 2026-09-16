@@ -32,6 +32,8 @@ A local commit alone is insufficient. Uncommitted files and local-only evidence 
 
 ## Make review-ready work discoverable
 
+For new structured contributions, prefer [resume and contribution reviews](REVIEWS.md), served as `docs reviews`: exact delivery revisions, persistent requests/responses and `work --mine`/`work --state awaiting-review`. Structured state overrides legacy labels and old checkpoints. Recurring workers resume the saved actor; replacement workers need an explicit authorized handoff. The label convention below remains for existing unstructured tasks.
+
 Use the `review-ready` label as a workflow convention, not a lifecycle fact. Once the scoped implementation and required checks are complete, deliverable access is established, and the report/checkpoint names the next reviewer action:
 
 ```sh

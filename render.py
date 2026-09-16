@@ -33,6 +33,15 @@ def render(rows,dest):
         for relation,target in re.findall(r'(?im)^(Supersedes|Contradicts|Supports|Comments-on):\s*([A-Za-z0-9_.-]+)\s*$',c.get('text','')):
             if target in entries:backlinks[target].append((relation.lower(),eid,date))
     current=['# Current project work\n\n',banner,'[Daily journal](journal/INDEX.md) | [All records](INDEX.md)\n\n']
+    from work import queue
+    review_queue=queue(rows,'',[])
+    review_items=[r for r in review_queue['items'] if r['review_state']!='none']
+    if review_items:
+        def review_cell(value):return str('unknown' if value is None or value=='' else value).replace('|','\\|').replace('\n',' ')[:160]
+        current.extend(['## Contribution and review queue\n\n','Review state is separate from task status and lifecycle evidence. Use `work` for the full current queue.\n\n','| Task | Owner | Task status | Review state | Pending feedback | Commit |\n','| --- | --- | --- | --- | --- | --- |\n'])
+        for item in review_items:current.append('| '+ ' | '.join(review_cell(item[k]) for k in ('task','owner','status','review_state','pending_review_items','commit'))+' |\n')
+        if review_queue['next_offset'] is not None:current.append('More work: use `work --offset '+str(review_queue['next_offset'])+'`.\n')
+        current.append('\n')
     facts=[r for r in project_facts(rows) if r['has_lifecycle']]
     if facts:
         def cell(value):return str(value or 'unknown').replace('|','\\|').replace('\n',' ')

@@ -116,13 +116,25 @@ def brief(rows,project,task,offset=0,limit=5):
     items=p['open_items'] if p else []
     if offset>len(items):raise ValueError('Unresolved-item offset exceeds total')
     deps=[d for d in (issue.get('dependencies') or []) if d.get('type')!='parent-child']
+    from work import workflow
+    review=workflow(issue)
+    matches_contribution=None if not review.get('contribution') else (facts['scope'] or {}).get('source_commit','').lower()==review['contribution']['commit'].lower()
+    if matches_contribution and review['review_state']=='awaiting-integration' and facts['facts']['integrated']['value']=='passed':
+        review=dict(review,review_state='integrated')
+    pending=review.get('pending_requests',[])
+    review_next={'changes-requested':'Address the outstanding review requests for the current contribution; read review '+task+'.',
+                 'awaiting-review':'Reviewer: retrieve and verify the current contribution, then record review feedback or approval.',
+                 'awaiting-integration':'Authorized integrator: integrate the approved contribution and record scoped integration evidence.',
+                 'integrated':'Integration is recorded for this contribution; follow the project release/deployment workflow and scoped lifecycle evidence.'}
     return {'task':task,'title':clip(issue.get('title'),200),'owner':clip(issue.get('assignee') or 'unassigned',96),'status':issue.get('status'),
             'activity_cursor':activity_cursor(data),'checkpoint':None if p is None else {'comment_id':str(c['id']),'author':clip(c.get('author'),96),'timestamp':c.get('created_at'),'source_commit':p['source_commit'],'branch':p['branch'],'incorporated_activity_cursor':p['activity_cursor'],
                 'newer_activity':p['activity_cursor']!=activity_cursor(snapshot(rows,project,task,str(c['id'])))},
             'intent':clip(p['intent'] if p else issue.get('description'),600),'acceptance':clip(p['acceptance'] if p else issue.get('acceptance_criteria'),1000),
-            'current_position':p['summary'] if p else 'Unknown: no structured checkpoint; legacy prose has not been reconciled.',
-            'next_action':p['next_action'] if p else 'Read relevant history, then register a checkpoint carrying unresolved items.',
-            'unresolved':{'coverage':'explicit checkpoint items only; legacy prose is not classified','total':len(items) if p else None,'items':items[offset:offset+limit],'next_offset':offset+limit if offset+limit<len(items) else None},
+            'current_position':p['summary'] if p else 'No checkpoint yet; current position and unresolved items have not been summarized.',
+            'next_action':review_next.get(review['review_state'],p['next_action'] if p else 'Read the task description, acceptance criteria and any history, then publish a checkpoint.'),
+            'unresolved':{'coverage':'explicit checkpoint items only; unsummarized prose is not classified','total':len(items) if p else None,'items':items[offset:offset+limit],'next_offset':offset+limit if offset+limit<len(items) else None},
+            'review':dict(review,pending_requests=pending[:5],pending_total=len(pending),more='review '+task if len(pending)>5 else None),
+            'lifecycle_matches_contribution':matches_contribution,
             'dependencies':{'total':len(deps),'items':[{k:clip(d.get(k),160) for k in ('depends_on_id','type')} for d in deps[:8]],'omitted':max(0,len(deps)-8)},
             'lifecycle':{dim:dict(value=f['value'],event_id=f['event_id']) for dim,f in facts['facts'].items()},
             'lifecycle_scope':{k:clip(v,160) for k,v in (facts['scope'] or {}).items()},
@@ -194,12 +206,13 @@ def parse_args(action,args):
 def format_brief(result):
     def excerpt(value):return value['text']+(f' [excerpt; {value["omitted_chars"]} characters omitted — use show/history]' if value['omitted_chars'] else '')
     lines=[f'{result["task"]}: {excerpt(result["title"])}',f'Owner: {excerpt(result["owner"])} | Status: {result["status"]}',
+           'Review/contribution: '+json.dumps(result['review'],ensure_ascii=False),
            'Intent: '+excerpt(result['intent']),'Acceptance: '+excerpt(result['acceptance']),
            'Current position: '+result['current_position'],'Next: '+result['next_action']]
     cp=result['checkpoint']
     if cp:lines += [f'Checkpoint: {cp["comment_id"]} by {excerpt(cp["author"])} at {cp["timestamp"]}',f'Branch: {cp["branch"] or "unknown"} | Source commit: {cp["source_commit"] or "unknown"}',
                     'Newer/changed activity: '+str(cp['newer_activity']), 'Incorporated activity cursor: '+cp['incorporated_activity_cursor']]
-    else:lines += ['Checkpoint: absent; unresolved legacy items are UNKNOWN, not zero.']
+    else:lines += ['No checkpoint yet; unresolved items are UNKNOWN, not zero.']
     unresolved=result['unresolved'];lines += [f'Unresolved items: {unresolved["total"] if unresolved["total"] is not None else "unknown"}']
     lines += [f'- {item["id"]} [{item["kind"]}]: {item["text"]} (source: {item["source"]})' for item in unresolved['items']]
     if unresolved['next_offset'] is not None:lines += [f'More unresolved items: brief {result["task"]} --items-offset {unresolved["next_offset"]}']

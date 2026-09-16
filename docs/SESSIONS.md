@@ -32,6 +32,8 @@ The bootstrap also accepts `start --name cline --request-id SAVED_REQUEST_UUID`.
 
 ## Limits and recovery
 
+Explicit recurring-run resume is now available: `worker.py ... --actor SAVED_ACTOR resume` records a durable timestamped resume event, returns onboarding and shows owned work with revision requests first. `client.py ... --actor SAVED_ACTOR -- session resume` records the event alone. Both accept a retry `--request-id`; the client generates/prints one if omitted. Ownership and actor stay unchanged. See [resume, authorized handoff and reviews](REVIEWS.md) for replacement workers and requested corrections. Legacy actors continue through onboard/work under their original actor; registered resume does not silently register or rename them.
+
 This is attribution and accidental-collision prevention, not authentication, an access role, a lease, or a detector of two processes deliberately sharing one ID. Existing explicitly named actors continue working; they do not acquire registry records automatically. A trusted participant can still reuse another actor string. Never use registration to take over existing claims.
 
 Registration is project-scoped. UUIDs make accidental cross-project collisions extremely unlikely, but there is no global identity service. `.sessions.json` is operator-owned runtime state, included in the existing coordination backup sidecar; do not edit or delete it to free names. Restore with this kit version or newer. As with other coordination data, never operate a restored copy as a second live authority. Shared backups do not include a worker's local saved actor/request ID; keep those in the private session handoff.

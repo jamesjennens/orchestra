@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "operation_id": "handoff-001",
+  "task": "example-task",
+  "from_actor": "OLD_ACTOR",
+  "to_actor": "NEW_ACTOR",
+  "reason": "Continue the recorded contribution in response to review.",
+  "approval": "Pointer to agreed handoff or explicit owner authorization."
+}
