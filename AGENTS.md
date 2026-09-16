@@ -12,4 +12,6 @@ Read docs/OPERATIONAL_WORKFLOW.md for lifecycle evidence, safe child creation, m
 
 Run unit tests for changes to transport or rendering. Integration tests mutate data and restart a server; use a separate disposable deployment. Never point them at a live team's configuration. Preserve version pins unless an upgrade is explicitly being validated.
 
+Use docs/BRIEFINGS.md for compact task reads and structured checkpoints. Preserve unresolved items until explicit resolution; do not infer lifecycle completion from a checkpoint or task closure.
+
 This repository supplies templates for participating projects. Their agents follow docs/WORKFLOW.md plus that project's completed READ_ME_FIRST.md.

@@ -1,5 +1,7 @@
 # Operational workflow
 
+For compact per-task reads, use [briefings and checkpoints](BRIEFINGS.md): `brief`, `checkpoint` and snapshot-paginated `history`. These preserve provenance and unresolved items independently of lifecycle facts.
+
 These examples use synthetic project `example`, task `example-task` and actor `alex/session1`. Substitute existing project/task IDs, real evidence and your own explicit actor. Run Python commands from the kit directory; keep configuration, payloads, exports and cursors outside committed source. The server must run a kit version supporting the `lifecycle` and `coordinate` actions.
 
 ## Connect and refresh

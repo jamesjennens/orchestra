@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "task": "example-task",
+  "previous": null,
+  "activity_cursor": "COPY_CURRENT_ACTIVITY_CURSOR_FROM_BRIEF",
+  "source_commit": "",
+  "branch": "",
+  "intent": "Describe the intended outcome.",
+  "acceptance": "Describe the acceptance criteria.",
+  "summary": "Describe the current verified position.",
+  "next_action": "Describe the next action and who should take it.",
+  "open_items": [],
+  "resolved": []
+}
