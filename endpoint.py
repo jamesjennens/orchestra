@@ -20,6 +20,19 @@ def execute(root,request):
     name=request['project'];path=project_dir(root,name)
     if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
     actor=request.get('actor','')
+    if request.get('action')=='session':
+        from sessions import execute as session_execute
+        args=request.get('args',[])
+        if not isinstance(args,list) or any(not isinstance(a,str) or '\0' in a for a in args):raise ValueError('Expected argument list')
+        if args[:1]!=['register'] and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}',actor):raise ValueError('Supply a session actor')
+        def export():
+            p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','export','--all'],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
+            if p.returncode:raise ValueError(p.stderr or p.stdout)
+            return p.stdout
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            result=session_execute(path,name,args,export)
+        return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''}
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}',actor):raise ValueError('Supply a short contributor/session actor')
     action=request.get('action','bd')
     if action in ('onboard','docs'):

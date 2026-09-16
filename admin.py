@@ -154,8 +154,11 @@ def backup_lock(root,name):
 def validate_coordination_files(files):
     if not isinstance(files,dict):raise ValueError('Invalid coordination files map')
     for name,record in files.items():
-        if name not in ('.merge-context.json','ONBOARDING.md') and not re.fullmatch(r'\.coordination-requests/[a-f0-9]{64}\.json',name):raise ValueError('Invalid coordination backup path')
+        if name not in ('.merge-context.json','ONBOARDING.md','.sessions.json') and not re.fullmatch(r'\.coordination-requests/[a-f0-9]{64}\.json',name):raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
+        if name=='.sessions.json':
+            from sessions import validate
+            validate(record)
         if name=='ONBOARDING.md' and (set(record)!={'text'} or not isinstance(record['text'],str) or not record['text'].strip() or len(record['text'].encode('utf-8'))>8000):raise ValueError('Invalid onboarding backup')
 
 def backup_project(root,name):
@@ -173,6 +176,9 @@ def backup_project(root,name):
             files['.coordination-requests/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
         context=path/'.merge-context.json'
         if context.exists():files[context.name]=json.loads(context.read_text(encoding='utf-8'))
+        registry=path/'.sessions.json'
+        if registry.is_symlink():raise ValueError('Session registry must not be a symlink')
+        if registry.exists():files[registry.name]=json.loads(registry.read_text(encoding='utf-8'))
         if (path/'ONBOARDING.md').exists() or (path/'ONBOARDING.md').is_symlink():
             from onboarding import read_document, PROJECT_LIMIT
             files['ONBOARDING.md']={'text':read_document(path,'ONBOARDING.md',PROJECT_LIMIT)}

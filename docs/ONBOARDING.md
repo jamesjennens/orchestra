@@ -3,10 +3,10 @@
 Start a worker in an empty directory. It needs SSH access to the configured service account, not access to another contributor's checkout. Give it the installation's bootstrap command (replace paths, host, project and actor):
 
 ```sh
-ssh beads-team python3 /home/beads/orchestra/worker.py --root /home/beads/beads-runtime --project example --actor alex/session1 onboard
+ssh beads-team python3 /home/beads/orchestra/worker.py --root /home/beads/beads-runtime --project example start --name cline
 ```
 
-`worker.py` only exposes `onboard` and `docs [NAME]`, prints readable text and propagates failure. It uses the installed endpoint locally. It cannot claim work or write records. Normal contributions use `client.py` and their configured project endpoint, including any project-specific guard. SSH access and actor names retain the existing trusted-team security model.
+`worker.py start` allocates a durable actor and prints it with onboarding instructions. Save the actor for subsequent commands and resumption; the readable name need not be unique. See [session registration and retries](SESSIONS.md). `onboard` and `docs [NAME]` remain read-only for existing actors. Bootstrap uses the installed endpoint locally and cannot claim tasks or write task records. Normal contributions use `client.py` and their configured project endpoint, including any project-specific guard. SSH access retains the existing trusted-team security model.
 
 With a configured client, the equivalent is:
 
@@ -34,8 +34,8 @@ The project entry point should explicitly supersede obsolete checkout-local coor
 ## Minimal prompt
 
 ```text
-Work from your own directory. Run the following command with a unique
-session actor and follow the returned project onboarding instructions:
+Work from your own directory. Run the following start command with a
+readable name; save the allocated actor and follow the returned instructions:
 
 REPLACE_WITH_SSH_BOOTSTRAP_COMMAND
 

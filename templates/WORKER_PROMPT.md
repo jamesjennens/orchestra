@@ -1,6 +1,6 @@
 # New worker prompt
 
-Prefer [server-owned onboarding](../docs/ONBOARDING.md) when configured: start from an empty directory and run the installation's `worker.py ... onboard` SSH command, or `client.py ... -- onboard` with an existing client. The server returns current shared rules and project-specific setup. The longer prompt below is a reference for installations without that entry point.
+Prefer [server-owned onboarding](../docs/ONBOARDING.md): run `worker.py ... start --name NAME` from an empty directory. It allocates an actor and returns shared rules/project setup. With an installed client, use `session register --name NAME` without --actor, then `--actor RETURNED_ACTOR -- onboard`. Save the actor for resumption. See [session registration](../docs/SESSIONS.md); readable names need not be unique. The longer prompt below is a reference; fill its actor placeholder with the registered ID where supported.
 
 Fill in the project details below, then paste the **Worker instructions** section into your agent's session. This works with an agent running on a contributor's PC or in a remote development terminal. The client configuration selects SSH or explicit same-host transport; the agent does not need MCP or its own server installation.
 

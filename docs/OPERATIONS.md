@@ -59,6 +59,8 @@ It refuses a populated destination, restores status and comments, and retains or
 
 ### Coordination journals and interrupted recovery
 
+Session registrations in `.sessions.json` are included in the coordination sidecar, alongside the private project onboarding entry point. Restore with a kit version supporting these records. Preserve original actor IDs for resumed workers; do not create a second live authority from a restored registry.
+
 `add-project` initializes and performs an initial backup. `backup` captures both the native backup directory and `backups/PROJECT.coordination.json`. The sidecar preserves pending child-request reservations and merge context outside Dolt. Keep this pair together. A pending marker is written before synchronization and becomes complete only after native sync succeeds; restore refuses an incomplete sidecar. Backup and restore serialize access to the pair, and backup excludes contributor writes through the endpoint. Direct operator/native writes bypass these locks and must be paused for backup.
 
 Copy a completed, quiescent backup pair off-machine using your normal encrypted backup system. Do not copy it during the next sync. This is not an atomic transaction across arbitrary filesystem copies; take a filesystem snapshot or hold the project's `backups/PROJECT.lock` while copying. Legacy backups without a sidecar warn that outstanding requests/merge context require reconciliation.

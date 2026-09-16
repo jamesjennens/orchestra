@@ -84,6 +84,14 @@ class BackupTests(unittest.TestCase):
         admin.restore_coordination(self.root,'source','destination')
         self.assertEqual((self.destination/'ONBOARDING.md').read_text(encoding='utf-8'),'Private project instructions 漢')
 
+    def test_session_registry_is_in_native_backup_sidecar(self):
+        registry={'schema_version':1,'records':{}}
+        (self.source/'.sessions.json').write_text(json.dumps(registry))
+        with patch.object(admin,'run_bd',return_value='synced'):admin.backup_project(self.root,'source')
+        self.assertEqual(json.loads(self.bundle.read_text())['files']['.sessions.json'],registry)
+        admin.restore_coordination(self.root,'source','destination')
+        self.assertEqual(json.loads((self.destination/'.sessions.json').read_text()),registry)
+
     def test_sidecar_completion_failure_leaves_pending_after_native_success(self):
         real_atomic = coordination.atomic
         def interrupted(path, data):

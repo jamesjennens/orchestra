@@ -76,7 +76,15 @@ def _attachments(args):
 def _wire(project,actor,args,action,path):
     # Same actor rule as the endpoint, enforced here too: a rejected actor must not
     # reach the transport layer, and never reaches the server as a shell word.
-    if not isinstance(actor,str) or not ACTOR.fullmatch(actor):
+    registering=action=='session' and args[:1]==['register']
+    if registering:
+        if not any(a=='--request-id' or a.startswith('--request-id=') for a in args):
+            import uuid
+            request_id=str(uuid.uuid4())
+            print('Registration request-id (reuse after an uncertain response): '+request_id,file=sys.stderr,flush=True)
+            args=[*args,'--request-id',request_id]
+        actor=actor or ''
+    if not registering and (not isinstance(actor,str) or not ACTOR.fullmatch(actor)):
         raise ValueError('Supply a short contributor/session actor')
     converted,attachments = _attachments(args)
     payload = {'project':project,'actor':actor,'action':action,'args':converted,'attachments':attachments}
@@ -100,14 +108,14 @@ def request(config,project,actor,args,action='bd',path=None):
     except json.JSONDecodeError:raise RuntimeError('Invalid endpoint response; inspect state before retrying.') from None
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--config',required=True);p.add_argument('--project',required=True);p.add_argument('--actor',required=True)
+    p=argparse.ArgumentParser();p.add_argument('--config',required=True);p.add_argument('--project',required=True);p.add_argument('--actor')
     p.add_argument('args',nargs=argparse.REMAINDER);a=p.parse_args()
     args=a.args[1:] if a.args[:1]==['--'] else a.args
     action='bd';path=None
     if args[:1]==['refresh']:action='refresh';args=[]
     elif args[:1]==['view']:
         action='view';path=args[1] if len(args)>1 else 'CURRENT.md';args=[]
-    elif args[:1] in (['brief'],['history'],['checkpoint'],['onboard'],['docs']):action=args.pop(0)
+    elif args[:1] in (['brief'],['history'],['checkpoint'],['onboard'],['docs'],['session']):action=args.pop(0)
     result=request(json.loads(Path(a.config).read_text()),a.project,a.actor,args,action,path)
     sys.stdout.write(result['stdout']);sys.stderr.write(result['stderr']);return result['returncode']
 
