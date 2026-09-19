@@ -31,9 +31,11 @@ def rows():
 
 def checkpoint(data, **changes):
     current, _ = b.checkpoints(data[0])
+    snap = b.snapshot(data, PROJECT, TASK)
     result = dict(schema_version=1, task=TASK,
                   previous=str(current[1]['id']) if current else None,
-                  activity_cursor=b.activity_cursor(b.snapshot(data, PROJECT, TASK)),
+                  activity_cursor=b.activity_cursor(snap),
+                  incorporated_digests=dict(snap['entry_digests']),
                   source_commit='abc123', branch='work/feature', intent='Deliver the feature',
                   acceptance='Pass the agreed checks', summary='Implementation is underway',
                   next_action='Run the focused tests', open_items=[], resolved=[])
@@ -176,10 +178,14 @@ class NewerActivityTests(unittest.TestCase):
         self.assertIsNotNone(newer)
         self.assertEqual(newer['other_count'], 3)
         self.assertEqual(newer['own_count'], 1)
-        self.assertEqual([a['text'] for a in newer['other_authors']], ['coordinator/session'])
+        self.assertEqual([a['text'] for a in newer['other_authors']['items']], ['coordinator/session'])
+        self.assertEqual(newer['other_authors']['omitted'], 0)
+        self.assertEqual(newer['coverage'], 'snapshot')
         surfaced = {e['entry_id'] for e in newer['entries']}
         self.assertTrue({f'{TASK}-cdir{n}' for n in range(3)} <= surfaced)
         self.assertEqual(newer['history'], 'history ' + TASK)
+        self.assertIn('--since 2026-09-15T12:00:00Z', newer['history_new'])
+        self.assertTrue(all(e['author']['text'] for e in newer['entries']))
         self.assertIn('STALE CHECKPOINT', result['next_action'])
         self.assertIn('No work outstanding; wait quietly', result['next_action'])
         self.assertNotEqual(result['next_action'], 'No work outstanding; wait quietly')
@@ -198,7 +204,7 @@ class NewerActivityTests(unittest.TestCase):
                                            lambda _: self.fail('duplicate write')),
                          dict(comment_id='cp1', reconciled=True))
 
-    def test_summary_is_bounded_and_includes_late_arriving_edited_activity(self):
+    def test_bounded_output_still_identifies_every_unincorporated_entry(self):
         data = self.directed_rows(3)
         for n in range(9):
             data[0]['comments'].append(comment(f'extra{n}', f'More direction {n}',
@@ -208,28 +214,46 @@ class NewerActivityTests(unittest.TestCase):
         data[0]['comments'][0]['text'] = 'Edited original finding'
         result = b.brief(data, PROJECT, TASK)
         newer = result['newer']
-        # The backdated note and the edited comment do not change the identity
-        # set; the activity cursor (hash over content) is what detects the edit.
-        self.assertEqual(newer['other_count'], 12)
-        # The edited own comment predates the checkpoint timestamp, so the
-        # bounded summary lists only the later own note; the cursor detects it.
-        self.assertEqual(newer['own_count'], 1)
+        # Per-entry digests identify the late backdated note AND the edited
+        # comment exactly, even though both predate/retain old timestamps.
+        self.assertEqual(newer['other_count'], 13)
+        self.assertEqual(newer['own_count'], 2)
+        self.assertEqual(newer['fresh_count'], 14)
+        self.assertEqual(newer['changed_or_late_count'], 1)
         self.assertEqual(len(newer['entries']), b.NEWER_MAX)
-        self.assertEqual(newer['omitted'], 13 - b.NEWER_MAX)
-    def test_late_or_edited_activity_still_raises_the_flag_with_a_read_path(self):
-        data = self.directed_rows(1)
-        data[0]['comments'].append(comment('late', 'Late backdated note', '2026-09-14T00:00:00Z',
-                                           author='coordinator/session'))
+        self.assertEqual(newer['omitted'], 15 - b.NEWER_MAX)
+        # Fresh entries fill the bounded excerpt first; the edited pre-checkpoint
+        # comment is still counted exactly via its changed content digest.
+        changed = [e for e in newer['entries'] if e['changed']]
+        self.assertEqual(changed, [])
+        # Direct summary with few fresh entries surfaces the changed one with its flag.
+        small = self.directed_rows(1)
+        small[0]['comments'][0]['text'] = 'Edited original finding'
+        newer_small = b.brief(small, PROJECT, TASK)['newer']
+        flagged = [e['entry_id'] for e in newer_small['entries'] if e['changed']]
+        self.assertEqual(flagged, [f'{TASK}-cfirst'])
+        self.assertEqual(newer_small['changed_or_late_count'], 1)
+
+    def test_legacy_checkpoint_without_digests_reports_unknown_coverage(self):
+        data = rows()
+        legacy = dict(schema_version=1, task=TASK, previous=None,
+                      activity_cursor=b.activity_cursor(b.snapshot(data, PROJECT, TASK)),
+                      source_commit='abc123', branch='work/feature', intent='Deliver the feature',
+                      acceptance='Pass the agreed checks', summary='Implementation is underway',
+                      next_action='Run the focused tests', open_items=[], resolved=[])
+        data[0]['comments'].append(comment('cp1', b.PREFIX + canonical_bytes(legacy).decode(),
+                                           '2026-09-15T12:00:00Z'))
+        data[0]['comments'].append(comment('dir0', 'Coordinator direction 0',
+                                           '2026-09-16T00:00:00Z', author='coordinator/session'))
+        # Sanity: the stored cursor covered only the original comment, so dir0 diverges.
+        self.assertNotEqual(legacy['activity_cursor'],
+                            b.activity_cursor(b.snapshot(data, PROJECT, TASK, 'cp1')))
         result = b.brief(data, PROJECT, TASK)
         newer = result['newer']
-        self.assertTrue(result['checkpoint']['newer_activity'])
         self.assertIsNotNone(newer)
-        # The backdated entry predates the checkpoint timestamp, so it cannot be
-        # separated from incorporated history by time; the counts stay honest and
-        # the note plus history path carry the obligation to reconcile fully.
-        self.assertEqual(newer['other_count'], 1)
-        self.assertEqual(newer['history'], 'history ' + TASK)
-        self.assertIn('late/edited', newer['note'])
+        self.assertEqual(newer['coverage'], 'unknown')
+        self.assertIn('UNKNOWN', result['next_action'])
+        self.assertIn('UNKNOWN', newer['note'])
 
     def test_no_checkpoint_and_current_checkpoint_have_no_newer_summary(self):
         self.assertIsNone(b.brief(rows(), PROJECT, TASK)['newer'])
@@ -241,6 +265,10 @@ class NewerActivityTests(unittest.TestCase):
         text = b.format_brief(b.brief(self.directed_rows(), PROJECT, TASK))
         self.assertIn('coordinator/session', text)
         self.assertIn('history ' + TASK, text)
+        # An unchanged checkpoint must NOT print the no-checkpoint line.
+        quiet = b.format_brief(b.brief(data, PROJECT, TASK))
+        self.assertIn('Checkpoint: cp1', quiet)
+        self.assertNotIn('No checkpoint yet', quiet)
 
     def test_newer_summary_tracks_the_current_checkpoint_of_a_chain(self):
         data = rows()

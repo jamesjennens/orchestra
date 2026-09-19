@@ -13,22 +13,20 @@ def workflow(issue):
         result=dict(result,review_state='legacy-review-ready')
     return result
 
-def checkpoint_newer_counts(row):
-    """Newer-activity counts for the work queue: own entries vs other actors' entries
-    that the task's current checkpoint did not incorporate. None without a checkpoint
-    or with a malformed/conflicting checkpoint history (brief remains the authority).
-    """
+def checkpoint_newer_counts(rows,row):
+    """Newer-activity counts for the work queue: own vs other actors' entries that
+    the task's current checkpoint did not incorporate. Uses the same full-row
+    snapshot as brief, so linked event rows are covered identically. None without
+    a checkpoint or with malformed/conflicting checkpoint history (brief remains
+    the authority); coverage flags whether counts are proven or unknown."""
     try:
-        from briefing import checkpoints,newer_activity_summary,snapshot,untoken
-        from requirements import content_hash
+        from briefing import checkpoints,newer_activity_summary,snapshot,activity_cursor
         (p,c),_invalid=checkpoints(row)
         if p is None:return None
-        cursor=untoken(p['activity_cursor'])
-        if not isinstance(cursor,dict) or cursor.get('kind')!='activity' or cursor.get('task')!=row['id']:return None
-        excluded=snapshot([row],cursor['project'],row['id'],str(c['id']))
-        if content_hash(excluded)==cursor['sha256']:return {'own':0,'others':0}
-        newer=newer_activity_summary(excluded,str(c['id']),c.get('created_at'),row.get('assignee'))
-        return {'own':newer['own_count'],'others':newer['other_count']}
+        excluded=snapshot(rows,'work-queue',row['id'],str(c['id']))
+        if p['activity_cursor']==activity_cursor(excluded):return {'own':0,'others':0,'coverage':'current'}
+        newer=newer_activity_summary(excluded,p.get('incorporated_digests'),c.get('created_at'),row.get('assignee'))
+        return {'own':newer['own_count'],'others':newer['other_count'],'coverage':newer['coverage']}
     except (ValueError,TypeError,KeyError):return None
 
 def queue(rows,actor,args):
@@ -53,10 +51,11 @@ def queue(rows,actor,args):
         if a.state and a.state!=state:continue
         contribution=review.get('contribution') or {}
         scope=facts.get(row['id'],{}).get('scope') or {}
-        newer_counts=checkpoint_newer_counts(row)
+        newer_counts=checkpoint_newer_counts(rows,row)
         items.append({'task':row['id'],'title':str(row.get('title',''))[:200],'owner':row.get('assignee'),'status':row.get('status'),'review_state':state,
                       'contribution_id':contribution.get('comment_id'),'commit':contribution.get('commit'),'pending_review_items':len(review.get('pending_requests',[])),
                       'newer_activity_by_others':None if newer_counts is None else newer_counts['others'],'newer_activity_own':None if newer_counts is None else newer_counts['own'],
+                      'newer_activity_coverage':None if newer_counts is None else newer_counts['coverage'],
                       'lifecycle':{k:v['value'] for k,v in fact.items()},'lifecycle_scope':scope,
                       'lifecycle_matches_contribution':None if not contribution else scope.get('source_commit','').lower()==contribution['commit'].lower(),'error':error})
     priority={'changes-requested':0,'error':1,'awaiting-review':2,'legacy-review-ready':2,'awaiting-integration':3}

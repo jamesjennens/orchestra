@@ -42,21 +42,37 @@ def snapshot(rows,project,task,exclude=None):
     if len({e['entry_id'] for e in entries})!=len(entries):raise ValueError('Duplicate history entry IDs')
     state={k:issue.get(k) for k in ('title','description','acceptance_criteria','design','notes','status','assignee','labels','dependencies')}
     for key in ('labels','dependencies'):state[key]=sorted(state[key] or [],key=canonical_bytes)
-    return {'project':project,'task':task,'state_sha256':content_hash(state),'entries':entries}
+    # Per-entry provenance: content digests keyed by stable entry ID let a later
+    # checkpoint/snapshot distinguish edited entries and late backdated arrivals
+    # that a whole-snapshot hash or timestamp filter cannot separate.
+    digests={e['entry_id']:content_hash(e) for e in entries}
+    return {'project':project,'task':task,'state_sha256':content_hash(state),'entries':entries,'entry_digests':digests}
+
+def entry_digests(data):
+    """Digests for snapshots predating the embedded entry_digests field."""
+    found=data.get('entry_digests')
+    return found if isinstance(found,dict) else {e['entry_id']:content_hash(e) for e in data['entries']}
 
 def activity_cursor(data):return token({'v':1,'kind':'activity','project':data['project'],'task':data['task'],'sha256':content_hash(data)})
 
 def text(value,label,limit,empty=False):
     if not isinstance(value,str) or len(value)>limit or (not empty and not value.strip()):raise ValueError(f'{label}: expected text up to {limit} characters')
 
-def validate_checkpoint(p,task):
-    fields={'schema_version','task','previous','activity_cursor','source_commit','branch','intent','acceptance','summary','next_action','open_items','resolved'}
-    if not isinstance(p,dict) or set(p)!=fields or type(p['schema_version']) is not int or p['schema_version']!=1:raise ValueError('Invalid checkpoint fields/version')
+def validate_checkpoint(p,task,require_digests=True):
+    fields={'schema_version','task','previous','activity_cursor','source_commit','branch','intent','acceptance','summary','next_action','open_items','resolved','incorporated_digests'}
+    if not isinstance(p,dict) or type(p.get('schema_version')) is not int or p['schema_version']!=1:raise ValueError('Invalid checkpoint fields/version')
+    if not set(p)<=fields or not set(fields)-({'incorporated_digests'} if not require_digests else set())<=set(p):raise ValueError('Invalid checkpoint fields/version')
     if p['task']!=task:raise ValueError('Checkpoint task mismatch')
     if p['previous'] is not None:identity(p['previous'])
     for key,limit in [('source_commit',128),('branch',200),('intent',600),('acceptance',1000),('summary',1000),('next_action',600)]:text(p[key],key,limit,empty=key in ('source_commit','branch'))
     cursor=untoken(p['activity_cursor'])
     if not isinstance(cursor,dict) or cursor.get('kind')!='activity' or cursor.get('task')!=task:raise ValueError('Expected task activity cursor from brief/history')
+    # Legacy checkpoints predate per-entry digests; they stay readable with
+    # unknown coverage, but new writes must record exact incorporated digests.
+    if 'incorporated_digests' in p:
+        digests=p['incorporated_digests']
+        if not isinstance(digests,dict) or len(digests)>20000 or not all(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,200}',str(k)) and re.fullmatch(r'[a-f0-9]{64}',str(v)) for k,v in digests.items()):raise ValueError('Invalid incorporated_digests')
+    elif require_digests:raise ValueError('Checkpoint must record incorporated_digests')
     for field in ('open_items','resolved'):
         items=p[field]
         if not isinstance(items,list) or len(items)>100:raise ValueError('Checkpoint item lists limited to 100')
@@ -86,7 +102,7 @@ def checkpoints(issue):
         body=comment.get('text','')
         if not body.startswith(PREFIX):continue
         try:
-            p=json.loads(body[len(PREFIX):]);validate_checkpoint(p,issue['id'])
+            p=json.loads(body[len(PREFIX):]);validate_checkpoint(p,issue['id'],require_digests=False)
             cid=str(comment['id'])
             if cid in records:raise ValueError('Duplicate checkpoint comment')
             records[cid]=(p,comment)
@@ -109,31 +125,40 @@ def clip(value,limit):
 
 NEWER_MAX=5
 
-def newer_activity_summary(data,checkpoint_comment_id,checkpoint_timestamp,owner):
-    """Bounded view of activity not incorporated into the current checkpoint.
+def newer_activity_summary(data,incorporated_digests,checkpoint_timestamp,owner):
+    """Bounded, per-entry view of activity the current checkpoint did not incorporate.
 
-    Reuses the already-computed snapshot that excludes the checkpoint comment
-    itself, so it detects added, late-arriving and edited activity without an
-    extra export. Counts are split between the owner's own entries and other
-    actors' entries; entry references stay bounded and carry stable entry IDs
-    so the reader can page `history` for the full bodies. Reading changes
-    nothing: acknowledgement and completion remain separate, explicit acts.
+    `incorporated_digests` is the checkpoint's recorded entry_id -> content digest
+    map, so edited entries (same ID, new content) and late arrivals backdated
+    before the checkpoint (new ID, old timestamp) are identified exactly; a
+    timestamp filter alone could not. Counts distinguish fresh entries from
+    changed/late ones and split own vs other actors. Every collection is
+    bounded with an explicit omitted count. Reading changes nothing:
+    acknowledgement and completion remain separate, explicit acts; a new
+    checkpoint re-incorporates the entries visible when it is built.
     """
-    if checkpoint_timestamp is None:
-        newer_entries=data['entries']
-    else:
-        bound=parse_moment(checkpoint_timestamp,'checkpoint timestamp')
-        newer_entries=[e for e in data['entries'] if parse_moment(e['timestamp'])>=bound]
-    if checkpoint_comment_id is not None:
-        newer_entries=[e for e in newer_entries if e['entry_id']!=data['task']+'-c'+str(checkpoint_comment_id)]
-    own=[e for e in newer_entries if e['author']==owner]
-    others=[e for e in newer_entries if e['author']!=owner]
+    unknown_coverage=incorporated_digests is None
+    known=incorporated_digests or {}
+    fresh=[];changed_late=[]
+    for e in data['entries']:
+        digest=content_hash(e)
+        if e['entry_id'] not in known:fresh.append(e)
+        elif known[e['entry_id']]!=digest:changed_late.append(e)
+    entries=fresh+changed_late
+    own=[e for e in entries if e['author']==owner]
+    others=[e for e in entries if e['author']!=owner]
+    authors=sorted({e['author'] for e in others})
+    refs=[{'entry_id':e['entry_id'],'kind':e['kind'],'timestamp':e['timestamp'],'author':clip(e['author'],96),
+           'changed':any(c is e for c in changed_late)} for e in entries[:NEWER_MAX]]
+    history='history '+data['task']
     return {'own_count':len(own),'other_count':len(others),
-            'other_authors':[clip(a,96) for a in sorted({e['author'] for e in others})],
-            'entries':[{'entry_id':e['entry_id'],'kind':e['kind'],'timestamp':e['timestamp']} for e in newer_entries[:NEWER_MAX]],
-            'omitted':max(0,len(newer_entries)-NEWER_MAX),
-            'history':'history '+data['task'],
-            'note':'Newer or changed activity exists that the saved checkpoint did not incorporate. The checkpoint next_action below may be stale; the listed entries are the oldest unincorporated ones and counts cover the full set, including late/edited entries the excerpt omits. Page history for complete coverage. Reading clears nothing; acknowledging or completing a direction stays an explicit act.'}
+            'fresh_count':len(fresh),'changed_or_late_count':len(changed_late),
+            'coverage':'unknown' if unknown_coverage else 'snapshot',
+            'other_authors':{'items':[clip(a,96) for a in authors[:NEWER_MAX]],'omitted':max(0,len(authors)-NEWER_MAX)},
+            'entries':refs,'omitted':max(0,len(entries)-NEWER_MAX),
+            'history':history,
+            'history_new':'history '+data['task']+' --since '+utc_text(parse_moment(checkpoint_timestamp,'checkpoint timestamp')) if checkpoint_timestamp else history,
+            'note':'Activity exists that the saved checkpoint did not incorporate; its next_action below may be stale. Entry refs are the oldest unincorporated ones with per-entry authors; counts cover the full snapshot, including edited and late backdated entries the excerpt omits. Use the history paths (the --since path lists fresh activity; page full history for edited/backdated entries). Reading clears nothing: acknowledging a direction, reconciling it into a new checkpoint and completing it stay separate explicit acts.'+(' Coverage is UNKNOWN: this checkpoint predates per-entry digests, so reconcile with history before trusting the counts.' if unknown_coverage else '')}
 
 def brief(rows,project,task,offset=0,limit=5):
     if type(offset) is not int or offset<0 or type(limit) is not int or not 1<=limit<=10:raise ValueError('Invalid unresolved-item page')
@@ -158,10 +183,12 @@ def brief(rows,project,task,offset=0,limit=5):
     if p is not None:
         excluded=snapshot(rows,project,task,str(c['id']))
         if p['activity_cursor']!=activity_cursor(excluded):
-            newer=newer_activity_summary(excluded,str(c['id']),c.get('created_at'),issue.get('assignee'))
+            newer=newer_activity_summary(excluded,p.get('incorporated_digests'),c.get('created_at'),issue.get('assignee'))
             if review['review_state'] not in review_next:
                 next_action=('STALE CHECKPOINT: activity the checkpoint did not incorporate exists ('+str(newer['other_count'])
-                             +' by other actors, '+str(newer['own_count'])+' own). Read newer activity first: '+newer['history']
+                             +' by other actors, '+str(newer['own_count'])+' own'
+                             +('' if newer['coverage']!='unknown' else ', coverage UNKNOWN — reconcile with history before trusting counts')
+                             +'). Read newer activity first: '+newer['history']
                              +'. The recorded checkpoint next action was: '+p['next_action'])
     return {'task':task,'title':clip(issue.get('title'),200),'owner':clip(issue.get('assignee') or 'unassigned',96),'status':issue.get('status'),
             'activity_cursor':activity_cursor(data),'checkpoint':None if p is None else {'comment_id':str(c['id']),'author':clip(c.get('author'),96),'timestamp':c.get('created_at'),'source_commit':p['source_commit'],'branch':p['branch'],'incorporated_activity_cursor':p['activity_cursor'],
@@ -250,13 +277,16 @@ def format_brief(result):
     cp=result['checkpoint']
     if cp:lines += [f'Checkpoint: {cp["comment_id"]} by {excerpt(cp["author"])} at {cp["timestamp"]}',f'Branch: {cp["branch"] or "unknown"} | Source commit: {cp["source_commit"] or "unknown"}',
                     'Newer/changed activity: '+str(cp['newer_activity']), 'Incorporated activity cursor: '+cp['incorporated_activity_cursor']]
+    else:lines += ['No checkpoint yet; unresolved items are UNKNOWN, not zero.']
     newer=result['newer']
     if newer:
-        lines += [f'Newer activity not in checkpoint: {newer["other_count"]} by other actors ({", ".join(a["text"] for a in newer["other_authors"]) or "none"}), {newer["own_count"]} own.']
-        lines += ['  '+e['entry_id']+' ['+e['kind']+'] '+e['timestamp'] for e in newer['entries']]
-        if newer['omitted']:lines += [f'  ... {newer["omitted"]} more; page: '+newer['history']]
-        lines += ['Read newer activity: '+newer['history'], newer['note']]
-    else:lines += ['No checkpoint yet; unresolved items are UNKNOWN, not zero.']
+        authors=', '.join(a['text'] for a in newer['other_authors']['items']) or 'none'
+        if newer['other_authors']['omitted']:authors+=f' (+{newer["other_authors"]["omitted"]} more)'
+        coverage='' if newer['coverage']!='unknown' else ' Coverage UNKNOWN (checkpoint predates per-entry digests).'
+        lines += [f'Newer activity not in checkpoint: {newer["other_count"]} by other actors ({authors}), {newer["own_count"]} own; {newer["fresh_count"]} fresh, {newer["changed_or_late_count"]} changed/late.'+coverage]
+        lines += ['  '+e['entry_id']+' ['+e['kind']+(' changed' if e['changed'] else '')+'] '+e['timestamp']+' by '+e['author']['text'] for e in newer['entries']]
+        if newer['omitted']:lines += [f'  ... {newer["omitted"]} more; fresh activity: '+newer['history_new']+'; full: '+newer['history']]
+        lines += ['Read newer activity: '+newer['history_new'], newer['note']]
     unresolved=result['unresolved'];lines += [f'Unresolved items: {unresolved["total"] if unresolved["total"] is not None else "unknown"}']
     lines += [f'- {item["id"]} [{item["kind"]}]: {item["text"]} (source: {item["source"]})' for item in unresolved['items']]
     if unresolved['next_offset'] is not None:lines += [f'More unresolved items: brief {result["task"]} --items-offset {unresolved["next_offset"]}']
