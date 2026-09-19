@@ -15,6 +15,22 @@ import subprocess
 import sys
 from pathlib import Path
 
+try:
+    from version import line, report
+except ModuleNotFoundError as exc:
+    if exc.name != "version":
+        raise
+    CLIENT_VERSION = "0.1.0"
+
+    def report(root=None, component="client"):
+        return {"component": component, "version": CLIENT_VERSION,
+                "source_commit": "unknown", "path": str(root or Path(__file__).resolve().parent)}
+
+    def line(metadata):
+        return "Orchestra %s: version %s, source %s" % (
+            metadata["component"], metadata["version"], metadata["source_commit"],
+        )
+
 ACTOR = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}')
 HOST = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@-]*')
 SERVER_PATH = re.compile(r'/[A-Za-z0-9_./-]+')
@@ -109,8 +125,14 @@ def request(config,project,actor,args,action='bd',path=None):
     except json.JSONDecodeError:raise RuntimeError('Invalid endpoint response; inspect state before retrying.') from None
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--config',required=True);p.add_argument('--project',required=True);p.add_argument('--actor')
+    p=argparse.ArgumentParser();p.add_argument('--version',action='store_true')
+    p.add_argument('--config');p.add_argument('--project');p.add_argument('--actor')
     p.add_argument('args',nargs=argparse.REMAINDER);a=p.parse_args()
+    if a.version:
+        print(line(report(Path(__file__).resolve().parent, "client")))
+        return 0
+    if not a.config or not a.project:
+        p.error('the following arguments are required: --config, --project')
     args=a.args[1:] if a.args[:1]==['--'] else a.args
     action='bd';path=None
     if args[:1]==['refresh']:action='refresh';args=[]
@@ -118,7 +140,16 @@ def main():
         action='view';path=args[1] if len(args)>1 else 'CURRENT.md';args=[]
     elif args[:1] in (['brief'],['history'],['checkpoint'],['onboard'],['docs'],['session'],['handoff'],['review'],['work']):action=args.pop(0)
     result=request(json.loads(Path(a.config).read_text()),a.project,a.actor,args,action,path)
-    sys.stdout.write(result['stdout']);sys.stderr.write(result['stderr']);return result['returncode']
+    output = result['stdout']
+    if (action == 'onboard' or
+            (action == 'session' and args[:1] == ['resume'])) and result['returncode'] == 0:
+        client = report(Path(__file__).resolve().parent, "client")
+        output += line(client) + '\n'
+        kit_versions = re.findall(r'Orchestra kit: version ([^,]+), source ([^\r\n]+)', output)
+        if kit_versions and kit_versions[-1][0] != client['version']:
+            output += ('Orchestra version mismatch: client=%s, kit=%s\n'
+                       % (client['version'], kit_versions[-1][0]))
+    sys.stdout.write(output);sys.stderr.write(result['stderr']);return result['returncode']
 
 if __name__=='__main__':
     # Keep redirected document/template output UTF-8 on Windows as well as POSIX.

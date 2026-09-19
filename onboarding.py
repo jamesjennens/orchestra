@@ -1,5 +1,6 @@
 """Read-only, fixed-catalog onboarding from the installed kit and project."""
 from pathlib import Path
+from version import line, report
 
 DOCUMENTS = {
     'start': 'docs/WORKER_START.md',
@@ -66,6 +67,8 @@ def execute(kit, project_path, project, actor, action, args):
     # Read both before constructing output: never return a plausible but incomplete start.
     entry = read_document(project_path, 'ONBOARDING.md', PROJECT_LIMIT)
     start = read_document(kit, DOCUMENTS['start'], 8000)
-    return (f'# Orchestra onboarding\n\nProject: {project}\nSession actor: {actor}\n\n'
+    metadata = report(kit)
+    return (f'# Orchestra onboarding\n\nProject: {project}\nSession actor: {actor}\n'
+            f'{line(metadata)}\n\n'
             + start+'\n\n# Project entry point\n\n'+entry
             +'\n\n# Supporting documents\n\n'+catalog+'\n')

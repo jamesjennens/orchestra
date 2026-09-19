@@ -19,7 +19,8 @@ class OnboardingTests(unittest.TestCase):
     def call(self,action,args):return o.execute(self.kit,self.project,'example','worker-1',action,args)
     def test_onboard_contains_project_shared_identity_and_catalog(self):
         result=self.call('onboard',[])
-        for value in ['Shared rules','Private project instructions','example','worker-1','docs briefings']:self.assertIn(value,result)
+        for value in ['Shared rules','Private project instructions','example','worker-1',
+                      'docs briefings','Orchestra kit: version 0.1.0']:self.assertIn(value,result)
     def test_missing_project_fails_instead_of_incomplete_instructions(self):
         (self.project/'ONBOARDING.md').unlink()
         with self.assertRaisesRegex(ValueError,'missing'):self.call('onboard',[])

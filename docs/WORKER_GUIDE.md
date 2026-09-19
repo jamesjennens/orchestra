@@ -15,6 +15,12 @@ Read the prospective task first, then verify:
 
 Environment provisioning may occur before the implementation claim in your isolated directory. It does not authorize application edits, deployment or taking another claim. If provisioning itself needs substantial shared changes, coordinate a separate setup task first.
 
+On PowerShell, pass an intentionally empty assignee as `--assignee=` rather than
+`--assignee ""`; the latter can be consumed as a missing value before it reaches
+the client. Onboarding and resume output reports the installed kit/client version
+and source revision, and warns when the client and kit versions differ. The report
+uses the packaged `VERSION` file, so it remains available outside a Git checkout.
+
 Record interpreter path/version, source base, dependency source/lock revision and exact commands/results. Without a lockfile, a fresh package install is not proof of reproducibility; record resolved versions and raise any missing reproducibility requirement rather than inventing a lock or changing project policy.
 
 If a check fails, report the command, working directory, interpreter, execution context, exit status and relevant error, excluding secrets. Distinguish permission/path/sandbox denial, missing package, incompatible runtime and application failure. Host imports succeeding while sandbox imports fail indicates an execution-boundary difference to investigate; it is not evidence that the packages are broken. Do not repeatedly reinstall packages or switch to another worker's environment to conceal the problem. Use an approved accessible interpreter/environment or request the required access change. Never bypass the execution boundary.

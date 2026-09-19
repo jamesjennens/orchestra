@@ -1,4 +1,5 @@
 import inspect
+import io
 import json
 import os
 import shutil
@@ -13,6 +14,7 @@ from unittest.mock import patch
 KIT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(KIT))
 from client import request
+import client
 
 SSH = {'host': 'sample', 'endpoint': '/srv/kit/endpoint.py', 'root': '/srv/state'}
 LOCAL = {'transport': 'local', 'endpoint': '/srv/kit/endpoint.py', 'root': '/srv/state',
@@ -40,6 +42,39 @@ class ClientTransportTests(unittest.TestCase):
         self.assertEqual(list(parameters), ['config', 'project', 'actor', 'args', 'action', 'path'])
         self.assertEqual(parameters['action'].default, 'bd')
         self.assertIsNone(parameters['path'].default)
+
+    def test_version_command_works_without_client_config(self):
+        with patch.object(sys, 'argv', ['client.py', '--version']):
+            with patch('builtins.print') as output:
+                self.assertEqual(client.main(), 0)
+        self.assertIn('Orchestra client: version 0.1.0', output.call_args.args[0])
+
+    def test_copied_standalone_client_has_version_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            copied = Path(directory) / 'client.py'
+            copied.write_text((Path(client.__file__).read_text(encoding='utf-8')),
+                              encoding='utf-8')
+            result = subprocess.run([sys.executable, str(copied), '--version'],
+                                    capture_output=True, text=True, encoding='utf-8')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Orchestra client: version 0.1.0, source unknown', result.stdout)
+
+    def test_onboard_output_includes_client_metadata_and_detects_mismatch(self):
+        response = {'returncode': 0, 'stdout': 'Orchestra kit: version 0.0.9, source unknown\n',
+                    'stderr': ''}
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'config.json'
+            config.write_text('{}', encoding='utf-8')
+            with patch.object(sys, 'argv', ['client.py', '--config', str(config),
+                                            '--project', 'example', '--actor', 'worker-1',
+                                            '--', 'onboard']), patch.object(client, 'request',
+                                            return_value=response):
+                output = io.StringIO()
+                with patch.object(sys, 'stdout', output):
+                    self.assertEqual(client.main(), 0)
+        rendered = output.getvalue()
+        self.assertIn('Orchestra client: version 0.1.0', rendered)
+        self.assertIn('Orchestra version mismatch: client=0.1.0, kit=0.0.9', rendered)
 
     def test_console_child_is_hidden_without_losing_captured_output(self):
         with patch('client.subprocess.CREATE_NO_WINDOW', 0x08000000, create=True):
