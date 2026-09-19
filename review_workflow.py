@@ -112,6 +112,24 @@ def records(issue):
     return ordered
 
 
+def describe_contribution_mismatch(op, supplied, current, latest):
+    """Actionable refusal for a review operation that names the wrong revision.
+
+    A caller confusing a task's `latest_comment_id` with the contribution
+    record's `comment_id` must be told which id is which; the older
+    "must reference current contribution revision" text did not distinguish
+    "no contribution exists yet" from "this id is the latest comment" from
+    "this id belongs to an older revision".
+    """
+    expected = (f'the current contribution id is {current}' if current
+                else 'no current contribution has been recorded yet')
+    # `latest` is the newest record in the chain, and may itself be the operation
+    # being validated, so only trust it when it is a distinct earlier record.
+    if supplied and latest and latest == supplied and latest != current:
+        return (f'Review operation {op} supplied {supplied}, which is the task latest comment id; '
+                f'reference the current contribution instead ({expected}).')
+    return f'Review operation {op} supplied {supplied}, but {expected}.'
+
 def projection(ordered):
     contribution = None; pending = {}; approved = False; latest = None
     for p, c in ordered:
@@ -124,7 +142,7 @@ def projection(ordered):
             contribution = dict(p, **metadata); approved = False
         else:
             if not current or p['contribution'] != current:
-                raise ValueError('Review operation must reference current contribution revision')
+                raise ValueError(describe_contribution_mismatch(op, p['contribution'], current, latest))
             if op == 'request-changes':
                 for item in p['items']:
                     pending[(cid, item['id'])] = dict(request=cid, item=item['id'], text=item['text'],

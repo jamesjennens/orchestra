@@ -106,6 +106,21 @@ After publishing a corrected contribution, its assigned owner explicitly respond
 
 Responses are owner assertions, not reviewer acceptance. When all requests have explicit responses, the contribution returns to `awaiting-review`. A reviewer may accept using an `approve` operation with the same common fields plus `contribution` and a `summary`. Approval requires no unresolved requests and refers to the current contribution. It projects `awaiting-integration`; it does not set reviewed/integrated/deployed lifecycle facts. A new contribution requires review again. Review participation remains subject to project policy; actor names are attribution, not verified authority.
 
+## Target the contribution record, not the latest comment
+
+`contribution` in a `request-changes`, `respond` or `approve` operation names the **contribution record's `comment_id`** — the id reported as `review.contribution.comment_id` and shown as the contribution's commit in `review TASK` and `work --mine`. It is **not** `review.latest_comment_id`, which is the newest record in the chain and advances with every reviewer request, response and approval. The two coincide only while the contribution is also the most recent record.
+
+Supplying the wrong id is refused before any native write, and the refusal names the operation, the id you supplied and the id you should have used:
+
+```text
+Review operation approve supplied 2, which is the task latest comment id;
+reference the current contribution instead (the current contribution id is 1).
+Review operation approve supplied not-a-real-id, but the current contribution id is 1.
+Review operation approve supplied unknown, but no current contribution has been recorded yet.
+```
+
+Read the current ids from `review TASK`. A refusal changes nothing: the review state, the pending items and the comment chain stay exactly as they were, so correct the payload and resubmit with a new operation ID. An **exact** repeat of an already-recorded operation — same operation ID, same canonical payload, same actor — still reconciles to the original comment without writing a second record, including after a later handoff or later reviews.
+
 ## Discover current work
 
 ```sh
