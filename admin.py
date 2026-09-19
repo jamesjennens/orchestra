@@ -11,6 +11,7 @@ import socket
 import subprocess
 import time
 from pathlib import Path
+from requirements import content_hash
 from contextlib import contextmanager
 from bootstrap import install as install_binaries
 
@@ -154,16 +155,22 @@ def backup_lock(root,name):
 def validate_coordination_files(files):
     if not isinstance(files,dict):raise ValueError('Invalid coordination files map')
     for name,record in files.items():
-        if name not in ('.merge-context.json','ONBOARDING.md','.sessions.json') and not re.fullmatch(r'(?:\.coordination-requests|\.handoffs)/[a-f0-9]{64}\.json',name):raise ValueError('Invalid coordination backup path')
+        if name not in ('.merge-context.json','ONBOARDING.md','.sessions.json') and not re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests)/[a-f0-9]{64}\.json',name):raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
         if name=='.sessions.json':
             from sessions import validate
             validate(record)
         if name.startswith('.handoffs/'):
             from handoff import validate_receipt
-            from requirements import content_hash
             validate_receipt(record)
             if name!='.handoffs/'+content_hash({'operation_id':record['identity']['payload']['operation_id']})+'.json':raise ValueError('Handoff receipt path mismatch')
+        if name.startswith('.handoff-requests/'):
+            from handoff import validate_request
+            validate_request({'schema_version':record.get('schema_version'),'operation':'request',
+                              'request_id':record.get('request_id'),'task':record.get('task'),
+                              'from_actor':record.get('from_actor'),'to_actor':record.get('to_actor'),
+                              'reason':record.get('reason')})
+            if name!='.handoff-requests/'+content_hash({'request_id':record['request_id']})+'.json':raise ValueError('Handoff request path mismatch')
         if name=='ONBOARDING.md' and (set(record)!={'text'} or not isinstance(record['text'],str) or not record['text'].strip() or len(record['text'].encode('utf-8'))>8000):raise ValueError('Invalid onboarding backup')
 
 def backup_project(root,name):
@@ -189,6 +196,11 @@ def backup_project(root,name):
         for record in handoffs.glob('*.json'):
             if record.is_symlink():raise ValueError('Handoff receipt must not be a symlink')
             files['.handoffs/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
+        requests=path/'.handoff-requests'
+        if requests.is_symlink():raise ValueError('Handoff request journal must not be a symlink')
+        for record in requests.glob('*.json'):
+            if record.is_symlink():raise ValueError('Handoff request must not be a symlink')
+            files['.handoff-requests/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
         if (path/'ONBOARDING.md').exists() or (path/'ONBOARDING.md').is_symlink():
             from onboarding import read_document, PROJECT_LIMIT
             files['ONBOARDING.md']={'text':read_document(path,'ONBOARDING.md',PROJECT_LIMIT)}

@@ -35,8 +35,21 @@ def queue(rows,actor,args):
         if a.state and a.state!=state:continue
         contribution=review.get('contribution') or {}
         scope=facts.get(row['id'],{}).get('scope') or {}
+        handoff_requests=[]
+        request_dir = getattr(queue, '_request_dir', None)
+        if request_dir and request_dir.is_dir():
+            for request_file in request_dir.glob('*.json'):
+                try:
+                    request=json.loads(request_file.read_text(encoding='utf-8'))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if request.get('task')==row['id'] and request.get('status')=='pending':
+                    handoff_requests.append({'request_id':request.get('request_id'),'from_actor':request.get('from_actor'),
+                                             'to_actor':request.get('to_actor'),'requester':request.get('requester'),
+                                             'reason':request.get('reason')})
         items.append({'task':row['id'],'title':str(row.get('title',''))[:200],'owner':row.get('assignee'),'status':row.get('status'),'review_state':state,
                       'contribution_id':contribution.get('comment_id'),'commit':contribution.get('commit'),'pending_review_items':len(review.get('pending_requests',[])),
+                      'pending_handoff_requests':handoff_requests,
                       'lifecycle':{k:v['value'] for k,v in fact.items()},'lifecycle_scope':scope,
                       'lifecycle_matches_contribution':None if not contribution else scope.get('source_commit','').lower()==contribution['commit'].lower(),'error':error})
     priority={'changes-requested':0,'error':1,'awaiting-review':2,'legacy-review-ready':2,'awaiting-integration':3}
@@ -46,6 +59,7 @@ def queue(rows,actor,args):
 
 def execute(path,actor,action,args,attachments,run):
     if action=='work':
+        queue._request_dir=path/'.handoff-requests'
         rows=[json.loads(line) for line in run(['export','--all']).splitlines() if line.strip()]
         return queue(rows,actor,args)
     if len(args) not in (1,2):raise ValueError('Use review TASK [--file payload.json] or handoff TASK --file payload.json')
@@ -61,6 +75,9 @@ def execute(path,actor,action,args,attachments,run):
     if not isinstance(payload,dict) or payload.get('task')!=task:raise ValueError('Payload task mismatch')
     if action=='handoff':
         from handoff import execute as handoff
+        if payload.get('operation')=='request':
+            from handoff import request as handoff_request
+            return handoff_request(path,actor,payload)
         return handoff(path,actor,payload,run)
     from review_workflow import execute as review
     rows=[json.loads(line) for line in run(['export','--all']).splitlines() if line.strip()]

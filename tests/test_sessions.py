@@ -79,6 +79,24 @@ class SessionTests(unittest.TestCase):
         payload=json.loads(client._wire('example',None,args,'session',None))
         self.assertEqual(payload['args'],args)
 
+    def test_run_events_are_attributed_and_retries_are_idempotent(self):
+        actor=self.register()['session']['actor']
+        run_id=str(uuid.uuid4());event_id=str(uuid.uuid4())
+        first=sessions.execute(self.path,'example',['run','start','--run-id',run_id,'--event-id',event_id,'--task','trial-task'],self.export,actor=actor)
+        retry=sessions.execute(self.path,'example',['run','start','--run-id',run_id,'--event-id',event_id,'--task','trial-task'],self.export,actor=actor)
+        self.assertFalse(first['reconciled']);self.assertTrue(retry['reconciled'])
+        self.assertEqual(retry['event']['actor'],actor)
+        with self.assertRaisesRegex(ValueError,'different content'):
+            sessions.execute(self.path,'example',['run','start','--run-id',run_id,'--event-id',event_id,'--task','other'],self.export,actor=actor)
+
+    def test_missing_heartbeat_does_not_transfer_run_owner(self):
+        actor=self.register()['session']['actor']
+        other=self.register()['session']['actor']
+        run_id=str(uuid.uuid4())
+        sessions.execute(self.path,'example',['run','start','--run-id',run_id,'--event-id',str(uuid.uuid4()),'--task','trial-task'],self.export,actor=actor)
+        with self.assertRaisesRegex(ValueError,'different actor'):
+            sessions.execute(self.path,'example',['run','heartbeat','--run-id',run_id,'--event-id',str(uuid.uuid4())],self.export,actor=other)
+
     def test_worker_start_uses_allocated_actor_for_onboarding(self):
         record={'actor':'session-'+str(uuid.uuid4()),'name':'worker','request_id':str(uuid.uuid4()),'created_at':'2026-09-16T00:00:00+00:00'}
         replies=[{'returncode':0,'stdout':json.dumps({'session':record}),'stderr':''},{'returncode':0,'stdout':'Instructions','stderr':''}]

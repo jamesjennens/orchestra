@@ -50,3 +50,12 @@ b list --label review-ready --limit 0 --json
 This label means ready for review, not reviewed, accepted, integrated or deployed. Record the six lifecycle facts independently. If changes are requested, evidence fails or the deliverable becomes inaccessible, append the reason, remove the label with `update TASK --remove-label review-ready --json`, and checkpoint the next action. Remove it after integration too. A separately scoped implementation task may close only under the project's agreement with a linked remaining review/integration task; label that open task so it stays discoverable.
 
 Report/label/checkpoint writes are separate operations. After interruption, inspect and reconcile partial updates; never infer a complete handoff merely from the label.
+
+For recurring or unattended work, record an explicit run with the same saved actor:
+`worker.py ... run start --run-id RUN_UUID --event-id EVENT_UUID --task TASK`,
+then use distinct heartbeat event IDs and finish with `run end --status
+succeeded|failed|cancelled`. Repeating an event ID is safe only when its payload is
+unchanged; a missing heartbeat never transfers ownership. A worker may also submit
+a durable handoff request through the structured handoff action. Requests are
+pending review records and do not mutate assignment or authorize the requester to
+approve its own takeover; inspect them separately from contribution review feedback.

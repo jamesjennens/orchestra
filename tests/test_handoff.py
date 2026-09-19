@@ -98,5 +98,16 @@ class HandoffTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             admin.validate_coordination_files({'.handoffs/'+'0'*64+'.json':record})
 
+    def test_handoff_request_is_durable_idempotent_and_cannot_self_approve(self):
+        request_payload={'schema_version':1,'operation':'request','request_id':'00000000-0000-0000-0000-000000000001',
+                         'task':'trial-task','from_actor':'alice','to_actor':'bob','reason':'Please review ownership'}
+        first=handoff.request(self.path,'bob',request_payload)
+        retry=handoff.request(self.path,'bob',request_payload)
+        self.assertFalse(first['reconciled']);self.assertTrue(retry['reconciled'])
+        with self.assertRaisesRegex(ValueError,'destination actor'):
+            handoff.request(self.path,'carol',request_payload)
+        record=json.loads(next((self.path/'.handoff-requests').glob('*.json')).read_text())
+        admin.validate_coordination_files({'.handoff-requests/'+next((self.path/'.handoff-requests').glob('*.json')).name:record})
+
 
 if __name__=='__main__':unittest.main()

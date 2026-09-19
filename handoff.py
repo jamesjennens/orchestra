@@ -1,11 +1,45 @@
 """Explicit owner/operator transfer, with a durable recoverable operation journal."""
 import json
 import re
+from datetime import datetime, timezone
 from coordination import atomic
 from requirements import canonical_bytes, content_hash
 
 ACTOR=re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}')
 ID=re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,160}')
+UUID=re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+
+def validate_request(p):
+    keys={'schema_version','operation','request_id','task','from_actor','to_actor','reason'}
+    if not isinstance(p,dict) or set(p)!=keys or p.get('schema_version')!=1 or p.get('operation')!='request':
+        raise ValueError('Invalid handoff request payload')
+    if not UUID.fullmatch(p['request_id']) or not ID.fullmatch(p['task']):
+        raise ValueError('Invalid handoff request identity')
+    for key in ('from_actor','to_actor'):
+        if not isinstance(p[key],str) or not ACTOR.fullmatch(p[key]):raise ValueError('Invalid '+key)
+    if p['from_actor']==p['to_actor']:raise ValueError('Requester must be distinct from current owner')
+    if not isinstance(p['reason'],str) or not p['reason'].strip() or len(p['reason'])>1000:
+        raise ValueError('Handoff request requires a bounded reason')
+
+def request(path, actor, p):
+    validate_request(p)
+    if actor!=p['to_actor']:raise ValueError('Only the requested destination actor may submit a handoff request')
+    folder=path/'.handoff-requests'
+    if folder.is_symlink():raise ValueError('Handoff request journal must not be a symlink')
+    folder.mkdir(exist_ok=True)
+    file=folder/(content_hash({'request_id':p['request_id']})+'.json')
+    if file.is_symlink():raise ValueError('Invalid handoff request path')
+    digest=content_hash(p)
+    record=json.loads(file.read_text(encoding='utf-8')) if file.exists() else None
+    if record:
+        if record.get('digest')!=digest or record.get('requester')!=actor:
+            raise ValueError('Handoff request ID reused with different content')
+        return dict(record,reconciled=True)
+    record={'schema_version':1,'request_id':p['request_id'],'task':p['task'],'from_actor':p['from_actor'],
+            'to_actor':p['to_actor'],'reason':p['reason'],'requester':actor,'status':'pending',
+            'created_at':datetime.now(timezone.utc).isoformat(),'digest':digest}
+    atomic(file,record)
+    return dict(record,reconciled=False)
 
 def validate(p):
     keys={'schema_version','operation_id','task','from_actor','to_actor','reason','approval'}
