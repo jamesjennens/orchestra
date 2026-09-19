@@ -7,6 +7,9 @@ from requirements import canonical_bytes, content_hash
 ACTOR=re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}')
 ID=re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,160}')
 
+INTENT_PREFIX = 'Kind: task-handoff-v1\n'
+COMPLETE_PREFIX = 'Kind: task-handoff-complete-v1\n'
+
 def validate(p):
     keys={'schema_version','operation_id','task','from_actor','to_actor','reason','approval'}
     if not isinstance(p,dict) or set(p)!=keys or type(p['schema_version']) is not int or p['schema_version']!=1:raise ValueError('Invalid handoff payload')
@@ -53,7 +56,7 @@ def execute(path, actor, p, run, operator=False):
         raise ValueError('Owner changed; reconcile before issuing a new authorized handoff')
     if record is None:
         record={'digest':digest,'status':'pending','identity':identity};atomic(file,record)
-    intent='Kind: task-handoff-v1\n'+canonical_bytes(identity).decode()
+    intent=INTENT_PREFIX+canonical_bytes(identity).decode()
     def comment(text):
         # Fetch comments directly: native show may not include them in every version.
         comments=json.loads(run(['comments',p['task'],'--json'])) or []
@@ -65,6 +68,6 @@ def execute(path, actor, p, run, operator=False):
         run(['update',p['task'],'--assignee',p['to_actor'],'--json'])
     elif current.get('assignee')!=p['to_actor']:raise ValueError('Owner changed during handoff')
     if issue().get('assignee')!=p['to_actor']:raise ValueError('Handoff outcome uncertain; retry same operation after inspection')
-    comment('Kind: task-handoff-complete-v1\n'+canonical_bytes(identity).decode())
+    comment(COMPLETE_PREFIX+canonical_bytes(identity).decode())
     record['status']='complete';atomic(file,record)
     return {'task':p['task'],'from_actor':p['from_actor'],'to_actor':p['to_actor'],'current_owner':p['to_actor'],'operation_id':p['operation_id'],'reconciled':False}
