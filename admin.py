@@ -155,7 +155,7 @@ def backup_lock(root,name):
 def validate_coordination_files(files):
     if not isinstance(files,dict):raise ValueError('Invalid coordination files map')
     for name,record in files.items():
-        if name not in ('.merge-context.json','ONBOARDING.md','.sessions.json') and not re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries)/[a-f0-9]{64}\.json',name):raise ValueError('Invalid coordination backup path')
+        if name not in ('.merge-context.json','ONBOARDING.md','.sessions.json','.feedback.jsonl') and not re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries)/[a-f0-9]{64}\.json',name):raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
         if name=='.sessions.json':
             from sessions import validate
@@ -174,6 +174,10 @@ def validate_coordination_files(files):
             validate_recovery(record)
             if name!='.handoff-recoveries/'+content_hash({'request_id':record['request_id']})+'.json':raise ValueError('Handoff recovery path mismatch')
         if name=='ONBOARDING.md' and (set(record)!={'text'} or not isinstance(record['text'],str) or not record['text'].strip() or len(record['text'].encode('utf-8'))>8000):raise ValueError('Invalid onboarding backup')
+        if name=='.feedback.jsonl':
+            from feedback import validate_feed_text
+            if set(record) != {'text'}:raise ValueError('Invalid feedback backup')
+            validate_feed_text(record['text'])
 
 def backup_project(root,name):
     import fcntl
@@ -211,6 +215,10 @@ def backup_project(root,name):
         if (path/'ONBOARDING.md').exists() or (path/'ONBOARDING.md').is_symlink():
             from onboarding import read_document, PROJECT_LIMIT
             files['ONBOARDING.md']={'text':read_document(path,'ONBOARDING.md',PROJECT_LIMIT)}
+        feedback=path/'.feedback.jsonl'
+        if feedback.exists() or feedback.is_symlink():
+            if feedback.is_symlink():raise ValueError('Feedback feed must not be a symlink')
+            files['.feedback.jsonl']={'text':feedback.read_text(encoding='utf-8')}
         validate_coordination_files(files)
         output=run_bd(root,name,['backup','sync'])
         atomic(bundle,{'schema_version':1,'status':'complete','files':files})
@@ -247,6 +255,10 @@ def restore_coordination(root,source,destination):
         if name=='ONBOARDING.md':
             from onboarding import write_project
             write_project(target,record['text'])
+        elif name=='.feedback.jsonl':
+            temporary=target.with_suffix('.tmp')
+            temporary.write_text(record['text'],encoding='utf-8',newline='\n')
+            os.replace(temporary,target)
         else:atomic(target,record)
 
 def main():

@@ -4,6 +4,35 @@ For compact per-task reads, use [briefings and checkpoints](BRIEFINGS.md): `brie
 
 These examples use synthetic project `example`, task `example-task` and actor `alex/session1`. Substitute existing project/task IDs, real evidence and your own explicit actor. Run Python commands from the kit directory; keep configuration, payloads, exports and cursors outside committed source. The server must run a kit version supporting the `lifecycle` and `coordinate` actions.
 
+## Private project feedback
+
+Feedback is a project-scoped append-only stream, separate from task claims and native
+issue comments. It is stored in the coordination runtime as `.feedback.jsonl`, is not
+included in generated Git views or source exports, and is retained by the native
+backup/restore pair. Use an explicit operation ID so an uncertain write can be
+reconciled safely:
+
+```json
+{
+  "operation_id": "alex/feedback-001",
+  "created_at": "2026-09-19T23:00:00+00:00",
+  "body": "Observed behavior and bounded recommendation.",
+  "source": {"task": "example-task", "version": "base-commit-or-release"},
+  "evidence": ["test://fixture/1"],
+  "triage": {"task": "example-task", "label": "review"},
+  "reminder": {"kind": "checkpoint", "text": "Mention during handoff"},
+  "supersedes": null
+}
+```
+
+Submit with `feedback add --file payload.json`; use `feedback correct --file
+payload.json` with `supersedes` set to the original entry ID for an additive
+correction. Retry the exact same payload after an uncertain response. Retrieve
+bounded pages with `feedback list --limit 20`, then pass the returned opaque
+`next_cursor` to `--cursor`; entries are never rewritten. `reminder.kind` may be
+`none`, `checkpoint` or `handoff` and is informational only; it never interrupts a
+worker.
+
 ## Connect and refresh
 
 SSH remains the default configuration:
