@@ -23,6 +23,7 @@ def _source_commit(root):
         result = subprocess.run(
             ["git", "-C", str(root), "rev-parse", "--verify", "HEAD"],
             capture_output=True, text=True, encoding="utf-8", timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, subprocess.TimeoutExpired):
         return "unknown"

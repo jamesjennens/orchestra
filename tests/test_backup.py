@@ -61,11 +61,11 @@ class BackupTests(unittest.TestCase):
             self.assertTrue(all(not h.closed for h in handles))
             self.assertEqual(name, 'source')
             self.assertEqual(args, ['backup', 'sync'])
-            self.assertEqual(json.loads(self.bundle.read_text())['status'], 'pending')
+            self.assertEqual(json.loads(self.bundle.read_text(encoding='utf-8'))['status'], 'pending')
             return 'native synced'
         with patch.object(admin, 'run_bd', side_effect=native):
             self.assertEqual(admin.backup_project(self.root, 'source'), 'native synced')
-        data = json.loads(self.bundle.read_text())
+        data = json.loads(self.bundle.read_text(encoding='utf-8'))
         self.assertEqual(data['status'], 'complete')
         self.assertEqual(data['files'], {self.request_name: self.receipt, '.merge-context.json': self.context})
 
@@ -73,13 +73,13 @@ class BackupTests(unittest.TestCase):
         self.save_bundle()
         with patch.object(admin, 'run_bd', side_effect=RuntimeError('sync failed')):
             with self.assertRaises(RuntimeError): admin.backup_project(self.root, 'source')
-        self.assertEqual(json.loads(self.bundle.read_text())['status'], 'pending')
+        self.assertEqual(json.loads(self.bundle.read_text(encoding='utf-8'))['status'], 'pending')
 
     def test_onboarding_is_captured_in_backup_and_restored_as_text(self):
         (self.source/'ONBOARDING.md').write_text('Private project instructions 漢',encoding='utf-8')
         with patch.object(admin,'run_bd',return_value='synced'):
             admin.backup_project(self.root,'source')
-        data=json.loads(self.bundle.read_text())
+        data=json.loads(self.bundle.read_text(encoding='utf-8'))
         self.assertEqual(data['files']['ONBOARDING.md'],{'text':'Private project instructions 漢'})
         admin.restore_coordination(self.root,'source','destination')
         self.assertEqual((self.destination/'ONBOARDING.md').read_text(encoding='utf-8'),'Private project instructions 漢')
@@ -88,7 +88,7 @@ class BackupTests(unittest.TestCase):
         registry={'schema_version':1,'records':{}}
         (self.source/'.sessions.json').write_text(json.dumps(registry))
         with patch.object(admin,'run_bd',return_value='synced'):admin.backup_project(self.root,'source')
-        self.assertEqual(json.loads(self.bundle.read_text())['files']['.sessions.json'],registry)
+        self.assertEqual(json.loads(self.bundle.read_text(encoding='utf-8'))['files']['.sessions.json'],registry)
         admin.restore_coordination(self.root,'source','destination')
         self.assertEqual(json.loads((self.destination/'.sessions.json').read_text()),registry)
 
@@ -101,7 +101,7 @@ class BackupTests(unittest.TestCase):
         with patch.object(admin, 'run_bd', return_value='synced') as native, patch.object(coordination, 'atomic', side_effect=interrupted):
             with self.assertRaises(OSError): admin.backup_project(self.root, 'source')
         native.assert_called_once()
-        self.assertEqual(json.loads(self.bundle.read_text())['status'], 'pending')
+        self.assertEqual(json.loads(self.bundle.read_text(encoding='utf-8'))['status'], 'pending')
 
     def test_corrupt_source_journal_prevents_native_sync(self):
         self.source_files()
@@ -109,7 +109,7 @@ class BackupTests(unittest.TestCase):
         with patch.object(admin, 'run_bd') as native:
             with self.assertRaises(ValueError): admin.backup_project(self.root, 'source')
         native.assert_not_called()
-        self.assertEqual(json.loads(self.bundle.read_text())['status'], 'pending')
+        self.assertEqual(json.loads(self.bundle.read_text(encoding='utf-8'))['status'], 'pending')
 
     def test_invalid_source_record_or_name_cannot_publish_complete_backup(self):
         journal = self.source / '.coordination-requests'
@@ -122,7 +122,7 @@ class BackupTests(unittest.TestCase):
                     with patch.object(admin, 'run_bd') as native:
                         with self.assertRaises(ValueError): admin.backup_project(self.root, 'source')
                     native.assert_not_called()
-                    self.assertEqual(json.loads(self.bundle.read_text())['status'], 'pending')
+                    self.assertEqual(json.loads(self.bundle.read_text(encoding='utf-8'))['status'], 'pending')
                 finally:
                     record.unlink()
 

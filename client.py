@@ -13,15 +13,22 @@ import re
 import shlex
 import subprocess
 import sys
+import importlib.util
 from pathlib import Path
 
+CLIENT_VERSION = "0.1.0"
 try:
-    from version import line, report
-except ModuleNotFoundError as exc:
-    if exc.name != "version":
-        raise
-    CLIENT_VERSION = "0.1.0"
-
+    _version_path = Path(__file__).resolve().with_name("version.py")
+    _version_text = _version_path.with_name("VERSION").read_text(encoding="utf-8").strip()
+    if _version_text != CLIENT_VERSION:
+        raise ImportError("unrelated version metadata")
+    _version_spec = importlib.util.spec_from_file_location("_orchestra_client_version", _version_path)
+    if _version_spec is None or _version_spec.loader is None:
+        raise ImportError("version module unavailable")
+    _version = importlib.util.module_from_spec(_version_spec)
+    _version_spec.loader.exec_module(_version)
+    line, report = _version.line, _version.report
+except (ImportError, OSError, AttributeError):
     def report(root=None, component="client"):
         return {"component": component, "version": CLIENT_VERSION,
                 "source_commit": "unknown", "path": str(root or Path(__file__).resolve().parent)}
@@ -141,14 +148,37 @@ def main():
     elif args[:1] in (['brief'],['history'],['checkpoint'],['onboard'],['docs'],['session'],['handoff'],['review'],['work']):action=args.pop(0)
     result=request(json.loads(Path(a.config).read_text()),a.project,a.actor,args,action,path)
     output = result['stdout']
-    if (action == 'onboard' or
-            (action == 'session' and args[:1] == ['resume'])) and result['returncode'] == 0:
+    if action == 'session' and args[:1] == ['resume'] and result['returncode'] == 0:
         client = report(Path(__file__).resolve().parent, "client")
-        output += line(client) + '\n'
+        try:
+            payload = json.loads(output)
+        except json.JSONDecodeError:
+            raise RuntimeError('Invalid resume response; inspect state before retrying.') from None
+        provenance = payload.get('provenance', {})
+        kit = provenance.get('kit') if isinstance(provenance, dict) else None
+        if not isinstance(kit, dict):
+            kit = {"component": "kit", "version": "unknown",
+                   "source_commit": "unknown", "path": "unknown"}
+        client_source = client.get("source_commit", "unknown")
+        kit_source = kit.get("source_commit", "unknown")
+        kit_version = kit.get("version", "unknown")
+        if kit_version == "unknown" or kit_source == "unknown":
+            parity = "unknown"
+        elif client["version"] != kit_version or (
+                client_source != "unknown" and client_source != kit_source):
+            parity = "mismatch"
+        elif client_source == kit_source:
+            parity = "match"
+        else:
+            parity = "unknown"
+        payload["provenance"] = {"client": client, "kit": kit, "parity": parity}
+        output = json.dumps(payload, ensure_ascii=False) + "\n"
+    elif action == 'onboard' and result['returncode'] == 0:
+        output += line(report(Path(__file__).resolve().parent, "client")) + '\n'
         kit_versions = re.findall(r'Orchestra kit: version ([^,]+), source ([^\r\n]+)', output)
-        if kit_versions and kit_versions[-1][0] != client['version']:
+        if kit_versions and kit_versions[-1][0] != report(Path(__file__).resolve().parent, "client")['version']:
             output += ('Orchestra version mismatch: client=%s, kit=%s\n'
-                       % (client['version'], kit_versions[-1][0]))
+                       % (report(Path(__file__).resolve().parent, "client")['version'], kit_versions[-1][0]))
     sys.stdout.write(output);sys.stderr.write(result['stderr']);return result['returncode']
 
 if __name__=='__main__':

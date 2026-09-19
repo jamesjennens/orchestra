@@ -59,6 +59,70 @@ class ClientTransportTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('Orchestra client: version 0.1.0, source unknown', result.stdout)
 
+    def test_standalone_client_ignores_adjacent_unrelated_version_module(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'client.py').write_text(Path(client.__file__).read_text(encoding='utf-8'), encoding='utf-8')
+            (root / 'version.py').write_text(
+                'def report(*args, **kwargs): return {"component": "wrong", "version": "9.9.9", "source_commit": "bad"}\n'
+                'def line(metadata): return "wrong"\n', encoding='utf-8')
+            result = subprocess.run([sys.executable, str(root / 'client.py'), '--version'],
+                                    capture_output=True, text=True, encoding='utf-8')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Orchestra client: version 0.1.0, source unknown', result.stdout)
+
+    def test_resume_cli_stdout_is_json_with_structured_unknown_provenance(self):
+        response = {'returncode': 0, 'stdout': json.dumps({'resume': {'request_id': 'r'}}), 'stderr': ''}
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'config.json'
+            config.write_text('{}', encoding='utf-8')
+            with patch.object(sys, 'argv', ['client.py', '--config', str(config),
+                                            '--project', 'example', '--actor', 'worker-1',
+                                            '--', 'session', 'resume']), \
+                    patch.object(client, 'request', return_value=response), \
+                    patch('sys.stdout', new_callable=io.StringIO) as output:
+                self.assertEqual(client.main(), 0)
+        rendered = json.loads(output.getvalue())
+        self.assertEqual(rendered['resume']['request_id'], 'r')
+        self.assertEqual(rendered['provenance']['parity'], 'unknown')
+        self.assertEqual(rendered['provenance']['kit']['source_commit'], 'unknown')
+
+    def test_resume_cli_reports_differing_revisions_without_corrupting_json(self):
+        response = {'returncode': 0, 'stdout': json.dumps({
+            'resume': {'request_id': 'r'},
+            'provenance': {'kit': {'component': 'kit', 'version': '0.1.0',
+                                   'source_commit': 'server-revision', 'path': '/srv/kit'}},
+        }), 'stderr': ''}
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'config.json'
+            config.write_text('{}', encoding='utf-8')
+            with patch.object(sys, 'argv', ['client.py', '--config', str(config),
+                                            '--project', 'example', '--actor', 'worker-1',
+                                            '--', 'session', 'resume']), \
+                    patch.object(client, 'request', return_value=response), \
+                    patch.object(client, 'report', return_value={
+                        'component': 'client', 'version': '0.1.0',
+                        'source_commit': 'client-revision', 'path': directory}), \
+                    patch('sys.stdout', new_callable=io.StringIO) as output:
+                self.assertEqual(client.main(), 0)
+        rendered = json.loads(output.getvalue())
+        self.assertEqual(rendered['provenance']['parity'], 'mismatch')
+
+    def test_failed_resume_preserves_diagnostics_and_does_not_add_stdout_metadata(self):
+        response = {'returncode': 7, 'stdout': '', 'stderr': 'resume failed\n'}
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'config.json'
+            config.write_text('{}', encoding='utf-8')
+            with patch.object(sys, 'argv', ['client.py', '--config', str(config),
+                                            '--project', 'example', '--actor', 'worker-1',
+                                            '--', 'session', 'resume']), \
+                    patch.object(client, 'request', return_value=response), \
+                    patch('sys.stdout', new_callable=io.StringIO) as output, \
+                    patch('sys.stderr', new_callable=io.StringIO) as error:
+                self.assertEqual(client.main(), 7)
+        self.assertEqual(output.getvalue(), '')
+        self.assertEqual(error.getvalue(), 'resume failed\n')
+
     def test_onboard_output_includes_client_metadata_and_detects_mismatch(self):
         response = {'returncode': 0, 'stdout': 'Orchestra kit: version 0.0.9, source unknown\n',
                     'stderr': ''}

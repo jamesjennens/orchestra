@@ -11,6 +11,7 @@ from pathlib import Path
 from admin import environment,project_dir,root_path
 from render import render
 from lifecycle import apply_native
+from version import report
 
 ALLOWED={'list','show','ready','search','count','create','update','close','reopen','comments','dep','state','lint'}
 FORBIDDEN={'--directory','-C','--db','--repo','--global','--actor','--author','--profile','--graph','--config','--metadata'}
@@ -32,6 +33,7 @@ def execute(root,request):
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             result=session_execute(path,name,args,export,actor=actor)
+        result['provenance'] = {'kit': report(Path(__file__).resolve().parent, 'kit')}
         return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''}
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}',actor):raise ValueError('Supply a short contributor/session actor')
     action=request.get('action','bd')
