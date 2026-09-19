@@ -107,6 +107,34 @@ def clip(value,limit):
     value=str(value or '')
     return {'text':value[:limit],'omitted_chars':max(0,len(value)-limit)}
 
+NEWER_MAX=5
+
+def newer_activity_summary(data,checkpoint_comment_id,checkpoint_timestamp,owner):
+    """Bounded view of activity not incorporated into the current checkpoint.
+
+    Reuses the already-computed snapshot that excludes the checkpoint comment
+    itself, so it detects added, late-arriving and edited activity without an
+    extra export. Counts are split between the owner's own entries and other
+    actors' entries; entry references stay bounded and carry stable entry IDs
+    so the reader can page `history` for the full bodies. Reading changes
+    nothing: acknowledgement and completion remain separate, explicit acts.
+    """
+    if checkpoint_timestamp is None:
+        newer_entries=data['entries']
+    else:
+        bound=parse_moment(checkpoint_timestamp,'checkpoint timestamp')
+        newer_entries=[e for e in data['entries'] if parse_moment(e['timestamp'])>=bound]
+    if checkpoint_comment_id is not None:
+        newer_entries=[e for e in newer_entries if e['entry_id']!=data['task']+'-c'+str(checkpoint_comment_id)]
+    own=[e for e in newer_entries if e['author']==owner]
+    others=[e for e in newer_entries if e['author']!=owner]
+    return {'own_count':len(own),'other_count':len(others),
+            'other_authors':[clip(a,96) for a in sorted({e['author'] for e in others})],
+            'entries':[{'entry_id':e['entry_id'],'kind':e['kind'],'timestamp':e['timestamp']} for e in newer_entries[:NEWER_MAX]],
+            'omitted':max(0,len(newer_entries)-NEWER_MAX),
+            'history':'history '+data['task'],
+            'note':'Newer or changed activity exists that the saved checkpoint did not incorporate. The checkpoint next_action below may be stale; the listed entries are the oldest unincorporated ones and counts cover the full set, including late/edited entries the excerpt omits. Page history for complete coverage. Reading clears nothing; acknowledging or completing a direction stays an explicit act.'}
+
 def brief(rows,project,task,offset=0,limit=5):
     if type(offset) is not int or offset<0 or type(limit) is not int or not 1<=limit<=10:raise ValueError('Invalid unresolved-item page')
     issue=task_row(rows,task);current,invalid=checkpoints(issue)
@@ -126,12 +154,22 @@ def brief(rows,project,task,offset=0,limit=5):
                  'awaiting-review':'Reviewer: retrieve and verify the current contribution, then record review feedback or approval.',
                  'awaiting-integration':'Authorized integrator: integrate the approved contribution and record scoped integration evidence.',
                  'integrated':'Integration is recorded for this contribution; follow the project release/deployment workflow and scoped lifecycle evidence.'}
+    newer=None;next_action=review_next.get(review['review_state'],p['next_action'] if p else 'Read the task description, acceptance criteria and any history, then publish a checkpoint.')
+    if p is not None:
+        excluded=snapshot(rows,project,task,str(c['id']))
+        if p['activity_cursor']!=activity_cursor(excluded):
+            newer=newer_activity_summary(excluded,str(c['id']),c.get('created_at'),issue.get('assignee'))
+            if review['review_state'] not in review_next:
+                next_action=('STALE CHECKPOINT: activity the checkpoint did not incorporate exists ('+str(newer['other_count'])
+                             +' by other actors, '+str(newer['own_count'])+' own). Read newer activity first: '+newer['history']
+                             +'. The recorded checkpoint next action was: '+p['next_action'])
     return {'task':task,'title':clip(issue.get('title'),200),'owner':clip(issue.get('assignee') or 'unassigned',96),'status':issue.get('status'),
             'activity_cursor':activity_cursor(data),'checkpoint':None if p is None else {'comment_id':str(c['id']),'author':clip(c.get('author'),96),'timestamp':c.get('created_at'),'source_commit':p['source_commit'],'branch':p['branch'],'incorporated_activity_cursor':p['activity_cursor'],
                 'newer_activity':p['activity_cursor']!=activity_cursor(snapshot(rows,project,task,str(c['id'])))},
+            'newer':newer,
             'intent':clip(p['intent'] if p else issue.get('description'),600),'acceptance':clip(p['acceptance'] if p else issue.get('acceptance_criteria'),1000),
             'current_position':p['summary'] if p else 'No checkpoint yet; current position and unresolved items have not been summarized.',
-            'next_action':review_next.get(review['review_state'],p['next_action'] if p else 'Read the task description, acceptance criteria and any history, then publish a checkpoint.'),
+            'next_action':next_action,
             'unresolved':{'coverage':'explicit checkpoint items only; unsummarized prose is not classified','total':len(items) if p else None,'items':items[offset:offset+limit],'next_offset':offset+limit if offset+limit<len(items) else None},
             'review':dict(review,pending_requests=pending[:5],pending_total=len(pending),more='review '+task if len(pending)>5 else None),
             'lifecycle_matches_contribution':matches_contribution,
@@ -212,6 +250,12 @@ def format_brief(result):
     cp=result['checkpoint']
     if cp:lines += [f'Checkpoint: {cp["comment_id"]} by {excerpt(cp["author"])} at {cp["timestamp"]}',f'Branch: {cp["branch"] or "unknown"} | Source commit: {cp["source_commit"] or "unknown"}',
                     'Newer/changed activity: '+str(cp['newer_activity']), 'Incorporated activity cursor: '+cp['incorporated_activity_cursor']]
+    newer=result['newer']
+    if newer:
+        lines += [f'Newer activity not in checkpoint: {newer["other_count"]} by other actors ({", ".join(a["text"] for a in newer["other_authors"]) or "none"}), {newer["own_count"]} own.']
+        lines += ['  '+e['entry_id']+' ['+e['kind']+'] '+e['timestamp'] for e in newer['entries']]
+        if newer['omitted']:lines += [f'  ... {newer["omitted"]} more; page: '+newer['history']]
+        lines += ['Read newer activity: '+newer['history'], newer['note']]
     else:lines += ['No checkpoint yet; unresolved items are UNKNOWN, not zero.']
     unresolved=result['unresolved'];lines += [f'Unresolved items: {unresolved["total"] if unresolved["total"] is not None else "unknown"}']
     lines += [f'- {item["id"]} [{item["kind"]}]: {item["text"]} (source: {item["source"]})' for item in unresolved['items']]

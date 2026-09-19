@@ -19,8 +19,8 @@ PROJECT = 'trial'
 STAMP = '2026-09-15T10:00:00Z'
 
 
-def comment(cid, text='A finding', stamp=STAMP):
-    return dict(id=str(cid), text=text, author='alice/session', created_at=stamp)
+def comment(cid, text='A finding', stamp=STAMP, author='alice/session'):
+    return dict(id=str(cid), text=text, author=author, created_at=stamp)
 
 
 def rows():
@@ -148,6 +148,120 @@ class CheckpointTests(unittest.TestCase):
         for dim in ('reviewed', 'integrated', 'deployed', 'live-verified'):
             self.assertEqual(result['lifecycle'][dim]['value'], 'unknown')
         self.assertEqual(result['dependencies']['items'][0]['depends_on_id']['text'], 'trial-upstream')
+
+
+class NewerActivityTests(unittest.TestCase):
+    """kittrial-5bb.1: a stale checkpoint must not hide newer directions."""
+
+    def directed_rows(self, directions=3):
+        """Analysis task, no contribution, an old no-action checkpoint, then
+        `directions` later coordinator comments plus one later own comment."""
+        data = rows()
+        data[0]['description'] = 'Analyze the options; no code contribution is expected.'
+        p = checkpoint(data, summary='Analysis complete; nothing is pending',
+                       next_action='No work outstanding; wait quietly')
+        data[0]['comments'].append(comment('cp1', b.PREFIX + canonical_bytes(p).decode(),
+                                           '2026-09-15T12:00:00Z'))
+        for n in range(directions):
+            data[0]['comments'].append(comment(f'dir{n}', f'Coordinator direction {n}',
+                                               f'2026-09-16T0{n}:00:00Z', author='coordinator/session'))
+        data[0]['comments'].append(comment('own', 'Own working note', '2026-09-16T09:00:00Z'))
+        return data
+
+    def test_outstanding_directions_surface_with_entry_ids_and_qualified_next_action(self):
+        data = self.directed_rows(3)
+        result = b.brief(data, PROJECT, TASK)
+        self.assertTrue(result['checkpoint']['newer_activity'])
+        newer = result['newer']
+        self.assertIsNotNone(newer)
+        self.assertEqual(newer['other_count'], 3)
+        self.assertEqual(newer['own_count'], 1)
+        self.assertEqual([a['text'] for a in newer['other_authors']], ['coordinator/session'])
+        surfaced = {e['entry_id'] for e in newer['entries']}
+        self.assertTrue({f'{TASK}-cdir{n}' for n in range(3)} <= surfaced)
+        self.assertEqual(newer['history'], 'history ' + TASK)
+        self.assertIn('STALE CHECKPOINT', result['next_action'])
+        self.assertIn('No work outstanding; wait quietly', result['next_action'])
+        self.assertNotEqual(result['next_action'], 'No work outstanding; wait quietly')
+
+    def test_reading_clears_nothing_and_checkpoint_stays_authoritative(self):
+        data = self.directed_rows()
+        before = b.activity_cursor(b.snapshot(data, PROJECT, TASK))
+        first = b.brief(data, PROJECT, TASK)
+        second = b.brief(data, PROJECT, TASK)
+        self.assertEqual(b.activity_cursor(b.snapshot(data, PROJECT, TASK)), before)
+        self.assertEqual(first['newer'], second['newer'])
+        self.assertEqual(first['newer']['other_count'], 3)
+        # A checkpoint retry against the same activity still reconciles instead of writing.
+        replay = json.loads(data[0]['comments'][1]['text'][len(b.PREFIX):])
+        self.assertEqual(b.save_checkpoint(data, PROJECT, TASK, replay, 'alice/session',
+                                           lambda _: self.fail('duplicate write')),
+                         dict(comment_id='cp1', reconciled=True))
+
+    def test_summary_is_bounded_and_includes_late_arriving_edited_activity(self):
+        data = self.directed_rows(3)
+        for n in range(9):
+            data[0]['comments'].append(comment(f'extra{n}', f'More direction {n}',
+                                               '2026-09-17T00:00:00Z', author='coordinator/session'))
+        data[0]['comments'].append(comment('late', 'Late backdated note', '2026-09-14T00:00:00Z',
+                                           author='coordinator/session'))
+        data[0]['comments'][0]['text'] = 'Edited original finding'
+        result = b.brief(data, PROJECT, TASK)
+        newer = result['newer']
+        # The backdated note and the edited comment do not change the identity
+        # set; the activity cursor (hash over content) is what detects the edit.
+        self.assertEqual(newer['other_count'], 12)
+        # The edited own comment predates the checkpoint timestamp, so the
+        # bounded summary lists only the later own note; the cursor detects it.
+        self.assertEqual(newer['own_count'], 1)
+        self.assertEqual(len(newer['entries']), b.NEWER_MAX)
+        self.assertEqual(newer['omitted'], 13 - b.NEWER_MAX)
+    def test_late_or_edited_activity_still_raises_the_flag_with_a_read_path(self):
+        data = self.directed_rows(1)
+        data[0]['comments'].append(comment('late', 'Late backdated note', '2026-09-14T00:00:00Z',
+                                           author='coordinator/session'))
+        result = b.brief(data, PROJECT, TASK)
+        newer = result['newer']
+        self.assertTrue(result['checkpoint']['newer_activity'])
+        self.assertIsNotNone(newer)
+        # The backdated entry predates the checkpoint timestamp, so it cannot be
+        # separated from incorporated history by time; the counts stay honest and
+        # the note plus history path carry the obligation to reconcile fully.
+        self.assertEqual(newer['other_count'], 1)
+        self.assertEqual(newer['history'], 'history ' + TASK)
+        self.assertIn('late/edited', newer['note'])
+
+    def test_no_checkpoint_and_current_checkpoint_have_no_newer_summary(self):
+        self.assertIsNone(b.brief(rows(), PROJECT, TASK)['newer'])
+        data = rows()
+        append_checkpoint(data, 'cp1', checkpoint(data))
+        result = b.brief(data, PROJECT, TASK)
+        self.assertIsNone(result['newer'])
+        self.assertNotIn('STALE CHECKPOINT', result['next_action'])
+        text = b.format_brief(b.brief(self.directed_rows(), PROJECT, TASK))
+        self.assertIn('coordinator/session', text)
+        self.assertIn('history ' + TASK, text)
+
+    def test_newer_summary_tracks_the_current_checkpoint_of_a_chain(self):
+        data = rows()
+        p = checkpoint(data)
+        data[0]['comments'].append(comment('cp1', b.PREFIX + canonical_bytes(p).decode(),
+                                           '2026-09-15T12:00:00Z'))
+        data[0]['comments'].append(comment('mid', 'Middle direction', '2026-09-16T00:00:00Z',
+                                           author='coordinator/session'))
+        second = checkpoint(data)
+        data[0]['comments'].append(comment('cp2', b.PREFIX + canonical_bytes(second).decode(),
+                                           '2026-09-17T00:00:00Z'))
+        data[0]['comments'].append(comment('after', 'Direction after cp2', '2026-09-18T00:00:00Z',
+                                           author='coordinator/session'))
+        newer = b.brief(data, PROJECT, TASK)['newer']
+        self.assertIsNotNone(newer)
+        entry_ids = {e['entry_id'] for e in newer['entries']}
+        self.assertIn(f'{TASK}-cafter', entry_ids)
+        self.assertNotIn(f'{TASK}-ccp1', entry_ids)
+        self.assertNotIn(f'{TASK}-ccp2', entry_ids)
+        self.assertNotIn(f'{TASK}-cmid', entry_ids)
+        self.assertEqual(newer['other_count'], 1)
 
 
 class HistoryTests(unittest.TestCase):

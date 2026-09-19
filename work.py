@@ -13,6 +13,24 @@ def workflow(issue):
         result=dict(result,review_state='legacy-review-ready')
     return result
 
+def checkpoint_newer_counts(row):
+    """Newer-activity counts for the work queue: own entries vs other actors' entries
+    that the task's current checkpoint did not incorporate. None without a checkpoint
+    or with a malformed/conflicting checkpoint history (brief remains the authority).
+    """
+    try:
+        from briefing import checkpoints,newer_activity_summary,snapshot,untoken
+        from requirements import content_hash
+        (p,c),_invalid=checkpoints(row)
+        if p is None:return None
+        cursor=untoken(p['activity_cursor'])
+        if not isinstance(cursor,dict) or cursor.get('kind')!='activity' or cursor.get('task')!=row['id']:return None
+        excluded=snapshot([row],cursor['project'],row['id'],str(c['id']))
+        if content_hash(excluded)==cursor['sha256']:return {'own':0,'others':0}
+        newer=newer_activity_summary(excluded,str(c['id']),c.get('created_at'),row.get('assignee'))
+        return {'own':newer['own_count'],'others':newer['other_count']}
+    except (ValueError,TypeError,KeyError):return None
+
 def queue(rows,actor,args):
     parser=Parser(add_help=False)
     group=parser.add_mutually_exclusive_group();group.add_argument('--mine',action='store_true');group.add_argument('--owner')
@@ -35,8 +53,10 @@ def queue(rows,actor,args):
         if a.state and a.state!=state:continue
         contribution=review.get('contribution') or {}
         scope=facts.get(row['id'],{}).get('scope') or {}
+        newer_counts=checkpoint_newer_counts(row)
         items.append({'task':row['id'],'title':str(row.get('title',''))[:200],'owner':row.get('assignee'),'status':row.get('status'),'review_state':state,
                       'contribution_id':contribution.get('comment_id'),'commit':contribution.get('commit'),'pending_review_items':len(review.get('pending_requests',[])),
+                      'newer_activity_by_others':None if newer_counts is None else newer_counts['others'],'newer_activity_own':None if newer_counts is None else newer_counts['own'],
                       'lifecycle':{k:v['value'] for k,v in fact.items()},'lifecycle_scope':scope,
                       'lifecycle_matches_contribution':None if not contribution else scope.get('source_commit','').lower()==contribution['commit'].lower(),'error':error})
     priority={'changes-requested':0,'error':1,'awaiting-review':2,'legacy-review-ready':2,'awaiting-integration':3}

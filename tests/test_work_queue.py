@@ -12,7 +12,7 @@ import review_workflow as rw
 import work
 from requirements import canonical_bytes
 from lifecycle import DIMENSIONS
-from test_briefing import rows,checkpoint,append_checkpoint,TASK,PROJECT
+from test_briefing import rows,checkpoint,append_checkpoint,comment,TASK,PROJECT
 from test_lifecycle import NativeStore
 
 
@@ -103,6 +103,45 @@ class WorkQueueTests(unittest.TestCase):
         self.assertFalse(item['lifecycle_matches_contribution'])
         self.assertEqual(item['lifecycle']['integrated'],'passed')
         self.assertEqual(item['lifecycle_scope']['source_commit'],'source-a')
+
+
+class NewerActivityQueueTests(unittest.TestCase):
+    """kittrial-5bb.1: resume/work must flag directions newer than the checkpoint."""
+
+    def directed(self):
+        data=rows()
+        p=checkpoint(data,next_action='Nothing pending')
+        data[0]['comments'].append(comment('cp1',briefing.PREFIX+canonical_bytes(p).decode(),
+                                           '2026-09-15T12:00:00Z'))
+        for n in range(3):
+            data[0]['comments'].append(comment(f'dir{n}',f'Direction {n}','2026-09-16T00:00:00Z',
+                                               author='coordinator/session'))
+        data[0]['comments'].append(comment('own','Own note','2026-09-16T01:00:00Z'))
+        return data
+
+    def test_queue_flags_newer_activity_by_others_for_the_owner(self):
+        item=work.queue(self.directed(),'alice/session',['--mine'])['items'][0]
+        self.assertEqual(item['newer_activity_by_others'],3)
+        self.assertEqual(item['newer_activity_own'],1)
+
+    def test_queue_flag_clears_once_checkpoint_incorporates_the_activity(self):
+        data=self.directed()
+        fresh=checkpoint(data,next_action='Process the three directions')
+        data[0]['comments'].append(comment('cp2',briefing.PREFIX+canonical_bytes(fresh).decode(),
+                                           '2026-09-16T02:00:00Z'))
+        item=work.queue(data,'alice/session',['--mine'])['items'][0]
+        self.assertEqual(item['newer_activity_by_others'],0)
+        self.assertEqual(item['newer_activity_own'],0)
+
+    def test_queue_without_checkpoint_or_with_malformed_history_is_neutral(self):
+        item=work.queue(rows(),'alice/session',['--mine'])['items'][0]
+        self.assertIsNone(item['newer_activity_by_others'])
+        broken=rows()
+        p=checkpoint(broken)
+        append_checkpoint(broken,'cp1',p)
+        append_checkpoint(broken,'cp2',dict(p,summary='Competing branch'))
+        item=work.queue(broken,'alice/session',['--mine'])['items'][0]
+        self.assertIsNone(item['newer_activity_by_others'])
 
 
 if __name__=='__main__':unittest.main()
