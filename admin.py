@@ -218,6 +218,8 @@ def backup_project(root,name):
         feedback=path/'.feedback.jsonl'
         if feedback.exists() or feedback.is_symlink():
             if feedback.is_symlink():raise ValueError('Feedback feed must not be a symlink')
+            from feedback import _read as read_feedback
+            read_feedback(feedback)
             files['.feedback.jsonl']={'text':feedback.read_text(encoding='utf-8')}
         validate_coordination_files(files)
         output=run_bd(root,name,['backup','sync'])

@@ -28,8 +28,15 @@ reconciled safely:
 Submit with `feedback add --file payload.json`; use `feedback correct --file
 payload.json` with `supersedes` set to the original entry ID for an additive
 correction. Retry the exact same payload after an uncertain response. Retrieve
-bounded pages with `feedback list --limit 20`, then pass the returned opaque
-`next_cursor` to `--cursor`; entries are never rewritten. `reminder.kind` may be
+bounded live pages with `feedback list --limit 20`, then pass the returned opaque
+`next_cursor` to `--cursor`; entries appended after a page are visible on resume.
+Each response includes a durable `watermark`, including final and empty pages.
+Cursors are bound to the project/feed path and its observed end watermark; foreign,
+ahead, or rollback cursors are rejected. Pagination is live rather than a frozen
+snapshot, so a caller should retain the watermark for polling. Entries are never
+rewritten. A truncated final JSONL record is quarantined and the validated
+acknowledged prefix remains readable; a fully newline-terminated invalid record
+still fails visibly. `reminder.kind` may be
 `none`, `checkpoint` or `handoff` and is informational only; it never interrupts a
 worker.
 

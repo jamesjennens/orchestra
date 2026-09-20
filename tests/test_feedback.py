@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import feedback
@@ -48,6 +49,82 @@ class FeedbackTests(unittest.TestCase):
         next_page = feedback.list_entries(self.path, limit=2, cursor=page["next_cursor"])
         self.assertEqual([item["sequence"] for item in next_page["entries"]], [3])
         self.assertIsNone(next_page["next_cursor"])
+        self.assertEqual(next_page["watermark"]["sequence"], 3)
+
+    def test_cursor_is_feed_scoped_and_rejects_ahead_or_rollback(self):
+        for number in range(3):
+            feedback.add(self.path, "session-one", payload("op-%d" % number))
+        page = feedback.list_entries(self.path, limit=1)
+        other = Path(self.temp.name) / "other.jsonl"
+        feedback.add(other, "session-one", payload("other"))
+        with self.assertRaisesRegex(ValueError, "Invalid feedback cursor"):
+            feedback.list_entries(other, cursor=page["next_cursor"])
+        with self.assertRaisesRegex(ValueError, "ahead"):
+            feedback.list_entries(self.path, cursor=feedback.encode_cursor(
+                self.path, 9, {"sequence": 9, "digest": "x"}))
+        self.path.write_text("\n".join(
+            json.dumps(item, sort_keys=True, separators=(",", ":"))
+            for item in feedback._read(self.path)[:2]) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "ahead"):
+            feedback.list_entries(self.path, cursor=page["next_cursor"])
+
+    def test_append_after_page_is_visible_on_live_resume(self):
+        feedback.add(self.path, "session-one", payload("op-1"))
+        page = feedback.list_entries(self.path, limit=1)
+        self.assertIsNone(page["next_cursor"])
+        self.assertEqual(page["watermark"]["sequence"], 1)
+        feedback.add(self.path, "session-one", payload("op-2"))
+        resumed = feedback.list_entries(self.path, cursor=feedback.encode_cursor(
+            self.path, page["watermark"]["sequence"], page["watermark"]))
+        self.assertEqual([entry["sequence"] for entry in resumed["entries"]], [2])
+
+    def test_partial_tail_is_quarantined_and_acknowledged_prefix_survives(self):
+        feedback.add(self.path, "session-one", payload("op-1"))
+        with self.path.open("ab") as stream:
+            stream.write(b'{"partial":')
+        entries = feedback.list_entries(self.path)["entries"]
+        self.assertEqual([entry["sequence"] for entry in entries], [1])
+        self.assertEqual(len(list(self.path.parent.glob(self.path.name + ".*.incomplete"))), 1)
+        feedback.add(self.path, "session-one", payload("op-2"))
+        self.assertEqual(len(feedback.list_entries(self.path)["entries"]), 2)
+
+    def test_injected_append_failure_recovers_on_exact_retry(self):
+        feedback.add(self.path, "session-one", payload("op-1"))
+        original = feedback._write_append
+
+        def interrupted(path, entry):
+            with path.open("ab") as stream:
+                stream.write(b'{"partial":')
+            raise OSError("injected append interruption")
+
+        with patch.object(feedback, "_write_append", side_effect=interrupted):
+            with self.assertRaisesRegex(OSError, "injected"):
+                feedback.add(self.path, "session-one", payload("op-2"))
+        result = feedback.add(self.path, "session-one", payload("op-2"))
+        self.assertFalse(result["reconciled"])
+        self.assertEqual([entry["sequence"] for entry in feedback.list_entries(self.path)["entries"]], [1, 2])
+        self.assertIs(feedback._write_append, original)
+
+    def test_empty_page_exposes_durable_watermark(self):
+        empty = feedback.list_entries(self.path)
+        self.assertEqual(empty["entries"], [])
+        self.assertEqual(empty["watermark"], {"sequence": 0, "digest": ""})
+        self.assertIsNone(empty["next_cursor"])
+
+    def test_feed_symlink_is_rejected_without_mutating_target(self):
+        target = Path(self.temp.name) / "target.jsonl"
+        feedback.add(target, "session-one", payload("target"))
+        try:
+            self.path.symlink_to(target)
+        except OSError as exc:
+            self.skipTest("Symlink privilege unavailable: %s" % exc)
+        original = target.read_bytes()
+        for operation in (lambda: feedback.list_entries(self.path),
+                          lambda: feedback.add(self.path, "session-one", payload("new"))):
+            with self.subTest(operation=operation):
+                with self.assertRaisesRegex(ValueError, "symlink"):
+                    operation()
+                self.assertEqual(target.read_bytes(), original)
 
     def test_correction_supersedes_without_rewriting_source(self):
         original = feedback.add(self.path, "session-one", payload("op-1"))["entry"]

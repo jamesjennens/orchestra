@@ -16,6 +16,7 @@ MAX_BODY = 12000
 MAX_EVIDENCE = 20
 MAX_LINK = 2000
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@/-]{0,160}\Z")
+QUARANTINE_SUFFIX = ".incomplete"
 
 
 def _identifier(value, field):
@@ -36,22 +37,45 @@ def _timestamp(value):
     return value
 
 
-def _cursor(value):
+def _feed_id(path):
+    return hashlib.sha256(str(path.absolute()).encode("utf-8")).hexdigest()
+
+
+def _watermark(entries):
+    if not entries:
+        return {"sequence": 0, "digest": ""}
+    encoded = json.dumps(entries[-1], ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return {"sequence": entries[-1]["sequence"], "digest": hashlib.sha256(encoded).hexdigest()}
+
+
+def _cursor(value, path, current):
     if not isinstance(value, str) or not value:
         raise ValueError("Invalid feedback cursor")
     try:
         data = json.loads(base64.urlsafe_b64decode(value.encode("ascii") + b"==="))
     except (ValueError, UnicodeError, binascii.Error, json.JSONDecodeError):
         raise ValueError("Invalid feedback cursor") from None
-    if not isinstance(data, dict) or data.get("v") != 1 or type(data.get("seq")) is not int or data["seq"] < 0:
+    if (not isinstance(data, dict) or data.get("v") != 2 or data.get("feed_id") != _feed_id(path)
+            or type(data.get("seq")) is not int or data["seq"] < 0
+            or not isinstance(data.get("watermark"), dict)):
         raise ValueError("Invalid feedback cursor")
+    watermark = data["watermark"]
+    if (set(watermark) != {"sequence", "digest"} or type(watermark["sequence"]) is not int
+            or watermark["sequence"] < data["seq"]):
+        raise ValueError("Invalid feedback cursor")
+    current_watermark = _watermark(current)
+    if data["seq"] > current_watermark["sequence"] or watermark["sequence"] > current_watermark["sequence"]:
+        raise ValueError("Feedback cursor is ahead of the current feed")
+    if watermark["sequence"] == current_watermark["sequence"] and watermark["digest"] != current_watermark["digest"]:
+        raise ValueError("Feedback cursor does not match the current feed")
     return data["seq"]
 
 
-def encode_cursor(seq):
+def encode_cursor(path, seq, watermark):
     if type(seq) is not int or seq < 0:
         raise ValueError("Invalid feedback sequence")
-    raw = json.dumps({"seq": seq, "v": 1}, sort_keys=True, separators=(",", ":")).encode("ascii")
+    raw = json.dumps({"feed_id": _feed_id(path), "seq": seq, "v": 2, "watermark": watermark},
+                     sort_keys=True, separators=(",", ":")).encode("ascii")
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
@@ -135,13 +159,39 @@ def validate_feed_text(text):
     return entries
 
 
+def _assert_regular(path):
+    if path.is_symlink():
+        raise ValueError("Feedback feed must not be a symlink")
+
+
 def _read(path):
+    _assert_regular(path)
     if not path.exists():
         return []
-    return validate_feed_text(path.read_text(encoding="utf-8"))
+    raw = path.read_bytes()
+    try:
+        return validate_feed_text(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        if not raw or raw.endswith(b"\n") or raw.endswith(b"\r"):
+            raise
+        lines = raw.splitlines(keepends=True)
+        if len(lines) < 2:
+            raise
+        prefix = b"".join(lines[:-1])
+        try:
+            entries = validate_feed_text(prefix.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            raise
+        quarantine = path.with_name(path.name + "." + hashlib.sha256(lines[-1]).hexdigest()[:16] + QUARANTINE_SUFFIX)
+        if quarantine.exists() or quarantine.is_symlink():
+            raise ValueError("Feedback recovery quarantine path already exists")
+        quarantine.write_bytes(lines[-1])
+        path.write_bytes(prefix)
+        return entries
 
 
 def _write_append(path, entry):
+    _assert_regular(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8", newline="\n") as stream:
         stream.write(json.dumps(entry, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
@@ -208,12 +258,15 @@ def _make_entry(sequence, actor, payload, kind):
 def list_entries(path, limit=20, cursor=None):
     if type(limit) is not int or not 1 <= limit <= MAX_PAGE:
         raise ValueError("Feedback limit must be 1..%d" % MAX_PAGE)
-    start = _cursor(cursor) if cursor is not None else 0
-    entries = [entry for entry in _read(path) if entry["sequence"] > start]
-    page = entries[:limit]
+    current = _read(path)
+    start = _cursor(cursor, path, current) if cursor is not None else 0
+    available = [entry for entry in current if entry["sequence"] > start]
+    page = available[:limit]
+    watermark = _watermark(current)
     return {
         "entries": page,
-        "next_cursor": encode_cursor(page[-1]["sequence"]) if len(entries) > len(page) else None,
+        "next_cursor": encode_cursor(path, page[-1]["sequence"], watermark) if len(available) > len(page) else None,
+        "watermark": watermark,
         "count": len(page),
     }
 
