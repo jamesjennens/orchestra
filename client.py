@@ -8,14 +8,17 @@ it runs the same endpoint as an argv list with shell=False. Both transports send
 byte-identical JSON envelope, so attachments and actor semantics do not vary.
 """
 import argparse
+import hashlib
 import json
 import re
 import shlex
 import subprocess
 import sys
+import re
 from pathlib import Path
 
 CLIENT_VERSION = "0.1.0"
+SOURCE_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 
 def report(root=None, component="client"):
     root = Path(root or Path(__file__).resolve().parent)
@@ -27,7 +30,16 @@ def report(root=None, component="client"):
                 manifest.get("component") == "orchestra-kit" and
                 manifest.get("version") == CLIENT_VERSION and
                 isinstance(manifest.get("source_commit"), str) and
-                isinstance(manifest.get("build_id"), str) and manifest["build_id"]):
+                (manifest["source_commit"] == "unknown" or
+                 SOURCE_COMMIT.fullmatch(manifest["source_commit"])) and
+                isinstance(manifest.get("build_id"), str) and manifest["build_id"] and
+                isinstance(manifest.get("files"), dict) and manifest["files"] and
+                all(isinstance(name, str) and Path(name).name == name and
+                    name != "provenance.json" and isinstance(digest, str) and
+                    re.fullmatch(r"[0-9a-f]{64}", digest) and
+                    (root / name).is_file() and
+                    hashlib.sha256((root / name).read_bytes()).hexdigest() == digest
+                    for name, digest in manifest["files"].items())):
             metadata.update(source_commit=manifest["source_commit"],
                             build_id=manifest["build_id"])
     except (OSError, UnicodeError, ValueError, TypeError):

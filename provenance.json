@@ -1,7 +1,12 @@
-{
-  "schema_version": 1,
-  "component": "orchestra-kit",
-  "version": "0.1.0",
-  "source_commit": "81c044375e3d4a63c12e0399f8c1551e9fffeb2c",
-  "build_id": "orchestra-kit-0.1.0-81c0443"
+﻿{
+    "schema_version":  1,
+    "component":  "orchestra-kit",
+    "version":  "0.1.0",
+    "source_commit":  "unknown",
+    "build_id":  "unreleased-source",
+    "files":  {
+                  "VERSION":  "e9dd8507f4bf0c6f42458e41aea833ad0bd3f6127272335eee9bf4d58541ed67",
+                  "client.py":  "522d5256cd8c8af1481fa77943eaa7d50764c90ea96ea522b517d01c6ea45930",
+                  "version.py":  "b02cf460edeff13f312e7b9256540ead23011ad0955cc726c5c8d2873d5f27b9"
+              }
 }

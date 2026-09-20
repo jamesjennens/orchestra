@@ -1,9 +1,37 @@
 """Version and source provenance for installed Orchestra kit components."""
 import json
+import hashlib
 from pathlib import Path
+import re
 
 
 KIT_VERSION = "0.1.0"
+SOURCE_COMMIT = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _manifest(root):
+    try:
+        manifest = json.loads((Path(root) / "provenance.json").read_text(encoding="utf-8"))
+        if (not isinstance(manifest, dict) or manifest.get("schema_version") != 1 or
+                manifest.get("component") != "orchestra-kit" or
+                manifest.get("version") != _read_version(root) or
+                not isinstance(manifest.get("source_commit"), str) or
+                (manifest["source_commit"] != "unknown" and
+                 not SOURCE_COMMIT.fullmatch(manifest["source_commit"])) or
+                not isinstance(manifest.get("build_id"), str) or not manifest["build_id"] or
+                not isinstance(manifest.get("files"), dict) or not manifest["files"]):
+            return None
+        for name, digest in manifest["files"].items():
+            if (not isinstance(name, str) or Path(name).name != name or
+                    name == "provenance.json" or not isinstance(digest, str) or
+                    not re.fullmatch(r"[0-9a-f]{64}", digest)):
+                return None
+            path = Path(root) / name
+            if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+                return None
+        return manifest
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return None
 
 
 def _read_version(root):
@@ -15,27 +43,12 @@ def _read_version(root):
 
 
 def _source_commit(root):
-    try:
-        manifest = json.loads((Path(root) / "provenance.json").read_text(encoding="utf-8"))
-        if (isinstance(manifest, dict) and manifest.get("schema_version") == 1 and
-                manifest.get("component") == "orchestra-kit" and
-                manifest.get("version") == _read_version(root) and
-                isinstance(manifest.get("source_commit"), str) and
-                isinstance(manifest.get("build_id"), str) and manifest["build_id"]):
-            return manifest["source_commit"]
-    except (OSError, UnicodeError, ValueError, TypeError):
-        pass
-    return "unknown"
+    manifest = _manifest(root)
+    return manifest["source_commit"] if manifest else "unknown"
 
 def _build_id(root):
-    try:
-        manifest = json.loads((Path(root) / "provenance.json").read_text(encoding="utf-8"))
-        if isinstance(manifest, dict) and manifest.get("schema_version") == 1 and manifest.get("component") == "orchestra-kit":
-            value = manifest.get("build_id")
-            return value if isinstance(value, str) and value else "unknown"
-    except (OSError, UnicodeError, ValueError, TypeError):
-        pass
-    return "unknown"
+    manifest = _manifest(root)
+    return manifest["build_id"] if manifest else "unknown"
 
 
 def report(root=None, component="kit"):
