@@ -217,7 +217,7 @@ Authorization: Bearer <worker-secret>
 
 ```http
 POST /v1/projects/proj_opaque_01/tasks/task_opaque_07/checkpoints
-Idempotency-Key: req_01H... 
+Idempotency-Key: req_01H...
 Authorization: Bearer <worker-secret>
 Content-Type: application/json
 
