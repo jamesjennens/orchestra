@@ -39,3 +39,11 @@ History returns JSON, with up to 5 entries and 4,000 encoded body bytes by defau
 More unresolved items are available through `brief TASK --items-offset N`; the default is five per page, maximum ten. This is a fresh current-state query, so re-read after a checkpoint change. Dependency counts and omitted counts are explicit; use `show` for all native edges.
 
 History snapshots live in each private runtime project's `.history-snapshots` directory. They contain private task evidence, are disposable, and are not part of the durable backup pair. There is no automatic retention policy yet. Operators may remove old snapshot files under the project's coordination lock; affected cursors fail explicitly and readers restart. Checkpoints and their provenance remain in native backups.
+
+## Opaque cursors are complete tokens
+
+`brief`, in both text and `--json` form, and `history` print `activity_cursor` and `next_cursor` as **complete** base64url tokens. They are never display-elided, wrapped or shortened: the string you see is exactly the string to send back. Copy the whole token, without retyping it, inserting line breaks or dropping a character.
+
+`checkpoint` requires the current `activity_cursor` for the same task. History continuation instead reads the immutable snapshot bound to its cursor, even after live activity changes. It fails explicitly if that saved snapshot is unavailable or its scope is invalid; start without a cursor to read newer activity. Checkpoint freshness and history continuation are separate contracts.
+
+Copy tokens exactly. Malformed or altered tokens can fail decoding, schema, scope or snapshot validation; the error text depends on the failure. Do not rely on one universal error string or reconstruct a token from a displayed abbreviation.

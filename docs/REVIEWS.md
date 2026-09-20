@@ -106,6 +106,21 @@ After publishing a corrected contribution, its assigned owner explicitly respond
 
 Responses are owner assertions, not reviewer acceptance. When all requests have explicit responses, the contribution returns to `awaiting-review`. A reviewer may accept using an `approve` operation with the same common fields plus `contribution` and a `summary`. Approval requires no unresolved requests and refers to the current contribution. It projects `awaiting-integration`; it does not set reviewed/integrated/deployed lifecycle facts. A new contribution requires review again. Review participation remains subject to project policy; actor names are attribution, not verified authority.
 
+## Target the contribution record, not the latest comment
+
+`contribution` in a `request-changes`, `respond` or `approve` operation names the **contribution record's `comment_id`** — the `contribution.comment_id` returned by `review TASK`, or `contribution_id` on an item returned by `work --mine`. The Git SHA is a separate value: `contribution.commit` in `review TASK`, or `commit` in a work item. The contribution record ID is **not** `latest_comment_id`, which is the newest record in the chain and advances with every reviewer request, response and approval. The two coincide only while the contribution is also the most recent record.
+
+Supplying the wrong id is refused before any native write, and the refusal names the operation, the id you supplied and the id you should have used:
+
+```text
+Review operation approve supplied 2, which is the task latest comment id;
+reference the current contribution instead (the current contribution id is 1).
+Review operation approve supplied not-a-real-id, but the current contribution id is 1.
+Review operation approve supplied unknown, but no current contribution has been recorded yet.
+```
+
+Read the current ids from `review TASK`. A refusal changes nothing: the review state, the pending items and the comment chain stay exactly as they were, so correct the payload and resubmit with a new operation ID. An **exact** repeat of an already-recorded operation — same operation ID, same canonical payload, same actor — still reconciles to the original comment without writing a second record, including after a later handoff or later reviews.
+
 ## Discover current work
 
 ```sh
@@ -122,3 +137,5 @@ The queue sorts requested changes first and shows task status, owner, review sta
 `brief` prioritizes pending review actions over an older checkpoint's next action. It shows up to five pending items with a pointer to `review TASK` for the rest. Generated CURRENT.md includes a bounded review queue; native `list` remains unchanged. Legacy `review-ready` labels remain discoverable, but structured review state takes precedence. If a task has no checkpoint, its description and acceptance are shown without calling it legacy work.
 
 The structured protocol is an append-only native comment chain with previous-comment checks. Do not hand-edit those comments. Forked/malformed records fail clearly and need operator reconciliation. Report/label changes are separate writes; a retry repairs interrupted removal of review-ready, while structured state stays authoritative.
+
+For example, if review returns contribution.comment_id = record-A, contribution.commit = <Git SHA>, and latest_comment_id = record-B, submit contribution = record-A and previous = record-B. Do not put the Git SHA in either comment-ID field.
