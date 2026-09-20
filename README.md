@@ -25,6 +25,7 @@ We are now using the harness to develop the harness. Start with the [draft BRD](
 - Job authors: [job](templates/JOB.md), [task](templates/TASK.md), [report](templates/REPORT.md), [annotation](templates/ANNOTATION.md).
 - Decision authors: [decision template](templates/DECISION.md).
 - Evidence: [validation](reports/VALIDATION.md) and [machine-readable integration results](reports/integration.json).
+- Project-owned datasets and long-running test outputs: [artifact manifests](docs/ARTIFACTS.md).
 
 ## Model
 
