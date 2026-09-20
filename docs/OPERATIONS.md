@@ -75,6 +75,15 @@ Edit `templates/beads-backup.service` for the installation paths/project, then c
 
 Use `client.local.example.json` for explicit Linux same-host execution, under an account with access to the runtime. Use `beads.cmd` on Windows or `sh beads.sh` on POSIX from any directory. The wrappers take the same required config/project/actor arguments as client.py; no PowerShell execution-policy change is required. See [operational examples](OPERATIONAL_WORKFLOW.md).
 
+Installed kit provenance is read only from the adjacent non-executable `provenance.json`
+manifest. A release build must generate it after selecting the exact source revision:
+`{"schema_version":1,"component":"orchestra-kit","version":"...","source_commit":"<full commit>","build_id":"<immutable build id>"}`.
+Installation copies `VERSION`, `provenance.json`, and the kit files as one artifact and
+must validate the manifest schema, component, version, non-empty build ID, and source
+identity before use. Missing, malformed, stale, or mismatched manifests report
+`source unknown`; the client never imports adjacent Python modules, consults ambient
+`ORCHESTRA_SOURCE_COMMIT`, or infers identity from a parent Git checkout.
+
 ## Maintenance
 
 ```sh

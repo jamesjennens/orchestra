@@ -13,30 +13,31 @@ import re
 import shlex
 import subprocess
 import sys
-import importlib.util
 from pathlib import Path
 
 CLIENT_VERSION = "0.1.0"
-try:
-    _version_path = Path(__file__).resolve().with_name("version.py")
-    _version_text = _version_path.with_name("VERSION").read_text(encoding="utf-8").strip()
-    if _version_text != CLIENT_VERSION:
-        raise ImportError("unrelated version metadata")
-    _version_spec = importlib.util.spec_from_file_location("_orchestra_client_version", _version_path)
-    if _version_spec is None or _version_spec.loader is None:
-        raise ImportError("version module unavailable")
-    _version = importlib.util.module_from_spec(_version_spec)
-    _version_spec.loader.exec_module(_version)
-    line, report = _version.line, _version.report
-except (ImportError, OSError, AttributeError):
-    def report(root=None, component="client"):
-        return {"component": component, "version": CLIENT_VERSION,
-                "source_commit": "unknown", "path": str(root or Path(__file__).resolve().parent)}
 
-    def line(metadata):
-        return "Orchestra %s: version %s, source %s" % (
-            metadata["component"], metadata["version"], metadata["source_commit"],
-        )
+def report(root=None, component="client"):
+    root = Path(root or Path(__file__).resolve().parent)
+    metadata = {"component": component, "version": CLIENT_VERSION,
+                "source_commit": "unknown", "build_id": "unknown", "path": str(root)}
+    try:
+        manifest = json.loads((root / "provenance.json").read_text(encoding="utf-8"))
+        if (isinstance(manifest, dict) and manifest.get("schema_version") == 1 and
+                manifest.get("component") == "orchestra-kit" and
+                manifest.get("version") == CLIENT_VERSION and
+                isinstance(manifest.get("source_commit"), str) and
+                isinstance(manifest.get("build_id"), str) and manifest["build_id"]):
+            metadata.update(source_commit=manifest["source_commit"],
+                            build_id=manifest["build_id"])
+    except (OSError, UnicodeError, ValueError, TypeError):
+        pass
+    return metadata
+
+def line(metadata):
+    return "Orchestra %s: version %s, source %s" % (
+        metadata["component"], metadata["version"], metadata["source_commit"],
+    )
 
 ACTOR = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}')
 HOST = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@-]*')
@@ -174,11 +175,17 @@ def main():
         payload["provenance"] = {"client": client, "kit": kit, "parity": parity}
         output = json.dumps(payload, ensure_ascii=False) + "\n"
     elif action == 'onboard' and result['returncode'] == 0:
-        output += line(report(Path(__file__).resolve().parent, "client")) + '\n'
+        client = report(Path(__file__).resolve().parent, "client")
+        output += line(client) + '\n'
         kit_versions = re.findall(r'Orchestra kit: version ([^,]+), source ([^\r\n]+)', output)
-        if kit_versions and kit_versions[-1][0] != report(Path(__file__).resolve().parent, "client")['version']:
+        kit_source = kit_versions[-1][1] if kit_versions else "unknown"
+        if kit_versions and (kit_versions[-1][0] != client['version'] or
+                             kit_source != client['source_commit']):
             output += ('Orchestra version mismatch: client=%s, kit=%s\n'
-                       % (report(Path(__file__).resolve().parent, "client")['version'], kit_versions[-1][0]))
+                       % (client['version'], kit_versions[-1][0]))
+        parity = "unknown" if client["source_commit"] == "unknown" or kit_source == "unknown" else (
+            "match" if client["source_commit"] == kit_source else "mismatch")
+        output += 'Orchestra provenance parity: %s\n' % parity
     sys.stdout.write(output);sys.stderr.write(result['stderr']);return result['returncode']
 
 if __name__=='__main__':

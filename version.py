@@ -1,6 +1,5 @@
 """Version and source provenance for installed Orchestra kit components."""
-import os
-import subprocess
+import json
 from pathlib import Path
 
 
@@ -16,21 +15,27 @@ def _read_version(root):
 
 
 def _source_commit(root):
-    configured = os.environ.get("ORCHESTRA_SOURCE_COMMIT", "").strip()
-    if configured:
-        return configured
     try:
-        result = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "--verify", "HEAD"],
-            capture_output=True, text=True, encoding="utf-8", timeout=5,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return "unknown"
-    if result.returncode != 0:
-        return "unknown"
-    value = result.stdout.strip()
-    return value or "unknown"
+        manifest = json.loads((Path(root) / "provenance.json").read_text(encoding="utf-8"))
+        if (isinstance(manifest, dict) and manifest.get("schema_version") == 1 and
+                manifest.get("component") == "orchestra-kit" and
+                manifest.get("version") == _read_version(root) and
+                isinstance(manifest.get("source_commit"), str) and
+                isinstance(manifest.get("build_id"), str) and manifest["build_id"]):
+            return manifest["source_commit"]
+    except (OSError, UnicodeError, ValueError, TypeError):
+        pass
+    return "unknown"
+
+def _build_id(root):
+    try:
+        manifest = json.loads((Path(root) / "provenance.json").read_text(encoding="utf-8"))
+        if isinstance(manifest, dict) and manifest.get("schema_version") == 1 and manifest.get("component") == "orchestra-kit":
+            value = manifest.get("build_id")
+            return value if isinstance(value, str) and value else "unknown"
+    except (OSError, UnicodeError, ValueError, TypeError):
+        pass
+    return "unknown"
 
 
 def report(root=None, component="kit"):
@@ -40,6 +45,7 @@ def report(root=None, component="kit"):
         "component": component,
         "version": _read_version(root),
         "source_commit": _source_commit(root),
+        "build_id": _build_id(root),
         "path": str(root),
     }
 

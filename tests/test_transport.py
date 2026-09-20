@@ -63,13 +63,23 @@ class ClientTransportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / 'client.py').write_text(Path(client.__file__).read_text(encoding='utf-8'), encoding='utf-8')
-            (root / 'version.py').write_text(
-                'def report(*args, **kwargs): return {"component": "wrong", "version": "9.9.9", "source_commit": "bad"}\n'
-                'def line(metadata): return "wrong"\n', encoding='utf-8')
+            (root / 'version.py').write_text('raise RuntimeError("unrelated module executed")\n', encoding='utf-8')
+            (root / 'VERSION').write_text('0.1.0\n', encoding='utf-8')
             result = subprocess.run([sys.executable, str(root / 'client.py'), '--version'],
                                     capture_output=True, text=True, encoding='utf-8')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('Orchestra client: version 0.1.0, source unknown', result.stdout)
+
+    def test_standalone_client_same_version_collision_keeps_unknown_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'client.py').write_text(Path(client.__file__).read_text(encoding='utf-8'), encoding='utf-8')
+            (root / 'VERSION').write_text('0.1.0\n', encoding='utf-8')
+            (root / 'version.py').write_text('raise RuntimeError("must never execute")\n', encoding='utf-8')
+            result = subprocess.run([sys.executable, str(root / 'client.py'), '--version'],
+                                    capture_output=True, text=True, encoding='utf-8')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('source unknown', result.stdout)
 
     def test_resume_cli_stdout_is_json_with_structured_unknown_provenance(self):
         response = {'returncode': 0, 'stdout': json.dumps({'resume': {'request_id': 'r'}}), 'stderr': ''}
