@@ -1,9 +1,11 @@
+import errno
 import json
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 
+import artifacts
 from artifacts import ArtifactError, ArtifactStore
 
 
@@ -121,6 +123,100 @@ class ArtifactStoreTests(unittest.TestCase):
             self.skipTest("symlink creation is not available")
         with self.assertRaises(ArtifactError):
             self.store.register("datasets/sample/link.txt", kind="dataset")
+
+    def test_manifest_corruption_and_duplicate_are_rejected_without_rewrite(self):
+        self._write("datasets/sample/data.bin", b"one")
+        self.store.register("datasets/sample/data.bin", kind="dataset")
+        original = self.store.manifest_path.read_bytes()
+        with self.store.manifest_path.open("ab") as handle:
+            handle.write(original)
+        with self.assertRaisesRegex(ArtifactError, "duplicate path"):
+            self.store.entries(verify=False)
+        self.assertEqual(self.store.manifest_path.read_bytes(), original + original)
+
+        self.store.manifest_path.write_text(json.dumps({"path": "bad"}) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(ArtifactError, "invalid fields"):
+            self.store.entries(verify=False)
+
+    def test_manifest_checksum_and_size_types_are_validated_without_verify(self):
+        self._write("results/task/output.txt", b"stable")
+        self.store.register("results/task/output.txt", kind="test-output", task="task")
+        row = json.loads(self.store.manifest_path.read_text(encoding="utf-8"))
+        row["bytes"] = True
+        original = json.dumps(row, sort_keys=True) + "\n"
+        self.store.manifest_path.write_text(original, encoding="utf-8")
+        with self.assertRaisesRegex(ArtifactError, "byte count"):
+            self.store.entries(verify=False)
+        self.assertEqual(self.store.manifest_path.read_text(encoding="utf-8"), original)
+
+    def test_manifest_and_lock_paths_are_reserved_for_default_and_custom_names(self):
+        for store, name in ((self.store, "manifest.jsonl"), (ArtifactStore(self.root / "custom", "catalog.jsonl"), "catalog.jsonl")):
+            before = store.manifest_path.read_bytes() if store.manifest_path.exists() else b""
+            with self.assertRaisesRegex(ArtifactError, "reserved"):
+                store.register(name, kind="result")
+            self.assertEqual(store.manifest_path.read_bytes() if store.manifest_path.exists() else b"", before)
+            with self.assertRaisesRegex(ArtifactError, "reserved"):
+                store.path_for(".", name)
+
+    def test_lock_file_size_is_stable_and_sidecar_symlinks_are_rejected(self):
+        with artifacts._exclusive_lock(self.store.lock_path):
+            first_size = self.store.lock_path.stat().st_size
+        with artifacts._exclusive_lock(self.store.lock_path):
+            second_size = self.store.lock_path.stat().st_size
+        self.assertEqual(first_size, 1)
+        self.assertEqual(second_size, first_size)
+
+        symlink_root = self.root / "symlink-lock"
+        symlink_root.mkdir()
+        target = symlink_root / "target"
+        target.write_bytes(b"x")
+        link = symlink_root / ".manifest.jsonl.lock"
+        try:
+            link.symlink_to(target)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlink creation is not available")
+        with self.assertRaisesRegex(ArtifactError, "symlink sidecar"):
+            ArtifactStore(symlink_root)
+
+    def test_windows_lock_permanent_failure_is_not_retried(self):
+        class Permanent:
+            LK_NBLCK = 1
+            def __init__(self):
+                self.calls = 0
+            def locking(self, *args):
+                self.calls += 1
+                raise OSError(errno.EBADF, "bad handle")
+
+        adapter = Permanent()
+        with self.assertRaisesRegex(ArtifactError, "cannot lock"):
+            with self.store.lock_path.open("a+b") as handle:
+                artifacts._windows_lock(handle, self.store.lock_path, adapter=adapter, timeout=0.1, poll=0)
+        self.assertEqual(adapter.calls, 1)
+
+    def test_windows_lock_contention_is_bounded_and_success_releases(self):
+        class Contended:
+            LK_NBLCK = 1
+            def locking(self, *args):
+                raise OSError(errno.EACCES, "busy")
+
+        with self.assertRaisesRegex(ArtifactError, "timed out"):
+            with self.store.lock_path.open("a+b") as handle:
+                if handle.tell() == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                artifacts._windows_lock(handle, self.store.lock_path, adapter=Contended(), timeout=0.03, poll=0.001)
+
+        class Successful:
+            LK_NBLCK = 1
+            def __init__(self):
+                self.calls = 0
+            def locking(self, *args):
+                self.calls += 1
+
+        adapter = Successful()
+        with self.store.lock_path.open("a+b") as handle:
+            artifacts._windows_lock(handle, self.store.lock_path, adapter=adapter, timeout=0.1, poll=0)
+        self.assertEqual(adapter.calls, 1)
 
 
 if __name__ == "__main__":

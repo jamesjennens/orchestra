@@ -38,9 +38,13 @@ The manifest is a JSONL file in the artifact root. Each entry records the
 relative path, byte count, SHA-256, source/dataset/as-of context, optional
 fields and securities, actor/task attribution, and generic JSON metadata.
 `register` is idempotent for an exact entry, rejects changed bytes and
-conflicting duplicate metadata, and serializes concurrent writers. `entries()`
-verifies every registered file by default; `verify(path)` verifies a selected
-entry.
+conflicting duplicate metadata, and serializes concurrent writers. The
+configured manifest and its lock sidecar are reserved and cannot themselves be
+registered. Manifest rows are schema-checked on every read, including
+`entries(verify=False)`, and corrupt or duplicate rows fail without rewriting
+the source file. `entries()` verifies every registered file by default;
+`verify(path)` verifies a selected entry. The lock sidecar is initialized once,
+uses bounded Windows contention retries, and reports permanent lock failures.
 
 Paths are deliberately portable and safe: absolute paths, traversal,
 symlinked files and root escapes are rejected. The helper does not grant

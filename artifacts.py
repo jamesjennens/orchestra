@@ -8,11 +8,13 @@ project that owns the artifact root.
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import os
 import re
 import tempfile
+import time
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterator
 
@@ -22,7 +24,14 @@ class ArtifactError(ValueError):
 
 
 _COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-_FIELDS = ("source", "dataset", "as_of", "fields", "securities", "actor", "task", "metadata")
+_RECORD_FIELDS = {
+    "schema_version", "path", "kind", "sha256", "bytes", "source", "dataset",
+    "as_of", "fields", "securities", "actor", "task", "metadata",
+}
+_TEXT_FIELDS = {"source", "dataset", "as_of", "actor", "task"}
+_LIST_FIELDS = {"fields", "securities"}
+_LOCK_TIMEOUT = 5.0
+_LOCK_POLL = 0.01
 
 
 def _safe_component(value: str, name: str) -> str:
@@ -43,8 +52,11 @@ def _relative_path(value: str | os.PathLike[str]) -> str:
         raise ArtifactError("artifact path must be relative")
     normalized = raw.replace("\\", "/")
     parts = normalized.split("/")
-    if any(part in {"", ".", ".."} for part in parts):
+    if any(part in {"", ".."} for part in parts):
         raise ArtifactError("artifact path contains an unsafe component")
+    parts = [part for part in parts if part != "."]
+    if not parts:
+        raise ArtifactError("artifact path contains no file")
     for part in parts:
         _safe_component(part, "path component")
     return "/".join(parts)
@@ -58,24 +70,44 @@ def _json_value(value: Any, name: str) -> Any:
     return value
 
 
+def _sidecar_path(path: Path) -> None:
+    if path.is_symlink():
+        raise ArtifactError(f"refusing symlink sidecar: {path.name}")
+
+
+def _windows_lock(handle, path: Path, adapter=None, timeout=_LOCK_TIMEOUT, poll=_LOCK_POLL) -> None:
+    if adapter is None:
+        import msvcrt as adapter
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            adapter.locking(handle.fileno(), adapter.LK_NBLCK, 1)
+            return
+        except OSError as exc:
+            contention = exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK} or (
+                getattr(exc, "winerror", None) in {33, 36}
+            )
+            if not contention:
+                raise ArtifactError(f"cannot lock {path.name}: {exc}") from exc
+            if time.monotonic() >= deadline:
+                raise ArtifactError(f"timed out acquiring {path.name} after {timeout:.1f}s") from exc
+            time.sleep(poll)
+
+
 @contextlib.contextmanager
 def _exclusive_lock(path: Path) -> Iterator[None]:
-    """Hold a cross-platform advisory lock on a sibling lock file."""
+    """Hold a bounded, symlink-safe cross-platform advisory lock."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    _sidecar_path(path)
     with path.open("a+b") as handle:
+        _sidecar_path(path)
+        if os.fstat(handle.fileno()).st_size == 0:
+            handle.write(b"\0")
+            handle.flush()
+            os.fsync(handle.fileno())
         if os.name == "nt":
-            import msvcrt
             handle.seek(0)
-            if handle.tell() == 0:
-                handle.write(b"\0")
-                handle.flush()
-            handle.seek(0)
-            while True:
-                try:
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-                    break
-                except OSError:
-                    continue
+            _windows_lock(handle, path)
         else:
             import fcntl
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
@@ -114,6 +146,12 @@ class ArtifactStore:
         self.root.mkdir(parents=True, exist_ok=True)
         self.manifest_path = self.root / manifest
         self.lock_path = self.manifest_path.with_name(f".{manifest}.lock")
+        self._reserved = {
+            manifest.replace("\\", "/").casefold() if os.name == "nt" else manifest.replace("\\", "/"),
+            self.lock_path.name.casefold() if os.name == "nt" else self.lock_path.name,
+        }
+        _sidecar_path(self.manifest_path)
+        _sidecar_path(self.lock_path)
 
     def dataset_path(self, dataset: str, filename: str) -> Path:
         return self.path_for("datasets", dataset, filename)
@@ -125,6 +163,7 @@ class ArtifactStore:
         if len(parts) < 2:
             raise ArtifactError("an artifact location needs a namespace and name")
         relative = _relative_path("/".join(parts))
+        self._reject_reserved(relative)
         path = self.root / Path(relative)
         self._check_within_root(path, must_exist=False)
         return path
@@ -144,6 +183,7 @@ class ArtifactStore:
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         relative = _relative_path(path)
+        self._reject_reserved(relative)
         _safe_component(kind, "kind")
         file_path = self.root / Path(relative)
         self._check_within_root(file_path, must_exist=True)
@@ -165,8 +205,7 @@ class ArtifactStore:
             "task": task,
             "metadata": metadata or {},
         }
-        for key in _FIELDS:
-            _json_value(record[key], key)
+        self._validate_record(record)
         with _exclusive_lock(self.lock_path):
             rows = self._read_unlocked()
             matches = [row for row in rows if row["path"] == relative]
@@ -198,10 +237,15 @@ class ArtifactStore:
             self._verify_row(row)
         return [dict(row) for row in selected]
 
+    def _reject_reserved(self, relative: str) -> None:
+        candidate = relative.casefold() if os.name == "nt" else relative
+        if candidate in self._reserved:
+            raise ArtifactError(f"artifact path is reserved: {relative}")
+
     def _check_within_root(self, path: Path, *, must_exist: bool) -> None:
         if must_exist and not path.exists():
             raise ArtifactError("artifact file does not exist")
-        if path.exists() and path.is_symlink():
+        if path.is_symlink():
             raise ArtifactError("symlink artifact paths are not allowed")
         resolved = path.resolve(strict=must_exist)
         try:
@@ -210,9 +254,7 @@ class ArtifactStore:
             raise ArtifactError("artifact path escapes the artifact root") from exc
 
     def _verify_row(self, row: dict[str, Any]) -> None:
-        if not isinstance(row, dict) or row.get("schema_version") != 1:
-            raise ArtifactError("invalid manifest entry")
-        relative = _relative_path(row.get("path", ""))
+        relative = self._validate_record(row)
         path = self.root / Path(relative)
         self._check_within_root(path, must_exist=True)
         checksum, size = _sha256(path)
@@ -230,12 +272,37 @@ class ArtifactStore:
                 for line in handle:
                     if line.strip():
                         value = json.loads(line)
-                        if not isinstance(value, dict):
-                            raise ArtifactError("manifest entries must be objects")
+                        self._validate_record(value, rows)
                         rows.append(value)
         except (OSError, json.JSONDecodeError) as exc:
             raise ArtifactError("cannot read artifact manifest") from exc
         return rows
+
+    def _validate_record(self, row: Any, rows: list[dict[str, Any]] | None = None) -> str:
+        if not isinstance(row, dict):
+            raise ArtifactError("manifest entry must be an object")
+        if set(row) != _RECORD_FIELDS:
+            raise ArtifactError("manifest entry has invalid fields")
+        if type(row["schema_version"]) is not int or row["schema_version"] != 1:
+            raise ArtifactError("manifest schema_version must be integer 1")
+        relative = _relative_path(row["path"])
+        self._reject_reserved(relative)
+        if not isinstance(row["kind"], str) or not _COMPONENT.fullmatch(row["kind"]):
+            raise ArtifactError("manifest kind is unsafe")
+        if not isinstance(row["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", row["sha256"]):
+            raise ArtifactError(f"invalid checksum for {relative}")
+        if type(row["bytes"]) is not int or row["bytes"] < 0:
+            raise ArtifactError(f"invalid byte count for {relative}")
+        for key in _TEXT_FIELDS:
+            if row[key] is not None and not isinstance(row[key], str):
+                raise ArtifactError(f"manifest {key} must be text or null")
+        for key in _LIST_FIELDS:
+            if row[key] is not None and (not isinstance(row[key], list) or any(not isinstance(item, str) for item in row[key])):
+                raise ArtifactError(f"manifest {key} must be a string list or null")
+        _json_value(row["metadata"], "metadata")
+        if rows is not None and any(existing["path"] == relative for existing in rows):
+            raise ArtifactError(f"manifest has duplicate path: {relative}")
+        return relative
 
     def _write_unlocked(self, rows: list[dict[str, Any]]) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
