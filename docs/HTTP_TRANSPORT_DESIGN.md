@@ -154,6 +154,26 @@ existing account only through an explicit, reviewed linking or invitation
 operation. Do not auto-link on an email string. The first implementation must
 not pretend that SSO, MFA, recovery email or group synchronization exists.
 
+### Provisional local lifecycle defaults
+
+For the first implementation, use configurable defaults of a 30-minute
+browser idle timeout, 12-hour absolute browser session lifetime, and session
+rotation on login, password reset, disablement and privilege change. Logout
+revokes the current session immediately. Password reset is an authenticated
+superuser operation in the initial local deployment: it generates a
+single-use random reset value delivered only through the operator's approved
+out-of-band channel, expires it after 30 minutes, stores only its hash, and
+revokes all sessions and worker credentials owned by the reset account.
+There is no email dependency.
+
+Worker credentials default to project scope, the minimum selected operation
+scope, 30-day expiry and explicit owner/superuser revocation. Creation returns
+the secret once; the server stores only a verifier. A future deployment may
+shorten or extend these values by configuration, but expiry and revocation
+checks remain mandatory. SSO and MFA can later replace or strengthen login
+without changing project authorization or actor binding; neither blocks the
+first local implementation.
+
 ## 5. Project isolation and authority
 
 Projects are opaque server identifiers with a separate membership relation.
@@ -169,7 +189,7 @@ The minimum action matrix is:
 | --- | --- | --- | --- | --- |
 | List/open an authorized project | all | own | member | member |
 | Read tasks, history, decisions, checkpoints and permitted attachments | all | own | member | member |
-| Create a project | policy-controlled | no | no | no |
+| Create a project | yes | no | no | no |
 | Invite/remove members and assign contributor/viewer | all | own | no | no |
 | Assign/remove project owner | all, subject to safeguard | policy-controlled, subject to safeguard | no | no |
 | Create/update jobs, tasks, feedback and checkpoints | all | own | member, per operation | no |
@@ -180,19 +200,31 @@ The minimum action matrix is:
 
 “All” is still subject to audit and destructive-operation confirmation. Project
 role never grants Git merge, repository administration, deployment or host
-access. A project creator becomes an owner only after the configured creation
-policy permits it. Prevent removal or disabling of the final active
-superuser, and prevent a project from having no active owner unless an
-authorized superuser performs an explicit recovery operation. Role assignment
-must be checked against the assigner's current role and cannot accept a
-client-supplied role claim.
+access. The coordinator-proposed initial defaults are configurable service
+policy, not owner-approved BRD text:
 
-The unresolved policy choices are whether ordinary authenticated users may
-create projects, whether project owners may add owners, whether a superuser
-may be delegated, and whether viewer access includes attachments and audit
-records. Implementations must require an explicit selected policy for each.
+- Authenticated users may create private projects; the creator becomes the
+ first owner. A deployment may disable self-service creation, in which case
+ only a superuser creates projects and assigns the first owner.
+- Owners may assign contributor/viewer membership, but only a superuser may
+ assign or remove project owners. The final active project owner cannot be
+ removed or disabled without an explicit superuser recovery action.
+- Exactly one or more protected superusers exist. The final active superuser
+ cannot be disabled, demoted or deleted through the ordinary API.
+- Members may read tasks, history, decisions, checkpoints, feedback and
+ ordinary permitted attachments. Viewer access excludes audit records,
+ membership administration and mutations.
+- Project owners and superusers may read project audit records. Private
+ feedback follows project membership, not the personal “My work” filter.
+- Superusers can administer every project; no cross-project search or
+ identifier disclosure is implied for ordinary members.
 
-## 6. Minimal API and optional browser product
+Role assignment must be checked against the assigner's current role and cannot
+accept a client-supplied role claim. These defaults may be configured before
+implementation tests, but changing them requires a reviewed policy decision
+and corresponding authorization tests.
+
+## 6. Minimal API and required browser workflow
 
 The minimal API is JSON over HTTPS and reuses existing canonical operation
 semantics. It should expose only bounded operations, with stable error codes,
@@ -234,13 +266,60 @@ resource where existence must not leak, `409` for stale state or idempotency
 conflict, `413` for bounded payload violations, `429` for throttling, and
 `5xx` only for an operation whose commit status is explicitly unknown.
 
-The optional browser product uses the same API and server authorization. It
-provides sign-in, project creation/joining, membership administration, task
-briefs/current checkpoints, paginated history, contribution/review queues,
-feedback and artifact links. Reading never acknowledges work. The UI is not
-the security boundary, does not store long-lived bearer secrets, and must
-surface stale/conflict/error states. A polished visual design and accessibility
-criteria belong to the follow-up web-interface task, not this transport design.
+The browser workflow is required product scope, not an optional GUI. It uses
+the same API and server authorization for sign-in, project creation/joining,
+membership administration, task briefs/current checkpoints, paginated history,
+contribution/review queues, feedback and artifact links. Reading never
+acknowledges work. The UI is not the security boundary, does not store
+long-lived bearer secrets, and must surface stale/conflict/error states. The
+follow-up web-interface task owns visual design, accessibility and the
+end-to-end browser walkthrough; this document fixes its security and API
+contract.
+
+### Bounded route and operation contract
+
+The following is the first bounded surface. “Backend mapping” means the
+existing canonical operation whose authorization wrapper must run before the
+call; it does not authorize direct database access. All mutation rows require
+the authenticated principal, current membership check, and a request ID.
+
+| Route/operation | Principal and role | Preconditions | Idempotency and response/errors | Backend mapping |
+| --- | --- | --- | --- | --- |
+| `POST /v1/sessions`, `DELETE /v1/sessions/current` | Anonymous login; authenticated logout | Login uses local account; logout uses current session | Login is not idempotent; `201` session or uniform `401`; logout exact session returns `204` | Local account verifier; session create/revoke |
+| `POST /v1/accounts/{id}/reset`, `POST /v1/accounts/{id}/disable` | Superuser; self-service reset uses an authenticated recovery flow | Reset/disable requires current account state and explicit audit reason | Key scoped to admin/session + account + action; `200` canonical state, `403/404/409` | Account reset/disable and session/token revocation |
+| `POST /v1/projects`, `GET /v1/projects`, `POST /v1/projects/{id}/archive` | Authenticated user; create default enabled; list members only; archive owner/superuser | Create validates unique metadata; archive requires active owner and confirmation | Create/archive key scoped to principal + route + payload; `201/200`, `403/409` | Project create/list and archive state transition |
+| `PUT /v1/projects/{id}/members/{user}`, `DELETE .../members/{user}` | Owner or superuser | Assigner is current owner; cannot remove final active owner | Key scoped to principal + project + target + payload; `200/204`, `403/409` | Membership add/remove and role transition |
+| `POST /v1/projects/{id}/worker-credentials`, `POST .../revoke` | Owner or superuser issues; owner of credential may revoke own | Project membership current; requested scope subset of issuer scope | Issue/revoke key scoped to principal + project + credential/action; secret once on `201`, then `204`; `403/409` | Credential registry and revocation |
+| `GET /v1/projects/{id}/tasks`, `GET .../tasks/{task}` | Project member; viewer may read | Membership checked before query and cursor validation | Opaque cursor bound to principal/project/query; `200`, `401/403/404` | Canonical task/list/show and history views |
+| `POST /v1/projects/{id}/tasks/{task}/claim` | Contributor/owner or bound worker credential | Task open/claimable and actor binding matches credential | Key scoped to principal + project + task + claim context; `200`, `403/409` | Existing atomic claim operation |
+| `POST /v1/projects/{id}/tasks/{task}/reviews` | Contributor submits; owner/reviewer role requests or approves | Current contribution and review chain are read under same authorization check | Key scoped to principal + task + contribution + operation; `201`, `403/409` | Structured contribution/review protocol |
+| `POST /v1/projects/{id}/tasks/{task}/checkpoints` | Contributor/owner; viewer denied | Checkpoint previous/cursor is current; task membership remains valid | Key scoped to principal + task + previous + payload; `201`, `403/409` | Canonical checkpoint append |
+| `GET /v1/projects/{id}/tasks/{task}/history` | Project member; audit is separate | Cursor is bound to authorized task/project snapshot | Opaque cursor; `200`, `403/404/409` | Bounded history/activity read |
+| `POST /v1/projects/{id}/feedback`, `GET /v1/projects/{id}/feedback` | Contributor/owner may add; project member may read per default policy | Source task/version and evidence are bounded; membership current | Add key scoped to principal + project + source + payload; `201`; list cursor; `403/409` | Feedback append/list stream |
+
+All successful mutation responses contain the canonical operation or record
+identifier and committed state. `401` means no valid authenticated principal,
+`403` means the principal lacks authority, `404` hides inaccessible existence,
+`409` covers stale state, final-admin safeguards and idempotency conflicts,
+`413` covers limits, `422` covers invalid structured payloads, and `429`
+covers throttling. A timeout or `5xx` never fabricates success: the client
+must reconcile with the same idempotency key or canonical read.
+
+Membership and revocation race handling is transactional at the service
+boundary: authorization reads the account/session/credential, membership,
+role and resource version under one database transaction or equivalent
+serializable check; the mutation records the checked authorization version.
+Revocation/disablement commits invalidate future operations and waits for
+in-flight transactions to commit or abort before reporting completion. A
+request that loses the race returns `401`, `403` or `409` and cannot complete
+the canonical mutation.
+
+Existing actor-owned claims are mapped by an explicit migration table from
+legacy actor string to stable user ID and, where applicable, credential ID.
+The first authenticated operation must prove possession of the mapped
+credential; spelling, display name, SSH key comment and actor string alone are
+not proof. Ambiguous or unmapped claims remain attributed historical records
+and require an explicit owner-authorized handoff before a new principal acts.
 
 ## 7. Attachments, replay and idempotency
 
@@ -308,25 +387,50 @@ HTTP roles implicitly. Local same-host transport remains explicit and does not
 fall back to HTTP or SSH. During migration, do not expose the database or
 shared runtime path to ordinary browser users.
 
-## 10. Phased migration
+### Implementation contract versus rollout configuration
 
-1. **Design and decision:** accept this boundary, select authority policies,
-   hosting/TLS constraints, retention and recovery owners, and create linked
-   implementation briefs. Keep the current trusted SSH deployment unchanged.
-2. **Disposable service:** implement the minimal API/auth package behind a
-   private TLS test endpoint; validate project isolation, actor binding,
-   revocation, idempotency, limits, audit and recovery with synthetic data.
-3. **Pilot bridge:** create explicit local accounts and project memberships.
+The `.19` implementation may proceed against a disposable local configuration
+once the route matrix, defaults above, transaction/revocation rules and
+contract tests are reviewed. It must use placeholders for hostname,
+certificate paths, proxy address, secret-store location, retention and
+recovery owner. Those are office rollout configuration, not prerequisites for
+implementing or testing the service.
+
+The office deployment owner later selects the real hostname, certificate
+operator, network exposure, backup key owner, retention period, recovery
+objective and incident contacts. A future SSO provider and MFA policy are
+integration choices; they are not prerequisites for the first local
+username/password implementation. The service must retain an identity-provider
+seam and be explicit when an office rollout has not selected one.
+
+## 10. Phased migration and exit criteria
+
+1. **Design and contract review:** review this boundary, route matrix,
+   configurable defaults, threat model and test plan. Keep the current
+   trusted SSH deployment unchanged. Exit when the coordinator records review
+   disposition and the implementation briefs reference this design.
+2. **`.19` disposable service:** implement the minimal API/auth package behind
+   a private TLS test endpoint using synthetic local configuration. Exit when
+   contract tests demonstrate local login/logout/reset/disable, project
+   isolation, actor binding, revocation races, idempotent retries, bounded
+   attachments, audit redaction, restart and restore; no office listener is
+   required.
+3. **`.20` required browser workflow:** build sign-in, create/join, project
+   membership, task/claim, checkpoint/history, feedback and contribution/review
+   screens against the reviewed API. Exit when a fresh synthetic user and
+   second worker complete the browser walkthrough, unauthorized project data
+   stays hidden, stale/retry errors are visible, and accessibility checks pass.
+4. **Pilot bridge:** create explicit local accounts and project memberships.
    Register worker credentials per project and map existing SSH actor/run
    records to stable user IDs as attribution metadata. Do not infer identity
-   from actor spelling or silently merge people. Keep SSH available for
-   operators and provide a documented rollback to it.
-4. **Office rollout:** provision TLS and accounts through the selected
-   operator-controlled process, run a backup/restore drill, invite users,
-   monitor audit/rate-limit signals, and migrate one disposable/project
-   cohort at a time. Revoke bridge credentials after verification.
-5. **Browser UI:** only after the API/auth contract is reviewed, implement the
-   required multi-user workflow against the same authorization boundary.
+   from actor spelling or silently merge people. Exit when one disposable
+   project cohort passes backup/restore and rollback, with SSH still available
+   for operators.
+5. **Office rollout:** the deployment owner selects hostname, TLS, proxy,
+   secret store, retention, recovery and optional external authentication.
+   Run a backup/restore drill, invite users, monitor audit/rate-limit signals,
+   and migrate one approved cohort at a time. Exit only after explicit
+   operational approval and live verification; this design grants neither.
 
 No migration step changes the draft BRD in place. Requirement changes,
 authority decisions and implementation acceptance are separate canonical
@@ -360,23 +464,32 @@ Review must separately label design acceptance, implementation, tests,
 integration, deployment and live verification. This document claims none of
 those lifecycle facts merely because examples or proposed tests exist.
 
-## 12. Open decisions before implementation
+## 12. Open decisions before implementation and rollout
 
-- Which named authorities may create projects, assign owners, approve
-  memberships and operate the global superuser?
-- Are ordinary users allowed to create projects, and is invitation required?
-- Which project roles may read attachments, audit records and private feedback?
-- What are the session/token lifetimes, MFA expectations and account-recovery
-  authority for the initial office?
-- Which TLS termination, hostname, network exposure, proxy trust and
-  certificate-renewal policy is approved?
-- What deployment owner, backup key owner, retention period and recovery
-  objective apply?
-- Which external identity provider, if any, will be linked later, and who may
-  bind an external subject to an existing local account?
-- Which exact canonical endpoint/client surfaces are in the first HTTP slice,
-  and which remain SSH-only for operators?
+The following are genuine coordinator/owner decisions, with the recommended
+default already usable for disposable implementation:
 
-Until these are answered in canonical decisions, `.19` and `.20` must treat
-the corresponding behavior as blocked design input rather than inventing a
-security policy.
+- **Project creation:** recommend authenticated creation with creator as owner;
+  effect of disabling it is that only a superuser can create and assign the
+  first owner.
+- **Owner delegation:** recommend only superusers assign/remove owners; effect
+  is that project owners administer contributor/viewer membership only.
+- **Visibility:** recommend members read private feedback and permitted
+  attachments, while only owners/superusers read audit; effect is narrower
+  disclosure for viewers and contributors.
+- **Recovery authority:** recommend superuser-only local reset with the
+  provisional 30-minute reset value and immediate credential/session
+  revocation; effect is an operator-controlled, no-email bootstrap.
+- **Office rollout:** select the hostname, TLS termination/certificate
+  operator, proxy trust and network exposure; effect is deployment-specific
+  configuration, not a change to the API contract.
+- **Operations:** assign deployment and backup-key owners, retention and
+  recovery objectives; effect is required before office rollout/live
+  verification, not before disposable implementation.
+- **External identity:** select whether and when to bind an SSO provider or
+  MFA; effect is a future authentication enhancement, not a prerequisite for
+  local accounts.
+
+The first implementation is blocked only on review of this contract and its
+configurable defaults. `.19` and `.20` must not claim deployment authority;
+office configuration, SSO/MFA and live verification remain separate decisions.
