@@ -93,8 +93,7 @@ class VersionTests(unittest.TestCase):
             extracted.mkdir()
             with tarfile.open(archive) as bundle:
                 bundle.extractall(extracted)
-            root = next(extracted.iterdir())
-            result = version.report(root)
+            result = version.report(extracted)
         self.assertEqual(result["source_commit"], "unknown")
         self.assertEqual(result["build_id"], "unreleased-source")
 
