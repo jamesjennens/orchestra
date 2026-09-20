@@ -10,6 +10,33 @@ ID=re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,160}')
 INTENT_PREFIX = 'Kind: task-handoff-v1\n'
 COMPLETE_PREFIX = 'Kind: task-handoff-complete-v1\n'
 
+def parse_identity(prefix, body):
+    """Return the canonical handoff identity payload, or None if not exact."""
+    if not isinstance(body, str) or not body.startswith(prefix):
+        return None
+    try:
+        identity = json.loads(body[len(prefix):])
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(identity, dict):
+        return None
+    try:
+        validate_receipt({'digest': content_hash(identity), 'status': 'pending',
+                          'identity': identity})
+    except ValueError:
+        return None
+    if canonical_bytes(identity).decode() != body[len(prefix):]:
+        return None
+    return identity
+
+
+def is_valid_intent(body):
+    return parse_identity(INTENT_PREFIX, body) is not None
+
+
+def is_valid_completion(body):
+    return parse_identity(COMPLETE_PREFIX, body) is not None
+
 def validate(p):
     keys={'schema_version','operation_id','task','from_actor','to_actor','reason','approval'}
     if not isinstance(p,dict) or set(p)!=keys or type(p['schema_version']) is not int or p['schema_version']!=1:raise ValueError('Invalid handoff payload')

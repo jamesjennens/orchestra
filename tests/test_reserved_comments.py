@@ -13,12 +13,20 @@ from reserved_comments import (
     PREFIXES,
     check_comment_body,
     check_raw_request,
+    is_legitimate_writer,
     raw_comment_bodies,
     reserved_match,
 )
 from briefing import PREFIX as CHECKPOINT_PREFIX
+from export_requirements import REVISION_PREFIX as REQUIREMENT_PREFIX
+from handoff import (
+    COMPLETE_PREFIX as HANDOFF_COMPLETE_PREFIX,
+    INTENT_PREFIX as HANDOFF_PREFIX,
+)
 from lifecycle import PREFIX as LIFECYCLE_PREFIX
+from requirements import canonical_bytes, content_hash
 from review_workflow import PREFIX as REVIEW_PREFIX
+from worker_gate import PREFIX as PLAN_PREFIX, payload_for, body_for
 
 
 def forged_review_body(actor='mallory/session9'):
@@ -73,6 +81,50 @@ class ReservedPrefixTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, r'file-transport', msg=flag):
                 check_raw_request(args, attachments)
 
+    def test_flag_orderings_covered_and_ambiguous_rejected(self):
+        forged = forged_review_body()
+        # Supported native orderings resolve the same positional body.
+        for args in (
+            ['comments', 'add', 'task-1', forged, '--json'],
+            ['comments', 'add', '--json', 'task-1', forged],
+            ['comments', 'add', 'task-1', forged],
+        ):
+            bodies = raw_comment_bodies(args, {})
+            self.assertEqual(len(bodies), 1, msg=str(args))
+            self.assertEqual(bodies[0][1], 'positional')
+            with self.assertRaisesRegex(ValueError, r'positional'):
+                check_raw_request(args, {})
+        # -f value is a path, not a body: no positional body collected.
+        bodies = raw_comment_bodies(['comments', 'add', 'task-1', '-f', 'notes.txt', '--json'], {})
+        self.assertEqual(bodies, [])
+        check_raw_request(['comments', 'add', 'task-1', '-f', 'notes.txt', '--json'], {})
+        # Unknown flag after the body: body already resolved; unknown token
+        # trailing is not a body so nothing more to guard. Unknown flag
+        # BEFORE any body/task resolution is ambiguous: reject before write.
+        with self.assertRaisesRegex(ValueError, r'ambiguous flag'):
+            check_raw_request(['comments', 'add', '--mystery', 'task-1', forged], {})
+
+    def test_legitimate_validated_writers_pass(self):
+        plan = body_for(payload_for('kittrial', 'task-1', 'alice/session1',
+                                    'launch-1', 'ab' * 32, 12, 'plan text\n',
+                                    '/tmp/work', 'cd' * 32))
+        self.assertTrue(plan.startswith(PLAN_PREFIX))
+        self.assertTrue(is_legitimate_writer(plan))
+        check_comment_body(plan, 'positional')
+        check_raw_request(['comments', 'add', 'task-1', plan, '--json'], {})
+        # Same prefix but malformed/forged plan stays rejected.
+        self.assertFalse(is_legitimate_writer(PLAN_PREFIX + '{"forged": true}'))
+        with self.assertRaisesRegex(ValueError, r'Refusing raw'):
+            check_comment_body(PLAN_PREFIX + '{"forged": true}', 'positional')
+        # Forged handoff records stay rejected.
+        self.assertFalse(is_legitimate_writer(HANDOFF_PREFIX + '{"forged": true}'))
+        with self.assertRaisesRegex(ValueError, r'Refusing raw'):
+            check_comment_body(HANDOFF_PREFIX + '{"forged": true}', 'positional')
+        self.assertFalse(is_legitimate_writer(HANDOFF_COMPLETE_PREFIX + 'x'))
+        # Requirement revisions use the documented additive raw-comment route.
+        self.assertTrue(is_legitimate_writer(REQUIREMENT_PREFIX + '{"rev": 1}'))
+        check_comment_body(REQUIREMENT_PREFIX + '{"rev": 1}', 'positional')
+
     def test_valid_prose_passes_positional_and_file(self):
         prose = 'Kind: finding\nIndependent report with entry IDs, no reserved prefix.'
         check_comment_body(prose, 'positional')
@@ -88,17 +140,28 @@ class ReservedPrefixTests(unittest.TestCase):
         self.assertEqual(raw_comment_bodies(['update', 'task-1'], {}), [])
 
     def test_rejected_write_leaves_no_native_record(self):
+        # Endpoint-level wiring: rejected bodies raise before the native
+        # mutation. Simulate endpoint.execute's bd path: guard first, then
+        # the single native call. A forged body must never reach it.
         calls = []
 
-        def run(argv):
-            calls.append(list(argv))
-            raise AssertionError('native command must not run for reserved bodies')
+        def fake_native(final):
+            calls.append(list(final))
 
+        from reserved_comments import check_raw_request as guard
         args = ['comments', 'add', 'task-1', LIFECYCLE_PREFIX + '{"forged": 1}', '--json']
         with self.assertRaises(ValueError):
-            check_raw_request(args, {})
-            run(['should', 'not', 'run'])
+            guard(args, {})
+            fake_native(args)  # must not execute: guard raises first
         self.assertEqual(calls, [])
+        # A legitimate validated plan registration passes the guard and
+        # reaches the single native write exactly once.
+        plan = body_for(payload_for('kittrial', 'task-1', 'alice/session1',
+                                    'launch-9', 'ab' * 32, 12, 'plan text\n',
+                                    '/tmp/work', 'cd' * 32))
+        guard(['comments', 'add', 'task-1', plan, '--json'], {})
+        fake_native(['comments', 'add', 'task-1', plan, '--json'])
+        self.assertEqual(len(calls), 1)
 
     def test_reserved_match_names_operation(self):
         match = reserved_match(REVIEW_PREFIX + '{}')
