@@ -9,6 +9,10 @@ KIT_VERSION = "0.1.0"
 SOURCE_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 
 
+def _digest(path):
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+
+
 def _manifest(root):
     try:
         manifest = json.loads((Path(root) / "provenance.json").read_text(encoding="utf-8"))
@@ -27,7 +31,7 @@ def _manifest(root):
                     not re.fullmatch(r"[0-9a-f]{64}", digest)):
                 return None
             path = Path(root) / name
-            if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            if not path.is_file() or _digest(path) != digest:
                 return None
         return manifest
     except (OSError, UnicodeError, ValueError, TypeError):

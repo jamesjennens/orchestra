@@ -17,7 +17,9 @@ class VersionTests(unittest.TestCase):
     def write_manifest(self, root, source_commit="unknown", build_id="build-1"):
         files = {}
         for name in ("VERSION", "version.py"):
-            files[name] = hashlib.sha256((root / name).read_bytes()).hexdigest()
+            files[name] = hashlib.sha256(
+                (root / name).read_bytes().replace(b"\r\n", b"\n")
+            ).hexdigest()
         (root / "provenance.json").write_text(json.dumps({
             "schema_version": 1, "component": "orchestra-kit",
             "version": "9.8.7", "source_commit": source_commit,

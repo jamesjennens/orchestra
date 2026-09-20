@@ -20,6 +20,10 @@ from pathlib import Path
 CLIENT_VERSION = "0.1.0"
 SOURCE_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 
+
+def _digest(path):
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+
 def report(root=None, component="client"):
     root = Path(root or Path(__file__).resolve().parent)
     metadata = {"component": component, "version": CLIENT_VERSION,
@@ -38,7 +42,7 @@ def report(root=None, component="client"):
                     name != "provenance.json" and isinstance(digest, str) and
                     re.fullmatch(r"[0-9a-f]{64}", digest) and
                     (root / name).is_file() and
-                    hashlib.sha256((root / name).read_bytes()).hexdigest() == digest
+                    _digest(root / name) == digest
                     for name, digest in manifest["files"].items())):
             metadata.update(source_commit=manifest["source_commit"],
                             build_id=manifest["build_id"])
