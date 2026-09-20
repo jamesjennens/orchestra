@@ -125,8 +125,8 @@ double-submit CSRF defense. Do not put session values in URLs or
 
 ### Worker/API credentials
 
-A human account may issue a named, project-scoped worker credential through an
-authorized API operation. The secret is displayed once, stored server-side
+A project owner or superuser may issue a named, project-scoped worker
+credential through an authorized API operation. The secret is displayed once, stored server-side
 only as a verifier or token hash, and carries an ID, owner user ID, allowed
 project(s), allowed operation scope, creation/last-use/expiry timestamps and
 revocation state. Prefer short-lived access tokens obtained from a separately
@@ -189,12 +189,13 @@ The minimum action matrix is:
 | --- | --- | --- | --- | --- |
 | List/open an authorized project | all | own | member | member |
 | Read tasks, history, decisions, checkpoints and permitted attachments | all | own | member | member |
-| Create a project | yes | no | no | no |
+| Create a project | yes, or authenticated user when enabled | no | no | no |
 | Invite/remove members and assign contributor/viewer | all | own | no | no |
 | Assign/remove project owner | all, subject to safeguard | policy-controlled, subject to safeguard | no | no |
 | Create/update jobs, tasks, feedback and checkpoints | all | own | member, per operation | no |
 | Claim work as the authenticated worker subject | all | own | own permitted credential | no |
 | Submit/revise a contribution or review request | all | own | member, per workflow | no |
+| Issue/revoke worker credentials | all | own project | no | no |
 | Read project audit | all | own | no | no |
 | Disable users, reset accounts, manage all projects | yes | no | no | no |
 
@@ -285,14 +286,16 @@ the authenticated principal, current membership check, and a request ID.
 
 | Route/operation | Principal and role | Preconditions | Idempotency and response/errors | Backend mapping |
 | --- | --- | --- | --- | --- |
+| `POST /v1/accounts`, `GET /v1/accounts` | Superuser; list is superuser-only | Create requires unique username and initial disabled/unset password; list is administrative | Create key scoped to principal + route (not payload); `201` account without a password, `403/409`; list `200` redacts secrets | Account create/list and audit |
 | `POST /v1/sessions`, `DELETE /v1/sessions/current` | Anonymous login; authenticated logout | Login uses local account; logout uses current session | Login is not idempotent; `201` session or uniform `401`; logout exact session returns `204` | Local account verifier; session create/revoke |
-| `POST /v1/accounts/{id}/reset`, `POST /v1/accounts/{id}/disable` | Superuser; self-service reset uses an authenticated recovery flow | Reset/disable requires current account state and explicit audit reason | Key scoped to admin/session + account + action; `200` canonical state, `403/404/409` | Account reset/disable and session/token revocation |
+| `POST /v1/accounts/{id}/password`, `POST /v1/accounts/{id}/reset`, `POST /v1/accounts/{id}/reset/redeem`, `POST /v1/accounts/{id}/disable` | Password change: account owner or superuser; reset issue/disable: superuser; reset redeem: reset recipient | Change requires current password or superuser; issue creates a pending single-use reset; redeem requires unexpired reset value and new password | Change/redeem key scoped to principal + account + operation; reset issue key scoped to admin + account; `204/200`, `401/403/409`; reset value is never returned by API | Password verifier update; reset-token consume; account disable and session/token revocation |
 | `POST /v1/projects`, `GET /v1/projects`, `POST /v1/projects/{id}/archive` | Authenticated user; create default enabled; list members only; archive owner/superuser | Create validates unique metadata; archive requires active owner and confirmation | Create/archive key scoped to principal + route + payload; `201/200`, `403/409` | Project create/list and archive state transition |
 | `PUT /v1/projects/{id}/members/{user}`, `DELETE .../members/{user}` | Owner or superuser | Assigner is current owner; cannot remove final active owner | Key scoped to principal + project + target + payload; `200/204`, `403/409` | Membership add/remove and role transition |
-| `POST /v1/projects/{id}/worker-credentials`, `POST .../revoke` | Owner or superuser issues; owner of credential may revoke own | Project membership current; requested scope subset of issuer scope | Issue/revoke key scoped to principal + project + credential/action; secret once on `201`, then `204`; `403/409` | Credential registry and revocation |
+| `POST /v1/projects/{id}/worker-credentials`, `POST .../worker-credentials/{credential}/revoke` | Owner or superuser issues; owner of credential may revoke own | Project membership current; requested scope subset of issuer scope | Issue key scoped to principal + project + route; request hash detects payload conflicts; `201` secret once, exact uncertain retry `200` metadata only; revoke key scoped to principal + project + credential, `204`; `403/409` | Credential registry and revocation |
+| `POST /v1/projects/{id}/jobs`, `PATCH /v1/projects/{id}/jobs/{job}`, `POST /v1/projects/{id}/tasks`, `PATCH /v1/projects/{id}/tasks/{task}` | Owner/contributor for create/update according to project policy; viewer denied | Membership current; update carries resource version; task parent/job must be in same project | Key scoped to principal + project + route + client operation ID; `201/200`, `403/409` | Canonical job/task create/update |
 | `GET /v1/projects/{id}/tasks`, `GET .../tasks/{task}` | Project member; viewer may read | Membership checked before query and cursor validation | Opaque cursor bound to principal/project/query; `200`, `401/403/404` | Canonical task/list/show and history views |
 | `POST /v1/projects/{id}/tasks/{task}/claim` | Contributor/owner or bound worker credential | Task open/claimable and actor binding matches credential | Key scoped to principal + project + task + claim context; `200`, `403/409` | Existing atomic claim operation |
-| `POST /v1/projects/{id}/tasks/{task}/reviews` | Contributor submits; owner/reviewer role requests or approves | Current contribution and review chain are read under same authorization check | Key scoped to principal + task + contribution + operation; `201`, `403/409` | Structured contribution/review protocol |
+| `POST /v1/projects/{id}/tasks/{task}/reviews` | Contributor submits; project owner requests or approves | Current contribution and review chain are read under same authorization check | Key scoped to principal + task + contribution + operation; `201`, `403/409` | Structured contribution/review protocol |
 | `POST /v1/projects/{id}/tasks/{task}/checkpoints` | Contributor/owner; viewer denied | Checkpoint previous/cursor is current; task membership remains valid | Key scoped to principal + task + previous + payload; `201`, `403/409` | Canonical checkpoint append |
 | `GET /v1/projects/{id}/tasks/{task}/history` | Project member; audit is separate | Cursor is bound to authorized task/project snapshot | Opaque cursor; `200`, `403/404/409` | Bounded history/activity read |
 | `POST /v1/projects/{id}/feedback`, `GET /v1/projects/{id}/feedback` | Contributor/owner may add; project member may read per default policy | Source task/version and evidence are bounded; membership current | Add key scoped to principal + project + source + payload; `201`; list cursor; `403/409` | Feedback append/list stream |
@@ -332,14 +335,28 @@ encodings and archive bombs. Download authorization is checked independently;
 the original filename is display metadata only.
 
 Every mutation that can be retried accepts an idempotency key scoped to
-authenticated principal, project and operation route. Store the request hash,
+authenticated principal, project and operation route. The key namespace does
+not include the request payload: store the canonical request hash separately,
 canonical result or explicit in-progress/unknown state, expiry and audit
-pointer under a uniqueness constraint. The same key with different content
-returns a conflict. A repeated exact request returns the original canonical
+pointer under a uniqueness constraint. and the same key with different content returns a conflict. A repeated exact
+request returns the original canonical
 result; it must not duplicate a task, comment, attachment registration or
 role change. Idempotency does not make a non-transactional external side effect
 exactly once, so the response and reconciliation protocol must expose unknown
 outcomes.
+
+Credential issuance is the deliberate exception to replaying a secret. The
+issuance idempotency record stores the credential ID, request hash, status and
+secret-delivery state, but never the bearer secret. If the `201` response is
+lost, an exact retry returns `200` with the credential ID and
+`secret_available:false`; it never creates a second secret and never exposes
+the original secret after the one-time delivery window. The caller then uses
+`POST .../worker-credentials/{id}/revoke` with the same authenticated owner
+or superuser, reconciles the revoked state, and issues a new credential with a
+new idempotency key. A failed or uncertain issuance is therefore explicitly
+reconciled, not treated as a usable credential. Revoke has its own idempotency
+record and returns `204` for the committed revoked state; it does not replay
+or return an issuance secret.
 
 Pagination cursors are opaque, bounded and bound to principal/project/query
 scope. Do not accept client offsets as authorization or use timestamps alone
@@ -493,3 +510,14 @@ default already usable for disposable implementation:
 The first implementation is blocked only on review of this contract and its
 configurable defaults. `.19` and `.20` must not claim deployment authority;
 office configuration, SSO/MFA and live verification remain separate decisions.
+
+The required fresh-user walkthrough is therefore concrete: a superuser creates
+an account and the user sets a password through the one-time reset redemption;
+the authenticated user creates a project when creation is enabled (otherwise
+the superuser creates it and assigns membership); the owner adds a second
+member, creates a job and task, and issues a project-scoped worker credential;
+the worker claims the task, appends a checkpoint and submits a contribution;
+the owner reviews it and both users can read the permitted history and
+feedback. Every transition is backed by the routes above, current role checks,
+and canonical backend records. A password reset issuance alone does not
+complete onboarding: only redemption by the recipient changes the verifier.
