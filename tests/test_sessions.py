@@ -97,6 +97,19 @@ class SessionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'different actor'):
             sessions.execute(self.path,'example',['run','heartbeat','--run-id',run_id,'--event-id',str(uuid.uuid4())],self.export,actor=other)
 
+    def test_existing_run_rejects_new_start_and_binds_followup_events_to_task(self):
+        actor=self.register()['session']['actor']
+        run_id=str(uuid.uuid4())
+        sessions.execute(self.path,'example',['run','start','--run-id',run_id,'--event-id',str(uuid.uuid4()),'--task','trial-task'],self.export,actor=actor)
+        with self.assertRaisesRegex(ValueError,'already exists'):
+            sessions.execute(self.path,'example',['run','start','--run-id',run_id,'--event-id',str(uuid.uuid4()),'--task','other'],self.export,actor=actor)
+        with self.assertRaisesRegex(ValueError,'bound task'):
+            sessions.execute(self.path,'example',['run','heartbeat','--run-id',run_id,'--event-id',str(uuid.uuid4()),'--task','other'],self.export,actor=actor)
+        heartbeat=sessions.execute(self.path,'example',['run','heartbeat','--run-id',run_id,'--event-id',str(uuid.uuid4()),'--task','trial-task'],self.export,actor=actor)
+        self.assertEqual(heartbeat['run']['status'],'running')
+        ended=sessions.execute(self.path,'example',['run','end','--run-id',run_id,'--event-id',str(uuid.uuid4()),'--task','trial-task','--status','succeeded'],self.export,actor=actor)
+        self.assertEqual(ended['run']['status'],'succeeded')
+
     def test_worker_start_uses_allocated_actor_for_onboarding(self):
         record={'actor':'session-'+str(uuid.uuid4()),'name':'worker','request_id':str(uuid.uuid4()),'created_at':'2026-09-16T00:00:00+00:00'}
         replies=[{'returncode':0,'stdout':json.dumps({'session':record}),'stderr':''},{'returncode':0,'stdout':'Instructions','stderr':''}]
@@ -105,6 +118,17 @@ class SessionTests(unittest.TestCase):
         self.assertIsNone(request.call_args_list[0].args[2])
         self.assertEqual(request.call_args_list[1].args[2],record['actor'])
         self.assertEqual(request.call_args_list[1].kwargs['action'],'onboard')
+
+    def test_worker_run_routes_each_event_to_session_action_without_rewriting_args(self):
+        actor='session-'+str(uuid.uuid4())
+        for kind, extra in (('start',['--task','trial-task']),('heartbeat',['--task','trial-task']),('end',['--task','trial-task','--status','succeeded'])):
+            with self.subTest(kind=kind):
+                argv=['worker.py','--root','/srv/runtime','--project','example','--actor',actor,
+                      'run',kind,'--run-id',str(uuid.uuid4()),'--event-id',str(uuid.uuid4()),*extra]
+                with patch.object(sys,'argv',argv), patch.object(worker,'request',return_value={'returncode':0,'stdout':'event\n','stderr':''}) as call, patch('sys.stdout',new_callable=__import__('io').StringIO):
+                    self.assertEqual(worker.main(),0)
+                self.assertEqual(call.call_args.kwargs['action'],'session')
+                self.assertEqual(call.call_args.args[3],argv[8:])
 
     def test_worker_does_not_register_when_onboarding_missing(self):
         with patch.object(sys,'argv',['worker.py','--root','/srv/runtime','--project','example','start','--name','worker']),patch('onboarding.execute',side_effect=ValueError('missing')),patch('admin.root_path',return_value=self.path),patch('worker.request') as request:

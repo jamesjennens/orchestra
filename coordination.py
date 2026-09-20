@@ -10,7 +10,9 @@ from requirements import content_hash, load_json
 def atomic(path, data):
     tmp=path.with_suffix('.tmp')
     with tmp.open('w',encoding='utf-8') as stream:
-        json.dump(data,stream,ensure_ascii=False,sort_keys=True)
+        # Escape non-ASCII in coordination JSON so the sidecar remains
+        # readable even when a Windows caller uses its legacy default codec.
+        json.dump(data,stream,ensure_ascii=True,sort_keys=True)
         stream.flush();os.fsync(stream.fileno())
     os.replace(tmp,path)
 

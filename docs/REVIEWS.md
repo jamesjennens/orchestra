@@ -14,6 +14,12 @@ This records a durable resume event without allocating another actor or changing
 
 Do not call `start` again merely because the harness started a fresh process. Retain the actor in private worker configuration or handoff notes. Registered resume requires a registered actor. Existing legacy actors can still use `onboard` and `work --mine` under their original actor; do not invent a registration to replace them implicitly. Matching names and elapsed time never authorize takeover.
 
+Worker run events preserve the same actor and task through the session route:
+`worker.py ... run start|heartbeat|end --run-id RUN --event-id EVENT --task TASK`
+(end also requires `--status succeeded|failed|cancelled`). Only an exact
+retry of a start is accepted; a new start, task change or status change is
+refused, and a running status is not completion evidence.
+
 ## Replacement worker: explicit handoff
 
 For a new actor taking over an existing task, the current owner supplies this JSON (use an exact saved target actor, not a display name):
@@ -41,6 +47,11 @@ python3 admin.py --root /PATH/runtime handoff PROJECT --actor COORDINATOR_ACTOR 
 This operator-only path records the initiator, approval evidence, old/new actor and reason. It is not a new permission system: service-account shell access remains trusted, and approval evidence must reflect actual authorization. The contributor endpoint does not accept an operator override.
 
 Handoff checks the expected current owner, journals the operation, records native intent/completion comments and changes only the assignee. It does not reopen/close tasks, change review/lifecycle facts or transfer a merge slot. If interrupted, inspect and retry the exact payload under the same initiating actor/authority. A completed retry never reassigns a task that has subsequently moved again. Pending journals are included in backups and must be reconciled after restore. Reopen a closed task explicitly under existing authority before requesting revisions.
+
+Requested handoffs are checked against the current task owner under the
+project lock. The destination may publish an attributed `accept` or `decline`;
+the current owner may `withdraw` or explicitly `supersede` a disposition. A
+requester cannot self-approve, and retries must reuse the exact payload.
 
 ## Structured contribution delivery
 
@@ -120,5 +131,11 @@ b review example-task
 The queue sorts requested changes first and shows task status, owner, review state, exact contribution commit and separate lifecycle values/scope. `--owner ACTOR`, `--limit` and `--offset` support coordinator scans. Pages are fresh views, not immutable history snapshots. Closed tasks with outstanding review state remain visible; closure is not acceptance. An approved contribution with passed scoped integration evidence can display integrated. Check the scope-match field before applying historical lifecycle evidence to the current contribution.
 
 `brief` prioritizes pending review actions over an older checkpoint's next action. It shows up to five pending items with a pointer to `review TASK` for the rest. Generated CURRENT.md includes a bounded review queue; native `list` remains unchanged. Legacy `review-ready` labels remain discoverable, but structured review state takes precedence. If a task has no checkpoint, its description and acceptance are shown without calling it legacy work.
+
+The work queue is a fresh, project-scoped bounded view (`--limit` and
+`--offset`). Malformed task, review, lifecycle or handoff records remain
+visible as `review_state: error` rather than disappearing. Complete backup
+sidecars validate every coordination record and handoff disposition before
+restore.
 
 The structured protocol is an append-only native comment chain with previous-comment checks. Do not hand-edit those comments. Forked/malformed records fail clearly and need operator reconciliation. Report/label changes are separate writes; a retry repairs interrupted removal of review-ready, while structured state stays authoritative.

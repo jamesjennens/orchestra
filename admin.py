@@ -164,12 +164,22 @@ def validate_coordination_files(files):
             from handoff import validate_receipt
             validate_receipt(record)
             if name!='.handoffs/'+content_hash({'operation_id':record['identity']['payload']['operation_id']})+'.json':raise ValueError('Handoff receipt path mismatch')
+        if name.startswith('.coordination-requests/'):
+            valid_receipt=(isinstance(record,dict) and record.get('status') in ('pending','complete')
+                           and set(record) in ({'sha256','status'},{'sha256','status','id'})
+                           and re.fullmatch(r'[a-f0-9]{64}',str(record.get('sha256',''))))
+            if valid_receipt and record['status']=='complete':
+                valid_receipt=isinstance(record.get('id'),str) and bool(record['id'])
+            if not valid_receipt:
+                raise ValueError('Invalid coordination request receipt')
+        if name=='.merge-context.json':
+            if not isinstance(record,dict) or set(record)!={'holder','task','target'} or not all(isinstance(record[k],str) and record[k].strip() for k in ('holder','task','target')):
+                raise ValueError('Invalid merge context')
+            if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}',record['holder']):
+                raise ValueError('Invalid merge context holder')
         if name.startswith('.handoff-requests/'):
-            from handoff import validate_request
-            validate_request({'schema_version':record.get('schema_version'),'operation':'request',
-                              'request_id':record.get('request_id'),'task':record.get('task'),
-                              'from_actor':record.get('from_actor'),'to_actor':record.get('to_actor'),
-                              'reason':record.get('reason')})
+            from handoff import validate_request_record
+            validate_request_record(record)
             if name!='.handoff-requests/'+content_hash({'request_id':record['request_id']})+'.json':raise ValueError('Handoff request path mismatch')
         if name=='ONBOARDING.md' and (set(record)!={'text'} or not isinstance(record['text'],str) or not record['text'].strip() or len(record['text'].encode('utf-8'))>8000):raise ValueError('Invalid onboarding backup')
 

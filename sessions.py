@@ -116,24 +116,30 @@ def execute(path, project, args, export, *, actor=None):
         run=runs.get(a.run_id)
         payload={'kind':a.kind,'run_id':a.run_id,'event_id':a.event_id,'task':a.task,'status':a.status or ''}
         digest=content_hash(payload)
+        created=False
         if run is None:
             if a.kind!='start' or not a.task:raise ValueError('Run start requires a task')
             run={'run_id':a.run_id,'actor':actor,'task':a.task,'status':'running','started_at':now,'last_heartbeat':now,'ended_at':None,'events':{}}
             runs[a.run_id]=run
+            created=True
         elif run['actor']!=actor:
             raise ValueError('Run belongs to a different actor')
         old=run['events'].get(a.event_id)
         if old:
             if old['payload_hash']!=digest:raise ValueError('Run event ID reused with different content')
             return dict(project=project,run=run,event=old,reconciled=True)
-        if a.kind=='start':
+        if created:
             event={'event_id':a.event_id,'kind':'start','actor':actor,'timestamp':now,'payload_hash':digest}
             run['events'][a.event_id]=event
             validate(data);atomic(file,data)
             return dict(project=project,run=run,event=event,reconciled=False)
         if a.kind=='start':
+            # A run ID is an idempotency key, not a way to create a second
+            # execution or mutate the task/status of an existing execution.
             raise ValueError('Run already exists; retry the exact start event')
         if run['status']!='running':raise ValueError('Run is already ended')
+        if not a.task or a.task!=run['task']:
+            raise ValueError('Run event task must match the bound task')
         if a.kind=='heartbeat':
             run['last_heartbeat']=now
         else:

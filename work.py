@@ -13,7 +13,7 @@ def workflow(issue):
         result=dict(result,review_state='legacy-review-ready')
     return result
 
-def queue(rows,actor,args):
+def queue(rows,actor,args,project=None):
     parser=Parser(add_help=False)
     group=parser.add_mutually_exclusive_group();group.add_argument('--mine',action='store_true');group.add_argument('--owner')
     parser.add_argument('--state',choices=['none','awaiting-review','changes-requested','awaiting-integration','integrated','legacy-review-ready','error'])
@@ -21,13 +21,26 @@ def queue(rows,actor,args):
     a=parser.parse_args(args)
     if not 1<=a.limit<=100 or a.offset<0:raise ValueError('Invalid work queue page')
     owner=actor if a.mine else a.owner
-    facts={r['id']:r for r in project_facts(rows)};items=[]
+    fact_errors={}
+    try:
+        facts={r['id']:r for r in project_facts(rows)}
+    except (ValueError,KeyError,TypeError) as exc:
+        # A malformed record must remain visible in the bounded queue rather
+        # than making a whole project appear empty.
+        facts={}
+        fact_errors['__export__']=str(exc)[:300]
+    items=[]
     for row in rows:
+        if project is not None and row.get('project') not in (None,project):continue
         if row.get('issue_type') in ('event','gate','merge-slot'):continue
         if owner is not None and row.get('assignee')!=owner:continue
-        try:review=workflow(row);state=review['review_state'];error=None
-        except ValueError as e:review={};state='error';error=str(e)[:300]
-        fact=facts.get(row['id'],{}).get('facts',{})
+        try:review=workflow(row);state=review['review_state'];error=fact_errors.get('__export__')
+        except (ValueError,KeyError,TypeError) as e:review={};state='error';error=str(e)[:300]
+        task_id=row.get('id')
+        if not isinstance(task_id,str) or not task_id:
+            task_id='[malformed-record]'
+            state='error';error=error or 'Record has no task ID'
+        fact=facts.get(task_id,{}).get('facts',{})
         current_contribution=review.get('contribution') or {}
         current_scope=facts.get(row['id'],{}).get('scope') or {}
         if state=='awaiting-integration' and current_contribution.get('commit','').lower()==current_scope.get('source_commit','').lower() and fact.get('integrated',{}).get('value')=='passed':state='integrated'
@@ -43,11 +56,11 @@ def queue(rows,actor,args):
                     request=json.loads(request_file.read_text(encoding='utf-8'))
                 except (OSError, json.JSONDecodeError):
                     continue
-                if request.get('task')==row['id'] and request.get('status')=='pending':
+                if request.get('task')==task_id and request.get('status')=='pending':
                     handoff_requests.append({'request_id':request.get('request_id'),'from_actor':request.get('from_actor'),
                                              'to_actor':request.get('to_actor'),'requester':request.get('requester'),
                                              'reason':request.get('reason')})
-        items.append({'task':row['id'],'title':str(row.get('title',''))[:200],'owner':row.get('assignee'),'status':row.get('status'),'review_state':state,
+        items.append({'task':task_id,'title':str(row.get('title',''))[:200],'owner':row.get('assignee'),'status':row.get('status'),'review_state':state,
                       'contribution_id':contribution.get('comment_id'),'commit':contribution.get('commit'),'pending_review_items':len(review.get('pending_requests',[])),
                       'pending_handoff_requests':handoff_requests,
                       'lifecycle':{k:v['value'] for k,v in fact.items()},'lifecycle_scope':scope,
@@ -61,7 +74,7 @@ def execute(path,actor,action,args,attachments,run):
     if action=='work':
         queue._request_dir=path/'.handoff-requests'
         rows=[json.loads(line) for line in run(['export','--all']).splitlines() if line.strip()]
-        return queue(rows,actor,args)
+        return queue(rows,actor,args,path.name)
     if len(args) not in (1,2):raise ValueError('Use review TASK [--file payload.json] or handoff TASK --file payload.json')
     task=args[0]
     if action=='review' and len(args)==1:
@@ -77,7 +90,14 @@ def execute(path,actor,action,args,attachments,run):
         from handoff import execute as handoff
         if payload.get('operation')=='request':
             from handoff import request as handoff_request
-            return handoff_request(path,actor,payload)
+            return handoff_request(path,actor,payload,run)
+        if payload.get('operation')=='disposition':
+            from handoff import dispose as handoff_disposition
+            return handoff_disposition(path,actor,payload,run)
+        if payload.get('operation') in ('accept','decline','withdraw','supersede'):
+            from handoff import dispose as handoff_disposition
+            normalized=dict(payload,operation='disposition',disposition=payload['operation'])
+            return handoff_disposition(path,actor,normalized,run)
         return handoff(path,actor,payload,run)
     from review_workflow import execute as review
     rows=[json.loads(line) for line in run(['export','--all']).splitlines() if line.strip()]

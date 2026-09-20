@@ -109,5 +109,19 @@ class HandoffTests(unittest.TestCase):
         record=json.loads(next((self.path/'.handoff-requests').glob('*.json')).read_text())
         admin.validate_coordination_files({'.handoff-requests/'+next((self.path/'.handoff-requests').glob('*.json')).name:record})
 
+    def test_handoff_dispositions_are_attributed_and_exactly_retried(self):
+        request_payload={'schema_version':1,'operation':'request','request_id':'00000000-0000-0000-0000-000000000002',
+                         'task':'trial-task','from_actor':'alice','to_actor':'bob','reason':'Please review ownership'}
+        handoff.request(self.path,'bob',request_payload,self.native)
+        accept={'schema_version':1,'operation':'disposition','request_id':request_payload['request_id'],
+                'task':'trial-task','disposition':'accept','reason':'I accept the transfer'}
+        first=handoff.dispose(self.path,'bob',accept,self.native)
+        retry=handoff.dispose(self.path,'bob',accept,self.native)
+        self.assertFalse(first['reconciled']);self.assertTrue(retry['reconciled'])
+        with self.assertRaisesRegex(ValueError,'not authorized'):
+            handoff.dispose(self.path,'alice',dict(accept,reason='self approve'),self.native)
+        admin.validate_coordination_files({'.handoff-requests/'+next((self.path/'.handoff-requests').glob('*.json')).name:
+                                           json.loads(next((self.path/'.handoff-requests').glob('*.json')).read_text())})
+
 
 if __name__=='__main__':unittest.main()
