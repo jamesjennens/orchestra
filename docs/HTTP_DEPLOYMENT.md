@@ -1,0 +1,216 @@
+# Office HTTP service: installation, TLS and recovery runbook
+
+**Status:** runbook for the disposable `.19` implementation. It describes a
+deployment shape but does not authorize one. No office hostname, certificate,
+secret store, network policy or backup key is selected here; the office owner
+supplies them. Nothing in this document was executed against a live host.
+
+The service is `http_service.py` (wire protocol and authorization), backed by
+`http_auth.py` (accounts, sessions, credentials, membership, audit, idempotency).
+Both use the Python standard library only. `http_client.py` is the worker/CLI
+transport; the existing SSH/local `client.py` transport is unchanged and remains
+the operator path.
+
+## 1. What the service is and is not
+
+It is an authenticated adapter to canonical coordination data: browser sessions
+and project-scoped worker credentials gate every route, and organization is by
+project membership (`owner`, `contributor`, `viewer`) with a global superuser.
+
+It is **not** a replacement for repository permissions, TLS termination, host
+isolation, or the canonical database's own access controls. It never grants Git
+merge, deployment or host authority.
+
+## 2. Components and paths
+
+| Item | Value |
+| --- | --- |
+| Service | `http_service.py` (stdlib `ThreadingHTTPServer`) |
+| Auth core | `http_auth.py` |
+| Client | `http_client.py` |
+| Private state | one JSON document at `--state` (e.g. `<RUNTIME_ROOT>/http-state.json`) |
+| Python | 3.10 or newer; no third-party packages |
+| Listener | loopback by default (`127.0.0.1:8443`), fronted by the reverse proxy |
+
+The state document contains only password verifiers, hashed session/credential
+tokens, membership, idempotency records and audit events. It must live outside
+source control on a private path owned by the service account.
+
+## 3. Provisioning a host (placeholders)
+
+```sh
+# 1. dedicated least-privilege account and private runtime root
+sudo useradd --system --home <RUNTIME_ROOT> --shell /usr/sbin/nologin <SERVICE_USER>
+sudo install -d -m 0700 -o <SERVICE_USER> -g <SERVICE_USER> <RUNTIME_ROOT>
+sudo install -d -m 0700 -o <SERVICE_USER> -g <SERVICE_USER> <RUNTIME_ROOT>/secrets
+
+# 2. the kit (pinned revision; no packages to install)
+sudo -u <SERVICE_USER> git clone <KIT_REPO_URL> <RUNTIME_ROOT>/kit
+cd <RUNTIME_ROOT>/kit && git checkout <PINNED_COMMIT>
+
+# 3. one-time superuser bootstrap; there is no default or shared password
+sudo -u <SERVICE_USER> python3 http_service.py \
+  --state <RUNTIME_ROOT>/http-state.json --bootstrap-user <ADMIN_USERNAME>
+# the operator types the password at the prompt; it is never echoed or logged
+```
+
+Bootstrap refuses to run once any account exists, so it cannot silently reset a
+live deployment. Create ordinary accounts through the API and hand each user a
+single-use reset value; only redemption changes the verifier.
+
+## 4. Service unit
+
+```ini
+# /etc/systemd/system/orchestra-http.service  (placeholders, not installed here)
+[Unit]
+Description=Orchestra authenticated HTTP service
+After=network-online.target
+
+[Service]
+User=<SERVICE_USER>
+Group=<SERVICE_USER>
+WorkingDirectory=<RUNTIME_ROOT>/kit
+ExecStart=/usr/bin/python3 http_service.py \
+  --state <RUNTIME_ROOT>/http-state.json \
+  --host 127.0.0.1 --port 8443 \
+  --trust-proxy
+Restart=on-failure
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=<RUNTIME_ROOT>
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`--trust-proxy` makes the service read the last `X-Forwarded-For` hop for login
+throttling. Enable it **only** when the listener is reachable solely by the
+configured reverse proxy; otherwise a client can spoof the throttle key.
+
+TLS may also terminate at the service itself with
+`--cert <CERT_PATH> --key <KEY_PATH>` (TLS 1.2 minimum). The service refuses a
+plaintext non-loopback listener unless `--allow-plaintext-non-loopback` is passed
+explicitly for a disposable test.
+
+## 5. Reverse proxy (example shape)
+
+```nginx
+# placeholders only; the office owner chooses the real hostname and certificate
+server {
+    listen 443 ssl;
+    server_name <HOSTNAME>;
+    ssl_certificate     <CERT_PATH>;
+    ssl_certificate_key <KEY_PATH>;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    client_max_body_size 300k;          # matches the service body bound
+
+    location / {
+        proxy_pass http://127.0.0.1:8443;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_read_timeout 60s;
+    }
+}
+```
+
+The proxy must reject or redirect plaintext, validate its certificate chain,
+enforce a body limit, and preserve only the documented forwarding headers. Do not
+add a wildcard CORS origin: credentialed requests require an explicit origin list
+and the service sends `Cache-Control: no-store` on every response.
+
+## 6. Worker clients
+
+```sh
+export ORCHESTRA_HTTP_URL=https://<HOSTNAME>
+export ORCHESTRA_PASSWORD='...'          # read from the environment, never an argv
+python3 http_client.py login --username <USERNAME>
+# the client prints the session token to stdout; keep it out of shell history/logs
+python3 http_client.py --token "$TOKEN" call GET /v1/projects
+```
+
+A project owner or superuser issues a project-scoped credential once; the secret
+is shown only in that `201` response. For unattended workers, store it in the
+operator's secret store and use it as a bearer token. An exact retry of a lost
+issuance returns `200` metadata with `secret_available:false`; it never re-delivers
+the secret. Revoke and reissue instead.
+
+Mutating calls accept an `Idempotency-Key`. On an uncertain `503` the client
+raises `UncertainOutcome` carrying the key: retry the identical request with that
+key to reconcile. Never retry an uncertain mutation with a new key.
+
+## 7. Secrets, rotation and redaction
+
+- Password verifiers are stored with memory-hard `scrypt`; plaintext passwords,
+  reset values, session cookies and bearer tokens are never stored or logged.
+- TLS keys, the password used at bootstrap and issued worker secrets live in
+  `<RUNTIME_ROOT>/secrets` or the operator's secret store, never in Git.
+- Rotate deployment secrets and revoke all sessions/credentials if compromise is
+  suspected. Disabling an account immediately revokes its sessions and credentials.
+- Audit events record time, request id, authenticated user id, project, action,
+  outcome and a short redacted reason. They never contain request bodies,
+  `Authorization` headers, cookies, passwords, reset values or attachment content.
+
+## 8. Backup, restore and rollback
+
+Back up, in one coordinated snapshot:
+
+1. the canonical coordination database and its sidecar,
+2. this service's `--state` document (accounts, membership, revocation state,
+   audit and idempotency records).
+
+Encrypt off-machine copies, restrict the key to the backup owner, and define
+retention before rollout. Restore drill on an **isolated** deployment:
+
+```sh
+sudo systemctl stop orchestra-http
+sudo -u <SERVICE_USER> install -m 0600 <RESTORED_STATE> <RUNTIME_ROOT>/http-state.json
+sudo -u <SERVICE_USER> python3 -m json.tool <RUNTIME_ROOT>/http-state.json > /dev/null
+sudo systemctl start orchestra-http
+curl -fsS http://127.0.0.1:8443/healthz          # {"status":"ok"}
+```
+
+After restore, verify hashes, revocation state, memberships and audit continuity,
+then cut over explicitly. Rollback is the previous pinned kit revision plus its
+matching state snapshot; restore both together. A state document whose
+`schema_version` is not understood fails closed at startup rather than guessing.
+
+## 9. SSH compatibility
+
+SSH and local transports keep their existing actor/config contract and gain no
+HTTP roles. HTTP principals are never inferred from an actor string; mapping
+legacy actor-owned claims to a stable user id is an explicit migration action in
+the pilot phase, not part of this service.
+
+## 10. Known limitations of this disposable build
+
+- Canonical operations run through `InProcessBackend`, a disposable JSON store
+  used by the contract tests. The Linux service binds the same interface to
+  `endpoint.py` through `EndpointBackend`; that binding is deliberately thin and
+  is not exercised by the portable suite.
+- The state store is a single JSON document guarded by one in-process lock. Run
+  exactly one service process; multi-process or multi-host scale-out is out of
+  scope and would need a transactional store.
+- Attachment uploads are validated and bounded but only their metadata and digest
+  are retained by the disposable backend; content storage belongs to the
+  canonical backend and is a follow-up item.
+- Administrative audit coverage is partial: login outcomes, authorization
+  denials and every successful idempotent mutation are recorded; a per-field
+  before/after administrative trail is not implemented.
+
+## 11. Unresolved office decisions (owner, before rollout)
+
+1. Hostname, certificate operator and renewal process.
+2. Reverse-proxy trust boundary and whether the proxy terminates TLS or the
+   service does.
+3. Secret-store location and backup-key owner.
+4. Retention period and recovery objectives for audit, state and backups.
+5. Whether to bind an external identity provider (SSO) or MFA, and when.
+6. Network exposure and any approved browser origin list.
+
+Until these are recorded, this service is a disposable local validation build,
+not an office deployment.

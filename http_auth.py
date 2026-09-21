@@ -1,0 +1,822 @@
+#!/usr/bin/env python3
+"""Identity, authorization and persistence core for the office HTTP transport.
+
+The HTTP adapter (``http_service.py``) owns the wire protocol; this module owns the
+security boundary described in ``docs/HTTP_TRANSPORT_DESIGN.md``:
+
+* local accounts with a memory-hard password verifier (stdlib ``scrypt``),
+* server-side browser sessions (hashed, idle + absolute expiry, revocation, CSRF),
+* project-scoped worker credentials whose secret is shown once and stored hashed,
+* single-use password-reset values,
+* project membership and the owner/contributor/viewer action matrix,
+* server-derived principals with actor labels treated as attribution only,
+* idempotency records bound to principal + project + route with a separate request
+  hash, including explicit unknown-outcome reconciliation,
+* an append-only audit stream that never records a secret.
+
+Only the Python standard library is used, and nothing here imports ``fcntl`` or any
+POSIX-only module, so the same code runs on a Windows workstation and a Linux office
+service. State is one JSON document written with an atomic replace. Multi-process
+concurrency is out of scope for the disposable validation build; the service is a
+single process with a per-process lock, and the deployment runbook pins that.
+"""
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import threading
+import time
+from pathlib import Path
+
+SCHEMA_VERSION = 1
+
+# Password verifier policy. n=2**14, r=8 needs ~16 MiB per hash; scrypt is the
+# memory-hard scheme available in the standard library without third-party wheels.
+SCRYPT_N, SCRYPT_R, SCRYPT_P = 2 ** 14, 8, 1
+SCRYPT_DKLEN, SCRYPT_SALT = 32, 16
+MIN_PASSWORD, MAX_PASSWORD = 8, 1024
+
+# Provisional local lifecycle defaults from the reviewed design, all configurable
+# at the Service boundary.
+SESSION_IDLE_SECONDS = 30 * 60
+SESSION_ABSOLUTE_SECONDS = 12 * 60 * 60
+CREDENTIAL_TTL_SECONDS = 30 * 24 * 60 * 60
+RESET_TTL_SECONDS = 30 * 60
+IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60
+LOGIN_WINDOW_SECONDS = 5 * 60
+LOGIN_MAX_ATTEMPTS = 10
+AUDIT_LIMIT = 10000
+
+ROLES = ('viewer', 'contributor', 'owner')
+RANK = {'viewer': 0, 'contributor': 1, 'owner': 2}
+
+PERIODS = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z?$')
+
+
+# --------------------------------------------------------------------------- errors
+class HttpError(Exception):
+    """An error that maps to one clean JSON response. Never carries a secret."""
+
+    def __init__(self, status, code, message, detail=None):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.message = message
+        self.detail = detail
+
+    def body(self, request_id):
+        error = {'code': self.code, 'message': self.message}
+        if self.detail is not None:
+            error['detail'] = self.detail
+        return {'error': error, 'request_id': request_id}
+
+
+def unauthenticated(message='Authentication required'):
+    return HttpError(401, 'unauthenticated', message)
+
+
+def forbidden(message='Not permitted'):
+    return HttpError(403, 'forbidden', message)
+
+
+def not_found(message='Not found'):
+    return HttpError(404, 'not_found', message)
+
+
+def conflict(message, detail=None):
+    return HttpError(409, 'conflict', message, detail)
+
+
+def too_large(message='Payload too large'):
+    return HttpError(413, 'payload_too_large', message)
+
+
+def invalid(message, detail=None):
+    return HttpError(422, 'invalid_payload', message, detail)
+
+
+def unsupported(message='Unsupported media type'):
+    return HttpError(415, 'unsupported_media_type', message)
+
+
+def throttled(message='Too many attempts'):
+    return HttpError(429, 'rate_limited', message)
+
+
+def uncertain(message='Outcome unknown'):
+    return HttpError(503, 'uncertain', message)
+
+
+# --------------------------------------------------------------------- token helpers
+def new_token():
+    return secrets.token_urlsafe(32)
+
+
+def token_hash(token):
+    if not isinstance(token, str) or not token:
+        return ''
+    return hashlib.sha256(token.encode('utf-8')).hexdigest()
+
+
+def canonical_json(value):
+    return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+
+
+def request_hash(payload):
+    """Canonical request hash used by the idempotency record (payload separate from key)."""
+    return hashlib.sha256(canonical_json(payload).encode('utf-8')).hexdigest()
+
+
+def now_iso(timestamp):
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(timestamp))
+
+
+# ------------------------------------------------------------------- password verifier
+def hash_password(password, *, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P):
+    _validate_password(password)
+    salt = os.urandom(SCRYPT_SALT)
+    derived = hashlib.scrypt(password.encode('utf-8'), salt=salt, n=n, r=r, p=p,
+                             dklen=SCRYPT_DKLEN)
+    return 'scrypt$%d$%d$%d$%s$%s' % (n, r, p, salt.hex(), derived.hex())
+
+
+def verify_password(verifier, password):
+    if not isinstance(verifier, str) or not isinstance(password, str):
+        return False
+    try:
+        scheme, n, r, p, salt, digest = verifier.split('$')
+        if scheme != 'scrypt':
+            return False
+        salt_bytes, expected = bytes.fromhex(salt), bytes.fromhex(digest)
+        derived = hashlib.scrypt(password.encode('utf-8'), salt=salt_bytes, n=int(n),
+                                 r=int(r), p=int(p), dklen=len(expected))
+    except (ValueError, TypeError, MemoryError, OverflowError):
+        return False
+    return hmac.compare_digest(derived, expected)
+
+
+def needs_rehash(verifier):
+    if not isinstance(verifier, str):
+        return True
+    try:
+        scheme, n, r, p, _, _ = verifier.split('$')
+    except ValueError:
+        return True
+    return scheme != 'scrypt' or int(n) < SCRYPT_N or int(r) < SCRYPT_R or int(p) < SCRYPT_P
+
+
+def _validate_password(password):
+    if not isinstance(password, str) or not MIN_PASSWORD <= len(password) <= MAX_PASSWORD:
+        raise invalid('Password must be %d-%d characters' % (MIN_PASSWORD, MAX_PASSWORD))
+
+
+# A fixed verifier used to spend the same work when an account does not exist, so a
+# caller cannot tell "no such user" from "wrong password" by response timing.
+_DUMMY_VERIFIER = None
+
+
+def _dummy_verifier():
+    global _DUMMY_VERIFIER
+    if _DUMMY_VERIFIER is None:
+        _DUMMY_VERIFIER = hash_password('orchestra-dummy-password')
+    return _DUMMY_VERIFIER
+
+
+# ------------------------------------------------------------------------- principal
+class Principal:
+    """A server-derived authenticated identity. Submitted actor labels never grant authority."""
+
+    __slots__ = ('user_id', 'display_name', 'superuser', 'via', 'credential_id',
+                 'credential_project', 'scopes', 'actor', 'csrf', 'session_hash')
+
+    def __init__(self, user_id, display_name, superuser, via, actor, *, credential_id=None,
+                 credential_project=None, scopes=(), csrf=None, session_hash=None):
+        self.user_id = user_id
+        self.display_name = display_name
+        self.superuser = superuser
+        self.via = via
+        self.credential_id = credential_id
+        self.credential_project = credential_project
+        self.scopes = tuple(scopes)
+        self.actor = actor
+        self.csrf = csrf
+        self.session_hash = session_hash
+
+    def __repr__(self):
+        return 'Principal(user_id=%r, via=%r, credential_id=%r)' % (
+            self.user_id, self.via, self.credential_id)
+
+
+# ----------------------------------------------------------------------------- store
+def _blank_state():
+    return {
+        'schema_version': SCHEMA_VERSION,
+        'users': {},
+        'usernames': {},
+        'sessions': {},
+        'credentials': {},
+        'credential_tokens': {},
+        'reset_tokens': {},
+        'projects': {},
+        'memberships': {},
+        'audit': [],
+        'idempotency': {},
+        'canonical': {'tasks': {}, 'checkpoints': {}, 'contributions': {}, 'feedback': {}},
+    }
+
+
+class Store:
+    """Atomic JSON persistence. One writer process, guarded by an in-process lock."""
+
+    def __init__(self, path, clock=time.time):
+        self.path = Path(path)
+        self.clock = clock
+        self.lock = threading.RLock()
+        self.state = self._load()
+
+    def now(self):
+        return self.clock()
+
+    def _load(self):
+        try:
+            text = self.path.read_text(encoding='utf-8')
+        except FileNotFoundError:
+            return _blank_state()
+        data = json.loads(text)
+        if not isinstance(data, dict) or data.get('schema_version') != SCHEMA_VERSION:
+            raise ValueError('Unsupported or corrupt service store schema')
+        base = _blank_state()
+        for key, value in base.items():
+            data.setdefault(key, value)
+        return data
+
+    def save(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_name(self.path.name + '.tmp')
+        temporary.write_text(json.dumps(self.state, ensure_ascii=False, indent=2) + '\n',
+                             encoding='utf-8')
+        os.replace(temporary, self.path)
+
+
+# --------------------------------------------------------------------------- service
+class Service:
+    """The authenticated authorization boundary.
+
+    Callers must invoke a public method with a :class:`Principal` obtained from
+    :meth:`authenticate`. Every project-scoped method re-reads current membership;
+    no client-supplied role or actor label is trusted.
+    """
+
+    def __init__(self, store, *, session_idle=SESSION_IDLE_SECONDS,
+                 session_absolute=SESSION_ABSOLUTE_SECONDS,
+                 credential_ttl=CREDENTIAL_TTL_SECONDS, reset_ttl=RESET_TTL_SECONDS,
+                 idempotency_ttl=IDEMPOTENCY_TTL_SECONDS,
+                 login_max_attempts=LOGIN_MAX_ATTEMPTS):
+        self.store = store
+        self.session_idle = session_idle
+        self.session_absolute = session_absolute
+        self.credential_ttl = credential_ttl
+        self.reset_ttl = reset_ttl
+        self.idempotency_ttl = idempotency_ttl
+        self.login_max_attempts = login_max_attempts
+        self._failures = {}
+
+    # -- helpers ---------------------------------------------------------------
+    @property
+    def state(self):
+        return self.store.state
+
+    def _now(self):
+        return self.store.now()
+
+    def audit(self, request_id, principal, action, outcome, *, project_id=None, reason=None,
+              actor=None):
+        """Append one redacted audit event. Secrets and payloads must never reach here."""
+        event = {
+            'time': now_iso(self._now()),
+            'request_id': request_id,
+            'user_id': principal.user_id if principal else None,
+            'actor': actor,
+            'credential_id': principal.credential_id if principal else None,
+            'project_id': project_id,
+            'action': action,
+            'outcome': outcome,
+            'reason': (str(reason)[:200] if reason else None),
+        }
+        self.state['audit'].append(event)
+        if len(self.state['audit']) > AUDIT_LIMIT:
+            del self.state['audit'][:len(self.state['audit']) - AUDIT_LIMIT]
+        return event
+
+    def _username(self, username):
+        if not isinstance(username, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@-]{1,63}',
+                                                            username):
+            raise invalid('Username must be 2-64 characters of letters, digits, . _ @ -')
+        return username
+
+    def _user(self, user_id):
+        user = self.state['users'].get(user_id)
+        if user is None:
+            raise not_found('Account not found')
+        return user
+
+    # -- bootstrap (operator, out of band; never an HTTP route) -----------------
+    @classmethod
+    def bootstrap_superuser(cls, store, username, password, display_name=None):
+        """Create the first protected superuser. Refuses once any account exists."""
+        with store.lock:
+            if store.state['users']:
+                raise conflict('A superuser already exists')
+            service = cls(store)
+            username = service._username(username)
+            user = {
+                'id': 'usr_' + secrets.token_hex(8),
+                'username': username,
+                'display_name': display_name or username,
+                'password': hash_password(password),
+                'superuser': True,
+                'disabled': False,
+                'created_at': now_iso(store.now()),
+            }
+            store.state['users'][user['id']] = user
+            store.state['usernames'][username.lower()] = user['id']
+            store.save()
+            service.audit(None, None, 'bootstrap', 'committed', reason='superuser created')
+            return user
+
+    # -- accounts --------------------------------------------------------------
+    def create_user(self, principal, username, display_name=None):
+        self._require_superuser(principal)
+        username = self._username(username)
+        with self.store.lock:
+            if username.lower() in self.state['usernames']:
+                raise conflict('Username already exists')
+            user = {
+                'id': 'usr_' + secrets.token_hex(8),
+                'username': username,
+                'display_name': display_name or username,
+                'password': None,
+                'superuser': False,
+                'disabled': False,
+                'created_at': now_iso(self._now()),
+            }
+            self.state['users'][user['id']] = user
+            self.state['usernames'][username.lower()] = user['id']
+            self.store.save()
+        return self._public_user(user)
+
+    def list_users(self, principal):
+        self._require_superuser(principal)
+        return [self._public_user(u) for u in self.state['users'].values()]
+
+    @staticmethod
+    def _public_user(user):
+        return {'id': user['id'], 'username': user['username'],
+                'display_name': user['display_name'], 'disabled': user['disabled'],
+                'superuser': user['superuser'], 'created_at': user['created_at']}
+
+    def change_password(self, principal, user_id, current_password, new_password):
+        with self.store.lock:
+            user = self._user(user_id)
+            if not principal.superuser and principal.user_id != user_id:
+                raise not_found('Account not found')
+            if not principal.superuser:
+                if not verify_password(user.get('password'), current_password or ''):
+                    raise forbidden('Current password is incorrect')
+            if verify_password(user.get('password'), new_password):
+                raise invalid('New password must differ from the current password')
+            user['password'] = hash_password(new_password)
+            if user.get('reset_token'):
+                user.pop('reset_token')
+            self._revoke_sessions_for(user_id)
+            self._revoke_credentials_for(user_id)
+            self.store.save()
+        return {'id': user_id, 'changed': True}
+
+    def issue_reset(self, principal, user_id, request_id=None):
+        self._require_superuser(principal)
+        with self.store.lock:
+            user = self._user(user_id)
+            token = new_token()
+            # Reissuing invalidates any previous pending reset for the account.
+            for existing, record in list(self.state['reset_tokens'].items()):
+                if record['user_id'] == user_id and not record['used']:
+                    del self.state['reset_tokens'][existing]
+            self.state['reset_tokens'][token_hash(token)] = {
+                'user_id': user_id,
+                'expires_at': self._now() + self.reset_ttl,
+                'used': False,
+                'issued_by': principal.user_id,
+            }
+            self.store.save()
+        # The value is returned once, to the authenticated superuser, and never stored.
+        return {'id': user_id, 'reset_value': token,
+                'expires_at': now_iso(self._now() + self.reset_ttl), 'single_use': True}
+
+    def redeem_reset(self, user_id, reset_value, new_password):
+        _validate_password(new_password)
+        digest = token_hash(reset_value)
+        with self.store.lock:
+            record = self.state['reset_tokens'].get(digest)
+            if record is None or record['user_id'] != user_id or record['used'] or \
+                    record['expires_at'] <= self._now():
+                raise unauthenticated('Invalid or expired reset value')
+            user = self._user(user_id)
+            record['used'] = True
+            user['password'] = hash_password(new_password)
+            self._revoke_sessions_for(user_id)
+            self._revoke_credentials_for(user_id)
+            self.store.save()
+        return {'id': user_id, 'password_set': True}
+
+    def disable_user(self, principal, user_id):
+        with self.store.lock:
+            user = self._user(user_id)
+            if not principal.superuser and principal.user_id != user_id:
+                raise not_found('Account not found')
+            if user['superuser']:
+                raise conflict('The superuser account cannot be disabled')
+            if not principal.superuser:
+                # Self-disable is permitted, but not when it would strand a project
+                # with no active owner; that recovery needs a superuser action.
+                for pid, members in self.state['memberships'].items():
+                    if members.get(user_id) == 'owner' and \
+                            sum(1 for role in members.values() if role == 'owner') <= 1:
+                        raise conflict('The final active project owner cannot be disabled',
+                                       {'project': pid})
+            user['disabled'] = True
+            self._revoke_sessions_for(user_id)
+            self._revoke_credentials_for(user_id)
+            self.store.save()
+        return {'id': user_id, 'disabled': True}
+
+    def _require_superuser(self, principal):
+        if principal is None or not principal.superuser:
+            raise forbidden('Superuser authority required')
+
+    def _revoke_sessions_for(self, user_id):
+        for digest, session in self.state['sessions'].items():
+            if session['user_id'] == user_id:
+                session['revoked'] = True
+
+    def _revoke_credentials_for(self, user_id):
+        for credential in self.state['credentials'].values():
+            if credential['user_id'] == user_id:
+                credential['revoked'] = True
+
+    # -- login, sessions and credentials ---------------------------------------
+    def _throttle_key(self, username, source):
+        return '%s|%s' % ((username or '').lower(), source or 'local')
+
+    def _check_throttle(self, username, source):
+        key = self._throttle_key(username, source)
+        cutoff = self._now() - LOGIN_WINDOW_SECONDS
+        attempts = [t for t in self._failures.get(key, []) if t >= cutoff]
+        self._failures[key] = attempts
+        if len(attempts) >= self.login_max_attempts:
+            raise throttled()
+
+    def _record_failure(self, username, source):
+        key = self._throttle_key(username, source)
+        self._failures.setdefault(key, []).append(self._now())
+
+    def login(self, username, password, source='local', request_id=None):
+        """Uniform failure response; never reveals whether the account exists."""
+        try:
+            self._check_throttle(username, source)
+        except HttpError:
+            self.audit(request_id, None, 'login', 'throttled', reason='rate limited')
+            self.store.save()
+            raise
+        with self.store.lock:
+            user_id = self.state['usernames'].get((username or '').lower())
+            user = self.state['users'].get(user_id) if user_id else None
+            verifier = user.get('password') if user else _dummy_verifier()
+            good = verify_password(verifier, password or '')
+            if not user or not good or user['disabled'] or not user.get('password'):
+                self._record_failure(username, source)
+                self.audit(request_id, None, 'login', 'failed', reason='invalid credentials')
+                self.store.save()
+                raise unauthenticated('Invalid credentials')
+            if needs_rehash(user['password']):
+                user['password'] = hash_password(password)
+            token, csrf = new_token(), new_token()
+            moment = self._now()
+            self.state['sessions'][token_hash(token)] = {
+                'user_id': user['id'],
+                'issued_at': moment,
+                'last_used': moment,
+                'idle_expires': moment + self.session_idle,
+                'absolute_expires': moment + self.session_absolute,
+                'revoked': False,
+                'csrf': csrf,
+            }
+            self._failures.pop(self._throttle_key(username, source), None)
+            self.audit(request_id, Principal(user['id'], user['display_name'],
+                                             user['superuser'], 'session', user['id']),
+                       'login', 'committed')
+            self.store.save()
+        return {'session_token': token, 'csrf_token': csrf,
+                'expires_at': now_iso(moment + self.session_absolute),
+                'idle_expires_at': now_iso(moment + self.session_idle),
+                'user': self._public_user(user)}
+
+    def authenticate(self, token, *, source='local', required_scope=None):
+        """Resolve a bearer session/credential value to a principal, or raise 401."""
+        digest = token_hash(token)
+        moment = self._now()
+        with self.store.lock:
+            session = self.state['sessions'].get(digest)
+            if session is not None:
+                if session['revoked'] or session['absolute_expires'] <= moment or \
+                        session['idle_expires'] <= moment:
+                    raise unauthenticated('Session expired or revoked')
+                user = self.state['users'].get(session['user_id'])
+                if user is None or user['disabled']:
+                    raise unauthenticated('Session expired or revoked')
+                session['last_used'] = moment
+                session['idle_expires'] = moment + self.session_idle
+                self.store.save()
+                return Principal(user['id'], user['display_name'], user['superuser'],
+                                 'session', user['id'], csrf=session['csrf'],
+                                 session_hash=digest)
+            credential_id = self.state['credential_tokens'].get(digest)
+            credential = self.state['credentials'].get(credential_id) if credential_id else None
+            if credential is not None:
+                if credential['revoked'] or credential['expires_at'] <= moment:
+                    raise unauthenticated('Credential expired or revoked')
+                user = self.state['users'].get(credential['user_id'])
+                if user is None or user['disabled']:
+                    raise unauthenticated('Credential expired or revoked')
+                if required_scope and required_scope not in credential['scopes']:
+                    raise forbidden('Credential scope does not permit this operation')
+                credential['last_used'] = moment
+                actor = credential.get('actor') or user['id']
+                self.store.save()
+                return Principal(user['id'], user['display_name'], user['superuser'],
+                                 'credential', actor, credential_id=credential['id'],
+                                 credential_project=credential['project_id'],
+                                 scopes=credential['scopes'])
+        raise unauthenticated('Authentication required')
+
+    def logout(self, principal, request_id=None):
+        if principal is None or principal.session_hash is None:
+            raise unauthenticated('No current session')
+        with self.store.lock:
+            session = self.state['sessions'].get(principal.session_hash)
+            if session is not None:
+                session['revoked'] = True
+                self.audit(request_id, principal, 'logout', 'committed')
+                self.store.save()
+        return {'logged_out': True}
+
+    def revoke_session(self, session_hash):
+        with self.store.lock:
+            session = self.state['sessions'].get(session_hash)
+            if session:
+                session['revoked'] = True
+                self.store.save()
+
+    # -- actor binding ---------------------------------------------------------
+    def bind_actor(self, principal, submitted_actor):
+        """Validate an optional actor label. It is attribution, never authority."""
+        if submitted_actor is None:
+            return principal.actor
+        if not isinstance(submitted_actor, str) or not re.fullmatch(
+                r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}', submitted_actor):
+            raise invalid('Invalid actor label')
+        if principal.via == 'credential':
+            namespace = principal.actor
+            if submitted_actor != namespace and not submitted_actor.startswith(namespace.rstrip('/') + '/'):
+                raise forbidden('Actor label is outside the credential attribution namespace')
+            return submitted_actor
+        if submitted_actor != principal.actor:
+            raise forbidden('Actor label does not match the authenticated account')
+        return submitted_actor
+
+    # -- projects and membership ----------------------------------------------
+    def create_project(self, principal, name, project_id=None):
+        self._validate_project_name(name)
+        with self.store.lock:
+            if any(p['name'].lower() == name.lower() and not p['archived']
+                   for p in self.state['projects'].values()):
+                raise conflict('A project with that name already exists')
+            pid = project_id or 'proj_' + secrets.token_hex(8)
+            if pid in self.state['projects']:
+                raise conflict('Project identifier already exists')
+            self.state['projects'][pid] = {
+                'id': pid, 'name': name, 'created_by': principal.user_id,
+                'created_at': now_iso(self._now()), 'archived': False,
+            }
+            self.state['memberships'][pid] = {principal.user_id: 'owner'}
+            self.store.save()
+        return self.project_view(principal, pid)
+
+    @staticmethod
+    def _validate_project_name(name):
+        if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9 _.-]{1,63}',
+                                                         name or ''):
+            raise invalid('Project name must be 2-64 characters of letters, digits, space, . _ -')
+
+    def list_projects(self, principal):
+        visible = []
+        for pid in self.state['projects']:
+            if principal.superuser or principal.user_id in self.state['memberships'].get(pid, {}):
+                visible.append(self.project_view(principal, pid))
+        return visible
+
+    def project_view(self, principal, project_id):
+        project, role = self.require_project(principal, project_id)
+        view = dict(project)
+        view['role'] = role
+        view['members'] = sorted(self.state['memberships'].get(project_id, {}))
+        return view
+
+    def require_project(self, principal, project_id, minimum='viewer'):
+        if principal is None:
+            raise unauthenticated()
+        if principal.via == 'credential' and principal.credential_project != project_id:
+            # A credential scoped to another project must not learn this one exists.
+            raise not_found('Project not found')
+        project = self.state['projects'].get(project_id)
+        members = self.state['memberships'].get(project_id, {})
+        if principal.superuser:
+            if project is None:
+                raise not_found('Project not found')
+            return project, 'owner'
+        if project is None or principal.user_id not in members:
+            raise not_found('Project not found')
+        role = members[principal.user_id]
+        if RANK[role] < RANK[minimum]:
+            raise forbidden('Project role does not permit this operation')
+        return project, role
+
+    def set_member(self, principal, project_id, user_id, role, request_id=None):
+        if role not in ROLES:
+            raise invalid('Role must be one of %s' % ', '.join(ROLES))
+        with self.store.lock:
+            project, actor_role = self.require_project(principal, project_id, 'owner')
+            self._user(user_id)
+            members = self.state['memberships'][project_id]
+            if role == 'owner' and not principal.superuser:
+                raise forbidden('Only a superuser may assign the owner role')
+            if members.get(user_id) == 'owner' and role != 'owner' and not principal.superuser:
+                raise forbidden('Only a superuser may remove a project owner')
+            members[user_id] = role
+            self.store.save()
+        return {'project': project_id, 'user': user_id, 'role': role}
+
+    def remove_member(self, principal, project_id, user_id, request_id=None):
+        with self.store.lock:
+            _, _ = self.require_project(principal, project_id, 'owner')
+            members = self.state['memberships'].get(project_id, {})
+            if user_id not in members:
+                raise not_found('Membership not found')
+            if members[user_id] == 'owner' and not principal.superuser:
+                raise forbidden('Only a superuser may remove a project owner')
+            if members[user_id] == 'owner' and \
+                    sum(1 for r in members.values() if r == 'owner') <= 1:
+                raise conflict('The final active project owner cannot be removed')
+            del members[user_id]
+            self.store.save()
+        return {'project': project_id, 'user': user_id, 'removed': True}
+
+    def archive_project(self, principal, project_id):
+        with self.store.lock:
+            project, role = self.require_project(principal, project_id, 'owner')
+            if project['archived']:
+                raise conflict('Project is already archived')
+            project['archived'] = True
+            self.store.save()
+        return {'id': project_id, 'archived': True}
+
+    # -- worker credentials ----------------------------------------------------
+    def issue_credential(self, principal, project_id, *, label=None, scopes=None,
+                         actor=None, request_id=None):
+        with self.store.lock:
+            project, role = self.require_project(principal, project_id, 'owner')
+            if principal.via == 'credential':
+                raise forbidden('A worker credential cannot issue another credential')
+            requested = tuple(scopes or ('tasks', 'checkpoints', 'reviews', 'feedback'))
+            allowed = set(principal.scopes) if principal.via == 'credential' else None
+            for scope in requested:
+                if scope not in ('tasks', 'checkpoints', 'reviews', 'feedback', 'read'):
+                    raise invalid('Unknown credential scope %r' % (scope,))
+                if allowed is not None and scope not in allowed:
+                    raise forbidden('Requested scope exceeds issuer scope')
+            if actor is not None and (not isinstance(actor, str) or not re.fullmatch(
+                    r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,63}', actor)):
+                raise invalid('Invalid credential actor namespace')
+            secret = new_token()
+            credential = {
+                'id': 'cred_' + secrets.token_hex(8),
+                'user_id': principal.user_id,
+                'project_id': project_id,
+                'label': label or 'worker',
+                'scopes': list(requested),
+                'actor': actor,
+                'token_hash': token_hash(secret),
+                'created_at': now_iso(self._now()),
+                'last_used': None,
+                'expires_at': self._now() + self.credential_ttl,
+                'revoked': False,
+            }
+            self.state['credentials'][credential['id']] = credential
+            self.state['credential_tokens'][token_hash(secret)] = credential['id']
+            self.store.save()
+        return {'id': credential['id'], 'project': project_id, 'label': credential['label'],
+                'scopes': list(requested), 'actor': actor, 'secret': secret,
+                'expires_at': now_iso(credential['expires_at']), 'secret_available': True}
+
+    def credential_view(self, credential):
+        return {'id': credential['id'], 'project': credential['project_id'],
+                'label': credential['label'], 'scopes': list(credential['scopes']),
+                'actor': credential.get('actor'), 'revoked': credential['revoked'],
+                'created_at': credential['created_at'],
+                'expires_at': now_iso(credential['expires_at'])}
+
+    def revoke_credential(self, principal, project_id, credential_id, request_id=None):
+        with self.store.lock:
+            self.require_project(principal, project_id, 'viewer')
+            credential = self.state['credentials'].get(credential_id)
+            if not isinstance(credential, dict) or credential.get('project_id') != project_id:
+                raise not_found('Credential not found')
+            own = credential['user_id'] == principal.user_id
+            if not (principal.superuser or own):
+                _, role = self.require_project(principal, project_id, 'owner')
+            if credential['revoked']:
+                return {'id': credential_id, 'revoked': True}
+            credential['revoked'] = True
+            self.store.save()
+        return {'id': credential_id, 'revoked': True}
+
+    # -- idempotency -----------------------------------------------------------
+    def _idempotency_key(self, principal, project_id, route, key):
+        scope = '%s|%s|%s|%s' % (principal.user_id, project_id or '-', route, key)
+        return hashlib.sha256(scope.encode('utf-8')).hexdigest()
+
+    def idempotency_check(self, principal, project_id, route, key, body_hash):
+        """Return 'replay' result, 'unknown', or None to proceed. Raises on conflict."""
+        if key is None:
+            return None
+        digest = self._idempotency_key(principal, project_id, route, key)
+        with self.store.lock:
+            record = self.state['idempotency'].get(digest)
+            if record is None:
+                return None
+            if record['expires_at'] <= self._now():
+                del self.state['idempotency'][digest]
+                return None
+            if record['request_hash'] != body_hash:
+                raise conflict('Idempotency key reused with a different request payload')
+            if record['state'] == 'committed':
+                return ('replay', record['status'], record['response'])
+            if record['state'] == 'unknown':
+                return ('unknown', None, None)
+            raise conflict('An identical request is already in progress')
+        return None
+
+    def idempotency_begin(self, principal, project_id, route, key, body_hash):
+        if key is None:
+            return None
+        digest = self._idempotency_key(principal, project_id, route, key)
+        with self.store.lock:
+            self.state['idempotency'][digest] = {
+                'principal': principal.user_id, 'project_id': project_id, 'route': route,
+                'request_hash': body_hash, 'state': 'in_progress', 'status': None,
+                'response': None, 'created_at': now_iso(self._now()),
+                'expires_at': self._now() + self.idempotency_ttl,
+            }
+            self.store.save()
+        return digest
+
+    def idempotency_commit(self, digest, status, response):
+        if digest is None:
+            return
+        with self.store.lock:
+            record = self.state['idempotency'].get(digest)
+            if record is not None:
+                record.update(state='committed', status=status, response=response)
+                self.store.save()
+
+    def idempotency_unknown(self, digest):
+        if digest is None:
+            return
+        with self.store.lock:
+            record = self.state['idempotency'].get(digest)
+            if record is not None:
+                record['state'] = 'unknown'
+                self.store.save()
+
+    def idempotency_release(self, digest):
+        if digest is None:
+            return
+        with self.store.lock:
+            self.state['idempotency'].pop(digest, None)
+
+    # -- HTTP-facing copies (never expose secrets) -----------------------------
+    def export_state(self):
+        """A backup-safe snapshot with no plaintext secret is ever stored anyway."""
+        return json.loads(json.dumps(self.state))
