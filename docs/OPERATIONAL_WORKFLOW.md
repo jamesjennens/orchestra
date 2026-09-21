@@ -29,14 +29,18 @@ Submit with `feedback add --file payload.json`; use `feedback correct --file
 payload.json` with `supersedes` set to the original entry ID for an additive
 correction. Retry the exact same payload after an uncertain response. Retrieve
 bounded live pages with `feedback list --limit 20`, then pass the returned opaque
-`next_cursor` to `--cursor`; entries appended after a page are visible on resume.
-Each response includes a durable `watermark`, including final and empty pages.
-Cursors are bound to the project/feed path and its observed end watermark; foreign,
-ahead, or rollback cursors are rejected. Pagination is live rather than a frozen
-snapshot, so a caller should retain the watermark for polling. Entries are never
-rewritten. A truncated final JSONL record is quarantined and the validated
-acknowledged prefix remains readable; a fully newline-terminated invalid record
-still fails visibly. `reminder.kind` may be
+`next_cursor` to `--cursor` while more pages remain; `resume_cursor` is always
+available for polling after a final or empty page. Entries appended after a page are
+visible on resume. Each response includes a durable `watermark`, including final and
+empty pages. Cursors are bound to the project/feed path, the observed end watermark,
+and the digest of the exact resumed prefix; foreign, ahead, rollback, or
+rollback-and-regrow cursors are rejected. Pagination is live rather than a frozen
+snapshot, so a caller should retain `resume_cursor` for polling. Entries are never
+rewritten. A torn final JSONL record is quarantined idempotently and the validated
+acknowledged prefix remains readable; a valid final record without a newline is
+normalized before append, while a fully newline-terminated invalid record still
+fails visibly. Recovery publishes the validated prefix by atomic replacement, so an
+interrupted recovery cannot truncate acknowledged entries. `reminder.kind` may be
 `none`, `checkpoint` or `handoff` and is informational only; it never interrupts a
 worker.
 

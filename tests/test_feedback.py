@@ -68,6 +68,26 @@ class FeedbackTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "ahead"):
             feedback.list_entries(self.path, cursor=page["next_cursor"])
 
+    def test_cursor_rejects_rollback_then_regrow_with_replacement_entries(self):
+        for number in range(3):
+            feedback.add(self.path, "session-one", payload("op-%d" % number))
+        page = feedback.list_entries(self.path, limit=1)
+        retained = feedback._read(self.path)[0]
+        replacement = dict(retained)
+        replacement["operation_id"] = "replacement"
+        replacement["entry_id"] = feedback._entry_id("replacement")
+        replacement["sequence"] = 2
+        third = dict(replacement)
+        third["operation_id"] = "replacement-2"
+        third["entry_id"] = feedback._entry_id("replacement-2")
+        third["sequence"] = 3
+        self.path.write_text(
+            "\n".join(json.dumps(item, sort_keys=True, separators=(",", ":"))
+                      for item in (retained, replacement, third)) + "\n",
+            encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "match the current feed"):
+            feedback.list_entries(self.path, cursor=page["next_cursor"])
+
     def test_append_after_page_is_visible_on_live_resume(self):
         feedback.add(self.path, "session-one", payload("op-1"))
         page = feedback.list_entries(self.path, limit=1)
@@ -87,6 +107,31 @@ class FeedbackTests(unittest.TestCase):
         self.assertEqual(len(list(self.path.parent.glob(self.path.name + ".*.incomplete"))), 1)
         feedback.add(self.path, "session-one", payload("op-2"))
         self.assertEqual(len(feedback.list_entries(self.path)["entries"]), 2)
+
+    def test_first_torn_append_is_quarantined_and_repeated_recovery_is_idempotent(self):
+        self.path.write_bytes(b'{"partial":')
+        self.assertEqual(feedback.list_entries(self.path)["entries"], [])
+        self.assertEqual(feedback.list_entries(self.path)["entries"], [])
+        self.assertEqual(len(list(self.path.parent.glob(self.path.name + ".*.incomplete"))), 1)
+
+    def test_valid_final_record_without_newline_is_normalized_before_append(self):
+        entry = feedback._make_entry(1, "session-one", payload("op-1"), "feedback")
+        self.path.write_text(json.dumps(entry, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+        self.assertEqual(feedback.list_entries(self.path)["entries"][0]["sequence"], 1)
+        feedback.add(self.path, "session-one", payload("op-2"))
+        self.assertEqual([entry["sequence"] for entry in feedback.list_entries(self.path)["entries"]], [1, 2])
+
+    def test_recovery_failure_does_not_lose_acknowledged_prefix(self):
+        first = feedback.add(self.path, "session-one", payload("op-1"))["entry"]
+        with self.path.open("ab") as stream:
+            stream.write(b'{"partial":')
+        original = feedback._atomic_replace
+        with patch.object(feedback, "_atomic_replace", side_effect=OSError("injected recovery interruption")):
+            with self.assertRaisesRegex(OSError, "injected"):
+                feedback.list_entries(self.path)
+        acknowledged = json.dumps(first, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        self.assertTrue(self.path.read_bytes().startswith(acknowledged + b"\n"))
+        self.assertIs(feedback._atomic_replace, original)
 
     def test_injected_append_failure_recovers_on_exact_retry(self):
         feedback.add(self.path, "session-one", payload("op-1"))
@@ -110,6 +155,19 @@ class FeedbackTests(unittest.TestCase):
         self.assertEqual(empty["entries"], [])
         self.assertEqual(empty["watermark"], {"sequence": 0, "digest": ""})
         self.assertIsNone(empty["next_cursor"])
+        self.assertIsNotNone(empty["resume_cursor"])
+        feedback.add(self.path, "session-one", payload("op-1"))
+        resumed = feedback.list_entries(self.path, cursor=empty["resume_cursor"])
+        self.assertEqual([entry["sequence"] for entry in resumed["entries"]], [1])
+
+    def test_final_page_exposes_public_resume_cursor(self):
+        feedback.add(self.path, "session-one", payload("op-1"))
+        final = feedback.list_entries(self.path)
+        self.assertIsNone(final["next_cursor"])
+        self.assertIsNotNone(final["resume_cursor"])
+        feedback.add(self.path, "session-one", payload("op-2"))
+        resumed = feedback.list_entries(self.path, cursor=final["resume_cursor"])
+        self.assertEqual([entry["sequence"] for entry in resumed["entries"]], [2])
 
     def test_feed_symlink_is_rejected_without_mutating_target(self):
         target = Path(self.temp.name) / "target.jsonl"
