@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import admin
 import coordination
+import handoff
 
 
 class BackupTests(unittest.TestCase):
@@ -110,6 +111,19 @@ class BackupTests(unittest.TestCase):
             with self.assertRaises(ValueError): admin.backup_project(self.root, 'source')
         native.assert_not_called()
         self.assertEqual(json.loads(self.bundle.read_text(encoding='utf-8'))['status'], 'pending')
+
+    def test_handoff_request_records_are_validated_in_backup(self):
+        payload={'schema_version':1,'operation':'request',
+                 'request_id':'00000000-0000-0000-0000-000000000007',
+                 'task':'source-1.1','from_actor':'alice','to_actor':'bob',
+                 'reason':'Take over'}
+        handoff.request(self.source,'bob',payload)
+        record=next((self.source/'.handoff-requests').glob('*.json'))
+        files={'.handoff-requests/'+record.name:json.loads(record.read_text(encoding='utf-8'))}
+        admin.validate_coordination_files(files)
+        files['.handoff-requests/'+record.name]['status']='accepted'
+        with self.assertRaises(ValueError):
+            admin.validate_coordination_files(files)
 
     def test_invalid_source_record_or_name_cannot_publish_complete_backup(self):
         journal = self.source / '.coordination-requests'

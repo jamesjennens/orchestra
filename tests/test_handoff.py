@@ -98,5 +98,86 @@ class HandoffTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             admin.validate_coordination_files({'.handoffs/'+'0'*64+'.json':record})
 
+    def test_request_disposition_accepts_only_current_owner_and_reconciles_handoff(self):
+        request_payload={'schema_version':1,'operation':'request',
+                         'request_id':'00000000-0000-0000-0000-000000000001',
+                         'task':'trial-task','from_actor':'alice','to_actor':'bob',
+                         'reason':'Please take over'}
+        handoff.request(self.path,'bob',request_payload)
+        disposition={'schema_version':1,'operation':'disposition','operation_id':'disp-1',
+                     'request_id':request_payload['request_id'],'task':'trial-task',
+                     'disposition':'accept','reason':'Owner approved','supersedes':None}
+        with self.assertRaisesRegex(ValueError,'current owner'):
+            handoff.disposition(self.path,'bob',disposition,self.native)
+        result=handoff.disposition(self.path,'alice',disposition,self.native)
+        self.assertEqual(result['status'],'accepted');self.assertEqual(self.native.owner,'bob')
+        self.assertTrue(handoff.disposition(self.path,'alice',disposition,self.native)['reconciled'])
+        record=json.loads(next((self.path/'.handoff-requests').glob('*.json')).read_text())
+        self.assertEqual(record['status'],'accepted')
+        self.assertEqual(record['disposition']['kind'],'accept')
+
+    def test_disposition_binds_task_and_rejects_requester_self_accept(self):
+        request_payload={'schema_version':1,'operation':'request',
+                         'request_id':'00000000-0000-0000-0000-000000000002',
+                         'task':'trial-task','from_actor':'alice','to_actor':'bob',
+                         'reason':'Please take over'}
+        handoff.request(self.path,'bob',request_payload)
+        self.native.owner='bob'
+        disposition={'schema_version':1,'operation':'disposition','operation_id':'disp-2',
+                     'request_id':request_payload['request_id'],'task':'trial-task',
+                     'disposition':'accept','reason':'Self approval','supersedes':None}
+        with self.assertRaisesRegex(ValueError,'own handoff'):
+            handoff.disposition(self.path,'bob',disposition,self.native)
+        disposition['task']='other-task'
+        with self.assertRaisesRegex(ValueError,'does not match stored request'):
+            handoff.disposition(self.path,'alice',disposition,self.native)
+
+    def test_accept_retry_reconciles_completed_transfer_before_owner_check(self):
+        request_payload={'schema_version':1,'operation':'request',
+                         'request_id':'00000000-0000-0000-0000-000000000004',
+                         'task':'trial-task','from_actor':'alice','to_actor':'bob',
+                         'reason':'Please take over'}
+        handoff.request(self.path,'bob',request_payload)
+        transfer=dict(schema_version=1,operation_id='handoff-'+request_payload['request_id'],
+                      task='trial-task',from_actor='alice',to_actor='bob',
+                      reason='Please take over',approval='Owner approved')
+        self.execute = lambda actor='alice', operator=False: handoff.execute(
+            self.path,actor,transfer,self.native,operator=operator)
+        self.native.lose_response=True
+        with self.assertRaises(RuntimeError):self.execute()
+        disposition={'schema_version':1,'operation':'disposition','operation_id':'disp-4',
+                     'request_id':request_payload['request_id'],'task':'trial-task',
+                     'disposition':'accept','reason':'Retry after response loss','supersedes':None}
+        result=handoff.disposition(self.path,'alice',disposition,self.native)
+        self.assertTrue(result['reconciled'])
+        self.assertEqual(json.loads(next((self.path/'.handoff-requests').glob('*.json')).read_text())['status'],'accepted')
+
+    def test_direct_transfer_settles_only_matching_request(self):
+        request_payload={'schema_version':1,'operation':'request',
+                         'request_id':'00000000-0000-0000-0000-000000000005',
+                         'task':'trial-task','from_actor':'alice','to_actor':'bob',
+                         'reason':'Please take over'}
+        other_payload=dict(request_payload,request_id='00000000-0000-0000-0000-000000000006')
+        handoff.request(self.path,'bob',request_payload)
+        handoff.request(self.path,'bob',other_payload)
+        transfer=dict(schema_version=1,operation_id='handoff-'+request_payload['request_id'],
+                      task='trial-task',from_actor='alice',to_actor='bob',
+                      reason='Please take over',approval='Owner approved')
+        handoff.execute(self.path,'alice',transfer,self.native)
+        records=[json.loads(p.read_text()) for p in (self.path/'.handoff-requests').glob('*.json')]
+        self.assertEqual(sorted(r['status'] for r in records),['accepted','pending'])
+
+    def test_accepted_request_history_is_required_for_backup(self):
+        request_payload={'schema_version':1,'operation':'request',
+                         'request_id':'00000000-0000-0000-0000-000000000003',
+                         'task':'trial-task','from_actor':'alice','to_actor':'bob',
+                         'reason':'Please take over'}
+        handoff.request(self.path,'bob',request_payload)
+        file=next((self.path/'.handoff-requests').glob('*.json'))
+        record=json.loads(file.read_text())
+        record['status']='accepted'
+        with self.assertRaises(ValueError):
+            admin.validate_coordination_files({'.handoff-requests/'+file.name:record})
+
 
 if __name__=='__main__':unittest.main()

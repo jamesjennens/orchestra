@@ -16,8 +16,8 @@ def main():
     a=parser.parse_args()
     args=a.args[1:] if a.args[:1]==['--'] else a.args
     resumed=False
-    if not args or args[0] not in ('onboard','docs','start','resume'):
-        parser.error('Use start --name NAME, resume with --actor SAVED_ACTOR, onboard or docs [NAME]; configure client.py for normal work')
+    if not args or args[0] not in ('onboard','docs','start','resume','run'):
+        parser.error('Use start --name NAME, resume with --actor SAVED_ACTOR, run start|heartbeat|end|status, onboard or docs [NAME]; configure client.py for normal work')
     cfg={'transport':'local','python':sys.executable,'endpoint':str(Path(__file__).resolve().with_name('endpoint.py')),'root':a.root}
     if args[0]=='start':
         if a.actor:parser.error('start allocates an actor; omit --actor')
@@ -45,7 +45,11 @@ def main():
         print('Resumed session: '+json.dumps(json.loads(r['stdout'])['resume'],ensure_ascii=False),flush=True)
         resumed=True
         args=['onboard']
-    r=request(cfg,a.project,a.actor,args[1:],action=args[0])
+    if args[0]=='run':
+        if not a.actor:parser.error('run requires --actor SAVED_ACTOR')
+        r=request(cfg,a.project,a.actor,args,action='session')
+    else:
+        r=request(cfg,a.project,a.actor,args[1:],action=args[0])
     sys.stdout.write(r['stdout']);sys.stderr.write(r['stderr'])
     if r['returncode'] or not resumed:return r['returncode']
     print('\nOwned work (revision requests first)',flush=True)

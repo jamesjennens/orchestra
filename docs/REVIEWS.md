@@ -42,6 +42,8 @@ This operator-only path records the initiator, approval evidence, old/new actor 
 
 Handoff checks the expected current owner, journals the operation, records native intent/completion comments and changes only the assignee. It does not reopen/close tasks, change review/lifecycle facts or transfer a merge slot. If interrupted, inspect and retry the exact payload under the same initiating actor/authority. A completed retry never reassigns a task that has subsequently moved again. Pending journals are included in backups and must be reconciled after restore. Reopen a closed task explicitly under existing authority before requesting revisions.
 
+When a handoff request exists, its task, original owner and destination are stored in the request journal. A completed direct transfer settles only the matching pending request. If the native owner update succeeded but its response was lost, an authorized retry reconciles the durable receipt before applying the current-owner check; conflicting request or receipt identities fail closed. Queue reads validate the full request journal before state or owner filtering so malformed records remain visible, including empty filtered pages.
+
 ## Structured contribution delivery
 
 Read `b review example-task`. It returns `latest_comment_id`, the current contribution and unresolved review requests. Copy `latest_comment_id` into `previous` for every new operation; use null only for the first operation. Each new assertion has a new operation ID; uncertain retries retain the exact original payload/actor.

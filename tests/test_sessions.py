@@ -79,6 +79,46 @@ class SessionTests(unittest.TestCase):
         payload=json.loads(client._wire('example',None,args,'session',None))
         self.assertEqual(payload['args'],args)
 
+    def test_run_start_is_idempotent_but_new_start_cannot_rebind_run(self):
+        actor=self.register()['session']['actor']
+        run_id=str(uuid.uuid4());event_id=str(uuid.uuid4())
+        first=sessions.execute(self.path,'example',['run','start','--run-id',run_id,'--event-id',event_id,'--task','trial-task'],self.export,actor=actor)
+        retry=sessions.execute(self.path,'example',['run','start','--run-id',run_id,'--event-id',event_id,'--task','trial-task'],self.export,actor=actor)
+        self.assertFalse(first['reconciled']);self.assertTrue(retry['reconciled'])
+        with self.assertRaisesRegex(ValueError,'already exists'):
+            sessions.execute(self.path,'example',['run','start','--run-id',run_id,'--event-id',str(uuid.uuid4()),'--task','other'],self.export,actor=actor)
+        status=sessions.execute(self.path,'example',['run','status','--run-id',run_id],self.export,actor=actor)
+        self.assertEqual(status['run']['task'],'trial-task');self.assertEqual(status['run']['event_total'],1)
+
+    def test_worker_run_routes_real_session_parser(self):
+        actor=self.register()['session']['actor']
+        run_id=str(uuid.uuid4());event_id=str(uuid.uuid4())
+        replies=[{'returncode':0,'stdout':json.dumps({'run':{'run_id':run_id}}),'stderr':''}]
+        argv=['worker.py','--root','/srv/runtime','--project','example','--actor',actor,
+              'run','start','--run-id',run_id,'--event-id',event_id,'--task','trial-task']
+        with patch.object(sys,'argv',argv),patch.object(worker,'request',side_effect=replies) as call,patch('sys.stdout'):
+            self.assertEqual(worker.main(),0)
+        self.assertEqual(call.call_args.kwargs['action'],'session')
+        self.assertEqual(call.call_args.args[3][:2],['run','start'])
+
+    def test_worker_run_forwards_all_real_parser_operations(self):
+        actor=self.register()['session']['actor']
+        run_id=str(uuid.uuid4())
+        calls=[]
+        def bridge(cfg,project,request_actor,args,action):
+            calls.append(args)
+            result=sessions.execute(self.path,project,args,self.export,actor=request_actor)
+            return {'returncode':0,'stdout':json.dumps(result),'stderr':''}
+        for kind,extra in (('start',['--task','trial-task']),
+                           ('heartbeat',[]),
+                           ('end',['--status','succeeded'])):
+            event_id=str(uuid.uuid4())
+            argv=['worker.py','--root','/srv/runtime','--project','example','--actor',actor,
+                  'run',kind,'--run-id',run_id,'--event-id',event_id,*extra]
+            with patch.object(sys,'argv',argv),patch.object(worker,'request',side_effect=bridge),patch('sys.stdout'):
+                self.assertEqual(worker.main(),0)
+        self.assertEqual([call[0:2] for call in calls],[['run','start'],['run','heartbeat'],['run','end']])
+
     def test_worker_start_uses_allocated_actor_for_onboarding(self):
         record={'actor':'session-'+str(uuid.uuid4()),'name':'worker','request_id':str(uuid.uuid4()),'created_at':'2026-09-16T00:00:00+00:00'}
         replies=[{'returncode':0,'stdout':json.dumps({'session':record}),'stderr':''},{'returncode':0,'stdout':'Instructions','stderr':''}]

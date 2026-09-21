@@ -104,5 +104,33 @@ class WorkQueueTests(unittest.TestCase):
         self.assertEqual(item['lifecycle']['integrated'],'passed')
         self.assertEqual(item['lifecycle_scope']['source_commit'],'source-a')
 
+    def test_queue_has_explicit_journal_input_and_surfaces_malformed_records(self):
+        with tempfile.TemporaryDirectory() as temp:
+            journal=Path(temp);(journal/'bad.json').write_text('{bad',encoding='utf-8')
+            result=work.queue(rows(),'alice/session',['--mine'],journal)
+        self.assertEqual(result['items'][0]['review_state'],'error')
+        self.assertIn('Malformed handoff journal',result['items'][0]['error'])
+        self.assertFalse(hasattr(work.queue,'_request_dir'))
+
+    def test_queue_bounds_nested_requests_and_exposes_continuation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            journal=Path(temp)
+            for number in range(3):
+                request={'schema_version':1,'operation':'request',
+                         'request_id':'00000000-0000-0000-0000-0000000000%02d' % (10+number),
+                         'task':TASK,'from_actor':'alice/session','to_actor':'bob/session',
+                         'reason':'Take over','requester':'bob/session','status':'pending',
+                         'created_at':'2026-09-16T00:00:00+00:00'}
+                from requirements import content_hash
+                request['digest']=content_hash({key:request[key] for key in
+                                                ('schema_version','operation','request_id','task','from_actor','to_actor','reason')})
+                (journal/(content_hash({'request_id':request['request_id']})+'.json')).write_text(
+                    json.dumps(request),encoding='utf-8')
+            first=work.queue(rows(),'alice/session',['--mine','--handoff-limit','1'],journal)
+            item=first['items'][0]
+            self.assertEqual(item['pending_handoff_total'],3)
+            self.assertEqual(len(item['pending_handoff_requests']),1)
+            self.assertEqual(item['pending_handoff_next_offset'],1)
+
 
 if __name__=='__main__':unittest.main()
