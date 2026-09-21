@@ -236,7 +236,7 @@ def restore_coordination(root,source,destination):
         return
     for name in files:
         target=path/name
-        if target.is_symlink() or target.parent.is_symlink():raise ValueError('Coordination restore paths must not be symlinks')
+        if target.is_symlink() or target.parent.is_symlink() or target.with_suffix('.tmp').is_symlink():raise ValueError('Coordination restore paths must not be symlinks')
     for name,record in files.items():
         target=project_dir(root,destination)/name
         target.parent.mkdir(exist_ok=True)

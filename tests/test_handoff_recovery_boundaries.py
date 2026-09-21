@@ -73,3 +73,20 @@ class RecoveryBoundaryTests(unittest.TestCase):
         except OSError:self.skipTest('Symlink privilege unavailable')
         with self.assertRaises(ValueError):self.accept()
         self.assertFalse(target.exists())
+
+    def test_restore_rejects_recovery_temporary_symlink_before_any_writes(self):
+        self.interrupt_before_receipt()
+        files={str(file.relative_to(self.path)).replace('\\','/'):json.loads(file.read_text())
+               for folder in ('.handoff-requests','.handoff-recoveries')
+               for file in (self.path/folder).glob('*.json')}
+        destination=self.root/'projects'/'destination'
+        recovery_name=next(name for name in files if name.startswith('.handoff-recoveries/'))
+        target=destination/recovery_name;target.parent.mkdir()
+        external=self.root/'external';external.write_text('untouched')
+        try:target.with_suffix('.tmp').symlink_to(external)
+        except OSError:self.skipTest('Symlink privilege unavailable')
+        with patch.object(admin,'coordination_backup',return_value=files):
+            with self.assertRaises(ValueError):admin.restore_coordination(self.root,'source','destination')
+        self.assertEqual(external.read_text(),'untouched')
+        self.assertFalse((destination/'.handoff-requests').exists())
+        self.assertFalse(target.exists())
