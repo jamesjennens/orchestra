@@ -16,7 +16,11 @@ An old task without a structured checkpoint reports its current position and unr
 
 ## Publish a checkpoint
 
-Read `brief --json`, reconcile relevant history and repository state, and save a UTF-8 JSON file using [the template](../templates/CHECKPOINT.json). Set `previous` to the current checkpoint's `comment_id` (or null for the first checkpoint), copy the briefing's top-level `activity_cursor`, and record the exact `incorporated_digests` (`entry_id` → content digest) from the snapshot the checkpoint summarizes — `brief` does not print them, so build the checkpoint against a fresh `history`/export snapshot or use the tooling that produces the cursor. Fill in the real source commit and branch, or leave them empty when unknown. Submit:
+Read `brief --json`, reconcile relevant history and repository state, and save a UTF-8 JSON file using [the template](../templates/CHECKPOINT.json). Set `previous` to the current checkpoint's `comment_id` (or null for the first checkpoint) and copy the briefing's top-level `activity_cursor`. Fill in the real source commit and branch, or leave them empty when unknown.
+
+Provenance is server-bound: do not hand-craft incorporated digests. Omit them and the server computes the exact snapshot digests under the project lock, or fetch the supported map with `checkpoint TASK --provenance` (returns the current `activity_cursor` and `incorporated_digests`) and embed it verbatim — a missing, extra or incorrect map is rejected. The stored record keeps a bounded window of recent digests plus a rolling chain hash over older history, so checkpoints on long-lived tasks stay within the size cap. Legacy payloads without provenance still parse for reads and exact retries reconcile; new writes receive provenance automatically.
+
+`directions` optionally records explicit dispositions for other actors' comment directions: `{"id": "<task>-c<comment_id>", "state": "acknowledged|resolved|superseded", "digest": "<entry digest from --provenance>", "note": ..., "evidence": ...}`. Acknowledged means seen and taken into account — it is not completion. Resolved/superseded require note and evidence, and the digest must match the incorporated entry, so an edited direction re-surfaces until re-dispositioned. A direction absent from `directions` stays outstanding on `brief` even when the checkpoint's digests incorporate it; receipt and cursor advancement are never resolution. Submit:
 
 ```sh
 b checkpoint example-task --file checkpoint.json

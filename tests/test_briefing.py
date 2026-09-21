@@ -35,7 +35,6 @@ def checkpoint(data, **changes):
     result = dict(schema_version=1, task=TASK,
                   previous=str(current[1]['id']) if current else None,
                   activity_cursor=b.activity_cursor(snap),
-                  incorporated_digests=dict(snap['entry_digests']),
                   source_commit='abc123', branch='work/feature', intent='Deliver the feature',
                   acceptance='Pass the agreed checks', summary='Implementation is underway',
                   next_action='Run the focused tests', open_items=[], resolved=[])
@@ -45,6 +44,21 @@ def checkpoint(data, **changes):
 
 def append_checkpoint(data, cid, p):
     data[0]['comments'].append(comment(cid, b.PREFIX + canonical_bytes(p).decode()))
+
+
+def save_cp(data, cid, **changes):
+    """Save a checkpoint through save_checkpoint (server-computed provenance) and
+    append the stored comment. Returns the stored payload."""
+    writes = []
+    def run(args):
+        writes.append(args)
+        return json.dumps(dict(id=cid))
+    p = checkpoint(data, **changes)
+    b.save_checkpoint(data, PROJECT, TASK, p, 'alice/session', run)
+    # The stored comment is what save_checkpoint wrote (with server provenance).
+    stored_text = writes[0][3]
+    data[0]['comments'].append(comment(cid, stored_text))
+    return json.loads(stored_text[len(b.PREFIX):])
 
 
 def blocker():
@@ -157,13 +171,13 @@ class NewerActivityTests(unittest.TestCase):
 
     def directed_rows(self, directions=3):
         """Analysis task, no contribution, an old no-action checkpoint, then
-        `directions` later coordinator comments plus one later own comment."""
+        `directions` later coordinator comments plus one later own comment.
+        The checkpoint is saved through save_checkpoint so it carries the
+        server-computed provenance (digests) of the activity it incorporates."""
         data = rows()
         data[0]['description'] = 'Analyze the options; no code contribution is expected.'
-        p = checkpoint(data, summary='Analysis complete; nothing is pending',
-                       next_action='No work outstanding; wait quietly')
-        data[0]['comments'].append(comment('cp1', b.PREFIX + canonical_bytes(p).decode(),
-                                           '2026-09-15T12:00:00Z'))
+        save_cp(data, 'cp1', summary='Analysis complete; nothing is pending',
+                next_action='No work outstanding; wait quietly')
         for n in range(directions):
             data[0]['comments'].append(comment(f'dir{n}', f'Coordinator direction {n}',
                                                f'2026-09-16T0{n}:00:00Z', author='coordinator/session'))
@@ -184,7 +198,7 @@ class NewerActivityTests(unittest.TestCase):
         surfaced = {e['entry_id'] for e in newer['entries']}
         self.assertTrue({f'{TASK}-cdir{n}' for n in range(3)} <= surfaced)
         self.assertEqual(newer['history'], 'history ' + TASK)
-        self.assertIn('--since 2026-09-15T12:00:00Z', newer['history_new'])
+        self.assertIn('--since ', newer['history_new'])
         self.assertTrue(all(e['author']['text'] for e in newer['entries']))
         self.assertIn('STALE CHECKPOINT', result['next_action'])
         self.assertIn('No work outstanding; wait quietly', result['next_action'])
@@ -272,14 +286,10 @@ class NewerActivityTests(unittest.TestCase):
 
     def test_newer_summary_tracks_the_current_checkpoint_of_a_chain(self):
         data = rows()
-        p = checkpoint(data)
-        data[0]['comments'].append(comment('cp1', b.PREFIX + canonical_bytes(p).decode(),
-                                           '2026-09-15T12:00:00Z'))
+        save_cp(data, 'cp1')
         data[0]['comments'].append(comment('mid', 'Middle direction', '2026-09-16T00:00:00Z',
                                            author='coordinator/session'))
-        second = checkpoint(data)
-        data[0]['comments'].append(comment('cp2', b.PREFIX + canonical_bytes(second).decode(),
-                                           '2026-09-17T00:00:00Z'))
+        save_cp(data, 'cp2')
         data[0]['comments'].append(comment('after', 'Direction after cp2', '2026-09-18T00:00:00Z',
                                            author='coordinator/session'))
         newer = b.brief(data, PROJECT, TASK)['newer']
@@ -290,6 +300,128 @@ class NewerActivityTests(unittest.TestCase):
         self.assertNotIn(f'{TASK}-ccp2', entry_ids)
         self.assertNotIn(f'{TASK}-cmid', entry_ids)
         self.assertEqual(newer['other_count'], 1)
+
+
+class ReviewV3Tests(unittest.TestCase):
+    """kittrial-5bb.1 review 01a0bc6c: digest-binding, ack-not-resolution, compatibility-cap."""
+
+    def writes(self):
+        calls = []
+        return calls, lambda args: (calls.append(args), json.dumps(dict(id='cpX')))[1]
+
+    def test_fabricated_digests_are_rejected_and_correct_map_accepted(self):
+        data = rows()
+        snap = b.snapshot(data, PROJECT, TASK)
+        real = dict(snap['entry_digests'])
+        p = checkpoint(data)
+        bads = [{'fabricated': '0' * 64}, {**real, 'extra': '1' * 64}]
+        if real:
+            first = next(iter(real))
+            bads.append({**real, first: '0' * 64})
+        for bad in bads:
+            calls, run = self.writes()
+            with self.subTest(bad=sorted(bad)), self.assertRaisesRegex(ValueError, 'does not match'):
+                b.save_checkpoint(data, PROJECT, TASK, dict(p, incorporated_digests=bad), 'alice/session', run)
+            self.assertEqual(calls, [])
+        calls, run = self.writes()
+        result = b.save_checkpoint(data, PROJECT, TASK, dict(p, incorporated_digests=real), 'alice/session', run)
+        self.assertFalse(result['reconciled'])
+        self.assertEqual(len(calls), 1)
+        stored = json.loads(calls[0][3][len(b.PREFIX):])
+        self.assertEqual(stored['provenance']['digests'], real)
+        self.assertNotIn('incorporated_digests', stored)
+
+    def test_omitted_digests_are_computed_server_side(self):
+        data = rows()
+        calls, run = self.writes()
+        b.save_checkpoint(data, PROJECT, TASK, checkpoint(data), 'alice/session', run)
+        stored = json.loads(calls[0][3][len(b.PREFIX):])
+        self.assertEqual(stored['provenance']['covered'], 1)
+        self.assertEqual(set(stored['provenance']['digests']), {f'{TASK}-cfirst'})
+
+    def test_provenance_endpoint_supplies_cursor_and_map(self):
+        data = rows()
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)
+            def run(args):
+                return '\n'.join(json.dumps(r) for r in data)
+            out = json.loads(b.execute(path, path, PROJECT, 'alice/session', 'checkpoint',
+                                       [TASK, '--provenance'], {}, run))
+            self.assertEqual(out['activity_cursor'], b.activity_cursor(b.snapshot(data, PROJECT, TASK)))
+            self.assertEqual(set(out['incorporated_digests']), {f'{TASK}-cfirst'})
+            p = checkpoint(data, incorporated_digests=out['incorporated_digests'])
+            p['activity_cursor'] = out['activity_cursor']
+            calls, run2 = self.writes()
+            b.save_checkpoint(data, PROJECT, TASK, p, 'alice/session', run2)
+            self.assertEqual(len(calls), 1)
+
+
+    def test_acknowledgement_is_not_resolution_and_edits_invalidate_it(self):
+        data = rows()
+        save_cp(data, 'cp0')
+        data[0]['comments'].append(comment('dir0', 'Coordinator direction', '2026-09-16T00:00:00Z',
+                                           author='coordinator/session'))
+        # A checkpoint that incorporates the direction via digests only still leaves it outstanding.
+        newer = b.brief(data, PROJECT, TASK)['newer']
+        self.assertEqual(newer['unresolved_directions']['total'], 1)
+        self.assertEqual(newer['unresolved_directions']['items'][0]['state'], 'unacknowledged')
+        digest = b.snapshot(data, PROJECT, TASK)['entry_digests'][f'{TASK}-cdir0']
+        save_cp(data, 'cp1', directions=[dict(id=f'{TASK}-cdir0', state='acknowledged', digest=digest)])
+        after = b.brief(data, PROJECT, TASK)
+        self.assertIsNone(after['newer'])
+        self.assertEqual(after['directions']['total'], 1)
+        self.assertEqual(after['directions']['items'][0]['state'], 'acknowledged')
+        # Editing the direction invalidates the earlier acknowledgement.
+        dir_comment = next(cm for cm in data[0]['comments'] if cm['id'] == 'dir0')
+        dir_comment['text'] = 'Edited coordinator direction'
+        revised = b.brief(data, PROJECT, TASK)
+        self.assertTrue(revised['checkpoint']['newer_activity'])
+        self.assertIn('outstanding direction', revised['next_action'])
+        self.assertEqual(revised['newer']['unresolved_directions']['items'][0]['state'], 'acknowledged')
+        # Only an explicit resolved/superseded disposition with matching digest clears it.
+        edited = b.snapshot(data, PROJECT, TASK)['entry_digests'][f'{TASK}-cdir0']
+        save_cp(data, 'cp2', directions=[dict(id=f'{TASK}-cdir0', state='resolved', digest=edited,
+                                              note='Direction implemented', evidence='commit abc123')])
+        self.assertEqual(b.brief(data, PROJECT, TASK)['directions']['total'], 0)
+        # A resolution against a stale digest is rejected before any write.
+        dir_comment['text'] = 'Re-edited coordinator direction'
+        calls, run = self.writes()
+        stale = checkpoint(data, directions=[dict(id=f'{TASK}-cdir0', state='resolved', digest=edited,
+                                                  note='x', evidence='y')])
+        with self.assertRaisesRegex(ValueError, 'does not match the incorporated entry'):
+            b.save_checkpoint(data, PROJECT, TASK, stale, 'alice/session', run)
+        self.assertEqual(calls, [])
+
+    def test_wrong_state_or_missing_evidence_rejected(self):
+        data = rows()
+        digest = b.snapshot(data, PROJECT, TASK)['entry_digests'][f'{TASK}-cfirst']
+        for dirs in ([dict(id=f'{TASK}-cfirst', state='done', digest=digest)],
+                     [dict(id=f'{TASK}-cfirst', state='resolved', digest=digest)],
+                     [dict(id=f'{TASK}-cfirst', state='acknowledged', digest='bad')]):
+            with self.subTest(dirs=dirs), self.assertRaises(ValueError):
+                b.validate_checkpoint(checkpoint(data, directions=dirs), TASK)
+
+    def test_large_history_stays_bounded_and_template_roundtrips(self):
+        data = rows()
+        for n in range(250):
+            data[0]['comments'].append(comment(f'c{n}', f'Comment {n}', '2026-09-17T00:00:00Z'))
+        calls, run = self.writes()
+        b.save_checkpoint(data, PROJECT, TASK, checkpoint(data), 'alice/session', run)
+        stored_text = calls[0][3]
+        stored = json.loads(stored_text[len(b.PREFIX):])
+        self.assertLessEqual(len(stored['provenance']['digests']), b.DIGEST_WINDOW)
+        self.assertEqual(stored['provenance']['covered'], 251)
+        self.assertNotEqual(stored['provenance']['chain'], b.ZERO_HASH)
+        self.assertLessEqual(len(stored_text.encode('utf-8')), 80 * 1024)
+        # Served template roundtrip: the shipped template parses into a valid write.
+        template = json.loads((Path(__file__).resolve().parents[1] / 'templates' / 'CHECKPOINT.json').read_text(encoding='utf-8'))
+        payload = checkpoint(data, **{k: v for k, v in template.items() if k in
+                                      ('source_commit', 'branch', 'intent', 'acceptance', 'summary', 'next_action')})
+        b.validate_checkpoint(payload, TASK)
+        # Legacy payload (pre-digest fields only) still validates for read/retry paths.
+        b.validate_checkpoint(payload, TASK, require_digests=False)
+        self.assertNotIn('incorporated_digests', payload)
+        self.assertNotIn('provenance', payload)
 
 
 class HistoryTests(unittest.TestCase):

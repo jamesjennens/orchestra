@@ -20,12 +20,12 @@ def checkpoint_newer_counts(rows,row):
     a checkpoint or with malformed/conflicting checkpoint history (brief remains
     the authority); coverage flags whether counts are proven or unknown."""
     try:
-        from briefing import checkpoints,newer_activity_summary,snapshot,activity_cursor
+        from briefing import checkpoints,newer_activity_summary,snapshot,activity_cursor,parse_provenance
         (p,c),_invalid=checkpoints(row)
         if p is None:return None
         excluded=snapshot(rows,'work-queue',row['id'],str(c['id']))
         if p['activity_cursor']==activity_cursor(excluded):return {'own':0,'others':0,'coverage':'current'}
-        newer=newer_activity_summary(excluded,p.get('incorporated_digests'),c.get('created_at'),row.get('assignee'))
+        newer=newer_activity_summary(excluded,parse_provenance(p),c.get('created_at'),row.get('assignee'))
         return {'own':newer['own_count'],'others':newer['other_count'],'coverage':newer['coverage']}
     except (ValueError,TypeError,KeyError):return None
 

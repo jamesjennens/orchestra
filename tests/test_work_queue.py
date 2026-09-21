@@ -12,7 +12,7 @@ import review_workflow as rw
 import work
 from requirements import canonical_bytes
 from lifecycle import DIMENSIONS
-from test_briefing import rows,checkpoint,append_checkpoint,comment,TASK,PROJECT
+from test_briefing import rows,checkpoint,append_checkpoint,save_cp,comment,TASK,PROJECT
 from test_lifecycle import NativeStore
 
 
@@ -110,9 +110,7 @@ class NewerActivityQueueTests(unittest.TestCase):
 
     def directed(self):
         data=rows()
-        p=checkpoint(data,next_action='Nothing pending')
-        data[0]['comments'].append(comment('cp1',briefing.PREFIX+canonical_bytes(p).decode(),
-                                           '2026-09-15T12:00:00Z'))
+        save_cp(data,'cp1',next_action='Nothing pending')
         for n in range(3):
             data[0]['comments'].append(comment(f'dir{n}',f'Direction {n}','2026-09-16T00:00:00Z',
                                                author='coordinator/session'))
@@ -126,9 +124,7 @@ class NewerActivityQueueTests(unittest.TestCase):
 
     def test_queue_flag_clears_once_checkpoint_incorporates_the_activity(self):
         data=self.directed()
-        fresh=checkpoint(data,next_action='Process the three directions')
-        data[0]['comments'].append(comment('cp2',briefing.PREFIX+canonical_bytes(fresh).decode(),
-                                           '2026-09-16T02:00:00Z'))
+        save_cp(data,'cp2',next_action='Process the three directions')
         item=work.queue(data,'alice/session',['--mine'])['items'][0]
         self.assertEqual(item['newer_activity_by_others'],0)
         self.assertEqual(item['newer_activity_own'],0)
