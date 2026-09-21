@@ -89,12 +89,19 @@ def disposition(path, actor, p, run, operator=False):
     if not file.exists():raise ValueError('Unknown handoff request')
     record=json.loads(file.read_text(encoding='utf-8'));validate_request_record(record)
     if p['task']!=record['task']:raise ValueError('Handoff disposition task does not match stored request')
+    recovery_file=path/'.handoff-recoveries'/(content_hash({'request_id':p['request_id']})+'.json')
+    recovery_identity={'operation_id':p['operation_id'],'actor':actor,'operator':operator,
+                       'reason':p['reason'],'task':p['task']}
+    if recovery_file.exists():
+        stored=json.loads(recovery_file.read_text(encoding='utf-8'))
+        if stored!=recovery_identity:
+            raise ValueError('Handoff recovery disposition identity changed')
     if record.get('disposition'):
         old=record['disposition']
         if old['operation_id']==p['operation_id'] and old['kind']==p['disposition'] and old['actor']==actor and old['reason']==p['reason']:
             return dict(record,reconciled=True)
         raise ValueError('Handoff request already has a disposition')
-    if p['disposition']=='accept' and _reconcile_completed_request(path, record, actor, p, run):
+    if p['disposition']=='accept' and _reconcile_completed_request(path, record, actor, p, run, operator):
         return dict(json.loads(file.read_text(encoding='utf-8')), reconciled=True)
     rows=json.loads(run(['show',p['task'],'--json']))
     if not isinstance(rows,list) or len(rows)!=1 or rows[0].get('id')!=p['task']:raise ValueError('Expected exact task')
@@ -110,10 +117,12 @@ def disposition(path, actor, p, run, operator=False):
     allowed = {record['from_actor']} if p['disposition'] in ('accept','decline') else {record['to_actor']}
     if not operator and actor not in allowed:raise ValueError('Actor is not authorized; disposition requires the current owner or requested destination')
     if p['disposition']=='accept':
+        recovery_file.parent.mkdir(exist_ok=True)
+        atomic(recovery_file,recovery_identity)
         handoff_payload={'schema_version':1,'operation_id':'handoff-'+p['request_id'],'task':record['task'],
                          'from_actor':record['from_actor'],'to_actor':record['to_actor'],
                          'reason':record['reason'],'approval':p['reason']}
-        execute(path,actor,handoff_payload,run,operator=operator)
+        execute(path,actor,handoff_payload,run,operator=operator,recovery=recovery_identity)
     record['status']={'accept':'accepted','decline':'declined','withdraw':'withdrawn','supersede':'superseded'}[p['disposition']]
     record['disposition']={'kind':p['disposition'],'actor':actor,'reason':p['reason'],'operation_id':p['operation_id']}
     validate_request_record(record);atomic(file,record)
@@ -131,6 +140,15 @@ def _reconcile_completed_request(path, request_record, actor, disposition, run=N
     validate_receipt(receipt)
     payload=receipt['identity']['payload']
     receipt_identity=receipt['identity']
+    recovery=receipt_identity.get('recovery')
+    if isinstance(disposition,dict):
+        expected_recovery={'operation_id':disposition['operation_id'],'actor':actor,'operator':operator,
+                           'reason':disposition['reason'],'task':disposition['task']}
+        if recovery is not None and recovery!=expected_recovery:
+            raise ValueError('Handoff recovery disposition identity changed')
+        recovery_file=path/'.handoff-recoveries'/(content_hash({'request_id':request_record['request_id']})+'.json')
+        if recovery_file.exists() and json.loads(recovery_file.read_text(encoding='utf-8'))!=expected_recovery:
+            raise ValueError('Handoff recovery disposition identity changed')
     if not operator and receipt_identity['operator']:
         raise ValueError('Recovery authority does not match original handoff authority')
     if actor!=receipt_identity['initiator'] and not (operator and receipt_identity['operator']):
@@ -138,6 +156,14 @@ def _reconcile_completed_request(path, request_record, actor, disposition, run=N
     if receipt['status']=='pending' and run is not None:
         rows=json.loads(run(['show',request_record['task'],'--json']))
         if isinstance(rows,list) and len(rows)==1 and rows[0].get('assignee')==request_record['to_actor']:
+            intent='Kind: task-handoff-v1\n'+canonical_bytes(receipt_identity).decode()
+            complete='Kind: task-handoff-complete-v1\n'+canonical_bytes(receipt_identity).decode()
+            comments=json.loads(run(['comments',request_record['task'],'--json'])) or []
+            if not any(c.get('text')==intent and c.get('author')==receipt_identity['initiator'] for c in comments):
+                run(['comments','add',request_record['task'],intent,'--json'])
+            comments=json.loads(run(['comments',request_record['task'],'--json'])) or []
+            if not any(c.get('text')==complete and c.get('author')==receipt_identity['initiator'] for c in comments):
+                run(['comments','add',request_record['task'],complete,'--json'])
             receipt['status']='complete'
             atomic(receipt_file,receipt)
     if receipt['status']!='complete' or payload['operation_id']!=operation_id:
@@ -160,13 +186,17 @@ def _reconcile_completed_request(path, request_record, actor, disposition, run=N
 def validate_receipt(record):
     if not isinstance(record,dict) or set(record)!={'digest','status','identity'} or record['status'] not in ('pending','complete'):raise ValueError('Invalid handoff receipt')
     identity=record['identity']
-    if not isinstance(identity,dict) or set(identity)!={'payload','initiator','operator'} or type(identity['operator']) is not bool:raise ValueError('Invalid handoff identity')
+    if not isinstance(identity,dict) or set(identity) not in ({'payload','initiator','operator'},{'payload','initiator','operator','recovery'}) or type(identity['operator']) is not bool:raise ValueError('Invalid handoff identity')
     validate(identity['payload'])
     if not isinstance(identity['initiator'],str) or not ACTOR.fullmatch(identity['initiator']):raise ValueError('Invalid handoff initiator')
     if not identity['operator'] and identity['initiator']!=identity['payload']['from_actor']:raise ValueError('Invalid handoff authority')
+    if 'recovery' in identity:
+        recovery=identity['recovery']
+        if not isinstance(recovery,dict) or set(recovery)!={'operation_id','actor','operator','reason','task'} or type(recovery['operator']) is not bool or recovery['task']!=identity['payload']['task'] or recovery['actor']!=identity['initiator'] or recovery['operator']!=identity['operator'] or not ID.fullmatch(recovery['operation_id']) or not ACTOR.fullmatch(recovery['actor']) or not isinstance(recovery['reason'],str) or not recovery['reason'].strip():
+            raise ValueError('Invalid handoff recovery identity')
     if record['digest']!=content_hash(identity):raise ValueError('Handoff receipt integrity mismatch')
 
-def execute(path, actor, p, run, operator=False):
+def execute(path, actor, p, run, operator=False, recovery=None):
     """Caller holds project lock. operator is supplied only by admin CLI."""
     validate(p)
     if not ACTOR.fullmatch(actor):raise ValueError('Invalid initiating actor')
@@ -176,9 +206,14 @@ def execute(path, actor, p, run, operator=False):
     folder.mkdir(exist_ok=True)
     file=folder/(content_hash({'operation_id':p['operation_id']})+'.json')
     if file.is_symlink() or file.with_suffix('.tmp').is_symlink():raise ValueError('Invalid journal path')
-    identity={'payload':p,'initiator':actor,'operator':operator};digest=content_hash(identity)
     record=json.loads(file.read_text(encoding='utf-8')) if file.exists() else None
     if file.exists():validate_receipt(record)
+    if recovery is None and record:
+        recovery=record['identity'].get('recovery')
+    identity={'payload':p,'initiator':actor,'operator':operator}
+    if recovery is not None:
+        identity['recovery']=recovery
+    digest=content_hash(identity)
     if record and record.get('digest')!=digest:raise ValueError('Handoff operation ID reused with different content or authority')
     def issue():
         rows=json.loads(run(['show',p['task'],'--json']))

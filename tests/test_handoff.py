@@ -212,6 +212,55 @@ class HandoffTests(unittest.TestCase):
         records=[json.loads(p.read_text()) for p in (self.path/'.handoff-requests').glob('*.json')]
         self.assertEqual(sorted(r['status'] for r in records),['accepted','pending'])
 
+    def test_interrupted_disposition_binds_changed_content_before_recovery(self):
+        request_payload={'schema_version':1,'operation':'request',
+                         'request_id':'00000000-0000-0000-0000-000000000011',
+                         'task':'trial-task','from_actor':'alice','to_actor':'bob',
+                         'reason':'Please take over'}
+        handoff.request(self.path,'bob',request_payload)
+        disposition={'schema_version':1,'operation':'disposition','operation_id':'disp-11',
+                     'request_id':request_payload['request_id'],'task':'trial-task',
+                     'disposition':'accept','reason':'Approved','supersedes':None}
+        self.native.lose_response=True
+        with self.assertRaises(RuntimeError):
+            handoff.disposition(self.path,'alice',disposition,self.native)
+        changed=dict(disposition,reason='Changed approval')
+        with self.assertRaisesRegex(ValueError,'identity changed'):
+            handoff.disposition(self.path,'alice',changed,self.native)
+
+    def test_interrupted_disposition_restores_completion_audit(self):
+        request_payload={'schema_version':1,'operation':'request',
+                         'request_id':'00000000-0000-0000-0000-000000000012',
+                         'task':'trial-task','from_actor':'alice','to_actor':'bob',
+                         'reason':'Please take over'}
+        handoff.request(self.path,'bob',request_payload)
+        disposition={'schema_version':1,'operation':'disposition','operation_id':'disp-12',
+                     'request_id':request_payload['request_id'],'task':'trial-task',
+                     'disposition':'accept','reason':'Approved','supersedes':None}
+        self.native.lose_response=True
+        with self.assertRaises(RuntimeError):
+            handoff.disposition(self.path,'alice',disposition,self.native)
+        result=handoff.disposition(self.path,'alice',disposition,self.native)
+        self.assertTrue(result['reconciled'])
+        self.assertEqual(sum('task-handoff-complete-v1' in c['text'] for c in self.native.comments),1)
+
+    def test_operator_disposition_retry_preserves_operator_authority(self):
+        request_payload={'schema_version':1,'operation':'request',
+                         'request_id':'00000000-0000-0000-0000-000000000013',
+                         'task':'trial-task','from_actor':'alice','to_actor':'bob',
+                         'reason':'Please take over'}
+        handoff.request(self.path,'bob',request_payload)
+        disposition={'schema_version':1,'operation':'disposition','operation_id':'disp-13',
+                     'request_id':request_payload['request_id'],'task':'trial-task',
+                     'disposition':'accept','reason':'Coordinator approved','supersedes':None}
+        self.native.lose_response=True
+        with self.assertRaises(RuntimeError):
+            handoff.disposition(self.path,'coordinator',disposition,self.native,operator=True)
+        result=handoff.disposition(self.path,'coordinator',disposition,self.native,operator=True)
+        self.assertTrue(result['reconciled'])
+        with self.assertRaisesRegex(ValueError,'identity changed'):
+            handoff.disposition(self.path,'mallory',disposition,self.native)
+
     def test_direct_transfer_settles_only_matching_request(self):
         request_payload={'schema_version':1,'operation':'request',
                          'request_id':'00000000-0000-0000-0000-000000000005',
