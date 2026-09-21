@@ -141,3 +141,5 @@ The queue sorts requested changes first and shows task status, owner, review sta
 The structured protocol is an append-only native comment chain with previous-comment checks. Do not hand-edit those comments. Forked/malformed records fail clearly and need operator reconciliation. Report/label changes are separate writes; a retry repairs interrupted removal of review-ready, while structured state stays authoritative.
 
 For example, if review returns contribution.comment_id = record-A, contribution.commit = <Git SHA>, and latest_comment_id = record-B, submit contribution = record-A and previous = record-B. Do not put the Git SHA in either comment-ID field.
+
+Handoff acceptance binds the complete disposition (including kind and supersedes) before transfer. The `.handoff-recoveries` journal is included in coordination backups and validated on restore. Interrupted completion keeps the original disposition ID on the accepted request. Older incomplete recovery identities fail closed and require explicit operator reconciliation; they are not silently promoted to exact retry evidence.
