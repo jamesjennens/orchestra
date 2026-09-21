@@ -133,7 +133,10 @@ class AuthCase(unittest.TestCase):
     def test_disable_revokes_sessions_and_credentials(self):
         admin = self.principal_for(self.service.login(ADMIN, ADMIN_PASSWORD)['session_token'])
         created, alex, token = self.make_user('alex', 'alex-password-1')
-        project = self.make_project(alex, 'Alpha')
+        # The admin stays an owner, so disabling alex does not remove the project's
+        # final owner (that invariant is exercised separately).
+        project = self.make_project(admin, 'Alpha')
+        self.service.set_member(admin, project, alex.user_id, 'owner')
         credential = self.service.issue_credential(alex, project)['secret']
         self.service.disable_user(admin, created['id'])
         with self.assertRaises(HttpError):
@@ -314,7 +317,9 @@ class AuthCase(unittest.TestCase):
         created = self.service.create_user(admin, 'alex')
         self.service.change_password(admin, created['id'], None, 'alex-password-1')
         alex = self.principal_for(self.service.login('alex', 'alex-password-1')['session_token'])
-        project = self.make_project(alex, 'Alpha')
+        # Admin remains an owner so alex is not the project's final owner.
+        project = self.make_project(admin, 'Alpha')
+        self.service.set_member(admin, project, created['id'], 'owner')
         secret = self.service.issue_credential(alex, project)['secret']
         self.service.disable_user(admin, created['id'])
         with self.assertRaises(HttpError):

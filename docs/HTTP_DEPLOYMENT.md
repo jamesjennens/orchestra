@@ -28,6 +28,7 @@ merge, deployment or host authority.
 | Service | `http_service.py` (stdlib `ThreadingHTTPServer`) |
 | Auth core | `http_auth.py` |
 | Client | `http_client.py` |
+| Canonical binding | `--backend endpoint` (default) via `EndpointBackend` -> `endpoint.py`; `--backend inprocess` is a disposable local check only |
 | Private state | one JSON document at `--state` (e.g. `<RUNTIME_ROOT>/http-state.json`) |
 | Python | 3.10 or newer; no third-party packages |
 | Listener | loopback by default (`127.0.0.1:8443`), fronted by the reverse proxy |
@@ -35,6 +36,12 @@ merge, deployment or host authority.
 The state document contains only password verifiers, hashed session/credential
 tokens, membership, idempotency records and audit events. It must live outside
 source control on a private path owned by the service account.
+
+The `endpoint` backend runs the canonical `endpoint.py` client as the service
+account and is the only binding that touches canonical coordination data. The
+HTTP layer never reads or writes canonical storage directly. The `inprocess`
+backend keeps canonical records inside the service state and exists solely for
+disposable local validation; it is not a deployment backend.
 
 ## 3. Provisioning a host (placeholders)
 
@@ -73,7 +80,10 @@ WorkingDirectory=<RUNTIME_ROOT>/kit
 ExecStart=/usr/bin/python3 http_service.py \
   --state <RUNTIME_ROOT>/http-state.json \
   --host 127.0.0.1 --port 8443 \
-  --trust-proxy
+  --backend endpoint \
+  --endpoint <RUNTIME_ROOT>/kit/endpoint.py \
+  --root <RUNTIME_ROOT> \
+  --trusted-proxy 127.0.0.1
 Restart=on-failure
 NoNewPrivileges=true
 PrivateTmp=true
@@ -86,9 +96,19 @@ UMask=0077
 WantedBy=multi-user.target
 ```
 
-`--trust-proxy` makes the service read the last `X-Forwarded-For` hop for login
-throttling. Enable it **only** when the listener is reachable solely by the
-configured reverse proxy; otherwise a client can spoof the throttle key.
+`--trusted-proxy ADDR` (repeatable, address or CIDR) names the peers whose
+forwarded headers the service will believe. A reverse proxy on the same host is
+`--trusted-proxy 127.0.0.1`. Enable it **only** for the configured proxy address:
+forwarded headers from any other peer are ignored, so a client cannot spoof the
+throttle key or claim `https`.
+
+That last point is what makes browser cookies safe under the documented TLS
+deployment. TLS terminates at the proxy, so the loopback connection to the
+service is plaintext and is **not** treated as secure by itself. The service marks
+the session cookie `Secure` only when the request arrived over TLS at the service
+or when a trusted peer sent `X-Forwarded-Proto: https`. A plaintext loopback
+request, or an `X-Forwarded-Proto` header from an untrusted peer, does not earn a
+`Secure` cookie. The proxy must set `X-Forwarded-Proto https` (see section 5).
 
 TLS may also terminate at the service itself with
 `--cert <CERT_PATH> --key <KEY_PATH>` (TLS 1.2 minimum). The service refuses a
@@ -119,9 +139,12 @@ server {
 ```
 
 The proxy must reject or redirect plaintext, validate its certificate chain,
-enforce a body limit, and preserve only the documented forwarding headers. Do not
-add a wildcard CORS origin: credentialed requests require an explicit origin list
-and the service sends `Cache-Control: no-store` on every response.
+enforce a body limit, and preserve only the documented forwarding headers. It
+should set `X-Forwarded-Proto https` and the service must name the proxy address
+with `--trusted-proxy` for that header to be believed (section 4); otherwise
+browser session cookies are issued without `Secure`. Do not add a wildcard CORS
+origin: credentialed requests require an explicit origin list and the service
+sends `Cache-Control: no-store` on every response.
 
 ## 6. Worker clients
 
@@ -138,6 +161,13 @@ is shown only in that `201` response. For unattended workers, store it in the
 operator's secret store and use it as a bearer token. An exact retry of a lost
 issuance returns `200` metadata with `secret_available:false`; it never re-delivers
 the secret. Revoke and reissue instead.
+
+A credential is bound to one project and to its `scopes` list (`read`, `tasks`,
+`checkpoints`, `reviews`, `feedback`). It may always read the project it is scoped
+to; a write route requires the matching scope. No credential can administer
+accounts or projects, issue or revoke credentials, or approve a review, whatever
+the role of the account that issued it. Issuing a credential never lends the
+issuer's authority to it.
 
 Mutating calls accept an `Idempotency-Key`. On an uncertain `503` the client
 raises `UncertainOutcome` carrying the key: retry the identical request with that
@@ -188,19 +218,35 @@ the pilot phase, not part of this service.
 
 ## 10. Known limitations of this disposable build
 
-- Canonical operations run through `InProcessBackend`, a disposable JSON store
-  used by the contract tests. The Linux service binds the same interface to
-  `endpoint.py` through `EndpointBackend`; that binding is deliberately thin and
-  is not exercised by the portable suite.
-- The state store is a single JSON document guarded by one in-process lock. Run
-  exactly one service process; multi-process or multi-host scale-out is out of
-  scope and would need a transactional store.
-- Attachment uploads are validated and bounded but only their metadata and digest
-  are retained by the disposable backend; content storage belongs to the
-  canonical backend and is a follow-up item.
+- The canonical binding is implemented for the full route surface:
+  `EndpointBackend` provides `invoke`, `list_tasks`, `get_task`, `task_history` and
+  `list_feedback`, maps task mutations onto `bd create/update` and
+  checkpoints/reviews onto the canonical structured `checkpoint`/`review` actions,
+  and re-checks authority when it writes the durable idempotency receipt. A
+  disposable subprocess test (`tests/test_http_review_fixes.py`) exercises the HTTP
+  surface through this seam against durable file-backed canonical state, including
+  uncertain-write reconciliation after a restart. Confirming the exact `bd` argv
+  against a live pinned runtime still needs a POSIX host with `bd`; this
+  workstation has neither.
+- **Explicitly unresolved routes.** The jobs alias and artifact-content routes are
+  not implemented. `POST`/`GET /v1/projects/{id}/feedback` fail closed with
+  `501 not_implemented` on the canonical backend because the dedicated feedback
+  stream ships with `kittrial-5bb.13`; the service never substitutes its own store
+  for canonical feedback. Attachment uploads are validated and bounded but only
+  their metadata and digest are retained, so **UI readiness is not claimed**.
 - Administrative audit coverage is partial: login outcomes, authorization
   denials and every successful idempotent mutation are recorded; a per-field
   before/after administrative trail is not implemented.
+- The state store is a single JSON document guarded by one in-process lock, written
+  with a unique temporary and an atomic replace. Run exactly one service process;
+  multi-process or multi-host scale-out is out of scope and would need a
+  transactional store. The store lock is also the authority/revocation boundary: a
+  revocation cannot interleave between an authority check and the mutation it
+  authorizes.
+- The final-owner invariant is enforced for every caller, including a superuser.
+  Recovery is explicit and accepted: assign `owner` to another member first, then
+  demote, remove or disable the previous sole owner. Review approval is owner-only;
+  a contributor cannot approve, and a worker credential never can.
 
 ## 11. Unresolved office decisions (owner, before rollout)
 

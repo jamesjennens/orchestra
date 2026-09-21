@@ -19,6 +19,7 @@ import argparse
 import base64
 import binascii
 import hashlib
+import ipaddress
 import json
 import re
 import secrets
@@ -28,9 +29,11 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from http_auth import (HttpError, Principal, Service, Store, conflict, forbidden, invalid,
-                       not_found, now_iso, request_hash, unauthenticated, uncertain,
-                       unsupported)
+from http_auth import (CAP_ACCOUNTS_ADMIN, CAP_APPROVE, CAP_CHECKPOINTS, CAP_FEEDBACK,
+                       CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_READ, CAP_REVIEWS,
+                       CAP_TASKS, HttpError, Service, Store, conflict, forbidden, invalid,
+                       not_found, not_implemented, now_iso, request_hash, unauthenticated,
+                       uncertain, unsupported)
 
 KIT_VERSION = '0.1.0'
 MAX_BODY_BYTES = 262144
@@ -43,11 +46,27 @@ DEFAULT_PAGE = 50
 MAX_CURSOR = 512
 IDEMPOTENCY_HEADER = 'Idempotency-Key'
 ATTACHMENT_MEDIA_TYPES = ('text/plain', 'text/markdown')
-SAFE_ID = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$')
+# One identifier pattern for every route parameter. Canonical Orchestra ids contain
+# hyphens and dots (``kittrial-5bb.19``), which the original ``[A-Za-z0-9_]+``
+# rejected. The first character must be alphanumeric, so ``.``/``..`` never match.
+ID = r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}'
+SAFE_ID = re.compile(r'^' + ID + r'$')
 REQUEST_ID = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
 IDEMPOTENCY_KEY = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$')
 CURSOR = re.compile(r'^[A-Za-z0-9_-]{1,%d}$' % MAX_CURSOR)
 LOOPBACK = ('127.0.0.1', '::1', 'localhost')
+
+
+def address_matches(peer, network):
+    """True when ``peer`` is inside the trusted ``network`` (address or CIDR)."""
+    if not isinstance(peer, str) or not peer:
+        return False
+    if network == 'localhost':
+        return peer in ('127.0.0.1', '::1')
+    try:
+        return ipaddress.ip_address(peer) in ipaddress.ip_network(network, strict=False)
+    except ValueError:
+        return False
 
 
 # ------------------------------------------------------------------- attachments
@@ -156,19 +175,29 @@ class InProcessBackend:
     def _results(self):
         return self.state.setdefault('results', {})
 
-    def _result_key(self, principal, project_id, route, key):
-        return request_hash({'u': principal.user_id, 'p': project_id, 'r': route, 'k': key})
+    def _result_key(self, principal, project_id, route, key, target):
+        return request_hash({'u': principal.user_id, 'c': principal.credential_id or '-',
+                             'p': project_id or '-', 'r': route, 't': target or '-',
+                             'k': key})
 
-    def invoke(self, route, principal, project_id, payload, key):
+    def invoke(self, route, principal, project_id, payload, key, target=None, authorize=None):
         if route not in self.ROUTES:
             raise ValueError('Unknown canonical route %r' % (route,))
-        result_key = self._result_key(principal, project_id, route, key) if key else None
-        if result_key and result_key in self._results():
-            return self._results()[result_key]
-        result = self._dispatch(route, principal, project_id, payload)
-        if result_key:
-            self._results()[result_key] = result
-        self.service.store.save()
+        result_key = self._result_key(principal, project_id, route, key, target) if key else None
+        # The authority re-check, the canonical write and the durable result share one
+        # critical section. A concurrent revocation therefore either commits before
+        # this section (and is observed by ``authorize``) or after it (and is
+        # serialized after the write); there is no window in which a caller that has
+        # already lost authority lands a write.
+        with self.service.store.lock:
+            if authorize is not None:
+                authorize()
+            if result_key is not None and result_key in self._results():
+                return self._results()[result_key]
+            result = self._dispatch(route, principal, project_id, payload)
+            if result_key is not None:
+                self._results()[result_key] = result
+            self.service.store.save()
         if self.faults.get(route, 0) > 0:
             self.faults[route] -= 1
             raise UncertainOutcome()
@@ -358,35 +387,249 @@ class InProcessBackend:
 class EndpointBackend:
     """Production seam: map authorized HTTP operations onto canonical ``endpoint.py``.
 
-    The Linux service runs ``endpoint.py`` as the same-account canonical process. This
-    adapter is intentionally thin: it is constructed with the interpreter, endpoint
-    path and runtime root, and the caller supplies the already-authorized project and
-    actor. It is not exercised by the portable test suite.
+    This is the runnable Linux binding, not deployment glue. Each of the six methods
+    the routes need is implemented:
+
+    * ``invoke`` maps task/checkpoint/review mutations onto the canonical client
+      protocol (``bd create/update`` and the structured ``checkpoint``/``review``
+      actions that already own claim, review and checkpoint semantics);
+    * ``list_tasks``/``get_task``/``task_history`` map onto ``bd list``/``show`` and
+      the canonical ``history`` action;
+    * ``list_feedback`` fails closed with a clean 501 until the dedicated feedback
+      stream (``kittrial-5bb.13``) is integrated into the canonical command set;
+      the service never substitutes its own in-memory feedback for canonical data.
+
+    Uncertain-write reconciliation is durable: the committed canonical result is
+    stored in the service state under the full semantic target and key, so an exact
+    retry after a lost response returns the stored result rather than repeating the
+    canonical write. The authority half of the boundary is re-checked when the
+    receipt is written, so a revocation that commits while the canonical call is in
+    flight is surfaced as an uncertain outcome, never as success.
     """
 
-    def __init__(self, python, endpoint, root, runner=None):
-        self.python, self.endpoint, self.root = python, endpoint, root
-        self.runner = runner
+    ROUTES = InProcessBackend.ROUTES
+    #: Routes with no canonical command yet, and why. Fails closed rather than
+    #: pretending the service store is canonical.
+    UNRESOLVED = {
+        'feedback.add': 'the canonical feedback command ships with kittrial-5bb.13',
+    }
+    READ_UNRESOLVED = {
+        'list_feedback': 'the canonical feedback command ships with kittrial-5bb.13',
+    }
 
-    def call(self, project, actor, action, args, attachments=None):
+    def __init__(self, python, endpoint, root, *, service, actor_namespace='http',
+                 timeout=150, runner=None):
+        self.python = python
+        self.endpoint = endpoint
+        self.root = root
+        self.service = service
+        self.actor_namespace = actor_namespace
+        self.timeout = timeout
+        self.runner = runner
+        self.faults = {}
+
+    def fail_next(self, route, times=1):
+        """Test hook: commit canonically, then report an uncertain outcome."""
+        self.faults[route] = times
+
+    @property
+    def state(self):
+        return self.service.state['canonical']
+
+    def _results(self):
+        return self.state.setdefault('results', {})
+
+    def _result_key(self, principal, project_id, route, key, target):
+        return request_hash({'u': principal.user_id, 'c': principal.credential_id or '-',
+                             'p': project_id or '-', 'r': route, 't': target or '-',
+                             'k': key})
+
+    def _actor(self, principal):
+        if principal.via == 'credential':
+            return principal.actor or principal.user_id
+        return '%s/%s' % (self.actor_namespace, principal.user_id)
+
+    # -- transport -------------------------------------------------------------
+    def _endpoint(self, action, project, actor, args, attachments=None):
+        if self.runner is not None:
+            return self.runner(action=action, project=project, actor=actor, args=args,
+                               attachments=attachments or {})
         import subprocess
-        payload = {'project': project, 'actor': actor, 'action': action,
-                   'args': args, 'attachments': attachments or {}}
-        argv = [self.python, self.endpoint, '--root', self.root]
-        completed = subprocess.run(argv, input=json.dumps(payload), text=True,
-                                   encoding='utf-8', capture_output=True, timeout=150)
+        payload = {'project': project, 'actor': actor, 'action': action, 'args': args,
+                   'attachments': attachments or {}}
+        try:
+            completed = subprocess.run([self.python, self.endpoint, '--root', self.root],
+                                       input=json.dumps(payload), text=True, encoding='utf-8',
+                                       capture_output=True, timeout=self.timeout)
+        except subprocess.TimeoutExpired:
+            raise uncertain('Canonical endpoint timed out; outcome may be unknown')
         if completed.returncode:
             raise uncertain('Canonical endpoint failed; outcome may be unknown')
-        return json.loads(completed.stdout)
+        try:
+            return json.loads(completed.stdout)
+        except ValueError:
+            raise uncertain('Canonical endpoint returned an invalid response')
+
+    def _run(self, action, project, actor, args, attachments=None):
+        reply = self._endpoint(action, project, actor, args, attachments)
+        code = reply.get('returncode') if isinstance(reply, dict) else None
+        stderr = (reply.get('stderr') or '') if isinstance(reply, dict) else ''
+        stdout = (reply.get('stdout') or '') if isinstance(reply, dict) else ''
+        if code == 124:
+            raise uncertain('Canonical command timed out; outcome may be unknown')
+        if code:
+            detail = stderr.strip().splitlines()[-1][:200] if stderr.strip() else None
+            if code == 2:
+                raise invalid('Canonical command rejected the request', detail)
+            raise uncertain('Canonical command failed; outcome may be unknown')
+        return _canonical_payload(stdout)
+
+    # -- mutations -------------------------------------------------------------
+    def invoke(self, route, principal, project_id, payload, key, target=None, authorize=None):
+        if route not in self.ROUTES:
+            raise ValueError('Unknown canonical route %r' % (route,))
+        if route in self.UNRESOLVED:
+            raise not_implemented('Canonical backend cannot perform %s: %s'
+                                  % (route, self.UNRESOLVED[route]))
+        result_key = self._result_key(principal, project_id, route, key, target) if key else None
+        with self.service.store.lock:
+            if authorize is not None:
+                authorize()
+            if result_key is not None and result_key in self._results():
+                return self._results()[result_key]
+        action, project, args, attachments = self._command(route, principal, project_id,
+                                                           payload)
+        result = self._run(action, project, self._actor(principal), args, attachments)
+        with self.service.store.lock:
+            if authorize is not None:
+                try:
+                    authorize()
+                except HttpError:
+                    # Authority was revoked while the canonical write was in flight.
+                    # The write may have committed, so never report success.
+                    self.service.audit(None, principal, route, 'unknown',
+                                       project_id=project_id,
+                                       reason='authority revoked in flight')
+                    self.service.store.save()
+                    raise UncertainOutcome()
+            if result_key is not None:
+                self._results()[result_key] = result
+            self.service.store.save()
+        if self.faults.get(route, 0) > 0:
+            self.faults[route] -= 1
+            raise UncertainOutcome()
+        return result
+
+    def _command(self, route, principal, project_id, payload):
+        """Build the canonical action and argv for one authorized mutation."""
+        task_id = payload.get('task_id')
+        if route == 'tasks.create':
+            args = ['create', str(payload.get('title') or ''), '--json']
+            attachments = {}
+            description = payload.get('description')
+            if description:
+                args = ['create', str(payload.get('title') or ''), '--body-file',
+                        '@attachment:0', '--json']
+                attachments = {'0': {'flag': '--body-file', 'text': description}}
+            return 'bd', project_id, args, attachments
+        if route == 'tasks.update':
+            args = ['update', str(task_id), '--json']
+            if payload.get('title') is not None:
+                args[2:2] = ['--title', str(payload['title'])]
+            if payload.get('status') in ('open', 'closed'):
+                args[2:2] = ['--status', {'open': 'open', 'closed': 'closed'}[payload['status']]]
+            if payload.get('description') is not None:
+                args[2:2] = ['--description', str(payload['description'])]
+            return 'bd', project_id, args, {}
+        if route == 'tasks.claim':
+            actor = payload.get('actor') or self._actor(principal)
+            return ('bd', project_id,
+                    ['update', str(task_id), '--status', 'in_progress', '--assignee',
+                     str(actor), '--json'], {})
+        if route == 'checkpoints.add':
+            # The canonical checkpoint is the structured document owned by
+            # briefing.py (activity cursor, source commit, unresolved items). The
+            # binding forwards it unchanged; it never invents canonical fields.
+            fields = ('schema_version', 'task', 'previous', 'activity_cursor',
+                      'source_commit', 'branch', 'intent', 'acceptance', 'summary',
+                      'next_action', 'open_items', 'resolved')
+            missing = [field for field in fields if field not in payload]
+            if missing:
+                raise invalid('Canonical checkpoint payload is missing fields: %s'
+                              % ', '.join(missing))
+            body = {field: payload.get(field) for field in fields}
+            body['task'] = task_id
+            return ('checkpoint', project_id, [str(task_id), '@attachment:0'],
+                    {'0': {'flag': '--file', 'text': json.dumps(body)}})
+        if route == 'reviews.add':
+            body = {key: payload.get(key) for key in
+                    ('operation', 'previous', 'contribution', 'supersedes', 'resolutions',
+                     'items', 'summary', 'commit', 'base_commit', 'bundle_sha256',
+                     'repository', 'delivery')}
+            body['task'] = task_id
+            return ('review', project_id, [str(task_id), '@attachment:0'],
+                    {'0': {'flag': '--file', 'text': json.dumps(body)}})
+        raise invalid('Backend route is not implemented for the canonical endpoint: %s' % route)
+
+    # -- reads (no canonical mutation) ----------------------------------------
+    def list_tasks(self, project_id, limit, offset):
+        # ``list --all --limit 0`` is the kit's own full-read form (see
+        # coordination.py); the HTTP page is sliced from that snapshot so the
+        # offset cursor stays exact.
+        rows = self._run('bd', project_id, self.actor_namespace + '/read',
+                         ['list', '--all', '--limit', '0', '--json'])
+        rows = rows if isinstance(rows, list) else rows.get('items', [])
+        return {'items': rows[offset:offset + limit], 'total': len(rows)}
+
+    def get_task(self, project_id, task_id):
+        row = self._run('bd', project_id, self.actor_namespace + '/read',
+                        ['show', str(task_id), '--json'])
+        if isinstance(row, list):
+            row = row[0] if row else {}
+        return row
+
+    def task_history(self, project_id, task_id, limit, offset):
+        want = min(offset + limit, 100000)
+        reply = self._run('history', project_id, self.actor_namespace + '/read',
+                          [str(task_id), '--limit', str(want), '--json'])
+        if isinstance(reply, list):
+            items, total = reply, len(reply)
+        else:
+            items = reply.get('entries') or []
+            total = reply.get('total_entries', len(items))
+        return {'items': items[offset:offset + limit], 'total': total}
+
+    def list_feedback(self, project_id, limit, offset):
+        raise not_implemented('Canonical backend has no feedback read yet: %s'
+                              % self.READ_UNRESOLVED['list_feedback'])
+
+
+def _canonical_payload(stdout):
+    """Parse the JSON body a canonical command returned, tolerating NDJSON."""
+    text = (stdout or '').strip()
+    if not text:
+        raise uncertain('Canonical command returned no data; outcome may be unknown')
+    try:
+        return json.loads(text)
+    except ValueError:
+        for line in reversed(text.splitlines()):
+            line = line.strip()
+            if line[:1] in ('{', '['):
+                try:
+                    return json.loads(line)
+                except ValueError:
+                    continue
+    raise uncertain('Canonical command returned unparsable data; outcome may be unknown')
 
 
 # ------------------------------------------------------------------ HTTP adapter
 class RouteContext:
     __slots__ = ('principal', 'payload', 'query', 'params', 'request_id',
-                 'idempotency_key', 'body_hash', 'auth_source', 'secure')
+                 'idempotency_key', 'body_hash', 'auth_source', 'secure',
+                 'route_target', 'authorize')
 
     def __init__(self, principal, payload, query, params, request_id, idempotency_key,
-                 body_hash, auth_source, secure):
+                 body_hash, auth_source, secure, route_target):
         self.principal = principal
         self.payload = payload
         self.query = query
@@ -396,6 +639,8 @@ class RouteContext:
         self.body_hash = body_hash
         self.auth_source = auth_source
         self.secure = secure
+        self.route_target = route_target
+        self.authorize = None
 
 
 ROUTES = []
@@ -415,7 +660,7 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     service = None
     backend = None
-    trust_proxy = False
+    trusted_proxies = ()
     max_body = MAX_BODY_BYTES
     protocol_version = 'HTTP/1.1'
     server_version = 'OrchestraHTTP/' + KIT_VERSION
@@ -445,9 +690,13 @@ class ApiHandler(BaseHTTPRequestHandler):
             name, anonymous, csrf, params = match
             payload, auth_source = self._read_request(method, anonymous, params, csrf,
                                                       request_id)
+            # The semantic route target is the method plus the concrete path (with the
+            # real account/project/task id substituted). It is the idempotency
+            # namespace, so two different targets never share a receipt.
+            route_target = '%s %s' % (method, path)
             ctx = RouteContext(self._principal, payload, query, params, request_id,
                                self._idempotency_key(), self._body_hash, auth_source,
-                               self._is_secure())
+                               self._is_secure(), route_target)
             status, response = getattr(self, name)(ctx)
             self._send_json(status, response)
         except HttpError as error:
@@ -472,23 +721,50 @@ class ApiHandler(BaseHTTPRequestHandler):
             return supplied
         return 'req_' + secrets.token_hex(8)
 
-    def _is_secure(self):
-        return getattr(self.connection, 'cipher', None) is not None or not self._peer_is_loopback()
-
-    def _peer_is_loopback(self):
+    def _peer_address(self):
         try:
-            return self.client_address[0] in LOOPBACK
+            return self.client_address[0]
         except (IndexError, TypeError):
-            return False
+            return ''
+
+    def _is_secure(self):
+        """Whether this request reached the service over a trusted secure channel.
+
+        TLS terminated at the service is obviously secure. Behind the documented
+        reverse proxy the loopback peer is NOT secure by itself, so a plaintext
+        loopback connection must not be treated as HTTPS. Forwarded scheme headers
+        are honored only when the immediate peer is a configured trusted proxy, so
+        an arbitrary client cannot claim ``https`` to win a Secure cookie.
+        """
+        if getattr(self.connection, 'cipher', None) is not None:
+            return True
+        if self._forwarded_proto() == 'https':
+            return True
+        return False
+
+    def _peer_is_trusted_proxy(self):
+        peer = self._peer_address()
+        return any(address_matches(peer, network) for network in self.trusted_proxies)
+
+    def _forwarded_proto(self):
+        if not self._peer_is_trusted_proxy():
+            return None
+        value = self.headers.get('X-Forwarded-Proto')
+        if isinstance(value, str) and value:
+            return value.split(',')[0].strip().lower()
+        return None
 
     def _source(self):
-        if self.trust_proxy:
+        if self._peer_is_trusted_proxy():
             forwarded = self.headers.get('X-Forwarded-For')
             if isinstance(forwarded, str) and forwarded:
                 candidate = forwarded.split(',')[-1].strip()
-                if REQUEST_ID.fullmatch(candidate):
-                    return candidate
-        return self.client_address[0] if self.client_address else 'unknown'
+                try:
+                    ipaddress.ip_address(candidate)
+                except ValueError:
+                    return self._peer_address()
+                return candidate
+        return self._peer_address() or 'unknown'
 
     def _idempotency_key(self):
         key = self.headers.get(IDEMPOTENCY_HEADER)
@@ -596,12 +872,24 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_header('Set-Cookie', attributes)
 
     # -- mutation helper -------------------------------------------------------
-    def _mutate(self, ctx, route_name, project_id, fn, *, status=200, idempotent=True,
-                replay_status=None):
+    def _mutate(self, ctx, route_name, project_id, fn, *, capability, allow_self_user=None,
+                status=200, idempotent=True, replay_status=None, serialize=True):
+        """Run one authorized, idempotent mutation.
+
+        ``capability`` names the authority the route needs. ``serialize=True`` holds
+        the store lock across the authority re-check, the write and the idempotency
+        receipt, so a concurrent revocation cannot slip between them. Backend routes
+        pass ``serialize=False``: their backend acquires the same lock after its own
+        invocation seam and re-checks authority there, which keeps the boundary
+        atomic while still letting a revocation that truly committed first win.
+        """
+        ctx.authorize = (lambda: self.service.check_authority(
+            ctx.principal, project_id, capability, allow_self_user=allow_self_user))
+        idem_route = '%s %s' % (route_name, ctx.route_target)
         key = ctx.idempotency_key if idempotent else None
         digest = None
         if key is not None:
-            outcome = self.service.idempotency_check(ctx.principal, project_id, route_name,
+            outcome = self.service.idempotency_check(ctx.principal, project_id, idem_route,
                                                      key, ctx.body_hash)
             if outcome is not None:
                 kind, stored_status, response = outcome
@@ -610,10 +898,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                     # marks that with replay_status (200 metadata-only for issue routes).
                     return (replay_status or stored_status), response
                 # 'unknown': reconcile by re-invoking the idempotent backend.
-            digest = self.service.idempotency_begin(ctx.principal, project_id, route_name,
+            digest = self.service.idempotency_begin(ctx.principal, project_id, idem_route,
                                                     key, ctx.body_hash)
         try:
-            public, stored = fn()
+            if serialize:
+                with self.service.store.lock:
+                    ctx.authorize()
+                    public, stored = fn()
+            else:
+                ctx.authorize()
+                public, stored = fn()
         except UncertainOutcome:
             self.service.idempotency_unknown(digest)
             self.service.audit(ctx.request_id, ctx.principal, route_name, 'unknown',
@@ -637,8 +931,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.service.store.save()
         return status, public
 
-    def _project(self, ctx, minimum='viewer'):
-        return self.service.require_project(ctx.principal, ctx.params['pid'], minimum)
+    def require(self, ctx, capability):
+        """Authorize one read/route capability against live authority."""
+        return self.service.check_authority(ctx.principal, ctx.params.get('pid'), capability)
+
+    def _project(self, ctx, capability=CAP_READ):
+        return self.service.check_authority(ctx.principal, ctx.params['pid'], capability)
 
     def _task_payload(self, ctx):
         payload = dict(ctx.payload or {})
@@ -677,6 +975,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         payload = ctx.payload or {}
         return self._mutate(ctx, 'accounts.create', None,
                             lambda: self._account_created(ctx, payload), status=201,
+                            capability=CAP_ACCOUNTS_ADMIN,
                             idempotent=bool(ctx.idempotency_key))
 
     def _account_created(self, ctx, payload):
@@ -686,9 +985,10 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     @route('GET', r'/v1/accounts')
     def accounts_list(self, ctx):
+        self.require(ctx, CAP_ACCOUNTS_ADMIN)
         return 200, {'items': self.service.list_users(ctx.principal)}
 
-    @route('POST', r'/v1/accounts/(?P<uid>[A-Za-z0-9_]+)/password')
+    @route('POST', r'/v1/accounts/(?P<uid>' + ID + r')/password')
     def account_password(self, ctx):
         payload = ctx.payload or {}
 
@@ -698,9 +998,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                                                   payload.get('new_password'))
             return result, result
         return self._mutate(ctx, 'accounts.password', None, change,
+                            capability=CAP_ACCOUNTS_ADMIN,
+                            allow_self_user=ctx.params['uid'],
                             idempotent=bool(ctx.idempotency_key))
 
-    @route('POST', r'/v1/accounts/(?P<uid>[A-Za-z0-9_]+)/reset')
+    @route('POST', r'/v1/accounts/(?P<uid>' + ID + r')/reset')
     def account_reset(self, ctx):
         def issue():
             result = self.service.issue_reset(ctx.principal, ctx.params['uid'],
@@ -711,12 +1013,14 @@ class ApiHandler(BaseHTTPRequestHandler):
             stored['reset_value_available'] = False
             return result, stored
         return self._mutate(ctx, 'accounts.reset', None, issue, status=201,
-                            replay_status=200)
+                            capability=CAP_ACCOUNTS_ADMIN, replay_status=200)
 
-    @route('POST', r'/v1/accounts/(?P<uid>[A-Za-z0-9_]+)/reset/redeem', anonymous=True,
+    @route('POST', r'/v1/accounts/(?P<uid>' + ID + r')/reset/redeem', anonymous=True,
            csrf=False)
     def account_reset_redeem(self, ctx):
         payload = ctx.payload or {}
+        # Anonymous but reset-value-authorized. The token lookup is uniform, so a
+        # missing account and a wrong value are indistinguishable to the caller.
         result = self.service.redeem_reset(ctx.params['uid'], payload.get('reset_value'),
                                            payload.get('new_password'))
         # Redemption is anonymous but token-authorized: record the account, never the
@@ -726,10 +1030,13 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.service.store.save()
         return 200, result
 
-    @route('POST', r'/v1/accounts/(?P<uid>[A-Za-z0-9_]+)/disable')
+    @route('POST', r'/v1/accounts/(?P<uid>' + ID + r')/disable')
     def account_disable(self, ctx):
         return self._mutate(ctx, 'accounts.disable', None,
-                            lambda: self._account_disabled(ctx), idempotent=bool(ctx.idempotency_key))
+                            lambda: self._account_disabled(ctx),
+                            capability=CAP_ACCOUNTS_ADMIN,
+                            allow_self_user=ctx.params['uid'],
+                            idempotent=bool(ctx.idempotency_key))
 
     def _account_disabled(self, ctx):
         result = self.service.disable_user(ctx.principal, ctx.params['uid'])
@@ -745,24 +1052,26 @@ class ApiHandler(BaseHTTPRequestHandler):
             result = self.service.create_project(ctx.principal, payload.get('name'), project_id)
             return result, result
         return self._mutate(ctx, 'projects.create', payload.get('project_id'), create,
-                            status=201)
+                            status=201, capability=CAP_PROJECT_CREATE)
 
     @route('GET', r'/v1/projects')
     def projects_list(self, ctx):
         return 200, {'items': self.service.list_projects(ctx.principal)}
 
-    @route('GET', r'/v1/projects/(?P<pid>[A-Za-z0-9_]+)')
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')')
     def project_get(self, ctx):
+        self._project(ctx, CAP_READ)
         return 200, self.service.project_view(ctx.principal, ctx.params['pid'])
 
-    @route('POST', r'/v1/projects/(?P<pid>[A-Za-z0-9_]+)/archive')
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/archive')
     def project_archive(self, ctx):
         def archive():
             result = self.service.archive_project(ctx.principal, ctx.params['pid'])
             return result, result
-        return self._mutate(ctx, 'projects.archive', ctx.params['pid'], archive)
+        return self._mutate(ctx, 'projects.archive', ctx.params['pid'], archive,
+                            capability=CAP_PROJECT_ADMIN)
 
-    @route('PUT', r'/v1/projects/(?P<pid>[A-Za-z0-9_]+)/members/(?P<uid>[A-Za-z0-9_]+)')
+    @route('PUT', r'/v1/projects/(?P<pid>' + ID + r')/members/(?P<uid>' + ID + r')')
     def member_set(self, ctx):
         payload = ctx.payload or {}
 
@@ -771,20 +1080,20 @@ class ApiHandler(BaseHTTPRequestHandler):
                                              ctx.params['uid'], payload.get('role'),
                                              request_id=ctx.request_id)
             return result, result
-        return self._mutate(ctx, 'members.set:' + ctx.params['uid'], ctx.params['pid'],
-                            set_member)
+        return self._mutate(ctx, 'members.set', ctx.params['pid'], set_member,
+                            capability=CAP_PROJECT_ADMIN)
 
-    @route('DELETE', r'/v1/projects/(?P<pid>[A-Za-z0-9_]+)/members/(?P<uid>[A-Za-z0-9_]+)')
+    @route('DELETE', r'/v1/projects/(?P<pid>' + ID + r')/members/(?P<uid>' + ID + r')')
     def member_remove(self, ctx):
         def remove():
             result = self.service.remove_member(ctx.principal, ctx.params['pid'],
                                                 ctx.params['uid'],
                                                 request_id=ctx.request_id)
             return result, result
-        return self._mutate(ctx, 'members.remove:' + ctx.params['uid'], ctx.params['pid'],
-                            remove)
+        return self._mutate(ctx, 'members.remove', ctx.params['pid'], remove,
+                            capability=CAP_PROJECT_ADMIN)
 
-    @route('POST', r'/v1/projects/(?P<pid>[A-Za-z0-9_]+)/worker-credentials')
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/worker-credentials')
     def credential_issue(self, ctx):
         payload = ctx.payload or {}
 
@@ -800,47 +1109,50 @@ class ApiHandler(BaseHTTPRequestHandler):
                       'secret_available': False}
             return public, stored
         return self._mutate(ctx, 'credentials.issue', ctx.params['pid'], issue, status=201,
-                            replay_status=200)
+                            capability=CAP_PROJECT_ADMIN, replay_status=200)
 
-    @route('POST', r'/v1/projects/(?P<pid>[A-Za-z0-9_]+)/worker-credentials/'
-                  r'(?P<cid>[A-Za-z0-9_]+)/revoke')
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/worker-credentials/'
+                  r'(?P<cid>' + ID + r')/revoke')
     def credential_revoke(self, ctx):
         def revoke():
             result = self.service.revoke_credential(ctx.principal, ctx.params['pid'],
                                                     ctx.params['cid'],
                                                     request_id=ctx.request_id)
             return result, result
-        return self._mutate(ctx, 'credentials.revoke:' + ctx.params['cid'],
-                            ctx.params['pid'], revoke, status=204)
+        return self._mutate(ctx, 'credentials.revoke', ctx.params['pid'], revoke, status=204,
+                            capability=CAP_PROJECT_ADMIN)
 
     # -- task routes -----------------------------------------------------------
-    @route('POST', r'/v1/projects/(?P<pid>[A-Za-z0-9_]+)/tasks')
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks')
     def tasks_create(self, ctx):
-        self._project(ctx, 'contributor')
+        self._project(ctx, CAP_TASKS)
         payload = dict(ctx.payload or {})
         payload['attachments'] = validate_attachments(payload.get('attachments'))
 
         def create():
             result = self.backend.invoke('tasks.create', ctx.principal, ctx.params['pid'],
-                                         payload, ctx.idempotency_key)
+                                         payload, ctx.idempotency_key,
+                                         target=ctx.route_target, authorize=ctx.authorize)
             return result, result
-        return self._mutate(ctx, 'tasks.create', ctx.params['pid'], create, status=201)
+        return self._mutate(ctx, 'tasks.create', ctx.params['pid'], create, status=201,
+                            capability=CAP_TASKS, serialize=False)
 
-    @route('PATCH', r'/v1/projects/(?P<pid>[A-Za-z0-9_]+)/tasks/(?P<tid>[A-Za-z0-9_]+)')
+    @route('PATCH', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')')
     def tasks_update(self, ctx):
-        self._project(ctx, 'contributor')
+        self._project(ctx, CAP_TASKS)
         payload = self._task_payload(ctx)
 
         def update():
             result = self.backend.invoke('tasks.update', ctx.principal, ctx.params['pid'],
-                                         payload, ctx.idempotency_key)
+                                         payload, ctx.idempotency_key,
+                                         target=ctx.route_target, authorize=ctx.authorize)
             return result, result
-        return self._mutate(ctx, 'tasks.update:' + ctx.params['tid'], ctx.params['pid'],
-                            update)
+        return self._mutate(ctx, 'tasks.update', ctx.params['pid'], update,
+                            capability=CAP_TASKS, serialize=False)
 
-    @route('GET', r'/v1/projects/(?P<pid>[A-Za-z0-9_]+)/tasks')
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks')
     def tasks_list(self, ctx):
-        self._project(ctx, 'viewer')
+        self._project(ctx, CAP_READ)
         limit, offset = self._page(ctx, ctx.query)
         result = self.backend.list_tasks(ctx.params['pid'], limit, offset)
         result['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query,
@@ -848,56 +1160,63 @@ class ApiHandler(BaseHTTPRequestHandler):
                                  if offset + limit < result['total'] else None)
         return 200, result
 
-    @route('GET', r'/v1/projects/(?P<pid>[A-Za-z0-9_]+)/tasks/(?P<tid>[A-Za-z0-9_]+)')
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')')
     def tasks_get(self, ctx):
-        self._project(ctx, 'viewer')
+        self._project(ctx, CAP_READ)
         return 200, self.backend.get_task(ctx.params['pid'], ctx.params['tid'])
 
-    @route('POST', r'/v1/projects/(?P<pid>[A-Za-z0-9_]+)/tasks/(?P<tid>[A-Za-z0-9_]+)/claim')
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/claim')
     def tasks_claim(self, ctx):
-        self._project(ctx, 'contributor')
+        self._project(ctx, CAP_TASKS)
         payload = self._task_payload(ctx)
         actor = self.service.bind_actor(ctx.principal, payload.pop('actor', None))
         payload['actor'] = actor
 
         def claim():
             result = self.backend.invoke('tasks.claim', ctx.principal, ctx.params['pid'],
-                                         payload, ctx.idempotency_key)
+                                         payload, ctx.idempotency_key,
+                                         target=ctx.route_target, authorize=ctx.authorize)
             return result, result
-        return self._mutate(ctx, 'tasks.claim:' + ctx.params['tid'], ctx.params['pid'],
-                            claim)
+        return self._mutate(ctx, 'tasks.claim', ctx.params['pid'], claim,
+                            capability=CAP_TASKS, serialize=False)
 
-    @route('POST', r'/v1/projects/(?P<pid>[A-Za-z0-9_]+)/tasks/(?P<tid>[A-Za-z0-9_]+)/checkpoints')
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/checkpoints')
     def checkpoints_add(self, ctx):
-        self._project(ctx, 'contributor')
+        self._project(ctx, CAP_CHECKPOINTS)
         payload = self._task_payload(ctx)
         if 'actor' in payload:
             payload['actor'] = self.service.bind_actor(ctx.principal, payload.get('actor'))
 
         def add():
             result = self.backend.invoke('checkpoints.add', ctx.principal, ctx.params['pid'],
-                                         payload, ctx.idempotency_key)
+                                         payload, ctx.idempotency_key,
+                                         target=ctx.route_target, authorize=ctx.authorize)
             return result, result
-        return self._mutate(ctx, 'checkpoints.add:' + ctx.params['tid'], ctx.params['pid'],
-                            add, status=201)
+        return self._mutate(ctx, 'checkpoints.add', ctx.params['pid'], add, status=201,
+                            capability=CAP_CHECKPOINTS, serialize=False)
 
-    @route('POST', r'/v1/projects/(?P<pid>[A-Za-z0-9_]+)/tasks/(?P<tid>[A-Za-z0-9_]+)/reviews')
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/reviews')
     def reviews_add(self, ctx):
-        self._project(ctx, 'contributor')
         payload = self._task_payload(ctx)
+        # Approval is an owner action; the contributor who delivered the work can
+        # contribute or request changes, never approve. A worker credential can never
+        # approve at all.
+        capability = CAP_APPROVE if payload.get('operation') == 'approve' else CAP_REVIEWS
+        self._project(ctx, capability)
         if 'actor' in payload:
             payload['actor'] = self.service.bind_actor(ctx.principal, payload.get('actor'))
 
         def add():
             result = self.backend.invoke('reviews.add', ctx.principal, ctx.params['pid'],
-                                         payload, ctx.idempotency_key)
+                                         payload, ctx.idempotency_key,
+                                         target=ctx.route_target, authorize=ctx.authorize)
             return result, result
-        return self._mutate(ctx, 'reviews.add:' + ctx.params['tid'], ctx.params['pid'],
-                            add, status=201)
+        return self._mutate(ctx, 'reviews.add', ctx.params['pid'], add, status=201,
+                            capability=capability, serialize=False)
 
-    @route('GET', r'/v1/projects/(?P<pid>[A-Za-z0-9_]+)/tasks/(?P<tid>[A-Za-z0-9_]+)/history')
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/history')
     def tasks_history(self, ctx):
-        self._project(ctx, 'viewer')
+        self._project(ctx, CAP_READ)
         limit, offset = self._page(ctx, ctx.query)
         result = self.backend.task_history(ctx.params['pid'], ctx.params['tid'], limit, offset)
         result['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query,
@@ -906,22 +1225,24 @@ class ApiHandler(BaseHTTPRequestHandler):
         return 200, result
 
     # -- feedback and audit ----------------------------------------------------
-    @route('POST', r'/v1/projects/(?P<pid>[A-Za-z0-9_]+)/feedback')
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/feedback')
     def feedback_add(self, ctx):
-        self._project(ctx, 'contributor')
+        self._project(ctx, CAP_FEEDBACK)
         payload = dict(ctx.payload or {})
         if 'actor' in payload:
             payload['actor'] = self.service.bind_actor(ctx.principal, payload.get('actor'))
 
         def add():
             result = self.backend.invoke('feedback.add', ctx.principal, ctx.params['pid'],
-                                         payload, ctx.idempotency_key)
+                                         payload, ctx.idempotency_key,
+                                         target=ctx.route_target, authorize=ctx.authorize)
             return result, result
-        return self._mutate(ctx, 'feedback.add', ctx.params['pid'], add, status=201)
+        return self._mutate(ctx, 'feedback.add', ctx.params['pid'], add, status=201,
+                            capability=CAP_FEEDBACK, serialize=False)
 
-    @route('GET', r'/v1/projects/(?P<pid>[A-Za-z0-9_]+)/feedback')
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/feedback')
     def feedback_list(self, ctx):
-        self._project(ctx, 'viewer')
+        self._project(ctx, CAP_READ)
         limit, offset = self._page(ctx, ctx.query)
         result = self.backend.list_feedback(ctx.params['pid'], limit, offset)
         result['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query,
@@ -929,9 +1250,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                                  if offset + limit < result['total'] else None)
         return 200, result
 
-    @route('GET', r'/v1/projects/(?P<pid>[A-Za-z0-9_]+)/audit')
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/audit')
     def audit_list(self, ctx):
-        self._project(ctx, 'owner')
+        self._project(ctx, CAP_PROJECT_ADMIN)
         limit, offset = self._page(ctx, ctx.query)
         events = [e for e in self.service.state['audit'] if e.get('project_id') == ctx.params['pid']]
         body = {'items': events[offset:offset + limit], 'total': len(events)}
@@ -956,14 +1277,15 @@ class ApiHandler(BaseHTTPRequestHandler):
         return limit, offset
 
 
-def build_handler(service, backend, *, trust_proxy=False, max_body=MAX_BODY_BYTES):
+def build_handler(service, backend, *, trusted_proxies=(), max_body=MAX_BODY_BYTES):
     return type('ConfiguredApiHandler', (ApiHandler,), {
-        'service': service, 'backend': backend, 'trust_proxy': trust_proxy,
+        'service': service, 'backend': backend,
+        'trusted_proxies': tuple(trusted_proxies or ()),
         'max_body': max_body,
     })
 
 
-def create_server(service, backend, *, host='127.0.0.1', port=0, trust_proxy=False,
+def create_server(service, backend, *, host='127.0.0.1', port=0, trusted_proxies=(),
                   max_body=MAX_BODY_BYTES, certfile=None, keyfile=None,
                   allow_plaintext_non_loopback=False):
     """Bind the service. Refuse a non-loopback plaintext listener unless explicitly allowed."""
@@ -972,7 +1294,7 @@ def create_server(service, backend, *, host='127.0.0.1', port=0, trust_proxy=Fal
         raise ValueError('Refusing plaintext on a non-loopback interface; supply TLS or '
                          'explicitly allow disposable plaintext')
     httpd = ThreadingHTTPServer((host, port), build_handler(service, backend,
-                                                            trust_proxy=trust_proxy,
+                                                            trusted_proxies=trusted_proxies,
                                                             max_body=max_body))
     httpd.daemon_threads = True
     if certfile:
@@ -983,6 +1305,15 @@ def create_server(service, backend, *, host='127.0.0.1', port=0, trust_proxy=Fal
     return httpd
 
 
+def build_backend(service, args):
+    """Select the canonical backend. ``endpoint`` is the documented Linux service."""
+    if args.backend == 'endpoint':
+        return EndpointBackend(args.endpoint_python, args.endpoint, args.root,
+                               service=service, actor_namespace=args.actor_namespace,
+                               timeout=args.endpoint_timeout)
+    return InProcessBackend(service)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Orchestra authenticated HTTP service')
     parser.add_argument('--state', required=True, help='private service state path (outside source)')
@@ -990,8 +1321,19 @@ def main(argv=None):
     parser.add_argument('--port', type=int, default=8443)
     parser.add_argument('--cert', help='TLS certificate (PEM)')
     parser.add_argument('--key', help='TLS private key (PEM)')
+    parser.add_argument('--trusted-proxy', action='append', default=[], metavar='ADDR',
+                        help='honor forwarded headers only from this address/CIDR (repeatable)')
     parser.add_argument('--trust-proxy', action='store_true',
-                        help='trust X-Forwarded-For from the configured reverse proxy')
+                        help='legacy alias: trust forwarded headers from loopback only')
+    parser.add_argument('--backend', choices=('endpoint', 'inprocess'), default='endpoint',
+                        help='canonical binding (default: endpoint)')
+    parser.add_argument('--endpoint-python', default='python3',
+                        help='interpreter that runs the canonical endpoint')
+    parser.add_argument('--endpoint', help='path to canonical endpoint.py')
+    parser.add_argument('--root', help='canonical runtime root passed to the endpoint')
+    parser.add_argument('--actor-namespace', default='http',
+                        help='actor namespace attributed to session principals')
+    parser.add_argument('--endpoint-timeout', type=int, default=150)
     parser.add_argument('--max-body', type=int, default=MAX_BODY_BYTES)
     parser.add_argument('--bootstrap-user', help='one-time operator bootstrap superuser')
     args = parser.parse_args(argv)
@@ -1003,12 +1345,19 @@ def main(argv=None):
         Service.bootstrap_superuser(store, args.bootstrap_user, password)
         print('Bootstrapped %s' % args.bootstrap_user)
         return 0
+    if args.backend == 'endpoint' and (not args.endpoint or not args.root):
+        parser.error('--backend endpoint requires --endpoint and --root '
+                     '(use --backend inprocess only for a disposable local check)')
+    trusted = list(args.trusted_proxy)
+    if args.trust_proxy and 'localhost' not in trusted:
+        trusted.append('localhost')
     service = Service(store)
-    backend = InProcessBackend(service)
+    backend = build_backend(service, args)
     httpd = create_server(service, backend, host=args.host, port=args.port,
-                          trust_proxy=args.trust_proxy, max_body=args.max_body,
+                          trusted_proxies=trusted, max_body=args.max_body,
                           certfile=args.cert, keyfile=args.key)
-    print('orchestra-http listening on %s:%d' % (args.host, httpd.server_address[1]))
+    print('orchestra-http listening on %s:%d (backend=%s)'
+          % (args.host, httpd.server_address[1], args.backend))
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

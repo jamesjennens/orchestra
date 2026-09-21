@@ -52,6 +52,42 @@ AUDIT_LIMIT = 10000
 ROLES = ('viewer', 'contributor', 'owner')
 RANK = {'viewer': 0, 'contributor': 1, 'owner': 2}
 
+# Capabilities are the single authority vocabulary for every route. A route names
+# the capability it needs; the Service decides whether the live principal holds it.
+# Roles grant capabilities to interactive sessions; credential scopes grant a
+# strictly smaller set that can never include administration or approval.
+CAP_READ = 'read'
+CAP_TASKS = 'tasks.write'
+CAP_CHECKPOINTS = 'checkpoints.write'
+CAP_REVIEWS = 'reviews.write'
+CAP_FEEDBACK = 'feedback.write'
+CAP_APPROVE = 'reviews.approve'
+CAP_PROJECT_ADMIN = 'project.admin'
+CAP_PROJECT_CREATE = 'project.create'
+CAP_ACCOUNTS_ADMIN = 'accounts.admin'
+
+SCOPE_CAPABILITIES = {
+    'read': frozenset({CAP_READ}),
+    'tasks': frozenset({CAP_TASKS}),
+    'checkpoints': frozenset({CAP_CHECKPOINTS}),
+    'reviews': frozenset({CAP_REVIEWS}),
+    'feedback': frozenset({CAP_FEEDBACK}),
+}
+CREDENTIAL_SCOPES = tuple(sorted(SCOPE_CAPABILITIES))
+
+ROLE_CAPABILITIES = {
+    'viewer': frozenset({CAP_READ}),
+    'contributor': frozenset({CAP_READ, CAP_TASKS, CAP_CHECKPOINTS, CAP_REVIEWS, CAP_FEEDBACK}),
+    'owner': frozenset({CAP_READ, CAP_TASKS, CAP_CHECKPOINTS, CAP_REVIEWS, CAP_FEEDBACK,
+                        CAP_APPROVE, CAP_PROJECT_ADMIN}),
+}
+# A worker credential is never an administrator and never approves its own work,
+# whatever the issuing account's role is.
+CREDENTIAL_FORBIDDEN_CAPABILITIES = frozenset({CAP_APPROVE, CAP_PROJECT_ADMIN,
+                                               CAP_PROJECT_CREATE, CAP_ACCOUNTS_ADMIN})
+ALL_CAPABILITIES = frozenset(ROLE_CAPABILITIES['owner'] | {CAP_PROJECT_CREATE,
+                                                           CAP_ACCOUNTS_ADMIN})
+
 PERIODS = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z?$')
 
 
@@ -99,6 +135,10 @@ def invalid(message, detail=None):
 
 def unsupported(message='Unsupported media type'):
     return HttpError(415, 'unsupported_media_type', message)
+
+
+def not_implemented(message='Not implemented'):
+    return HttpError(501, 'not_implemented', message)
 
 
 def throttled(message='Too many attempts'):
@@ -253,11 +293,28 @@ class Store:
         return data
 
     def save(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_name(self.path.name + '.tmp')
-        temporary.write_text(json.dumps(self.state, ensure_ascii=False, indent=2) + '\n',
-                             encoding='utf-8')
-        os.replace(temporary, self.path)
+        # One unique temporary per write, then an atomic replace. A fixed
+        # ``<name>.tmp`` would let a second writer (or a stale process) clobber an
+        # in-flight snapshot before it is renamed, so the name carries the pid and a
+        # random suffix. The lock is re-entrant, so callers that already hold it
+        # (the whole mutation boundary) still get a consistent snapshot.
+        with self.lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.path.with_name(
+                '%s.%d.%s.tmp' % (self.path.name, os.getpid(), secrets.token_hex(4)))
+            text = json.dumps(self.state, ensure_ascii=False, indent=2) + '\n'
+            try:
+                with open(temporary, 'w', encoding='utf-8') as handle:
+                    handle.write(text)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, self.path)
+            except BaseException:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+                raise
 
 
 # --------------------------------------------------------------------------- service
@@ -378,7 +435,10 @@ class Service:
                 'superuser': user['superuser'], 'created_at': user['created_at']}
 
     def change_password(self, principal, user_id, current_password, new_password):
+        if principal is None or principal.via == 'credential':
+            raise forbidden('Session authority required for password changes')
         with self.store.lock:
+            self._refresh_authority(principal)
             user = self._user(user_id)
             if not principal.superuser and principal.user_id != user_id:
                 raise not_found('Account not found')
@@ -431,21 +491,33 @@ class Service:
             self.store.save()
         return {'id': user_id, 'password_set': True}
 
+    def _assert_not_final_owner(self, user_id):
+        """Refuse any change that would leave an active project with zero owners.
+
+        This applies to every caller including a superuser: the invariant protects
+        the project record, not the caller. Recovery is an explicit, accepted
+        operation: assign ``owner`` to another member first (which atomically
+        creates a second owner), then demote or disable the previous one.
+        """
+        for pid, members in self.state['memberships'].items():
+            if members.get(user_id) == 'owner' and \
+                    sum(1 for role in members.values() if role == 'owner') <= 1:
+                raise conflict('The final active project owner cannot be removed, demoted '
+                               'or disabled; assign another owner first', {'project': pid})
+
     def disable_user(self, principal, user_id):
+        if principal is None or principal.via == 'credential':
+            raise forbidden('Session authority required to disable an account')
         with self.store.lock:
+            self._refresh_authority(principal)
             user = self._user(user_id)
             if not principal.superuser and principal.user_id != user_id:
                 raise not_found('Account not found')
             if user['superuser']:
                 raise conflict('The superuser account cannot be disabled')
-            if not principal.superuser:
-                # Self-disable is permitted, but not when it would strand a project
-                # with no active owner; that recovery needs a superuser action.
-                for pid, members in self.state['memberships'].items():
-                    if members.get(user_id) == 'owner' and \
-                            sum(1 for role in members.values() if role == 'owner') <= 1:
-                        raise conflict('The final active project owner cannot be disabled',
-                                       {'project': pid})
+            # The final-owner invariant is enforced for every caller, including a
+            # superuser disabling a project's sole owner.
+            self._assert_not_final_owner(user_id)
             user['disabled'] = True
             self._revoke_sessions_for(user_id)
             self._revoke_credentials_for(user_id)
@@ -453,8 +525,10 @@ class Service:
         return {'id': user_id, 'disabled': True}
 
     def _require_superuser(self, principal):
-        if principal is None or not principal.superuser:
-            raise forbidden('Superuser authority required')
+        with self.store.lock:
+            self._refresh_authority(principal)
+            if not principal.superuser:
+                raise forbidden('Superuser authority required')
 
     def _revoke_sessions_for(self, user_id):
         for digest, session in self.state['sessions'].items():
@@ -555,11 +629,124 @@ class Service:
                 credential['last_used'] = moment
                 actor = credential.get('actor') or user['id']
                 self.store.save()
-                return Principal(user['id'], user['display_name'], user['superuser'],
+                # A credential carries ONLY the authority granted by its type, project
+                # and scopes. It never inherits the issuing account's global superuser
+                # authority: ``superuser`` is always False here, and scopes are the
+                # only source of capability.
+                return Principal(user['id'], user['display_name'], False,
                                  'credential', actor, credential_id=credential['id'],
                                  credential_project=credential['project_id'],
                                  scopes=credential['scopes'])
         raise unauthenticated('Authentication required')
+
+    # -- live authority --------------------------------------------------------
+    def _refresh_authority(self, principal):
+        """Re-read the live session/credential behind ``principal``.
+
+        The caller must hold ``store.lock``. This is the authority half of the
+        serializable authorization/revocation boundary: a revocation that commits
+        before this call is observed here, so an in-flight mutation can never
+        inherit authority the caller has already lost. Derived fields are refreshed
+        from live state rather than trusted from the original request.
+        """
+        if principal is None:
+            raise unauthenticated()
+        moment = self._now()
+        if principal.via == 'session':
+            session = self.state['sessions'].get(principal.session_hash)
+            if session is None or session['revoked'] or \
+                    session['absolute_expires'] <= moment or session['idle_expires'] <= moment:
+                raise unauthenticated('Session expired or revoked')
+            user = self.state['users'].get(session['user_id'])
+            if user is None or user['disabled']:
+                raise unauthenticated('Authentication is no longer valid')
+            principal.superuser = bool(user['superuser'])
+            principal.display_name = user['display_name']
+            return user
+        if principal.via == 'credential':
+            credential = self.state['credentials'].get(principal.credential_id)
+            if credential is None or credential['revoked'] or credential['expires_at'] <= moment:
+                raise unauthenticated('Credential expired or revoked')
+            user = self.state['users'].get(credential['user_id'])
+            if user is None or user['disabled']:
+                raise unauthenticated('Authentication is no longer valid')
+            principal.superuser = False
+            principal.scopes = tuple(credential['scopes'])
+            principal.credential_project = credential['project_id']
+            principal.actor = credential.get('actor') or principal.actor
+            return user
+        raise unauthenticated()
+
+    def capabilities_for(self, principal, project_id):
+        """The capabilities the live principal holds for ``project_id``.
+
+        The caller must have refreshed ``principal`` first (or accept a stale copy);
+        ``check_authority`` does both under one lock.
+        """
+        if principal.via == 'credential':
+            if principal.credential_project != project_id:
+                return frozenset()
+            caps = {CAP_READ}  # a credential may always read the project it is scoped to
+            for scope in principal.scopes:
+                caps |= SCOPE_CAPABILITIES.get(scope, frozenset())
+            return frozenset(caps) - CREDENTIAL_FORBIDDEN_CAPABILITIES
+        if principal.superuser:
+            return ALL_CAPABILITIES
+        role = self.state['memberships'].get(project_id, {}).get(principal.user_id)
+        return ROLE_CAPABILITIES.get(role, frozenset())
+
+    def check_authority(self, principal, project_id, capability, *, allow_self_user=None):
+        """Authorize one capability against live authority, or raise 401/403/404.
+
+        This is the single boundary every route uses. When called inside a mutation
+        it runs while ``store.lock`` is held and before the canonical write, so a
+        revocation cannot interleave between the check and the write.
+        """
+        with self.store.lock:
+            return self._check_authority_locked(principal, project_id, capability,
+                                                allow_self_user=allow_self_user)
+
+    def _check_authority_locked(self, principal, project_id, capability, *,
+                                allow_self_user=None):
+        self._refresh_authority(principal)
+        if allow_self_user is not None and principal.user_id == allow_self_user:
+            if principal.via != 'session':
+                # A worker credential must never administer the account that issued it.
+                raise forbidden('Session authority required for account changes')
+            return None, 'self'
+        if capability == CAP_ACCOUNTS_ADMIN:
+            if principal.via != 'session' or not principal.superuser:
+                raise forbidden('Superuser authority required')
+            return None, 'superuser'
+        if capability == CAP_PROJECT_CREATE:
+            if principal.via == 'credential':
+                raise forbidden('A worker credential cannot create projects')
+            return None, 'session'
+        if principal.via == 'credential':
+            if principal.credential_project != project_id:
+                raise not_found('Project not found')
+            if capability not in self.capabilities_for(principal, project_id):
+                raise forbidden('Credential scope does not permit this operation')
+            project = self.state['projects'].get(project_id)
+            if project is None:
+                raise not_found('Project not found')
+            return project, 'credential'
+        project = self.state['projects'].get(project_id)
+        if project is None:
+            raise not_found('Project not found')
+        if principal.superuser:
+            return project, 'owner'
+        role = self.state['memberships'].get(project_id, {}).get(principal.user_id)
+        if role is None:
+            raise not_found('Project not found')
+        if capability not in ROLE_CAPABILITIES.get(role, frozenset()):
+            raise forbidden('Project role does not permit this operation')
+        return project, role
+
+    def revalidate_authority(self, principal):
+        """Refresh live authority or raise; used by the backend write boundary."""
+        with self.store.lock:
+            return self._refresh_authority(principal)
 
     def logout(self, principal, request_id=None):
         if principal is None or principal.session_hash is None:
@@ -598,8 +785,11 @@ class Service:
 
     # -- projects and membership ----------------------------------------------
     def create_project(self, principal, name, project_id=None):
+        if principal is None or principal.via == 'credential':
+            raise forbidden('A worker credential cannot create projects')
         self._validate_project_name(name)
         with self.store.lock:
+            self._refresh_authority(principal)
             if any(p['name'].lower() == name.lower() and not p['archived']
                    for p in self.state['projects'].values()):
                 raise conflict('A project with that name already exists')
@@ -621,11 +811,18 @@ class Service:
             raise invalid('Project name must be 2-64 characters of letters, digits, space, . _ -')
 
     def list_projects(self, principal):
-        visible = []
-        for pid in self.state['projects']:
-            if principal.superuser or principal.user_id in self.state['memberships'].get(pid, {}):
-                visible.append(self.project_view(principal, pid))
-        return visible
+        with self.store.lock:
+            self._refresh_authority(principal)
+            if principal.via == 'credential':
+                pid = principal.credential_project
+                if pid not in self.state['projects']:
+                    return []
+                return [self.project_view(principal, pid)]
+            visible = []
+            for pid in self.state['projects']:
+                if principal.superuser or principal.user_id in self.state['memberships'].get(pid, {}):
+                    visible.append(self.project_view(principal, pid))
+            return visible
 
     def project_view(self, principal, project_id):
         project, role = self.require_project(principal, project_id)
@@ -635,56 +832,63 @@ class Service:
         return view
 
     def require_project(self, principal, project_id, minimum='viewer'):
-        if principal is None:
-            raise unauthenticated()
-        if principal.via == 'credential' and principal.credential_project != project_id:
-            # A credential scoped to another project must not learn this one exists.
-            raise not_found('Project not found')
-        project = self.state['projects'].get(project_id)
-        members = self.state['memberships'].get(project_id, {})
-        if principal.superuser:
-            if project is None:
-                raise not_found('Project not found')
-            return project, 'owner'
-        if project is None or principal.user_id not in members:
-            raise not_found('Project not found')
-        role = members[principal.user_id]
-        if RANK[role] < RANK[minimum]:
-            raise forbidden('Project role does not permit this operation')
-        return project, role
+        """Role/capability gate kept for internal callers.
+
+        ``minimum`` maps onto the capability model so a credential can never borrow
+        the issuing account's role: viewer -> read, contributor -> a write
+        capability, owner -> project administration (credentials never hold it).
+        """
+        capability = {'viewer': CAP_READ, 'contributor': CAP_TASKS,
+                      'owner': CAP_PROJECT_ADMIN}.get(minimum, CAP_READ)
+        return self.check_authority(principal, project_id, capability)
 
     def set_member(self, principal, project_id, user_id, role, request_id=None):
         if role not in ROLES:
             raise invalid('Role must be one of %s' % ', '.join(ROLES))
+        if principal is None or principal.via == 'credential':
+            raise forbidden('Session authority required for membership changes')
         with self.store.lock:
+            self._refresh_authority(principal)
             project, actor_role = self.require_project(principal, project_id, 'owner')
             self._user(user_id)
             members = self.state['memberships'][project_id]
+            current = members.get(user_id)
             if role == 'owner' and not principal.superuser:
                 raise forbidden('Only a superuser may assign the owner role')
-            if members.get(user_id) == 'owner' and role != 'owner' and not principal.superuser:
-                raise forbidden('Only a superuser may remove a project owner')
+            if current == 'owner' and role != 'owner':
+                if not principal.superuser:
+                    raise forbidden('Only a superuser may remove a project owner')
+                # Even a superuser cannot demote the sole owner: that would leave the
+                # project with no owner. Ownership must be replaced, not deleted.
+                if sum(1 for r in members.values() if r == 'owner') <= 1:
+                    raise conflict('The final active project owner cannot be demoted; '
+                                   'assign another owner first', {'project': project_id})
             members[user_id] = role
             self.store.save()
         return {'project': project_id, 'user': user_id, 'role': role}
 
     def remove_member(self, principal, project_id, user_id, request_id=None):
+        if principal is None or principal.via == 'credential':
+            raise forbidden('Session authority required for membership changes')
         with self.store.lock:
+            self._refresh_authority(principal)
             _, _ = self.require_project(principal, project_id, 'owner')
             members = self.state['memberships'].get(project_id, {})
             if user_id not in members:
                 raise not_found('Membership not found')
-            if members[user_id] == 'owner' and not principal.superuser:
-                raise forbidden('Only a superuser may remove a project owner')
-            if members[user_id] == 'owner' and \
-                    sum(1 for r in members.values() if r == 'owner') <= 1:
-                raise conflict('The final active project owner cannot be removed')
+            if members[user_id] == 'owner':
+                if not principal.superuser:
+                    raise forbidden('Only a superuser may remove a project owner')
+                self._assert_not_final_owner(user_id)
             del members[user_id]
             self.store.save()
         return {'project': project_id, 'user': user_id, 'removed': True}
 
     def archive_project(self, principal, project_id):
+        if principal is None or principal.via == 'credential':
+            raise forbidden('A worker credential cannot archive a project')
         with self.store.lock:
+            self._refresh_authority(principal)
             project, role = self.require_project(principal, project_id, 'owner')
             if project['archived']:
                 raise conflict('Project is already archived')
@@ -695,17 +899,15 @@ class Service:
     # -- worker credentials ----------------------------------------------------
     def issue_credential(self, principal, project_id, *, label=None, scopes=None,
                          actor=None, request_id=None):
+        if principal is None or principal.via == 'credential':
+            raise forbidden('A worker credential cannot issue another credential')
         with self.store.lock:
+            self._refresh_authority(principal)
             project, role = self.require_project(principal, project_id, 'owner')
-            if principal.via == 'credential':
-                raise forbidden('A worker credential cannot issue another credential')
             requested = tuple(scopes or ('tasks', 'checkpoints', 'reviews', 'feedback'))
-            allowed = set(principal.scopes) if principal.via == 'credential' else None
             for scope in requested:
-                if scope not in ('tasks', 'checkpoints', 'reviews', 'feedback', 'read'):
+                if scope not in CREDENTIAL_SCOPES:
                     raise invalid('Unknown credential scope %r' % (scope,))
-                if allowed is not None and scope not in allowed:
-                    raise forbidden('Requested scope exceeds issuer scope')
             if actor is not None and (not isinstance(actor, str) or not re.fullmatch(
                     r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,63}', actor)):
                 raise invalid('Invalid credential actor namespace')
@@ -738,7 +940,10 @@ class Service:
                 'expires_at': now_iso(credential['expires_at'])}
 
     def revoke_credential(self, principal, project_id, credential_id, request_id=None):
+        if principal is None or principal.via == 'credential':
+            raise forbidden('A worker credential cannot revoke credentials')
         with self.store.lock:
+            self._refresh_authority(principal)
             self.require_project(principal, project_id, 'viewer')
             credential = self.state['credentials'].get(credential_id)
             if not isinstance(credential, dict) or credential.get('project_id') != project_id:
@@ -754,7 +959,12 @@ class Service:
 
     # -- idempotency -----------------------------------------------------------
     def _idempotency_key(self, principal, project_id, route, key):
-        scope = '%s|%s|%s|%s' % (principal.user_id, project_id or '-', route, key)
+        # Bind the namespace to the *full semantic target* (principal, credential,
+        # project, route target and key). ``route`` is supplied as
+        # "<operation> <method> <path>" so two different account/member/task targets
+        # can never share a receipt even when the payload and key are identical.
+        scope = '%s|%s|%s|%s|%s' % (principal.user_id, principal.credential_id or '-',
+                                    project_id or '-', route, key)
         return hashlib.sha256(scope.encode('utf-8')).hexdigest()
 
     def idempotency_check(self, principal, project_id, route, key, body_hash):
