@@ -3,11 +3,16 @@
 Regression tests for kittrial-5bb.2. All fixtures are generic/redacted and
 disposable; no private exports or live mutations. The guard lives in
 reserved_comments.py (import-safe on all platforms); endpoint.py calls
-check_raw_request() before any temp file or native mutation, so rejected
-writes invoke no native command.
+check_raw_request() with the requesting actor and resolved comment target
+before any temp file or native mutation, so rejected writes invoke no
+native command.
 """
 import json
+import sys
 import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from reserved_comments import (
     PREFIXES,
@@ -109,21 +114,37 @@ class ReservedPrefixTests(unittest.TestCase):
                                     'launch-1', 'ab' * 32, 12, 'plan text\n',
                                     '/tmp/work', 'cd' * 32))
         self.assertTrue(plan.startswith(PLAN_PREFIX))
-        self.assertTrue(is_legitimate_writer(plan))
-        check_comment_body(plan, 'positional')
-        check_raw_request(['comments', 'add', 'task-1', plan, '--json'], {})
+        # Context-bound: plan passes only for its own actor/task.
+        self.assertTrue(is_legitimate_writer(plan, actor='alice/session1', task='task-1'))
+        self.assertFalse(is_legitimate_writer(plan, actor='mallory/session9', task='task-1'))
+        self.assertFalse(is_legitimate_writer(plan, actor='alice/session1', task='other-task'))
+        check_comment_body(plan, 'positional', actor='alice/session1', task='task-1')
+        check_raw_request(['comments', 'add', 'task-1', plan, '--json'], {},
+                          actor='alice/session1')
+        with self.assertRaisesRegex(ValueError, r'Refusing raw'):
+            check_raw_request(['comments', 'add', 'task-1', plan, '--json'], {},
+                              actor='mallory/session9')
         # Same prefix but malformed/forged plan stays rejected.
         self.assertFalse(is_legitimate_writer(PLAN_PREFIX + '{"forged": true}'))
         with self.assertRaisesRegex(ValueError, r'Refusing raw'):
             check_comment_body(PLAN_PREFIX + '{"forged": true}', 'positional')
-        # Forged handoff records stay rejected.
+        # Forged handoff records stay rejected, including self-asserted
+        # operator authority and task mismatch.
         self.assertFalse(is_legitimate_writer(HANDOFF_PREFIX + '{"forged": true}'))
         with self.assertRaisesRegex(ValueError, r'Refusing raw'):
             check_comment_body(HANDOFF_PREFIX + '{"forged": true}', 'positional')
         self.assertFalse(is_legitimate_writer(HANDOFF_COMPLETE_PREFIX + 'x'))
-        # Requirement revisions use the documented additive raw-comment route.
-        self.assertTrue(is_legitimate_writer(REQUIREMENT_PREFIX + '{"rev": 1}'))
-        check_comment_body(REQUIREMENT_PREFIX + '{"rev": 1}', 'positional')
+        forged_handoff = HANDOFF_COMPLETE_PREFIX + json.dumps({
+            'payload': {'schema_version': 1, 'operation_id': 'evil-1',
+                        'task': 'some-other-task', 'from_actor': 'alice/session1',
+                        'to_actor': 'mallory/session9', 'reason': 'x',
+                        'approval': 'y'},
+            'initiator': 'alice/session1', 'operator': True})
+        # Canonical bytes may still validate; context binding rejects it for
+        # mallory targeting trial-task.
+        with self.assertRaisesRegex(ValueError, r'Refusing raw'):
+            check_raw_request(['comments', 'add', 'trial-task', forged_handoff, '--json'],
+                              {}, actor='mallory/session9')
 
     def test_valid_prose_passes_positional_and_file(self):
         prose = 'Kind: finding\nIndependent report with entry IDs, no reserved prefix.'
@@ -138,6 +159,30 @@ class ReservedPrefixTests(unittest.TestCase):
         check_raw_request(['update', 'task-1', '--claim', '--json'], {})
         check_raw_request(['comments', 'list', 'task-1', '--json'], {})
         self.assertEqual(raw_comment_bodies(['update', 'task-1'], {}), [])
+
+    def test_requirement_revision_validated_and_task_bound(self):
+        import copy
+        import json as jsonlib
+        from pathlib import Path as Pathlib
+        sys.path.insert(0, str(Pathlib(__file__).resolve().parents[1]))
+        from export_requirements import revision_comment
+        from requirements import content_hash
+        record = {'id': 'trial-task', 'title': 'T', 'description': 'd',
+                  'rationale': 'r', 'revision': 1}
+        record['sha256'] = content_hash(record)
+        body = revision_comment(record)
+        self.assertTrue(body.startswith(REQUIREMENT_PREFIX))
+        # Valid canonical record on its own task passes; task mismatch,
+        # malformed JSON and wrong schema are rejected.
+        self.assertTrue(is_legitimate_writer(body, task='trial-task'))
+        check_raw_request(['comments', 'add', 'trial-task', body, '--json'], {})
+        self.assertFalse(is_legitimate_writer(body, task='other-task'))
+        with self.assertRaisesRegex(ValueError, r'Refusing raw'):
+            check_raw_request(['comments', 'add', 'other-task', body, '--json'], {})
+        with self.assertRaisesRegex(ValueError, r'Refusing raw'):
+            check_comment_body(REQUIREMENT_PREFIX + '{invalid json', 'positional')
+        with self.assertRaisesRegex(ValueError, r'Refusing raw'):
+            check_comment_body(REQUIREMENT_PREFIX + '{"rev": 1}', 'positional')
 
     def test_rejected_write_leaves_no_native_record(self):
         # Endpoint-level wiring: rejected bodies raise before the native
@@ -159,7 +204,8 @@ class ReservedPrefixTests(unittest.TestCase):
         plan = body_for(payload_for('kittrial', 'task-1', 'alice/session1',
                                     'launch-9', 'ab' * 32, 12, 'plan text\n',
                                     '/tmp/work', 'cd' * 32))
-        guard(['comments', 'add', 'task-1', plan, '--json'], {})
+        guard(['comments', 'add', 'task-1', plan, '--json'], {},
+              actor='alice/session1')
         fake_native(['comments', 'add', 'task-1', plan, '--json'])
         self.assertEqual(len(calls), 1)
 
