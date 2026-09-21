@@ -22,6 +22,18 @@ def queue(rows,actor,args,request_dir=None):
     a=parser.parse_args(args)
     if not 1<=a.limit<=100 or a.offset<0 or not 1<=a.handoff_limit<=100 or a.handoff_offset<0:raise ValueError('Invalid work queue page')
     owner=actor if a.mine else a.owner
+    journal_requests=[];journal_errors=[]
+    if request_dir and request_dir.is_dir():
+        request_files=sorted(request_dir.glob('*.json'))
+        if len(request_files)>1000:raise ValueError('Handoff request journal exceeds bounded queue coverage')
+        for request_file in request_files:
+            try:
+                request=json.loads(request_file.read_text(encoding='utf-8'))
+                from handoff import validate_request_record
+                validate_request_record(request)
+                journal_requests.append(request)
+            except (OSError,json.JSONDecodeError,ValueError) as exc:
+                journal_errors.append({'path':request_file.name,'error':str(exc)[:300]})
     facts={r['id']:r for r in project_facts(rows)};items=[]
     for row in rows:
         if row.get('issue_type') in ('event','gate','merge-slot'):continue
@@ -36,22 +48,11 @@ def queue(rows,actor,args,request_dir=None):
         if a.state and a.state!=state:continue
         contribution=review.get('contribution') or {}
         scope=facts.get(row['id'],{}).get('scope') or {}
-        handoff_requests=[];journal_errors=[]
-        if request_dir and request_dir.is_dir():
-            request_files=sorted(request_dir.glob('*.json'))
-            if len(request_files)>1000:raise ValueError('Handoff request journal exceeds bounded queue coverage')
-            for request_file in request_files:
-                try:
-                    request=json.loads(request_file.read_text(encoding='utf-8'))
-                    from handoff import validate_request_record
-                    validate_request_record(request)
-                except (OSError,json.JSONDecodeError,ValueError) as exc:
-                    journal_errors.append({'path':request_file.name,'error':str(exc)[:300]})
-                    continue
-                if request.get('task')==row['id'] and request.get('status')=='pending':
-                    handoff_requests.append({'request_id':request['request_id'],'from_actor':request['from_actor'],
-                                             'to_actor':request['to_actor'],'requester':request['requester'],
-                                             'reason':request['reason']})
+        handoff_requests=[{'request_id':request['request_id'],'from_actor':request['from_actor'],
+                           'to_actor':request['to_actor'],'requester':request['requester'],
+                           'reason':request['reason']}
+                          for request in journal_requests
+                          if request.get('task')==row['id'] and request.get('status')=='pending']
         handoff_total=len(handoff_requests)
         handoff_requests=handoff_requests[a.handoff_offset:a.handoff_offset+a.handoff_limit]
         if journal_errors:
@@ -65,8 +66,12 @@ def queue(rows,actor,args,request_dir=None):
                       'lifecycle_matches_contribution':None if not contribution else scope.get('source_commit','').lower()==contribution['commit'].lower(),'error':error})
     priority={'changes-requested':0,'error':1,'awaiting-review':2,'legacy-review-ready':2,'awaiting-integration':3}
     items.sort(key=lambda r:(priority.get(r['review_state'],4),r['task']))
-    return {'owner':owner,'total':len(items),'items':items[a.offset:a.offset+a.limit],'next_offset':a.offset+a.limit if a.offset+a.limit<len(items) else None,
+    result={'owner':owner,'total':len(items),'items':items[a.offset:a.offset+a.limit],'next_offset':a.offset+a.limit if a.offset+a.limit<len(items) else None,
             'coverage':'Fresh current view; structured review takes precedence over legacy review-ready labels. Lifecycle facts remain independent; malformed handoff journals are surfaced as errors.'}
+    if journal_errors:
+        result['journal_errors']=journal_errors
+        result['coverage']=result['coverage']+' Journal validation completed before task filters; errors apply to this entire page.'
+    return result
 
 def execute(path,actor,action,args,attachments,run):
     if action=='work':

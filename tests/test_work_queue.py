@@ -112,6 +112,16 @@ class WorkQueueTests(unittest.TestCase):
         self.assertIn('Malformed handoff journal',result['items'][0]['error'])
         self.assertFalse(hasattr(work.queue,'_request_dir'))
 
+    def test_filtered_and_empty_queue_reads_expose_journal_errors(self):
+        with tempfile.TemporaryDirectory() as temp:
+            journal=Path(temp);(journal/'bad.json').write_text('{bad',encoding='utf-8')
+            filtered=work.queue(rows(),'different-session',['--mine'],journal)
+            empty=work.queue([],'alice/session',['--mine'],journal)
+        self.assertEqual(filtered['total'],0)
+        self.assertEqual(empty['total'],0)
+        self.assertEqual(len(filtered['journal_errors']),1)
+        self.assertEqual(len(empty['journal_errors']),1)
+
     def test_queue_bounds_nested_requests_and_exposes_continuation(self):
         with tempfile.TemporaryDirectory() as temp:
             journal=Path(temp)

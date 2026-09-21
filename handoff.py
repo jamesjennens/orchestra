@@ -91,10 +91,10 @@ def disposition(path, actor, p, run, operator=False):
     if p['task']!=record['task']:raise ValueError('Handoff disposition task does not match stored request')
     if record.get('disposition'):
         old=record['disposition']
-        if old['operation_id']==p['operation_id'] and old['kind']==p['disposition'] and old['actor']==actor:
+        if old['operation_id']==p['operation_id'] and old['kind']==p['disposition'] and old['actor']==actor and old['reason']==p['reason']:
             return dict(record,reconciled=True)
         raise ValueError('Handoff request already has a disposition')
-    if p['disposition']=='accept' and _reconcile_completed_request(path, record, actor, p['reason'], run):
+    if p['disposition']=='accept' and _reconcile_completed_request(path, record, actor, p, run):
         return dict(json.loads(file.read_text(encoding='utf-8')), reconciled=True)
     rows=json.loads(run(['show',p['task'],'--json']))
     if not isinstance(rows,list) or len(rows)!=1 or rows[0].get('id')!=p['task']:raise ValueError('Expected exact task')
@@ -122,7 +122,7 @@ def disposition(path, actor, p, run, operator=False):
 def _request_file(path, request_id):
     return path/'.handoff-requests'/(content_hash({'request_id':request_id})+'.json')
 
-def _reconcile_completed_request(path, request_record, actor, reason, run=None):
+def _reconcile_completed_request(path, request_record, actor, disposition, run=None, operator=False):
     operation_id='handoff-'+request_record['request_id']
     receipt_file=path/'.handoffs'/(content_hash({'operation_id':operation_id})+'.json')
     if not receipt_file.exists():
@@ -130,6 +130,11 @@ def _reconcile_completed_request(path, request_record, actor, reason, run=None):
     receipt=json.loads(receipt_file.read_text(encoding='utf-8'))
     validate_receipt(receipt)
     payload=receipt['identity']['payload']
+    receipt_identity=receipt['identity']
+    if not operator and receipt_identity['operator']:
+        raise ValueError('Recovery authority does not match original handoff authority')
+    if actor!=receipt_identity['initiator'] and not (operator and receipt_identity['operator']):
+        raise ValueError('Recovery actor does not match original handoff authority')
     if receipt['status']=='pending' and run is not None:
         rows=json.loads(run(['show',request_record['task'],'--json']))
         if isinstance(rows,list) and len(rows)==1 and rows[0].get('assignee')==request_record['to_actor']:
@@ -140,8 +145,14 @@ def _reconcile_completed_request(path, request_record, actor, reason, run=None):
     expected={key:request_record[key] for key in ('task','from_actor','to_actor','reason')}
     if any(payload[key]!=value for key,value in expected.items()):
         raise ValueError('Completed handoff receipt conflicts with request')
-    request_record['status']='accepted'
-    request_record['disposition']={'kind':'accept','actor':actor,'reason':reason,'operation_id':operation_id}
+    if isinstance(disposition,dict):
+        request_record['status']='accepted'
+        request_record['disposition']={'kind':'accept','actor':actor,'reason':disposition['reason'],
+                                        'operation_id':disposition['operation_id']}
+    else:
+        request_record['status']='accepted'
+        request_record['disposition']={'kind':'accept','actor':actor,'reason':disposition,
+                                        'operation_id':operation_id}
     validate_request_record(request_record)
     atomic(_request_file(path,request_record['request_id']),request_record)
     return True
@@ -176,7 +187,15 @@ def execute(path, actor, p, run, operator=False):
         return rows[0]
     current=issue()
     if current.get('issue_type') not in ('task','bug','feature','chore','epic','decision'):raise ValueError('Handoff is only for work issues, not gates/events')
-    if record and record.get('status')=='complete':return {'task':p['task'],'from_actor':p['from_actor'],'to_actor':p['to_actor'],'current_owner':current.get('assignee'),'reconciled':True,'operation_id':p['operation_id']}
+    if record and record.get('status')=='complete':
+        request_id=p['operation_id'][8:] if p['operation_id'].startswith('handoff-') else ''
+        request_file=_request_file(path,request_id) if request_id else None
+        if request_file and request_file.exists():
+            request_record=json.loads(request_file.read_text(encoding='utf-8'))
+            validate_request_record(request_record)
+            if request_record['status']=='pending':
+                _reconcile_completed_request(path,request_record,actor,p['approval'],run,operator)
+        return {'task':p['task'],'from_actor':p['from_actor'],'to_actor':p['to_actor'],'current_owner':current.get('assignee'),'reconciled':True,'operation_id':p['operation_id']}
     if current.get('assignee') not in ((p['from_actor'],p['to_actor']) if record else (p['from_actor'],)):
         raise ValueError('Owner changed; reconcile before issuing a new authorized handoff')
     if record is None:
@@ -201,5 +220,5 @@ def execute(path, actor, p, run, operator=False):
         request_record=json.loads(request_file.read_text(encoding='utf-8'))
         validate_request_record(request_record)
         if request_record['status']=='pending':
-            _reconcile_completed_request(path,request_record,actor,p['approval'],run)
+            _reconcile_completed_request(path,request_record,actor,p['approval'],run,operator)
     return {'task':p['task'],'from_actor':p['from_actor'],'to_actor':p['to_actor'],'current_owner':p['to_actor'],'operation_id':p['operation_id'],'reconciled':False}
