@@ -168,7 +168,7 @@ class ReservedPrefixTests(unittest.TestCase):
         from export_requirements import revision_comment
         from requirements import content_hash
         record = {'id': 'trial-task', 'title': 'T', 'description': 'd',
-                  'rationale': 'r', 'revision': 1}
+                  'acceptance_state': 'draft', 'revision': 1}
         record['sha256'] = content_hash(record)
         body = revision_comment(record)
         self.assertTrue(body.startswith(REQUIREMENT_PREFIX))
@@ -208,6 +208,24 @@ class ReservedPrefixTests(unittest.TestCase):
               actor='alice/session1')
         fake_native(['comments', 'add', 'task-1', plan, '--json'])
         self.assertEqual(len(calls), 1)
+
+    def test_handoff_raw_records_always_rejected_on_endpoint_path(self):
+        # Structured handoff writes use the internal run path; raw endpoint
+        # handoff records are rejected unconditionally, even canonical ones
+        # with operator=true and matching task/actor.
+        identity = {'payload': {'schema_version': 1, 'operation_id': 'h-1',
+                                'task': 'trial-task', 'from_actor': 'alice/session1',
+                                'to_actor': 'bob/session2', 'reason': 'r',
+                                'approval': 'a'},
+                    'initiator': 'alice/session1', 'operator': True}
+        from requirements import canonical_bytes, content_hash
+        from handoff import parse_identity
+        body = HANDOFF_COMPLETE_PREFIX + canonical_bytes(identity).decode()
+        self.assertIsNotNone(parse_identity(HANDOFF_COMPLETE_PREFIX, body))
+        for actor in ('mallory/session9', 'alice/session1', 'bob/session2'):
+            with self.assertRaisesRegex(ValueError, r'Refusing raw'):
+                check_raw_request(['comments', 'add', 'trial-task', body, '--json'],
+                                  {}, actor=actor)
 
     def test_reserved_match_names_operation(self):
         match = reserved_match(REVIEW_PREFIX + '{}')

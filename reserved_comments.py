@@ -23,12 +23,17 @@ from worker_gate import PREFIX as PLAN_PREFIX, parse_body as parse_plan_body
 
 
 def parse_requirement_record(body):
-    """Return the requirement record iff exact canonical revision bytes."""
+    """Return the requirement record iff it passes the full supported schema.
+
+    Uses the publisher's own record validation (required fields, revision,
+    acceptance_state, content hash) plus exact canonical bytes, so only a
+    record a legitimate revision write could produce passes.
+    """
     if not isinstance(body, str) or not body.startswith(REQUIREMENT_PREFIX):
         return None
     rest = body[len(REQUIREMENT_PREFIX):]
     try:
-        from export_requirements import exact_reference, parse_json
+        from export_requirements import parse_json
         from requirements import canonical_bytes, content_hash
         record = parse_json(rest)
     except (ValueError, TypeError):
@@ -36,13 +41,14 @@ def parse_requirement_record(body):
     if not isinstance(record, dict) or not {'id', 'revision', 'sha256'} <= set(record):
         return None
     try:
-        rid, rev, digest = exact_reference(
-            {k: record[k] for k in ('id', 'revision', 'sha256')})
-    except ValueError:
+        from requirements import _validate_record, REQUIREMENT_FIELDS, RECORD_FIELDS
+        if record.get('key') is not None:
+            _validate_record(record, 'revision-comment', has_key=True)
+        else:
+            _validate_record(record, 'revision-comment', has_key=False)
+    except (ValueError, TypeError):
         return None
-    if not isinstance(record.get('id'), str) or record['id'] != rid:
-        return None
-    if content_hash(record) != digest:
+    if content_hash(record) != record.get('sha256'):
         return None
     if canonical_bytes(record).decode() != rest:
         return None
@@ -137,16 +143,12 @@ def is_legitimate_writer(body, actor=None, task=None):
         if task is not None and payload.get('task') != task:
             return False
         return True
-    if body.startswith(HANDOFF_PREFIX):
-        identity = parse_handoff_identity(HANDOFF_PREFIX, body)
-        if identity is None:
-            return False
-        return handoff_context_ok(identity, actor, task)
-    if body.startswith(HANDOFF_COMPLETE_PREFIX):
-        identity = parse_handoff_identity(HANDOFF_COMPLETE_PREFIX, body)
-        if identity is None:
-            return False
-        return handoff_context_ok(identity, actor, task)
+    if body.startswith(HANDOFF_PREFIX) or body.startswith(HANDOFF_COMPLETE_PREFIX):
+        # Handoff authority cannot be established from self-asserted comment
+        # fields: verified handoff writes go through the structured handoff
+        # operation (internal run path, ownership-checked). Raw endpoint
+        # handoff records are rejected unconditionally.
+        return False
     if body.startswith(REQUIREMENT_PREFIX):
         record = parse_requirement_record(body)
         if record is None:
