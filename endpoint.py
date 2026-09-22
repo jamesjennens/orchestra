@@ -17,6 +17,7 @@ from reserved_comments import (check_raw_request, comment_target,
                                first_reserved_label, label_guard_request,
                                operator_only_in_args, raw_file_flag_in_args,
                                reserved_label_in_args)
+from http_authority import run_guarded
 
 ALLOWED={'list','show','ready','search','count','create','update','close','reopen','comments','dep','state','lint'}
 # Legacy name kept for operators reading this file; enforcement is the
@@ -107,10 +108,11 @@ def execute(root,request):
             stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
             if warnings:run_warnings.append(warnings)
             return stdout
+        def work_effect():
+            return {'returncode':0,'stdout':json.dumps(work_execute(path,actor,action,args,request.get('attachments',{}),run),ensure_ascii=False,indent=2)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            result=work_execute(path,actor,action,args,request.get('attachments',{}),run)
-        return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False,indent=2)+'\n','stderr':''.join(run_warnings)}
+            return run_guarded(request,path/'.http-operations.json',work_effect)
     if action in ('onboard','docs'):
         from onboarding import execute as onboard
         return {'returncode':0,'stdout':onboard(Path(__file__).resolve().parent,path,name,actor,action,request.get('args',[])),'stderr':''}
@@ -123,10 +125,11 @@ def execute(root,request):
             stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
             if warnings:run_warnings.append(warnings)
             return stdout
+        def briefing_effect():
+            return {'returncode':0,'stdout':briefing_execute(root,path,name,actor,action,args,request.get('attachments',{}),run),'stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            output=briefing_execute(root,path,name,actor,action,args,request.get('attachments',{}),run)
-        return {'returncode':0,'stdout':output,'stderr':''.join(run_warnings)}
+            return run_guarded(request,path/'.http-operations.json',briefing_effect)
     if action in ('lifecycle','coordinate'):
         args=request.get('args',[])
         if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):raise ValueError('Expected one JSON payload')
@@ -136,13 +139,15 @@ def execute(root,request):
             stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
             if warnings:run_warnings.append(warnings)
             return stdout
-        with (path/'.coordination.lock').open('a') as lock:
-            fcntl.flock(lock,fcntl.LOCK_EX)
+        def lifecycle_effect():
             if action=='lifecycle':result=apply_native(payload,actor,run)
             else:
                 from coordination import apply_native as coordinate
                 result=coordinate(payload,actor,run,path)
-        return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
+            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            return run_guarded(request,path/'.http-operations.json',lifecycle_effect)
     if action == 'feedback':
         from feedback import execute as feedback_execute
         args=request.get('args',[])
@@ -209,8 +214,10 @@ def execute(root,request):
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             _guard_reserved_labels(root,path,args,actor)
-            p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*final],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
-        return {'returncode':p.returncode,'stdout':p.stdout,'stderr':p.stderr}
+            def bd_effect():
+                p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*final],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
+                return {'returncode':p.returncode,'stdout':p.stdout,'stderr':p.stderr}
+            return run_guarded(request,path/'.http-operations.json',bd_effect)
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('--root',required=True);a=p.parse_args()

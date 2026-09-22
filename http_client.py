@@ -248,17 +248,35 @@ class Client:
                             {'actor': actor}, key=key)
 
     def add_checkpoint(self, project, task, *, previous, summary, open_items=None,
-                       activity_cursor=None, actor=None, key=None):
+                       activity_cursor=None, actor=None, key=None, schema_version=1,
+                       source_commit='', branch='', intent=None, acceptance=None,
+                       next_action=None, resolved=None):
+        """Append one canonical checkpoint; ``activity_cursor`` comes from history/brief."""
+        body = {'schema_version': schema_version, 'previous': previous,
+                'activity_cursor': activity_cursor, 'source_commit': source_commit,
+                'branch': branch, 'intent': intent, 'acceptance': acceptance,
+                'summary': summary, 'next_action': next_action,
+                'open_items': open_items or [], 'resolved': resolved or [], 'actor': actor}
         return self.request('POST', '/v1/projects/%s/tasks/%s/checkpoints'
                             % (quote(project, safe=''), quote(task, safe='')),
-                            {'previous': previous, 'summary': summary,
-                             'open_items': open_items or [],
-                             'activity_cursor': activity_cursor, 'actor': actor}, key=key)
+                            body, key=key)
 
-    def add_review(self, project, task, operation, *, commit=None, base_commit=None,
-                   bundle_sha256=None, summary=None, actor=None, key=None):
-        body = {'operation': operation, 'summary': summary, 'actor': actor,
-                'commit': commit, 'base_commit': base_commit, 'bundle_sha256': bundle_sha256}
+    def add_review(self, project, task, operation, *, operation_id=None, previous=None,
+                   schema_version=1, commit=None, base_commit=None, bundle_sha256=None,
+                   summary=None, actor=None, key=None, repository=None, delivery=None,
+                   supersedes=None, contribution=None, items=None, resolutions=None):
+        """Record one contribution/review operation.
+
+        The canonical backend forwards exactly the fields the operation needs, so the
+        caller supplies the canonical payload (``previous``/``operation_id`` and the
+        operation-specific evidence) rather than a fixed union with nulls.
+        """
+        body = {'schema_version': schema_version, 'operation': operation,
+                'operation_id': operation_id, 'previous': previous, 'actor': actor,
+                'commit': commit, 'base_commit': base_commit, 'bundle_sha256': bundle_sha256,
+                'summary': summary, 'repository': repository, 'delivery': delivery,
+                'supersedes': supersedes, 'contribution': contribution,
+                'items': items, 'resolutions': resolutions}
         return self.request('POST', '/v1/projects/%s/tasks/%s/reviews'
                             % (quote(project, safe=''), quote(task, safe='')), body, key=key)
 

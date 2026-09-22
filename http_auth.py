@@ -30,7 +30,12 @@ import threading
 import time
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+from http_authority import (ALL_CAPABILITIES, CAP_ACCOUNTS_ADMIN, CAP_APPROVE,
+                            CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROJECT_ADMIN,
+                            CAP_PROJECT_CREATE, CAP_READ, CAP_REVIEWS, CAP_TASKS,
+                            CREDENTIAL_FORBIDDEN_CAPABILITIES, CREDENTIAL_SCOPES, RANK,
+                            ROLE_CAPABILITIES, ROLES, SCOPE_CAPABILITIES, SCHEMA_VERSION,
+                            AuthorityDenied, authority_request, decide, file_lock)
 
 # Password verifier policy. n=2**14, r=8 needs ~16 MiB per hash; scrypt is the
 # memory-hard scheme available in the standard library without third-party wheels.
@@ -49,45 +54,12 @@ LOGIN_WINDOW_SECONDS = 5 * 60
 LOGIN_MAX_ATTEMPTS = 10
 AUDIT_LIMIT = 10000
 
-ROLES = ('viewer', 'contributor', 'owner')
-RANK = {'viewer': 0, 'contributor': 1, 'owner': 2}
-
 # Capabilities are the single authority vocabulary for every route. A route names
 # the capability it needs; the Service decides whether the live principal holds it.
 # Roles grant capabilities to interactive sessions; credential scopes grant a
-# strictly smaller set that can never include administration or approval.
-CAP_READ = 'read'
-CAP_TASKS = 'tasks.write'
-CAP_CHECKPOINTS = 'checkpoints.write'
-CAP_REVIEWS = 'reviews.write'
-CAP_FEEDBACK = 'feedback.write'
-CAP_APPROVE = 'reviews.approve'
-CAP_PROJECT_ADMIN = 'project.admin'
-CAP_PROJECT_CREATE = 'project.create'
-CAP_ACCOUNTS_ADMIN = 'accounts.admin'
-
-SCOPE_CAPABILITIES = {
-    'read': frozenset({CAP_READ}),
-    'tasks': frozenset({CAP_TASKS}),
-    'checkpoints': frozenset({CAP_CHECKPOINTS}),
-    'reviews': frozenset({CAP_REVIEWS}),
-    'feedback': frozenset({CAP_FEEDBACK}),
-}
-CREDENTIAL_SCOPES = tuple(sorted(SCOPE_CAPABILITIES))
-
-ROLE_CAPABILITIES = {
-    'viewer': frozenset({CAP_READ}),
-    'contributor': frozenset({CAP_READ, CAP_TASKS, CAP_CHECKPOINTS, CAP_REVIEWS, CAP_FEEDBACK}),
-    'owner': frozenset({CAP_READ, CAP_TASKS, CAP_CHECKPOINTS, CAP_REVIEWS, CAP_FEEDBACK,
-                        CAP_APPROVE, CAP_PROJECT_ADMIN}),
-}
-# A worker credential is never an administrator and never approves its own work,
-# whatever the issuing account's role is.
-CREDENTIAL_FORBIDDEN_CAPABILITIES = frozenset({CAP_APPROVE, CAP_PROJECT_ADMIN,
-                                               CAP_PROJECT_CREATE, CAP_ACCOUNTS_ADMIN})
-ALL_CAPABILITIES = frozenset(ROLE_CAPABILITIES['owner'] | {CAP_PROJECT_CREATE,
-                                                           CAP_ACCOUNTS_ADMIN})
-
+# strictly smaller set that can never include administration or approval. The
+# vocabulary and the decision function live in ``http_authority`` so the canonical
+# endpoint can apply exactly the same rule immediately before an effect.
 PERIODS = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z?$')
 
 
@@ -298,7 +270,12 @@ class Store:
         # in-flight snapshot before it is renamed, so the name carries the pid and a
         # random suffix. The lock is re-entrant, so callers that already hold it
         # (the whole mutation boundary) still get a consistent snapshot.
-        with self.lock:
+        #
+        # ``<state>.lock`` is a *cross-process* lock: the canonical endpoint takes the
+        # same file around live-authority re-validation plus its effect, so an
+        # authority change persisted here (revocation, membership, disable) is either
+        # committed before the endpoint's check or serialized after the effect.
+        with self.lock, file_lock(str(self.path) + '.lock'):
             self.path.parent.mkdir(parents=True, exist_ok=True)
             temporary = self.path.with_name(
                 '%s.%d.%s.tmp' % (self.path.name, os.getpid(), secrets.token_hex(4)))
@@ -680,27 +657,34 @@ class Service:
     def capabilities_for(self, principal, project_id):
         """The capabilities the live principal holds for ``project_id``.
 
-        The caller must have refreshed ``principal`` first (or accept a stale copy);
-        ``check_authority`` does both under one lock.
+        This routes through the same :func:`http_authority.decide` rule used by the
+        route boundary and the canonical endpoint, so a credential can never exceed
+        its issuer's current project role.
         """
-        if principal.via == 'credential':
-            if principal.credential_project != project_id:
-                return frozenset()
-            caps = {CAP_READ}  # a credential may always read the project it is scoped to
-            for scope in principal.scopes:
-                caps |= SCOPE_CAPABILITIES.get(scope, frozenset())
-            return frozenset(caps) - CREDENTIAL_FORBIDDEN_CAPABILITIES
-        if principal.superuser:
-            return ALL_CAPABILITIES
-        role = self.state['memberships'].get(project_id, {}).get(principal.user_id)
-        return ROLE_CAPABILITIES.get(role, frozenset())
+        try:
+            decide(self.state, authority_request(principal, project_id, CAP_READ),
+                   now=self._now())
+        except AuthorityDenied:
+            return frozenset()
+        caps = set()
+        for capability in (CAP_READ, CAP_TASKS, CAP_CHECKPOINTS, CAP_REVIEWS, CAP_FEEDBACK,
+                           CAP_APPROVE, CAP_PROJECT_ADMIN):
+            try:
+                decide(self.state, authority_request(principal, project_id, capability),
+                       now=self._now())
+                caps.add(capability)
+            except AuthorityDenied:
+                continue
+        return frozenset(caps)
 
     def check_authority(self, principal, project_id, capability, *, allow_self_user=None):
         """Authorize one capability against live authority, or raise 401/403/404.
 
         This is the single boundary every route uses. When called inside a mutation
         it runs while ``store.lock`` is held and before the canonical write, so a
-        revocation cannot interleave between the check and the write.
+        revocation cannot interleave between the check and the write. The decision
+        itself is :func:`http_authority.decide`, the same function the canonical
+        endpoint runs immediately before the effect.
         """
         with self.store.lock:
             return self._check_authority_locked(principal, project_id, capability,
@@ -709,39 +693,18 @@ class Service:
     def _check_authority_locked(self, principal, project_id, capability, *,
                                 allow_self_user=None):
         self._refresh_authority(principal)
+        try:
+            decision = decide(self.state,
+                              authority_request(principal, project_id, capability,
+                                                now=self._now()),
+                              allow_self_user=allow_self_user)
+        except AuthorityDenied as denied:
+            raise HttpError(denied.status, denied.code, denied.message, denied.detail)
         if allow_self_user is not None and principal.user_id == allow_self_user:
-            if principal.via != 'session':
-                # A worker credential must never administer the account that issued it.
-                raise forbidden('Session authority required for account changes')
-            return None, 'self'
-        if capability == CAP_ACCOUNTS_ADMIN:
-            if principal.via != 'session' or not principal.superuser:
-                raise forbidden('Superuser authority required')
-            return None, 'superuser'
-        if capability == CAP_PROJECT_CREATE:
-            if principal.via == 'credential':
-                raise forbidden('A worker credential cannot create projects')
-            return None, 'session'
-        if principal.via == 'credential':
-            if principal.credential_project != project_id:
-                raise not_found('Project not found')
-            if capability not in self.capabilities_for(principal, project_id):
-                raise forbidden('Credential scope does not permit this operation')
-            project = self.state['projects'].get(project_id)
-            if project is None:
-                raise not_found('Project not found')
-            return project, 'credential'
-        project = self.state['projects'].get(project_id)
-        if project is None:
-            raise not_found('Project not found')
-        if principal.superuser:
-            return project, 'owner'
-        role = self.state['memberships'].get(project_id, {}).get(principal.user_id)
-        if role is None:
-            raise not_found('Project not found')
-        if capability not in ROLE_CAPABILITIES.get(role, frozenset()):
-            raise forbidden('Project role does not permit this operation')
-        return project, role
+            return None, decision['role']
+        if capability in (CAP_ACCOUNTS_ADMIN, CAP_PROJECT_CREATE):
+            return None, decision['role']
+        return self.state.get('projects', {}).get(project_id), decision['role']
 
     def revalidate_authority(self, principal):
         """Refresh live authority or raise; used by the backend write boundary."""
@@ -987,6 +950,43 @@ class Service:
                 return ('unknown', None, None)
             raise conflict('An identical request is already in progress')
         return None
+
+    def idempotency_reserve(self, principal, project_id, route, key, body_hash, *,
+                            canonical=False):
+        """Atomically check and reserve one idempotency key in a single lock hold.
+
+        Returns ``('replay', status, response)`` for a committed exact retry,
+        ``('reconcile', digest, None)`` when a prior attempt reserved the identity but
+        did not record a result (only the canonical path can reconcile) and
+        ``('new', digest, None)`` when this caller now owns the key. A second
+        concurrent identical request can therefore never overwrite the reservation:
+        it sees ``in_progress`` and either reconciles (canonical) or gets a 409.
+        """
+        if key is None:
+            return ('new', None, None)
+        digest = self._idempotency_key(principal, project_id, route, key)
+        with self.store.lock:
+            record = self.state['idempotency'].get(digest)
+            if record is not None and record['expires_at'] <= self._now():
+                del self.state['idempotency'][digest]
+                record = None
+            if record is not None:
+                if record['request_hash'] != body_hash:
+                    raise conflict('Idempotency key reused with a different request payload')
+                if record['state'] == 'committed':
+                    return ('replay', record['status'], record['response'])
+                if record['state'] == 'unknown' or record.get('canonical'):
+                    return ('reconcile', digest, None)
+                raise conflict('An identical request is already in progress')
+            self.state['idempotency'][digest] = {
+                'principal': principal.user_id, 'project_id': project_id, 'route': route,
+                'request_hash': body_hash, 'state': 'in_progress', 'status': None,
+                'response': None, 'canonical': bool(canonical),
+                'created_at': now_iso(self._now()),
+                'expires_at': self._now() + self.idempotency_ttl,
+            }
+            self.store.save()
+        return ('new', digest, None)
 
     def idempotency_begin(self, principal, project_id, route, key, body_hash):
         if key is None:

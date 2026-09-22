@@ -1,14 +1,19 @@
-"""HTTP-boundary regression tests for the six P1 findings on kittrial-5bb.19.
+"""HTTP-boundary regression tests for the P1 findings on kittrial-5bb.19.
 
-Each test maps to one requested change and exercises the real HTTP surface (or the
-real subprocess canonical binding), including the negative cases:
+Round 1 (rev2, commit 6fb527a) covered one requested change per class:
+``CanonicalEndpointCase``, ``CredentialAuthorityCase``, ``IdempotencyTargetCase``,
+``FinalOwnerCase``, ``RevocationRaceCase``/``StoreDurabilityCase`` and
+``DeploymentContractCase``.
 
-1. canonical-backend      -> ``CanonicalEndpointCase`` (real subprocess seam)
-2. credential-authority   -> ``CredentialAuthorityCase``
-3. idempotency-target     -> ``IdempotencyTargetCase``
-4. final-owner            -> ``FinalOwnerCase``
-5. revocation-transaction -> ``RevocationRaceCase``, ``StoreDurabilityCase``
-6. browser-deployment     -> ``DeploymentContractCase``
+Round 2 (rev3) adds a class per finding, each with the positive flow and the negative
+case:
+
+1. ``CanonicalProtocolCase``      -> real canonical argv/field sets and history paging
+2. ``CanonicalLostResultCase``    -> one effect across commit-before-response/restart
+3. ``CanonicalRevocationCase``    -> revocation committed first blocks the effect
+4. ``LiveMembershipCase``         -> issuer demotion/removal narrows its credentials
+5. ``IdempotencyAtomicityCase``   -> atomic reservation and a stable creation namespace
+6. ``AttachmentLossCase``         -> evidence is never discarded behind a 201
 """
 import argparse
 import http.client
@@ -25,8 +30,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from http_auth import HttpError, Service, Store
-from http_service import (EndpointBackend, InProcessBackend, build_backend, create_server,
-                          MAX_BODY_BYTES)
+from http_service import (EndpointBackend, InProcessBackend, UncertainOutcome,
+                          build_backend, create_server, MAX_BODY_BYTES)
 
 TMP_ROOT = Path(os.environ.get('ORCHESTRA_TEST_TMP', str(ROOT / '.runtime' / 'test-tmp')))
 ADMIN = 'root-admin'
@@ -544,7 +549,7 @@ class CanonicalEndpointCase(Harness):
                                            % (project, task_id), token=alex).status)
         # The canonical file, not service memory, holds the record.
         canonical = json.loads((self.canonical_root / 'canonical.json').read_text())
-        self.assertEqual(1, len(canonical['tasks']))
+        self.assertEqual(1, len(canonical['rows']))
 
     def test_uncertain_write_reconciles_after_a_restart(self):
         alex, project = self._setup_project()
@@ -560,7 +565,7 @@ class CanonicalEndpointCase(Harness):
         retry = self.create_task(alex, project, 'canonical task', key='canon-key-0002')
         self.assertEqual(201, retry.status, retry.data)
         canonical = json.loads((self.canonical_root / 'canonical.json').read_text())
-        self.assertEqual(1, len(canonical['tasks']))
+        self.assertEqual(1, len(canonical['rows']))
 
     def test_feedback_fails_closed_until_the_canonical_stream_exists(self):
         alex, project = self._setup_project()
@@ -583,6 +588,326 @@ class BackendSelectionCase(unittest.TestCase):
         self.assertIsInstance(build_backend(service, args), EndpointBackend)
         args.backend = 'inprocess'
         self.assertIsInstance(build_backend(service, args), InProcessBackend)
+
+
+# ==================================================================== round 3
+# The six round-3 P1 findings. Each has a reproduction and a regression assertion
+# against the real HTTP surface, including the negative cases.
+
+CONTRIBUTION = {'repository': 'https://example.invalid/repo.git', 'commit': COMMIT,
+                'base_commit': BASE, 'summary': 'delivered', 'supersedes': None,
+                'delivery': {'kind': 'bundle', 'path': 'koopa:/tmp/x.bundle',
+                             'sha256': BUNDLE}}
+
+
+class EndpointCase(Harness):
+    """Base for canonical-binding cases: the strict stub applies the real contract."""
+
+    def make_backend(self):
+        self.canonical_root = self.tmp / 'canonical'
+        return EndpointBackend(sys.executable, str(STUB), str(self.canonical_root),
+                               service=self.service)
+
+    def canonical_rows(self):
+        path = self.canonical_root / 'canonical.json'
+        if not path.exists():
+            return []
+        return json.loads(path.read_text(encoding='utf-8'))['rows']
+
+    def setup_project(self):
+        admin = self.admin_token()
+        self.create_account(admin, 'alex', 'alex-password-1')
+        alex = self.login('alex', 'alex-password-1')[0]
+        return alex, self.create_project(alex, 'Alpha')
+
+    def contribute(self, token, project, task, previous=None, operation_id=None, key=None):
+        body = dict(CONTRIBUTION)
+        body.update({'operation': 'contribute', 'schema_version': 1,
+                     'operation_id': operation_id or 'op-' + secrets.token_hex(6),
+                     'previous': previous})
+        return self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (project, task),
+                            body, token=token, key=key)
+
+
+class CanonicalProtocolCase(EndpointCase):
+    """1. canonical-protocol: argv, exact review fields, and history paging."""
+
+    def test_create_with_description_and_review_and_history_use_the_real_contract(self):
+        alex, project = self.setup_project()
+        described = self.request('POST', '/v1/projects/%s/tasks' % project,
+                                 {'title': 'described', 'description': 'evidence body'},
+                                 token=alex)
+        self.assertEqual(201, described.status, described.data)
+        plain = self.create_task(alex, project, 'plain')
+        self.assertEqual(201, plain.status, plain.data)
+        task_id = plain.data['id']
+        self.assertEqual(200, self.request('POST', '/v1/projects/%s/tasks/%s/claim'
+                                           % (project, task_id), {}, token=alex).status)
+        review = self.contribute(alex, project, task_id)
+        self.assertEqual(201, review.status, review.data)
+        self.assertIn('comment_id', review.data)
+        # HTTP default page size (50) must not exceed the canonical history limit (20).
+        history = self.request('GET', '/v1/projects/%s/tasks/%s/history?limit=50'
+                               % (project, task_id), token=alex)
+        self.assertEqual(200, history.status, history.data)
+        self.assertTrue(history.data['items'])
+        self.assertIn('activity_cursor', history.data)
+
+    def test_complete_create_claim_checkpoint_contribute_approve_flow(self):
+        alex, project = self.setup_project()
+        task_id = self.create_task(alex, project, 'flow task').data['id']
+        self.assertEqual(200, self.request('POST', '/v1/projects/%s/tasks/%s/claim'
+                                           % (project, task_id), {}, token=alex).status)
+        history = self.request('GET', '/v1/projects/%s/tasks/%s/history?limit=5'
+                               % (project, task_id), token=alex).data
+        checkpoint = self.request(
+            'POST', '/v1/projects/%s/tasks/%s/checkpoints' % (project, task_id),
+            {'schema_version': 1, 'previous': None,
+             'activity_cursor': history['activity_cursor'], 'source_commit': COMMIT,
+             'branch': 'contrib/test', 'intent': 'prove the canonical checkpoint',
+             'acceptance': 'accepted by the canonical validator',
+             'summary': 'checkpoint accepted', 'next_action': 'contribute',
+             'open_items': [], 'resolved': []}, token=alex)
+        self.assertEqual(201, checkpoint.status, checkpoint.data)
+        review = self.contribute(alex, project, task_id)
+        self.assertEqual(201, review.status, review.data)
+        contribution_id = review.data.get('comment_id') or \
+            (review.data.get('contribution') or {}).get('comment_id')
+        self.assertTrue(contribution_id, review.data)
+        approve = self.request(
+            'POST', '/v1/projects/%s/tasks/%s/reviews' % (project, task_id),
+            {'operation': 'approve', 'schema_version': 1, 'previous': contribution_id,
+             'operation_id': 'op-' + secrets.token_hex(6),
+             'contribution': contribution_id, 'summary': 'accepted'}, token=alex)
+        self.assertEqual(201, approve.status, approve.data)
+
+    def test_no_raw_file_flag_is_emitted_and_the_body_travels_as_an_attachment(self):
+        alex, project = self.setup_project()
+        principal = self.service.authenticate(alex)
+        action, _, args, attachments = self.backend._command(
+            'tasks.create', principal, project, {'title': 't', 'description': 'body'})
+        self.assertEqual('bd', action)
+        self.assertIn('@attachment:0', args)
+        self.assertNotIn('--body-file', args)
+        self.assertEqual('--body-file', attachments['0']['flag'])
+        self.assertEqual('body', attachments['0']['text'])
+
+    def test_review_body_is_exactly_the_canonical_field_set(self):
+        from review_workflow import validate
+        alex, project = self.setup_project()
+        principal = self.service.authenticate(alex)
+        for operation, extra in (('contribute', CONTRIBUTION),
+                                 ('approve', {'contribution': 'c' * 20, 'summary': 'ok'})):
+            payload = {'task_id': 'task-1', 'operation': operation, 'schema_version': 1,
+                       'previous': None, 'operation_id': 'op-' + operation}
+            payload.update(extra)
+            _, _, args, attachments = self.backend._command(
+                'reviews.add', principal, project, payload, 'f' * 64)
+            body = json.loads(attachments['0']['text'])
+            validate(body, 'task-1')  # raises if the field set or values are wrong
+            self.assertEqual('task-1', body['task'])
+
+
+class CanonicalLostResultCase(EndpointCase):
+    """2. canonical-lost-result: response loss before the local receipt."""
+
+    def test_lost_response_does_not_duplicate_the_canonical_task(self):
+        alex, project = self.setup_project()
+        backend = self.backend
+        original = backend._endpoint
+
+        def lossy(action, project_id, actor, args, attachments=None, **kwargs):
+            original(action, project_id, actor, args, attachments, **kwargs)
+            raise UncertainOutcome('response lost after the canonical commit')
+
+        backend._endpoint = lossy
+        first = self.create_task(alex, project, 'lost response', key='lost-key-0100')
+        self.assertEqual(503, first.status, first.data)
+        backend._endpoint = original
+        # Rebuild Service and EndpointBackend from disk, as after a process restart.
+        store = Store(self.tmp / 'state.json')
+        service = Service(store)
+        self.restart(service, EndpointBackend(sys.executable, str(STUB),
+                                              str(self.canonical_root), service=service))
+        retry = self.create_task(alex, project, 'lost response', key='lost-key-0100')
+        self.assertEqual(201, retry.status, retry.data)
+        rows = self.canonical_rows()
+        self.assertEqual(1, len(rows))
+        # The replayed result is the committed record, not a second creation.
+        self.assertEqual(rows[0]['id'], retry.data['id'])
+
+
+class CanonicalRevocationCase(EndpointCase):
+    """3. canonical-revocation: live authority is re-validated inside the effect."""
+
+    def test_revocation_committed_before_the_write_blocks_the_canonical_effect(self):
+        admin = self.admin_token()
+        self.create_account(admin, 'alex', 'alex-password-1')
+        alex = self.login('alex', 'alex-password-1')[0]
+        project = self.create_project(alex, 'Alpha')
+        issued = self.issue_credential(alex, project, label='worker',
+                                       scopes=['tasks', 'checkpoints', 'reviews', 'feedback'])
+        secret, credential_id = issued['secret'], issued['id']
+        backend = self.backend
+        original = backend._run
+        state = {'pause': True}
+        entered, proceed = threading.Event(), threading.Event()
+
+        def paused(*args, **kwargs):
+            if state['pause']:
+                entered.set()
+                self.assertTrue(proceed.wait(timeout=20), 'probe was never resumed')
+            return original(*args, **kwargs)
+
+        backend._run = paused
+        outcome = {}
+
+        def create():
+            outcome['response'] = self.create_task(secret, project, 'raced task',
+                                                   key='race-key-0100')
+
+        worker = threading.Thread(target=create)
+        worker.start()
+        self.assertTrue(entered.wait(timeout=20), 'create never reached the canonical seam')
+        revoked = self.request('POST', '/v1/projects/%s/worker-credentials/%s/revoke'
+                               % (project, credential_id), token=alex)
+        self.assertEqual(204, revoked.status, revoked.data)
+        proceed.set()
+        worker.join(timeout=30)
+        state['pause'] = False
+        self.assertIn(outcome['response'].status, (401, 403), outcome['response'].data)
+        self.assertEqual([], self.canonical_rows())
+
+    def test_scope_denial_is_a_clean_403_before_any_canonical_write(self):
+        alex, project = self.setup_project()
+        issued = self.issue_credential(alex, project, label='cp', scopes=['checkpoints'])
+        denied = self.create_task(issued['secret'], project, 'sneaky')
+        self.assertEqual(403, denied.status, denied.data)
+        self.assertEqual([], self.canonical_rows())
+
+
+class LiveMembershipCase(Harness):
+    """4. live-membership: a credential never outlives its issuer's role."""
+
+    def _project_with_issuer(self):
+        admin = self.admin_token()
+        alex_id = self.create_account(admin, 'alex', 'alex-password-1')
+        blair_id = self.create_account(admin, 'blair', 'blair-password-1')
+        alex = self.login('alex', 'alex-password-1')[0]
+        project = self.create_project(alex, 'Alpha')
+        issued = self.issue_credential(alex, project, label='worker',
+                                       scopes=['tasks', 'checkpoints', 'reviews', 'feedback'])
+        return admin, alex_id, blair_id, alex, project, issued
+
+    def test_demotion_and_removal_stop_an_issued_credential_immediately(self):
+        admin, alex_id, blair_id, alex, project, issued = self._project_with_issuer()
+        secret = issued['secret']
+        self.assertEqual(201, self.create_task(secret, project, 'while owner').status)
+        # A second owner must exist before the first can be demoted or removed.
+        self.assertEqual(200, self.request('PUT', '/v1/projects/%s/members/%s'
+                                           % (project, blair_id), {'role': 'owner'},
+                                           token=admin).status)
+        self.assertEqual(200, self.request('PUT', '/v1/projects/%s/members/%s'
+                                           % (project, alex_id), {'role': 'viewer'},
+                                           token=admin).status)
+        denied = self.create_task(secret, project, 'after demotion')
+        self.assertEqual(403, denied.status, denied.data)
+        # A viewer keeps read, so the credential still reads but never writes.
+        self.assertEqual(200, self.request('GET', '/v1/projects/%s/tasks' % project,
+                                           token=secret).status)
+        self.assertEqual(200, self.request('DELETE', '/v1/projects/%s/members/%s'
+                                           % (project, alex_id), token=admin).status)
+        self.assertIn(self.request('POST', '/v1/projects/%s/tasks' % project,
+                                   {'title': 'after removal'}, token=secret).status, (403, 404))
+        self.assertIn(self.request('GET', '/v1/projects/%s/tasks' % project,
+                                   token=secret).status, (403, 404))
+
+    def test_credential_of_a_current_member_is_unaffected(self):
+        admin, alex_id, blair_id, alex, project, issued = self._project_with_issuer()
+        self.assertEqual(201, self.create_task(issued['secret'], project, 'still allowed').status)
+
+
+class IdempotencyAtomicityCase(Harness):
+    """5. idempotency-atomicity: reservation is atomic and creation keys are stable."""
+
+    def test_concurrent_identical_issue_creates_exactly_one_credential(self):
+        admin = self.admin_token()
+        self.create_account(admin, 'alex', 'alex-password-1')
+        alex = self.login('alex', 'alex-password-1')[0]
+        project = self.create_project(alex, 'Alpha')
+        service = self.service
+        original = service.issue_credential
+        barrier = threading.Barrier(2)
+
+        def gated(*args, **kwargs):
+            try:
+                barrier.wait(timeout=3)
+            except threading.BrokenBarrierError:
+                pass
+            return original(*args, **kwargs)
+
+        service.issue_credential = gated
+        results = {}
+        start = threading.Barrier(3)
+
+        def issue(number):
+            start.wait(timeout=5)
+            results[number] = self.request(
+                'POST', '/v1/projects/%s/worker-credentials' % project, {'label': 'same'},
+                token=alex, key='concurrent-key-0100')
+
+        threads = [threading.Thread(target=issue, args=(n,)) for n in (0, 1)]
+        for thread in threads:
+            thread.start()
+        start.wait(timeout=5)
+        for thread in threads:
+            thread.join(timeout=30)
+        service.issue_credential = original
+        statuses = sorted(results[n].status for n in results)
+        self.assertEqual(1, statuses.count(201), statuses)
+        self.assertEqual(1, len(self.store.state['credentials']))
+
+    def test_project_create_same_key_changed_body_conflicts(self):
+        admin = self.admin_token()
+        first = self.request('POST', '/v1/projects',
+                             {'name': 'Created one', 'project_id': 'proj-one'},
+                             token=admin, key='project-key-0100')
+        self.assertEqual(201, first.status, first.data)
+        changed = self.request('POST', '/v1/projects',
+                               {'name': 'Created two', 'project_id': 'proj-two'},
+                               token=admin, key='project-key-0100')
+        self.assertEqual(409, changed.status, changed.data)
+        self.assertEqual(1, len(self.store.state['projects']))
+
+
+class AttachmentLossCase(Harness):
+    """6. attachment-loss: never acknowledge a task whose evidence was discarded."""
+
+    ATTACHMENT = {'name': 'note.txt', 'media_type': 'text/plain',
+                  'content_base64': 'YXR0YWNobWVudC1wYXlsb2Fk'}
+
+    def test_valid_attachment_is_rejected_and_not_stored(self):
+        admin = self.admin_token()
+        self.create_account(admin, 'alex', 'alex-password-1')
+        alex = self.login('alex', 'alex-password-1')[0]
+        project = self.create_project(alex, 'Alpha')
+        response = self.request('POST', '/v1/projects/%s/tasks' % project,
+                                {'title': 'with evidence',
+                                 'attachments': [self.ATTACHMENT]}, token=alex)
+        self.assertEqual(501, response.status, response.data)
+        self.assertEqual('not_implemented', response.data['error']['code'])
+        self.assertEqual(0, self.request('GET', '/v1/projects/%s/tasks' % project,
+                                         token=alex).data['total'])
+
+
+class EndpointAttachmentLossCase(EndpointCase):
+    def test_valid_attachment_never_reaches_the_canonical_write(self):
+        alex, project = self.setup_project()
+        response = self.request('POST', '/v1/projects/%s/tasks' % project,
+                                {'title': 'with evidence',
+                                 'attachments': [AttachmentLossCase.ATTACHMENT]}, token=alex)
+        self.assertEqual(501, response.status, response.data)
+        self.assertEqual([], self.canonical_rows())
 
 
 if __name__ == '__main__':

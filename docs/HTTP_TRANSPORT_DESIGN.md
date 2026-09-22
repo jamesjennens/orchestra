@@ -343,6 +343,12 @@ content hashes while streaming, and reject traversal, symlinks, ambiguous
 encodings and archive bombs. Download authorization is checked independently;
 the original filename is display metadata only.
 
+**Current build status (rev3).** The `.19` service validates attachment bounds,
+filenames and media types, but no route persists attachment content yet: the artifact
+binding is deferred with the job/artifact routes. A syntactically valid attachment is
+therefore rejected with `501 not_implemented` rather than accepted and dropped. The
+service never returns `201` while discarding submitted evidence.
+
 Every mutation that can be retried accepts an idempotency key scoped to
 authenticated principal, project and operation route. The key namespace does
 not include the request payload: store the canonical request hash separately,
@@ -353,6 +359,13 @@ result; it must not duplicate a task, comment, attachment registration or
 role change. Idempotency does not make a non-transactional external side effect
 exactly once, so the response and reconciliation protocol must expose unknown
 outcomes.
+
+**Current build status (rev3).** Reservation, mutation and receipt are atomic for
+in-process mutations, and every canonical mutation carries a deterministic operation
+identity that the endpoint journals durably with the effect. A retry after a lost
+response replays the recorded canonical envelope instead of repeating the effect; an
+authority change persisted first is observed by the endpoint immediately before the
+effect under the same cross-process lock. Attachments excepted, see above.
 
 Credential issuance is the deliberate exception to replaying a secret. The
 issuance idempotency record stores the credential ID, request hash, status and
