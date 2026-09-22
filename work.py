@@ -20,13 +20,16 @@ def checkpoint_newer_counts(rows,row):
     a checkpoint or with malformed/conflicting checkpoint history (brief remains
     the authority); coverage flags whether counts are proven or unknown."""
     try:
-        from briefing import checkpoints,newer_activity_summary,snapshot,activity_cursor,parse_provenance
+        from briefing import checkpoints,newer_activity_summary,snapshot,activity_cursor,parse_provenance,direction_index,unresolved_directions
         (p,c),_invalid=checkpoints(row)
         if p is None:return None
         excluded=snapshot(rows,'work-queue',row['id'],str(c['id']))
-        if p['activity_cursor']==activity_cursor(excluded):return {'own':0,'others':0,'coverage':'current'}
-        newer=newer_activity_summary(excluded,parse_provenance(p),c.get('created_at'),row.get('assignee'))
-        return {'own':newer['own_count'],'others':newer['other_count'],'coverage':newer['coverage']}
+        if p['activity_cursor']==activity_cursor(excluded):coverage='current';own=others=0
+        else:
+            newer=newer_activity_summary(excluded,parse_provenance(p),c.get('created_at'),row.get('assignee'),direction_index(p))
+            own=newer['own_count'];others=newer['other_count'];coverage=newer['coverage']
+        outstanding=len(unresolved_directions(excluded['entries'],direction_index(p),row.get('assignee')))
+        return {'own':own,'others':others,'coverage':coverage,'directions':outstanding}
     except (ValueError,TypeError,KeyError):return None
 
 def queue(rows,actor,args):
@@ -56,6 +59,7 @@ def queue(rows,actor,args):
                       'contribution_id':contribution.get('comment_id'),'commit':contribution.get('commit'),'pending_review_items':len(review.get('pending_requests',[])),
                       'newer_activity_by_others':None if newer_counts is None else newer_counts['others'],'newer_activity_own':None if newer_counts is None else newer_counts['own'],
                       'newer_activity_coverage':None if newer_counts is None else newer_counts['coverage'],
+                      'unresolved_directions':None if newer_counts is None else newer_counts['directions'],
                       'lifecycle':{k:v['value'] for k,v in fact.items()},'lifecycle_scope':scope,
                       'lifecycle_matches_contribution':None if not contribution else scope.get('source_commit','').lower()==contribution['commit'].lower(),'error':error})
     priority={'changes-requested':0,'error':1,'awaiting-review':2,'legacy-review-ready':2,'awaiting-integration':3}
