@@ -36,6 +36,20 @@ Push permission for a contribution branch is separate from permission to merge, 
 
 A local commit alone is insufficient. Uncommitted files and local-only evidence must be listed as outstanding work, not as a transferable completed implementation. Do not put credentials or private runtime data into a branch/bundle.
 
+## Reserved machine-record comments
+
+Raw `comments add` bodies (positional text and `--file` inputs) are checked
+for reserved machine-record prefixes (`Kind: contribution-review-v1`,
+`Kind: task-checkpoint-v1`, `Kind: lifecycle-v1`,
+`Kind: requirement-revision-v1`, `Kind: task-handoff-v1`,
+`Kind: task-handoff-complete-v1`, `Kind: plan-registration.`). Raw review,
+checkpoint, lifecycle and handoff records are rejected before any native
+mutation. Requirement revisions and worker-plan registrations retain their
+supported raw transport only after schema, canonical content and applicable
+actor/task checks. Rejected writes name the dedicated
+structured operation (`review`, `checkpoint`, `lifecycle record`, `handoff`,
+`worker_gate.py register`). Ordinary prose remains valid.
+
 ## Make review-ready work discoverable
 
 For new structured contributions, prefer [resume and contribution reviews](REVIEWS.md), served as `docs reviews`: exact delivery revisions, persistent requests/responses and `work --mine`/`work --state awaiting-review`. Structured state overrides legacy labels and old checkpoints. Recurring workers resume the saved actor; replacement workers need an explicit authorized handoff. The label convention below remains for existing unstructured tasks.

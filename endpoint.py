@@ -12,6 +12,7 @@ from admin import environment,project_dir,root_path
 from render import render
 from lifecycle import apply_native
 from version import report
+from reserved_comments import check_raw_request, comment_target
 
 ALLOWED={'list','show','ready','search','count','create','update','close','reopen','comments','dep','state','lint'}
 FORBIDDEN={'--directory','-C','--db','--repo','--global','--actor','--author','--profile','--graph','--config','--metadata'}
@@ -97,6 +98,14 @@ def execute(root,request):
     if args[0] not in ALLOWED:raise ValueError('Command is outside the contributor interface; use admin.py for setup/maintenance')
     if any(a.split('=',1)[0] in FORBIDDEN for a in args):raise ValueError('Connection/identity/file configuration flags are operator-only')
     # Positional dep/comment IDs are fine; file inputs must be transported explicitly.
+    # Raw comments add bodies (positional and transported file inputs) must not
+    # carry forged machine-record prefixes: those records require their
+    # dedicated structured operations with chain/ownership validation.
+    # Checked before any temp file or native mutation; rejected writes leave
+    # no native record. Actor/task context binds supported records to the
+    # actual request target; unresolvable targets fail closed.
+    check_raw_request(args, request.get('attachments', {}),
+                      actor=actor, task=comment_target(args))
     with tempfile.TemporaryDirectory(prefix='request-',dir=root) as tmp:
         attachments=request.get('attachments',{})
         final=[]

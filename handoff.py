@@ -45,6 +45,36 @@ def validate_request_record(record):
         if disposition['kind']!=expected:
             raise ValueError('Handoff disposition does not match request status')
 
+INTENT_PREFIX = 'Kind: task-handoff-v1\n'
+COMPLETE_PREFIX = 'Kind: task-handoff-complete-v1\n'
+
+def parse_identity(prefix, body):
+    """Return the canonical handoff identity payload, or None if not exact."""
+    if not isinstance(body, str) or not body.startswith(prefix):
+        return None
+    try:
+        identity = json.loads(body[len(prefix):])
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(identity, dict):
+        return None
+    try:
+        validate_receipt({'digest': content_hash(identity), 'status': 'pending',
+                          'identity': identity})
+    except ValueError:
+        return None
+    if canonical_bytes(identity).decode() != body[len(prefix):]:
+        return None
+    return identity
+
+
+def is_valid_intent(body):
+    return parse_identity(INTENT_PREFIX, body) is not None
+
+
+def is_valid_completion(body):
+    return parse_identity(COMPLETE_PREFIX, body) is not None
+
 def validate(p):
     keys={'schema_version','operation_id','task','from_actor','to_actor','reason','approval'}
     if not isinstance(p,dict) or set(p)!=keys or type(p['schema_version']) is not int or p['schema_version']!=1:raise ValueError('Invalid handoff payload')
@@ -270,7 +300,7 @@ def execute(path, actor, p, run, operator=False, recovery=None):
         raise ValueError('Owner changed; reconcile before issuing a new authorized handoff')
     if record is None:
         record={'digest':digest,'status':'pending','identity':identity};atomic(file,record)
-    intent='Kind: task-handoff-v1\n'+canonical_bytes(identity).decode()
+    intent=INTENT_PREFIX+canonical_bytes(identity).decode()
     def comment(text):
         # Fetch comments directly: native show may not include them in every version.
         comments=json.loads(run(['comments',p['task'],'--json'])) or []
@@ -282,7 +312,7 @@ def execute(path, actor, p, run, operator=False, recovery=None):
         run(['update',p['task'],'--assignee',p['to_actor'],'--json'])
     elif current.get('assignee')!=p['to_actor']:raise ValueError('Owner changed during handoff')
     if issue().get('assignee')!=p['to_actor']:raise ValueError('Handoff outcome uncertain; retry same operation after inspection')
-    comment('Kind: task-handoff-complete-v1\n'+canonical_bytes(identity).decode())
+    comment(COMPLETE_PREFIX+canonical_bytes(identity).decode())
     record['status']='complete';atomic(file,record)
     request_id=p['operation_id'][8:] if p['operation_id'].startswith('handoff-') else ''
     request_file=_request_file(path,request_id) if request_id else None
