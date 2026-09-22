@@ -67,6 +67,26 @@ Copy a completed, quiescent backup pair off-machine using your normal encrypted 
 
 If restore is interrupted, the new destination may exist with only part of the restore completed. Preserve it for inspection; retry recovery into another unused destination. Do not delete the source or force reuse of the partially restored target. Verify pending reservations, comments, lifecycle events, baselines and slot context before switching clients.
 
+### Malformed structured history
+
+A comment that claims a reserved machine format (`Kind: contribution-review-v1`, `Kind: task-checkpoint-v1`) but fails validation makes `brief`, `review` and `refresh` fail for that task. Repair it on the host; never edit or delete rows in the native database.
+
+Read the incident first: `brief PROJECT-TASK` fails naming the offending comment id, and `history PROJECT-TASK` returns its exact bytes. Build a void payload and submit it with the host command:
+
+```json
+{"schema_version":1,"operation":"void-record","operation_id":"void-1","task":"PROJECT-TASK",
+ "target":"COMMENT-ID","target_kind":"contribution-review","target_sha256":"SHA256-OF-ORIGINAL",
+ "original":"EXACT ORIGINAL COMMENT TEXT","reason":"WHY THIS RECORD IS VOID","disposition":"void"}
+```
+
+```sh
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime void-record PROJECT --actor OPERATOR --file void.json
+```
+
+`target_sha256` is the SHA-256 of `original` encoded as UTF-8, so the record proves which bytes were reconciled. Void records are append-only and are written only by this host command; the contributor endpoint refuses them and a malformed or stale void comment is ignored and reported rather than applied. Nothing is deleted: the original comment, the void record and its actor, timestamp and reason all stay in native history, in `history` reads and in rendered pages, and native backup plus `restore-new` preserve both. Reads expose applied voids in `review.recoveries`.
+
+A void may not target a record that is part of the contribution history the surviving records currently form, so recovery cannot suppress a current revision or approval. If a surviving record's `previous` names a voided comment, reads keep failing closed and name that record; void it explicitly as well, or deliver a revision that repairs the chain. Re-running the identical void payload is idempotent.
+
 ### Optional scheduled backup
 
 Edit `templates/beads-backup.service` for the installation paths/project, then copy it and `templates/beads-backup.timer` into the service account's `~/.config/systemd/user/`. Enable with `systemctl --user daemon-reload` and `systemctl --user enable --now beads-backup.timer`. Check `systemctl --user list-timers` and the service journal; lingering must already be enabled for unattended operation. The timer performs same-host backup only. Configure off-machine copying and retention separately. These templates do not replace an existing team's backup schedule.

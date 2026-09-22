@@ -442,6 +442,7 @@ def main():
     a.add_argument('--disposition',choices=['failed','released','complete'],default='released')
     a.add_argument('--issue-id',dest='issue_id',default=None,
                    help='with --disposition complete, the exact native record to confirm')
+    a=sub.add_parser('void-record');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     for command in ('backup','restore-new'):
         a=sub.add_parser(command);a.add_argument('project')
         if command=='restore-new':a.add_argument('destination')
@@ -529,6 +530,17 @@ def main():
             fcntl.flock(lock,fcntl.LOCK_EX)
             print(json.dumps(reconcile(path,args.operation_id,args.actor,args.reason,
                                        args.disposition,run,issue_id=args.issue_id)))
+    elif args.command=='void-record':
+        import fcntl
+        from review_workflow import apply_void
+        path=project_dir(root,args.project)
+        payload=json.loads(Path(args.file).read_text(encoding='utf-8-sig'))
+        if not isinstance(payload,dict) or not isinstance(payload.get('task'),str):raise ValueError('Void record payload must name its task')
+        def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            rows=[json.loads(line) for line in run_bd(root,args.project,['export','--all']).splitlines() if line.strip()]
+            print(json.dumps(apply_void(rows,payload['task'],args.actor,payload,run,operator=True)))
     elif args.command=='backup':print(backup_project(root,args.project))
     elif args.command=='journal':
         import fcntl

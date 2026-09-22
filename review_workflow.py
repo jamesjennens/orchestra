@@ -5,6 +5,7 @@ comment authors supply attribution; actor labels are not authentication.
 """
 import json
 import re
+import recovery
 from requirements import canonical_bytes
 
 PREFIX = 'Kind: contribution-review-v1\n'
@@ -87,26 +88,42 @@ def validate(p, task):
         raise ValueError('Review workflow payload exceeds 24 KB')
 
 
-def records(issue):
+def records(issue, voided=None):
+    voided = set(voided or ())
     found = {}; operations = set()
     for c in issue.get('comments') or []:
         raw = c.get('text', '')
         if not isinstance(raw, str) or not raw.startswith(PREFIX):
             continue
+        cid = str(c['id'])
+        if cid in voided:
+            continue
         try:
             p = json.loads(raw[len(PREFIX):]); validate(p, issue['id'])
-            cid = str(c['id']); identity(cid)
+            identity(cid)
             text(c.get('author'), 'native author', 300)
             text(c.get('created_at'), 'native timestamp', 100)
         except (ValueError, KeyError, TypeError) as exc:
-            raise ValueError('Malformed contribution-review history; operator reconciliation required') from exc
+            raise ValueError('Malformed contribution-review history; operator reconciliation required '
+                             '(an operator may void comment ' + cid + ' with admin.py void-record)') from exc
         if cid in found or p['operation_id'] in operations:
             raise ValueError('Duplicate workflow comment/operation ID')
         operations.add(p['operation_id']); found[cid] = (p, c)
-    ordered = []; previous = None
+    return chain(found, voided)
+
+
+def chain(found, voided=()):
+    """Link records by their explicit `previous` reference; never silently re-link."""
+    voided = set(voided or ()); ordered = []; previous = None
     while found:
         children = [cid for cid, (p, _) in found.items() if p['previous'] == previous]
         if len(children) != 1:
+            dangling = sorted((cid, p['previous']) for cid, (p, _) in found.items() if p['previous'] in voided)
+            if dangling:
+                raise ValueError('Contribution-review record(s) ' +
+                                 ', '.join(cid + ' -> ' + previous_id for cid, previous_id in dangling) +
+                                 ' still reference voided record(s); void those downstream records explicitly '
+                                 'or deliver a revision that repairs the chain')
             raise ValueError('Conflicting or unlinked contribution-review history')
         previous = children[0]; ordered.append(found.pop(previous))
     return ordered
@@ -141,6 +158,96 @@ class StaleReviewPrevious(ValueError):
             'deciding.\n' + canonical_bytes(self.detail).decode('utf-8'))
 
 
+def effective(issue, voided):
+    """Individually valid non-voided records; malformed/duplicate ones are excluded."""
+    found = {}; operations = set()
+    for c in issue.get('comments') or []:
+        raw = c.get('text', '')
+        if not isinstance(raw, str) or not raw.startswith(PREFIX):
+            continue
+        cid = str(c['id'])
+        if cid in voided:
+            continue
+        try:
+            p = json.loads(raw[len(PREFIX):]); validate(p, issue['id'])
+            identity(cid)
+            text(c.get('author'), 'native author', 300)
+            text(c.get('created_at'), 'native timestamp', 100)
+        except (ValueError, KeyError, TypeError):
+            continue
+        if p['operation_id'] in operations:
+            continue
+        operations.add(p['operation_id']); found[cid] = (p, c)
+    return found
+
+
+def protected(issue, voided, target):
+    """Comment ids in the chain the surviving records currently form.
+
+    A void may not remove one of these: recovery reconciles malformed, duplicate
+    or conflicting records, it never suppresses a revision or an approval that
+    the surviving records still link into place. The chain is walked greedily
+    from the head and stops at the first ambiguity, so an already-unlinked
+    downstream record stays voidable while the effective prefix stays protected.
+    """
+    surviving = effective(issue, set(voided) - {target})
+    reached = []; previous = None
+    while True:
+        children = [cid for cid, (p, _) in surviving.items() if p['previous'] == previous]
+        if len(children) != 1:
+            break
+        previous = children[0]; reached.append(previous)
+    return set(reached)
+
+
+def check_void(issue, payload, voided):
+    """Whole-transition check for one operator void before any native mutation."""
+    raw = recovery.target_text(issue, payload['target'])
+    if not raw.startswith(PREFIX):
+        raise ValueError('Operator void target is not a contribution-review record: ' + payload['target'])
+    if not recovery.preserves(raw, payload):
+        raise ValueError('Operator void record must preserve the exact current bytes of ' + payload['target'])
+    if payload['target'] in protected(issue, voided, payload['target']):
+        raise ValueError('Operator void refused for ' + payload['target'] + ': that record is part of the '
+                         'contribution history the surviving records currently form; voids only reconcile '
+                         'malformed, duplicate or conflicting records')
+
+
+def history(issue):
+    """Apply operator voids; return (ordered, voids, invalid).
+
+    Raises when the history cannot be reconciled even after voids, including
+    when surviving records still reference a voided revision.
+    """
+    voids, targets, invalid = recovery.records(issue)
+    for p, _ in voids:
+        check_void(issue, p, set(targets))
+    return records(issue, set(targets)), voids, invalid
+
+
+def apply_void(rows, task, actor, payload, run, operator=False):
+    """Append one operator void record; operator is supplied only by the admin CLI."""
+    if not operator:
+        raise ValueError('Operator void records are not authorized over the contributor review transport; '
+                         'an operator must use admin.py void-record on the coordination host')
+    recovery.validate(payload, task); text(actor, 'actor', 300)
+    matches = [r for r in rows if r.get('id') == task]
+    if len(matches) != 1 or matches[0].get('issue_type') == 'event':
+        raise ValueError('Task missing, duplicated or is an event')
+    issue = matches[0]; voids, targets, _ = recovery.records(issue)
+    for p, c in voids:
+        if p['operation_id'] == payload['operation_id']:
+            if p == payload and c.get('author') == actor:
+                return dict(comment_id=str(c['id']), reconciled=True, target=p['target'])
+            raise ValueError('Void operation ID already used with different payload or actor')
+        if p['target'] == payload['target']:
+            raise ValueError('Another operator void record already targets ' + p['target'])
+    check_void(issue, payload, set(targets))
+    # Validate the whole transition before the sole native mutation.
+    result = json.loads(run(['comments', 'add', task, recovery.PREFIX + canonical_bytes(payload).decode(), '--json']))
+    return dict(comment_id=str(result['id']), reconciled=False, target=payload['target'])
+
+
 def describe_contribution_mismatch(op, supplied, current, latest):
     """Actionable refusal for a review operation that names the wrong revision.
 
@@ -173,7 +280,7 @@ def receipt(state, rows, task):
     return {key: answer[key] for key in ('review_state', 'workflow_state', 'integration')}
 
 
-def projection(ordered):
+def projection(ordered, voids=None, invalid=None):
     contribution = None; pending = {}; approved = False; latest = None
     for p, c in ordered:
         cid = str(c['id']); op = p['operation']
@@ -207,21 +314,39 @@ def projection(ordered):
         latest = cid
     state = ('none' if contribution is None else 'changes-requested' if pending else
              'awaiting-integration' if approved else 'awaiting-review')
+    recoveries = [{'comment_id': str(c['id']), 'disposition': p['disposition'], 'target': p['target'],
+                   'target_kind': p['target_kind'], 'target_sha256': p['target_sha256'],
+                   'original_chars': len(p['original']), 'author': c['author'],
+                   'timestamp': c['created_at'], 'reason': p['reason']} for p, c in (voids or [])]
+    warnings = []
+    if recoveries:
+        warnings.append('Operator void record(s) applied to: ' +
+                        ', '.join(r['target'] for r in recoveries[:5]) +
+                        ' (targets are excluded from the review chain; their original bytes remain in history)')
+    invalid = list(invalid or [])
+    if invalid:
+        warnings.append('Malformed or stale operator void comments ignored: ' + ', '.join(invalid[:5]))
     return dict(contribution=contribution, review_state=state,
-                pending_requests=list(pending.values()), latest_comment_id=latest, warnings=[])
+                pending_requests=list(pending.values()), latest_comment_id=latest,
+                recoveries=recoveries, warnings=warnings)
 
 
 def project(issue):
-    return projection(records(issue))
+    ordered, voids, invalid = history(issue)
+    return projection(ordered, voids, invalid)
 
 
 def execute(rows, task, actor, payload, run):
     """Validate, CAS and append once; return receipt and projected review state."""
+    if isinstance(payload, dict) and payload.get('operation') == recovery.OPERATION:
+        raise ValueError('Operator void records are not accepted over the contributor review transport; '
+                         'an operator must use admin.py void-record on the coordination host')
     validate(payload, task); text(actor, 'actor', 300)
     matches = [r for r in rows if r.get('id') == task]
     if len(matches) != 1 or matches[0].get('issue_type') == 'event':
         raise ValueError('Task missing, duplicated or is an event')
-    issue = matches[0]; ordered = records(issue); state = projection(ordered)
+    issue = matches[0]; ordered, voids, invalid = history(issue)
+    state = projection(ordered, voids, invalid)
     effective_state = receipt(state, rows, task)['review_state']
     # Exact retries remain recoverable after ownership changes or later revisions.
     for p, c in ordered:
@@ -229,6 +354,10 @@ def execute(rows, task, actor, payload, run):
             if p == payload and c['author'] == actor:
                 return dict(comment_id=str(c['id']), reconciled=True, **receipt(state, rows, task))
             raise ValueError('Operation ID already used with different payload or actor')
+    voided_operations = _voided_operation_ids(issue, voids)
+    if payload['operation_id'] in voided_operations:
+        raise ValueError('Operation ID ' + payload['operation_id'] + ' belongs to a voided contribution-review '
+                         'record; operator recovery removed that revision, so retry it as a new operation')
     if payload['previous'] != state['latest_comment_id']:
         raise StaleReviewPrevious(task, payload['previous'],
                                   state['latest_comment_id'], effective_state)
@@ -237,6 +366,23 @@ def execute(rows, task, actor, payload, run):
     if payload['operation'] == 'request-changes' and issue.get('status') == 'closed':
         raise ValueError('Reopen the closed task explicitly before requesting changes')
     # Validate the entire transition before the sole native mutation.
-    preview = projection(ordered + [(payload, {'id': 'pending-write', 'author': actor, 'created_at': 'pending'})])
+    preview = projection(ordered + [(payload, {'id': 'pending-write', 'author': actor, 'created_at': 'pending'})],
+                         voids, invalid)
     result = json.loads(run(['comments', 'add', task, PREFIX + canonical_bytes(payload).decode(), '--json']))
     return dict(comment_id=str(result['id']), reconciled=False, **receipt(preview, rows, task))
+
+
+def _voided_operation_ids(issue, voids):
+    """Operation ids of review records that an operator void removed."""
+    found = []
+    for p, _ in voids:
+        raw = recovery.target_text(issue, p['target'])
+        if not raw.startswith(PREFIX):
+            continue
+        try:
+            body = json.loads(raw[len(PREFIX):])
+        except (ValueError, TypeError):
+            continue
+        if isinstance(body, dict) and isinstance(body.get('operation_id'), str):
+            found.append(body['operation_id'])
+    return found
