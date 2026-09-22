@@ -13,6 +13,7 @@ DOCUMENTS = {
     'review-response-template': 'templates/REVIEW_RESPONSE.json',
     'handoff-template': 'templates/HANDOFF.json',
     'briefings': 'docs/BRIEFINGS.md',
+    'cli-contract': 'docs/CLI_CONTRACT.md',
     'operations': 'docs/OPERATIONAL_WORKFLOW.md',
     'checkpoint-template': 'templates/CHECKPOINT.json',
     'task-template': 'templates/TASK.md',

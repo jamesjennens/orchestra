@@ -11,6 +11,14 @@ from requirements import canonical_bytes, content_hash
 
 PREFIX='Kind: task-checkpoint-v1\n'
 KINDS={'blocker','question','decision','correction','dependency'}
+CHECKPOINT_ITEMS_MAX=100
+CHECKPOINT_TEXT_LIMIT=400
+CHECKPOINT_SOURCE_LIMIT=240
+CHECKPOINT_MAX_BYTES=80000
+BRIEF_ITEM_OFFSET_MIN=0
+BRIEF_ITEM_LIMIT_MIN,BRIEF_ITEM_LIMIT_MAX=1,10
+HISTORY_LIMIT_MIN,HISTORY_LIMIT_MAX=1,20
+HISTORY_BUDGET_MIN,HISTORY_BUDGET_MAX=256,8000
 
 def token(data):return base64.urlsafe_b64encode(canonical_bytes(data)).decode().rstrip('=')
 
@@ -51,7 +59,12 @@ def text(value,label,limit,empty=False):
 
 def validate_checkpoint(p,task):
     fields={'schema_version','task','previous','activity_cursor','source_commit','branch','intent','acceptance','summary','next_action','open_items','resolved'}
-    if not isinstance(p,dict) or set(p)!=fields or type(p['schema_version']) is not int or p['schema_version']!=1:raise ValueError('Invalid checkpoint fields/version')
+    if not isinstance(p,dict):raise ValueError('Invalid checkpoint: expected a JSON object')
+    unknown=sorted(set(p)-fields);missing=sorted(fields-set(p));details=[]
+    if unknown:details.append('unknown fields: '+', '.join(unknown))
+    if missing:details.append('missing fields: '+', '.join(missing))
+    if not details and (type(p['schema_version']) is not int or p['schema_version']!=1):details.append('schema_version must be integer 1')
+    if details:raise ValueError('Invalid checkpoint: '+'; '.join(details))
     if p['task']!=task:raise ValueError('Checkpoint task mismatch')
     if p['previous'] is not None:identity(p['previous'])
     for key,limit in [('source_commit',128),('branch',200),('intent',600),('acceptance',1000),('summary',1000),('next_action',600)]:text(p[key],key,limit,empty=key in ('source_commit','branch'))
@@ -59,18 +72,25 @@ def validate_checkpoint(p,task):
     if not isinstance(cursor,dict) or cursor.get('kind')!='activity' or cursor.get('task')!=task:raise ValueError('Expected task activity cursor from brief/history')
     for field in ('open_items','resolved'):
         items=p[field]
-        if not isinstance(items,list) or len(items)>100:raise ValueError('Checkpoint item lists limited to 100')
+        if not isinstance(items,list) or len(items)>CHECKPOINT_ITEMS_MAX:
+            raise ValueError('%s: expected a list of at most %d items' % (field,CHECKPOINT_ITEMS_MAX))
         ids=[]
-        for item in items:
+        for index,item in enumerate(items):
+            path='%s[%d]' % (field,index)
             keys={'id','kind','text','source'} if field=='open_items' else {'id','reason','evidence'}
-            if not isinstance(item,dict) or set(item)!=keys:raise ValueError('Invalid '+field+' item')
+            if not isinstance(item,dict):
+                raise ValueError('%s: expected an object with fields %s' % (path,', '.join(sorted(keys))))
+            unknown=sorted(set(item)-keys);missing=sorted(keys-set(item));details=[]
+            if unknown:details.append('unknown fields: '+', '.join(unknown))
+            if missing:details.append('missing fields: '+', '.join(missing))
+            if details:raise ValueError('%s: %s; allowed fields: %s' % (path,'; '.join(details),', '.join(sorted(keys))))
             ids.append(identity(item['id']))
             if field=='open_items':
-                if item['kind'] not in KINDS:raise ValueError('Invalid unresolved kind')
-                text(item['text'],'item text',400);text(item['source'],'source',240)
-            else:text(item['reason'],'resolution reason',400);text(item['evidence'],'resolution evidence',240)
+                if item['kind'] not in KINDS:raise ValueError('%s.kind: expected one of %s' % (path,', '.join(sorted(KINDS))))
+                text(item['text'],path+'.text',CHECKPOINT_TEXT_LIMIT);text(item['source'],path+'.source',CHECKPOINT_SOURCE_LIMIT)
+            else:text(item['reason'],path+'.reason',CHECKPOINT_TEXT_LIMIT);text(item['evidence'],path+'.evidence',CHECKPOINT_SOURCE_LIMIT)
         if len(set(ids))!=len(ids):raise ValueError('Duplicate item IDs')
-    if len(canonical_bytes(p))>80000:raise ValueError('Checkpoint exceeds 80 KB')
+    if len(canonical_bytes(p))>CHECKPOINT_MAX_BYTES:raise ValueError('Checkpoint exceeds %d KB' % (CHECKPOINT_MAX_BYTES//1000))
 
 def transition(previous,current):
     old={x['id'] for x in previous['open_items']} if previous else set()
@@ -108,7 +128,8 @@ def clip(value,limit):
     return {'text':value[:limit],'omitted_chars':max(0,len(value)-limit)}
 
 def brief(rows,project,task,offset=0,limit=5):
-    if type(offset) is not int or offset<0 or type(limit) is not int or not 1<=limit<=10:raise ValueError('Invalid unresolved-item page')
+    if type(offset) is not int or offset<BRIEF_ITEM_OFFSET_MIN or type(limit) is not int or not BRIEF_ITEM_LIMIT_MIN<=limit<=BRIEF_ITEM_LIMIT_MAX:
+        raise ValueError('Invalid unresolved-item page: --items-offset must be >= %d and --items-limit must be %d..%d' % (BRIEF_ITEM_OFFSET_MIN,BRIEF_ITEM_LIMIT_MIN,BRIEF_ITEM_LIMIT_MAX))
     issue=task_row(rows,task);current,invalid=checkpoints(issue)
     if issue.get('issue_type')=='event':raise ValueError('Use history/show for an event; brief requires a task or job')
     data=snapshot(rows,project,task);p,c=current if current else (None,None)
@@ -156,8 +177,8 @@ def save_checkpoint(rows,project,task,p,actor,run):
     return {'comment_id':str(result['id']),'reconciled':False}
 
 def history_page(data,project,task,limit=5,since=None,cursor=None,body_budget=4000):
-    if type(limit) is not int or not 1<=limit<=20:raise ValueError('History limit must be 1..20')
-    if type(body_budget) is not int or not 256<=body_budget<=8000:raise ValueError('History body budget must be 256..8000')
+    if type(limit) is not int or not HISTORY_LIMIT_MIN<=limit<=HISTORY_LIMIT_MAX:raise ValueError('History limit must be %d..%d' % (HISTORY_LIMIT_MIN,HISTORY_LIMIT_MAX))
+    if type(body_budget) is not int or not HISTORY_BUDGET_MIN<=body_budget<=HISTORY_BUDGET_MAX:raise ValueError('History body budget must be %d..%d' % (HISTORY_BUDGET_MIN,HISTORY_BUDGET_MAX))
     if data.get('project')!=project or data.get('task')!=task:raise ValueError('History scope mismatch')
     digest=content_hash(data);index=0;start=0
     since=utc_text(parse_moment(since,'--since')) if since is not None else None

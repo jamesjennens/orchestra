@@ -3,8 +3,81 @@ import argparse
 import json
 from lifecycle import project_facts
 
+CONTRACT_VERSION = 'cli-contract-v1'
+WORK_STATES = ['none','awaiting-review','changes-requested','awaiting-integration','integrated','legacy-review-ready','error']
+WORK_LIMIT_MIN, WORK_LIMIT_MAX = 1, 100
+WORK_OFFSET_MIN = 0
+
+# Common mistakes get a targeted hint instead of argparse's bare "unrecognized
+# arguments". Keys are matched as substrings of the parser error message.
+MISTAKEN_FLAGS = {
+    '--review-state': 'use --state for the review-state filter',
+    '--state-name': 'use --state',
+    '--assignee': 'use --owner ACTOR or --mine',
+    '--task': 'work lists the queue; use "review TASK" for one task',
+    '--review': 'work lists the queue; use "review TASK" for one task',
+}
+
+def help_payload(action='work'):
+    """Machine-readable help returned through the normal JSON envelope on exit 0."""
+    usage = {
+        'work': 'work [--mine | --owner ACTOR] [--state STATE] [--limit N] [--offset N] '
+                '[--handoff-limit N] [--handoff-offset N] [--json]',
+        'review': 'review TASK [--file payload.json]',
+        'handoff': 'handoff TASK --file payload.json',
+    }
+    payload = {'schema_version': 1, 'contract': CONTRACT_VERSION, 'command': action,
+               'usage': usage.get(action, action),
+               'options': help_options(action),
+               'exit_codes': {'0': 'result or help JSON on stdout',
+                              '2': 'validation/transport error on stderr; stdout is not written'}}
+    if action == 'work':
+        payload['limits'] = {
+            'limit': '%d..%d' % (WORK_LIMIT_MIN, WORK_LIMIT_MAX),
+            'offset': '>= %d' % WORK_OFFSET_MIN,
+            'handoff-limit': '%d..%d' % (WORK_LIMIT_MIN, WORK_LIMIT_MAX),
+            'handoff-offset': '>= %d' % WORK_OFFSET_MIN,
+        }
+        payload['output'] = {
+            'top_level': ['owner', 'total', 'items', 'next_offset', 'coverage'],
+            'item_identity': 'items[].task is the native task ID; items[].contribution_id is the '
+                             'contribution comment ID, not a Git commit or latest_comment_id',
+            'item_fields': ['task', 'title', 'owner', 'status', 'review_state', 'contribution_id',
+                            'commit', 'pending_review_items', 'pending_handoff_requests',
+                            'pending_handoff_total', 'pending_handoff_next_offset', 'lifecycle',
+                            'lifecycle_scope', 'lifecycle_matches_contribution', 'error'],
+        }
+    elif action == 'review':
+        payload['operations'] = ['read (review TASK)', 'contribute', 'request-changes',
+                                 'respond', 'approve']
+        payload['notes'] = [
+            'Contribution payloads use contribution = the contribution record comment_id, '
+            'never a Git SHA and never latest_comment_id.',
+            'A JSON file attachment is required for every operation except read.',
+        ]
+    elif action == 'handoff':
+        payload['operations'] = ['transfer (from_actor/to_actor)', 'request', 'disposition']
+        payload['notes'] = ['A JSON file attachment is required; payload.task must equal TASK.']
+    return payload
+
+def help_options(action):
+    if action != 'work':return []
+    return [
+        {'flag': '--mine', 'description': 'show only tasks owned by the requesting actor'},
+        {'flag': '--owner ACTOR', 'description': 'show only tasks owned by ACTOR (mutually exclusive with --mine)'},
+        {'flag': '--state STATE', 'description': 'filter by review state: ' + ', '.join(WORK_STATES)},
+        {'flag': '--limit N', 'description': 'page size %d..%d (default 20)' % (WORK_LIMIT_MIN, WORK_LIMIT_MAX)},
+        {'flag': '--offset N', 'description': 'page offset >= %d (default 0)' % WORK_OFFSET_MIN},
+        {'flag': '--handoff-limit N', 'description': 'pending handoff requests per task %d..%d (default 20)' % (WORK_LIMIT_MIN, WORK_LIMIT_MAX)},
+        {'flag': '--handoff-offset N', 'description': 'pending handoff offset >= %d (default 0)' % WORK_OFFSET_MIN},
+        {'flag': '--json', 'description': 'accepted for consistency; work always returns JSON'},
+        {'flag': '-h, --help', 'description': 'return this help as JSON on stdout with exit code 0'},
+    ]
+
 class Parser(argparse.ArgumentParser):
-    def error(self,message):raise ValueError(message)
+    def error(self,message):
+        hint=next((text for flag,text in MISTAKEN_FLAGS.items() if flag in message),None)
+        raise ValueError(message+('; hint: '+hint if hint else ''))
 
 def workflow(issue):
     from review_workflow import project
@@ -14,13 +87,17 @@ def workflow(issue):
     return result
 
 def queue(rows,actor,args,request_dir=None):
+    if '--help' in args or '-h' in args:return help_payload('work')
     parser=Parser(add_help=False)
     group=parser.add_mutually_exclusive_group();group.add_argument('--mine',action='store_true');group.add_argument('--owner')
-    parser.add_argument('--state',choices=['none','awaiting-review','changes-requested','awaiting-integration','integrated','legacy-review-ready','error'])
+    parser.add_argument('--state',choices=WORK_STATES)
     parser.add_argument('--limit',type=int,default=20);parser.add_argument('--offset',type=int,default=0)
     parser.add_argument('--handoff-limit',type=int,default=20);parser.add_argument('--handoff-offset',type=int,default=0)
+    parser.add_argument('--json',action='store_true')  # output is always JSON; accepted for consistency
     a=parser.parse_args(args)
-    if not 1<=a.limit<=100 or a.offset<0 or not 1<=a.handoff_limit<=100 or a.handoff_offset<0:raise ValueError('Invalid work queue page')
+    if not WORK_LIMIT_MIN<=a.limit<=WORK_LIMIT_MAX or a.offset<WORK_OFFSET_MIN or not WORK_LIMIT_MIN<=a.handoff_limit<=WORK_LIMIT_MAX or a.handoff_offset<WORK_OFFSET_MIN:
+        raise ValueError('Invalid work page: --limit and --handoff-limit must be %d..%d; '
+                         '--offset and --handoff-offset must be >= %d' % (WORK_LIMIT_MIN,WORK_LIMIT_MAX,WORK_OFFSET_MIN))
     owner=actor if a.mine else a.owner
     journal_requests=[];journal_errors=[]
     if request_dir and request_dir.is_dir():
@@ -74,6 +151,8 @@ def queue(rows,actor,args,request_dir=None):
     return result
 
 def execute(path,actor,action,args,attachments,run):
+    if args[:1] in (['--help'],['-h']):
+        return help_payload(action if action in ('work','review','handoff') else 'work')
     if action=='work':
         rows=[json.loads(line) for line in run(['export','--all']).splitlines() if line.strip()]
         return queue(rows,actor,args,path/'.handoff-requests')

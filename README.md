@@ -12,6 +12,7 @@ We are now using the harness to develop the harness. Start with the [draft BRD](
 - Project direction and remaining work: [implementation plan](docs/PLAN.md).
 - Operational feedback and next priorities: [pilot follow-up](docs/PILOT_FEEDBACK.md).
 - Lifecycle evidence, activity cursors, safe child creation and merge slots: [operational commands](docs/OPERATIONAL_WORKFLOW.md).
+- Versioned client/endpoint JSON, help, ID, cursor and limit contract: [CLI contract](docs/CLI_CONTRACT.md).
 - Compact current task state, persistent unresolved items and paginated evidence: [briefings and checkpoints](docs/BRIEFINGS.md).
 - Copilot and remote development: [office setup](docs/COPILOT_REMOTE_DEV.md).
 - Optional headless workers: [Cline launch and recovery](docs/CLINE_WORKERS.md), [Hermes planning and resumption](docs/HERMES_WORKERS.md).
