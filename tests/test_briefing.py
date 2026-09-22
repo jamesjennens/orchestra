@@ -598,6 +598,154 @@ class ReviewV4Tests(unittest.TestCase):
             b.fit_provenance({'task': TASK, 'pad': 'p' * (b.RECORD_MAX + 1)}, {'a': '0' * 64})
 
 
+class ReviewV5Tests(unittest.TestCase):
+    """kittrial-5bb.1 review 01a0c715: historical retry, verify coverage honesty,
+    merged-record validation."""
+
+    def writes(self):
+        calls = []
+        return calls, lambda args: (calls.append(args), json.dumps(dict(id=f'cp{len(calls)}')))[1]
+
+    def store(self, data, cid, **changes):
+        calls, run = self.writes()
+        b.save_checkpoint(data, PROJECT, TASK, checkpoint(data, **changes), 'alice/session', run)
+        data[0]['comments'].append(comment(cid, calls[0][3]))
+        return json.loads(calls[0][3][len(b.PREFIX):]), run
+
+    def directed(self, count=1):
+        data = rows()
+        for n in range(count):
+            data[0]['comments'].append(comment(f'dir{n}', f'Direction {n}', '2026-09-16T00:00:00Z',
+                                               author='coordinator/session'))
+        return data
+
+    def save(self, data, cid, payload):
+        """Save a payload; append the stored receipt as comment `cid` when written."""
+        calls, run = self.writes()
+        result = b.save_checkpoint(data, PROJECT, TASK, payload, 'alice/session', run)
+        if calls: data[0]['comments'].append(comment(cid, calls[-1][3]))
+        return result, calls
+
+    def test_retry_is_independent_of_later_checkpoints_and_edits(self):
+        data = self.directed(1)
+        p = checkpoint(data)
+        first, calls = self.save(data, 'cpA', dict(p))
+        self.assertFalse(first['reconciled'])
+        self.assertEqual(len(calls), 1)
+        # A NEWER checkpoint introduces a carried disposition.
+        digest = b.snapshot(data, PROJECT, TASK)['entry_digests'][f'{TASK}-cdir0']
+        second, _ = self.save(data, 'cpB', checkpoint(data, directions=[
+            dict(id=f'{TASK}-cdir0', state='acknowledged', digest=digest)]))
+        self.assertFalse(second['reconciled'])
+        # Retrying the ORIGINAL request still reconciles against its own receipt,
+        # independent of the later checkpoint.
+        retry, retry_calls = self.save(data, 'cpX', dict(p))
+        self.assertTrue(retry['reconciled'])
+        self.assertEqual(retry['comment_id'], 'cpA')
+        self.assertEqual(retry_calls, [])
+        # A successfully saved DIRECTION request retried after that direction is
+        # edited reconciles on its own receipt instead of failing the digest guard.
+        req = checkpoint(data, directions=[dict(id=f'{TASK}-cdir0', state='acknowledged', digest=digest)])
+        stored, _ = self.save(data, 'cpC', req)
+        self.assertFalse(stored['reconciled'])
+        data[0]['comments'][0]['text'] = 'Edited direction text'
+        again, again_calls = self.save(data, 'cpY', req)
+        self.assertTrue(again['reconciled'])
+        self.assertEqual(again['comment_id'], 'cpC')
+        self.assertEqual(again_calls, [])
+        # A genuinely changed payload is not reconciled.
+        changed, changed_calls = self.save(data, 'cpZ', checkpoint(data, summary='Changed summary'))
+        self.assertFalse(changed['reconciled'])
+        self.assertEqual(len(changed_calls), 1)
+
+
+    def test_verify_is_honest_beyond_both_bounded_maps(self):
+        data = rows()
+        for n in range(750):
+            data[0]['comments'].append(comment(f'c{n}', f'Comment {n}', '2026-09-17T00:00:00Z'))
+        stored, calls = self.save(data, 'cp1', checkpoint(data))
+        recorded = json.loads(calls[0][3][len(b.PREFIX):])['provenance']
+        self.assertEqual(recorded['covered'], 751)
+        self.assertEqual(len(recorded['digests']), b.DIGEST_WINDOW)
+        self.assertEqual(len(recorded['older']), b.OLDER_MAX)
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)
+            def run(args):
+                return '\n'.join(json.dumps(r) for r in data)
+            verified = json.loads(b.execute(path, path, PROJECT, 'alice/session', 'checkpoint',
+                                            [TASK, '--verify'], {}, run))
+            # 251 entries are beyond both bounds: they are NOT relabelled fresh.
+            self.assertEqual(verified['coverage'], 'bounded')
+            self.assertEqual(verified['unverified'], 251)
+            self.assertEqual(verified['fresh'], 0)
+            self.assertEqual(verified['unchanged'], 500)
+            self.assertEqual(verified['verified_entries'], 500)
+            self.assertIn('NOT checked', verified['note'])
+            self.assertIn('re-anchor', verified['note'])
+        # Brief agrees once activity diverges: unverified, not fresh/other.
+        data[0]['title'] = 'A task (retitled)'
+        newer = b.brief(data, PROJECT, TASK)['newer']
+        self.assertEqual(newer['coverage'], 'windowed')
+        self.assertEqual(newer['unverified_count'], 251)
+        self.assertEqual(newer['fresh_count'], 0)
+        self.assertEqual(newer['other_count'], 0)
+        # Editing an entry that is beyond BOTH bounds cannot be proven: it is
+        # reported as unverified rather than as a checked change. Pick the entry
+        # dynamically, since window membership follows entry-ID order.
+        recorded_map = {**recorded['digests'], **recorded['older']}
+        unverifiable = next(e['entry_id'] for e in b.snapshot(data, PROJECT, TASK, 'cp1')['entries']
+                            if e['entry_id'] not in recorded_map)
+        target = next(i for i, c in enumerate(data[0]['comments'])
+                      if f'{TASK}-c{c["id"]}' == unverifiable)
+        data[0]['comments'][target]['text'] = 'Edited comment beyond both bounds'
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)
+            def run(args):
+                return '\n'.join(json.dumps(r) for r in data)
+            verified = json.loads(b.execute(path, path, PROJECT, 'alice/session', 'checkpoint',
+                                            [TASK, '--verify'], {}, run))
+            self.assertEqual(verified['changed'], 0)
+            self.assertEqual(verified['coverage'], 'bounded')
+            self.assertEqual(verified['unverified'], 251)
+        # Re-anchoring with a fresh checkpoint restores exact coverage (the write
+        # path digests the full snapshot, which now also includes the prior
+        # checkpoint comment).
+        reanchored, _ = self.save(data, 'cp2', checkpoint(data))
+        self.assertEqual(reanchored['covered'], 752)
+        self.assertFalse(reanchored['reconciled'])
+
+    def test_merged_dispositions_stay_readable_and_overflow_is_refused(self):
+        data = rows()
+        for n in range(3):
+            data[0]['comments'].append(comment(f'dir{n}', f'Direction {n}', '2026-09-16T00:00:00Z',
+                                               author='coordinator/session'))
+        digests = b.snapshot(data, PROJECT, TASK)['entry_digests']
+        def disposition(n, state='resolved'):
+            return dict(id=f'{TASK}-cdir{n}', state=state, digest=digests[f'{TASK}-cdir{n}'],
+                        note='done', evidence='commit x')
+        # Carry 100 resolved dispositions, then add one new resolved disposition:
+        # the merged record stays readable and within the cap.
+        many = [dict(disposition(0), id=f'{TASK}-cold{n}', digest=digests[f'{TASK}-cdir0']) for n in range(99)]
+        many.append(disposition(1))
+        payload = checkpoint(data, directions=many)
+        stored, _ = self.save(data, 'cp1', payload)
+        current, invalid = b.checkpoints(data[0])
+        self.assertEqual(invalid, [])
+        self.assertLessEqual(len(current[0]['directions']), b.DIRECTIONS_MAX)
+        self.assertLessEqual(len(current[0].get('carried') or []), b.DIRECTIONS_MAX)
+        self.assertLessEqual(len(b.direction_index(current[0])), b.DIRECTIONS_MAX)
+        # Adding one more while everything carried is unresolved overflows and is
+        # refused with guidance, leaving no native effect.
+        open_dirs = [dict(disposition(0), id=f'{TASK}-copenn{n}', state='acknowledged') for n in range(100)]
+        self.save(data, 'cp2', checkpoint(data, directions=open_dirs))
+        calls, run = self.writes()
+        with self.assertRaisesRegex(ValueError, 'unresolved direction'):
+            b.save_checkpoint(data, PROJECT, TASK,
+                              checkpoint(data, directions=[dict(disposition(0), id=f'{TASK}-cnew', state='acknowledged')]),
+                              'alice/session', run)
+        self.assertEqual(calls, [])
+
+
 class HistoryTests(unittest.TestCase):
     def test_order_uses_instants_when_fractional_seconds_differ(self):
         data = rows()
