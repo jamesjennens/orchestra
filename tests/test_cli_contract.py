@@ -107,6 +107,19 @@ class WorkHelpContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '--state'):
             work.queue(rows(), 'alice/session', ['--state', 'not-a-state'])
 
+    def test_review_read_accepts_json_consistently(self):
+        lines = '\n'.join(json.dumps(row) for row in rows())
+        result = work.execute(Path('.'), 'alice/session', 'review', [TASK, '--json'], {},
+                              lambda argv: lines)
+        self.assertEqual(result['review_state'], 'none')
+
+    def test_review_and_handoff_help_list_json_and_help_flags(self):
+        for action in ('review', 'handoff'):
+            with self.subTest(action=action):
+                flags = [option['flag'] for option in work.help_options(action)]
+                self.assertIn('--json', flags)
+                self.assertIn('-h, --help', flags)
+
     def test_work_output_shape_is_backward_compatible(self):
         result = work.queue(rows(), 'alice/session', ['--mine'])
         self.assertEqual(set(result), {'owner', 'total', 'items', 'next_offset', 'coverage'})

@@ -61,18 +61,34 @@ def help_payload(action='work'):
     return payload
 
 def help_options(action):
-    if action != 'work':return []
-    return [
-        {'flag': '--mine', 'description': 'show only tasks owned by the requesting actor'},
-        {'flag': '--owner ACTOR', 'description': 'show only tasks owned by ACTOR (mutually exclusive with --mine)'},
-        {'flag': '--state STATE', 'description': 'filter by review state: ' + ', '.join(WORK_STATES)},
-        {'flag': '--limit N', 'description': 'page size %d..%d (default 20)' % (WORK_LIMIT_MIN, WORK_LIMIT_MAX)},
-        {'flag': '--offset N', 'description': 'page offset >= %d (default 0)' % WORK_OFFSET_MIN},
-        {'flag': '--handoff-limit N', 'description': 'pending handoff requests per task %d..%d (default 20)' % (WORK_LIMIT_MIN, WORK_LIMIT_MAX)},
-        {'flag': '--handoff-offset N', 'description': 'pending handoff offset >= %d (default 0)' % WORK_OFFSET_MIN},
-        {'flag': '--json', 'description': 'accepted for consistency; work always returns JSON'},
+    common = [
+        {'flag': '--json', 'description': 'accepted for consistency; structured output is always JSON'},
         {'flag': '-h, --help', 'description': 'return this help as JSON on stdout with exit code 0'},
     ]
+    if action == 'work':
+        return [
+            {'flag': '--mine', 'description': 'show only tasks owned by the requesting actor'},
+            {'flag': '--owner ACTOR', 'description': 'show only tasks owned by ACTOR (mutually exclusive with --mine)'},
+            {'flag': '--state STATE', 'description': 'filter by review state: ' + ', '.join(WORK_STATES)},
+            {'flag': '--limit N', 'description': 'page size %d..%d (default 20)' % (WORK_LIMIT_MIN, WORK_LIMIT_MAX)},
+            {'flag': '--offset N', 'description': 'page offset >= %d (default 0)' % WORK_OFFSET_MIN},
+            {'flag': '--handoff-limit N', 'description': 'pending handoff requests per task %d..%d (default 20)' % (WORK_LIMIT_MIN, WORK_LIMIT_MAX)},
+            {'flag': '--handoff-offset N', 'description': 'pending handoff offset >= %d (default 0)' % WORK_OFFSET_MIN},
+            *common,
+        ]
+    if action == 'review':
+        return [
+            {'flag': 'TASK', 'description': 'task to read, or the task a payload applies to'},
+            {'flag': '--file payload.json', 'description': 'transport a contribution/review payload as text'},
+            *common,
+        ]
+    if action == 'handoff':
+        return [
+            {'flag': 'TASK', 'description': 'task to hand off or disposition'},
+            {'flag': '--file payload.json', 'description': 'transport a handoff payload as text'},
+            *common,
+        ]
+    return common
 
 class Parser(argparse.ArgumentParser):
     def error(self,message):
@@ -153,6 +169,9 @@ def queue(rows,actor,args,request_dir=None):
 def execute(path,actor,action,args,attachments,run):
     if args[:1] in (['--help'],['-h']):
         return help_payload(action if action in ('work','review','handoff') else 'work')
+    if action in ('review','handoff'):
+        # Structured output is already JSON; accept the flag consistently with brief/show/work.
+        args=[token for token in args if token!='--json']
     if action=='work':
         rows=[json.loads(line) for line in run(['export','--all']).splitlines() if line.strip()]
         return queue(rows,actor,args,path/'.handoff-requests')
