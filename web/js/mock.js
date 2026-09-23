@@ -107,6 +107,38 @@ export function seed() {
   task('proj_invoice', 2, { title: 'Email a summary after each nightly run', priority: 2, created_by: 'usr_tomasz', created_at: at(44), updated_at: at(44) });
   task('proj_handbook', 1, { title: 'Winter procedures chapter', status: 'closed', review_state: 'integrated', created_at: at(2300), updated_at: at(2000) });
 
+
+  const reqRecords = {
+    'cp-brd': { id: 'cp-brd', title: 'Customer portal requirements', status: 'open', type: 'epic', created_at: at(620), description: 'Requirements for the self-service customer portal, owned by Priya Raman.', comments: [] },
+    'cp-brd.5': { id: 'cp-brd.5', title: 'Decision: customers see orders from all their sites', status: 'open', type: 'decision', created_at: at(560), comments: [],
+      description: '## Decision\nA customer account sees orders placed by every site linked to it, not only the site that signed in. Authority: Priya Raman, 2025-11-04, after the pilot with a multi-site customer.\n\n## Rationale\nPilot customers kept phoning to ask about orders placed by a sister site. Site-only views caused most support calls.\n\n## Alternatives\nPer-site accounts only; an opt-in group view. Rejected: both add setup work for the customer.\n\n## Consequences\nPaged order history (cp-brd.2) must handle large multi-site accounts. Export must include the site name.' },
+    'cp-brd.6': { id: 'cp-brd.6', title: 'Decision: no card details stored in the portal', status: 'closed', type: 'decision', created_at: at(540), comments: [],
+      description: '## Decision\nThe portal never stores card numbers; payments go through the payment provider\u2019s hosted page. Authority: Morgan Ellis, 2025-11-20.\n\n## Rationale\nKeeps the portal out of card-data compliance scope.\n\n## Alternatives\nTokenised cards stored by us: rejected, compliance cost.\n\n## Consequences\nRetry of failed payments (cp-brd.4) must re-open the hosted page rather than charge silently.' },
+    'cp-brd.7': { id: 'cp-brd.7', title: 'Review of portal requirements v1.0', status: 'closed', type: 'task', created_at: at(530), description: 'Independent review of cp-brd.1 to cp-brd.4 before acceptance.',
+      comments: [
+        { id: 'c1', author: 'Tomasz Nowak', at: at(529), kind: 'review', body: 'F1: cp-brd.2 does not say how many orders a page shows.\n\nF2: cp-brd.3 acceptance does not name a response time.' },
+        { id: 'c2', author: 'Priya Raman', at: at(525), kind: 'disposition', body: 'F1 adopted: 50 per page. F2 adopted: 2 seconds for 95% of searches. Baseline v1.0 accepted with both changes.' },
+      ] },
+  };
+  const req = (n, key, title, text, state = 'accepted') => {
+    const id = 'cp-brd.' + n;
+    reqRecords[id] = { id, title: key + ': ' + title, status: 'open', type: 'task', created_at: at(600), description: text, comments: [] };
+    return { id, key, title: key + ': ' + title, revision: n === 2 ? 2 : 1, revisions: n === 2 ? 2 : 1, acceptance_state: state, sha256: (sha('req' + n) + sha('rq' + n)).slice(0, 64), description: text, recorded_at: at(524), recorded_by: 'Priya Raman' };
+  };
+  const requirements = {
+    proj_portal: {
+      baseline: { name: 'v1.0', state: 'accepted', manifest_sha256: (sha('base') + sha('line')).slice(0, 64), record: 'cp-brd.7', review: 'cp-brd.7', note: 'Accepted by Priya Raman after review cp-brd.7.' },
+      narrative: null,
+      items: [
+        req(1, 'R01', 'Customers find any order quickly', '## Requirement\nA signed-in customer can find any order from any of their sites by reference, PO number or date.\n\n## Rationale\nSee decision cp-brd.5.\n\n## Acceptance criteria\nSearch by reference or PO returns in under 2 seconds for 95% of searches.'),
+        req(2, 'R02', 'Order history stays usable for large accounts', '## Requirement\nOrder history is paged, 50 orders per page, in a stable order, for accounts with any number of orders.\n\n## Rationale\nMulti-site accounts (cp-brd.5) reach tens of thousands of orders.\n\n## Acceptance criteria\nNo duplicates or gaps across pages; CSV export contains every order.'),
+        req(3, 'R03', 'Account settings in the customer\u2019s language', '## Requirement\nAccount settings are available in English and German.\n\n## Acceptance criteria\nEvery label and error message is translated.', 'draft'),
+        req(4, 'R04', 'Failed card payments can be retried', '## Requirement\nA customer can retry a failed card payment once from the order page.\n\n## Rationale\nConstrained by cp-brd.6: no stored card details.\n\n## Acceptance criteria\nRetry re-opens the provider\u2019s hosted payment page.'),
+      ],
+      decisions: ['cp-brd.5', 'cp-brd.6'],
+      records: reqRecords,
+    },
+  };
   const history = {};
   const feedback = {
     proj_portal: [
@@ -121,7 +153,7 @@ export function seed() {
     proj_portal: [{ id: 'cred_k1', label: 'Kestrel build runner', user_id: 'usr_kestrel', scopes: ['tasks', 'checkpoints', 'reviews'], created_at: at(390), expires_at: new Date(Date.now() + 60 * 24 * H).toISOString(), revoked: false }],
     proj_invoice: [], proj_handbook: [],
   };
-  return { users, projects, memberships, tasks: T, history, feedback, audit, credentials, results: {}, session: null, seq: 100 };
+  return { users, projects, memberships, tasks: T, history, feedback, audit, credentials, requirements, results: {}, session: null, seq: 100 };
 }
 
 function err(status, code, message, detail) { return { status, data: { error: { code, message, detail }, request_id: 'req_mock' } }; }
@@ -129,6 +161,14 @@ const ok = (data, status = 200) => ({ status, data });
 
 export function createMock(options = {}) {
   const db = options.db || seed();
+  if (options.extra) {
+    // A real project's requirements, loaded only into a private prototype copy.
+    const x = options.extra; const p = x.project;
+    db.projects[p.id] = { ...p, archived: false };
+    db.memberships[p.id] = { usr_priya: 'owner', usr_tomasz: 'contributor', usr_kestrel: 'contributor', usr_lena: 'viewer' };
+    db.feedback[p.id] = []; db.credentials[p.id] = [];
+    db.requirements[p.id] = { baseline: x.baseline, narrative: x.narrative, items: x.requirements, decisions: x.decisions, records: x.records };
+  }
   const latency = options.latency ?? 120;
   const routes = [];
   const on = (method, pattern, fn, anonymous = false) => routes.push([method, new RegExp('^' + pattern + '$'), fn, anonymous]);
@@ -364,6 +404,50 @@ export function createMock(options = {}) {
     return ok({ ...f, author_name: name(f.author) }, 201);
   });
   on('GET', '/v1/projects/(?<pid>[\\w-]+)/audit', (b, p) => guardProject(p.pid) || (isOwner(p.pid) ? ok({ items: db.audit.filter((a) => a.project_id === p.pid).map((a) => ({ ...a, user_name: name(a.user_id) })), next_cursor: null }) : err(403, 'forbidden', 'Only a project owner can read the audit log')));
+
+  // ---- requirements & decisions (proposed read routes) ------------------------
+  const R = (pid) => db.requirements && db.requirements[pid];
+  const textOf = (rec) => [rec.title, rec.description].concat((rec.comments || []).map((c) => (typeof c.body === 'string' ? c.body : JSON.stringify(c.body)))).join('\n');
+  const keysOf = (data) => Object.fromEntries(data.items.filter((r) => r.key).map((r) => [r.key, r.id]));
+  const idsIn = (text, known, keys = {}) => { const out = new Set(); const re = /\b(kittrial-[a-z0-9]+(?:\.\d+)*|[a-z]+-[a-z0-9]{3}(?:\.\d+)+|R\d{2})\b/g; let m; while ((m = re.exec(text))) { const id = keys[m[1]] || m[1]; if (known[id]) out.add(id); } return [...out]; };
+  const brief = (rec) => ({ id: rec.id, title: rec.title, status: rec.status });
+  const firstSentence = (text, name) => { const m = new RegExp('##\\s+' + name + '\\s*\\n+([^\\n]+)', 'i').exec(text || ''); return m ? m[1].split(/(?<=\.)\s/)[0].slice(0, 220) : ''; };
+  const connections = (data, id) => {
+    const recs = data.records; const self = recs[id];
+    const keys = keysOf(data);
+    const references = self ? idsIn(textOf(self), recs, keys).filter((x) => x !== id).map((x) => brief(recs[x])) : [];
+    const mentioned_by = Object.values(recs).filter((r) => r.id !== id && idsIn(textOf(r), recs, keys).includes(id)).map(brief);
+    return { references, mentioned_by };
+  };
+  on('GET', '/v1/projects/(?<pid>[\\w-]+)/requirements', (b, p) => {
+    const g = guardProject(p.pid); if (g) return g;
+    const data = R(p.pid);
+    if (!data) return ok({ baseline: null, narrative: null, items: [], known: [], decision_count: 0 });
+    return ok({ baseline: data.baseline, narrative: data.narrative, items: data.items, known: Object.keys(data.records), keys: keysOf(data), decision_count: data.decisions.length });
+  });
+  on('GET', '/v1/projects/(?<pid>[\\w-]+)/requirements/(?<rid>[\\w.-]+)', (b, p) => {
+    const g = guardProject(p.pid); if (g) return g;
+    const data = R(p.pid); if (!data) return err(404, 'not_found', 'Requirement not found');
+    const item = data.items.find((r) => r.id === p.rid) || (data.narrative && data.narrative.id === p.rid ? data.narrative : null);
+    if (!item) return err(404, 'not_found', 'Requirement not found');
+    const decs = data.decisions.map((id) => data.records[id]).filter(Boolean).map((d) => ({ ...brief(d), why: firstSentence(d.description, 'Decision'), mentions: idsIn(textOf(d), data.records, keysOf(data)) }));
+    const direct = decs.filter((d) => d.mentions.includes(item.id));
+    const c = connections(data, item.id);
+    return ok({ requirement: item, known: Object.keys(data.records), keys: keysOf(data), decisions: { direct, baseline: decs.filter((d) => !direct.includes(d)) }, mentioned_by: c.mentioned_by.filter((m) => !data.decisions.includes(m.id)) });
+  });
+  on('GET', '/v1/projects/(?<pid>[\\w-]+)/decisions', (b, p) => {
+    const g = guardProject(p.pid); if (g) return g;
+    const data = R(p.pid);
+    const items = data ? data.decisions.map((id) => data.records[id]).filter(Boolean).map((d) => ({ ...brief(d), created_at: d.created_at, summary: firstSentence(d.description, 'Decision') })).sort((a, c) => (a.created_at < c.created_at ? 1 : -1)) : [];
+    return ok({ items, total: items.length, next_cursor: null });
+  });
+  on('GET', '/v1/projects/(?<pid>[\\w-]+)/records/(?<id>[\\w.-]+)', (b, p) => {
+    const g = guardProject(p.pid); if (g) return g;
+    const data = R(p.pid); const rec = data && data.records[p.id];
+    if (!rec) return err(404, 'not_found', 'Record not found');
+    const kind = data.decisions.includes(rec.id) ? 'decision' : data.items.some((r) => r.id === rec.id) || (data.narrative && data.narrative.id === rec.id) ? 'requirement' : 'record';
+    return ok({ record: rec, kind, known: Object.keys(data.records), keys: keysOf(data), ...connections(data, rec.id) });
+  });
 
   return async function transport(method, url, headers, body) {
     await new Promise((resolve) => setTimeout(resolve, latency));

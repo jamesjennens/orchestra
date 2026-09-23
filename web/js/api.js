@@ -110,6 +110,10 @@ export function createApi(transport) {
     myWork: () => call('GET', '/v1/me/work'),
     feedback: (pid, params) => call('GET', `/v1/projects/${pid}/feedback`, { params }),
     addFeedback: (pid, body) => mutate('POST', `/v1/projects/${pid}/feedback`, body),
+    requirements: (pid) => call('GET', `/v1/projects/${pid}/requirements`),
+    requirement: (pid, rid) => call('GET', `/v1/projects/${pid}/requirements/${rid}`),
+    decisions: (pid) => call('GET', `/v1/projects/${pid}/decisions`),
+    record: (pid, id) => call('GET', `/v1/projects/${pid}/records/${id}`),
     audit: (pid, params) => call('GET', `/v1/projects/${pid}/audit`, { params }),
   };
 }

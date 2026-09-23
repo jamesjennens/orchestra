@@ -50,6 +50,7 @@ export async function welcome(ctx) {
 export async function directory(ctx) {
   await ctx.refreshProjects();
   const showArchived = h('input', { type: 'checkbox', id: 'show-archived' });
+  const archivedToggle = h('label', { class: 'check', for: 'show-archived' }, showArchived, 'Show archived projects');
   const list = h('div');
   const draw = () => {
     const items = ctx.projects.filter((p) => showArchived.checked || !p.archived);
@@ -76,7 +77,7 @@ export async function directory(ctx) {
 
   return h('div', { class: 'stack' },
     pageHead({ title: 'Projects', lede: ctx.me.superuser ? 'As a superuser you can see every project.' : 'Projects you are a member of.' }),
-    h('div', { class: 'toolbar' }, showArchived, h('label', { for: 'show-archived' }, 'Show archived projects')),
+    h('div', { class: 'toolbar' }, archivedToggle),
     list,
     h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'New project')), h('div', { class: 'panel-body' }, form)));
 }

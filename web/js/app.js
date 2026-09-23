@@ -7,6 +7,7 @@ import * as work from './views/work.js';
 import * as project from './views/project.js';
 import * as task from './views/task.js';
 import * as admin from './views/admin.js';
+import * as reqs from './views/requirements.js';
 
 const ROUTES = [
   [/^\/$/, work.home],
@@ -18,6 +19,11 @@ const ROUTES = [
   [/^\/p\/(?<pid>[\w-]+)\/settings$/, project.settings],
   [/^\/p\/(?<pid>[\w-]+)\/new$/, task.create],
   [/^\/p\/(?<pid>[\w-]+)\/t\/(?<tid>[\w-]+)$/, task.detail],
+  [/^\/p\/(?<pid>[\w-]+)\/requirements$/, reqs.brd],
+  [/^\/p\/(?<pid>[\w-]+)\/requirements\/(?<rid>[\w.-]+)$/, reqs.requirement],
+  [/^\/p\/(?<pid>[\w-]+)\/decisions$/, reqs.decisions],
+  [/^\/p\/(?<pid>[\w-]+)\/decisions\/(?<did>[\w.-]+)$/, reqs.decision],
+  [/^\/p\/(?<pid>[\w-]+)\/records\/(?<id>[\w.-]+)$/, reqs.record],
   [/^\/admin\/users$/, admin.users],
   [/^\/account$/, admin.account],
 ];
@@ -76,7 +82,7 @@ export async function start(root, options = {}) {
     const main = h('main', { class: 'main', id: 'main', tabindex: '-1' });
     shell = h('div', { class: 'shell' },
       h('a', { class: 'skip', href: '#main', onclick: (e) => { e.preventDefault(); main.focus(); } }, 'Skip to content'),
-      h('nav', { class: 'rail', 'aria-label': 'Main' },
+      h('nav', { class: 'rail', id: 'rail', 'aria-label': 'Main' },
         h('a', { class: 'brand', href: ctx.href('/') }, brandMark(), h('span', null, 'Orchestra')),
         h('div', { class: 'rail-section' },
           link('/', 'My work'),
@@ -87,6 +93,8 @@ export async function start(root, options = {}) {
           current ? [
             link('/p/' + pid, 'Tasks'),
             link('/p/' + pid + '/reviews', 'Reviews'),
+            link('/p/' + pid + '/requirements', 'Requirements'),
+            link('/p/' + pid + '/decisions', 'Decisions'),
             link('/p/' + pid + '/feedback', 'Feedback'),
             link('/p/' + pid + '/settings', 'Members & settings'),
           ] : null),
@@ -101,7 +109,8 @@ export async function start(root, options = {}) {
             h('button', { type: 'button', onclick: ctx.signOut }, 'Sign out')))),
       h('div', { class: 'content' },
         h('div', { class: 'main-top' },
-          h('button', { type: 'button', class: 'menu-toggle ghost', 'aria-label': 'Open navigation', onclick: () => shell.classList.toggle('nav-open') }, 'Menu')),
+          h('button', { type: 'button', class: 'menu-toggle ghost', 'aria-expanded': 'false', 'aria-controls': 'rail', onclick: (e) => { const open = shell.classList.toggle('nav-open'); e.currentTarget.setAttribute('aria-expanded', String(open)); } }, 'Menu'),
+          h('a', { class: 'brand', href: ctx.href('/') }, brandMark(), h('span', null, 'Orchestra'))),
         main));
     return main;
   }
@@ -128,7 +137,8 @@ export async function start(root, options = {}) {
       }
       const title = main.querySelector('h1');
       document.title = (title ? title.textContent + ' · ' : '') + 'Orchestra';
-      if (title) title.focus({ preventScroll: false });
+      try { window.scrollTo(0, 0); } catch { /* ignore */ }
+      if (title) title.focus({ preventScroll: true });
       return;
     }
     mount(main, h('div', { class: 'panel' }, h('div', { class: 'empty' }, h('strong', null, 'Page not found'), h('a', { href: ctx.href('/') }, 'Go to My work'))));

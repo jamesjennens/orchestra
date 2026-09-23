@@ -32,4 +32,10 @@ const banner = (c) => {
     h('span', { class: 'toolbar' }, h('label', { for: 'proto-person' }, 'View as'), select));
 };
 
-start(document.getElementById('app'), { transport: createMock(), loginHint, banner }).then((c) => { ctx = c; });
+// A private copy may ship data/harness.json (a real project's requirements); the
+// public repository never contains it.
+async function extraData() {
+  try { const r = await fetch('data/harness.json', { cache: 'no-store' }); return r.ok ? await r.json() : null; } catch { return null; }
+}
+
+extraData().then((extra) => start(document.getElementById('app'), { transport: createMock({ extra }), loginHint, banner })).then((c) => { ctx = c; });
