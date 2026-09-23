@@ -46,10 +46,10 @@ def review_comment(cid, p, author='worker', stamp=STAMP):
     return dict(id=str(cid), text=w.PREFIX + canonical_bytes(p).decode(), author=author, created_at=stamp)
 
 
-def void(target, original, operation_id='v1', **extra):
+def void(target, original, operation_id='v1', operator='operator', **extra):
     p = dict(schema_version=1, operation='void-record', operation_id=operation_id, task=TASK, target=str(target),
              target_kind='contribution-review', target_sha256=recovery.digest(original), original=original,
-             reason='Malformed record; reconcile before further review', disposition='void')
+             reason='Malformed record; reconcile before further review', disposition='void', operator=operator)
     p.update(extra)
     return p
 
@@ -130,7 +130,7 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(len(data[0]['comments']), 2)
         with self.assertRaisesRegex(ValueError, 'different payload or actor'):
-            w.apply_void(data, TASK, 'other', dict(payload, reason='A different reason'), run, operator=True)
+            w.apply_void(data, TASK, 'other', dict(payload, operator='other'), run, operator=True)
         with self.assertRaisesRegex(ValueError, 'already targets'):
             w.apply_void(data, TASK, 'operator', dict(payload, operation_id='v2'), run, operator=True)
         self.assertEqual(len(calls), 1)
@@ -148,12 +148,93 @@ class ReviewRecoveryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'currently form'):
                 w.apply_void(data, TASK, 'operator', void(target, text), run, operator=True)
         self.assertEqual(calls, [])
-        # A record edited directly into the database is refused on read, never silently applied.
+        # A void edited directly into the database is refused on read: it never
+        # suppresses the record, reads stay healthy and the refusal is surfaced.
         data[0]['comments'].append(void_comment('v9', void('c2', second['text'], operation_id='v9')))
-        with self.assertRaisesRegex(ValueError, 'currently form'):
-            w.project(data[0])
+        state = w.project(data[0])
+        self.assertEqual(state['review_state'], 'awaiting-integration')
+        self.assertEqual(state['contribution']['comment_id'], 'c1')
+        self.assertEqual(len(state['recoveries']), 1)
+        refused = state['recoveries'][0]
+        self.assertFalse(refused['applied'])
+        self.assertEqual(refused['disposition'], 'refused')
+        self.assertEqual(refused['target'], 'c2')
+        self.assertIn('currently form', refused['refusal'])
+        self.assertIn('refused', ' '.join(state['warnings']))
+        # The whole task stays readable and writable through the work queue.
+        self.assertEqual([(i['task'], i['review_state']) for i in work.queue(data, 'worker', [])['items']],
+                         [(TASK, 'awaiting-integration')])
         data[0]['comments'].pop()
         self.assertEqual(w.project(data[0])['review_state'], 'awaiting-integration')
+
+    def test_refused_void_targeting_the_surviving_contribution_is_inert(self):
+        first = review_comment('c1', contribute())
+        second = review_comment('c2', approve('c1', previous='c1'), author='reviewer')
+        data = [native([first, second, void_comment('v1', void('c1', first['text']))])]
+        state = w.project(data[0])
+        self.assertEqual(state['review_state'], 'awaiting-integration')
+        self.assertEqual([(r['target'], r['applied']) for r in state['recoveries']], [('c1', False)])
+        self.assertIn('refused', ' '.join(state['warnings']))
+        # A refused void is not an incident: the original stays inspectable and
+        # the incident list keeps the refusal rather than dropping it silently.
+        entries = briefing.snapshot(data, PROJECT, TASK)['entries']
+        self.assertTrue(any(e['body'] == first['text'] for e in entries))
+
+    def test_void_is_bound_to_its_native_operator_provenance(self):
+        first = review_comment('c1', contribute(operation_id='c1'))
+        second = review_comment('c2', approve('c1', operation_id='a1', previous='c1'), author='reviewer')
+        # A foreign-authored record cannot remove a healthy approval, even with
+        # a well-formed payload that names the operator.
+        forged = void_comment('v1', void('c2', second['text']), author='mallory/session9')
+        state = w.project(native([first, second, forged]))
+        self.assertEqual(state['review_state'], 'awaiting-integration')
+        self.assertEqual(state['recoveries'], [])
+        self.assertIn('v1', ' '.join(state['warnings']))
+        # Nor can it reconcile a malformed record: the chain still fails closed.
+        bad = broken_review()
+        data = native([first, bad, void_comment('v2', void('c2', bad['text']), author='mallory/session9')])
+        with self.assertRaisesRegex(ValueError, 'operator reconciliation'):
+            w.project(data)
+        # A payload that claims a different operator than the issuing actor is
+        # refused before any native write.
+        rows = [native([broken_review()])]
+        calls, run = self.run_native(rows, author='operator')
+        with self.assertRaisesRegex(ValueError, 'must match the issuing actor'):
+            w.apply_void(rows, TASK, 'operator', void('c2', broken_review()['text'], operator='someone-else'),
+                         run, operator=True)
+        self.assertEqual(calls, [])
+
+    def test_void_after_an_approval_requires_a_fresh_approval(self):
+        first = review_comment('c1', contribute())
+        second = review_comment('c2', approve('c1', previous='c1'), author='reviewer')
+        bad = dict(id='r1', text=w.PREFIX + json.dumps(
+            dict(schema_version=1, operation='request-changes', operation_id='r1', task=TASK, previous='c2',
+                 contribution='c1', items=[dict(id='i1', text='fix', extra='x')]), sort_keys=True),
+            author='reviewer', created_at=STAMP)
+        data = [native([first, second, bad, void_comment('v1', void('r1', bad['text']))])]
+        state = w.project(data[0])
+        self.assertNotEqual(state['review_state'], 'awaiting-integration')
+        self.assertEqual(state['review_state'], 'awaiting-review')
+        self.assertEqual(state['recoveries'][0]['target'], 'r1')
+        self.assertTrue(state['recoveries'][0]['applied'])
+        self.assertTrue(state['recoveries'][0]['invalidates_approval'])
+        self.assertIn('fresh approval', ' '.join(state['warnings']))
+        # A fresh approval recorded after the void restores eligibility.
+        fresh = review_comment('c3', approve('c1', operation_id='a2', previous='c2'), author='reviewer')
+        data[0]['comments'].append(fresh)
+        self.assertEqual(w.project(data[0])['review_state'], 'awaiting-integration')
+
+    def test_voiding_a_forked_request_changes_does_not_yield_an_approval(self):
+        first = review_comment('c1', contribute())
+        request = dict(schema_version=1, operation='request-changes', operation_id='rA', task=TASK, previous='c1',
+                       contribution='c1', items=[dict(id='i1', text='fix')])
+        forked = review_comment('rA', request, author='reviewer')
+        approval = review_comment('aB', approve('c1', operation_id='aB', previous='c1'), author='reviewer2')
+        data = [native([first, forked, approval, void_comment('w1', void('rA', forked['text']))])]
+        state = w.project(data[0])
+        self.assertNotEqual(state['review_state'], 'awaiting-integration')
+        self.assertEqual(state['review_state'], 'awaiting-review')
+        self.assertIn('fresh approval', ' '.join(state['warnings']))
 
     def test_voiding_a_revision_with_a_downstream_approval_fails_closed(self):
         good = review_comment('c1', contribute())

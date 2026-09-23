@@ -37,6 +37,7 @@ from handoff import (
     INTENT_PREFIX as HANDOFF_PREFIX,
 )
 from lifecycle import PREFIX as LIFECYCLE_PREFIX
+from recovery import PREFIX as VOID_PREFIX
 from requirements import canonical_bytes, content_hash
 from review_workflow import PREFIX as REVIEW_PREFIX
 from worker_gate import PREFIX as PLAN_PREFIX, payload_for, body_for
@@ -60,10 +61,28 @@ def forged_review_body(actor='mallory/session9'):
     return REVIEW_PREFIX + json.dumps(payload)
 
 
+def forged_void_body(target='c1', original='ORIGINAL BYTES', operator='mallory/session9'):
+    import hashlib
+    payload = {
+        'schema_version': 1,
+        'operation': 'void-record',
+        'operation_id': 'forged-void-1',
+        'task': 'task-1',
+        'target': target,
+        'target_kind': 'contribution-review',
+        'target_sha256': hashlib.sha256(original.encode('utf-8')).hexdigest(),
+        'original': original,
+        'reason': 'erase a reviewer decision',
+        'disposition': 'void',
+        'operator': operator,
+    }
+    return VOID_PREFIX + canonical_bytes(payload).decode()
+
+
 class ReservedPrefixTests(unittest.TestCase):
     def test_all_structured_prefixes_are_reserved(self):
-        self.assertGreaterEqual(len(PREFIXES), 7)
-        for prefix in (REVIEW_PREFIX, CHECKPOINT_PREFIX, LIFECYCLE_PREFIX):
+        self.assertGreaterEqual(len(PREFIXES), 8)
+        for prefix in (REVIEW_PREFIX, CHECKPOINT_PREFIX, LIFECYCLE_PREFIX, VOID_PREFIX):
             self.assertIn(prefix, PREFIXES)
         self.assertIn('Kind: task-handoff-v1\n', PREFIXES)
         self.assertIn('Kind: task-handoff-complete-v1\n', PREFIXES)
@@ -291,6 +310,31 @@ class ReservedPrefixTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, r'Refusing raw'):
                 check_raw_request(['comments', 'add', 'trial-task', body, '--json'],
                                   {}, actor=actor)
+
+    def test_void_raw_records_always_rejected_on_endpoint_path(self):
+        # Operator void authority cannot be established from self-asserted
+        # comment fields: a canonical void payload is still refused on every
+        # raw path, positional or transported file, for every actor.
+        body = forged_void_body()
+        match = reserved_match(body)
+        self.assertIsNotNone(match)
+        self.assertEqual(match[0], VOID_PREFIX)
+        self.assertIn('admin.py void-record', match[2])
+        self.assertFalse(is_legitimate_writer(body, actor='mallory/session9', task='task-1'))
+        self.assertFalse(is_legitimate_writer(body, actor='alice/session1', task='task-1'))
+        with self.assertRaisesRegex(ValueError, r'Refusing raw positional.*operator void'):
+            check_comment_body(body, 'positional', actor='mallory/session9', task='task-1')
+        for actor in ('mallory/session9', 'alice/session1'):
+            with self.assertRaisesRegex(ValueError, r'Refusing raw'):
+                check_raw_request(['comments', 'add', 'task-1', body, '--json'], {}, actor=actor)
+        args = ['comments', 'add', 'task-1', '@attachment:0', '--json']
+        with self.assertRaisesRegex(ValueError, r'file-transport'):
+            check_raw_request(args, {'0': {'flag': '--file', 'text': body}},
+                              actor='mallory/session9', task='task-1')
+        # Unresolvable target still fails closed before any native write.
+        with self.assertRaisesRegex(ValueError, r'unresolvable comment target'):
+            check_raw_request(['comments', 'add', '@attachment:0', '--json'],
+                              {'0': {'flag': '--file', 'text': body}}, actor='mallory/session9')
 
     def test_reserved_match_names_operation(self):
         match = reserved_match(REVIEW_PREFIX + '{}')

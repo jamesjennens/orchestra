@@ -12,10 +12,13 @@ remains inspectable and a reviewer can audit the decision.
 
 A malformed, forged or stale void record never takes effect. It is ignored and
 reported, exactly like an invalid checkpoint, so recovery can never dead-end on
-its own bookkeeping and a void can never suppress history by accident. Applying
-a void to a record that is part of the contribution chain the surviving records
-currently form is refused by the owning module, so an unauthorised void cannot
-remove a current approval.
+its own bookkeeping and a void can never suppress history by accident. Validity
+is bound to native provenance, not payload shape: the record names the operator
+that issued it and its stored native author must match, and the prefix is
+reserved on the contributor transport so a raw `comments add` can never write
+one. Applying a void to a record that is part of the contribution chain the
+surviving records currently form is refused by the owning module, so an
+unauthorised void cannot remove a current approval.
 """
 import hashlib
 import json
@@ -27,7 +30,7 @@ OPERATION = 'void-record'
 DISPOSITIONS = ('void',)
 KIND_PREFIXES = {'contribution-review': 'Kind: contribution-review-v1\n'}
 FIELDS = {'schema_version', 'operation', 'operation_id', 'task', 'target', 'target_kind',
-          'target_sha256', 'original', 'reason', 'disposition'}
+          'target_sha256', 'original', 'reason', 'disposition', 'operator'}
 ORIGINAL_LIMIT = 60000
 BYTE_LIMIT = 80000
 
@@ -59,6 +62,7 @@ def issued(p, task):
     identity(task, 'Invalid void record task')
     identity(p['operation_id'], 'Invalid void record operation ID')
     identity(p['target'], 'Invalid void record target')
+    identity(p['operator'], 'Invalid void record operator')
     if p['target_kind'] not in KIND_PREFIXES:
         raise ValueError('Unsupported operator void target kind')
     if p['disposition'] not in DISPOSITIONS:
@@ -99,9 +103,13 @@ def target_text(issue, target):
 def records(issue):
     """Read the void records on one issue as (voids, targets, invalid).
 
-    `voids`/`targets` hold only records that are individually valid and whose
-    target still exists with exactly the preserved bytes and matching kind.
-    Anything else is listed in `invalid` and has no effect on the projection.
+    `voids`/`targets` hold only records that are individually valid, whose
+    target still exists with exactly the preserved bytes and matching kind,
+    and whose declared operator matches the native comment's author. Validity
+    is therefore bound to native provenance, not to the payload shape alone:
+    a void whose stored author is not the operator it names never takes
+    effect. Anything else is listed in `invalid` and has no effect on the
+    projection.
     """
     voids = []
     targets = {}
@@ -116,8 +124,10 @@ def records(issue):
             p = json.loads(raw[len(PREFIX):])
             issued(p, issue['id'])
             identity(cid, 'Invalid void record comment ID')
-            text(comment.get('author'), 'void record author', 300)
+            author = text(comment.get('author'), 'void record author', 300)
             text(comment.get('created_at'), 'void record timestamp', 100)
+            if author != p['operator']:
+                raise ValueError('Operator void record provenance does not match its native author')
             if p['target'] in targets or p['operation_id'] in operations:
                 raise ValueError('Conflicting operator void record')
             original = target_text(issue, p['target'])
