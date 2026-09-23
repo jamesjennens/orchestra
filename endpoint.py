@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""One SSH request per process. JSON on stdin/stdout; no contributor shell interpolation."""
+"""One request per process. JSON on stdin/stdout; no contributor shell interpolation.
+
+The same entry point serves the SSH worker and the trusted HTTP service. The HTTP
+service adds ``--authority-store``/``--authority-lock`` (and ``--require-authority``
+for mutations) to the launch command; those are server-side configuration and are
+never taken from the request body. An SSH-shaped request therefore cannot choose the
+live-authority document or the lock path, and can only omit the check because it has
+no HTTP principal at all.
+"""
 import argparse
 import fcntl
 import json
@@ -17,7 +25,7 @@ from reserved_comments import (check_raw_request, comment_target,
                                first_reserved_label, label_guard_request,
                                operator_only_in_args, raw_file_flag_in_args,
                                reserved_label_in_args)
-from http_authority import run_guarded
+from http_authority import AuthorityConfig, run_guarded
 
 ALLOWED={'list','show','ready','search','count','create','update','close','reopen','comments','dep','state','lint'}
 # Legacy name kept for operators reading this file; enforcement is the
@@ -78,7 +86,7 @@ def _guard_reserved_labels(root,path,args,actor):
         if label is not None:
             raise ValueError('Refusing to replace labels on %s: it currently holds the reserved label %s, which only coordination.py may write. Use the coordination workflow (coordination.py); --add-label remains available for ordinary labels.'%(canonical,label))
 
-def execute(root,request):
+def execute(root,request,authority_config=None,require_authority=False):
     name=request['project'];path=project_dir(root,name)
     if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
     actor=request.get('actor','')
@@ -112,7 +120,9 @@ def execute(root,request):
             return {'returncode':0,'stdout':json.dumps(work_execute(path,actor,action,args,request.get('attachments',{}),run),ensure_ascii=False,indent=2)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            return run_guarded(request,path/'.http-operations.json',work_effect)
+            return run_guarded(request,path/'.http-operations.json',work_effect,
+                               authority_config=authority_config,
+                               require_authority=require_authority)
     if action in ('onboard','docs'):
         from onboarding import execute as onboard
         return {'returncode':0,'stdout':onboard(Path(__file__).resolve().parent,path,name,actor,action,request.get('args',[])),'stderr':''}
@@ -129,7 +139,9 @@ def execute(root,request):
             return {'returncode':0,'stdout':briefing_execute(root,path,name,actor,action,args,request.get('attachments',{}),run),'stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            return run_guarded(request,path/'.http-operations.json',briefing_effect)
+            return run_guarded(request,path/'.http-operations.json',briefing_effect,
+                               authority_config=authority_config,
+                               require_authority=require_authority)
     if action in ('lifecycle','coordinate'):
         args=request.get('args',[])
         if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):raise ValueError('Expected one JSON payload')
@@ -147,7 +159,9 @@ def execute(root,request):
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            return run_guarded(request,path/'.http-operations.json',lifecycle_effect)
+            return run_guarded(request,path/'.http-operations.json',lifecycle_effect,
+                               authority_config=authority_config,
+                               require_authority=require_authority)
     if action == 'feedback':
         from feedback import execute as feedback_execute
         args=request.get('args',[])
@@ -217,14 +231,25 @@ def execute(root,request):
             def bd_effect():
                 p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*final],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
                 return {'returncode':p.returncode,'stdout':p.stdout,'stderr':p.stderr}
-            return run_guarded(request,path/'.http-operations.json',bd_effect)
+            return run_guarded(request,path/'.http-operations.json',bd_effect,
+                               authority_config=authority_config,
+                               require_authority=require_authority)
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--root',required=True);a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--root',required=True)
+    p.add_argument('--authority-store',help='server-side live-authority document (HTTP service only)')
+    p.add_argument('--authority-lock',help='server-side authority lock (defaults to STORE.lock)')
+    p.add_argument('--require-authority',action='store_true',
+                   help='refuse a mutation that omits the live-authority descriptor')
+    a=p.parse_args()
+    authority_config=None
+    if a.authority_store:
+        authority_config=AuthorityConfig(a.authority_store,a.authority_lock)
     try:
         text=sys.stdin.read(2_000_001)
         if len(text)>2_000_000:raise ValueError('Request exceeds 2 MB')
-        answer=execute(root_path(a.root),json.loads(text))
+        answer=execute(root_path(a.root),json.loads(text),authority_config=authority_config,
+                       require_authority=a.require_authority)
     except subprocess.TimeoutExpired:
         answer={'returncode':124,'stdout':'','stderr':'Command timed out; mutation outcome may be uncertain. Inspect state before retrying.\n'}
     except Exception as e:

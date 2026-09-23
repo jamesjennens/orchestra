@@ -13,19 +13,26 @@ from both sides of the process seam:
   demotion stops that credential immediately. ``http_auth.Service`` uses this
   function for every route; ``endpoint.py`` calls it again immediately before the
   canonical effect, under the same cross-process lock (:func:`file_lock`) the HTTP
-  service takes to persist authority changes. A revocation that commits first is
-  therefore observed before the effect; a mutation that starts first completes.
+  service takes to persist authority changes. The authority document and lock are
+  :class:`AuthorityConfig` values passed by the trusted HTTP service as endpoint
+  launch arguments; they are never read from the request body. A revocation that
+  commits first is therefore observed before the effect; a mutation that starts first
+  completes.
 * **Operation identity** (:class:`OperationJournal` + :func:`run_guarded`). Every
-  canonical mutation carries a deterministic ``operation_id``. The endpoint reserves
-  the identity durably *before* the effect and records the response envelope *with*
-  it, inside the canonical coordination lock and the authority lock. A retry after a
-  lost response replays the recorded envelope instead of repeating the effect; a
-  retry whose first attempt never committed can still proceed after the reservation
-  is released. Uncertainty is preserved, never converted into a duplicate.
+  canonical mutation carries a deterministic ``operation_id``, and the identity binds
+  the authenticated principal and route as well as the request body. The endpoint
+  reserves the identity durably *before* the effect and records the response envelope
+  *with* it, inside the canonical coordination lock and the authority lock. A retry
+  after a lost response replays the recorded envelope instead of repeating the effect;
+  an identity reused by a different principal is a clean conflict; a retry whose first
+  attempt never committed can still proceed after the reservation is released.
+  Uncertainty is preserved, never converted into a duplicate: an exception that is not
+  proven pre-effect keeps the reservation and reports ``124``.
 
 Nothing here imports ``fcntl`` at module import time, so the same module imports on a
 Windows workstation and a Linux office host.
 """
+import hashlib
 import json
 import os
 import threading
@@ -34,6 +41,20 @@ from contextlib import contextmanager
 from pathlib import Path
 
 SCHEMA_VERSION = 1
+
+# ------------------------------------------------------- operation journal bounds
+#: Hard capacity of one project's operation journal. There is deliberately no
+#: implicit age/count eviction: silently dropping a committed or unresolved identity
+#: would let an exact retry repeat an effect. At capacity a new guarded mutation
+#: fails closed (``124``) until an operator runs the explicit
+#: :meth:`OperationJournal.prune`.
+JOURNAL_LIMIT = 2000
+#: Largest serialized response envelope retained for replay. A larger envelope is
+#: recorded by digest only, so a retry reports uncertainty instead of a truncated
+#: result.
+MAX_ENVELOPE_BYTES = 65536
+#: Largest serialized journal document accepted after a mutation.
+MAX_JOURNAL_BYTES = 8 * 1024 * 1024
 
 # --------------------------------------------------------------- capability model
 CAP_READ = 'read'
@@ -258,13 +279,70 @@ def read_state(path):
 
 
 # --------------------------------------------------------------- operation journal
+class AuthorityConfig:
+    """Server-side location of the live-authority document and its lock.
+
+    The trusted HTTP service passes these to the canonical endpoint as *launch*
+    arguments, exactly as it passes ``--root``. They are never read from the request
+    body, so an SSH-shaped request cannot redirect the live-authority read or make
+    ``file_lock`` create a lock at a caller-chosen path.
+    """
+
+    __slots__ = ('store', 'lock')
+
+    def __init__(self, store, lock=None):
+        if not isinstance(store, str) or not store:
+            raise ValueError('AuthorityConfig.store must be a non-empty path')
+        self.store = store
+        self.lock = lock or (store + '.lock')
+
+
+def principal_key(request):
+    """The authenticated identity an operation identity is bound to.
+
+    A trusted authority descriptor binds the stable principal (user, credential and
+    session), not the mutable actor label. Without an authority descriptor the
+    endpoint is on the unauthenticated SSH path, where the actor label is the only
+    available attribution and is used unchanged.
+    """
+    authority = request.get('authority')
+    if isinstance(authority, dict):
+        user_id = authority.get('user_id')
+        if isinstance(user_id, str) and user_id:
+            return 'user:%s|cred:%s|session:%s' % (
+                user_id, authority.get('credential_id') or '-',
+                authority.get('session_hash') or '-')
+    actor = request.get('actor')
+    return 'actor:%s' % (actor if isinstance(actor, str) else '')
+
+
 def operation_hash(request):
-    """Canonical identity of a mutation *body*, excluding the operation id itself."""
+    """Canonical identity of a mutation.
+
+    Binds the project, route, actor *and* authenticated principal in addition to the
+    action arguments and attachments, so the same client-supplied ``operation_id``
+    from two principals is a conflict rather than a replay of another principal's
+    result.
+    """
     payload = {'project': request.get('project'), 'action': request.get('action'),
-               'args': request.get('args'), 'attachments': request.get('attachments') or {}}
+               'route': request.get('route'), 'actor': request.get('actor') or '',
+               'principal': principal_key(request), 'args': request.get('args'),
+               'attachments': request.get('attachments') or {}}
     text = json.dumps(payload, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
-    import hashlib
     return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+class JournalFull(Exception):
+    """The operation journal cannot accept an identity without dropping one."""
+
+
+class PreEffectFailure(Exception):
+    """An effect may raise this to assert the failure happened before any write.
+
+    Only this marker releases a reservation. Any other exception is reported as an
+    uncertain outcome (``124``) and keeps the reservation, because a timeout or a
+    mid-flow error can happen *after* a native write committed.
+    """
 
 
 class OperationJournal:
@@ -272,11 +350,21 @@ class OperationJournal:
 
     The caller holds the project coordination lock, so a plain read/modify/write of
     one JSON document is serialized; the write is an atomic replace.
+
+    Retention is a hard, documented boundary. Entries are never evicted implicitly:
+    when the journal is at :data:`JOURNAL_LIMIT` entries or :data:`MAX_JOURNAL_BYTES`
+    bytes a new reservation fails closed, and only :meth:`prune` (an explicit operator
+    action) removes an identity. A response envelope larger than
+    :data:`MAX_ENVELOPE_BYTES` is recorded by digest only, so an exact retry reports
+    uncertainty instead of returning a truncated result.
     """
 
-    def __init__(self, path, limit=5000):
+    def __init__(self, path, limit=JOURNAL_LIMIT, max_envelope=MAX_ENVELOPE_BYTES,
+                 max_bytes=MAX_JOURNAL_BYTES):
         self.path = Path(path)
         self.limit = limit
+        self.max_envelope = max_envelope
+        self.max_bytes = max_bytes
 
     def _load(self):
         try:
@@ -291,83 +379,202 @@ class OperationJournal:
         temporary.write_text(json.dumps(data), encoding='utf-8')
         temporary.replace(self.path)
 
-    def lookup(self, operation_id):
-        return self._load().get(operation_id)
+    @staticmethod
+    def _serialized(data):
+        return json.dumps(data, ensure_ascii=False)
 
-    def reserve(self, operation_id, request_hash):
+    def _enforce(self, data):
+        if len(data) > self.limit:
+            raise JournalFull('Operation journal is at capacity (%d entries)' % self.limit)
+        try:
+            text = self._serialized(data)
+        except (TypeError, ValueError):
+            raise JournalFull('Operation journal is not serializable')
+        if len(text.encode('utf-8')) > self.max_bytes:
+            raise JournalFull('Operation journal exceeds its byte budget')
+
+    def _bounded(self, envelope):
+        try:
+            text = self._serialized(envelope)
+        except (TypeError, ValueError):
+            return None, hashlib.sha256(b'').hexdigest(), True
+        raw = text.encode('utf-8')
+        if len(raw) > self.max_envelope:
+            return None, hashlib.sha256(raw).hexdigest(), True
+        return envelope, hashlib.sha256(raw).hexdigest(), False
+
+    def lookup(self, operation_id):
+        entry = self._load().get(operation_id)
+        return entry if isinstance(entry, dict) else None
+
+    def reserve(self, operation_id, request_hash, principal):
         data = self._load()
         data[operation_id] = {'state': 'in_progress', 'request_hash': request_hash,
-                              'at': time.time()}
-        if len(data) > self.limit:
-            ordered = sorted(data.items(), key=lambda item: item[1].get('at', 0))
-            data = dict(ordered[-self.limit:])
+                              'principal': principal, 'at': time.time()}
+        self._enforce(data)
         self._save(data)
 
-    def complete(self, operation_id, envelope, request_hash):
+    def complete(self, operation_id, envelope, request_hash, principal):
         data = self._load()
-        data[operation_id] = {'state': 'committed', 'request_hash': request_hash,
-                              'envelope': envelope, 'at': time.time()}
+        stored, digest, omitted = self._bounded(envelope)
+        record = {'state': 'committed', 'request_hash': request_hash, 'principal': principal,
+                  'at': time.time(), 'envelope': stored, 'envelope_sha256': digest}
+        if omitted:
+            record['envelope_omitted'] = True
+        data[operation_id] = record
+        if omitted is False and len(self._serialized(data).encode('utf-8')) > self.max_bytes:
+            # Keep the identity and its digest, drop only the oversized body.
+            record['envelope'] = None
+            record['envelope_omitted'] = True
+        self._enforce(data)
         self._save(data)
+
+    def mark_unknown(self, operation_id):
+        """Keep a reservation whose outcome is not known to be pre-effect."""
+        data = self._load()
+        record = data.get(operation_id)
+        if isinstance(record, dict):
+            record['state'] = 'unknown'
+            record['at'] = time.time()
+            self._save(data)
 
     def discard(self, operation_id):
         data = self._load()
         if data.pop(operation_id, None) is not None:
             self._save(data)
 
+    def prune(self, before):
+        """Explicitly remove entries last touched before ``before`` (epoch seconds).
 
-def run_guarded(request, journal_path, effect):
+        This is the *only* path that removes an identity, and it is an operator
+        action: after a prune an exact retry of a pruned operation can repeat the
+        effect, so canonical state must be reconciled first. Returns the count
+        removed.
+        """
+        data = self._load()
+        removed = [key for key, value in data.items()
+                   if isinstance(value, dict) and value.get('at', 0) < before]
+        for key in removed:
+            data.pop(key, None)
+        if removed:
+            self._save(data)
+        return len(removed)
+
+    def stats(self):
+        data = self._load()
+        states = {'in_progress': 0, 'committed': 0, 'unknown': 0}
+        for value in data.values():
+            if isinstance(value, dict) and value.get('state') in states:
+                states[value['state']] += 1
+        return {'total': len(data), 'limit': self.limit, 'states': states,
+                'bytes': self.path.stat().st_size if self.path.exists() else 0}
+
+
+def _envelope(code, stderr='', **extra):
+    payload = {'returncode': code, 'stdout': '', 'stderr': stderr}
+    payload.update(extra)
+    return payload
+
+
+def run_guarded(request, journal_path, effect, authority_config=None,
+                require_authority=False):
     """Run one canonical mutation through the live-authority and identity boundary.
 
     Returns the canonical response envelope (the same shape ``endpoint.py`` emits).
-    The authority lock is held across re-validation and the effect, so an HTTP-side
-    revocation that committed first is observed here and the effect never runs.
+
+    * The live-authority store and lock come only from ``authority_config`` (the
+      server-side launch configuration). Any ``store``/``lock`` fields in the request
+      are ignored, so a hostile request cannot choose the file that is read or the
+      lock that is created. Without a configuration the request's authority block is
+      ignored entirely, which is the SSH compatibility path.
+    * ``require_authority`` marks the trusted HTTP service's mutation path: a request
+      that omits the descriptor is refused rather than silently skipping the check.
+    * The authority lock is held across re-validation and the effect, so an HTTP-side
+      revocation that committed first is observed here and the effect never runs.
     """
     authority = request.get('authority')
-    lock_path = authority.get('lock') if isinstance(authority, dict) else None
+    if not isinstance(authority, dict):
+        authority = None
+    if require_authority and authority_config is None:
+        return _envelope(126, stderr='Live authority is not configured\n',
+                         authority_status=401)
+    if require_authority and authority is None:
+        return _envelope(126, stderr='Live authority descriptor required\n',
+                         authority_status=401)
+
+    lock_path = authority_config.lock if authority_config is not None else None
     context = file_lock(lock_path) if lock_path else _no_lock()
     with context:
-        if isinstance(authority, dict):
+        if authority_config is not None and authority is not None:
+            descriptor = {key: value for key, value in authority.items()
+                          if key not in ('store', 'lock')}
             try:
-                state = read_state(authority.get('store'))
-                decide(state, authority)
+                state = read_state(authority_config.store)
+                decide(state, descriptor)
             except AuthorityDenied as denied:
-                return {'returncode': 126, 'stdout': '', 'stderr': '%s\n' % denied.message,
-                        'authority_status': denied.status}
+                return _envelope(126, stderr='%s\n' % denied.message,
+                                 authority_status=denied.status)
         operation_id = request.get('operation_id')
         journal = OperationJournal(journal_path) if operation_id else None
+        principal = principal_key(request)
         if journal is not None:
             request_hash = operation_hash(request)
             entry = journal.lookup(operation_id)
             if entry is not None:
+                if entry.get('principal') != principal:
+                    return _envelope(2, stderr='Operation identity belongs to a different '
+                                               'principal\n')
                 if entry.get('request_hash') != request_hash:
-                    return {'returncode': 2, 'stdout': '',
-                            'stderr': 'Operation identity reused with a different request\n'}
+                    return _envelope(2, stderr='Operation identity reused with a different '
+                                               'request\n')
                 if entry.get('state') == 'committed':
+                    if entry.get('envelope_omitted') or entry.get('envelope') is None:
+                        return _envelope(124, stderr='Operation is committed but its response '
+                                                     'exceeded the retention bound; reconcile '
+                                                     'canonical state before retrying.\n')
                     return entry.get('envelope')
                 # The prior attempt reserved the identity and its outcome is unknown:
                 # preserve uncertainty rather than repeating a possibly committed effect.
-                return {'returncode': 124, 'stdout': '',
-                        'stderr': 'Operation identity reserved; outcome unknown. Reconcile '
-                                  'canonical state before retrying.\n'}
-            journal.reserve(operation_id, request_hash)
+                return _envelope(124, stderr='Operation identity reserved; outcome unknown. '
+                                             'Reconcile canonical state before retrying.\n')
+            try:
+                journal.reserve(operation_id, request_hash, principal)
+            except JournalFull as full:
+                return _envelope(124, stderr='%s; no effect was attempted. Reconcile state '
+                                             'or prune the journal first.\n' % full)
         try:
             envelope = effect()
-        except BaseException:
-            # An exception from the canonical effect is a definite failure (the
-            # canonical modules raise before appending, and dedupe by operation id
-            # anyway), so release the identity for a clean retry.
+        except PreEffectFailure:
+            # The effect proved it failed before writing anything, so the identity can
+            # be released for a clean retry.
             if journal is not None:
                 journal.discard(operation_id)
             raise
-        if journal is not None:
-            if envelope.get('returncode') in (None, 0):
-                journal.complete(operation_id, envelope, operation_hash(request))
-            elif envelope.get('returncode') != 2:
+        except Exception:
+            # A timeout or mid-flow error can follow a committed native write. Keep
+            # the reservation and report uncertainty; never discard on an exception
+            # that is not proven pre-effect.
+            if journal is not None:
+                journal.mark_unknown(operation_id)
+            return _envelope(124, stderr='Effect raised after the reservation; outcome '
+                                         'unknown. Reconcile canonical state before retrying.\n')
+        if journal is not None and isinstance(envelope, dict):
+            code = envelope.get('returncode')
+            if code in (None, 0):
+                try:
+                    journal.complete(operation_id, envelope, operation_hash(request),
+                                     principal)
+                except JournalFull:
+                    journal.mark_unknown(operation_id)
+                    return _envelope(124, stderr='Operation committed but the journal could '
+                                                 'not retain the response; reconcile canonical '
+                                                 'state before retrying.\n')
+            elif code == 2:
+                journal.discard(operation_id)
+            else:
                 # Non-validation failure: the effect may have committed; keep the
                 # reservation so a retry reports uncertainty instead of duplicating.
-                pass
-            else:
-                journal.discard(operation_id)
+                journal.mark_unknown(operation_id)
         return envelope
 
 

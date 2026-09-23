@@ -21,6 +21,7 @@ The canonical effect is emulated (a JSON row store), not a real Beads database; 
 probe documents that boundary in its report.
 """
 import argparse
+import inspect
 import json
 import os
 import sys
@@ -244,6 +245,9 @@ def dispatch(canonical, request, tmp):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--root', required=True)
+    parser.add_argument('--authority-store')
+    parser.add_argument('--authority-lock')
+    parser.add_argument('--require-authority', action='store_true')
     arguments = parser.parse_args()
     try:
         request = json.loads(sys.stdin.read(2_000_001))
@@ -255,10 +259,21 @@ def main():
     journal_path = canonical.path / '.http-operations.json'
     tmp = canonical.path / '.attachments'
     tmp.mkdir(parents=True, exist_ok=True)
+    config = None
+    if http_authority is not None and hasattr(http_authority, 'AuthorityConfig') and \
+            arguments.authority_store:
+        config = http_authority.AuthorityConfig(arguments.authority_store,
+                                                arguments.authority_lock)
     try:
         if http_authority is not None and hasattr(http_authority, 'run_guarded'):
-            answer = http_authority.run_guarded(request, journal_path,
-                                                lambda: dispatch(canonical, request, tmp))
+            parameters = inspect.signature(http_authority.run_guarded).parameters
+            if 'authority_config' in parameters:
+                answer = http_authority.run_guarded(
+                    request, journal_path, lambda: dispatch(canonical, request, tmp),
+                    authority_config=config, require_authority=arguments.require_authority)
+            else:
+                answer = http_authority.run_guarded(request, journal_path,
+                                                    lambda: dispatch(canonical, request, tmp))
         else:
             answer = dispatch(canonical, request, tmp)
     except Exception as error:  # noqa: BLE001 - report, never traceback

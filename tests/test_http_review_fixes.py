@@ -14,6 +14,18 @@ case:
 4. ``LiveMembershipCase``         -> issuer demotion/removal narrows its credentials
 5. ``IdempotencyAtomicityCase``   -> atomic reservation and a stable creation namespace
 6. ``AttachmentLossCase``         -> evidence is never discarded behind a 201
+
+Round 3 (rev4) adds a class per round-4 request, each with the negative and positive
+case:
+
+7. ``RequestAuthorityCase``       -> authority store/lock are launch configuration
+8. ``OperationIdentityCase``      -> an operation identity is bound to its principal
+9. ``ExceptionUncertaintyCase``   -> an exception after a possible write keeps the
+                                     reservation and reports 124
+10. ``JournalBoundsCase``         -> capacity fails closed, envelopes are bounded,
+                                     only an explicit prune removes an identity
+11. ``RealEndpointAuthorityCase`` -> the same boundary through the real ``endpoint.py``
+                                     SSH/launch entry point (POSIX only)
 """
 import argparse
 import http.client
@@ -21,15 +33,20 @@ import json
 import os
 import secrets
 import shutil
+import subprocess
 import sys
 import threading
+import time
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import http_authority
 from http_auth import HttpError, Service, Store
+from http_authority import (AuthorityConfig, JournalFull, OperationJournal,
+                            PreEffectFailure, principal_key, run_guarded)
 from http_service import (EndpointBackend, InProcessBackend, UncertainOutcome,
                           build_backend, create_server, MAX_BODY_BYTES)
 
@@ -908,6 +925,417 @@ class EndpointAttachmentLossCase(EndpointCase):
                                  'attachments': [AttachmentLossCase.ATTACHMENT]}, token=alex)
         self.assertEqual(501, response.status, response.data)
         self.assertEqual([], self.canonical_rows())
+
+
+# ==================================================================== round 4
+# The four round-4 review requests against the shared authority/identity boundary.
+# Each class has the negative case (what the pre-fix revision did) and the positive
+# case (the fixed boundary), so the tests fail on the revision they criticise.
+
+def authority_state(project='p', now=None):
+    """A minimal live authority document that grants usr_a and usr_b owner on project."""
+    moment = time.time() if now is None else now
+    return {
+        'schema_version': 1,
+        'users': {'usr_a': {'id': 'usr_a', 'disabled': False},
+                  'usr_b': {'id': 'usr_b', 'disabled': False}},
+        'sessions': {
+            'sess_a': {'user_id': 'usr_a', 'revoked': False,
+                       'absolute_expires': moment + 3600, 'idle_expires': moment + 3600},
+            'sess_b': {'user_id': 'usr_b', 'revoked': False,
+                       'absolute_expires': moment + 3600, 'idle_expires': moment + 3600}},
+        'credentials': {},
+        'projects': {project: {'id': project, 'archived': False}},
+        'memberships': {project: {'usr_a': 'owner', 'usr_b': 'owner'}},
+    }
+
+
+def authority_descriptor(user, session, project='p', capability='tasks.write'):
+    return {'via': 'session', 'user_id': user, 'session_hash': session, 'project': project,
+            'capability': capability, 'now': time.time() + 5}
+
+
+def ledger(count=None):
+    """An effect that records how many times it actually ran."""
+    records = []
+
+    def effect(label='ran'):
+        records.append(label)
+        return {'returncode': 0, 'stdout': label, 'stderr': ''}
+    return records, effect
+
+
+class RequestAuthorityCase(unittest.TestCase):
+    """1. endpoint-trusts-request-authority: paths are server configuration."""
+
+    def setUp(self):
+        self.tmp = unique_dir('authority4-')
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.server_store = self.tmp / 'server-state.json'
+        self.server_store.write_text(json.dumps(authority_state()), encoding='utf-8')
+        self.config = AuthorityConfig(str(self.server_store))
+
+    def test_ssh_shaped_authority_cannot_choose_store_or_lock(self):
+        # Negative case: at the pre-fix boundary this request made file_lock create the
+        # caller's lock path and read the caller's store (a readability oracle).
+        caller_lock = self.tmp / 'ssh-caller' / 'nested' / 'x.lock'
+        caller_store = self.tmp / 'ssh-canary.json'
+        caller_store.write_text('CANARY-NOT-JSON', encoding='utf-8')
+        records, effect = ledger()
+        request = {'project': 'p', 'actor': 'attacker', 'action': 'bd',
+                   'args': ['create', 'x'], 'operation_id': 'op-ssh-authority',
+                   'authority': authority_descriptor('usr_a', 'sess_a')}
+        request['authority'].update({'store': str(caller_store), 'lock': str(caller_lock)})
+        result = run_guarded(request, self.tmp / 'journal.json', effect)
+        self.assertEqual(0, result['returncode'], result)
+        self.assertEqual(1, len(records))
+        self.assertFalse(caller_lock.exists(), 'caller-chosen lock path was created')
+        self.assertFalse(caller_lock.parent.exists(), 'caller-chosen directory was created')
+
+    def test_trusted_config_ignores_request_store_and_lock(self):
+        caller_lock = self.tmp / 'cfg-caller' / 'nested' / 'x.lock'
+        caller_store = self.tmp / 'cfg-canary.json'
+        caller_store.write_text('CANARY-NOT-JSON', encoding='utf-8')
+        records, effect = ledger()
+        request = {'project': 'p', 'actor': 'attacker', 'action': 'bd',
+                   'args': ['create', 'x'], 'operation_id': 'op-cfg-authority',
+                   'authority': authority_descriptor('usr_a', 'sess_a')}
+        request['authority'].update({'store': str(caller_store), 'lock': str(caller_lock)})
+        result = run_guarded(request, self.tmp / 'journal.json', effect,
+                             authority_config=self.config)
+        # The server-side store granted the capability; the hostile paths were ignored.
+        self.assertEqual(0, result['returncode'], result)
+        self.assertEqual(1, len(records))
+        self.assertFalse(caller_lock.exists())
+        self.assertTrue((self.server_store.parent / (self.server_store.name + '.lock')).exists())
+
+    def test_configured_mutation_refuses_a_missing_descriptor(self):
+        records, effect = ledger()
+        request = {'project': 'p', 'actor': 'attacker', 'action': 'bd',
+                   'args': ['create', 'x'], 'operation_id': 'op-no-authority'}
+        result = run_guarded(request, self.tmp / 'journal.json', effect,
+                             authority_config=self.config, require_authority=True)
+        self.assertEqual(126, result['returncode'], result)
+        self.assertEqual([], records)
+
+    def test_configured_mutation_refuses_an_unauthorized_descriptor(self):
+        # A session that is not in the document is denied by the server-side store,
+        # never by whatever the request claims.
+        records, effect = ledger()
+        request = {'project': 'p', 'actor': 'attacker', 'action': 'bd',
+                   'args': ['create', 'x'], 'operation_id': 'op-unknown',
+                   'authority': authority_descriptor('usr_missing', 'sess_missing')}
+        result = run_guarded(request, self.tmp / 'journal.json', effect,
+                             authority_config=self.config, require_authority=True)
+        self.assertEqual(126, result['returncode'], result)
+        self.assertEqual(401, result.get('authority_status'))
+        self.assertEqual([], records)
+
+
+class OperationIdentityCase(unittest.TestCase):
+    """2. operation-identity-not-principal-bound."""
+
+    def setUp(self):
+        self.tmp = unique_dir('identity4-')
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.server_store = self.tmp / 'server-state.json'
+        self.server_store.write_text(json.dumps(authority_state()), encoding='utf-8')
+        self.config = AuthorityConfig(str(self.server_store))
+        self.journal = self.tmp / 'journal.json'
+
+    def request(self, actor, user, session, operation_id='op-shared'):
+        return {'project': 'p', 'actor': actor, 'action': 'bd', 'args': ['create', 'x'],
+                'operation_id': operation_id,
+                'authority': authority_descriptor(user, session)}
+
+    def test_other_principal_with_the_same_operation_id_conflicts(self):
+        records, effect = ledger()
+        first = run_guarded(self.request('a', 'usr_a', 'sess_a'), self.journal, effect,
+                            authority_config=self.config)
+        second = run_guarded(self.request('b', 'usr_b', 'sess_b'), self.journal, effect,
+                             authority_config=self.config)
+        self.assertEqual(0, first['returncode'], first)
+        # The pre-fix boundary replayed worker-a's envelope to worker-b; now it is a
+        # clean conflict and worker-b's effect never runs.
+        self.assertEqual(2, second['returncode'], second)
+        self.assertEqual(1, len(records))
+        self.assertEqual('', second.get('stdout', ''))
+        self.assertIn('principal', second.get('stderr', ''))
+
+    def test_same_principal_exact_retry_replays_the_committed_envelope(self):
+        records, effect = ledger()
+        first = run_guarded(self.request('a', 'usr_a', 'sess_a'), self.journal, effect,
+                            authority_config=self.config)
+        retry = run_guarded(self.request('a', 'usr_a', 'sess_a'), self.journal, effect,
+                            authority_config=self.config)
+        self.assertEqual(0, first['returncode'], first)
+        self.assertEqual(first, retry)
+        self.assertEqual(1, len(records))
+
+    def test_replayed_identity_is_bound_to_the_route_body(self):
+        records, effect = ledger()
+        run_guarded(self.request('a', 'usr_a', 'sess_a'), self.journal, effect,
+                    authority_config=self.config)
+        changed = self.request('a', 'usr_a', 'sess_a')
+        changed['args'] = ['create', 'different']
+        conflict = run_guarded(changed, self.journal, effect, authority_config=self.config)
+        self.assertEqual(2, conflict['returncode'], conflict)
+        self.assertEqual(1, len(records))
+
+    def test_actor_label_is_not_enough_to_replay_another_principal(self):
+        # Same actor label, different principal: the stable principal wins.
+        records, effect = ledger()
+        run_guarded(self.request('shared-label', 'usr_a', 'sess_a'), self.journal, effect,
+                    authority_config=self.config)
+        conflict = run_guarded(self.request('shared-label', 'usr_b', 'sess_b'), self.journal,
+                               effect, authority_config=self.config)
+        self.assertEqual(2, conflict['returncode'], conflict)
+        self.assertEqual(1, len(records))
+
+
+class ExceptionUncertaintyCase(unittest.TestCase):
+    """3. exception-path-duplicates."""
+
+    def setUp(self):
+        self.tmp = unique_dir('exception4-')
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.journal = self.tmp / 'journal.json'
+
+    def test_effect_exception_keeps_the_reservation_and_never_duplicates(self):
+        effects = {'n': 0}
+        request = {'project': 'p', 'actor': 'a', 'action': 'bd', 'args': ['create', 'x'],
+                   'operation_id': 'op-raise'}
+
+        def effect():
+            effects['n'] += 1
+            if effects['n'] == 1:
+                raise RuntimeError('native commit then transport failure')
+            return {'returncode': 0, 'stdout': 'second', 'stderr': ''}
+
+        first = run_guarded(request, self.journal, effect)
+        retry = run_guarded(request, self.journal, effect)
+        # The pre-fix boundary discarded the reservation and re-ran the effect.
+        self.assertEqual(124, first['returncode'], first)
+        self.assertEqual(124, retry['returncode'], retry)
+        self.assertEqual(1, effects['n'])
+        self.assertEqual('unknown', OperationJournal(self.journal).lookup('op-raise')['state'])
+
+    def test_a_returncode_failure_keeps_the_reservation(self):
+        effects = {'n': 0}
+        request = {'project': 'p', 'actor': 'a', 'action': 'bd', 'args': ['create', 'x'],
+                   'operation_id': 'op-fail'}
+
+        def effect():
+            effects['n'] += 1
+            return {'returncode': 1, 'stdout': '', 'stderr': 'native failed after write'}
+
+        first = run_guarded(request, self.journal, effect)
+        retry = run_guarded(request, self.journal, effect)
+        self.assertEqual(1, first['returncode'])
+        self.assertEqual(124, retry['returncode'], retry)
+        self.assertEqual(1, effects['n'])
+
+    def test_proven_pre_effect_failure_releases_the_identity(self):
+        effects = {'n': 0}
+        request = {'project': 'p', 'actor': 'a', 'action': 'bd', 'args': ['create', 'x'],
+                   'operation_id': 'op-pre-effect'}
+
+        def effect():
+            effects['n'] += 1
+            if effects['n'] == 1:
+                raise PreEffectFailure('rejected before any write')
+            return {'returncode': 0, 'stdout': 'after-release', 'stderr': ''}
+
+        with self.assertRaises(PreEffectFailure):
+            run_guarded(request, self.journal, effect)
+        # The proven pre-effect failure released the identity before the retry.
+        self.assertIsNone(OperationJournal(self.journal).lookup('op-pre-effect'))
+        retry = run_guarded(request, self.journal, effect)
+        self.assertEqual(0, retry['returncode'], retry)
+        self.assertEqual(2, effects['n'])
+        self.assertEqual('committed',
+                         OperationJournal(self.journal).lookup('op-pre-effect')['state'])
+
+    def test_validation_returncode_two_releases_the_identity(self):
+        effects = {'n': 0}
+        request = {'project': 'p', 'actor': 'a', 'action': 'bd', 'args': ['create', 'x'],
+                   'operation_id': 'op-validation'}
+
+        def effect():
+            effects['n'] += 1
+            return {'returncode': 2, 'stdout': '', 'stderr': 'rejected'}
+
+        run_guarded(request, self.journal, effect)
+        retry = run_guarded(request, self.journal, effect)
+        self.assertEqual(2, retry['returncode'], retry)
+        self.assertEqual(2, effects['n'])
+
+
+class JournalBoundsCase(unittest.TestCase):
+    """4. journal-scope-and-bounds."""
+
+    def setUp(self):
+        self.tmp = unique_dir('bounds4-')
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.request = {'project': 'p', 'actor': 'x', 'action': 'bd', 'args': ['create', 'x']}
+
+    def _seed_full(self, path, limit):
+        request_hash = http_authority.operation_hash(self.request)
+        principal = principal_key(self.request)
+        base = time.time() - 1000
+        data = {}
+        for index in range(limit):
+            data['op-fill-%05d' % index] = {
+                'state': 'committed', 'request_hash': request_hash, 'principal': principal,
+                'at': base + index,
+                'envelope': {'returncode': 0, 'stdout': 'seeded', 'stderr': ''}}
+        path.write_text(json.dumps(data), encoding='utf-8')
+        return data
+
+    def test_capacity_fails_closed_without_evicting_an_identity(self):
+        path = self.tmp / 'full.json'
+        self._seed_full(path, http_authority.JOURNAL_LIMIT)
+        records, effect = ledger()
+        capacity = run_guarded(dict(self.request, operation_id='op-capacity'), path, effect)
+        # The pre-fix journal silently evicted the oldest identity here and ran the
+        # effect; now the mutation fails closed and no effect runs.
+        self.assertEqual(124, capacity['returncode'], capacity)
+        self.assertEqual([], records)
+        # The oldest identity is still retained, so its exact retry replays.
+        oldest = run_guarded(dict(self.request, operation_id='op-fill-00000'), path, effect)
+        self.assertEqual(0, oldest['returncode'], oldest)
+        self.assertEqual('seeded', oldest['stdout'])
+        self.assertEqual([], records)
+
+    def test_oversized_envelope_is_reported_uncertain_not_replayed(self):
+        path = self.tmp / 'big.json'
+        request = dict(self.request, operation_id='op-big')
+        request_hash = http_authority.operation_hash(request)
+        journal = OperationJournal(str(path), max_envelope=64)
+        journal.reserve('op-big', request_hash, principal_key(request))
+        journal.complete('op-big', {'returncode': 0, 'stdout': 'Z' * 4096, 'stderr': ''},
+                         request_hash, principal_key(request))
+        entry = journal.lookup('op-big')
+        self.assertTrue(entry.get('envelope_omitted'))
+        self.assertIsNone(entry.get('envelope'))
+        records, effect = ledger()
+        retry = run_guarded(request, path, effect)
+        # The pre-fix boundary replayed the whole oversized envelope as a result.
+        self.assertEqual(124, retry['returncode'], retry)
+        self.assertEqual([], records)
+
+    def test_prune_is_the_only_explicit_removal(self):
+        path = self.tmp / 'prune.json'
+        journal = OperationJournal(str(path))
+        records, effect = ledger()
+        request = dict(self.request, operation_id='op-prune')
+        run_guarded(request, path, effect)
+        self.assertIsNotNone(journal.lookup('op-prune'))
+        stats = journal.stats()
+        self.assertEqual(1, stats['states']['committed'])
+        removed = journal.prune(time.time() + 1)
+        self.assertEqual(1, removed)
+        self.assertIsNone(journal.lookup('op-prune'))
+
+    def test_journal_full_is_raised_before_the_effect(self):
+        path = self.tmp / 'raise.json'
+        journal = OperationJournal(str(path), limit=1)
+        journal.reserve('op-first', 'hash', 'actor:x')
+        with self.assertRaises(JournalFull):
+            journal.reserve('op-second', 'hash', 'actor:x')
+        self.assertEqual(1, len(journal._load()))
+
+
+@unittest.skipUnless(os.name == 'posix', 'endpoint.py imports fcntl; POSIX only')
+class RealEndpointAuthorityCase(unittest.TestCase):
+    """The SSH worker entry point itself, with a disposable canonical runtime."""
+
+    def setUp(self):
+        import importlib.util
+        self.tmp = unique_dir('endpoint4-')
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.root = self.tmp / 'root'
+        (self.root / 'bin').mkdir(parents=True)
+        (self.root / 'projects' / 'probe' / '.beads').mkdir(parents=True)
+        (self.root / 'projects' / 'probe' / '.beads' / 'metadata.json').write_text(
+            '{}', encoding='utf-8')
+        (self.root / 'deployment.private.json').write_text(
+            json.dumps({'password': 'probe'}), encoding='utf-8')
+        bd = self.root / 'bin' / 'bd'
+        bd.write_text('#!/bin/sh\necho \'{"id":"proj-1","title":"x"}\'\nexit 0\n',
+                      encoding='utf-8')
+        bd.chmod(0o755)
+        spec = importlib.util.spec_from_file_location('real_endpoint', str(ROOT / 'endpoint.py'))
+        self.endpoint = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.endpoint)
+        self.config = AuthorityConfig(str(self.tmp / 'authority.json'))
+        self.config_path = self.tmp / 'authority.json'
+        self.config_path.write_text(json.dumps(authority_state(project='probe')),
+                                    encoding='utf-8')
+
+    def test_hostile_authority_block_is_ignored_on_the_ssh_path(self):
+        canary_lock = self.tmp / 'ssh-caller' / 'nested' / 'x.lock'
+        canary_store = self.tmp / 'ssh-canary.json'
+        canary_store.write_text('CANARY-NOT-JSON', encoding='utf-8')
+        request = {'project': 'probe', 'actor': 'attacker', 'action': 'bd', 'args': ['create', 'x'],
+                   'operation_id': 'op-endpoint-hostile',
+                   'authority': {'via': 'session', 'user_id': 'usr_a',
+                                 'session_hash': 'sess_a', 'project': 'probe',
+                                 'capability': 'tasks.write',
+                                 'store': str(canary_store), 'lock': str(canary_lock)}}
+        result = self.endpoint.execute(self.root, request)
+        self.assertEqual(0, result['returncode'], result)
+        self.assertFalse(canary_lock.exists(), 'SSH request created a caller-chosen lock')
+        self.assertFalse(canary_lock.parent.exists())
+
+    def test_launch_configured_endpoint_uses_server_authority(self):
+        canary_lock = self.tmp / 'http-caller' / 'nested' / 'x.lock'
+        canary_store = self.tmp / 'http-canary.json'
+        canary_store.write_text('CANARY-NOT-JSON', encoding='utf-8')
+        request = {'project': 'probe', 'actor': 'attacker', 'action': 'bd', 'args': ['create', 'x'],
+                   'operation_id': 'op-endpoint-configured',
+                   'authority': {'via': 'session', 'user_id': 'usr_a',
+                                 'session_hash': 'sess_a', 'project': 'probe',
+                                 'capability': 'tasks.write',
+                                 'store': str(canary_store), 'lock': str(canary_lock)}}
+        result = self.endpoint.execute(self.root, request, authority_config=self.config,
+                                       require_authority=True)
+        self.assertEqual(0, result['returncode'], result)
+        self.assertFalse(canary_lock.exists())
+        # A descriptor-less mutation through the trusted launch is refused.
+        bare = {'project': 'probe', 'actor': 'attacker', 'action': 'bd', 'args': ['create', 'x'],
+                'operation_id': 'op-endpoint-bare'}
+        refused = self.endpoint.execute(self.root, bare, authority_config=self.config,
+                                        require_authority=True)
+        self.assertEqual(126, refused['returncode'], refused)
+
+    def test_timeout_after_a_native_commit_does_not_duplicate(self):
+        marker = self.tmp / 'native-created.jsonl'
+        calls = {'n': 0}
+        real_run = self.endpoint.subprocess.run
+
+        def fake_run(argv, **kwargs):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                marker.write_text('committed\n', encoding='utf-8')
+                raise subprocess.TimeoutExpired(argv, 120)
+            return real_run(argv, **kwargs)
+
+        self.endpoint.subprocess.run = fake_run
+        try:
+            request = {'project': 'probe', 'actor': 'attacker', 'action': 'bd',
+                       'args': ['create', 'x'], 'operation_id': 'op-endpoint-timeout',
+                       'authority': authority_descriptor('usr_a', 'sess_a', project='probe')}
+            first = self.endpoint.execute(self.root, request, authority_config=self.config,
+                                          require_authority=True)
+            retry = self.endpoint.execute(self.root, request, authority_config=self.config,
+                                          require_authority=True)
+        finally:
+            self.endpoint.subprocess.run = real_run
+        self.assertEqual(124, first['returncode'], first)
+        self.assertEqual(124, retry['returncode'], retry)
+        self.assertEqual(1, calls['n'], 'the native command ran a second time')
+        self.assertEqual('committed\n', marker.read_text(encoding='utf-8'))
 
 
 if __name__ == '__main__':

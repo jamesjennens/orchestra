@@ -445,6 +445,11 @@ class EndpointBackend:
         self.timeout = timeout
         self.runner = runner
         self.faults = {}
+        # Server-side authority locations. The endpoint is launched with these paths;
+        # they never travel in a request body, so a request cannot redirect the
+        # live-authority read or make the endpoint create a lock at a chosen path.
+        self.authority_store = str(service.store.path)
+        self.authority_lock = str(service.store.path) + '.lock'
 
     def fail_next(self, route, times=1):
         """Test hook: commit canonically, then report an uncertain outcome."""
@@ -474,7 +479,7 @@ class EndpointBackend:
 
     # -- transport -------------------------------------------------------------
     def _endpoint(self, action, project, actor, args, attachments=None, operation_id=None,
-                  authority=None):
+                  authority=None, require_authority=False):
         if self.runner is not None:
             return self.runner(action=action, project=project, actor=actor, args=args,
                                attachments=attachments or {}, operation_id=operation_id,
@@ -484,13 +489,20 @@ class EndpointBackend:
                    'attachments': attachments or {}}
         # The operation identity and the authority descriptor travel with the
         # mutation: the endpoint reserves the identity and re-validates live
-        # authority immediately before the canonical effect.
+        # authority immediately before the canonical effect. The descriptor carries
+        # the principal only; the *store and lock locations* are launch configuration
+        # below, never request data.
         if operation_id:
             payload['operation_id'] = operation_id
         if authority:
             payload['authority'] = authority
+        argv = [self.python, self.endpoint, '--root', self.root,
+                '--authority-store', self.authority_store,
+                '--authority-lock', self.authority_lock]
+        if require_authority:
+            argv.append('--require-authority')
         try:
-            completed = subprocess.run([self.python, self.endpoint, '--root', self.root],
+            completed = subprocess.run(argv,
                                        input=json.dumps(payload), text=True, encoding='utf-8',
                                        capture_output=True, timeout=self.timeout)
         except subprocess.TimeoutExpired:
@@ -503,9 +515,10 @@ class EndpointBackend:
             raise uncertain('Canonical endpoint returned an invalid response')
 
     def _run(self, action, project, actor, args, attachments=None, operation_id=None,
-             authority=None):
+             authority=None, require_authority=False):
         reply = self._endpoint(action, project, actor, args, attachments,
-                               operation_id=operation_id, authority=authority)
+                               operation_id=operation_id, authority=authority,
+                               require_authority=require_authority)
         code = reply.get('returncode') if isinstance(reply, dict) else None
         stderr = (reply.get('stderr') or '') if isinstance(reply, dict) else ''
         stdout = (reply.get('stdout') or '') if isinstance(reply, dict) else ''
@@ -547,13 +560,22 @@ class EndpointBackend:
                                                            payload, operation_id)
         authority = None
         if capability is not None:
+            # Principal descriptor only: the store/lock locations are endpoint launch
+            # configuration (``self.authority_store``), not request data.
             authority = authority_request(principal, project_id, capability,
                                           now=self.service._now())
-            authority['store'] = str(self.service.store.path)
-            authority['lock'] = str(self.service.store.path) + '.lock'
-        result = self._run(action, project, payload.get('actor') or self._actor(principal),
-                           args, attachments, operation_id=operation_id,
-                           authority=authority)
+        try:
+            result = self._run(action, project, payload.get('actor') or self._actor(principal),
+                               args, attachments, operation_id=operation_id,
+                               authority=authority, require_authority=capability is not None)
+        except HttpError as failure:
+            # The endpoint reported an uncertain outcome (124 or an unclassified
+            # failure) for a mutation whose identity it still reserves. Preserve that
+            # uncertainty in the HTTP receipt too, so an exact retry reconciles
+            # through the durable operation identity instead of releasing the key.
+            if failure.status == 503:
+                raise UncertainOutcome() from None
+            raise
         # The endpoint's guarded section linearized live authority with the effect, so
         # no further authority re-check is needed here: a revocation that committed
         # before the effect refused it, and one that commits after the effect has not

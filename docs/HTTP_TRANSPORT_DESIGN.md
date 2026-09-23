@@ -367,6 +367,42 @@ response replays the recorded canonical envelope instead of repeating the effect
 authority change persisted first is observed by the endpoint immediately before the
 effect under the same cross-process lock. Attachments excepted, see above.
 
+**Current build status (rev4).** The authority and identity boundary is now expressed
+in server-side configuration rather than request data:
+
+* *Authority location.* The live-authority document and its lock are passed to
+  `endpoint.py` as launch arguments (`--authority-store`, `--authority-lock`) by the
+  trusted HTTP service, exactly like `--root`. `store`/`lock` fields inside a request
+  body are ignored even when the configuration is present, and without a
+  configuration the whole `authority` block is ignored (the SSH compatibility path
+  has no HTTP principal to check). `--require-authority` marks the trusted mutation
+  launch, so a mutation that omits the descriptor is refused with `126` instead of
+  silently skipping the live check. An SSH-shaped request that supplies hostile
+  `authority.store`/`authority.lock` therefore cannot read a chosen server file or
+  create a lock at a chosen path.
+* *Identity.* `operation_hash` binds the authenticated principal, the actor label,
+  the route, the project, the action arguments and the attachments. A client-supplied
+  `operation_id` reused by a *different* principal is a clean conflict (`2`), never a
+  replay of another principal's committed envelope; an exact retry by the same
+  principal still replays.
+* *Exceptions.* Only an express `PreEffectFailure` releases a reservation. Any other
+  exception (a `subprocess` timeout after the native write, a mid-flow `ValueError`)
+  or non-zero non-validation return code keeps the reservation and reports `124`
+  uncertainty, because the write may already have committed.
+* *Journal bounds.* `.http-operations.json` is bounded by `JOURNAL_LIMIT` entries,
+  `MAX_ENVELOPE_BYTES` per retained envelope and `MAX_JOURNAL_BYTES` per document.
+  Nothing is evicted implicitly: at capacity a new guarded mutation fails closed with
+  `124` and no effect. An oversized response envelope is recorded by digest and a
+  retry reports uncertainty instead of returning a truncated result. `prune()` is the
+  only (explicit, operator-invoked) path that removes an identity, and doing so makes
+  an exact retry of a pruned operation repeat its effect.
+* *Affected non-HTTP callers.* `endpoint.py` is also the SSH worker entry. Every SSH
+  request that carries an `operation_id`, and every `brief`/`history`/`checkpoint`
+  request that passes through the guarded branch, uses the same journal and the same
+  bounds; SSH does **not** run the live-authority check (there is no HTTP principal)
+  and cannot opt into or out of it from request data. `InProcessBackend` (disposable
+  local validation) keeps its own receipt store and is unaffected.
+
 Credential issuance is the deliberate exception to replaying a secret. The
 issuance idempotency record stores the credential ID, request hash, status and
 secret-delivery state, but never the bearer secret. If the `201` response is
