@@ -24,7 +24,9 @@ Every request is one JSON object on stdin; every response is one JSON object on 
 - `stderr` carries native warnings, progress notes and errors. It is **never** mixed
   into `stdout`.
 - The client writes `stdout` to its own stdout and `stderr` to its own stderr, and
-  exits with `returncode`.
+  exits with `returncode`. With the additive client option `--out FILE` it writes
+  `stdout` to `FILE` as UTF-8 with LF line endings and no BOM instead, and leaves its
+  own stdout empty.
 - On validation or transport failure, `returncode` is nonzero (`2` for endpoint
   validation), `stdout` is empty, and `stderr` starts with the error type
   (`ValueError: ...`). Automation should parse stdout only when the exit code is `0`.
@@ -33,24 +35,62 @@ Native commands can succeed (exit `0`) while printing warnings. The endpoint for
 those warnings on `stderr` and keeps the success JSON clean; it does not silently drop
 them and does not merge them into `stdout`.
 
+### Native boundary: what may reach an error, a warning or a log
+
+The endpoint applies one reviewed policy to native output before it crosses into a
+structured result:
+
+- **Native stderr on success is forwarded verbatim.** It is operator-facing native
+  output (warnings, progress notes), not an error echo; the endpoint does not redact
+  or truncate it.
+- **Raw `bd` passthrough is intentionally unchanged.** The `bd` action and `refresh`
+  return native `stdout`/`stderr` and the native exit code as they are, so an operator
+  can run arbitrary allowed `bd` commands. That path is not bounded or redacted and is
+  not part of the structured-error contract below.
+- **A nonzero exit in a structured command becomes a labelled, bounded error.** The
+  message is `Native command failed (<rc>)` plus, at most, one short diagnostic line
+  (<= 160 characters) with absolute paths replaced by `<path>`. Longer output — and
+  any first line that is itself longer than one diagnostic line — is withheld behind
+  `[native output withheld: N line(s), M characters, sha256:<12 hex>]`, so an operator
+  can correlate with server logs without the payload appearing in the error.
+- **stdout is expected to carry only JSON.** A short non-JSON stdout line (a native
+  warning printed on the wrong stream) is re-labelled as a `native stdout note:` line on
+  `stderr` and the command still succeeds with clean JSON on `stdout`. stdout that
+  contains no JSON at all fails with `Native stdout is not JSON (exit 0)` naming the
+  bounded, redacted first line or the withheld-output label — never a bare
+  `JSONDecodeError`. A pretty-printed JSON document or JSON Lines still parse with a
+  warning line before or after them.
+
 Errors are bounded and labelled. They name the offending field, index or option, but
-they do not echo whole private payloads: attachment bodies, comment text and oversized
-native output are not reproduced in the error or in logs.
+they do not echo whole private payloads: attachment bodies, comment text, oversized
+native output and caller-supplied field names are truncated or withheld rather than
+reproduced in the error or in logs.
 
 ## Command help
 
-`work`, `review` and `handoff` answer `-h`/`--help` on stdout with exit code `0`:
+`work`, `review`, `handoff`, `brief`, `history` and `checkpoint` answer `-h`/`--help`
+on stdout with exit code `0`:
 
 ```sh
 b work --help
 b review --help
 b handoff --help
+b brief --help
+b history --help
+b checkpoint --help
 ```
 
+Help recognition is uniform: `-h`/`--help` is honoured wherever it appears as a
+standalone token, except when the token before it is an option that takes a value, so
+`work --owner -h` is still the option error it has always been and not a help request.
+`review TASK --help` and `handoff --json --help` return help, and help never runs a
+native command, takes the coordination lock or needs an attachment.
+
 `work --help` returns machine-readable usage, options, limits, output shape, identity
-fields and exit codes. `work --json` is accepted for consistency; `work` always returns
-JSON, so the flag is a no-op. Help is data, not a `SystemExit`, so it survives the
-endpoint envelope.
+fields and exit codes. The briefing commands return the same envelope with their own
+usage, options, limits and notes. `work --json` is accepted for consistency; `work`
+always returns JSON, so the flag is a no-op. Help is data, not a `SystemExit`, so it
+survives the endpoint envelope.
 
 ## `work`: list/queue shape
 
@@ -132,6 +172,7 @@ a clear refusal, not a wrong read.
 | `checkpoint` | item `text`/`reason` | <= 400 characters |
 | `checkpoint` | item `source`/`evidence` | <= 240 characters |
 | `checkpoint` | whole payload | <= 80 KB canonical bytes |
+| any checkpoint error | listed unknown/missing field names | <= 8 names, each <= 60 characters |
 
 Out-of-range values fail with a nonzero exit code and an error that names the option or
 field **and** the limit, for example:
@@ -146,9 +187,11 @@ field **and** the limit, for example:
 | `work --assignee X` | `work --owner X` or `work --mine` | `hint: use --owner ACTOR or --mine` |
 | `work --task X` / `work --review X` | `review X` for one task | `hint: work lists the queue; use "review TASK" for one task` |
 | `--mine --owner X` | one of the two | argparse mutual-exclusion error |
-| `brief --limit N` | `brief --items-limit N` | `--items-offset/--items-limit` page error |
+| `brief --limit N` | `brief --items-limit N` | `hint: use --items-limit for the unresolved-item page size` |
+| `brief --offset N` | `brief --items-offset N` | `hint: use --items-offset for the unresolved-item page offset` |
 | `previous = latest_comment_id` in a review payload | `contribution = contribution.comment_id` | review workflow names the misused ID |
 | reading `brief.owner` as a string | read `brief.owner.text` | excerpt-object contract above |
+| `work --owner -h` | `work --owner ACTOR` | argparse `expected one argument`; `-h` is the option's value, not a help request |
 
 ## Wrapper option ordering
 
@@ -172,24 +215,47 @@ attachment paths are resolved relative to the caller's directory unless absolute
 
 ### PowerShell capture
 
-Windows PowerShell `>` / `Out-File` writes UTF-16LE, not UTF-8. Do not capture client
-stdout with `>` and then parse it as UTF-8:
+Windows PowerShell 5.1 `>` / `Out-File` does not write UTF-8. Executed on Windows
+PowerShell 5.1 (revision probe `evidence/rev2/windows-ps/`):
+
+| Capture | Bytes written | Decodes as |
+| --- | --- | --- |
+| PowerShell `-NoProfile` `>` | `FF FE ...` (UTF-16LE with BOM) | `utf-16`, not `utf-8` |
+| PowerShell with a profile that sets `$PSDefaultParameterValues['Out-File:Encoding']` | `EF BB BF ...` (UTF-8 **with BOM**) | `utf-8-sig`, not `utf-8` |
+| `cmd /c ... > file` | plain UTF-8, no BOM | `utf-8` |
+| client `--out FILE` | plain UTF-8, no BOM, LF endings | `utf-8` |
+
+Preferred capture, in order:
 
 ```powershell
-# Wrong: UTF-16LE file
-python client.py --config client.local.json --project example --actor alex/session1 -- work --json > queue.json
+# 1. Client-owned capture: the client writes UTF-8 without a BOM; stdout stays empty.
+python client.py --config client.local.json --project example --actor alex/session1 `
+  --out queue.json -- work --json
 
-# Right: let the client write UTF-8 through CMD redirection
+# 2. CMD redirection, clean UTF-8 whether or not PowerShell has a profile.
 cmd /c "python client.py --config client.local.json --project example --actor alex/session1 -- work --json > queue.json"
 
-# Right: capture in-process and write UTF-8 explicitly
+# 3. Capture in-process and write UTF-8 explicitly.
 python -c "from pathlib import Path; from client import request; from requirements import load_json; r=request(load_json('client.local.json'),'example','alex/session1',[],action='view',path='issues.jsonl'); assert r['returncode']==0,r['stderr']; Path('issues.jsonl').write_text(r['stdout'],encoding='utf-8')"
 ```
 
-If a UTF-16LE file already exists, decode it as `utf-16`, not `utf-8`. Passing
-arguments as a literal array (`subprocess.run([...])`, or PowerShell's normal argument
-passing) is supported; the client cannot detect a flag that a shell dropped before
-Python started.
+`--out` is a client option placed before the `--` separator, like `--config`. On a
+nonzero exit it writes no file and leaves the failure on `stderr` with the command's
+exit code.
+
+If a PowerShell-redirected file already exists, detect the encoding from its BOM
+instead of assuming one:
+
+```python
+raw = open('queue.json', 'rb').read()
+encoding = ('utf-16' if raw[:2] in (b'\xff\xfe', b'\xfe\xff')
+            else 'utf-8-sig' if raw[:3] == b'\xef\xbb\xbf' else 'utf-8')
+payload = json.loads(raw.decode(encoding))
+```
+
+Passing arguments as a literal array (`subprocess.run([...])`, or PowerShell's normal
+argument passing) is supported; the client cannot detect a flag that a shell dropped
+before Python started.
 
 ## `create-child` version difference
 

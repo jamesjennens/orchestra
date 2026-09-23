@@ -19,6 +19,12 @@ BRIEF_ITEM_OFFSET_MIN=0
 BRIEF_ITEM_LIMIT_MIN,BRIEF_ITEM_LIMIT_MAX=1,10
 HISTORY_LIMIT_MIN,HISTORY_LIMIT_MAX=1,20
 HISTORY_BUDGET_MIN,HISTORY_BUDGET_MAX=256,8000
+FIELD_NAME_LIMIT=60
+FIELD_NAME_COUNT=8
+BRIEF_MISTAKEN_FLAGS={
+    '--limit':'use --items-limit for the unresolved-item page size',
+    '--offset':'use --items-offset for the unresolved-item page offset',
+}
 
 def token(data):return base64.urlsafe_b64encode(canonical_bytes(data)).decode().rstrip('=')
 
@@ -57,12 +63,23 @@ def activity_cursor(data):return token({'v':1,'kind':'activity','project':data['
 def text(value,label,limit,empty=False):
     if not isinstance(value,str) or len(value)>limit or (not empty and not value.strip()):raise ValueError(f'{label}: expected text up to {limit} characters')
 
+def field_names(values):
+    """Bounded, sorted caller-supplied field names for an error message.
+
+    Names are capped individually and in count so a caller cannot turn a
+    validation error into an echo of an arbitrarily large payload.
+    """
+    names=sorted(values)
+    shown=[name[:FIELD_NAME_LIMIT]+('...' if len(name)>FIELD_NAME_LIMIT else '') for name in names[:FIELD_NAME_COUNT]]
+    if len(names)>FIELD_NAME_COUNT:shown.append('(+%d more)'%(len(names)-FIELD_NAME_COUNT))
+    return ', '.join(shown)
+
 def validate_checkpoint(p,task):
     fields={'schema_version','task','previous','activity_cursor','source_commit','branch','intent','acceptance','summary','next_action','open_items','resolved'}
     if not isinstance(p,dict):raise ValueError('Invalid checkpoint: expected a JSON object')
     unknown=sorted(set(p)-fields);missing=sorted(fields-set(p));details=[]
-    if unknown:details.append('unknown fields: '+', '.join(unknown))
-    if missing:details.append('missing fields: '+', '.join(missing))
+    if unknown:details.append('unknown fields: '+field_names(unknown))
+    if missing:details.append('missing fields: '+field_names(missing))
     if not details and (type(p['schema_version']) is not int or p['schema_version']!=1):details.append('schema_version must be integer 1')
     if details:raise ValueError('Invalid checkpoint: '+'; '.join(details))
     if p['task']!=task:raise ValueError('Checkpoint task mismatch')
@@ -81,8 +98,8 @@ def validate_checkpoint(p,task):
             if not isinstance(item,dict):
                 raise ValueError('%s: expected an object with fields %s' % (path,', '.join(sorted(keys))))
             unknown=sorted(set(item)-keys);missing=sorted(keys-set(item));details=[]
-            if unknown:details.append('unknown fields: '+', '.join(unknown))
-            if missing:details.append('missing fields: '+', '.join(missing))
+            if unknown:details.append('unknown fields: '+field_names(unknown))
+            if missing:details.append('missing fields: '+field_names(missing))
             if details:raise ValueError('%s: %s; allowed fields: %s' % (path,'; '.join(details),', '.join(sorted(keys))))
             ids.append(identity(item['id']))
             if field=='open_items':
@@ -214,10 +231,14 @@ def history_page(data,project,task,limit=5,since=None,cursor=None,body_budget=40
             'coverage':'Snapshot of exported comments and native task events, not every database mutation. Continue this snapshot or restart for new activity.'}
 
 class Parser(argparse.ArgumentParser):
-    def error(self,message):raise ValueError(message)
+    hints={}
+    def error(self,message):
+        hint=next((text for flag,text in self.hints.items() if flag in message),None)
+        raise ValueError(message+('; hint: '+hint if hint else ''))
 
 def parse_args(action,args):
-    parser=Parser(add_help=False);parser.add_argument('task');parser.add_argument('--json',action='store_true')
+    parser=Parser(add_help=False);parser.hints=BRIEF_MISTAKEN_FLAGS if action=='brief' else {}
+    parser.add_argument('task');parser.add_argument('--json',action='store_true')
     if action=='brief':parser.add_argument('--items-offset',type=int,default=0);parser.add_argument('--items-limit',type=int,default=5)
     elif action=='history':
         parser.add_argument('--limit',type=int,default=5);parser.add_argument('--since');parser.add_argument('--cursor');parser.add_argument('--body-budget',type=int,default=4000)
@@ -242,8 +263,34 @@ def format_brief(result):
               'Evidence: '+json.dumps(result['evidence'],ensure_ascii=False),*result['warnings']]
     return '\n'.join(lines)+'\n'
 
+def help_limits(action):
+    """Documented limits for the machine-readable help of one briefing command."""
+    if action=='brief':
+        return {'items-offset':'>= %d'%BRIEF_ITEM_OFFSET_MIN,
+                'items-limit':'%d..%d'%(BRIEF_ITEM_LIMIT_MIN,BRIEF_ITEM_LIMIT_MAX)}
+    if action=='history':
+        return {'limit':'%d..%d'%(HISTORY_LIMIT_MIN,HISTORY_LIMIT_MAX),
+                'body-budget':'%d..%d encoded bytes'%(HISTORY_BUDGET_MIN,HISTORY_BUDGET_MAX)}
+    return {'open_items':'<= %d'%CHECKPOINT_ITEMS_MAX,'resolved':'<= %d'%CHECKPOINT_ITEMS_MAX,
+            'item text/reason':'<= %d characters'%CHECKPOINT_TEXT_LIMIT,
+            'item source/evidence':'<= %d characters'%CHECKPOINT_SOURCE_LIMIT,
+            'payload':'<= %d KB canonical bytes'%(CHECKPOINT_MAX_BYTES//1000),
+            'error field names':'<= %d names, each <= %d characters'%(FIELD_NAME_COUNT,FIELD_NAME_LIMIT)}
+
+def help_notes(action):
+    if action=='brief':
+        return ['Unresolved items come from the latest valid checkpoint; a missing checkpoint means unknown, not zero.',
+                '--limit/--offset are not brief options; use --items-limit/--items-offset.']
+    if action=='history':
+        return ['Pages are snapshot-bound; pass next_cursor back to continue the same snapshot.']
+    return ['A JSON file attachment is required; payload.task must equal TASK.',
+            'Every unresolved item must be carried forward unchanged or explicitly resolved with reason and evidence.']
+
 def execute(root,path,project,actor,action,args,attachments,run):
     """Endpoint holds project coordination lock. History caches are disposable."""
+    from work import help_payload,help_requested
+    if help_requested(args):
+        return json.dumps(help_payload(action),ensure_ascii=False,indent=2)+'\n'
     if action=='checkpoint':
         if len(args)!=2 or not args[1].startswith('@attachment:'):raise ValueError('Use checkpoint TASK --file checkpoint.json')
         item=attachments.get(args[1].partition(':')[2],{})

@@ -18,6 +18,21 @@ MISTAKEN_FLAGS = {
     '--review': 'work lists the queue; use "review TASK" for one task',
 }
 
+# Help is recognised wherever it appears as a standalone token, but not when the
+# token before it is an option that takes a value: `work --owner -h` is still the
+# option error it has always been, never a help request.
+HELP_TOKENS = ('-h', '--help')
+VALUE_OPTIONS = {'--owner', '--state', '--limit', '--offset', '--handoff-limit',
+                 '--handoff-offset', '--file', '-f', '--items-offset', '--items-limit',
+                 '--since', '--cursor', '--body-budget'}
+
+def help_requested(args):
+    """True when args ask for help; side-effect free for every command."""
+    for index, token in enumerate(args):
+        if token in HELP_TOKENS and not (index and args[index - 1] in VALUE_OPTIONS):
+            return True
+    return False
+
 def help_payload(action='work'):
     """Machine-readable help returned through the normal JSON envelope on exit 0."""
     usage = {
@@ -25,6 +40,10 @@ def help_payload(action='work'):
                 '[--handoff-limit N] [--handoff-offset N] [--json]',
         'review': 'review TASK [--file payload.json]',
         'handoff': 'handoff TASK --file payload.json',
+        'brief': 'brief TASK [--items-offset N] [--items-limit N] [--json]',
+        'history': 'history TASK [--limit N] [--since TIME] [--cursor TOKEN] '
+                   '[--body-budget BYTES]',
+        'checkpoint': 'checkpoint TASK --file checkpoint.json',
     }
     payload = {'schema_version': 1, 'contract': CONTRACT_VERSION, 'command': action,
                'usage': usage.get(action, action),
@@ -58,6 +77,10 @@ def help_payload(action='work'):
     elif action == 'handoff':
         payload['operations'] = ['transfer (from_actor/to_actor)', 'request', 'disposition']
         payload['notes'] = ['A JSON file attachment is required; payload.task must equal TASK.']
+    elif action in ('brief', 'history', 'checkpoint'):
+        import briefing
+        payload['limits'] = briefing.help_limits(action)
+        payload['notes'] = briefing.help_notes(action)
     return payload
 
 def help_options(action):
@@ -88,6 +111,28 @@ def help_options(action):
             {'flag': '--file payload.json', 'description': 'transport a handoff payload as text'},
             *common,
         ]
+    if action == 'brief':
+        return [
+            {'flag': 'TASK', 'description': 'task to brief'},
+            {'flag': '--items-offset N', 'description': 'unresolved-item page offset >= 0 (default 0)'},
+            {'flag': '--items-limit N', 'description': 'unresolved items per page 1..10 (default 5)'},
+            *common,
+        ]
+    if action == 'history':
+        return [
+            {'flag': 'TASK', 'description': 'task whose snapshot-bound history is paged'},
+            {'flag': '--limit N', 'description': 'entries per page 1..20 (default 5)'},
+            {'flag': '--since TIME', 'description': 'only entries at or after this timestamp'},
+            {'flag': '--cursor TOKEN', 'description': 'continue the exact snapshot page'},
+            {'flag': '--body-budget N', 'description': 'encoded body bytes per page 256..8000 (default 4000)'},
+            *common,
+        ]
+    if action == 'checkpoint':
+        return [
+            {'flag': 'TASK', 'description': 'task the checkpoints belong to'},
+            {'flag': '--file checkpoint.json', 'description': 'transport the checkpoint payload as text'},
+            *common,
+        ]
     return common
 
 class Parser(argparse.ArgumentParser):
@@ -103,7 +148,7 @@ def workflow(issue):
     return result
 
 def queue(rows,actor,args,request_dir=None):
-    if '--help' in args or '-h' in args:return help_payload('work')
+    if help_requested(args):return help_payload('work')
     parser=Parser(add_help=False)
     group=parser.add_mutually_exclusive_group();group.add_argument('--mine',action='store_true');group.add_argument('--owner')
     parser.add_argument('--state',choices=WORK_STATES)
@@ -167,8 +212,10 @@ def queue(rows,actor,args,request_dir=None):
     return result
 
 def execute(path,actor,action,args,attachments,run):
-    if args[:1] in (['--help'],['-h']):
-        return help_payload(action if action in ('work','review','handoff') else 'work')
+    # Help is recognised anywhere it is a standalone token and never touches the
+    # native export, the coordination lock or an attachment.
+    if help_requested(args):
+        return help_payload(action)
     if action in ('review','handoff'):
         # Structured output is already JSON; accept the flag consistently with brief/show/work.
         args=[token for token in args if token!='--json']
