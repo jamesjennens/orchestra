@@ -8,11 +8,13 @@ import * as project from './views/project.js';
 import * as task from './views/task.js';
 import * as admin from './views/admin.js';
 import * as reqs from './views/requirements.js';
+import * as agents from './views/agents.js';
 
 const ROUTES = [
   [/^\/$/, work.home],
   [/^\/welcome$/, work.welcome],
   [/^\/projects$/, work.directory],
+  [/^\/agents$/, agents.list],
   [/^\/p\/(?<pid>[\w-]+)$/, project.overview],
   [/^\/p\/(?<pid>[\w-]+)\/reviews$/, project.reviews],
   [/^\/p\/(?<pid>[\w-]+)\/feedback$/, project.feedback],
@@ -86,6 +88,7 @@ export async function start(root, options = {}) {
         h('a', { class: 'brand', href: ctx.href('/') }, brandMark(), h('span', null, 'Orchestra')),
         h('div', { class: 'rail-section' },
           link('/', 'My work'),
+          link('/agents', 'My agents'),
           link('/projects', 'All projects')),
         h('div', { class: 'rail-section' },
           h('label', { class: 'rail-label', for: 'project-switch' }, 'Project'),

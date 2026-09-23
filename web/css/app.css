@@ -290,6 +290,24 @@ code.hash { font-size: 11px; overflow-wrap: anywhere; color: var(--muted); }
 .collapsible.expanded::after { display: none; }
 pre.json { font-family: var(--mono); font-size: 12px; background: var(--surface-2); padding: 10px; border-radius: var(--radius); overflow-x: auto; margin: 0; }
 
+/* ---------- agents ---------- */
+.agent-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 12px; }
+.agent-card { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.agent-card.needs { border-color: color-mix(in srgb, var(--warn) 55%, var(--line)); }
+.agent-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
+.agent-head h3 { font-size: var(--t-md); }
+.agent-items { margin: 0; padding-left: 18px; font-size: var(--t-sm); display: flex; flex-direction: column; gap: 4px; }
+.resume { display: flex; flex-direction: column; gap: 6px; background: var(--surface-2); border-radius: var(--radius); padding: 8px 10px; }
+.resume-row { display: grid; grid-template-columns: 72px minmax(0, 1fr) auto; gap: 8px; align-items: center; }
+.resume-label { font-size: 11px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); }
+.resume .path { overflow-wrap: anywhere; }
+.resume .prompt { color: var(--ink-2); }
+.resume button { min-height: 26px; padding: 0 8px; }
+fieldset.checks { border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 12px; margin: 0; display: flex; flex-direction: column; gap: 8px; }
+fieldset.checks legend { font-size: var(--t-sm); font-weight: 600; color: var(--ink-2); padding: 0 4px; }
+dialog { max-height: calc(100vh - 48px); overflow: auto; }
+dialog pre.json { max-height: 220px; white-space: pre-wrap; }
+
 /* ---------- responsive ---------- */
 @media (max-width: 960px) {
   .detail { grid-template-columns: minmax(0, 1fr); }

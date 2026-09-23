@@ -20,8 +20,10 @@ export function seed() {
     usr_morgan: { id: 'usr_morgan', username: 'morgan', display_name: 'Morgan Ellis', superuser: true, disabled: false, created_at: at(900) },
     usr_priya: { id: 'usr_priya', username: 'priya', display_name: 'Priya Raman', superuser: false, disabled: false, created_at: at(700) },
     usr_tomasz: { id: 'usr_tomasz', username: 'tomasz', display_name: 'Tomasz Nowak', superuser: false, disabled: false, created_at: at(650) },
-    usr_kestrel: { id: 'usr_kestrel', username: 'kestrel', display_name: 'Kestrel (agent)', superuser: false, disabled: false, created_at: at(400) },
-    usr_wren: { id: 'usr_wren', username: 'wren', display_name: 'Wren (agent)', superuser: false, disabled: false, created_at: at(380) },
+    usr_kestrel: { id: 'usr_kestrel', username: 'kestrel', display_name: 'Kestrel (agent)', superuser: false, disabled: false, created_at: at(400),
+      agent_of: 'usr_tomasz', tool: 'GitHub Copilot in VS Code', working_directory: 'C:\\Users\\tomasz\\agents\\portal-kestrel', last_seen_at: at(3) },
+    usr_wren: { id: 'usr_wren', username: 'wren', display_name: 'Wren (agent)', superuser: false, disabled: false, created_at: at(380),
+      agent_of: 'usr_priya', tool: 'GitHub Copilot in VS Code', working_directory: 'D:\\work\\agents\\invoice-wren', last_seen_at: at(5) },
     usr_lena: { id: 'usr_lena', username: 'lena', display_name: 'Lena Fischer', superuser: false, disabled: false, created_at: at(300) },
     usr_sam: { id: 'usr_sam', username: 'sam', display_name: 'Sam Okafor', superuser: false, disabled: true, created_at: at(800) },
   };
@@ -258,7 +260,7 @@ export function createMock(options = {}) {
     db.projects[p.pid].archived = true; log(p.pid, 'projects.archive');
     return ok(projectView(db.projects[p.pid]));
   });
-  on('GET', '/v1/projects/(?<pid>[\\w-]+)/members', (b, p) => guardProject(p.pid) || ok({ items: Object.entries(db.memberships[p.pid]).map(([uid, r]) => ({ user_id: uid, display_name: name(uid), username: db.users[uid].username, role: r, disabled: db.users[uid].disabled })) }));
+  on('GET', '/v1/projects/(?<pid>[\\w-]+)/members', (b, p) => guardProject(p.pid) || ok({ items: Object.entries(db.memberships[p.pid]).map(([uid, r]) => ({ user_id: uid, display_name: name(uid), username: db.users[uid].username, role: r, disabled: db.users[uid].disabled, agent_of_name: db.users[uid].agent_of ? name(db.users[uid].agent_of) : null })) }));
   on('PUT', '/v1/projects/(?<pid>[\\w-]+)/members/(?<uid>[\\w-]+)', (b, p) => {
     const g = guardProject(p.pid); if (g) return g;
     if (!isOwner(p.pid)) return err(403, 'forbidden', 'Only a project owner can change membership');
@@ -391,7 +393,7 @@ export function createMock(options = {}) {
       if (t.assignee === db.session) mine.push(v);
       if (isOwner(t.project_id) && (role(t.project_id) === 'owner') && ['awaiting-review', 'approved'].includes(t.review_state)) toReview.push(v);
     }
-    return ok({ assigned: mine, to_review: toReview });
+    return ok({ assigned: mine, to_review: toReview, agents: agentsOf(db.session).map((a) => agentView(a, me())) });
   });
   on('GET', '/v1/projects/(?<pid>[\\w-]+)/feedback', (b, p) => guardProject(p.pid) || ok({ items: db.feedback[p.pid].map((f) => ({ ...f, author_name: name(f.author) })), total: db.feedback[p.pid].length, next_cursor: null }));
   on('POST', '/v1/projects/(?<pid>[\\w-]+)/feedback', (b, p) => {
@@ -404,6 +406,48 @@ export function createMock(options = {}) {
     return ok({ ...f, author_name: name(f.author) }, 201);
   });
   on('GET', '/v1/projects/(?<pid>[\\w-]+)/audit', (b, p) => guardProject(p.pid) || (isOwner(p.pid) ? ok({ items: db.audit.filter((a) => a.project_id === p.pid).map((a) => ({ ...a, user_name: name(a.user_id) })), next_cursor: null }) : err(403, 'forbidden', 'Only a project owner can read the audit log')));
+
+  // ---- personal agents (proposed routes; kittrial-5bb.22) ----------------------
+  const RANK = { viewer: 0, contributor: 1, owner: 2 };
+  const agentView = (a, viewer) => {
+    const projectsOf = Object.entries(db.memberships).filter(([pid, m]) => m[a.id] && !db.projects[pid].archived).map(([pid, m]) => ({ id: pid, name: db.projects[pid].name, role: m[a.id] }));
+    const open = db.tasks.filter((t) => t.assignee === a.id && t.status !== 'closed' && !db.projects[t.project_id].archived);
+    const items = [];
+    for (const t of open) {
+      if (t.review_state === 'changes-requested') items.push({ project_id: t.project_id, task_id: t.id, title: t.title, kind: 'feedback', text: `${t.requests.filter((r) => r.status === 'open').length} requested change(s) to address` });
+      else if (t.review_state === 'awaiting-review') items.push({ project_id: t.project_id, task_id: t.id, title: t.title, kind: 'waiting', text: `revision ${t.contribution.revision} waiting for review` });
+      else if (t.review_state !== 'approved') items.push({ project_id: t.project_id, task_id: t.id, title: t.title, kind: 'working', text: 'claimed, no delivery yet' });
+    }
+    const claimable = db.tasks.filter((t) => !t.assignee && t.status === 'open' && projectsOf.some((p) => p.id === t.project_id)).length;
+    const attention = items.some((i) => i.kind === 'feedback') ? 'feedback' : items.some((i) => i.kind === 'working') ? 'working' : items.length ? 'waiting' : 'idle';
+    // The folder path can reveal local usernames: only the owner and superusers see it.
+    const ownerView = Boolean(viewer && (viewer.id === a.agent_of || viewer.superuser));
+    return { id: a.id, display_name: a.display_name, owner_id: a.agent_of, owner_name: name(a.agent_of), tool: a.tool, working_directory: ownerView ? a.working_directory : undefined,
+      last_seen_at: a.last_seen_at || null, projects: projectsOf, items: items.sort((x, y) => (x.kind === 'feedback' ? -1 : y.kind === 'feedback' ? 1 : 0)), attention, claimable, disabled: a.disabled || db.users[a.agent_of].disabled };
+  };
+  const agentsOf = (uid) => Object.values(db.users).filter((u) => u.agent_of === uid);
+  on('GET', '/v1/agents', () => ok({ items: agentsOf(db.session).map((a) => agentView(a, me())) }));
+  on('POST', '/v1/agents', (b) => {
+    const title = String(b.name || '').trim();
+    if (title.length < 2 || title.length > 40) return err(422, 'invalid_payload', 'Agent name must be 2–40 characters');
+    const projectsWanted = Array.isArray(b.projects) ? b.projects : [];
+    for (const pid of projectsWanted) {
+      if (!visible(pid)) return err(404, 'not_found', 'Project not found');
+      if (!(me().superuser || RANK[role(pid)] >= RANK.contributor)) return err(403, 'forbidden', 'You need contributor access to add an agent to ' + db.projects[pid].name);
+    }
+    const id = 'usr_' + (db.seq += 1);
+    const username = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') + '-' + id.slice(4);
+    db.users[id] = { id, username, display_name: title + ' (agent)', superuser: false, disabled: false, created_at: new Date().toISOString(), agent_of: db.session, tool: b.tool || null, working_directory: b.working_directory || null, last_seen_at: null };
+    for (const pid of projectsWanted) db.memberships[pid][id] = 'contributor';
+    log(projectsWanted[0] || null, 'agents.create', null, title);
+    return ok({ agent: agentView(db.users[id], me()), owner_name: me().display_name, server: 'https://orchestra.example.invalid', credential: { id: 'cred_' + (db.seq += 1), secret: 'orc_' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2) } }, 201);
+  });
+  on('PATCH', '/v1/agents/(?<aid>[\\w-]+)', (b, p) => {
+    const a = db.users[p.aid];
+    if (!a || !a.agent_of || (a.agent_of !== db.session && !me().superuser)) return err(404, 'not_found', 'Agent not found');
+    for (const k of ['working_directory', 'tool']) if (b[k] !== undefined) a[k] = String(b[k]).slice(0, 300) || null;
+    return ok(agentView(a, me()));
+  });
 
   // ---- requirements & decisions (proposed read routes) ------------------------
   const R = (pid) => db.requirements && db.requirements[pid];

@@ -8,7 +8,7 @@ const PEOPLE = [
   ['morgan', 'Morgan Ellis', 'superuser'],
   ['priya', 'Priya Raman', 'project owner'],
   ['tomasz', 'Tomasz Nowak', 'contributor'],
-  ['kestrel', 'Kestrel (agent)', 'agent'],
+  ['kestrel', 'Kestrel (agent of Tomasz)', 'agent'],
   ['lena', 'Lena Fischer', 'viewer'],
 ];
 

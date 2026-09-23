@@ -154,7 +154,7 @@ export async function settings(ctx, { pid }) {
             drawMembers();
           });
           return h('tr', null,
-            h('td', null, h('div', { class: 'title' }, m.display_name), h('div', { class: 'sub' }, '@' + m.username, m.disabled ? ' · account disabled' : '')),
+            h('td', null, h('div', { class: 'title' }, m.display_name), h('div', { class: 'sub' }, '@' + m.username, m.agent_of_name ? ' · agent of ' + m.agent_of_name : '', m.disabled ? ' · account disabled' : '')),
             h('td', null, owner ? select : h('span', { class: 'role' }, m.role)),
             owner ? h('td', null, h('button', { type: 'button', class: 'danger', disabled: project.archived, onclick: async (e) => {
               const ok = await confirmDialog({ title: `Remove ${m.display_name}?`, body: 'They lose access to this project immediately, including any worker credentials they issued. Their past contributions stay in the record.', confirmLabel: 'Remove', danger: true });
