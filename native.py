@@ -9,12 +9,15 @@ operator-facing native output and is forwarded verbatim. Everything else that
 would otherwise reach an error message or a log is bounded and redacted:
 
 * a nonzero exit becomes ``Native command failed (<rc>)`` with at most one short
-  diagnostic line, absolute paths replaced, and any longer output withheld behind
-  a line/character count and a content digest;
-* stdout that is not the expected JSON is treated as contamination: short
-  non-JSON lines are re-labelled as ``native stdout note:`` warnings, and a
-  stdout with no JSON at all becomes a labelled error instead of a bare
-  ``JSONDecodeError``.
+  diagnostic line, path-shaped tokens replaced, and any longer output withheld
+  behind a line/character count and a content digest;
+* stdout is classified by one reviewed policy before it becomes a result: the
+  whole stream is decoded first (so an indented document wrapped in warning
+  lines stays one document and never leaks line by line), line mode is used only
+  when every data line is a complete JSON object or array, and standalone
+  scalars or log-record objects are noise;
+* forwarded stdout-noise lines are re-labelled as ``native stdout note:`` and
+  capped (see ``NOISE_LINE_LIMIT``); leftovers are withheld with a digest.
 
 Raw ``bd`` passthrough (the ``bd`` action and ``refresh``) is intentionally
 outside this boundary and returns native output unchanged.
@@ -27,10 +30,38 @@ import subprocess
 DETAIL_LINE_LIMIT = 160
 # Kept as the published name of the detail bound.
 DIAGNOSTIC_LIMIT = DETAIL_LINE_LIMIT
+# At most this many stdout-noise lines are re-labelled individually; the rest
+# are withheld behind one count/digest line.
+NOISE_LINE_LIMIT = 8
 TIMEOUT = 120
 NOISE_PREFIX = 'native stdout note: '
-PATH_TOKEN = re.compile(r'(?:[A-Za-z]:)?[\\/][^\s\'";,]+')
+# A structured result is an object or an array; a bare scalar never is.
+JSON_RESULT_TYPES = (dict, list)
+# A standalone object whose keys are all log-record keys is a log line, not a
+# result row (``{"level": "warn"}``).
+LOG_RECORD_KEYS = frozenset((
+    'level', 'severity', 'time', 'timestamp', 'ts', 'msg', 'message', 'logger',
+    'caller', 'thread', 'module', 'service', 'component', 'pid',
+))
 _JSON = json.JSONDecoder()
+
+# --- path redaction ---------------------------------------------------------
+# One reviewed boundary, applied in order. Each pattern replaces a whole
+# path-shaped token so no private fragment survives in an echoed line:
+# quoted spans, URLs (file:/http:/...), absolute Windows/UNC paths (a quoted or
+# unquoted path with spaces is taken whole up to its last space-free segment),
+# absolute POSIX paths, and relative path tokens that look like a path (>= 2
+# separators, or a dotted final segment). A two-segment token without a dot -
+# an actor like ``alice/session`` - is deliberately left alone.
+_QUOTED_PATH = re.compile(r'(["\'])([^"\']*[\\/][^"\']*)\1')
+_URL = re.compile(r'\b[A-Za-z][A-Za-z0-9+.-]*://[^\s\'";,]+')
+_WIN_SEGMENT = r'[^\s\\/:*?"<>|]+'
+_WIN_DIR = _WIN_SEGMENT + r'(?: ' + _WIN_SEGMENT + r')*'
+_WINDOWS_PATH = re.compile(
+    r'(?:[A-Za-z]:[\\/]|\\\\[^\s\\/]+[\\/])'
+    r'(?:' + _WIN_DIR + r'[\\/])*' + _WIN_SEGMENT)
+_POSIX_PATH = re.compile(r'(?<![\w.-])/[^\s\'";,]+')
+_RELATIVE_PATH = re.compile(r'[A-Za-z0-9._-]+(?:[\\/][A-Za-z0-9._-]+)+')
 
 
 def argv(root, path, actor, command, scoped=True):
@@ -46,9 +77,22 @@ def run(command, env, timeout=TIMEOUT):
                           encoding='utf-8', timeout=timeout)
 
 
+def _relative_path(match):
+    token = match.group(0)
+    last = token.replace('\\', '/').rsplit('/', 1)[-1]
+    if token.count('/') + token.count('\\') >= 2 or '.' in last:
+        return '<path>'
+    return token
+
+
 def redact(text):
-    """Replace absolute paths and cap the length of one echoed diagnostic line."""
-    value = PATH_TOKEN.sub('<path>', str(text)).strip()
+    """Replace path-shaped tokens and cap one echoed diagnostic line."""
+    value = str(text)
+    value = _QUOTED_PATH.sub(r'\1<path>\1', value)
+    value = _URL.sub('<path>', value)
+    value = _WINDOWS_PATH.sub('<path>', value)
+    value = _POSIX_PATH.sub('<path>', value)
+    value = _RELATIVE_PATH.sub(_relative_path, value).strip()
     if len(value) > DETAIL_LINE_LIMIT:
         value = value[:DETAIL_LINE_LIMIT] + '...'
     return value
@@ -85,47 +129,98 @@ def stdout_failure(stdout):
     return 'Native stdout is not JSON (exit 0): %s' % detail(stdout)
 
 
-def _parses(text):
+def _decode_whole(text):
     try:
-        _JSON.decode(text)
-        return True
+        return _JSON.decode(text)
     except ValueError:
-        return False
+        return None
+
+
+def _is_log_record(value):
+    return (isinstance(value, dict) and bool(value)
+            and set(value).issubset(LOG_RECORD_KEYS))
+
+
+def _result_value(text):
+    """The whole text as one JSON object/array result, or None."""
+    value = _decode_whole(text)
+    if isinstance(value, JSON_RESULT_TYPES) and not _is_log_record(value):
+        return value
+    return None
+
+
+def _data_line(line):
+    """Whether one line is a standalone JSON Lines data row."""
+    return _result_value(line.strip()) is not None
+
+
+def _line_starts(text):
+    """Offsets of ``{``/``[`` that begin a line - where native output starts."""
+    for match in re.finditer(r'(?m)^[ \t]*([{\[])', text):
+        yield match.start(1)
+
+
+def _embedded_document(text):
+    """Longest line-anchored JSON object/array plus the noise lines around it."""
+    best = None
+    for start in _line_starts(text):
+        if best is not None and start < best[1]:
+            continue
+        try:
+            value, end = _JSON.raw_decode(text, start)
+        except ValueError:
+            continue
+        if not isinstance(value, JSON_RESULT_TYPES) or _is_log_record(value):
+            continue
+        if best is None or (end - start) > (best[1] - best[0]):
+            best = (start, end)
+    if best is None:
+        return None
+    start, end = best
+    outside = [line for line in (text[:start] + text[end:]).splitlines()
+               if line.strip()]
+    return text[start:end], outside
 
 
 def json_stdout(stdout):
     """Return (json_text, noise_lines) for native stdout.
 
-    ``json_text`` is empty when stdout has no JSON at all. JSON Lines and a
-    single JSON document survive surrounding noise lines; noise is returned so
-    the caller can label it on stderr instead of failing with a decode error.
+    ``json_text`` is empty when stdout carries no result document at all. The
+    whole stream is decoded first, so an indented document wrapped in warning
+    lines is one document rather than a per-line fragment. Line mode (JSON
+    Lines) is used only when every data line is a complete JSON object/array;
+    scalars and log-record objects are noise. Noise is returned so the caller
+    can label it on stderr instead of failing with a decode error.
     """
     text = stdout or ''
     if not text.strip():
         return '', []
-    if _parses(text):
+    if _result_value(text) is not None:
         return text, []
-    clean, noise = [], []
+    data, noise = [], []
     for line in text.splitlines():
         if not line.strip():
             continue
-        (clean if _parses(line) else noise).append(line)
-    if clean:
-        return '\n'.join(clean) + '\n', noise
-    # A pretty-printed document can still carry one warning line around it.
-    starts = [index for index in (text.find('{'), text.find('[')) if index != -1]
-    if starts:
-        start = min(starts)
-        try:
-            _, end = _JSON.raw_decode(text, start)
-        except ValueError:
-            end = None
-        if end is not None:
-            outside = (text[:start] + text[end:]).splitlines()
-            outside = [line for line in outside if line.strip()]
-            if outside:
-                return text[start:end], outside
+        (data if _data_line(line) else noise).append(line)
+    embedded = _embedded_document(text)
+    if embedded is not None:
+        document, outside = embedded
+        # A multi-line document outranks single-line JSON Lines candidates.
+        if not data or '\n' in document:
+            return document, outside
+    if data:
+        return '\n'.join(data) + '\n', noise
     return '', [line for line in text.splitlines() if line.strip()]
+
+
+def _noise_notes(noise, raw):
+    notes = ''
+    for line in noise[:NOISE_LINE_LIMIT]:
+        notes += NOISE_PREFIX + (redact(line) if len(line) <= DETAIL_LINE_LIMIT
+                                 else withheld([line], raw)) + '\n'
+    if len(noise) > NOISE_LINE_LIMIT:
+        notes += NOISE_PREFIX + withheld(noise[NOISE_LINE_LIMIT:], raw) + '\n'
+    return notes
 
 
 def split(completed):
@@ -135,8 +230,5 @@ def split(completed):
     stdout, noise = json_stdout(completed.stdout or '')
     if not stdout.strip() and noise:
         raise ValueError(stdout_failure(completed.stdout or ''))
-    warnings = completed.stderr or ''
-    for line in noise:
-        warnings += NOISE_PREFIX + (redact(line) if len(line) <= DETAIL_LINE_LIMIT
-                                    else withheld([line], completed.stdout or '')) + '\n'
-    return stdout, warnings
+    return stdout, (completed.stderr or '') + _noise_notes(noise,
+                                                           completed.stdout or '')

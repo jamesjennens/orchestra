@@ -49,22 +49,55 @@ structured result:
   not part of the structured-error contract below.
 - **A nonzero exit in a structured command becomes a labelled, bounded error.** The
   message is `Native command failed (<rc>)` plus, at most, one short diagnostic line
-  (<= 160 characters) with absolute paths replaced by `<path>`. Longer output — and
+  (<= 160 characters) with path-shaped tokens replaced by `<path>`. Longer output — and
   any first line that is itself longer than one diagnostic line — is withheld behind
   `[native output withheld: N line(s), M characters, sha256:<12 hex>]`, so an operator
   can correlate with server logs without the payload appearing in the error.
-- **stdout is expected to carry only JSON.** A short non-JSON stdout line (a native
-  warning printed on the wrong stream) is re-labelled as a `native stdout note:` line on
-  `stderr` and the command still succeeds with clean JSON on `stdout`. stdout that
-  contains no JSON at all fails with `Native stdout is not JSON (exit 0)` naming the
-  bounded, redacted first line or the withheld-output label — never a bare
-  `JSONDecodeError`. A pretty-printed JSON document or JSON Lines still parse with a
-  warning line before or after them.
+- **stdout is expected to carry only JSON, and is classified by one policy.** The whole
+  stream is decoded first: when it is one JSON object or array — indented or not — that
+  object/array is the result document, with any non-JSON warning lines before or after
+  it re-labelled on `stderr`. A multi-line document always outranks single-line
+  candidates, so an indented document wrapped in warnings never degrades into the one
+  fragment line that happens to parse alone. Line mode (JSON Lines, one result row per
+  line) is used only when every data line is a complete JSON object or array; a line
+  that is a bare scalar (`42`, `"label"`) or a log-record object
+  (`{"level": "warn"}`, keys drawn only from `level`, `severity`, `time`/`timestamp`/
+  `ts`, `msg`/`message`, `logger`, `caller`, `thread`, `module`, `service`,
+  `component`, `pid`) is noise: it is noted on `stderr`, never kept as a data row.
+  stdout that contains no result document at all — including a lone scalar, a lone log
+  record, or a truncated JSON document — fails with `Native stdout is not JSON
+  (exit 0)` naming the bounded, redacted first line or the withheld-output label —
+  never a bare `JSONDecodeError`. A truncated JSON Lines stream keeps its complete rows
+  and notes the incomplete one.
+- **Forwarded stdout-noise lines are capped.** At most 8 noise lines are re-labelled
+  individually as `native stdout note:`, each redacted or withheld like the diagnostic
+  line; any remaining lines become one `native output withheld` note with a count and
+  digest, so a native flood cannot fill the caller's stderr.
 
 Errors are bounded and labelled. They name the offending field, index or option, but
 they do not echo whole private payloads: attachment bodies, comment text, oversized
 native output and caller-supplied field names are truncated or withheld rather than
 reproduced in the error or in logs.
+
+### Redaction boundary for the one echoed line
+
+The single diagnostic or note line that is echoed has whole path-shaped tokens
+replaced by `<path>`, in this order: quoted spans that contain a path separator
+(`"C:\Users\James Smith\private notes\db.txt"` becomes `"<path>"`), URLs
+(`file:///…`, `https://…`), absolute Windows/UNC paths (spaces inside directory
+segments are kept together, so an unquoted `C:\Users\James Smith\private notes\db.txt`
+is removed whole), absolute POSIX paths, and relative path tokens that look like a
+path (two or more separators, or a dotted final segment, so `data/private/tok.txt`
+becomes `<path>`). A two-segment token without a dot — an actor such as
+`alice/session` — is deliberately left alone; it is an identity, not a path.
+
+This is a reviewed boundary, not complete sanitisation: a *relative* single-segment
+prefix can survive when the token has only one separator and no dot, an unquoted path
+whose last space-containing segment is followed by more text is removed only up to its
+last space-free segment, and other private-looking values (tokens, message bodies)
+are not pattern-matched. The bound that matters is that the echo is one short line and
+that path-shaped tokens lose their whole path, not just a suffix.
+
 
 ## Command help
 
@@ -173,6 +206,7 @@ a clear refusal, not a wrong read.
 | `checkpoint` | item `source`/`evidence` | <= 240 characters |
 | `checkpoint` | whole payload | <= 80 KB canonical bytes |
 | any checkpoint error | listed unknown/missing field names | <= 8 names, each <= 60 characters |
+| forwarded `native stdout note:` lines | individually re-labelled | <= 8; the rest withheld with a count and digest |
 
 Out-of-range values fail with a nonzero exit code and an error that names the option or
 field **and** the limit, for example:

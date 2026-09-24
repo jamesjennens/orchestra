@@ -18,6 +18,7 @@ KIT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(KIT))
 import briefing
 import client
+import coordination
 import native
 import onboarding
 import work
@@ -366,6 +367,194 @@ class NativeStdoutBoundaryTests(unittest.TestCase):
         output, stderr = native.split(completed('{"id": 1}\n', 'Warning: stderr note\n', 0))
         self.assertEqual(stderr, 'Warning: stderr note\n')
         self.assertNotIn('native stdout note', stderr)
+
+
+class NativeDocumentClassificationTests(unittest.TestCase):
+    """One policy at the native boundary: decode the whole result document first.
+
+    An indented document wrapped in warning lines must stay one document, JSON
+    Lines is line mode only when every data line is a complete object/array, and
+    scalars or log-record objects are noise - noted, or rejected when nothing
+    else remains.
+    """
+
+    WARNING = 'warning: beads.role not configured\n'
+    DOC = '''{
+  "id": "kittrial-5bb.7",
+  "title": "T",
+  "description": "PRIVATE-DESC: reviewer-only text",
+  "labels": [
+    "review-ready",
+    "private-label"
+  ]
+}
+'''
+    SHOW = '''[
+  {
+    "id": "kittrial-5bb.7",
+    "description": "PRIVATE-DESC: reviewer-only text",
+    "labels": [
+      "review-ready",
+      "private-label"
+    ]
+  }
+]
+'''
+    OBJECT_TAIL = '''{
+  "available": true,
+  "holder": null,
+  "waiters": [
+    {"actor": "carol/session"}
+  ]
+}
+'''
+    MERGE = '''{
+  "available": true,
+  "holder": null,
+  "task": "kittrial-5bb.7",
+  "description": "PRIVATE-DESC: merge document body",
+  "waiters": [
+    {"actor": "alice/session"},
+    {"available": true, "holder": null}
+  ]
+}
+'''
+
+    def split(self, stdout):
+        return native.split(completed(stdout, '', 0))
+
+    def test_indented_document_with_scalar_line_stays_one_document(self):
+        output, stderr = self.split(self.WARNING + self.DOC)
+        self.assertEqual(json.loads(output), json.loads(self.DOC))
+        self.assertNotEqual(output.strip(), '"private-label"')
+        self.assertNotIn('PRIVATE-DESC', stderr)
+        self.assertEqual(stderr.count(native.NOISE_PREFIX), 1)
+
+    def test_indented_show_document_stays_one_document(self):
+        output, stderr = self.split(self.WARNING + self.SHOW)
+        rows = json.loads(output)
+        self.assertEqual([row['id'] for row in rows], ['kittrial-5bb.7'])
+        self.assertIn('private-label', output)
+        self.assertNotIn('PRIVATE-DESC', stderr)
+
+    def test_one_line_object_tail_does_not_win_over_the_document(self):
+        output, stderr = self.split(self.WARNING + self.OBJECT_TAIL)
+        document = json.loads(output)
+        self.assertTrue(document['available'])
+        self.assertEqual(document['waiters'][0]['actor'], 'carol/session')
+        self.assertNotIn('carol/session', stderr)
+        self.assertEqual(stderr.count(native.NOISE_PREFIX), 1)
+
+    def test_truncated_document_is_rejected_not_taken_as_a_fragment(self):
+        truncated = ('{\n  "id": "t",\n  "labels": [\n'
+                     '    "PRIVATE-LABEL"\n')
+        with self.assertRaises(ValueError) as caught:
+            self.split(self.WARNING + truncated)
+        message = str(caught.exception)
+        self.assertIn('Native stdout is not JSON', message)
+        self.assertNotIn('PRIVATE-LABEL', message)
+
+    def test_json_lines_stream_is_unchanged(self):
+        output, stderr = self.split('{"id": 1}\n{"id": 2}\n')
+        self.assertEqual([json.loads(line)['id'] for line in output.splitlines()],
+                         [1, 2])
+        self.assertEqual(stderr, '')
+
+    def test_merge_check_document_reaches_the_caller_whole(self):
+        warnings = []
+
+        def run(argv):
+            self.assertEqual(argv[:2], ['merge-slot', 'check'])
+            stdout, note = native.split(completed(self.WARNING + self.MERGE, '', 0))
+            if note:
+                warnings.append(note)
+            return stdout
+
+        # merge-check only reads the journal path, so a missing directory is fine.
+        state = coordination.apply_native({'operation': 'merge-check'},
+                                          'alice/session', run,
+                                          Path('merge-context-probe'))
+        self.assertTrue(state['available'])
+        self.assertEqual(state['task'], 'kittrial-5bb.7')
+        self.assertNotIn('PRIVATE-DESC', ''.join(warnings))
+
+
+class NativeNoiseShapeTests(unittest.TestCase):
+    """Noise that happens to be valid JSON is still not result data."""
+
+    def split(self, stdout):
+        return native.split(completed(stdout, '', 0))
+
+    def test_bare_scalar_stdout_is_rejected(self):
+        with self.assertRaises(ValueError) as caught:
+            self.split('42\n')
+        self.assertIn('Native stdout is not JSON', str(caught.exception))
+
+    def test_scalar_noise_is_noted_not_kept_as_a_data_row(self):
+        output, stderr = self.split('42\n{"id": 1}\n')
+        self.assertEqual(json.loads(output), {'id': 1})
+        self.assertIn(native.NOISE_PREFIX + '42', stderr)
+
+    def test_json_log_record_is_noted_not_kept_as_a_data_row(self):
+        output, stderr = self.split('{"level":"warn"}\n{"id": 1}\n')
+        self.assertEqual(json.loads(output), {'id': 1})
+        self.assertIn('level', stderr)
+        self.assertNotIn('level', output)
+
+    def test_lone_json_log_record_is_rejected(self):
+        with self.assertRaises(ValueError) as caught:
+            self.split('{"level":"warn","msg":"nothing to report"}\n')
+        self.assertIn('Native stdout is not JSON', str(caught.exception))
+
+    def test_forwarded_noise_lines_are_capped(self):
+        flood = ''.join('native warning line %02d\n' % index
+                        for index in range(50))
+        output, stderr = self.split('{"id": 1}\n' + flood)
+        self.assertEqual(json.loads(output), {'id': 1})
+        self.assertEqual(stderr.count(native.NOISE_PREFIX),
+                         native.NOISE_LINE_LIMIT + 1)
+        self.assertIn('withheld', stderr)
+        self.assertLess(len(stderr), 1000)
+
+
+class RedactionBoundaryTests(unittest.TestCase):
+    """The echoed diagnostic line drops whole path-shaped tokens."""
+
+    def test_quoted_windows_path_with_spaces_is_removed_whole(self):
+        value = native.redact(
+            r'error: cannot open "C:\Users\James Smith\private notes\db.txt": locked')
+        self.assertNotIn('Smith', value)
+        self.assertNotIn('notes', value)
+        self.assertNotIn('private', value)
+        self.assertIn('<path>', value)
+        self.assertIn('locked', value)
+
+    def test_unquoted_windows_path_with_spaces_keeps_prose(self):
+        value = native.redact(
+            r'error: cannot open C:\Users\James Smith\private notes\db.txt: locked')
+        self.assertNotIn('Smith', value)
+        self.assertNotIn('notes', value)
+        self.assertIn('locked', value)
+
+    def test_relative_path_prefix_is_removed(self):
+        self.assertEqual(native.redact('error: cannot read data/private/tok.txt'),
+                         'error: cannot read <path>')
+
+    def test_actor_like_two_segment_token_is_left_alone(self):
+        text = 'error: actor alice/session is not the current owner'
+        self.assertEqual(native.redact(text), text)
+
+    def test_file_uri_is_removed_whole(self):
+        self.assertEqual(
+            native.redact('error: cannot read file:///c:/Users/James/private/tok.txt'),
+            'error: cannot read <path>')
+
+    def test_posix_absolute_path_is_removed(self):
+        value = native.redact(
+            'error: cannot open /srv/state/projects/trial/.beads/db: locked')
+        self.assertNotIn('/srv/state', value)
+        self.assertIn('<path>', value)
+        self.assertIn('locked', value)
 
 
 class CheckpointFieldNameBoundTests(unittest.TestCase):
