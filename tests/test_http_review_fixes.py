@@ -1644,6 +1644,8 @@ class RealEndpointPreEffectCase(unittest.TestCase):
         (self.root / 'projects' / 'probe' / '.beads').mkdir(parents=True)
         (self.root / 'projects' / 'probe' / '.beads' / 'metadata.json').write_text(
             '{}', encoding='utf-8')
+        (self.root / 'deployment.private.json').write_text(
+            json.dumps({'password': 'probe'}), encoding='utf-8')
         bd = self.root / 'bin' / 'bd'
         bd.write_text('#!/bin/sh\necho \'{"id":"proj-1","title":"x"}\'\nexit 0\n',
                       encoding='utf-8')
