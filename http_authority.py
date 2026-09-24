@@ -666,17 +666,19 @@ def run_guarded(request, journal_path, effect, authority_config=None,
             request_hash = operation_hash(request, trusted)
             entry = journal.lookup(operation_id)
             if entry is not None:
-                if journal.expired(entry):
-                    return _envelope(2, stderr='Operation identity expired: it is older than '
-                                               'the %d second idempotency receipt window. '
-                                               'Reconcile canonical state and use a fresh '
-                                               'operation_id.\n' % journal.retention)
                 if entry.get('principal') != principal:
                     return _envelope(2, stderr='Operation identity belongs to a different '
                                                'principal\n')
                 if entry.get('request_hash') != request_hash:
                     return _envelope(2, stderr='Operation identity reused with a different '
                                                'request\n')
+                if journal.expired(entry):
+                    # Same principal and request, but the receipt window has closed: the
+                    # identity is refused as expired rather than replayed or re-run.
+                    return _envelope(2, stderr='Operation identity expired: it is older than '
+                                               'the %d second idempotency receipt window. '
+                                               'Reconcile canonical state and use a fresh '
+                                               'operation_id.\n' % journal.retention)
                 if entry.get('state') == 'committed':
                     if entry.get('envelope_omitted') or entry.get('envelope') is None:
                         return _envelope(124, stderr='Operation is committed but its response '
