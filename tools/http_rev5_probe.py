@@ -345,6 +345,14 @@ def _http(port, method, path, body=None, token=None):
     return status, data
 
 
+def _http_step(port, method, path, body, expect, token=None):
+    status, data = _http(port, method, path, body, token=token)
+    if status != expect or not isinstance(data, dict):
+        raise RuntimeError('%s %s -> %s %s' % (method, path, status,
+                                               json.dumps(data)[:200]))
+    return data
+
+
 def probe_real_http_service(module, tmp, code_dir):
     if os.name != 'posix':
         return {'skipped': 'endpoint.py imports fcntl; real HTTP service needs POSIX'}
@@ -353,6 +361,9 @@ def probe_real_http_service(module, tmp, code_dir):
     from http_service import EndpointBackend, create_server, MAX_BODY_BYTES
 
     root = _disposable_root(tmp, code_dir)
+    # The endpoint subprocess inherits this environment, and the disposable bd shim
+    # reads it to import the checkout under test.
+    os.environ['REV5_PROBE_CODE_DIR'] = str(code_dir)
     store = Store(tmp / 'service-state.json')
     Service.bootstrap_superuser(store, 'root-admin', 'correct-horse-battery-staple')
     service = Service(store)
@@ -364,25 +375,31 @@ def probe_real_http_service(module, tmp, code_dir):
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     try:
-        status, admin = _http(port, 'POST', '/v1/sessions',
-                              {'username': 'root-admin',
-                               'password': 'correct-horse-battery-staple'})
+        admin = _http_step(port, 'POST', '/v1/sessions',
+                           {'username': 'root-admin',
+                            'password': 'correct-horse-battery-staple'}, 201)
         admin_token = admin['session']['token']
-        _, account = _http(port, 'POST', '/v1/accounts', {'username': 'alex'},
-                           token=admin_token)
-        _http(port, 'POST', '/v1/accounts/%s/password' % account['id'],
-              {'new_password': 'alex-password-1'}, token=admin_token)
-        _, session = _http(port, 'POST', '/v1/sessions',
-                           {'username': 'alex', 'password': 'alex-password-1'})
+        account = _http_step(port, 'POST', '/v1/accounts', {'username': 'alex'}, 201,
+                             token=admin_token)
+        _http_step(port, 'POST', '/v1/accounts/%s/password' % account['id'],
+                   {'new_password': 'alex-password-1'}, 200, token=admin_token)
+        session = _http_step(port, 'POST', '/v1/sessions',
+                             {'username': 'alex', 'password': 'alex-password-1'}, 201)
         token = session['session']['token']
-        _, project = _http(port, 'POST', '/v1/projects',
-                           {'name': 'Probe', 'project_id': 'probe'}, token=token)
-        _, task = _http(port, 'POST', '/v1/projects/probe/tasks', {'title': 'probe task'},
-                        token=token)
-        _http(port, 'POST', '/v1/projects/probe/tasks/%s/claim' % task['id'], {},
-              token=token)
+        project = _http_step(port, 'POST', '/v1/projects',
+                             {'name': 'Probe', 'project_id': 'probe'}, 201, token=token)
+        # The real endpoint.py requires an initialized project directory whose name is a
+        # valid bd project name; project creation is service-local, so materialize the
+        # directory before the first canonical call.
+        project_dir = root / 'projects' / project['id']
+        (project_dir / '.beads').mkdir(parents=True, exist_ok=True)
+        (project_dir / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+        task = _http_step(port, 'POST', '/v1/projects/%s/tasks' % project['id'],
+                          {'title': 'probe task'}, 201, token=token)
+        _http_step(port, 'POST', '/v1/projects/%s/tasks/%s/claim'
+                   % (project['id'], task['id']), {}, 200, token=token)
         approve_status, approve = _http(
-            port, 'POST', '/v1/projects/probe/tasks/%s/reviews' % task['id'],
+            port, 'POST', '/v1/projects/%s/tasks/%s/reviews' % (project['id'], task['id']),
             {'operation': 'approve', 'schema_version': 1, 'previous': None,
              'operation_id': 'op-rev5-http-approve', 'contribution': 'c0ffee1234',
              'summary': 'accepted'}, token=token)
@@ -390,8 +407,7 @@ def probe_real_http_service(module, tmp, code_dir):
         httpd.shutdown()
         httpd.server_close()
         thread.join(timeout=5)
-    observations = {'project': project.get('id') if project else None,
-                    'task': task.get('id') if task else None,
+    observations = {'project': project.get('id'), 'task': task.get('id'),
                     'approve_status': approve_status,
                     'approve_code': (approve or {}).get('error', {}).get('code')}
     closed = approve_status == 422 and observations['approve_code'] == 'invalid_payload'
