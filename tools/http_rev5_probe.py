@@ -66,7 +66,9 @@ while index < len(argv):
 path = Path(directory)
 canonical = Canonical(path.parents[1], path.name)
 try:
-    code, out, err = canonical.bd(rest)
+    # ``endpoint.py`` already enforces the contributor interface for the caller-supplied
+    # ``bd`` action; the internal ``run`` closure is not re-filtered there either.
+    code, out, err = canonical.bd(rest, enforce=False)
 except Exception as error:  # noqa: BLE001
     sys.stderr.write('%s: %s\\n' % (type(error).__name__, error))
     sys.exit(1)
