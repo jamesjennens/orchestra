@@ -214,6 +214,49 @@ def normalize_provenance(p):
 # Backwards-compatible alias used by the work queue.
 parse_provenance=normalize_provenance
 
+def checkpoint_history(issue):
+    """All valid checkpoint payloads for a task, oldest first (native order)."""
+    found=[]
+    for c in issue.get('comments') or []:
+        text=str(c.get('text',''))
+        if not text.startswith(PREFIX):continue
+        try:payload=json.loads(text[len(PREFIX):]);validate_checkpoint(payload,issue['id'],require_digests=False)
+        except (ValueError,TypeError):continue
+        found.append((str(c['id']),payload))
+    return found
+
+def chain_dispositions(payloads):
+    """Authoritative dispositions merged across the whole checkpoint chain.
+
+    Bounding a single payload must never erase an earlier recorded disposition:
+    a resolution retired from the newest record to respect the cap is still
+    authoritative from the checkpoint that recorded it. Newest value wins per
+    entry; a later edit still invalidates via digest mismatch.
+    """
+    merged={}
+    for _cid,payload in payloads:
+        for d in (payload.get('carried') or []):merged[d['id']]=d
+        for d in (payload.get('directions') or []):merged[d['id']]=d
+    return merged
+
+def chain_evidence(payloads):
+    """Retained historical evidence for entry content, merged across the chain.
+
+    Exact digests (fresh in any checkpoint's window) take precedence over the
+    truncated digests older maps retain, so edits recorded at any point in the
+    task's history stay verifiable. Returns (exact, truncated, recorded) where
+    `recorded` is False when no checkpoint ever carried per-entry evidence.
+    """
+    exact={};trunc={};recorded=False
+    for _cid,payload in payloads:
+        prov=normalize_provenance(payload)
+        if prov is None:continue
+        recorded=True
+        for k,v in prov['digests'].items():exact[k]=v
+        for k,v in prov['older'].items():trunc.setdefault(k,v)
+    for k in exact:trunc.pop(k,None)
+    return exact,trunc,recorded
+
 def direction_index(checkpoint_payload):
     """Effective dispositions: server-carried entries plus the caller's own recorded
     request entries, which take precedence. The two are stored separately so an
@@ -305,8 +348,8 @@ def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=No
     if coverage=='unknown':
         note+=' Coverage is UNKNOWN: this checkpoint predates per-entry digests, so reconcile with history before trusting the counts.'
     elif coverage=='windowed':
-        note+=(' Coverage is WINDOWED: '+str(unverified)+' older entries are beyond the recorded digest window, so their current content is unverified and they are excluded from the fresh/changed counts. '
-               'Run "checkpoint '+data['task']+' --verify" for an exact server-side classification of those entries.')
+        note+=(' Coverage is WINDOWED: '+str(unverified)+' older entries have no per-entry evidence recorded by this checkpoint, so their current content is unverified and they are excluded from the fresh/changed counts. '
+               'Run "checkpoint '+data['task']+' --verify" for the classification supported by evidence retained across the task\'s checkpoints (entries no checkpoint ever recorded stay unknown).')
     result={'own_count':len(own),'other_count':len(others),
             'fresh_count':len(fresh),'changed_or_late_count':len(changed_late),
             'unverified_count':unverified,
@@ -350,10 +393,11 @@ def brief(rows,project,task,offset=0,limit=5):
     # and it qualifies the next action even when the activity cursor is current.
     dir_out=None
     if p is not None:
-        outstanding=unresolved_directions(data['entries'],direction_index(p),issue.get('assignee'))
+        dispositions=chain_dispositions(checkpoint_history(issue))
+        outstanding=unresolved_directions(data['entries'],dispositions,issue.get('assignee'))
         dir_out={'total':len(outstanding),
                  'items':[{'entry_id':e['entry_id'],'timestamp':e['timestamp'],'author':clip(e['author'],96),
-                           'state':(direction_index(p).get(e['entry_id']) or {}).get('state','unacknowledged')} for e in outstanding[:NEWER_MAX]],
+                           'state':(dispositions.get(e['entry_id']) or {}).get('state','unacknowledged')} for e in outstanding[:NEWER_MAX]],
                  'omitted':max(0,len(outstanding)-NEWER_MAX)}
         if dir_out['total']:
             ids=', '.join(i['entry_id'][-8:] if False else i['entry_id'] for i in dir_out['items'][:NEWER_MAX])
@@ -362,7 +406,8 @@ def brief(rows,project,task,offset=0,limit=5):
     if p is not None:
         excluded=snapshot(rows,project,task,str(c['id']))
         if p['activity_cursor']!=activity_cursor(excluded):
-            newer=newer_activity_summary(excluded,normalize_provenance(p),c.get('created_at'),issue.get('assignee'),direction_index(p))
+            newer=newer_activity_summary(excluded,normalize_provenance(p),c.get('created_at'),issue.get('assignee'),
+                                         chain_dispositions(checkpoint_history(issue)))
             if review['review_state'] not in review_next:
                 dirs=newer.get('unresolved_directions')
                 dir_note='' if not dirs else '; '+str(dirs['total'])+' outstanding direction(s) not yet resolved/superseded'
@@ -587,34 +632,49 @@ def execute(root,path,project,actor,action,args,attachments,run):
             rows=[json.loads(x) for x in run(['export','--all']).splitlines() if x.strip()]
             issue=task_row(rows,args[0]);current,invalid=checkpoints(issue)
             if invalid:raise ValueError('Malformed checkpoint entries require correction before verification')
-            snap=snapshot(rows,project,args[0],str(current[1]['id']) if current else None);computed=entry_digests(snap)
             if current is None:
+                snap=snapshot(rows,project,args[0]);computed=entry_digests(snap)
                 return json.dumps({'task':args[0],'checkpoint':None,'coverage':'none',
-                                   'fresh':len(computed),'changed':0,'unchanged':0,
+                                   'fresh':len(computed),'changed':0,'unchanged':0,'unverified':0,
                                    'note':'No checkpoint exists; every entry is unincorporated.'},ensure_ascii=False,indent=2)+'\n'
-            recorded=normalize_provenance(current[0])
+            snap=snapshot(rows,project,args[0],str(current[1]['id']));total=len(snap['entries'])
+            exact,trunc,recorded=chain_evidence(checkpoint_history(issue))
+            if not recorded:
+                # No checkpoint ever carried per-entry evidence: nothing can be
+                # claimed as checked. Report unknown coverage rather than fresh.
+                return json.dumps({'task':args[0],'checkpoint':str(current[1]['id']),'coverage':'unknown',
+                                   'fresh':0,'changed':0,'unchanged':0,'unverified':total,
+                                   'verified_entries':0,'recorded_coverage':'unknown',
+                                   'note':'No per-entry evidence is recorded by any checkpoint in this task (legacy records), so no entry can be classified. '
+                                          'Coverage is UNKNOWN: '+str(total)+' entries were NOT checked. Publish a checkpoint to record evidence for the current history; '
+                                          'entries never recorded remain unknown until then (use history/show for manual reconciliation).'},ensure_ascii=False,indent=2)+'\n'
             fresh=changed=unchanged=unverified=0
             changed_ids=[]
+            # A missing ID is genuinely new only when no checkpoint in the chain had
+            # to drop entries from its own evidence (no gap); otherwise it may be
+            # never-recorded history and stays unverified.
+            gap=any((normalize_provenance(payload) or {}).get('covered',0)>(len((normalize_provenance(payload) or {}).get('digests',{}))+len((normalize_provenance(payload) or {}).get('older',{})))
+                    for _cid,payload in checkpoint_history(issue) if normalize_provenance(payload) is not None)
             for e in snap['entries']:
-                verdict='unverified' if recorded is None else classify_entry(e,recorded)
-                if verdict=='changed':
-                    changed+=1;changed_ids.append(e['entry_id'])
-                elif verdict=='incorporated':unchanged+=1
-                elif recorded is not None and recorded['covered']-recorded['verifiable']>0:
-                    # Beyond both recorded bounds: coverage is unknown for this
-                    # entry, so it is reported unverified rather than assumed fresh
-                    # or assumed unchanged.
-                    unverified+=1
+                digest=content_hash(e);eid=e['entry_id']
+                if eid in exact:
+                    if exact[eid]==digest:unchanged+=1
+                    else:changed+=1;changed_ids.append(eid)
+                elif eid in trunc:
+                    if trunc[eid]==digest[:OLDER_DIGEST]:unchanged+=1
+                    else:changed+=1;changed_ids.append(eid)
+                elif gap:unverified+=1
                 else:fresh+=1
             bounded=unverified>0
             return json.dumps({'task':args[0],'checkpoint':str(current[1]['id']),
                                'coverage':'bounded' if bounded else 'verified',
                                'fresh':fresh,'changed':changed,'unchanged':unchanged,'unverified':unverified,
                                'changed_entry_ids':changed_ids[:NEWER_MAX],'changed_omitted':max(0,len(changed_ids)-NEWER_MAX),
-                               'verified_entries':unchanged+changed,'recorded_coverage':'unknown' if recorded is None else ('complete' if recorded['complete'] else 'windowed'),
-                               'note':('Exact server-side classification for the '+str(unchanged+changed)+' entries the checkpoint can re-verify. '
-                                       +('COVERAGE IS BOUNDED: '+str(unverified)+' older entries are beyond both recorded bounds, so their content was NOT checked and they are reported unverified rather than unchanged or fresh. ') if bounded else '')
-                                      +'Actionable path: publish a checkpoint (or run --provenance then checkpoint) to re-anchor the recorded bounds to the current history, after which those entries are verifiable again; until then treat them as unknown.'},ensure_ascii=False,indent=2)+'\n'
+                               'verified_entries':unchanged+changed,'recorded_coverage':'retained-across-chain',
+                               'note':('Checked '+str(unchanged+changed)+' of '+str(total)+' entries against the per-entry evidence retained across this task\'s checkpoints. '
+                                      +('COVERAGE IS BOUNDED: '+str(unverified)+' entries have no recorded evidence anywhere in the chain, so their content was NOT checked and they are reported unverified rather than unchanged or fresh. ' if bounded else '')
+                                      +'There is no shortcut that verifies never-recorded entries: evidence only exists for entries a checkpoint actually recorded. '
+                                      +'To make current entries verifiable going forward, publish a checkpoint; for never-recorded history reconcile manually via history/show.')},ensure_ascii=False,indent=2)+'\n'
         if len(args)!=2 or not args[1].startswith('@attachment:'):raise ValueError('Use checkpoint TASK --file checkpoint.json')
         item=attachments.get(args[1].partition(':')[2],{})
         if item.get('flag') not in ('--file','-f') or not isinstance(item.get('text'),str):raise ValueError('Checkpoint needs a JSON file attachment')

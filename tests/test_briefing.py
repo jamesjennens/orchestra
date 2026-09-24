@@ -516,7 +516,7 @@ class ReviewV4Tests(unittest.TestCase):
                 return '\n'.join(json.dumps(r) for r in data)
             verified = json.loads(b.execute(path, path, PROJECT, 'alice/session', 'checkpoint',
                                             [TASK, '--verify'], {}, run))
-            self.assertEqual(verified['recorded_coverage'], 'windowed')
+            self.assertEqual(verified['recorded_coverage'], 'retained-across-chain')
             self.assertEqual(verified['changed'], 1)
             self.assertEqual(verified['changed_entry_ids'], [f'{TASK}-cc0'])
             self.assertEqual(verified['unchanged'], 250)
@@ -681,7 +681,7 @@ class ReviewV5Tests(unittest.TestCase):
             self.assertEqual(verified['unchanged'], 500)
             self.assertEqual(verified['verified_entries'], 500)
             self.assertIn('NOT checked', verified['note'])
-            self.assertIn('re-anchor', verified['note'])
+            self.assertIn('no shortcut', verified['note'])
         # Brief agrees once activity diverges: unverified, not fresh/other.
         data[0]['title'] = 'A task (retitled)'
         newer = b.brief(data, PROJECT, TASK)['newer']
@@ -744,6 +744,125 @@ class ReviewV5Tests(unittest.TestCase):
                               checkpoint(data, directions=[dict(disposition(0), id=f'{TASK}-cnew', state='acknowledged')]),
                               'alice/session', run)
         self.assertEqual(calls, [])
+
+
+class ReviewV6Tests(unittest.TestCase):
+    """kittrial-5bb.1 review 01a0c72c: persistent resolution, truthful history coverage."""
+
+    def writes(self):
+        calls = []
+        return calls, lambda args: (calls.append(args), json.dumps(dict(id=f'cp{len(calls)}')))[1]
+
+    def save(self, data, cid, payload):
+        """Save a payload; the fake transport returns `cid` so stored ids match the
+        appended comments and the checkpoint chain stays linked."""
+        calls = []
+        def run(args):
+            calls.append(args)
+            return json.dumps(dict(id=cid))
+        result = b.save_checkpoint(data, PROJECT, TASK, payload, 'alice/session', run)
+        if calls: data[0]['comments'].append(comment(cid, calls[-1][3]))
+        return result, calls
+
+    def test_resolutions_persist_beyond_the_latest_payload_cap(self):
+        data = rows()
+        for n in range(3):
+            data[0]['comments'].append(comment(f'dir{n}', f'Direction {n}', '2026-09-16T00:00:00Z',
+                                               author='coordinator/session'))
+        digests = b.snapshot(data, PROJECT, TASK)['entry_digests']
+        head = dict(id=f'{TASK}-cdir0', state='resolved', digest=digests[f'{TASK}-cdir0'],
+                    note='done', evidence='commit a')
+        # 100 resolutions recorded, then one more: the earliest is retired from the
+        # newest payload to respect the cap but must stay authoritatively resolved.
+        first = [dict(head, id=f'{TASK}-cold{n}') for n in range(99)] + [head]
+        self.save(data, 'cp1', checkpoint(data, directions=first))
+        second, _ = self.save(data, 'cp2', checkpoint(data, directions=[
+            dict(head, id=f'{TASK}-cnew1')]))
+        latest = json.loads(data[0]['comments'][-1]['text'][len(b.PREFIX):])
+        recorded_ids={d['id'] for d in (latest['directions'] or [])} | {d['id'] for d in (latest.get('carried') or [])}
+        # Sanity: the retirement really happened in the bound payload...
+        self.assertLess(len(recorded_ids), 101)
+        # ...yet the direction is still known resolved, not unacknowledged: only the
+        # two never-dispositioned directions remain outstanding.
+        result = b.brief(data, PROJECT, TASK)
+        self.assertEqual(result['directions']['total'], 2)
+        self.assertNotIn(f'{TASK}-cdir0', {i['entry_id'] for i in result['directions']['items']})
+        # An unresolved direction still survives, and an edit alone re-flags its own
+        # resolution without disturbing others: dir1 (acknowledged) and dir2
+        # (never dispositioned) were already outstanding; the edited dir0 joins them.
+        self.save(data, 'cp3', checkpoint(data, directions=[
+            dict(id=f'{TASK}-cdir1', state='acknowledged', digest=digests[f'{TASK}-cdir1'])]))
+        self.assertEqual(b.brief(data, PROJECT, TASK)['directions']['total'], 2)
+        idx=next(i for i,c in enumerate(data[0]['comments']) if c['id']=='dir0')
+        data[0]['comments'][idx]['text']='Edited direction'
+        after=b.brief(data, PROJECT, TASK)
+        self.assertEqual(after['directions']['total'], 3)
+        states={i['entry_id']:i['state'] for i in after['directions']['items']}
+        self.assertEqual(states[f'{TASK}-cdir0'], 'resolved')
+        # The accepted records remain bounded and readable.
+        current, invalid = b.checkpoints(data[0])
+        self.assertEqual(invalid, [])
+        self.assertLessEqual(len(b.direction_index(current[0])), b.DIRECTIONS_MAX)
+
+
+    def test_legacy_and_never_recorded_history_are_reported_unknown(self):
+        # A legacy checkpoint with no provenance must not claim verification.
+        data = rows()
+        legacy = dict(schema_version=1, task=TASK, previous=None,
+                      activity_cursor=b.activity_cursor(b.snapshot(data, PROJECT, TASK)),
+                      source_commit='', branch='', intent='i', acceptance='a', summary='s', next_action='n',
+                      open_items=[], resolved=[])
+        data[0]['comments'].append(comment('cp1', b.PREFIX + canonical_bytes(legacy).decode()))
+        data[0]['comments'].append(comment('late', 'Late entry', '2026-09-16T00:00:00Z'))
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)
+            def run(args):
+                return '\n'.join(json.dumps(r) for r in data)
+            verified = json.loads(b.execute(path, path, PROJECT, 'alice/session', 'checkpoint',
+                                            [TASK, '--verify'], {}, run))
+            self.assertEqual(verified['coverage'], 'unknown')
+            self.assertEqual(verified['verified_entries'], 0)
+            self.assertEqual(verified['fresh'], 0)
+            self.assertEqual(verified['unchanged'], 0)
+            self.assertEqual(verified['changed'], 0)
+            self.assertGreater(verified['unverified'], 0)
+            self.assertIn('NOT checked', verified['note'])
+        # With evidence: a 751-entry history where evidence has gaps must not claim
+        # to have verified never-recorded entries, and publishing another checkpoint
+        # does not pretend to either.
+        data = rows()
+        for n in range(750):
+            data[0]['comments'].append(comment(f'c{n}', f'Comment {n}', '2026-09-17T00:00:00Z'))
+        first, _ = self.save(data, 'cpE1', checkpoint(data))
+        # ...and publishing another checkpoint does NOT pretend to verify entries no
+        # checkpoint ever recorded: the count stays honest.
+        self.save(data, 'cpE2', checkpoint(data))
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)
+            def run(args):
+                return '\n'.join(json.dumps(r) for r in data)
+            verified = json.loads(b.execute(path, path, PROJECT, 'alice/session', 'checkpoint',
+                                            [TASK, '--verify'], {}, run))
+            self.assertEqual(verified['coverage'], 'bounded')
+            self.assertGreater(verified['unverified'], 0)
+            self.assertEqual(verified['fresh'], 0)
+            self.assertIn('no shortcut', verified['note'])
+            self.assertIn('NOT checked', verified['note'])
+        # An edit to an entry that IS covered by retained evidence is detected.
+        exact, trunc, _ = b.chain_evidence(b.checkpoint_history(data[0]))
+        cp_ids = {f'{TASK}-c{c["id"]}' for c in data[0]['comments'] if str(c.get('text','')).startswith(b.PREFIX)}
+        covered = next(e['entry_id'] for e in b.snapshot(data, PROJECT, TASK, 'cpE2')['entries']
+                       if (e['entry_id'] in exact or e['entry_id'] in trunc) and e['entry_id'] not in cp_ids)
+        target = next(i for i, c in enumerate(data[0]['comments']) if f'{TASK}-c{c["id"]}' == covered)
+        data[0]['comments'][target]['text'] = 'Edited covered entry'
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)
+            def run(args):
+                return '\n'.join(json.dumps(r) for r in data)
+            verified = json.loads(b.execute(path, path, PROJECT, 'alice/session', 'checkpoint',
+                                            [TASK, '--verify'], {}, run))
+            self.assertGreaterEqual(verified['changed'], 1)
+            self.assertIn(covered, verified['changed_entry_ids'])
 
 
 class HistoryTests(unittest.TestCase):

@@ -20,15 +20,16 @@ def checkpoint_newer_counts(rows,row):
     a checkpoint or with malformed/conflicting checkpoint history (brief remains
     the authority); coverage flags whether counts are proven or unknown."""
     try:
-        from briefing import checkpoints,newer_activity_summary,snapshot,activity_cursor,parse_provenance,direction_index,unresolved_directions
+        from briefing import checkpoints,newer_activity_summary,snapshot,activity_cursor,parse_provenance,chain_dispositions,checkpoint_history,unresolved_directions
         (p,c),_invalid=checkpoints(row)
         if p is None:return None
         excluded=snapshot(rows,'work-queue',row['id'],str(c['id']))
+        dispositions=chain_dispositions(checkpoint_history(row))
         if p['activity_cursor']==activity_cursor(excluded):coverage='current';own=others=0
         else:
-            newer=newer_activity_summary(excluded,parse_provenance(p),c.get('created_at'),row.get('assignee'),direction_index(p))
+            newer=newer_activity_summary(excluded,parse_provenance(p),c.get('created_at'),row.get('assignee'),dispositions)
             own=newer['own_count'];others=newer['other_count'];coverage=newer['coverage']
-        outstanding=len(unresolved_directions(excluded['entries'],direction_index(p),row.get('assignee')))
+        outstanding=len(unresolved_directions(excluded['entries'],dispositions,row.get('assignee')))
         return {'own':own,'others':others,'coverage':coverage,'directions':outstanding}
     except (ValueError,TypeError,KeyError):return None
 
