@@ -25,7 +25,7 @@ from reserved_comments import (check_raw_request, comment_target,
                                first_reserved_label, label_guard_request,
                                operator_only_in_args, raw_file_flag_in_args,
                                reserved_label_in_args)
-from http_authority import AuthorityConfig, run_guarded
+from http_authority import AuthorityConfig, NativeRunner, run_guarded
 
 ALLOWED={'list','show','ready','search','count','create','update','close','reopen','comments','dep','state','lint'}
 # Legacy name kept for operators reading this file; enforcement is the
@@ -116,13 +116,16 @@ def execute(root,request,authority_config=None,require_authority=False):
             stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
             if warnings:run_warnings.append(warnings)
             return stdout
+        # The instrumented runner is the work effect's only route to native state, so
+        # a validation refusal raised before any write is provably pre-effect.
+        runner=NativeRunner(run)
         def work_effect():
-            return {'returncode':0,'stdout':json.dumps(work_execute(path,actor,action,args,request.get('attachments',{}),run),ensure_ascii=False,indent=2)+'\n','stderr':''.join(run_warnings)}
+            return {'returncode':0,'stdout':json.dumps(work_execute(path,actor,action,args,request.get('attachments',{}),runner),ensure_ascii=False,indent=2)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             return run_guarded(request,path/'.http-operations.json',work_effect,
                                authority_config=authority_config,
-                               require_authority=require_authority)
+                               require_authority=require_authority,runner=runner)
     if action in ('onboard','docs'):
         from onboarding import execute as onboard
         return {'returncode':0,'stdout':onboard(Path(__file__).resolve().parent,path,name,actor,action,request.get('args',[])),'stderr':''}
@@ -135,13 +138,14 @@ def execute(root,request,authority_config=None,require_authority=False):
             stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
             if warnings:run_warnings.append(warnings)
             return stdout
+        runner=NativeRunner(run)
         def briefing_effect():
-            return {'returncode':0,'stdout':briefing_execute(root,path,name,actor,action,args,request.get('attachments',{}),run),'stderr':''.join(run_warnings)}
+            return {'returncode':0,'stdout':briefing_execute(root,path,name,actor,action,args,request.get('attachments',{}),runner),'stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             return run_guarded(request,path/'.http-operations.json',briefing_effect,
                                authority_config=authority_config,
-                               require_authority=require_authority)
+                               require_authority=require_authority,runner=runner)
     if action in ('lifecycle','coordinate'):
         args=request.get('args',[])
         if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):raise ValueError('Expected one JSON payload')
@@ -151,17 +155,18 @@ def execute(root,request,authority_config=None,require_authority=False):
             stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
             if warnings:run_warnings.append(warnings)
             return stdout
+        runner=NativeRunner(run)
         def lifecycle_effect():
-            if action=='lifecycle':result=apply_native(payload,actor,run)
+            if action=='lifecycle':result=apply_native(payload,actor,runner)
             else:
                 from coordination import apply_native as coordinate
-                result=coordinate(payload,actor,run,path)
+                result=coordinate(payload,actor,runner,path)
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             return run_guarded(request,path/'.http-operations.json',lifecycle_effect,
                                authority_config=authority_config,
-                               require_authority=require_authority)
+                               require_authority=require_authority,runner=runner)
     if action == 'feedback':
         from feedback import execute as feedback_execute
         args=request.get('args',[])
@@ -228,12 +233,14 @@ def execute(root,request,authority_config=None,require_authority=False):
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             _guard_reserved_labels(root,path,args,actor)
-            def bd_effect():
-                p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*final],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
+            def bd_dispatch(argv):
+                p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*argv],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
                 return {'returncode':p.returncode,'stdout':p.stdout,'stderr':p.stderr}
+            runner=NativeRunner(bd_dispatch)
+            def bd_effect():return runner(final)
             return run_guarded(request,path/'.http-operations.json',bd_effect,
                                authority_config=authority_config,
-                               require_authority=require_authority)
+                               require_authority=require_authority,runner=runner)
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('--root',required=True)

@@ -385,23 +385,61 @@ in server-side configuration rather than request data:
   `operation_id` reused by a *different* principal is a clean conflict (`2`), never a
   replay of another principal's committed envelope; an exact retry by the same
   principal still replays.
-* *Exceptions.* Only an express `PreEffectFailure` releases a reservation. Any other
-  exception (a `subprocess` timeout after the native write, a mid-flow `ValueError`)
-  or non-zero non-validation return code keeps the reservation and reports `124`
-  uncertainty, because the write may already have committed.
+* *Exceptions.* An express `PreEffectFailure`, or a validation/refusal exception
+  (`ValueError`/`KeyError`/`TypeError`/`IndexError`/`UnicodeError`) raised before the
+  effect's first native write, releases the reservation and reports the real error at
+  `rc=2`. Any other exception (a `subprocess` timeout, an `OSError`, a mid-flow error
+  after a write) keeps the reservation and reports `124` uncertainty, because the
+  write may already have committed. The pre-write test is the instrumented
+  `NativeRunner` injected into the effect (`endpoint.py`): it is the effect's only
+  route to `bin/bd`, records whether a mutating invocation was attempted, and treats
+  an unrecognized verb as a write.
 * *Journal bounds.* `.http-operations.json` is bounded by `JOURNAL_LIMIT` entries,
   `MAX_ENVELOPE_BYTES` per retained envelope and `MAX_JOURNAL_BYTES` per document.
-  Nothing is evicted implicitly: at capacity a new guarded mutation fails closed with
-  `124` and no effect. An oversized response envelope is recorded by digest and a
-  retry reports uncertainty instead of returning a truncated result. `prune()` is the
-  only (explicit, operator-invoked) path that removes an identity, and doing so makes
-  an exact retry of a pruned operation repeat its effect.
+  An oversized response envelope is recorded by digest and a retry reports
+  uncertainty instead of returning a truncated result. Retention is a *timed receipt
+  window* (see rev5 below), not an implicit count eviction: live identities are never
+  dropped, and capacity for genuinely new identities still fails closed with `124`.
 * *Affected non-HTTP callers.* `endpoint.py` is also the SSH worker entry. Every SSH
   request that carries an `operation_id`, and every `brief`/`history`/`checkpoint`
   request that passes through the guarded branch, uses the same journal and the same
   bounds; SSH does **not** run the live-authority check (there is no HTTP principal)
   and cannot opt into or out of it from request data. `InProcessBackend` (disposable
   local validation) keeps its own receipt store and is unaffected.
+
+**Current build status (rev5).** Revision 5 answers the three round-5 review requests
+at the same boundary:
+
+* *Pre-effect validation.* Refusals raised by the guarded effects (`work`/`review`/
+  `handoff`/`lifecycle`/`coordinate`/`brief`/`history`/`checkpoint`) before any native
+  write keep `rc=2` and their real message instead of being flattened to a generic
+  `124`, and the operation identity is released so an identical retry re-executes
+  rather than returning `124` forever. Over HTTP this restores the `400 invalid`
+  response for, for example, approve-without-contribution. A failure after a write is
+  unchanged: the identity stays held and the caller sees `124`.
+* *Journal retention.* An identity is a replayable idempotency receipt for
+  `JOURNAL_RETENTION_SECONDS` (default 7 days) after its last touch. Inside that window
+  an exact retry replays a committed envelope or reports uncertainty, and a live
+  reservation is never evicted. Outside the window the identity is *expired*: the
+  endpoint refuses a retry as expired with `rc=2` (never replayed, never re-run) while
+  the record remains, and the record becomes reclaimable. Reclamation runs
+  automatically only under capacity pressure, so a normally busy project reaches the
+  entry limit only with live identities and still fails closed; expired identities are
+  reclaimed instead of locking the project out. The receipt window is the documented
+  limit of the idempotency guarantee: once an expired record has been reclaimed, a
+  retry of that old `operation_id` is indistinguishable from a new operation, so
+  canonical state must be reconciled before reusing it.
+* *Operator tooling.* `admin.py journal PROJECT [--retention SECONDS]
+  [--reclaim-expired] [--prune-before EPOCH]` inspects the journal in place (total,
+  per-state counts, expired/reclaimable count, bytes) and is the explicit recovery
+  path: `--reclaim-expired` compacts closed windows and `--prune-before EPOCH` removes
+  a still-live identity after the operator has reconciled canonical state. Both run
+  under the project coordination lock.
+* *Principal binding.* A request's `authority` descriptor binds the operation identity
+  only when the endpoint was launched with a live-authority store. On the
+  unauthenticated SSH path the descriptor is caller-controlled and is ignored, so an
+  SSH request cannot assert another principal's identity for the journal.
+
 
 Credential issuance is the deliberate exception to replaying a secret. The
 issuance idempotency record stores the credential ID, request hash, status and

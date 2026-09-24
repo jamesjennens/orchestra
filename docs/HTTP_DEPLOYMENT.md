@@ -209,6 +209,42 @@ then cut over explicitly. Rollback is the previous pinned kit revision plus its
 matching state snapshot; restore both together. A state document whose
 `schema_version` is not understood fails closed at startup rather than guessing.
 
+### Operation journal recovery (idempotency receipts)
+
+Each project keeps its idempotency receipts in
+`<PROJECT>/.http-operations.json`: one entry per canonical mutation that carried an
+`operation_id`. An entry stays replayable for the receipt window (default 7 days,
+`http_authority.JOURNAL_RETENTION_SECONDS`). Inside the window an exact retry replays
+the committed response or reports `124` uncertainty; it never repeats the effect.
+
+A busy project does **not** need routine pruning. When the journal reaches
+`JOURNAL_LIMIT` (2000) entries the endpoint reclaims only identities whose receipt
+window has closed; live identities always fail closed with `124`, and expired
+identities are never locked out. An operator only intervenes for inspection or for a
+stuck unknown identity:
+
+```sh
+# inspect: totals, per-state counts, expired/reclaimable count and bytes
+sudo -u <SERVICE_USER> python3 admin.py --root <RUNTIME_ROOT> journal <PROJECT>
+
+# compact closed receipt windows now (safe; expired retries were already refused)
+sudo -u <SERVICE_USER> python3 admin.py --root <RUNTIME_ROOT> journal <PROJECT> --reclaim-expired
+
+# override the window for one inspection/compaction (seconds)
+sudo -u <SERVICE_USER> python3 admin.py --root <RUNTIME_ROOT> journal <PROJECT> \
+    --retention 86400 --reclaim-expired
+
+# explicit override after reconciling canonical state: remove a still-live identity
+sudo -u <SERVICE_USER> python3 admin.py --root <RUNTIME_ROOT> journal <PROJECT> \
+    --prune-before <EPOCH_SECONDS>
+```
+
+`--prune-before` is the only operation that can make an exact retry repeat its
+effect. Reconcile the canonical task/comment state first, then prune that identity,
+then let the client issue a fresh `operation_id`. Every journal command runs under the
+project coordination lock, so it cannot interleave with a live mutation; it is a
+local operator action and is never exposed over HTTP.
+
 ## 9. SSH compatibility
 
 SSH and local transports keep their existing actor/config contract and gain no

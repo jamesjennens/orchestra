@@ -26,6 +26,25 @@ case:
                                      only an explicit prune removes an identity
 11. ``RealEndpointAuthorityCase`` -> the same boundary through the real ``endpoint.py``
                                      SSH/launch entry point (POSIX only)
+
+Round 4 (rev5) adds a class per round-5 request, including the negative cases:
+
+12. ``PreEffectValidationCase``      -> a refusal raised before the effect's first
+                                       native write keeps rc=2 and releases the
+                                       identity; one after a write stays 124
+13. ``JournalRetentionCase``         -> expired receipts are reclaimed instead of
+                                       locking a busy project out; an in-window retry
+                                       replays and an expired retry is refused
+14. ``SshPrincipalClaimCase``        -> an SSH request cannot assert another
+                                       principal for the operation identity
+15. ``PreEffectValidationHttpCase``  -> the canonical refusal is a clean HTTP client
+                                       error again, not UncertainOutcome (503)
+16. ``JournalRetentionHttpCase``     -> a full journal of expired receipts does not
+                                       lock out authenticated HTTP writes
+17. ``RealEndpointPreEffectCase``    -> the same release through real ``endpoint.py``
+                                       (POSIX only)
+18. ``JournalOperatorCommandCase``   -> ``admin.py journal`` inspect/reclaim/prune
+                                       (POSIX only)
 """
 import argparse
 import http.client
@@ -45,8 +64,9 @@ sys.path.insert(0, str(ROOT))
 
 import http_authority
 from http_auth import HttpError, Service, Store
-from http_authority import (AuthorityConfig, JournalFull, OperationJournal,
-                            PreEffectFailure, principal_key, run_guarded)
+from http_authority import (AuthorityConfig, JOURNAL_RETENTION_SECONDS, JournalFull,
+                            NativeRunner, OperationJournal, PreEffectFailure,
+                            is_mutating_invocation, principal_key, run_guarded)
 from http_service import (EndpointBackend, InProcessBackend, UncertainOutcome,
                           build_backend, create_server, MAX_BODY_BYTES)
 
@@ -1336,6 +1356,376 @@ class RealEndpointAuthorityCase(unittest.TestCase):
         self.assertEqual(124, retry['returncode'], retry)
         self.assertEqual(1, calls['n'], 'the native command ran a second time')
         self.assertEqual('committed\n', marker.read_text(encoding='utf-8'))
+
+
+# ==================================================================== round 5
+# The three round-5 review requests. Each class carries the negative case the
+# pre-fix revision exhibited and the fixed behaviour, so it fails on rev4.
+
+def runner_for(invocations=None):
+    """A NativeRunner over a dispatch that records invocations and returns stdout."""
+    calls = [] if invocations is None else invocations
+
+    def dispatch(argv):
+        calls.append(list(argv))
+        return 'ok'
+
+    return NativeRunner(dispatch), calls
+
+
+class PreEffectValidationCase(unittest.TestCase):
+    """1. validation-errors-become-uncertain."""
+
+    def setUp(self):
+        self.tmp = unique_dir('preeffect5-')
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.journal = self.tmp / 'journal.json'
+
+    @staticmethod
+    def _request(operation_id):
+        return {'project': 'p', 'actor': 'a', 'action': 'review',
+                'args': ['task-1', '@attachment:0'], 'operation_id': operation_id}
+
+    def test_refusal_before_any_write_keeps_the_real_error_and_releases(self):
+        runner, calls = runner_for()
+        effects = {'n': 0}
+
+        def effect():
+            effects['n'] += 1
+            runner(['export', '--all'])
+            if effects['n'] == 1:
+                raise ValueError('Invalid attachment')
+            return {'returncode': 0, 'stdout': 'after-release', 'stderr': ''}
+
+        request = self._request('op-refusal')
+        # The pre-fix boundary flattened this to a generic 124 and held the identity,
+        # so an identical retry returned 124 forever.
+        with self.assertRaisesRegex(ValueError, 'Invalid attachment'):
+            run_guarded(request, self.journal, effect, runner=runner)
+        self.assertIsNone(OperationJournal(self.journal).lookup('op-refusal'))
+        self.assertEqual([['export', '--all']], calls)
+        retry = run_guarded(request, self.journal, effect, runner=runner)
+        self.assertEqual(0, retry['returncode'], retry)
+        self.assertEqual(2, effects['n'], 'the released identity did not re-execute')
+
+    def test_refusal_after_a_write_stays_uncertain_and_holds_the_identity(self):
+        runner, _ = runner_for()
+        effects = {'n': 0}
+
+        def effect():
+            effects['n'] += 1
+            runner(['comments', 'add', 'task-1', 'body'])
+            raise ValueError('Owner changed during handoff')
+
+        request = self._request('op-postwrite')
+        first = run_guarded(request, self.journal, effect, runner=runner)
+        self.assertEqual(124, first['returncode'], first)
+        self.assertIn('Owner changed during handoff', first['stderr'])
+        retry = run_guarded(request, self.journal, effect, runner=runner)
+        self.assertEqual(124, retry['returncode'], retry)
+        self.assertEqual(1, effects['n'])
+        self.assertEqual('unknown',
+                         OperationJournal(self.journal).lookup('op-postwrite')['state'])
+
+    def test_an_unrecognized_verb_fails_safe_to_uncertain(self):
+        runner, _ = runner_for()
+
+        def effect():
+            runner(['frobnicate', 'task-1'])
+            raise ValueError('refused after an unknown write verb')
+
+        first = run_guarded(self._request('op-unknown-verb'), self.journal, effect,
+                            runner=runner)
+        self.assertEqual(124, first['returncode'], first)
+        self.assertIsNotNone(OperationJournal(self.journal).lookup('op-unknown-verb'))
+
+    def test_without_a_runner_a_refusal_is_still_uncertain(self):
+        def effect():
+            raise ValueError('unproven refusal')
+
+        result = run_guarded(self._request('op-unproven'), self.journal, effect)
+        self.assertEqual(124, result['returncode'], result)
+        self.assertEqual('unknown',
+                         OperationJournal(self.journal).lookup('op-unproven')['state'])
+
+    def test_verb_classification_treats_unknown_verbs_as_writes(self):
+        self.assertFalse(is_mutating_invocation(['export', '--all']))
+        self.assertFalse(is_mutating_invocation(['show', 'task-1', '--json']))
+        self.assertFalse(is_mutating_invocation(['comments', 'task-1', '--json']))
+        self.assertFalse(is_mutating_invocation(['merge-slot', 'check', '--json']))
+        self.assertTrue(is_mutating_invocation(['comments', 'add', 'task-1', 'body']))
+        self.assertTrue(is_mutating_invocation(['merge-slot', 'acquire', '--holder', 'a']))
+        self.assertTrue(is_mutating_invocation(['update', 'task-1', '--json']))
+        self.assertTrue(is_mutating_invocation(['create', '--title', 'x']))
+        self.assertTrue(is_mutating_invocation(['set-state', 'task-1', 'implemented=passed']))
+        self.assertTrue(is_mutating_invocation([]))
+        self.assertTrue(is_mutating_invocation(['brand-new-verb']))
+
+
+class JournalRetentionCase(unittest.TestCase):
+    """2. journal-capacity-lockout."""
+
+    def setUp(self):
+        self.tmp = unique_dir('retention5-')
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.request = {'project': 'p', 'actor': 'x', 'action': 'bd',
+                        'args': ['create', 'x']}
+
+    def _seed(self, path, count, age):
+        request_hash = http_authority.operation_hash(self.request)
+        principal = principal_key(self.request)
+        moment = time.time() - age
+        data = {}
+        for index in range(count):
+            data['op-fill-%05d' % index] = {
+                'state': 'committed', 'request_hash': request_hash, 'principal': principal,
+                'at': moment - index,
+                'envelope': {'returncode': 0, 'stdout': 'seeded', 'stderr': ''}}
+        path.write_text(json.dumps(data), encoding='utf-8')
+        return data
+
+    def test_a_full_journal_of_live_identities_still_fails_closed(self):
+        path = self.tmp / 'live.json'
+        self._seed(path, http_authority.JOURNAL_LIMIT, age=10)
+        records, effect = ledger()
+        result = run_guarded(dict(self.request, operation_id='op-new'), path, effect)
+        self.assertEqual(124, result['returncode'], result)
+        self.assertEqual([], records)
+
+    def test_expired_identities_are_reclaimed_instead_of_locking_out(self):
+        path = self.tmp / 'expired.json'
+        self._seed(path, http_authority.JOURNAL_LIMIT, age=JOURNAL_RETENTION_SECONDS + 60)
+        records, effect = ledger()
+        result = run_guarded(dict(self.request, operation_id='op-new'), path, effect)
+        # The pre-fix journal returned 124 here until an operator pruned by hand.
+        self.assertEqual(0, result['returncode'], result)
+        self.assertEqual(['ran'], records)
+        self.assertEqual(1, OperationJournal(str(path)).stats()['total'])
+
+    def test_an_in_window_retry_replays_and_never_re_runs(self):
+        path = self.tmp / 'replay.json'
+        records, effect = ledger()
+        request = dict(self.request, operation_id='op-replay')
+        first = run_guarded(request, path, effect)
+        retry = run_guarded(request, path, effect)
+        self.assertEqual(0, first['returncode'], first)
+        self.assertEqual('ran', retry['stdout'])
+        self.assertEqual(['ran'], records)
+
+    def test_an_expired_retry_is_refused_not_replayed_or_re_run(self):
+        path = self.tmp / 'stale.json'
+        request = dict(self.request, operation_id='op-stale')
+        path.write_text(json.dumps({'op-stale': {
+            'state': 'committed', 'request_hash': http_authority.operation_hash(request),
+            'principal': principal_key(request),
+            'at': time.time() - JOURNAL_RETENTION_SECONDS - 60,
+            'envelope': {'returncode': 0, 'stdout': 'stale', 'stderr': ''}}}),
+            encoding='utf-8')
+        records, effect = ledger()
+        result = run_guarded(request, path, effect)
+        self.assertEqual(2, result['returncode'], result)
+        self.assertIn('expired', result['stderr'])
+        self.assertEqual([], records)
+        # The expired record is retained until reclaimed or capacity pressure.
+        self.assertIsNotNone(OperationJournal(str(path)).lookup('op-stale'))
+
+    def test_reclaim_expired_and_stats_are_operator_visible(self):
+        path = self.tmp / 'operator.json'
+        self._seed(path, 3, age=JOURNAL_RETENTION_SECONDS + 60)
+        journal = OperationJournal(str(path))
+        stats = journal.stats()
+        self.assertEqual(3, stats['expired'])
+        self.assertEqual(JOURNAL_RETENTION_SECONDS, stats['retention'])
+        self.assertEqual(3, journal.reclaim_expired())
+        self.assertIsNone(journal.lookup('op-fill-00000'))
+        self.assertEqual(0, journal.stats()['expired'])
+
+    def test_reclaim_expired_keeps_in_window_identities(self):
+        path = self.tmp / 'mixed.json'
+        self._seed(path, 2, age=JOURNAL_RETENTION_SECONDS + 60)
+        request = dict(self.request, operation_id='op-fresh')
+        run_guarded(request, path, lambda: {'returncode': 0, 'stdout': 'ok', 'stderr': ''})
+        journal = OperationJournal(str(path))
+        self.assertEqual(2, journal.reclaim_expired())
+        self.assertIsNotNone(journal.lookup('op-fresh'))
+
+
+class SshPrincipalClaimCase(unittest.TestCase):
+    """3. ssh-can-claim-principal."""
+
+    def setUp(self):
+        self.tmp = unique_dir('sshclaim5-')
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.server_store = self.tmp / 'server-state.json'
+        self.server_store.write_text(json.dumps(authority_state()), encoding='utf-8')
+        self.config = AuthorityConfig(str(self.server_store))
+        self.journal = self.tmp / 'journal.json'
+
+    @staticmethod
+    def _request(actor, operation_id):
+        return {'project': 'p', 'actor': actor, 'action': 'bd', 'args': ['create', 'x'],
+                'operation_id': operation_id,
+                'authority': authority_descriptor('usr_a', 'sess_a')}
+
+    def test_an_ssh_descriptor_cannot_claim_another_principal(self):
+        # The pre-fix boundary read the request's authority block even with no authority
+        # store configured, so an SSH caller could write under another principal's
+        # identity and a later authenticated retry replayed the forged envelope.
+        self.assertEqual('actor:attacker', principal_key(self._request('attacker', 'x')))
+        self.assertEqual('user:usr_a|cred:-|session:sess_a',
+                         principal_key(self._request('attacker', 'x'), True))
+        forged, effect = ledger()
+        first = run_guarded(self._request('attacker', 'op-forged'), self.journal, effect)
+        self.assertEqual(0, first['returncode'], first)
+        self.assertEqual('actor:attacker',
+                         OperationJournal(self.journal).lookup('op-forged')['principal'])
+        # The authenticated HTTP call as the claimed principal is a clean conflict.
+        second = run_guarded(self._request('attacker', 'op-forged'), self.journal, effect,
+                             authority_config=self.config, require_authority=True)
+        self.assertEqual(2, second['returncode'], second)
+        self.assertEqual(1, len(forged))
+
+    def test_a_configured_descriptor_still_binds_the_real_principal(self):
+        records, effect = ledger()
+        result = run_guarded(self._request('attacker', 'op-http'), self.journal, effect,
+                             authority_config=self.config, require_authority=True)
+        self.assertEqual(0, result['returncode'], result)
+        entry = OperationJournal(self.journal).lookup('op-http')
+        self.assertEqual('user:usr_a|cred:-|session:sess_a', entry['principal'])
+
+
+class PreEffectValidationHttpCase(EndpointCase):
+    """1. A canonical pre-write refusal is a client error, not UncertainOutcome."""
+
+    def test_approve_without_a_contribution_is_a_clean_invalid_request(self):
+        alex, project = self.setup_project()
+        task_id = self.create_task(alex, project, 'approve without contribution').data['id']
+        self.assertEqual(200, self.request('POST', '/v1/projects/%s/tasks/%s/claim'
+                                           % (project, task_id), {}, token=alex).status)
+        response = self.request(
+            'POST', '/v1/projects/%s/tasks/%s/reviews' % (project, task_id),
+            {'operation': 'approve', 'schema_version': 1, 'previous': None,
+             'operation_id': 'op-' + secrets.token_hex(6),
+             'contribution': 'c0ffee1234', 'summary': 'accepted'}, token=alex)
+        # rev4 turned this real canonical refusal into UncertainOutcome (503).
+        self.assertEqual(422, response.status, response.data)
+        self.assertEqual('invalid_payload', response.data['error']['code'])
+
+
+class JournalRetentionHttpCase(EndpointCase):
+    """2. A full journal of expired receipts must not lock out HTTP writes."""
+
+    def test_expired_receipts_do_not_lock_out_authenticated_http_writes(self):
+        alex, project = self.setup_project()
+        journal_path = self.canonical_root / project / '.http-operations.json'
+        journal_path.parent.mkdir(parents=True, exist_ok=True)
+        moment = time.time() - JOURNAL_RETENTION_SECONDS - 60
+        data = {}
+        for index in range(http_authority.JOURNAL_LIMIT):
+            data['op-seed-%05d' % index] = {
+                'state': 'committed', 'request_hash': 'seed', 'principal': 'actor:seed',
+                'at': moment - index,
+                'envelope': {'returncode': 0, 'stdout': 'seeded', 'stderr': ''}}
+        journal_path.write_text(json.dumps(data), encoding='utf-8')
+        created = self.create_task(alex, project, 'after a full expired journal')
+        # rev4 refused every authenticated mutation with 503 until an operator pruned.
+        self.assertEqual(201, created.status, created.data)
+
+
+@unittest.skipUnless(os.name == 'posix', 'endpoint.py imports fcntl; POSIX only')
+class RealEndpointPreEffectCase(unittest.TestCase):
+    """1. The refusal and release through the real ``endpoint.py`` entry point."""
+
+    def setUp(self):
+        self.tmp = unique_dir('endpoint5-')
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.root = self.tmp / 'root'
+        (self.root / 'bin').mkdir(parents=True)
+        (self.root / 'projects' / 'probe' / '.beads').mkdir(parents=True)
+        (self.root / 'projects' / 'probe' / '.beads' / 'metadata.json').write_text(
+            '{}', encoding='utf-8')
+        bd = self.root / 'bin' / 'bd'
+        bd.write_text('#!/bin/sh\necho \'{"id":"proj-1","title":"x"}\'\nexit 0\n',
+                      encoding='utf-8')
+        bd.chmod(0o755)
+
+    def _invoke(self, request):
+        completed = subprocess.run([sys.executable, str(ROOT / 'endpoint.py'),
+                                    '--root', str(self.root)],
+                                   input=json.dumps(request), text=True, encoding='utf-8',
+                                   capture_output=True, timeout=60)
+        self.assertFalse(completed.returncode, completed.stderr)
+        return json.loads(completed.stdout)
+
+    def _journal(self):
+        return OperationJournal(str(self.root / 'projects' / 'probe'
+                                    / '.http-operations.json'))
+
+    def test_review_payload_mismatch_keeps_rc_two_and_releases(self):
+        request = {'project': 'probe', 'actor': 'attacker', 'action': 'review',
+                   'args': ['kittrial-1', '@attachment:0'],
+                   'attachments': {'0': {'flag': '--file', 'text': '{}'}},
+                   'operation_id': 'op-real-review'}
+        first = self._invoke(request)
+        self.assertEqual(2, first['returncode'], first)
+        self.assertIn('Payload task mismatch', first['stderr'])
+        self.assertIsNone(self._journal().lookup('op-real-review'))
+        # The identity was released: the identical retry re-executes and refuses again
+        # with the real message rather than returning 124 forever.
+        second = self._invoke(request)
+        self.assertEqual(2, second['returncode'], second)
+        self.assertIn('Payload task mismatch', second['stderr'])
+
+    def test_unknown_work_flag_keeps_rc_two_and_releases(self):
+        request = {'project': 'probe', 'actor': 'attacker', 'action': 'work',
+                   'args': ['--nope'], 'operation_id': 'op-real-work'}
+        first = self._invoke(request)
+        self.assertEqual(2, first['returncode'], first)
+        self.assertIn('unrecognized arguments', first['stderr'])
+        self.assertIsNone(self._journal().lookup('op-real-work'))
+        second = self._invoke(request)
+        self.assertEqual(2, second['returncode'], second)
+
+
+@unittest.skipUnless(os.name == 'posix', 'admin.py operator commands are POSIX only')
+class JournalOperatorCommandCase(unittest.TestCase):
+    """2. The documented operator recovery path for the operation journal."""
+
+    def setUp(self):
+        self.tmp = unique_dir('adminjournal5-')
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.root = self.tmp / 'root'
+        self.project = self.root / 'projects' / 'probe'
+        (self.project / '.beads').mkdir(parents=True)
+        (self.project / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+
+    def _run(self, *extra):
+        completed = subprocess.run([sys.executable, str(ROOT / 'admin.py'),
+                                    '--root', str(self.root), 'journal', 'probe', *extra],
+                                   text=True, encoding='utf-8', capture_output=True, timeout=60)
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        return json.loads(completed.stdout)
+
+    def test_inspect_reclaim_and_prune(self):
+        journal_path = self.project / '.http-operations.json'
+        journal_path.write_text(json.dumps({
+            'op-expired': {'state': 'committed', 'request_hash': 'h',
+                           'principal': 'actor:x',
+                           'at': time.time() - JOURNAL_RETENTION_SECONDS - 60,
+                           'envelope': {'returncode': 0, 'stdout': '', 'stderr': ''}},
+            'op-live': {'state': 'committed', 'request_hash': 'h', 'principal': 'actor:x',
+                        'at': time.time(),
+                        'envelope': {'returncode': 0, 'stdout': '', 'stderr': ''}}}),
+            encoding='utf-8')
+        inspected = self._run()
+        self.assertEqual(2, inspected['stats']['total'])
+        self.assertEqual(1, inspected['stats']['expired'])
+        reclaimed = self._run('--reclaim-expired')
+        self.assertEqual(1, reclaimed['reclaimed'])
+        self.assertEqual(1, reclaimed['stats']['total'])
+        pruned = self._run('--prune-before', str(time.time() + 1))
+        self.assertEqual(1, pruned['pruned'])
+        self.assertEqual(0, pruned['stats']['total'])
 
 
 if __name__ == '__main__':

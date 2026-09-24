@@ -206,12 +206,13 @@ def envelope(code, stdout='', stderr='', **extra):
     return payload
 
 
-def dispatch(canonical, request, tmp):
+def dispatch(canonical, request, tmp, run=None):
     action = request.get('action')
     args = request.get('args') or []
     attachments = request.get('attachments') or {}
     actor = request.get('actor', '')
     project = request['project']
+    run = canonical.run if run is None else run
     if not isinstance(args, list):
         raise ValueError('Expected argument list')
     if action == 'bd':
@@ -226,18 +227,33 @@ def dispatch(canonical, request, tmp):
             raise ValueError('Use checkpoint TASK --file checkpoint.json')
         items = {k: dict(v, path=str(Path(tmp) / k)) for k, v in attachments.items()}
         output = briefing_execute(canonical.root, canonical.path, project, actor, 'checkpoint',
-                                  args, items, canonical.run)
+                                  args, items, run)
         return envelope(0, output)
     if action in ('brief', 'history'):
         from briefing import execute as briefing_execute
         items = {k: dict(v, path=str(Path(tmp) / k)) for k, v in attachments.items()}
         output = briefing_execute(canonical.root, canonical.path, project, actor, action,
-                                  args, items, canonical.run)
+                                  args, items, run)
         return envelope(0, output)
     if action == 'review':
         from work import execute as work_execute
         items = {k: dict(v, path=str(Path(tmp) / k)) for k, v in attachments.items()}
-        result = work_execute(canonical.path, actor, 'review', args, items, canonical.run)
+        result = work_execute(canonical.path, actor, 'review', args, items, run)
+        return envelope(0, json.dumps(result, ensure_ascii=False) + '\n')
+    if action in ('work', 'handoff'):
+        from work import execute as work_execute
+        items = {k: dict(v, path=str(Path(tmp) / k)) for k, v in attachments.items()}
+        result = work_execute(canonical.path, actor, action, args, items, run)
+        return envelope(0, json.dumps(result, ensure_ascii=False) + '\n')
+    if action == 'lifecycle':
+        from lifecycle import apply_native
+        payload = json.loads(args[0]) if args and isinstance(args[0], str) else None
+        result = apply_native(payload, actor, run)
+        return envelope(0, json.dumps(result, ensure_ascii=False) + '\n')
+    if action == 'coordinate':
+        from coordination import apply_native as coordinate
+        payload = json.loads(args[0]) if args and isinstance(args[0], str) else None
+        result = coordinate(payload, actor, run, canonical.path)
         return envelope(0, json.dumps(result, ensure_ascii=False) + '\n')
     raise ValueError('Unknown action')
 
@@ -264,18 +280,27 @@ def main():
             arguments.authority_store:
         config = http_authority.AuthorityConfig(arguments.authority_store,
                                                 arguments.authority_lock)
+    # The instrumented runner is the effect's only route to native state: a refusal
+    # raised before its first write is proven pre-effect and keeps rc=2.
+    run_callable = canonical.run
+    runner = None
+    if http_authority is not None and hasattr(http_authority, 'NativeRunner'):
+        runner = http_authority.NativeRunner(canonical.run)
+        run_callable = runner
     try:
         if http_authority is not None and hasattr(http_authority, 'run_guarded'):
             parameters = inspect.signature(http_authority.run_guarded).parameters
+            kwargs = {}
             if 'authority_config' in parameters:
-                answer = http_authority.run_guarded(
-                    request, journal_path, lambda: dispatch(canonical, request, tmp),
-                    authority_config=config, require_authority=arguments.require_authority)
-            else:
-                answer = http_authority.run_guarded(request, journal_path,
-                                                    lambda: dispatch(canonical, request, tmp))
+                kwargs = {'authority_config': config,
+                          'require_authority': arguments.require_authority}
+            if 'runner' in parameters:
+                kwargs['runner'] = runner
+            answer = http_authority.run_guarded(
+                request, journal_path,
+                lambda: dispatch(canonical, request, tmp, run_callable), **kwargs)
         else:
-            answer = dispatch(canonical, request, tmp)
+            answer = dispatch(canonical, request, tmp, run_callable)
     except Exception as error:  # noqa: BLE001 - report, never traceback
         answer = envelope(2, stderr='%s: %s\n' % (type(error).__name__, error))
     print(json.dumps(answer, ensure_ascii=False))
