@@ -12,9 +12,12 @@ from admin import environment,project_dir,root_path
 from render import render
 from lifecycle import apply_native
 from version import report
-from reserved_comments import check_raw_request, comment_target
+from reserved_comments import (check_raw_request, comment_target,
+                               operator_only_in_args)
 
 ALLOWED={'list','show','ready','search','count','create','update','close','reopen','comments','dep','state','lint'}
+# Legacy name kept for operators reading this file; enforcement is the
+# spelling-aware reserved_comments.operator_only_in_args() below.
 FORBIDDEN={'--directory','-C','--db','--repo','--global','--actor','--author','--profile','--graph','--config','--metadata'}
 FILE_FLAGS={'--body-file','--design-file','--file','-f'}
 
@@ -96,7 +99,10 @@ def execute(root,request):
     args=request.get('args',[])
     if not isinstance(args,list) or not args or any(not isinstance(a,str) or '\0' in a for a in args):raise ValueError('Expected argument list')
     if args[0] not in ALLOWED:raise ValueError('Command is outside the contributor interface; use admin.py for setup/maintenance')
-    if any(a.split('=',1)[0] in FORBIDDEN for a in args):raise ValueError('Connection/identity/file configuration flags are operator-only')
+    # Identity/connection/file flags in every pflag spelling (short, joined,
+    # =value, boolean cluster) are operator-only. `--` ends flag parsing, as in
+    # bd itself, so a body operand after it is not a flag.
+    if operator_only_in_args(args) is not None:raise ValueError('Connection/identity/file configuration flags are operator-only')
     # Positional dep/comment IDs are fine; file inputs must be transported explicitly.
     # Raw comments add bodies (positional and transported file inputs) must not
     # carry forged machine-record prefixes: those records require their

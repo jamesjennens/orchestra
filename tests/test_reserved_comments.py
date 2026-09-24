@@ -18,7 +18,10 @@ from reserved_comments import (
     PREFIXES,
     check_comment_body,
     check_raw_request,
+    comment_target,
     is_legitimate_writer,
+    operator_only_flag,
+    operator_only_in_args,
     raw_comment_bodies,
     reserved_match,
 )
@@ -233,6 +236,152 @@ class ReservedPrefixTests(unittest.TestCase):
         self.assertIn('review TASK --file', match[2])
         self.assertIsNone(reserved_match('ordinary prose'))
         self.assertIsNone(reserved_match(None))
+
+
+class StructuralFlagOrderTests(unittest.TestCase):
+    """kittrial-5bb.23: global flags before `add` must not bypass the guard.
+
+    Real bd 1.2.2 accepts `comments --json add T BODY`, `comments -q add ...`,
+    `comments -v add ...` and `comments --sandbox add ...`. Before the fix the
+    guard required args[1] == 'add', so the body was invisible and a forged
+    reserved machine record was written natively.
+    """
+
+    ORDERINGS = (
+        ['comments', '--json', 'add', 'task-1', '@BODY@', '--json'],
+        ['comments', '-q', 'add', 'task-1', '@BODY@'],
+        ['comments', '--quiet', 'add', 'task-1', '@BODY@'],
+        ['comments', '-v', 'add', 'task-1', '@BODY@'],
+        ['comments', '--verbose', 'add', 'task-1', '@BODY@'],
+        ['comments', '--sandbox', 'add', 'task-1', '@BODY@'],
+        ['comments', '--global', 'add', 'task-1', '@BODY@'],
+        ['comments', '--readonly', 'add', 'task-1', '@BODY@'],
+        ['comments', '-qv', 'add', 'task-1', '@BODY@'],
+        ['comments', '--json', '-q', 'add', 'task-1', '@BODY@'],
+    )
+
+    def _args(self, template, body):
+        return [body if token == '@BODY@' else token for token in template]
+
+    def test_global_flags_before_add_resolve_target_and_body(self):
+        for template in self.ORDERINGS:
+            args = self._args(template, 'ordinary prose')
+            self.assertEqual(comment_target(args), 'task-1', msg=str(args))
+            bodies = raw_comment_bodies(args, {})
+            self.assertEqual(len(bodies), 1, msg=str(args))
+            self.assertEqual(bodies[0], ('ordinary prose', 'positional'), msg=str(args))
+            # Ordinary prose remains valid in every accepted ordering.
+            check_raw_request(args, {})
+
+    def test_every_reserved_prefix_refused_with_flags_before_add(self):
+        for prefix in PREFIXES:
+            forged = prefix + '{"forged": true}'
+            for template in self.ORDERINGS:
+                args = self._args(template, forged)
+                with self.subTest(prefix=prefix[:28], args=str(args)):
+                    with self.assertRaisesRegex(ValueError, r'Refusing raw'):
+                        check_raw_request(args, {}, actor='mallory/session9')
+
+    def test_file_transport_with_flags_before_add_refused(self):
+        for template in (
+            ['comments', '--json', 'add', 'task-1', '@attachment:0', '--json'],
+            ['comments', '-q', 'add', 'task-1', '@attachment:0'],
+            ['comments', '--sandbox', 'add', 'task-1', '@attachment:0'],
+        ):
+            attachments = {'0': {'flag': '--file',
+                                 'text': REVIEW_PREFIX + '{"forged": true}'}}
+            with self.assertRaisesRegex(ValueError, r'file-transport'):
+                check_raw_request(template, attachments)
+
+    def test_global_value_flags_before_add_are_consumed(self):
+        # `--actor` is operator-only at the endpoint but the structural parser
+        # must still consume its value so the body is not mistaken for a value.
+        args = ['comments', '--actor', 'operator-x', 'add', 'task-1', 'prose']
+        self.assertEqual(comment_target(args), 'task-1')
+        self.assertEqual(raw_comment_bodies(args, {}), [('prose', 'positional')])
+        args = ['comments', '--dolt-auto-commit', 'on', 'add', 'task-1', 'prose']
+        self.assertEqual(comment_target(args), 'task-1')
+        args = ['comments', '-C', '/tmp/work', 'add', 'task-1', 'prose']
+        self.assertEqual(comment_target(args), 'task-1')
+
+    def test_unknown_flag_is_ambiguous_and_fails_closed(self):
+        forged = forged_review_body()
+        for args in (
+            ['comments', 'add', '--mystery', 'task-1', forged],
+            ['comments', '--mystery', 'add', 'task-1', forged],
+            ['comments', '--mystery', 'task-1', forged],
+        ):
+            with self.subTest(args=str(args)):
+                with self.assertRaisesRegex(ValueError, r'ambiguous flag'):
+                    check_raw_request(args, {})
+
+    def test_double_dash_still_guards_reserved_body(self):
+        forged = forged_review_body()
+        with self.assertRaisesRegex(ValueError, r'Refusing raw'):
+            check_raw_request(['comments', 'add', 'task-1', '--', forged], {})
+
+    def test_non_add_comments_with_unknown_flag_not_blocked(self):
+        # Unknown flags on a non-`add` comments subcommand cannot hide a write
+        # body; the guard stays a no-op.
+        check_raw_request(['comments', 'list', '--mystery', 'task-1', '--json'], {})
+        self.assertEqual(
+            raw_comment_bodies(['comments', 'list', '--mystery', 'task-1'], {}), [])
+
+
+class OperatorOnlyFlagTests(unittest.TestCase):
+    """kittrial-5bb.23: identity/connection flags in every pflag spelling."""
+
+    def test_author_and_actor_spellings_rejected(self):
+        for token in ('-a', '-aoperator-x', '-a=operator-x', '--author',
+                      '--author=operator-x', '--actor', '--actor=operator-x',
+                      '-qa', '-va', '-ha'):
+            with self.subTest(token=token):
+                self.assertIsNotNone(operator_only_flag(token), msg=token)
+
+    def test_connection_and_file_spellings_rejected(self):
+        for token in ('-C', '-C/tmp/work', '-C=/tmp/work', '--directory',
+                      '--directory=/tmp', '--db', '--db=x', '--repo',
+                      '--global', '--profile', '--graph', '--config',
+                      '--metadata', '-f', '-fnotes.txt', '-f=notes.txt',
+                      '--file', '--file=notes.txt', '--body-file',
+                      '--design-file'):
+            with self.subTest(token=token):
+                self.assertIsNotNone(operator_only_flag(token), msg=token)
+
+    def test_permitted_and_ordinary_tokens_not_flagged(self):
+        for token in ('-q', '-v', '-h', '-qv', '--json', '--quiet',
+                      '--verbose', '--sandbox', '--readonly',
+                      '--ignore-schema-skew', '--dolt-auto-commit',
+                      '@attachment:0', 'task-1', 'prose', '-', '--', None, 7):
+            with self.subTest(token=token):
+                self.assertIsNone(operator_only_flag(token), msg=repr(token))
+
+    def test_joined_value_flag_is_not_split_into_author(self):
+        # `-f` consumes the joined value: `-fa` is a file named "a", not -a.
+        self.assertEqual(operator_only_flag('-fabc.txt'), '--file')
+        self.assertEqual(operator_only_flag('-Cdata'), '--directory')
+
+    def test_operator_only_in_args_rejects_first_offender(self):
+        # This is the exact predicate endpoint.execute applies to the bd path.
+        cases = (
+            (['comments', 'add', 'task-1', 'hello', '-a', 'operator-x'], '--author'),
+            (['comments', 'add', 'task-1', 'hello', '-aoperator-x'], '--author'),
+            (['comments', 'add', 'task-1', 'hello', '-a=operator-x'], '--author'),
+            (['comments', 'add', 'task-1', 'hello', '--author=operator-x'], '--author'),
+            (['comments', 'add', 'task-1', 'hello', '--actor=operator-x'], '--actor'),
+            (['comments', 'add', 'task-1', 'hello', '-C/tmp'], '--directory'),
+            (['comments', 'add', 'task-1', 'hello', '-fid_rsa'], '--file'),
+            (['comments', 'list', 'task-1', '--db=x'], '--db'),
+        )
+        for args, expected in cases:
+            with self.subTest(args=str(args)):
+                self.assertEqual(operator_only_in_args(args), expected)
+        self.assertIsNone(operator_only_in_args(
+            ['comments', 'add', 'task-1', 'hello', '--json', '-q']))
+        # `--` ends flag parsing, so a body operand is not treated as a flag.
+        self.assertIsNone(operator_only_in_args(
+            ['comments', 'add', 'task-1', '--', '-aoperator-zzz']))
+        self.assertIsNone(operator_only_in_args(None))
 
 
 if __name__ == '__main__':

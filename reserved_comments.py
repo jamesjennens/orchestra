@@ -56,31 +56,20 @@ def parse_requirement_record(body):
 
 
 def raw_target(args):
-    """First non-flag token after `comments add`, or None if unresolvable."""
-    if not isinstance(args, list) or len(args) < 2:
+    """First non-flag operand after `comments add`, or None if unresolvable.
+
+    Uses the structural parser, so global flags placed before the `add`
+    subcommand (`comments --json add TASK BODY`) resolve the same target.
+    """
+    parts = _comments_parts(args)
+    if parts is None or parts[0] != 'add':
         return None
-    if args[0] != 'comments' or args[1] != 'add':
-        return None
-    skip_next = False
-    found = False
-    for token in args[2:]:
+    for token in parts[1]:
         if not isinstance(token, str):
             continue
         if token.startswith('@attachment:'):
             continue
-        if skip_next:
-            skip_next = False
-            continue
-        if token in COMMENT_FLAGS_WITH_VALUE:
-            skip_next = True
-            continue
-        if token in COMMENT_NO_VALUE_FLAGS:
-            continue
-        if token.startswith('-') and len(token) > 1:
-            return None
-        if not found:
-            found = True
-            return token
+        return token
     return None
 
 
@@ -101,14 +90,211 @@ RESERVED = (
 PREFIXES = tuple(prefix for prefix, _, _ in RESERVED)
 
 
-# Known native no-value flags (verified against pinned bd --help on koopa).
-# These are skipped when locating the positional body; an unrecognized
-# flag before the body is ambiguous and rejected before any native write.
-COMMENT_NO_VALUE_FLAGS = {
-    '--json', '-h', '--help', '-q', '--quiet', '-v', '--verbose',
-    '--global', '--profile', '--sandbox', '--readonly', '--local-time',
-    '--ignore-schema-skew',
+# ---------------------------------------------------------------------------
+# Structural bd argv parsing.
+#
+# bd (cobra/pflag) accepts global flags before the subcommand, so
+# `comments --json add TASK BODY`, `comments -q add ...`, `comments -v add ...`
+# and `comments --sandbox add ...` are all valid. The old guard assumed
+# args[1] == 'add', so those orderings hid the body from the reserved-prefix
+# check and a forged machine record was written. The tokenizer below locates
+# the subcommand regardless of preceding global flags. Unrecognized flags make
+# the structure ambiguous (an unknown value-taking flag could consume the
+# apparent subcommand or body), so a `comments` invocation that contains one
+# fails closed before any native write.
+#
+# Flag inventory verified against the pinned bd 1.2.2 help output:
+#   global:  --actor --db -C/--directory --dolt-auto-commit --global
+#            --ignore-schema-skew --json --profile -q/--quiet --readonly
+#            --sandbox -v/--verbose -h/--help
+#   comments add: -a/--author -f/--file -h/--help
+# `--local-time` is retained as a tolerated legacy spelling (bd 1.2.2 rejects
+# it natively, so no write results).
+# ---------------------------------------------------------------------------
+
+BD_GLOBAL_BOOL_FLAGS = {
+    '--json', '--quiet', '-q', '--verbose', '-v', '--global',
+    '--ignore-schema-skew', '--readonly', '--sandbox', '--profile',
+    '--help', '-h', '--local-time',
 }
+BD_GLOBAL_VALUE_FLAGS = {
+    '--actor', '--db', '--directory', '-C', '--dolt-auto-commit',
+}
+BD_COMMENT_ADD_BOOL_FLAGS = {'--help', '-h'}
+BD_COMMENT_ADD_VALUE_FLAGS = {'--author', '-a', '--file', '-f'}
+
+# Short flags that take a value (pflag allows -xVALUE and -x=VALUE).
+BD_SHORT_VALUE_FLAGS = frozenset('afC')
+BD_SHORT_BOOL_FLAGS = frozenset('hqv')
+
+
+def _classify_bd_flag(token):
+    """Classify a bd flag token as ('value'|'bool', attached) or None.
+
+    `attached` is True when the value is joined to the flag (`-aX`, `-a=X`,
+    `--author=X`); otherwise the next argv token is the flag's value.
+    """
+    if token.startswith('--'):
+        name, sep, _ = token.partition('=')
+        if name in BD_GLOBAL_VALUE_FLAGS or name in BD_COMMENT_ADD_VALUE_FLAGS:
+            return ('value', bool(sep))
+        if name in BD_GLOBAL_BOOL_FLAGS or name in BD_COMMENT_ADD_BOOL_FLAGS:
+            return ('bool', bool(sep))
+        return None
+    body = token[1:]
+    if not body:
+        return None
+    end = body.find('=')
+    if end != -1:
+        chars, attached = body[:end], True
+    else:
+        chars, attached = body, False
+    for index, ch in enumerate(chars):
+        if ch in BD_SHORT_VALUE_FLAGS:
+            return ('value', attached or index < len(chars) - 1)
+        if ch in BD_SHORT_BOOL_FLAGS:
+            continue
+        return None
+    return ('bool', attached)
+
+
+def _tokenize_bd_args(args):
+    """Split argv into ('positional'|'flag'|'unknown', token) pairs.
+
+    Known flag values are consumed so they are never mistaken for operands;
+    `--` ends flag parsing exactly as pflag does.
+    """
+    tokens = []
+    end_of_flags = False
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if not isinstance(token, str):
+            index += 1
+            continue
+        if end_of_flags:
+            tokens.append(('positional', token))
+            index += 1
+            continue
+        if token == '--':
+            end_of_flags = True
+            index += 1
+            continue
+        if len(token) > 1 and token.startswith('-'):
+            spec = _classify_bd_flag(token)
+            if spec is None:
+                tokens.append(('unknown', token))
+                index += 1
+                continue
+            kind, attached = spec
+            tokens.append(('flag', token))
+            index += 2 if kind == 'value' and not attached else 1
+            continue
+        tokens.append(('positional', token))
+        index += 1
+    return tokens
+
+
+def _comments_parts(args):
+    """Return (subcommand, operands) for a bd `comments` invocation.
+
+    `operands` are the positional tokens after the subcommand, with flag
+    values removed. Returns None when this is not a `comments` command.
+    Raises ValueError when an unrecognized flag could hide the subcommand or
+    body (ambiguous), so no native write can be reached.
+    """
+    if not isinstance(args, list):
+        return None
+    tokens = _tokenize_bd_args(args)
+    positional = [i for i, (kind, _) in enumerate(tokens) if kind == 'positional']
+    if not positional or tokens[positional[0]][1] != 'comments':
+        return None
+    if len(positional) < 2:
+        unknown = [token for kind, token in tokens if kind == 'unknown']
+        if unknown:
+            raise ValueError(
+                'Refusing comments request: ambiguous flag %r before native '
+                'write; the bd command could not be parsed structurally.'
+                % (unknown[0],))
+        return (None, [])
+    sub_index = positional[1]
+    subcommand = tokens[sub_index][1]
+    operands = [tokens[i][1] for i in positional[2:]]
+    unknown = [token for kind, token in tokens if kind == 'unknown']
+    before_subcommand = [
+        token for i, (kind, token) in enumerate(tokens)
+        if kind == 'unknown' and i < sub_index
+    ]
+    if before_subcommand or (subcommand == 'add' and unknown):
+        raise ValueError(
+            'Refusing comments request: ambiguous flag %r before native '
+            'write; the bd command could not be parsed structurally.'
+            % ((before_subcommand or unknown)[0],))
+    return (subcommand, operands)
+
+
+# Operator-only flags: identity/connection/file configuration that a
+# contributor must not set. Matched in every pflag spelling, including the
+# short form (`-a`), joined value (`-aX`, `-C/tmp`), and `=value`
+# (`-a=X`, `--author=X`), plus boolean clusters (`-qa`).
+OPERATOR_ONLY_LONG_FLAGS = {
+    '--directory', '--db', '--repo', '--global', '--actor', '--author',
+    '--profile', '--graph', '--config', '--metadata',
+}
+OPERATOR_ONLY_FILE_FLAGS = {'--file', '--body-file', '--design-file'}
+OPERATOR_ONLY_SHORT_VALUE = {'a': '--author', 'C': '--directory', 'f': '--file'}
+
+
+def operator_only_flag(token):
+    """Canonical operator-only flag name for an argv token, or None.
+
+    Unlike a `token.split('=')[0]` denylist this catches joined short forms:
+    `-a`, `-a operator`, `-aoperator`, `-a=operator`, `-aoperator=...`,
+    `--author=...`, `--actor`, `-C/tmp`, `-qa` (cluster), `-fnotes.txt`.
+    """
+    if not isinstance(token, str) or len(token) < 2 or not token.startswith('-'):
+        return None
+    if token.startswith('--'):
+        name = token.partition('=')[0]
+        if name in OPERATOR_ONLY_LONG_FLAGS or name in OPERATOR_ONLY_FILE_FLAGS:
+            return name
+        return None
+    body = token[1:]
+    end = body.find('=')
+    chars = body[:end] if end != -1 else body
+    for ch in chars:
+        name = OPERATOR_ONLY_SHORT_VALUE.get(ch)
+        if name is not None:
+            return name
+        if ch in BD_SHORT_BOOL_FLAGS:
+            continue
+        return None
+    return None
+
+
+def operator_only_in_args(args):
+    """First operator-only flag in an argv list, or None.
+
+    `--` ends flag parsing exactly as in bd/pflag, so operands after it are
+    ordinary body text, not flags.
+    """
+    if not isinstance(args, list):
+        return None
+    end_of_flags = False
+    for token in args:
+        if token == '--':
+            end_of_flags = True
+            continue
+        if end_of_flags:
+            continue
+        name = operator_only_flag(token)
+        if name is not None:
+            return name
+    return None
+
+
+# Backwards-compatible aliases for the previous flag tables.
+COMMENT_NO_VALUE_FLAGS = BD_GLOBAL_BOOL_FLAGS
 COMMENT_FLAGS_WITH_VALUE = {'-f', '--file'}
 
 
@@ -184,24 +370,22 @@ def raw_comment_bodies(args, attachments):
     """Collect (body, source) pairs from a raw `comments add` request.
 
     Pure helper so the endpoint guard is unit-testable without fcntl.
-    Returns [] for non-`comments add` commands. The positional body is
-    the first non-flag token after `comments add TASK`, so supported
-    flag orderings (e.g. `comments add --json TASK BODY`,
-    `comments add TASK BODY --json`) are covered; `-f/--file` values
-    are consumed as paths, not bodies.
+    Returns [] for non-`comments add` commands. The bd command is parsed
+    structurally, so global flags before `add` (`comments --json add TASK
+    BODY`) and flags anywhere after the operand are handled; `-f/--file`
+    values are consumed as paths, not bodies. An unrecognized flag is
+    ambiguous and rejected before any native write.
     """
-    if not isinstance(args, list) or len(args) < 2:
-        return []
-    if args[0] != 'comments' or args[1] != 'add':
+    parts = _comments_parts(args)
+    if parts is None or parts[0] != 'add':
         return []
     if not isinstance(attachments, dict):
         attachments = {}
     bodies = []
     file_body = None
-    positional = list(args[2:])
     # Transported file inputs arrive as @attachment: tokens.
     remaining = []
-    for token in positional:
+    for token in parts[1]:
         if isinstance(token, str) and token.startswith('@attachment:'):
             key = token.partition(':')[2]
             item = attachments.get(key)
@@ -211,33 +395,11 @@ def raw_comment_bodies(args, attachments):
                     file_body = item['text']
         else:
             remaining.append(token)
-    # Positional body: first non-flag token after `comments add TASK`,
-    # skipping flags and their values. An unrecognized flag before the
-    # body is ambiguous and rejected before any native write.
-    skip_next = False
-    found_task = False
-    for token in remaining:
-        if not isinstance(token, str):
-            continue
-        if skip_next:
-            skip_next = False
-            continue
-        if token in COMMENT_FLAGS_WITH_VALUE:
-            skip_next = True
-            continue
-        if token in COMMENT_NO_VALUE_FLAGS:
-            continue
-        if token.startswith('-') and len(token) > 1:
-            raise ValueError(
-                'Refusing raw positional comment: ambiguous flag %r before '
-                'native write; place the comment body as the first non-flag '
-                'token after `comments add TASK`.' % (token,))
-        if not found_task:
-            found_task = True
-            continue
-        if file_body is None:
+    # Positional body: the second operand after `comments add TASK`.
+    if file_body is None and len(remaining) >= 2:
+        token = remaining[1]
+        if isinstance(token, str):
             bodies.append((token, 'positional'))
-        break
     return bodies
 
 
