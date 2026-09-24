@@ -42,19 +42,17 @@ def _feed_id(path):
     return hashlib.sha256(str(path.absolute()).encode("utf-8")).hexdigest()
 
 
-def _entry_digest(entry):
-    encoded = json.dumps(entry, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
 def _watermark(entries, sequence=None):
     if not entries or sequence == 0:
         return {"sequence": 0, "digest": ""}
-    item = entries[-1] if sequence is None else next(
-        (entry for entry in entries if entry["sequence"] == sequence), None)
-    if item is None:
+    end = entries[-1]["sequence"] if sequence is None else sequence
+    if end > len(entries):
         raise ValueError("Feedback watermark sequence is unavailable")
-    return {"sequence": item["sequence"], "digest": _entry_digest(item)}
+    digest = hashlib.sha256(b"feedback-prefix-v1").digest()
+    for entry in entries[:end]:
+        encoded = json.dumps(entry, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        digest = hashlib.sha256(digest + b"\n" + encoded).digest()
+    return {"sequence": end, "digest": digest.hex()}
 
 
 def _cursor(value, path, current):
@@ -64,13 +62,13 @@ def _cursor(value, path, current):
         data = json.loads(base64.urlsafe_b64decode(value.encode("ascii") + b"==="))
     except (ValueError, UnicodeError, binascii.Error, json.JSONDecodeError):
         raise ValueError("Invalid feedback cursor") from None
-    if (not isinstance(data, dict) or data.get("v") != 3 or data.get("feed_id") != _feed_id(path)
+    if (not isinstance(data, dict) or data.get("v") != 4 or data.get("feed_id") != _feed_id(path)
             or type(data.get("seq")) is not int or data["seq"] < 0
             or not isinstance(data.get("watermark"), dict)):
         raise ValueError("Invalid feedback cursor")
     watermark = data["watermark"]
     if (set(watermark) != {"sequence", "digest"} or type(watermark["sequence"]) is not int
-            or watermark["sequence"] < data["seq"]):
+            or watermark["sequence"] < data["seq"] or not isinstance(watermark["digest"], str)):
         raise ValueError("Invalid feedback cursor")
     anchor = data.get("anchor")
     if (not isinstance(anchor, dict) or set(anchor) != {"sequence", "digest"}
@@ -80,7 +78,7 @@ def _cursor(value, path, current):
     current_watermark = _watermark(current)
     if data["seq"] > current_watermark["sequence"] or watermark["sequence"] > current_watermark["sequence"]:
         raise ValueError("Feedback cursor is ahead of the current feed")
-    if watermark["sequence"] == current_watermark["sequence"] and watermark["digest"] != current_watermark["digest"]:
+    if _watermark(current, watermark["sequence"]) != watermark:
         raise ValueError("Feedback cursor does not match the current feed")
     if data["seq"] == 0:
         if anchor["digest"]:
@@ -94,8 +92,10 @@ def encode_cursor(path, seq, watermark, anchor=None):
     if type(seq) is not int or seq < 0:
         raise ValueError("Invalid feedback sequence")
     if anchor is None:
-        anchor = {"sequence": seq, "digest": watermark.get("digest", "")}
-    raw = json.dumps({"anchor": anchor, "feed_id": _feed_id(path), "seq": seq, "v": 3,
+        if not isinstance(watermark, dict) or watermark.get("sequence") != seq:
+            raise ValueError("A cursor anchor is required when the sequence is before the watermark")
+        anchor = watermark
+    raw = json.dumps({"anchor": anchor, "feed_id": _feed_id(path), "seq": seq, "v": 4,
                       "watermark": watermark},
                      sort_keys=True, separators=(",", ":")).encode("ascii")
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
@@ -159,10 +159,17 @@ def _validate_entry(entry, expected_seq=None):
 def validate_feed_text(text):
     if not isinstance(text, str):
         raise ValueError("Feedback feed must be text")
+    if text == "":
+        return []
+    lines = text.split("\n")
+    if lines[-1] == "":
+        lines.pop()
     previous = 0
     operations = {}
     entries = []
-    for line in text.splitlines():
+    for line in lines:
+        if line.endswith("\r"):
+            line = line[:-1]
         if not line.strip():
             raise ValueError("Feedback feed contains a blank line")
         try:
@@ -196,18 +203,28 @@ def _atomic_replace(path, content):
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
-        try:
-            directory_fd = os.open(str(path.parent), os.O_RDONLY)
-        except OSError:
-            directory_fd = None
-        if directory_fd is not None:
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+        _fsync_directory(path.parent)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def _write_quarantine_temporary(fd, tail):
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(tail)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _fsync_directory(path):
+    try:
+        directory_fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def _quarantine(path, tail):
@@ -218,16 +235,14 @@ def _quarantine(path, tail):
         if quarantine.read_bytes() != tail:
             raise ValueError("Feedback recovery quarantine path already exists")
         return
-    fd = os.open(str(quarantine), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".quarantine", dir=str(path.parent))
     try:
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(tail)
-            stream.flush()
-            os.fsync(stream.fileno())
-    except BaseException:
-        if quarantine.exists():
-            quarantine.unlink()
-        raise
+        _write_quarantine_temporary(fd, tail)
+        os.replace(temporary, quarantine)
+        _fsync_directory(path.parent)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def _read(path):
@@ -237,14 +252,14 @@ def _read(path):
     raw = path.read_bytes()
     if not raw:
         return []
-    if raw.endswith(b"\n") or raw.endswith(b"\r"):
+    if raw.endswith(b"\n"):
         return validate_feed_text(raw.decode("utf-8"))
     try:
         entries = validate_feed_text(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
-        lines = raw.splitlines(keepends=True)
-        prefix = b"".join(lines[:-1])
-        tail = lines[-1] if lines else raw
+        split_at = raw.rfind(b"\n")
+        prefix = raw[:split_at + 1] if split_at >= 0 else b""
+        tail = raw[split_at + 1:] if split_at >= 0 else raw
         entries = validate_feed_text(prefix.decode("utf-8"))
         _quarantine(path, tail)
         _atomic_replace(path, prefix)

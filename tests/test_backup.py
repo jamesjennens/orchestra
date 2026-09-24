@@ -96,23 +96,29 @@ class BackupTests(unittest.TestCase):
 
     def test_feedback_feed_is_backed_up_and_restored_as_private_text(self):
         feed_path = self.source/'.feedback.jsonl'
-        feedback.add(feed_path, 'session-one', {
+        payload = {
             'operation_id': 'backup-op',
             'created_at': '2026-09-19T23:00:00+00:00',
-            'body': 'private',
+            'body': 'private \u0085 \u2028 \u2029 text',
             'source': {'task': 'kittrial-5bb.13', 'version': 'base-1'},
             'evidence': ['test://backup'],
             'triage': {'task': 'kittrial-5bb.13', 'label': 'review'},
             'reminder': {'kind': 'none', 'text': ''},
             'supersedes': None,
-        })
+        }
+        feedback.add(feed_path, 'session-one', payload)
+        self.assertEqual(feedback.list_entries(feed_path)['entries'][0]['body'], payload['body'])
         feed = feed_path.read_text(encoding='utf-8')
         with patch.object(admin, 'run_bd', return_value='synced'):
             admin.backup_project(self.root, 'source')
         data = json.loads(self.bundle.read_text(encoding='utf-8'))
         self.assertEqual(data['files']['.feedback.jsonl'], {'text': feed})
         admin.restore_coordination(self.root, 'source', 'destination')
-        self.assertEqual((self.destination/'.feedback.jsonl').read_text(encoding='utf-8'), feed)
+        restored_path = self.destination/'.feedback.jsonl'
+        self.assertEqual(restored_path.read_text(encoding='utf-8'), feed)
+        restored = feedback.list_entries(restored_path)['entries'][0]
+        self.assertEqual(restored['body'], payload['body'])
+        self.assertTrue(feedback.add(restored_path, 'session-one', payload)['reconciled'])
 
     def test_sidecar_completion_failure_leaves_pending_after_native_success(self):
         real_atomic = coordination.atomic

@@ -32,15 +32,18 @@ bounded live pages with `feedback list --limit 20`, then pass the returned opaqu
 `next_cursor` to `--cursor` while more pages remain; `resume_cursor` is always
 available for polling after a final or empty page. Entries appended after a page are
 visible on resume. Each response includes a durable `watermark`, including final and
-empty pages. Cursors are bound to the project/feed path, the observed end watermark,
-and the digest of the exact resumed prefix; foreign, ahead, rollback, or
-rollback-and-regrow cursors are rejected. Pagination is live rather than a frozen
+empty pages. Cursors are bound to the project/feed path and cumulative digests of
+both the exact resumed prefix and the entire prefix through the observed end
+watermark; foreign, ahead, rollback, or changed-prefix cursors are rejected even
+after later appends. Pagination is live rather than a frozen
 snapshot, so a caller should retain `resume_cursor` for polling. Entries are never
 rewritten. A torn final JSONL record is quarantined idempotently and the validated
 acknowledged prefix remains readable; a valid final record without a newline is
 normalized before append, while a fully newline-terminated invalid record still
-fails visibly. Recovery publishes the validated prefix by atomic replacement, so an
-interrupted recovery cannot truncate acknowledged entries. `reminder.kind` may be
+fails visibly. Quarantine evidence and the recovered prefix are published through
+same-directory atomic replacements; interrupted publication leaves the original
+tail readable for retry. JSONL records split only at LF, so Unicode line separators
+inside JSON strings round-trip normally. `reminder.kind` may be
 `none`, `checkpoint` or `handoff` and is informational only; it never interrupts a
 worker.
 

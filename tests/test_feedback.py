@@ -88,6 +88,36 @@ class FeedbackTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "match the current feed"):
             feedback.list_entries(self.path, cursor=page["next_cursor"])
 
+    def test_cursor_rejects_changes_to_consumed_or_observed_prefix_after_growth(self):
+        for number in range(3):
+            feedback.add(self.path, "session-one", payload("op-%d" % number))
+        page = feedback.list_entries(self.path, limit=1)
+        original = feedback._read(self.path)
+
+        changed_consumed = [dict(entry) for entry in original]
+        changed_consumed[0]["body"] = "changed consumed entry"
+        self.path.write_text("\n".join(
+            json.dumps(item, sort_keys=True, separators=(",", ":"))
+            for item in changed_consumed) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "match the current feed"):
+            feedback.list_entries(self.path, cursor=page["resume_cursor"])
+
+        changed_observed = [dict(entry) for entry in original]
+        changed_observed[1]["body"] = "changed observed but not consumed entry"
+        self.path.write_text("\n".join(
+            json.dumps(item, sort_keys=True, separators=(",", ":"))
+            for item in changed_observed) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "match the current feed"):
+            feedback.list_entries(self.path, cursor=page["resume_cursor"])
+
+        self.path.write_text("\n".join(
+            json.dumps(item, sort_keys=True, separators=(",", ":"))
+            for item in original) + "\n", encoding="utf-8")
+        for number in range(3, 5):
+            feedback.add(self.path, "session-one", payload("op-%d" % number))
+        resumed = feedback.list_entries(self.path, cursor=page["resume_cursor"])
+        self.assertEqual([entry["sequence"] for entry in resumed["entries"]], [2, 3, 4, 5])
+
     def test_append_after_page_is_visible_on_live_resume(self):
         feedback.add(self.path, "session-one", payload("op-1"))
         page = feedback.list_entries(self.path, limit=1)
@@ -114,6 +144,15 @@ class FeedbackTests(unittest.TestCase):
         self.assertEqual(feedback.list_entries(self.path)["entries"], [])
         self.assertEqual(len(list(self.path.parent.glob(self.path.name + ".*.incomplete"))), 1)
 
+    def test_unicode_jsonl_separators_round_trip_and_exact_retry(self):
+        body = "before\u0085middle\u2028line\u2029paragraph"
+        source = payload("unicode-op", body=body)
+        result = feedback.add(self.path, "session-one", source)
+        self.assertEqual(feedback.list_entries(self.path)["entries"][0]["body"], body)
+        retry = feedback.add(self.path, "session-one", source)
+        self.assertTrue(retry["reconciled"])
+        self.assertEqual(result["entry"], retry["entry"])
+
     def test_valid_final_record_without_newline_is_normalized_before_append(self):
         entry = feedback._make_entry(1, "session-one", payload("op-1"), "feedback")
         self.path.write_text(json.dumps(entry, sort_keys=True, separators=(",", ":")), encoding="utf-8")
@@ -132,6 +171,44 @@ class FeedbackTests(unittest.TestCase):
         acknowledged = json.dumps(first, sort_keys=True, separators=(",", ":")).encode("utf-8")
         self.assertTrue(self.path.read_bytes().startswith(acknowledged + b"\n"))
         self.assertIs(feedback._atomic_replace, original)
+
+    def test_quarantine_write_interruption_preserves_feed_and_retries(self):
+        first = feedback.add(self.path, "session-one", payload("op-1"))["entry"]
+        tail = b'{"interrupted":'
+        with self.path.open("ab") as stream:
+            stream.write(tail)
+        original_bytes = self.path.read_bytes()
+
+        def interrupted(fd, content):
+            with feedback.os.fdopen(fd, "wb") as stream:
+                stream.write(content[:3])
+                stream.flush()
+            raise OSError("injected quarantine write interruption")
+
+        with patch.object(feedback, "_write_quarantine_temporary", side_effect=interrupted):
+            with self.assertRaisesRegex(OSError, "injected"):
+                feedback.list_entries(self.path)
+        self.assertEqual(self.path.read_bytes(), original_bytes)
+        self.assertFalse(list(self.path.parent.glob(self.path.name + ".*.incomplete")))
+
+        self.assertEqual(feedback.list_entries(self.path)["entries"], [first])
+        quarantine = next(self.path.parent.glob(self.path.name + ".*.incomplete"))
+        self.assertEqual(quarantine.read_bytes(), tail)
+
+    def test_quarantine_publish_interruption_preserves_tail_and_retries(self):
+        feedback.add(self.path, "session-one", payload("op-1"))
+        tail = b'{"interrupted":'
+        with self.path.open("ab") as stream:
+            stream.write(tail)
+        original_bytes = self.path.read_bytes()
+        with patch.object(feedback.os, "replace", side_effect=OSError("injected quarantine publish interruption")):
+            with self.assertRaisesRegex(OSError, "injected"):
+                feedback.list_entries(self.path)
+        self.assertEqual(self.path.read_bytes(), original_bytes)
+        self.assertFalse(list(self.path.parent.glob(self.path.name + ".*.incomplete")))
+        self.assertEqual(len(feedback.list_entries(self.path)["entries"]), 1)
+        quarantine = next(self.path.parent.glob(self.path.name + ".*.incomplete"))
+        self.assertEqual(quarantine.read_bytes(), tail)
 
     def test_injected_append_failure_recovers_on_exact_retry(self):
         feedback.add(self.path, "session-one", payload("op-1"))
