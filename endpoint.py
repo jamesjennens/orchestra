@@ -16,7 +16,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from admin import environment,project_dir,root_path
+from admin import environment,project_dir,root_path,operators as configured_operators
 import native
 from render import render
 from lifecycle import apply_native
@@ -122,7 +122,8 @@ def execute(root,request,authority_config=None,require_authority=False):
         # a validation refusal raised before any write is provably pre-effect.
         runner=NativeRunner(run)
         def work_effect():
-            return {'returncode':0,'stdout':json.dumps(work_execute(path,actor,action,args,request.get('attachments',{}),runner),ensure_ascii=False,indent=2)+'\n','stderr':''.join(run_warnings)}
+            return {'returncode':0,'stdout':json.dumps(work_execute(path,actor,action,args,request.get('attachments',{}),runner,
+                                                                    operators=configured_operators(root)),ensure_ascii=False,indent=2)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             return run_guarded(request,journal_path(path),work_effect,
@@ -142,7 +143,8 @@ def execute(root,request,authority_config=None,require_authority=False):
             return stdout
         runner=NativeRunner(run)
         def briefing_effect():
-            return {'returncode':0,'stdout':briefing_execute(root,path,name,actor,action,args,request.get('attachments',{}),runner),'stderr':''.join(run_warnings)}
+            return {'returncode':0,'stdout':briefing_execute(root,path,name,actor,action,args,request.get('attachments',{}),runner,
+                                                             operators=configured_operators(root)),'stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             return run_guarded(request,journal_path(path),briefing_effect,

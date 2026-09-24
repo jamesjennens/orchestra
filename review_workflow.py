@@ -213,20 +213,22 @@ def check_void(issue, payload, voided):
                          'malformed, duplicate or conflicting records')
 
 
-def history(issue):
+def history(issue, operators=None):
     """Apply operator voids; return (ordered, voids, invalid, refused, positions).
 
     A well-formed void that would remove a record the surviving history still
     forms is *refused*: it has no effect on the projection and is surfaced as a
     refused recovery instead of making every read on the task fail. `invalid`
-    lists void comments that are malformed, stale, or not bound to their native
-    operator. `positions` maps comment id to native order so a void's position
-    relative to an approval is observable.
+    lists void comments that are malformed, stale, not bound to their native
+    author, or authored by someone outside the server-side operator allowlist
+    `operators` (the endpoint supplies it; None falls back to the host
+    ORCHESTRA_OPERATORS configuration). `positions` maps comment id to native
+    order so a void's position relative to an approval is observable.
 
     Raises when the history cannot be reconciled even after applied voids,
     including when surviving records still reference a voided revision.
     """
-    voids, targets, invalid = recovery.records(issue)
+    voids, targets, invalid = recovery.records(issue, operators)
     applied = {}
     refused = []
     for p, c in voids:
@@ -241,17 +243,27 @@ def history(issue):
     return ordered, list(applied.values()), invalid, refused, positions
 
 
-def apply_void(rows, task, actor, payload, run, operator=False):
+def apply_void(rows, task, actor, payload, run, operator=False, operators=None):
     """Append one operator void record; operator is supplied only by the admin CLI.
 
     The issuing operator is bound into the record so reads can verify native
-    provenance; a payload that names a different operator than the issuing
-    actor is refused before any native mutation.
+    provenance, and the issuing actor must be on the server-side operator
+    allowlist the host supplies (deployment configuration or
+    ORCHESTRA_OPERATORS). A payload that names a different operator than the
+    issuing actor, an actor outside the allowlist, or an unconfigured allowlist
+    is refused before any native mutation.
     """
     if not operator:
         raise ValueError('Operator void records are not authorized over the contributor review transport; '
                          'an operator must use admin.py void-record on the coordination host')
     text(actor, 'actor', 300)
+    authority = recovery.configured_operators(operators)
+    if not authority:
+        raise ValueError('No operator allowlist is configured on the coordination host; add the acting '
+                         'operator to deployment.private.json before recording a void')
+    if actor not in authority:
+        raise ValueError('Actor ' + actor + ' is not a server-side configured operator; only a configured '
+                         'operator may record a void')
     if not isinstance(payload, dict):
         raise ValueError('Invalid operator void record')
     payload = dict(payload)
@@ -262,7 +274,7 @@ def apply_void(rows, task, actor, payload, run, operator=False):
     matches = [r for r in rows if r.get('id') == task]
     if len(matches) != 1 or matches[0].get('issue_type') == 'event':
         raise ValueError('Task missing, duplicated or is an event')
-    issue = matches[0]; voids, targets, _ = recovery.records(issue)
+    issue = matches[0]; voids, targets, _ = recovery.records(issue, operators)
     for p, c in voids:
         if p['operation_id'] == payload['operation_id']:
             if p == payload and c.get('author') == actor:
@@ -388,12 +400,12 @@ def projection(ordered, voids=None, invalid=None, refused=None, positions=None):
                 recoveries=recoveries, warnings=warnings)
 
 
-def project(issue):
-    ordered, voids, invalid, refused, positions = history(issue)
+def project(issue, operators=None):
+    ordered, voids, invalid, refused, positions = history(issue, operators)
     return projection(ordered, voids, invalid, refused, positions)
 
 
-def execute(rows, task, actor, payload, run):
+def execute(rows, task, actor, payload, run, operators=None):
     """Validate, CAS and append once; return receipt and projected review state."""
     if isinstance(payload, dict) and payload.get('operation') == recovery.OPERATION:
         raise ValueError('Operator void records are not accepted over the contributor review transport; '
@@ -402,7 +414,7 @@ def execute(rows, task, actor, payload, run):
     matches = [r for r in rows if r.get('id') == task]
     if len(matches) != 1 or matches[0].get('issue_type') == 'event':
         raise ValueError('Task missing, duplicated or is an event')
-    issue = matches[0]; ordered, voids, invalid, refused, positions = history(issue)
+    issue = matches[0]; ordered, voids, invalid, refused, positions = history(issue, operators)
     state = projection(ordered, voids, invalid, refused, positions)
     effective_state = receipt(state, rows, task)['review_state']
     # Exact retries remain recoverable after ownership changes or later revisions.

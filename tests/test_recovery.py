@@ -2,6 +2,7 @@
 import contextlib
 import io
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -21,6 +22,9 @@ from requirements import canonical_bytes
 TASK = 'trial-task'
 PROJECT = 'trial'
 STAMP = '2026-09-20T00:00:00Z'
+# Server-side operator allowlist used by the read model in these tests. It is
+# deployment configuration, never the void payload's own `operator` string.
+OPERATORS = 'operator ops other'
 
 
 def native(comments):
@@ -63,6 +67,11 @@ def broken_review(cid='c2', text='not-json'):
 
 
 class ReviewRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.env = patch.dict(os.environ, {'ORCHESTRA_OPERATORS': OPERATORS})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
     def run_native(self, data, author='worker'):
         calls = []
 
@@ -284,6 +293,68 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.assertEqual(state['review_state'], 'awaiting-review')
         self.assertEqual(state['recoveries'], [])
 
+    def test_self_authored_void_is_inert_without_server_side_operator_authority(self):
+        # A contributor names their own actor as the payload operator; without a
+        # configured allowlist entry that void has no authority at all.
+        first = review_comment('c1', contribute())
+        second = review_comment('c2', approve('c1', previous='c1'), author='reviewer')
+        forged = void_comment('v1', void('c2', second['text'], operator='worker'), author='worker')
+        state = w.project(native([first, second, forged]))
+        self.assertEqual(state['review_state'], 'awaiting-integration')
+        self.assertEqual(state['recoveries'], [])
+        self.assertIn('v1', ' '.join(state['warnings']))
+        # Nor can it reconcile a malformed record even though actor and payload
+        # operator agree on the contributor's own name.
+        bad = broken_review()
+        data = native([first, bad, void_comment('v2', void('c2', bad['text'], operator='worker'), author='worker')])
+        with self.assertRaisesRegex(ValueError, 'operator reconciliation'):
+            w.project(data)
+
+    def test_configured_operator_allowlist_bounds_void_authors(self):
+        first = review_comment('c1', contribute())
+        bad = broken_review()
+        # 'operator' is not configured here; the same record authored by a
+        # configured 'ops' is accepted.
+        forged = void_comment('v1', void('c2', bad['text'], operator='operator'), author='operator')
+        with self.assertRaisesRegex(ValueError, 'operator reconciliation'):
+            w.project(native([first, bad, forged]), operators=('ops',))
+        allowed = void_comment('v2', void('c2', bad['text'], operator='ops'), author='ops')
+        state = w.project(native([first, bad, allowed]), operators=('ops',))
+        self.assertEqual(state['review_state'], 'awaiting-review')
+        self.assertEqual([r['target'] for r in state['recoveries']], ['c2'])
+        # An unconfigured allowlist authorizes nobody.
+        with self.assertRaisesRegex(ValueError, 'operator reconciliation'):
+            w.project(native([first, bad, allowed]), operators=())
+
+    def test_apply_void_requires_a_server_side_configured_operator(self):
+        bad = broken_review()
+        rows = [native([bad])]
+        calls, run = self.run_native(rows, author='operator')
+        with self.assertRaisesRegex(ValueError, 'No operator allowlist'):
+            w.apply_void(rows, TASK, 'operator', void('c2', bad['text']), run, operator=True, operators=())
+        with self.assertRaisesRegex(ValueError, 'not a server-side configured operator'):
+            w.apply_void(rows, TASK, 'rogue', void('c2', bad['text'], operator='rogue'), run,
+                         operator=True, operators=('operator',))
+        self.assertEqual(calls, [])
+
+    def test_void_must_follow_its_target_in_native_order(self):
+        first = review_comment('c1', contribute())
+        request = review_comment('x', dict(schema_version=1, operation='request-changes', operation_id='rX',
+                                           task=TASK, previous='c1', contribution='c1',
+                                           items=[dict(id='i1', text='fix')]), author='reviewer')
+        approval = review_comment('aB', approve('c1', operation_id='aB', previous='c1'), author='reviewer2')
+        # The void is recorded before the record it targets: it cannot reconcile
+        # the fork, so the conflicting history stays fail-closed.
+        data = native([first, void_comment('V', void('x', request['text'])), approval, request])
+        with self.assertRaisesRegex(ValueError, 'Conflicting or unlinked'):
+            w.project(data)
+        self.assertIn('V', recovery.records(data, OPERATORS)[2])
+        # The same void recorded after its target still applies.
+        data = native([first, approval, request, void_comment('V', void('x', request['text']))])
+        state = w.project(data)
+        self.assertEqual(state['review_state'], 'awaiting-review')
+        self.assertEqual([r['target'] for r in state['recoveries']], ['x'])
+
     def test_voiding_a_malformed_record_cannot_be_resurrected_by_exact_retry(self):
         good = review_comment('c1', contribute())
         bad = broken_review()
@@ -326,6 +397,9 @@ class AdminVoidRecordTests(unittest.TestCase):
             (self.root / 'projects' / 'trial').mkdir(parents=True)
         except OSError as exc:  # confined environments may forbid nested temp directories
             self.skipTest('nested temporary directory unavailable: ' + str(exc))
+        # Server-side operator configuration the host CLI enforces.
+        (self.root / 'deployment.private.json').write_text(
+            json.dumps({'password': 'x', 'unit': 'none', 'operators': ['operator']}), encoding='utf-8')
         self.flock = Mock()
         self.patcher = patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=self.flock, LOCK_EX=2)})
         self.patcher.start()
@@ -343,10 +417,10 @@ class AdminVoidRecordTests(unittest.TestCase):
         self.rows[0]['comments'].append(dict(id='w1', text=argv[3], author='operator', created_at=STAMP))
         return json.dumps({'id': 'w1'})
 
-    def invoke(self, payload):
+    def invoke(self, payload, actor='operator'):
         path = self.root / 'void.json'
         path.write_text(json.dumps(payload), encoding='utf-8')
-        argv = ['admin.py', '--root', str(self.root), 'void-record', 'trial', '--actor', 'operator',
+        argv = ['admin.py', '--root', str(self.root), 'void-record', 'trial', '--actor', actor,
                 '--file', str(path)]
         with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', return_value=self.root), \
                 patch.object(admin, 'run_bd', side_effect=self.native), \
@@ -364,6 +438,27 @@ class AdminVoidRecordTests(unittest.TestCase):
         self.rows = [native([review_comment('c1', contribute())])]
         with self.assertRaisesRegex(ValueError, 'currently form'):
             self.invoke(void('c1', self.rows[0]['comments'][0]['text']))
+        self.assertEqual(self.writes, [])
+
+    def test_deployment_operator_allowlist_is_manageable_and_enforced(self):
+        self.assertEqual(admin.operators(self.root), frozenset({'operator'}))
+
+        def cli(*argv):
+            with patch.object(sys, 'argv', ['admin.py', '--root', str(self.root), *argv]), \
+                    patch.object(admin, 'root_path', return_value=self.root), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                admin.main()
+            return json.loads(out.getvalue())['operators']
+
+        self.assertEqual(cli('operators', 'list'), ['operator'])
+        self.assertEqual(cli('operators', 'add', 'coordinator'), ['operator', 'coordinator'])
+        self.assertEqual(cli('operators', 'remove', 'operator'), ['coordinator'])
+        self.assertEqual(admin.operators(self.root), frozenset({'coordinator'}))
+
+    def test_operator_cli_refuses_an_actor_outside_the_allowlist(self):
+        payload = void('c2', self.rows[0]['comments'][0]['text'], operator='rogue')
+        with self.assertRaisesRegex(ValueError, 'not a server-side configured operator'):
+            self.invoke(payload, actor='rogue')
         self.assertEqual(self.writes, [])
 
     def test_operator_cli_requires_a_task_and_exact_bytes(self):

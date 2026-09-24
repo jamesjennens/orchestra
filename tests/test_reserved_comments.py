@@ -336,6 +336,38 @@ class ReservedPrefixTests(unittest.TestCase):
             check_raw_request(['comments', 'add', '@attachment:0', '--json'],
                               {'0': {'flag': '--file', 'text': body}}, actor='mallory/session9')
 
+    def test_flags_before_add_cannot_hide_a_forged_reserved_body(self):
+        # Native bd accepts global/author flags before `add`; the guard must
+        # resolve `add` past them or a reserved body written that way escapes.
+        body = forged_void_body()
+        for args in (
+            ['comments', '--json', 'add', 'task-1', body],
+            ['comments', '-q', 'add', 'task-1', body],
+            ['comments', '-v', 'add', 'task-1', body],
+            ['comments', '--sandbox', 'add', 'task-1', body],
+            ['comments', '-a', 'operator-x', 'add', 'task-1', body],
+            ['comments', '-aoperator-x', 'add', 'task-1', body],
+        ):
+            bodies = raw_comment_bodies(args, {})
+            self.assertEqual(len(bodies), 1, msg=str(args))
+            self.assertEqual(bodies[0][0], body, msg=str(args))
+            with self.assertRaisesRegex(ValueError, r'operator void', msg=str(args)):
+                check_raw_request(args, {})
+        # A legitimate structured writer is still located and passes when a
+        # global flag precedes `add`.
+        plan = body_for(payload_for('kittrial', 'task-1', 'alice/session1',
+                                    'launch-2', 'cd' * 32, 12, 'plan text\n',
+                                    '/tmp/work', 'ef' * 32))
+        check_raw_request(['comments', '--json', 'add', 'task-1', plan, '--json'], {},
+                          actor='alice/session1')
+        # An ambiguous leading flag before `add` still fails closed.
+        with self.assertRaisesRegex(ValueError, r'ambiguous flag'):
+            check_raw_request(['comments', '--mystery', 'add', 'task-1', body], {})
+        # Residual, tracked by kittrial-5bb.23: `-a` after the body still
+        # forges the native author of an otherwise-ordinary prose comment. This
+        # change does not claim to close that generic `-a` path.
+        check_raw_request(['comments', 'add', 'task-1', 'ordinary prose', '-a', 'operator-x'], {})
+
     def test_reserved_match_names_operation(self):
         match = reserved_match(REVIEW_PREFIX + '{}')
         self.assertIsNotNone(match)

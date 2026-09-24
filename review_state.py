@@ -85,10 +85,17 @@ def scopes_for(rows, task):
     return next((r['scopes'] for r in integration_evidence(rows) if r['id']==task),[])
 
 
-def project(issue, scopes=None):
-    """Raw workflow state plus the effective, integration-aware review state."""
+def project(issue, scopes=None, operators=None):
+    """Raw workflow state plus the effective, integration-aware review state.
+
+    ``operators`` is the void-record operator authority the caller already
+    resolved (the endpoint's deployment allowlist, or admin.py's); it is threaded
+    straight through to the void-aware review projection so an operator void is
+    only applied when its author is on that same allowlist. It adds no new state
+    and defaults to None, which keeps the pre-existing host fallback intact.
+    """
     from review_workflow import project as workflow
-    result=workflow(issue)
+    result=workflow(issue, operators)
     raw=result['review_state']
     if raw=='none' and 'review-ready' in (issue.get('labels') or []):
         result=dict(result,review_state='legacy-review-ready')

@@ -39,6 +39,27 @@ def root_path(value):
 def config(root):
     return json.loads((root/'deployment.private.json').read_text())
 
+def operators(root):
+    """Server-side operator allowlist for void records.
+
+    Deployment configuration (`deployment.private.json`'s `operators`) plus the
+    host `ORCHESTRA_OPERATORS` environment variable. Only these actors may
+    author an operator void: the endpoint supplies this set to every read and
+    the host `void-record` command refuses any other actor. A deployment that
+    configures no operators authorizes nobody, so a forged or self-authored
+    void comment is inert. This is not read from the void payload.
+    """
+    found=[]
+    marker=root/'deployment.private.json'
+    if marker.is_file():
+        value=json.loads(marker.read_text()).get('operators')
+        if isinstance(value,list):found.extend(value)
+        elif isinstance(value,str):found.append(value)
+        elif value is not None:raise ValueError('deployment operators must be a list of actor identities')
+    found.extend((os.environ.get('ORCHESTRA_OPERATORS') or '').replace(',',' ').split())
+    from recovery import configured_operators
+    return configured_operators(found)
+
 def environment(root):
     env=os.environ.copy()
     env.update({'PATH':str(root/'bin')+os.pathsep+env.get('PATH',''),
@@ -443,6 +464,7 @@ def main():
     a.add_argument('--issue-id',dest='issue_id',default=None,
                    help='with --disposition complete, the exact native record to confirm')
     a=sub.add_parser('void-record');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('operators');a.add_argument('action',choices=['list','add','remove']);a.add_argument('actor',nargs='?')
     for command in ('backup','restore-new'):
         a=sub.add_parser(command);a.add_argument('project')
         if command=='restore-new':a.add_argument('destination')
@@ -536,11 +558,29 @@ def main():
         path=project_dir(root,args.project)
         payload=json.loads(Path(args.file).read_text(encoding='utf-8-sig'))
         if not isinstance(payload,dict) or not isinstance(payload.get('task'),str):raise ValueError('Void record payload must name its task')
+        authority=operators(root)
         def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             rows=[json.loads(line) for line in run_bd(root,args.project,['export','--all']).splitlines() if line.strip()]
-            print(json.dumps(apply_void(rows,payload['task'],args.actor,payload,run,operator=True)))
+            print(json.dumps(apply_void(rows,payload['task'],args.actor,payload,run,operator=True,operators=authority)))
+    elif args.command=='operators':
+        marker=root/'deployment.private.json'
+        if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
+        from recovery import identity
+        cfg=config(root)
+        current=list(cfg.get('operators') or [])
+        if args.action=='list':print(json.dumps({'operators':current}));return
+        if not args.actor:raise ValueError('operators '+args.action+' requires an actor identity')
+        actor=identity(args.actor,'Invalid operator identity')
+        if args.action=='add':
+            if actor not in current:current.append(actor)
+        elif actor in current:current.remove(actor)
+        if current:cfg['operators']=current
+        else:cfg.pop('operators',None)
+        fd=os.open(marker,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
+        with os.fdopen(fd,'w') as f:json.dump(cfg,f)
+        print(json.dumps({'operators':current}))
     elif args.command=='backup':print(backup_project(root,args.project))
     elif args.command=='journal':
         import fcntl
