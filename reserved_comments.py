@@ -127,6 +127,72 @@ BD_COMMENT_ADD_VALUE_FLAGS = {'--author', '-a', '--file', '-f'}
 BD_SHORT_VALUE_FLAGS = frozenset('afC')
 BD_SHORT_BOOL_FLAGS = frozenset('hqv')
 
+# Per-command shorthand inventory, verified against the pinned bd 1.2.2 help
+# output. A `bool` shorthand never takes a value; a `value` shorthand consumes
+# the rest of the cluster (`-n5`) or the next argv token (`-n 5`). A shorthand
+# not listed for the command is ambiguous and fails closed, so an unknown
+# boolean shorthand can no longer smuggle an operator-only shorthand such as
+# `-C` past the guard (`list -rC`, `ready -uC`).
+BD_GLOBAL_SHORT_FLAGS = {'C': 'value', 'h': 'bool', 'q': 'bool',
+                         'v': 'bool', 'V': 'bool'}
+BD_COMMAND_SHORT_FLAGS = {
+    'comments': {'add': {'a': 'value', 'f': 'value', 'h': 'bool'}},
+    'list': {'a': 'value', 'l': 'value', 'n': 'value', 'p': 'value',
+             'r': 'bool', 's': 'value', 't': 'value', 'w': 'bool'},
+    'show': {'w': 'bool'},
+    'ready': {'a': 'value', 'l': 'value', 'n': 'value', 'p': 'value',
+              's': 'value', 't': 'value', 'u': 'bool'},
+    'search': {'a': 'value', 'l': 'value', 'n': 'value', 's': 'value',
+               't': 'value', 'r': 'bool'},
+    'count': {'a': 'value', 'l': 'value', 'p': 'value', 's': 'value',
+              't': 'value'},
+    'create': {'a': 'value', 'd': 'value', 'e': 'value', 'f': 'value',
+               'l': 'value', 'p': 'value', 't': 'value'},
+    'update': {'a': 'value', 'd': 'value', 'e': 'value', 'p': 'value',
+               's': 'value', 't': 'value'},
+    'close': {'f': 'bool', 'r': 'value'},
+    'reopen': {'r': 'value'},
+    'dep': {'b': 'value'},
+    'state': {},
+    'lint': {'s': 'value', 't': 'value'},
+}
+
+
+def _short_flag_table(command, subcommand=None):
+    """Shorthand table for a bd command, or None without command context.
+
+    Without command context callers get the conservative command-agnostic
+    union (`a`/`f`/`C` are operator-only), which is what the helper tests
+    exercise.
+    """
+    if command is None:
+        return None
+    table = dict(BD_GLOBAL_SHORT_FLAGS)
+    if command == 'comments':
+        table.update(BD_COMMAND_SHORT_FLAGS['comments'].get(subcommand) or {})
+    else:
+        table.update(BD_COMMAND_SHORT_FLAGS.get(command) or {})
+    return table
+
+
+def _bd_command_context(args):
+    """Best-effort (command, subcommand) for a bd argv list.
+
+    The endpoint only reaches the guard after `args[0] in ALLOWED`, so the
+    command is the first token. Transported `@attachment:` tokens are skipped
+    while resolving the `comments` subcommand because the endpoint expands them
+    into file flags in place.
+    """
+    command = args[0] if args and isinstance(args[0], str) else None
+    subcommand = None
+    if command == 'comments':
+        for token in args[1:]:
+            if (isinstance(token, str) and not token.startswith('-')
+                    and not token.startswith('@attachment:')):
+                subcommand = token
+                break
+    return command, subcommand
+
 
 def _classify_bd_flag(token):
     """Classify a bd flag token as ('value'|'bool', attached) or None.
@@ -200,8 +266,14 @@ def _comments_parts(args):
 
     `operands` are the positional tokens after the subcommand, with flag
     values removed. Returns None when this is not a `comments` command.
-    Raises ValueError when an unrecognized flag could hide the subcommand or
-    body (ambiguous), so no native write can be reached.
+    Raises ValueError when an unrecognized flag, or a transported attachment
+    placed before the subcommand, could hide the subcommand or body
+    (ambiguous), so no native write can be reached.
+
+    The endpoint expands `@attachment:k` into its file flag in place, so an
+    attachment before the subcommand becomes `comments --file PATH add TASK`,
+    an ordering cobra accepts. That hid the body from the guard, so it is
+    refused outright; attachments belong after the subcommand.
     """
     if not isinstance(args, list):
         return None
@@ -209,18 +281,35 @@ def _comments_parts(args):
     positional = [i for i, (kind, _) in enumerate(tokens) if kind == 'positional']
     if not positional or tokens[positional[0]][1] != 'comments':
         return None
-    if len(positional) < 2:
-        unknown = [token for kind, token in tokens if kind == 'unknown']
+    subcommand = None
+    sub_index = None
+    before = []
+    after = []
+    for index in positional[1:]:
+        token = tokens[index][1]
+        if subcommand is None:
+            if isinstance(token, str) and token.startswith('@attachment:'):
+                before.append(token)
+                continue
+            subcommand = token
+            sub_index = index
+        else:
+            after.append(token)
+    if before:
+        raise ValueError(
+            'Refusing comments request: attachment transport %r placed before '
+            'the subcommand would expand to a file flag ahead of %r, hiding '
+            'the body from the reserved-prefix guard; no native write was '
+            'attempted. Place attachments after the subcommand.'
+            % (before[0], subcommand))
+    unknown = [token for kind, token in tokens if kind == 'unknown']
+    if subcommand is None:
         if unknown:
             raise ValueError(
                 'Refusing comments request: ambiguous flag %r before native '
                 'write; the bd command could not be parsed structurally.'
                 % (unknown[0],))
         return (None, [])
-    sub_index = positional[1]
-    subcommand = tokens[sub_index][1]
-    operands = [tokens[i][1] for i in positional[2:]]
-    unknown = [token for kind, token in tokens if kind == 'unknown']
     before_subcommand = [
         token for i, (kind, token) in enumerate(tokens)
         if kind == 'unknown' and i < sub_index
@@ -230,7 +319,7 @@ def _comments_parts(args):
             'Refusing comments request: ambiguous flag %r before native '
             'write; the bd command could not be parsed structurally.'
             % ((before_subcommand or unknown)[0],))
-    return (subcommand, operands)
+    return (subcommand, after)
 
 
 # Operator-only flags: identity/connection/file configuration that a
@@ -245,12 +334,17 @@ OPERATOR_ONLY_FILE_FLAGS = {'--file', '--body-file', '--design-file'}
 OPERATOR_ONLY_SHORT_VALUE = {'a': '--author', 'C': '--directory', 'f': '--file'}
 
 
-def operator_only_flag(token):
+def operator_only_flag(token, command=None, subcommand=None):
     """Canonical operator-only flag name for an argv token, or None.
 
-    Unlike a `token.split('=')[0]` denylist this catches joined short forms:
-    `-a`, `-a operator`, `-aoperator`, `-a=operator`, `-aoperator=...`,
-    `--author=...`, `--actor`, `-C/tmp`, `-qa` (cluster), `-fnotes.txt`.
+    With command context the command's real shorthand inventory is used, so
+    `-a` is --author for `comments add` but --assignee for
+    list/ready/search/count/create/update, `-f` is --file for comments/create
+    but --force for close, and a shorthand unknown to the command fails closed
+    instead of hiding a later `-C`. Without command context every
+    operator-only short spelling is refused. Joined, `=value` and clustered
+    spellings are all covered (`-a`, `-aX`, `-a=X`, `--author=X`, `-qa`,
+    `-C/tmp`, `-rC`).
     """
     if not isinstance(token, str) or len(token) < 2 or not token.startswith('-'):
         return None
@@ -262,13 +356,33 @@ def operator_only_flag(token):
     body = token[1:]
     end = body.find('=')
     chars = body[:end] if end != -1 else body
+    table = _short_flag_table(command, subcommand)
     for ch in chars:
-        name = OPERATOR_ONLY_SHORT_VALUE.get(ch)
-        if name is not None:
-            return name
-        if ch in BD_SHORT_BOOL_FLAGS:
+        if table is None:
+            if ch in OPERATOR_ONLY_SHORT_VALUE:
+                spec = 'value'
+            elif ch in BD_SHORT_BOOL_FLAGS:
+                spec = 'bool'
+            else:
+                spec = None
+        else:
+            spec = table.get(ch)
+        if spec is None:
+            # Unknown shorthand for this command: ambiguous. Fail closed so an
+            # unknown boolean cannot smuggle a later operator-only shorthand.
+            return token
+        if ch == 'C':
+            return '--directory'
+        if ch == 'a' and (command is None
+                          or (command == 'comments' and subcommand == 'add')):
+            return '--author'
+        if ch == 'f' and (command is None or command in ('comments', 'create')):
+            return '--file'
+        if spec == 'bool':
             continue
-        return None
+        # A value-taking shorthand consumes the rest of the cluster (or the
+        # next token): the following characters are its value, not flags.
+        break
     return None
 
 
@@ -276,10 +390,13 @@ def operator_only_in_args(args):
     """First operator-only flag in an argv list, or None.
 
     `--` ends flag parsing exactly as in bd/pflag, so operands after it are
-    ordinary body text, not flags.
+    ordinary body text, not flags. Command context selects the real shorthand
+    inventory so `-a`/`-f` mean the command's own flags and an unknown
+    shorthand fails closed.
     """
     if not isinstance(args, list):
         return None
+    command, subcommand = _bd_command_context(args)
     end_of_flags = False
     for token in args:
         if token == '--':
@@ -287,9 +404,101 @@ def operator_only_in_args(args):
             continue
         if end_of_flags:
             continue
-        name = operator_only_flag(token)
+        name = operator_only_flag(token, command, subcommand)
         if name is not None:
             return name
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Reserved coordination label namespaces.
+#
+# coordination.py writes `request:<request_id hash>` and
+# `request-content:<content digest>` through its own internal run path. The raw
+# contributor bd path must not be able to plant, replace or remove them: a
+# planted `request:<hash>` label blocks a known request_id ("Native request
+# content mismatch") and planting both labels can reconcile a victim
+# create-child to an attacker issue. Reads (`list -l request:...`) stay usable
+# because only the create/update label-writing flags are inspected.
+# ---------------------------------------------------------------------------
+
+RESERVED_LABEL_PREFIXES = ('request:', 'request-content:')
+LABEL_WRITE_FLAGS = {
+    'create': {'--labels', '-l'},
+    'update': {'--add-label', '--set-labels', '--remove-label'},
+}
+
+
+def _label_values(args):
+    """Label values written by create/update label flags in an argv list."""
+    command = args[0] if args and isinstance(args[0], str) else None
+    flags = LABEL_WRITE_FLAGS.get(command)
+    if not flags:
+        return []
+    table = _short_flag_table(command)
+    values = []
+    index = 0
+    end_of_flags = False
+    while index < len(args):
+        token = args[index]
+        if not isinstance(token, str):
+            index += 1
+            continue
+        if end_of_flags:
+            index += 1
+            continue
+        if token == '--':
+            end_of_flags = True
+            index += 1
+            continue
+        if token.startswith('--'):
+            name, sep, value = token.partition('=')
+            if name in flags:
+                if sep:
+                    values.append(value)
+                else:
+                    index += 1
+                    if index < len(args) and isinstance(args[index], str):
+                        values.append(args[index])
+            index += 1
+            continue
+        if len(token) > 1 and token.startswith('-'):
+            body = token[1:]
+            end = body.find('=')
+            chars = body[:end] if end != -1 else body
+            attached = body[end + 1:] if end != -1 else None
+            for position, ch in enumerate(chars):
+                if ch == 'l' and command == 'create':
+                    if attached is not None and position == len(chars) - 1:
+                        values.append(attached)
+                    elif position < len(chars) - 1:
+                        values.append(chars[position + 1:])
+                    else:
+                        index += 1
+                        if index < len(args) and isinstance(args[index], str):
+                            values.append(args[index])
+                    break
+                spec = table.get(ch) if table else None
+                if spec == 'bool':
+                    continue
+                # A value-taking (or unknown) shorthand consumes the rest.
+                break
+            index += 1
+            continue
+        index += 1
+    return values
+
+
+def reserved_label_in_args(args):
+    """First reserved-namespace label written by a create/update label flag."""
+    if not isinstance(args, list):
+        return None
+    for value in _label_values(args):
+        for part in value.split(','):
+            label = part.strip()
+            for prefix in RESERVED_LABEL_PREFIXES:
+                if label.startswith(prefix):
+                    return label
     return None
 
 
@@ -373,8 +582,9 @@ def raw_comment_bodies(args, attachments):
     Returns [] for non-`comments add` commands. The bd command is parsed
     structurally, so global flags before `add` (`comments --json add TASK
     BODY`) and flags anywhere after the operand are handled; `-f/--file`
-    values are consumed as paths, not bodies. An unrecognized flag is
-    ambiguous and rejected before any native write.
+    values are consumed as paths, not bodies. An unrecognized flag, or an
+    attachment token placed before the subcommand, is ambiguous and rejected
+    before any native write.
     """
     parts = _comments_parts(args)
     if parts is None or parts[0] != 'add':

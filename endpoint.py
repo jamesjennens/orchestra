@@ -13,7 +13,7 @@ from render import render
 from lifecycle import apply_native
 from version import report
 from reserved_comments import (check_raw_request, comment_target,
-                               operator_only_in_args)
+                               operator_only_in_args, reserved_label_in_args)
 
 ALLOWED={'list','show','ready','search','count','create','update','close','reopen','comments','dep','state','lint'}
 # Legacy name kept for operators reading this file; enforcement is the
@@ -100,9 +100,18 @@ def execute(root,request):
     if not isinstance(args,list) or not args or any(not isinstance(a,str) or '\0' in a for a in args):raise ValueError('Expected argument list')
     if args[0] not in ALLOWED:raise ValueError('Command is outside the contributor interface; use admin.py for setup/maintenance')
     # Identity/connection/file flags in every pflag spelling (short, joined,
-    # =value, boolean cluster) are operator-only. `--` ends flag parsing, as in
-    # bd itself, so a body operand after it is not a flag.
+    # =value, boolean cluster) are operator-only. Shorthand knowledge is
+    # per-command, so -a is --assignee on list/ready/search/count/create/update
+    # but --author on `comments add`, -f is --force on close but --file on
+    # comments/create, and an unknown shorthand fails closed so `-rC`/`-uC`
+    # cannot switch project. `--` ends flag parsing, as in bd itself, so a body
+    # operand after it is not a flag.
     if operator_only_in_args(args) is not None:raise ValueError('Connection/identity/file configuration flags are operator-only')
+    # The reserved coordination label namespaces are written only by
+    # coordination.py through its internal run path; the raw contributor bd
+    # path must not plant request:/request-content: labels.
+    label=reserved_label_in_args(args)
+    if label is not None:raise ValueError('Reserved request/request-content labels are operator-only; use the coordination request workflow (coordination.py)')
     # Positional dep/comment IDs are fine; file inputs must be transported explicitly.
     # Raw comments add bodies (positional and transported file inputs) must not
     # carry forged machine-record prefixes: those records require their
