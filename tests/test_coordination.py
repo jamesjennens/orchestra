@@ -13,6 +13,10 @@ import coordination
 CHILD = {'operation': 'create-child', 'request_id': 'session/request1',
          'parent': 'sample-job', 'title': 'Bounded contribution',
          'description': 'Keep this exact intent.', 'type': 'task'}
+DECISION = {'operation': 'create-child', 'request_id': 'session/decision1',
+            'parent': 'sample-job', 'title': 'Bounded decision',
+            'description': '## Decision\nUse it.\n## Rationale\nBecause.\n## Alternatives Considered\nNone.',
+            'type': 'decision'}
 MERGE = {'operation': 'merge-acquire', 'task': 'sample-task', 'target': 'main@commit1'}
 
 
@@ -24,6 +28,7 @@ class Native:
         self.issues = []
         self.holder = None
         self.create_outcome = 'ok'
+        self.refuse_create = None
         self.acquire_outcome = 'ok'
         self.show_fails = False
 
@@ -33,6 +38,8 @@ class Native:
             label = args[args.index('--label') + 1]
             return json.dumps([issue for issue in self.issues if label in issue['labels']])
         if args[0] == 'create':
+            if self.refuse_create is not None:
+                raise ValueError(self.refuse_create)
             if self.create_outcome == 'not-written':
                 raise RuntimeError('uncertain native failure')
             issue = {'id': 'sample-job.7',
@@ -152,6 +159,83 @@ class CoordinationTests(unittest.TestCase):
                 self.apply(CHILD)
         self.assertEqual(self.native.count('create'), 0)
 
+    def receipt(self):
+        files = list((self.project / '.coordination-requests').iterdir())
+        self.assertEqual(len(files), 1)
+        return json.loads(files[0].read_text(encoding='utf-8'))
+
+    def test_missing_decision_sections_record_failed_receipt_and_corrected_retry_succeeds(self):
+        broken = dict(DECISION, description='## Decision\nUse it.\n## Rationale\nBecause.')
+        with self.assertRaisesRegex(ValueError, '## Alternatives Considered'):
+            self.apply(broken)
+        receipt = self.receipt()
+        self.assertEqual(receipt['status'], 'failed')
+        self.assertIn('## Alternatives Considered', receipt['error'])
+        self.assertIn('## Decision, ## Rationale, ## Alternatives Considered', receipt['error'])
+        self.assertEqual(self.native.count('create'), 0)
+        self.assertEqual(self.native.issues, [])
+        # The same request ID accepts corrected content and creates exactly one issue.
+        self.assertEqual(self.apply(DECISION), {'id': 'sample-job.7', 'reconciled': False})
+        self.assertEqual(self.native.count('create'), 1)
+        self.assertEqual(len(self.native.issues), 1)
+        self.assertEqual(self.receipt()['status'], 'complete')
+        history = self.receipt()['history']
+        self.assertEqual(history[0]['status'], 'failed')
+
+    def test_refused_native_decision_records_failed_and_corrected_retry_succeeds(self):
+        self.native.refuse_create = 'missing required sections for decision: ## Alternatives Considered'
+        with self.assertRaisesRegex(ValueError, '## Decision, ## Rationale, ## Alternatives Considered'):
+            self.apply(DECISION)
+        receipt = self.receipt()
+        self.assertEqual(receipt['status'], 'failed')
+        self.assertEqual(self.native.count('create'), 1)
+        self.assertEqual(self.native.issues, [])
+        self.native.refuse_create = None
+        self.assertEqual(self.apply(DECISION)['id'], 'sample-job.7')
+        self.assertEqual(self.native.count('create'), 2)
+        self.assertEqual(len(self.native.issues), 1)
+
+    def test_refused_create_that_landed_reconciles_as_complete(self):
+        native = self.native
+
+        def landed(args):
+            if args[0] == 'create':
+                native.calls.append(list(args))
+                native.issues.append({'id': 'sample-job.7',
+                                      'labels': args[args.index('--labels') + 1].split(',')})
+                raise ValueError('create reported failure after committing')
+            return native(args)
+
+        result = coordination.apply_native(copy.deepcopy(CHILD), 'alice', landed, self.project)
+        self.assertEqual(result, {'id': 'sample-job.7', 'reconciled': True})
+        self.assertEqual(self.receipt()['status'], 'complete')
+        self.assertEqual(self.receipt()['id'], 'sample-job.7')
+
+    def test_refused_create_that_cannot_be_confirmed_stays_pending(self):
+        self.native.refuse_create = 'native create refused'
+        calls = {'list': 0}
+
+        def run(args):
+            if args[0] == 'list':
+                calls['list'] += 1
+                if calls['list'] == 2:
+                    raise RuntimeError('native read unavailable')
+            return self.native(args)
+
+        with self.assertRaisesRegex(ValueError, 'uncertain'):
+            coordination.apply_native(copy.deepcopy(CHILD), 'alice', run, self.project)
+        self.assertEqual(self.receipt()['status'], 'pending')
+        with self.assertRaisesRegex(ValueError, 'Reserved request'):
+            coordination.apply_native(copy.deepcopy(CHILD), 'alice', run, self.project)
+
+    def test_uncertain_create_keeps_pending_reservation(self):
+        self.native.create_outcome = 'not-written'
+        with self.assertRaises(RuntimeError):
+            self.apply(CHILD)
+        self.assertEqual(self.receipt()['status'], 'pending')
+        with self.assertRaisesRegex(ValueError, 'Reserved request'):
+            self.apply(CHILD)
+
     def test_merge_nonholder_cannot_release_or_acquire(self):
         self.apply(MERGE)
         with self.assertRaisesRegex(ValueError, 'Only the current holder'):
@@ -204,6 +288,66 @@ class CoordinationTests(unittest.TestCase):
         self.assertEqual(self.apply({'operation': 'merge-release'}),
                          {'released': False, 'available': True})
         self.assertEqual(self.native.count('merge-slot', 'release'), 1)
+
+
+class ReconcileTests(unittest.TestCase):
+    """Operator release of a reservation with no native issue, audited and idempotent."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.project = Path(temp.name)
+        self.native = Native()
+
+    def pending(self):
+        self.native.create_outcome = 'not-written'
+        with self.assertRaises(RuntimeError):
+            coordination.apply_native(copy.deepcopy(CHILD), 'alice', self.native, self.project)
+
+    def receipt(self):
+        return json.loads(next((self.project / '.coordination-requests').iterdir()).read_text(encoding='utf-8'))
+
+    def test_operator_reconcile_is_audited_and_idempotent(self):
+        self.pending()
+        result = coordination.reconcile_request(self.project, CHILD['request_id'], 'operator-1',
+                                                'native validation refused before the fix', 'released',
+                                                self.native, at='2026-09-25T00:00:00Z')
+        self.assertEqual(result, {'request_id': CHILD['request_id'], 'status': 'released', 'reconciled': True,
+                                  'reconciliation': {'actor': 'operator-1',
+                                                     'reason': 'native validation refused before the fix',
+                                                     'disposition': 'released', 'at': '2026-09-25T00:00:00Z'}})
+        stored = self.receipt()
+        self.assertEqual(stored['status'], 'released')
+        self.assertEqual(stored['reconciliation'], result['reconciliation'])
+        again = coordination.reconcile_request(self.project, CHILD['request_id'], 'operator-1',
+                                               'native validation refused before the fix', 'released',
+                                               self.native, at='2026-09-26T00:00:00Z')
+        self.assertTrue(again['already'])
+        self.assertFalse(again['reconciled'])
+        self.assertEqual(self.receipt(), stored)
+        # A released request ID accepts the same content on a corrected retry.
+        self.native.create_outcome = 'ok'
+        self.assertEqual(coordination.apply_native(copy.deepcopy(CHILD), 'alice', self.native, self.project)['id'],
+                         'sample-job.7')
+
+    def test_reconcile_refuses_when_native_issue_exists(self):
+        self.native.create_outcome = 'lost-response'
+        with self.assertRaises(RuntimeError):
+            coordination.apply_native(copy.deepcopy(CHILD), 'alice', self.native, self.project)
+        with self.assertRaisesRegex(ValueError, 'already exists'):
+            coordination.reconcile_request(self.project, CHILD['request_id'], 'operator-1', 'checked',
+                                           'released', self.native)
+
+    def test_reconcile_requires_a_reservation(self):
+        with self.assertRaisesRegex(ValueError, 'No coordination request reservation'):
+            coordination.reconcile_request(self.project, 'missing/request', 'operator-1', 'checked',
+                                           'released', self.native)
+
+    def test_reconcile_refuses_a_completed_request(self):
+        coordination.apply_native(copy.deepcopy(CHILD), 'alice', self.native, self.project)
+        with self.assertRaisesRegex(ValueError, 'not pending'):
+            coordination.reconcile_request(self.project, CHILD['request_id'], 'operator-1', 'checked',
+                                           'released', self.native)
 
 
 if __name__ == '__main__':

@@ -259,6 +259,9 @@ def main():
     for command in ('backup','restore-new'):
         a=sub.add_parser(command);a.add_argument('project')
         if command=='restore-new':a.add_argument('destination')
+    a=sub.add_parser('reconcile-request');a.add_argument('project');a.add_argument('--request-id',required=True)
+    a.add_argument('--actor',required=True);a.add_argument('--reason',required=True)
+    a.add_argument('--disposition',choices=['failed','released'],default='released')
     a=sub.add_parser('service');a.add_argument('action',choices=['start','stop','restart','status'])
     args=p.parse_args();root=root_path(args.root)
     if args.command=='install':install(root,args.port,args.unit)
@@ -273,6 +276,16 @@ def main():
             write_project(path/'ONBOARDING.md',Path(args.file).read_text(encoding='utf-8-sig'))
         print('Project onboarding installed; back up the project after changes.')
     elif args.command=='service':print(service(root,args.action))
+    elif args.command=='reconcile-request':
+        import fcntl
+        from coordination import reconcile_request
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            result=reconcile_request(path,args.request_id,args.actor,args.reason,args.disposition,
+                                     lambda argv: run_bd(root,args.project,argv))
+        print(json.dumps(result,ensure_ascii=False))
     elif args.command=='handoff':
         import fcntl
         from handoff import execute as handoff

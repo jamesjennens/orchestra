@@ -113,7 +113,17 @@ Save `child.json`:
 python coordination.py --config client.local.json --project example --actor alex/session1 --file child.json
 ```
 
-Use the returned native child ID in all references. The request is bound to its actor and content, reserved durably, and marked on the native issue so a retry can reconcile instead of creating a duplicate. Inspect uncertain outcomes and retry only the same request. A reserved request with **no visible native issue** stops for operator reconciliation; do not bypass it with a new request ID or delete its reservation. Duplicate native matches also require reconciliation. For type `decision`, include the Decision, Rationale and Alternatives sections; native validation runs at creation.
+Use the returned native child ID in all references. The request is bound to its actor and content, reserved durably, and marked on the native issue so a retry can reconcile instead of creating a duplicate. Inspect uncertain outcomes and retry only the same request. A reserved request with **no visible native issue** stops for operator reconciliation; do not bypass it with a new request ID or delete its reservation. Duplicate native matches also require reconciliation.
+
+Type templates are validated before a pending reservation can strand a request ID. For type `decision`, name the required section headers exactly: `## Decision`, `## Rationale` and `## Alternatives Considered`; the create-child error lists any missing header and the required set. A description that fails this pre-check, or a native validation refusal that is confirmed to have created no issue, records the receipt as `failed` with the error. A failed (or operator-`released`) receipt may be resubmitted under the **same** `request_id` with corrected content; identical content simply fails again. An uncertain outcome (timeout, lost or unparseable response, or a failure that cannot be confirmed) stays `pending` and must not be reissued under a new ID.
+
+Release a stuck reservation with the operator command, which inspects the pending request, confirms natively that no issue exists, and records the actor, reason and disposition in the receipt:
+
+```sh
+python admin.py --root /srv/runtime reconcile-request example --request-id alex/child-001 --actor operator-1 --reason "native validation refused before the fix" --disposition released
+```
+
+The command is idempotent: releasing an already failed/released request reports `already: true` and does not rewrite its audit record, and it refuses when an issue does exist or no reservation is present.
 
 ## Integrate through one project-wide merge slot
 

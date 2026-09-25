@@ -232,6 +232,30 @@ class BackupTests(unittest.TestCase):
         self.assertIn((self.root, 'newproject', ['backup', 'init', str(self.root / 'backups' / 'newproject')]), [c.args for c in native.call_args_list])
         backup.assert_called_once_with(self.root, 'newproject')
 
+    def test_reconcile_request_command_releases_under_lock_and_prints_audit(self):
+        (self.source / '.beads').mkdir()
+        (self.source / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+        journal = self.source / '.coordination-requests'
+        journal.mkdir()
+        identity = coordination.content_hash({'request_id': 'alice/child-001'})
+        record = {'sha256': 'b' * 64, 'status': 'pending'}
+        (journal / (identity + '.json')).write_text(json.dumps(record), encoding='utf-8')
+        argv = ['admin.py', '--root', str(self.root), 'reconcile-request', 'source',
+                '--request-id', 'alice/child-001', '--actor', 'operator-1',
+                '--reason', 'native validation refused before the fix', '--disposition', 'released']
+        with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', return_value=self.root), \
+                patch.object(admin, 'run_bd', return_value='[]') as native, \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            admin.main()
+        self.flock.assert_called_once()
+        native.assert_called_once()
+        self.assertEqual(native.call_args.args[2][:4], ['list', '--all', '--limit', '0'])
+        stored = json.loads((journal / (identity + '.json')).read_text(encoding='utf-8'))
+        self.assertEqual(stored['status'], 'released')
+        self.assertEqual(stored['reconciliation']['actor'], 'operator-1')
+        self.assertEqual(stored['reconciliation']['reason'], 'native validation refused before the fix')
+        self.assertIn('operator-1', out.getvalue())
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -1,3 +1,8 @@
+Required section headers for a `decision` created through `create-child`:
+`## Decision`, `## Rationale` and `## Alternatives Considered`. Native
+validation (`bd create --type decision --validate`) refuses a description that
+omits any of them; include all three even when a section is short.
+
 ## Decision
 
 State the decision, scope, deciding authority and current applicability.
