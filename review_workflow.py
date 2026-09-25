@@ -36,7 +36,14 @@ def fields(value, expected):
 def validate(p, task):
     if not isinstance(p, dict) or not isinstance(p.get('operation'), str) or p['operation'] not in EXTRA:
         raise ValueError('Invalid review workflow operation')
-    fields(p, COMMON | EXTRA[p['operation']])
+    if p['operation'] == 'contribute':
+        # `follows` is optional on purpose: payloads and chains written before the
+        # additive follow-on relation existed must keep validating unchanged.
+        expected = COMMON | EXTRA['contribute']
+        if set(p) not in (expected, expected | {'follows'}):
+            raise ValueError('Invalid review workflow fields')
+    else:
+        fields(p, COMMON | EXTRA[p['operation']])
     if type(p['schema_version']) is not int or p['schema_version'] != 1 or p['task'] != task:
         raise ValueError('Invalid review workflow version/task')
     identity(task); identity(p['operation_id'])
@@ -50,6 +57,11 @@ def validate(p, task):
                 raise ValueError(f'{key}: require exact 40/64 hexadecimal commit')
         if p['supersedes'] is not None:
             identity(p['supersedes'])
+        follows = p.get('follows')
+        if follows is not None:
+            identity(follows)
+        if p['supersedes'] is not None and follows is not None:
+            raise ValueError('Contribution may supersede or follow the current revision, not both')
         d = p['delivery']
         if not isinstance(d, dict):
             raise ValueError('Invalid delivery')
@@ -321,14 +333,32 @@ def receipt(state, rows, task):
 
 
 def projection(ordered, voids=None, invalid=None, refused=None, positions=None):
-    contribution = None; pending = {}; approved = False; approved_id = None; latest = None
+    """Project the chain. ``prior_contributions`` keeps every revision the current
+    one replaced visible, tagged with its ``relation`` (``follows`` additive or
+    ``supersedes``), so a follow-on never hides the integrated prior change. The
+    prior revision's scoped lifecycle facts are not re-scoped: they stay recorded
+    in lifecycle history under their own scope."""
+    contribution = None; prior = []; pending = {}; approved = False; approved_id = None; latest = None
     for p, c in ordered:
         cid = str(c['id']); op = p['operation']
         metadata = {'comment_id': cid, 'author': c['author'], 'timestamp': c['created_at']}
         current = contribution['comment_id'] if contribution else None
         if op == 'contribute':
-            if p['supersedes'] != current:
-                raise ValueError('Contribution must explicitly supersede the current revision')
+            follows = p.get('follows')
+            if follows is not None:
+                if follows != current:
+                    raise ValueError('Contribution must follow the current revision')
+                relation = 'follows'
+            elif p['supersedes'] is not None:
+                if p['supersedes'] != current:
+                    raise ValueError('Contribution must explicitly supersede the current revision')
+                relation = 'supersedes'
+            elif current is not None:
+                raise ValueError('Contribution must explicitly supersede or follow the current revision')
+            else:
+                relation = None
+            if contribution is not None:
+                prior.append(dict(contribution, relation=relation))
             contribution = dict(p, **metadata); approved = False; approved_id = None
         else:
             if not current or p['contribution'] != current:
@@ -395,7 +425,7 @@ def projection(ordered, voids=None, invalid=None, refused=None, positions=None):
     invalid = list(invalid or [])
     if invalid:
         warnings.append('Malformed or stale operator void comments ignored: ' + ', '.join(invalid[:5]))
-    return dict(contribution=contribution, review_state=state,
+    return dict(contribution=contribution, prior_contributions=prior, review_state=state,
                 pending_requests=list(pending.values()), latest_comment_id=latest,
                 recoveries=recoveries, warnings=warnings)
 

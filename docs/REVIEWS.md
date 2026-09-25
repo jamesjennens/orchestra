@@ -58,6 +58,7 @@ The assigned owner submits `b review example-task --file contribution.json`:
   "task": "example-task",
   "previous": null,
   "supersedes": null,
+  "follows": null,
   "repository": "https://example.org/team/repository.git",
   "commit": "1111111111111111111111111111111111111111",
   "base_commit": "2222222222222222222222222222222222222222",
@@ -72,7 +73,9 @@ The assigned owner submits `b review example-task --file contribution.json`:
 
 For remote branches, use `delivery: {"kind":"remote","remote":"git@example.org:team/repository.git","branch":"worker/task"}`. Replace synthetic hashes with exact full commit/base IDs and the actual bundle SHA-256. Remote access and bundle contents are not verified automatically: the reviewer must retrieve, verify and test them. The protocol rejects incomplete delivery fields, not false assertions.
 
-For a revised contribution, set `previous` to the latest workflow comment and `supersedes` to the current contribution's `comment_id`. Record its exact new branch/bundle path, commit, base and checksum, even when only the bundle filename changed. Old delivery records remain in history. A new contribution does not resolve feedback automatically.
+For a revision that replaces a rejected or unintegrated contribution, set `previous` to the latest workflow comment and `supersedes` to the current contribution's `comment_id`.
+
+For an **additive follow-on** to work that is already integrated, set `previous` to the latest workflow comment and `follows` to the current contribution's `comment_id`, with `supersedes: null` and `base_commit` set to the prior integration commit. `follows` asserts that the new change builds on the prior revision rather than retracting it: the prior contribution's record and its lifecycle facts stay intact and remain visible in `review TASK`/`brief` under `prior_contributions`, where each replaced revision carries the `relation` (`follows` or `supersedes`) that replaced it as current. `follows` and `supersedes` are mutually exclusive, and the field is optional so payloads and chains written before it existed keep validating; a first contribution sets both to null. Record the exact new branch/bundle path, commit, base and checksum in every case, even when only the bundle filename changed. Old delivery records remain in history. A new contribution does not resolve feedback automatically.
 
 ## Request changes and respond
 
