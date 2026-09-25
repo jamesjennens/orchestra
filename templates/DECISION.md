@@ -1,7 +1,10 @@
-Required section headers for a `decision` created through `create-child`:
-`## Decision`, `## Rationale` and `## Alternatives Considered`. Native
-validation (`bd create --type decision --validate`) refuses a description that
-omits any of them; include all three even when a section is short.
+A `decision` created through `create-child` is preflighted with the identical
+`bd create --dry-run --validate`, so bd decides validity and nothing is reserved
+when it refuses. bd expects the section names `Decision`, `Rationale` and
+`Alternatives Considered`; it matches them case-insensitively as text, so a
+heading, bold text or a prose mention all qualify. Include all three even when a
+section is short. The create-child error names the required headings only when bd
+itself reports missing sections.
 
 ## Decision
 

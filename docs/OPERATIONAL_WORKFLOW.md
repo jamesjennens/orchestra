@@ -115,15 +115,19 @@ python coordination.py --config client.local.json --project example --actor alex
 
 Use the returned native child ID in all references. The request is bound to its actor and content, reserved durably, and marked on the native issue so a retry can reconcile instead of creating a duplicate. Inspect uncertain outcomes and retry only the same request. A reserved request with **no visible native issue** stops for operator reconciliation; do not bypass it with a new request ID or delete its reservation. Duplicate native matches also require reconciliation.
 
-Type templates are validated before a pending reservation can strand a request ID. For type `decision`, name the required section headers exactly: `## Decision`, `## Rationale` and `## Alternatives Considered`; the create-child error lists any missing header and the required set. A description that fails this pre-check, or a native validation refusal that is confirmed to have created no issue, records the receipt as `failed` with the error. A failed (or operator-`released`) receipt may be resubmitted under the **same** `request_id` with corrected content; identical content simply fails again. An uncertain outcome (timeout, lost or unparseable response, or a failure that cannot be confirmed) stays `pending` and must not be reissued under a new ID.
+Before anything is reserved, `create-child` runs the **identical create with `--dry-run`** (plus `--validate` for a `decision`). bd is the single source of truth for validation: the preflight writes nothing, so a refused description or a missing parent leaves the request ID free for corrected content instead of stranding it. The kit never re-implements bd's section matching.
 
-Release a stuck reservation with the operator command, which inspects the pending request, confirms natively that no issue exists, and records the actor, reason and disposition in the receipt:
+A real create that exits nonzero **after** a passing preflight is not proof that nothing was written: bd can commit the issue and then fail (for example while adding the request label), and that commit may not be visible to an immediate label read. Such a request stays `pending` and must be reconciled; a retry under the same ID is refused rather than risking a duplicate.
+
+Type templates are still documented here as help. For a `decision`, `bd create --type decision --validate` expects the section names `Decision`, `Rationale` and `Alternatives Considered`; bd matches them case-insensitively as text, so headings, bold text and prose mentions all qualify. The required-heading hint is added to the create-child error only when bd itself reports missing sections; unrelated errors such as a missing parent are returned unchanged.
+
+Release or complete a stuck reservation with the operator command, which inspects the pending request under the project lock, checks native state, and records the actor, reason and disposition in the receipt:
 
 ```sh
 python admin.py --root /srv/runtime reconcile-request example --request-id alex/child-001 --actor operator-1 --reason "native validation refused before the fix" --disposition released
 ```
 
-The command is idempotent: releasing an already failed/released request reports `already: true` and does not rewrite its audit record, and it refuses when an issue does exist or no reservation is present.
+`released` (default) and `failed` confirm natively that **no** issue exists, then free the ID; the original actor stays bound to it, and `released --any-actor` deliberately opens it to any actor. `complete` completes the receipt from the single labelled native issue when the original content is unknown, recording the operator in the audit. If a commit may exist without its request label, the automated label check cannot see it, so inspect native state by title and parent before releasing. The command is idempotent for an identical retry (reporting `already: true`), refuses a *differing* retry with the recorded audit instead of silently keeping the first one, and refuses `complete` when no labelled native issue exists.
 
 ## Integrate through one project-wide merge slot
 

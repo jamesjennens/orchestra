@@ -261,7 +261,9 @@ def main():
         if command=='restore-new':a.add_argument('destination')
     a=sub.add_parser('reconcile-request');a.add_argument('project');a.add_argument('--request-id',required=True)
     a.add_argument('--actor',required=True);a.add_argument('--reason',required=True)
-    a.add_argument('--disposition',choices=['failed','released'],default='released')
+    a.add_argument('--disposition',choices=['failed','released','complete'],default='released')
+    a.add_argument('--any-actor',action='store_true',dest='any_actor',
+                   help='with --disposition released, open the request ID to any actor')
     a=sub.add_parser('service');a.add_argument('action',choices=['start','stop','restart','status'])
     args=p.parse_args();root=root_path(args.root)
     if args.command=='install':install(root,args.port,args.unit)
@@ -284,7 +286,7 @@ def main():
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             result=reconcile_request(path,args.request_id,args.actor,args.reason,args.disposition,
-                                     lambda argv: run_bd(root,args.project,argv))
+                                     lambda argv: run_bd(root,args.project,argv),any_actor=args.any_actor)
         print(json.dumps(result,ensure_ascii=False))
     elif args.command=='handoff':
         import fcntl
