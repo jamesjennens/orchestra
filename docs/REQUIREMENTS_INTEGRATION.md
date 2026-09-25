@@ -51,6 +51,66 @@ To reaffirm a node, add `reaffirmation` containing `baseline_sha256`, exact repl
 
 Keep original graph references and evidence. For later transitions, `--history history.json` accepts a list of `{manifest, acceptance}` objects (acceptance is null for drafts), allowing older evidence and reaffirmations to resolve. An unchanged scope stays unaffected across unrelated changes. Retain old graph/impact files and record a report pointer in Beads; this tool does not overwrite history or automatically approve changes.
 
+## Draft or revise a requirement record in one step
+
+Contributors cannot use `label add` (outside the contributor interface) and
+`create-child` cannot set labels, so a requirement record can lack the
+`requirement` / `requirement:draft` type and state labels that
+[REQUIREMENTS_CONTRACT](REQUIREMENTS_CONTRACT.md) F2 and the web requirements
+view depend on. `requirement_records.py` supplies one locked, idempotent
+operation that drafts or revises a record, applies only those controlled labels
+and posts the `requirement-revision-v1` comment.
+
+The payload is a closed schema (`schema_version` 1). The `operation` field is
+supplied by the subcommand, not the file:
+
+```json
+{"schema_version": 1, "operation_id": "session-1/req-1", "kind": "requirement",
+ "parent": "sample-job", "title": "R01: Intent", "key": "R01",
+ "description": "## Requirement\n...", "acceptance_state": "draft"}
+```
+
+```sh
+python requirement_records.py draft  --config client.json --project example --actor alex --file record.json
+python requirement_records.py revise --config client.json --project example --actor alex --file record.json
+```
+
+- `draft` creates the record at revision 1 labeled `requirement:draft`, or
+  selects an existing `task` id and applies the labels to it; it needs `parent`
+  only when creating.
+- `revise` selects an existing `task`, must write exactly the next revision and
+  may move the record to `requirement:accepted`.
+- `kind` is `requirement` (needs `key`) or `brd-section` (narrative, no key).
+- Labels are controlled: they are derived from `kind` and `acceptance_state`. A
+  caller-supplied `labels` field is refused, and unrelated labels are untouched.
+- Retrying the same `operation_id` with identical content reconciles without a
+  second record, comment or label write; reusing it with different content is
+  refused. An uncertain create with no visible record stops for operator
+  reconciliation instead of allocating a new id.
+- `decided_by` from the open kittrial-pth.25 change proposal is not accepted
+  yet, so passing it is refused rather than written as an unvalidated field.
+
+### Backfill labels on existing records (operator)
+
+Records created before this operation (for example through `create-child`) can
+be labelled without rewriting their content. The operator runs this against the
+project on the server; it writes only the controlled labels and never a revision
+comment:
+
+```json
+{"schema_version": 1, "operation_id": "backfill-2026-09-25",
+ "records": [{"task": "sample-job.7", "kind": "requirement", "acceptance_state": "draft"}]}
+```
+
+```sh
+python admin.py --root /path/to/runtime requirement-backfill \
+  --project example --actor operator --file backfill.json
+```
+
+The command is idempotent: an identical repeated run reports `changed: false`.
+Unknown records, duplicate entries and caller-supplied labels are refused before
+any native write.
+
 ## Require an acknowledged plan before launching
 
 `worker_gate.py` supplies `register`, `check` and `run`. Every command requires explicit `--config`, `--project`, `--task`, `--actor`, `--launch-id`, `--plan`, `--cwd` and `--receipt`. For example:

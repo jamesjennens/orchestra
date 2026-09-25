@@ -50,6 +50,12 @@ actor/task checks. Rejected writes name the dedicated
 structured operation (`review`, `checkpoint`, `lifecycle record`, `handoff`,
 `worker_gate.py register`). Ordinary prose remains valid.
 
+When a requirement or BRD narrative record also needs its controlled type/state
+labels, use the dedicated `requirement_records.py draft|revise` operation
+([native integration](REQUIREMENTS_INTEGRATION.md#draft-or-revise-a-requirement-record-in-one-step))
+instead of a raw comment. Operators label records that already exist with
+`admin.py requirement-backfill`.
+
 ## Make review-ready work discoverable
 
 For new structured contributions, prefer [resume and contribution reviews](REVIEWS.md), served as `docs reviews`: exact delivery revisions, persistent requests/responses and `work --mine`/`work --state awaiting-review`. Structured state overrides legacy labels and old checkpoints. Recurring workers resume the saved actor; replacement workers need an explicit authorized handoff. The label convention below remains for existing unstructured tasks.

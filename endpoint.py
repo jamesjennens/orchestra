@@ -127,7 +127,7 @@ def execute(root,request):
             fcntl.flock(lock,fcntl.LOCK_EX)
             output=briefing_execute(root,path,name,actor,action,args,request.get('attachments',{}),run)
         return {'returncode':0,'stdout':output,'stderr':''.join(run_warnings)}
-    if action in ('lifecycle','coordinate'):
+    if action in ('lifecycle','coordinate','requirement'):
         args=request.get('args',[])
         if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):raise ValueError('Expected one JSON payload')
         payload=json.loads(args[0])
@@ -139,9 +139,16 @@ def execute(root,request):
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             if action=='lifecycle':result=apply_native(payload,actor,run)
-            else:
+            elif action=='coordinate':
                 from coordination import apply_native as coordinate
                 result=coordinate(payload,actor,run,path)
+            if action=='lifecycle':result=apply_native(payload,actor,run)
+            elif action=='coordinate':
+                from coordination import apply_native as coordinate
+                result=coordinate(payload,actor,run,path)
+            else:
+                from requirement_records import apply_native as requirement_apply
+                result=requirement_apply(payload,actor,run,path)
         return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
     if action == 'feedback':
         from feedback import execute as feedback_execute
