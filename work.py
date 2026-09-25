@@ -1,17 +1,14 @@
 """Review/contribution transport and bounded current work queues."""
 import argparse
 import json
-from lifecycle import project_facts
+from lifecycle import integration_evidence, project_facts
 
 class Parser(argparse.ArgumentParser):
     def error(self,message):raise ValueError(message)
 
-def workflow(issue):
-    from review_workflow import project
-    result=project(issue)
-    if result['review_state']=='none' and 'review-ready' in (issue.get('labels') or []):
-        result=dict(result,review_state='legacy-review-ready')
-    return result
+def workflow(issue,scopes=None):
+    from review_state import project
+    return project(issue,scopes)
 
 def queue(rows,actor,args,request_dir=None):
     parser=Parser(add_help=False)
@@ -34,16 +31,13 @@ def queue(rows,actor,args,request_dir=None):
                 journal_requests.append(request)
             except (OSError,json.JSONDecodeError,ValueError) as exc:
                 journal_errors.append({'path':request_file.name,'error':str(exc)[:300]})
-    facts={r['id']:r for r in project_facts(rows)};items=[]
+    facts={r['id']:r for r in project_facts(rows)};evidence={r['id']:r['scopes'] for r in integration_evidence(rows)};items=[]
     for row in rows:
         if row.get('issue_type') in ('event','gate','merge-slot'):continue
         if owner is not None and row.get('assignee')!=owner:continue
-        try:review=workflow(row);state=review['review_state'];error=None
+        try:review=workflow(row,evidence.get(row['id']));state=review['review_state'];error=None
         except ValueError as e:review={};state='error';error=str(e)[:300]
         fact=facts.get(row['id'],{}).get('facts',{})
-        current_contribution=review.get('contribution') or {}
-        current_scope=facts.get(row['id'],{}).get('scope') or {}
-        if state=='awaiting-integration' and current_contribution.get('commit','').lower()==current_scope.get('source_commit','').lower() and fact.get('integrated',{}).get('value')=='passed':state='integrated'
         if row.get('status')=='closed' and state not in ('changes-requested','awaiting-review','awaiting-integration','legacy-review-ready','error'):continue
         if a.state and a.state!=state:continue
         contribution=review.get('contribution') or {}
@@ -63,7 +57,8 @@ def queue(rows,actor,args,request_dir=None):
                       'pending_handoff_total':handoff_total,
                       'pending_handoff_next_offset':a.handoff_offset+a.handoff_limit if a.handoff_offset+a.handoff_limit<handoff_total else None,
                       'lifecycle':{k:v['value'] for k,v in fact.items()},'lifecycle_scope':scope,
-                      'lifecycle_matches_contribution':None if not contribution else scope.get('source_commit','').lower()==contribution['commit'].lower(),'error':error})
+                      'lifecycle_matches_contribution':None if not contribution else review.get('integration',{}).get('matches_contribution'),
+                      'integration':review.get('integration'),'workflow_state':review.get('workflow_state'),'error':error})
     priority={'changes-requested':0,'error':1,'awaiting-review':2,'legacy-review-ready':2,'awaiting-integration':3}
     items.sort(key=lambda r:(priority.get(r['review_state'],4),r['task']))
     result={'owner':owner,'total':len(items),'items':items[a.offset:a.offset+a.limit],'next_offset':a.offset+a.limit if a.offset+a.limit<len(items) else None,
@@ -82,7 +77,9 @@ def execute(path,actor,action,args,attachments,run):
     if action=='review' and len(args)==1:
         from briefing import task_row
         rows=[json.loads(line) for line in run(['export','--all']).splitlines() if line.strip()]
-        return workflow(task_row(rows,task))
+        issue=task_row(rows,task)
+        scopes=next((r['scopes'] for r in integration_evidence(rows) if r['id']==task),[])
+        return workflow(issue,scopes)
     if len(args)!=2 or not args[1].startswith('@attachment:'):raise ValueError('A JSON file attachment is required')
     item=attachments.get(args[1].partition(':')[2],{})
     if not isinstance(item,dict) or item.get('flag') not in ('--file','-f') or not isinstance(item.get('text'),str):raise ValueError('Invalid attachment')

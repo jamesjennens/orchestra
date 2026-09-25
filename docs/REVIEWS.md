@@ -147,7 +147,15 @@ b brief example-task
 b review example-task
 ```
 
-The queue sorts requested changes first and shows task status, owner, review state, exact contribution commit and separate lifecycle values/scope. `--owner ACTOR`, `--limit` and `--offset` support coordinator scans. Pages are fresh views, not immutable history snapshots. Closed tasks with outstanding review state remain visible; closure is not acceptance. An approved contribution with passed scoped integration evidence can display integrated. Check the scope-match field before applying historical lifecycle evidence to the current contribution.
+The queue sorts requested changes first and shows task status, owner, review state, exact contribution commit and separate lifecycle values/scope. `--owner ACTOR`, `--limit` and `--offset` support coordinator scans. Pages are fresh views, not immutable history snapshots. Closed tasks with outstanding review state remain visible; closure is not acceptance.
+
+`review TASK`, `brief` and `work` combine the workflow chain and lifecycle evidence in **one shared projection**, so they cannot disagree about whether a contribution is integrated. Additive fields:
+
+- `review_state` is the effective state and may now be `integrated`.
+- `workflow_state` is the raw append-only workflow state, kept clearly separate (`none`, `awaiting-review`, `changes-requested`, `awaiting-integration`, or `legacy-review-ready` for the legacy label).
+- `integration` reports `fact`, `scope`, `scope_token`, `source_commit`, `integration_commit` and `matches_contribution` for the current contribution.
+
+An approved contribution displays `integrated` when **any** lifecycle scope whose `source_commit` equals the contribution's FULL commit records `integrated=passed`; scope order does not matter, so recording a later release/live-verified scope does not return settled work to the awaiting-integration queue. A newest manual (unstructured) assertion, ordering ambiguity, or a value/label disagreement leaves the integration fact unknown instead of reusing an older pass; `matches_contribution` still reports whether a scope names the contribution commit. The top-level `lifecycle` and `lifecycle_scope` fields keep their existing newest-scope meaning, while `lifecycle_matches_contribution` now reports the effective scope match. All of these fields are additive to the previous JSON.
 
 `brief` prioritizes pending review actions over an older checkpoint's next action. It shows up to five pending items with a pointer to `review TASK` for the rest. Generated CURRENT.md includes a bounded review queue; native `list` remains unchanged. Legacy `review-ready` labels remain discoverable, but structured review state takes precedence. If a task has no checkpoint, its description and acceptance are shown without calling it legacy work.
 

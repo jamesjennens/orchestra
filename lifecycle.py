@@ -91,6 +91,55 @@ def project_facts(rows):
     return result
 
 
+def integration_evidence(rows):
+    """Per-scope ``integrated`` evidence, newest recorded scope first.
+
+    ``project_facts`` reports only the newest scope and treats older evidence as
+    unknown once a later scope is recorded. Integration is decided per scope: a
+    contribution counts as integrated when ANY scope whose ``source_commit``
+    equals its full commit records ``integrated=passed``, regardless of scope
+    order. This reader exposes those values without changing ``project_facts``.
+
+    Trust stays conservative. Ordering ambiguity, a newest unstructured (manual)
+    assertion, or a newest value that disagrees with the native ``integrated:``
+    label yields no trusted value, never a guess.
+    """
+    events={}
+    for row in rows:
+        event=native_event(row)
+        if event:events.setdefault((event['task'],event['dimension']),[]).append(event)
+    result=[]
+    for row in rows:
+        if row.get('issue_type')=='event':continue
+        task=row['id'];found=events.get((task,'integrated'),[]);trusted=None
+        if found:
+            orders=[e['order'] for e in found]
+            newest=max(found,key=lambda e:e['order'] if e['order'] is not None else -1)
+            labels=[v for v in (row.get('labels') or []) if v.startswith('integrated:')]
+            if (all(o is not None for o in orders) and len(set(orders))==len(orders)
+                    and newest['payload'] is not None
+                    and labels==['integrated:'+newest['value']]):
+                trusted=found
+        scopes=[];seen=set()
+        for event in events.get((task,'lifecycle-scope'),[]):
+            payload=event['payload']
+            if not payload or event['value'] in seen:continue
+            seen.add(event['value']);scopes.append((event,event['value'],payload['scope']))
+        scopes.sort(key=lambda x:x[0]['order'] if x[0]['order'] is not None else -1,reverse=True)
+        entries=[]
+        for event,token,scope in scopes:
+            fact=None
+            if trusted:
+                candidates=[x for x in trusted if x['payload'] and content_hash(x['payload']['scope'])==token]
+                if candidates:
+                    latest=max(candidates,key=lambda x:x['order'])
+                    fact={'value':latest['value'],'event_id':latest['id'],
+                          'evidence':latest['payload']['evidence'],'provenance':latest['payload']['provenance']}
+            entries.append({'scope_token':token,'scope':scope,'order':event['order'],'integrated':fact})
+        result.append({'id':task,'scopes':entries})
+    return result
+
+
 def apply_native(payload, actor, run):
     """Caller holds project lock; run(argv) invokes pinned bd and returns stdout."""
     validate_payload(payload)

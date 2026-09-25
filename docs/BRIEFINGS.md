@@ -12,6 +12,8 @@ b show example-task --json
 
 The default briefing answers who owns the task, its current position, unresolved items and next action. It also includes intent, acceptance, checkpoint author/time/branch/source commit and incorporated activity cursor, freshness, native dependencies, and six independent lifecycle facts with evidence pointers. A checkpoint does not set lifecycle facts; completed code never implies deployment. The native assignee remains authoritative.
 
+The `review` object comes from the same projection used by `review TASK` and `work`, so the three reads cannot disagree about whether a contribution is integrated. It carries the raw `workflow_state` plus an additive `integration` block (`fact`, `scope`, `integration_commit`, `matches_contribution`); see [REVIEWS.md](REVIEWS.md).
+
 An old task without a structured checkpoint reports its current position and unresolved coverage as **unknown**, not empty or complete. It shows bounded excerpts and directs the reader to reconcile history. Do not manufacture a checkpoint from only the last few comments. `show` retains the full native output; it can still exceed a calling tool's output limit.
 
 ## Publish a checkpoint
