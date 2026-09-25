@@ -112,6 +112,35 @@ def records(issue):
     return ordered
 
 
+class StaleReviewPrevious(ValueError):
+    """A new review operation named a `previous` that is no longer the chain head.
+
+    The current head is returned with the refusal so a caller does not need a blind
+    extra fetch to discover it. `latest_comment_id` and `review_state` describe the
+    head at rejection time; they do not carry the chain content, so a caller must
+    still re-read before deciding. `detail` is the transport-neutral structured
+    error: the CLI prints it as one canonical JSON line on stderr and an HTTP
+    transport returns it as the 409 body.
+    """
+
+    code = 'stale-previous'
+    http_status = 409
+
+    def __init__(self, task, supplied, latest_comment_id, review_state):
+        self.task = task
+        self.supplied_previous = supplied
+        self.latest_comment_id = latest_comment_id
+        self.review_state = review_state
+        self.detail = {'code': self.code, 'http_status': self.http_status, 'task': task,
+                       'supplied_previous': supplied, 'latest_comment_id': latest_comment_id,
+                       'review_state': review_state}
+        head = 'null (no review record exists yet)' if latest_comment_id is None else latest_comment_id
+        super().__init__(
+            'Stale review workflow previous; reread brief. Current latest_comment_id is '
+            f'{head} and review_state is {review_state}; re-read the chain content before '
+            'deciding.\n' + canonical_bytes(self.detail).decode('utf-8'))
+
+
 def describe_contribution_mismatch(op, supplied, current, latest):
     """Actionable refusal for a review operation that names the wrong revision.
 
@@ -186,7 +215,8 @@ def execute(rows, task, actor, payload, run):
                 return dict(comment_id=str(c['id']), reconciled=True, review_state=state['review_state'])
             raise ValueError('Operation ID already used with different payload or actor')
     if payload['previous'] != state['latest_comment_id']:
-        raise ValueError('Stale review workflow previous; reread brief')
+        raise StaleReviewPrevious(task, payload['previous'],
+                                  state['latest_comment_id'], state['review_state'])
     if payload['operation'] in ('contribute', 'respond') and (not issue.get('assignee') or actor != issue['assignee']):
         raise ValueError('Only the current assigned owner may contribute/respond; resume or handoff first')
     if payload['operation'] == 'request-changes' and issue.get('status') == 'closed':

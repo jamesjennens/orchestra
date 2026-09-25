@@ -267,6 +267,14 @@ resource where existence must not leak, `409` for stale state or idempotency
 conflict, `413` for bounded payload violations, `429` for throttling, and
 `5xx` only for an operation whose commit status is explicitly unknown.
 
+For a review write whose `previous` is no longer the chain head, the `409` body
+carries the transport-neutral detail produced by `review_workflow.StaleReviewPrevious`
+(`code` `stale-previous`, `task`, `supplied_previous`, current `latest_comment_id`,
+`review_state`). It is the same object the SSH/CLI transport prints as one canonical
+JSON line on stderr, so a caller can rebuild the payload without a blind extra read;
+the values are identifiers and state only, so the caller must still re-read the chain
+content before deciding.
+
 The browser workflow is required product scope, not an optional GUI. It uses
 the same API and server authorization for sign-in, project creation/joining,
 membership administration, task briefs/current checkpoints, paginated history,
