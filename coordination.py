@@ -71,7 +71,7 @@ def resubmittable(prior, actor):
     if not isinstance(prior,dict) or prior.get('status') not in RELEASABLE:return False
     if prior.get('actor')==actor:return True
     audit=prior.get('reconciliation') or {}
-    return prior.get('status')=='released' and audit.get('any_actor') is True
+    return bool(audit.get('any_actor'))
 
 
 def receipt_record(prior, digest, status, **extra):
@@ -85,14 +85,42 @@ def receipt_record(prior, digest, status, **extra):
     return record
 
 
-def reconcile_request(project, request_id, actor, reason, disposition, run, at=None, any_actor=False):
+def issue_confirmation(issue_id, run):
+    """Read back the exact native issue a `complete` disposition will attach.
+
+    The confirmation names the parent, creator and title so the operator sees
+    *which* issue is being accepted instead of silently trusting whatever
+    carried a guessable `request:` label. A read that cannot confirm the exact
+    issue fails closed: the receipt is not completed on an unverified issue.
+    """
+    try:
+        rows=json.loads(run(['show',issue_id,'--json']))
+    except (TypeError,ValueError) as exc:
+        raise ValueError('Could not read native issue %s to confirm its parent, creator and title: %s' % (issue_id,exc))
+    if isinstance(rows,dict):rows=[rows]
+    if (not isinstance(rows,list) or len(rows)!=1 or not isinstance(rows[0],dict)
+            or rows[0].get('id')!=issue_id):
+        raise ValueError('Could not confirm the exact native issue %s; refusing to complete an unconfirmed receipt' % issue_id)
+    row=rows[0]
+    return {'id':issue_id,
+            'title':row.get('title'),
+            'creator':row.get('created_by') or row.get('creator') or row.get('author') or row.get('assignee'),
+            'parent':row.get('parent') or row.get('parent_id')}
+
+
+def reconcile_request(project, request_id, actor, reason, disposition, run, at=None, any_actor=False, issue_id=None):
     """Operator-only: resolve a stuck reservation without guessing native state.
 
     * `complete` completes the receipt from the single labelled native issue when
-      the original content is unknown, recording the operator in the audit.
-    * `failed`/`released` confirm natively that no issue exists first. `released`
-      with `any_actor=True` explicitly opens the ID to any actor; otherwise the
-      original actor stays bound to it.
+      the original content is unknown, recording the operator in the audit. It
+      requires an explicit `issue_id` and prints that issue's parent, creator and
+      title in the confirmation.
+    * `failed`/`released` confirm natively that no issue exists first. A receipt
+      that records its original actor keeps that binding; `released --any-actor`
+      deliberately opens the ID to any actor. A receipt with **no recorded
+      actor** (an older stuck reservation) refuses `failed`/`released` unless
+      `--any-actor` is supplied on that same first call, because otherwise the
+      ID would be bound to nobody and could never be resubmitted.
     * Repeating the identical reconciliation is idempotent, while a differing
       retry is refused with the recorded audit instead of silently returning
       `already: true` and keeping a different record.
@@ -100,8 +128,13 @@ def reconcile_request(project, request_id, actor, reason, disposition, run, at=N
     identifier(request_id);identifier(actor)
     if disposition not in ('failed','released','complete'):
         raise ValueError('Disposition must be failed, released or complete')
-    if any_actor and disposition!='released':raise ValueError('Only a released disposition may be opened to any actor')
+    if issue_id is not None and (not isinstance(issue_id,str) or not issue_id.strip()):
+        raise ValueError('Invalid issue ID')
+    if issue_id is not None and disposition!='complete':
+        raise ValueError('An issue ID applies only to a complete disposition')
     if not isinstance(reason,str) or not reason.strip():raise ValueError('A reconciliation reason is required')
+    if disposition=='complete' and not issue_id:
+        raise ValueError('A complete disposition requires an explicit --issue-id naming the labelled native issue; confirm its parent, creator and title before completing the receipt')
     identity=content_hash({'request_id':request_id})
     receipt=project/'.coordination-requests'/(identity+'.json')
     if not receipt.exists():raise ValueError('No coordination request reservation exists for that request ID')
@@ -109,28 +142,71 @@ def reconcile_request(project, request_id, actor, reason, disposition, run, at=N
     if not isinstance(prior,dict) or not isinstance(prior.get('status'),str):
         raise ValueError('Malformed coordination request receipt; inspect before reconciling')
     audit=prior.get('reconciliation') or {}
+    actorless=not prior.get('actor')
+    if any_actor and disposition=='complete':
+        raise ValueError('Only a failed or released disposition may be opened to any actor')
+    if any_actor and disposition=='failed' and not actorless:
+        raise ValueError('A failed receipt stays bound to its original actor; only a released disposition may be opened to any actor')
+    at=at or time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())
     if prior['status'] in RELEASABLE:
         same=(audit.get('actor')==actor and audit.get('reason')==reason
               and audit.get('disposition')==disposition and bool(audit.get('any_actor'))==any_actor)
         if same:
             return {'request_id':request_id,'status':prior['status'],'reconciled':False,'already':True,
                     'reconciliation':audit}
+        # A release recorded by an older kit build bound the ID to nobody because
+        # the receipt had no actor. Let the operator upgrade that recorded
+        # release to any_actor instead of leaving it permanently locked.
+        if actorless and any_actor and disposition in ('failed','released'):
+            upgraded=dict(audit)
+            upgraded.update({'any_actor':True,'upgraded_by':actor,'upgraded_at':at,'upgrade_reason':reason})
+            updated=receipt_record(prior,prior.get('sha256'),prior['status'],actor=prior.get('actor'),
+                                   reconciliation=upgraded)
+            if prior.get('error'):updated['error']=prior['error']
+            atomic(receipt,updated)
+            return {'request_id':request_id,'status':prior['status'],'reconciled':True,'upgraded':True,
+                    'reconciliation':upgraded}
         raise ValueError('Reconciliation conflict: request %s is already %s by actor %r (disposition %r, reason %r); the recorded audit is kept and a differing retry is refused.'
                          % (request_id,prior['status'],audit.get('actor'),audit.get('disposition'),audit.get('reason')))
+    if prior['status']=='complete':
+        same=(audit.get('actor')==actor and audit.get('reason')==reason
+              and audit.get('disposition')=='complete' and prior.get('id')==issue_id and not any_actor)
+        if same:
+            return {'request_id':request_id,'status':'complete','reconciled':False,'already':True,
+                    'id':prior.get('id'),'reconciliation':audit}
+        raise ValueError('Reconciliation conflict: request %s is already complete by actor %r (reason %r, id %r); the recorded audit is kept and a differing retry is refused.'
+                         % (request_id,audit.get('actor'),audit.get('reason'),prior.get('id')))
     if prior['status']!='pending':raise ValueError('Coordination request is not pending; nothing to reconcile')
+    if actorless and disposition in ('failed','released') and not any_actor:
+        raise ValueError('The reservation for request %s records no actor, so a %s disposition would bind it to nobody and permanently lock the request ID. Re-run with --any-actor to open it to any actor, or use --disposition complete --issue-id if a native issue exists. See docs/OPERATIONAL_WORKFLOW.md.'
+                         % (request_id,disposition))
     label='request:'+identity
     found=json.loads(run(['list','--all','--limit','0','--label',label,'--json'])) or []
     if len(found)>1:raise ValueError('Duplicate native request records; manual operator reconciliation required')
-    at=at or time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())
-    if found:
-        if disposition!='complete':
-            raise ValueError('A native issue already exists for this request; complete the reservation with --disposition complete instead of releasing it')
-        audit={'actor':actor,'reason':reason,'disposition':'complete','at':at,'completed_from':'native'}
+    digest=prior.get('sha256')
+    labels=(found[0].get('labels') or []) if found else []
+    coordinated=(not digest) or ('request-content:'+digest in labels)
+    if found and disposition!='complete':
+        if coordinated:
+            raise ValueError('A native issue already exists for this request; complete the reservation with --disposition complete --issue-id instead of releasing it')
+        # The only issue carrying the guessable request: label lacks this
+        # reservation's request-content: marker, so it is a planted or foreign
+        # issue and must not block the operator from releasing the request.
+    if found and disposition=='complete':
+        if found[0].get('id')!=issue_id:
+            raise ValueError('--issue-id %s does not match the labelled native request issue %s; refusing to complete a different issue'
+                             % (issue_id,found[0].get('id')))
+        if not coordinated:
+            raise ValueError('The labelled native issue %s does not carry request-content:%s, so it was not created for this reserved content; a same-label planted or foreign issue is refused. Inspect its parent, creator and title before deciding.'
+                             % (issue_id,digest))
+        details=issue_confirmation(issue_id,run)
+        audit={'actor':actor,'reason':reason,'disposition':'complete','at':at,'completed_from':'native','issue':details}
         updated=receipt_record(prior,prior.get('sha256'),'complete',id=found[0]['id'],
                                actor=prior.get('actor') or actor,reconciliation=audit)
         if prior.get('error'):updated['error']=prior['error']
         atomic(receipt,updated)
-        return {'request_id':request_id,'status':'complete','reconciled':True,'id':found[0]['id'],'reconciliation':audit}
+        return {'request_id':request_id,'status':'complete','reconciled':True,'id':found[0]['id'],
+                'issue':details,'reconciliation':audit}
     if disposition=='complete':
         raise ValueError('No labelled native issue exists for this request; completion needs one, so use --disposition failed or released')
     audit={'actor':actor,'reason':reason,'disposition':disposition,'at':at}

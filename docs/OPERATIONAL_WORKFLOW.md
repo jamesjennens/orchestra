@@ -127,7 +127,15 @@ Release or complete a stuck reservation with the operator command, which inspect
 python admin.py --root /srv/runtime reconcile-request example --request-id alex/child-001 --actor operator-1 --reason "native validation refused before the fix" --disposition released
 ```
 
-`released` (default) and `failed` confirm natively that **no** issue exists, then free the ID; the original actor stays bound to it, and `released --any-actor` deliberately opens it to any actor. `complete` completes the receipt from the single labelled native issue when the original content is unknown, recording the operator in the audit. If a commit may exist without its request label, the automated label check cannot see it, so inspect native state by title and parent before releasing. The command is idempotent for an identical retry (reporting `already: true`), refuses a *differing* retry with the recorded audit instead of silently keeping the first one, and refuses `complete` when no labelled native issue exists.
+`released` (default) and `failed` confirm natively that **no** issue exists, then free the ID. When the receipt records its original actor, that actor stays bound to the freed ID; `released --any-actor` deliberately opens it to any actor. A receipt that records **no** actor (the older `{sha256, status: pending}` reservations) refuses `failed`/`released` unless `--any-actor` is supplied on that same first call, because otherwise the ID is bound to nobody and can never be resubmitted; an actorless release already recorded by an older build can still be upgraded with a later `released --any-actor`. `complete` requires an explicit `--issue-id`: it completes the receipt from that single labelled native issue and prints the issue's parent, creator and title in the confirmation, and it refuses an issue that does not carry the matching `request-content:` label (a planted or foreign issue with the guessable `request:` label alone). If a commit may exist without its request label, the automated label check cannot see it, so inspect native state by title and parent before releasing. The command is idempotent for an identical retry (reporting `already: true`, including an identical `complete`), refuses a *differing* retry with the recorded audit instead of silently keeping the first one, and refuses `complete` when no labelled native issue exists.
+
+Operator runbook for a stuck reservation:
+
+1. Inspect native state by title and parent (`bd show`/`list`) so you know whether an issue exists.
+2. If an issue exists, run `--disposition complete --issue-id <id>` and confirm the printed `title`, `creator` and `parent` are the expected child; if the issue lacks the matching `request-content:` label, stop and investigate instead of completing.
+3. If no issue exists and the receipt records an actor, release it (the original actor resubmits). If you must hand the ID to another actor, add `--any-actor`.
+4. If no issue exists and the receipt records **no** actor, pass `--any-actor` on this first release (a plain release is refused); then any actor may resubmit the same request ID.
+5. Never delete the reservation or allocate a new request ID to bypass a refusal.
 
 ## Integrate through one project-wide merge slot
 

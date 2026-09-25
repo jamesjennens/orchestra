@@ -31,6 +31,7 @@ class Native:
     def __init__(self):
         self.calls = []
         self.issues = []
+        self.details = {}
         self.holder = None
         self.create_outcome = 'ok'
         self.acquire_outcome = 'ok'
@@ -39,6 +40,12 @@ class Native:
         self.bd_validate_decisions = True
         self.drop_request_label = False
         self.hide_label_reads = 0
+        self.creator = 'alice'
+
+    def remember(self, issue, args):
+        self.details[issue['id']] = {
+            'id': issue['id'], 'title': args[args.index('--title') + 1],
+            'created_by': self.creator, 'parent': args[args.index('--parent') + 1]}
 
     def section_refusal(self, args):
         if not self.bd_validate_decisions or args[args.index('--type') + 1] != 'decision':
@@ -72,6 +79,7 @@ class Native:
                 labels = [label for label in labels if not label.startswith('request:')]
             issue = {'id': 'sample-job.%d' % (len(self.issues) + 7), 'labels': labels}
             self.issues.append(issue)
+            self.remember(issue, args)
             if self.drop_request_label:
                 raise ValueError('adding labels: database is locked')
             if self.create_outcome == 'stale-label-read':
@@ -86,7 +94,7 @@ class Native:
         if args[0] == 'show':
             if self.show_fails:
                 raise RuntimeError('task missing')
-            return json.dumps([{'id': args[1]}])
+            return json.dumps([self.details.get(args[1], {'id': args[1]})])
         if args[:2] == ['merge-slot', 'check']:
             return json.dumps({'available': self.holder is None, 'holder': self.holder})
         if args[:2] == ['merge-slot', 'acquire']:
@@ -407,6 +415,18 @@ class ReconcileTests(unittest.TestCase):
     def receipt(self):
         return json.loads(next((self.project / '.coordination-requests').iterdir()).read_text(encoding='utf-8'))
 
+    def stuck(self, actor=None):
+        """Write the real deployed receipt shape ({sha256,status:pending}, no actor)."""
+        identity = coordination.content_hash({'request_id': CHILD['request_id']})
+        digest = coordination.content_hash({'actor': 'legacy-original', 'payload': CHILD})
+        journal = self.project / '.coordination-requests'
+        journal.mkdir(exist_ok=True)
+        record = {'sha256': digest, 'status': 'pending'}
+        if actor is not None:
+            record['actor'] = actor
+        (journal / (identity + '.json')).write_text(json.dumps(record), encoding='utf-8')
+        return digest
+
     def test_operator_reconcile_is_audited_and_idempotent(self):
         self.pending()
         result = coordination.reconcile_request(self.project, CHILD['request_id'], 'operator-1',
@@ -466,29 +486,155 @@ class ReconcileTests(unittest.TestCase):
         self.native.create_outcome = 'lost-response'
         with self.assertRaises(RuntimeError):
             coordination.apply_native(copy.deepcopy(CHILD), 'alice', self.native, self.project)
+        issue = {'id': 'sample-job.7', 'title': CHILD['title'], 'creator': 'alice',
+                 'parent': CHILD['parent']}
         result = coordination.reconcile_request(self.project, CHILD['request_id'], 'operator-1',
                                                 'issue exists without a completed receipt',
-                                                'complete', self.native, at='2026-09-25T00:00:00Z')
+                                                'complete', self.native, issue_id='sample-job.7',
+                                                at='2026-09-25T00:00:00Z')
         self.assertEqual(result, {'request_id': CHILD['request_id'], 'status': 'complete', 'reconciled': True,
-                                  'id': 'sample-job.7',
+                                  'id': 'sample-job.7', 'issue': issue,
                                   'reconciliation': {'actor': 'operator-1',
                                                      'reason': 'issue exists without a completed receipt',
                                                      'disposition': 'complete', 'at': '2026-09-25T00:00:00Z',
-                                                     'completed_from': 'native'}})
+                                                     'completed_from': 'native', 'issue': issue}})
         stored = self.receipt()
         self.assertEqual(stored['status'], 'complete')
         self.assertEqual(stored['id'], 'sample-job.7')
         self.assertEqual(stored['actor'], 'alice')
+        self.assertEqual(stored['reconciliation']['issue'], issue)
         # The original actor's identical create reconciles to the completed issue.
         self.assertEqual(coordination.apply_native(copy.deepcopy(CHILD), 'alice', self.native, self.project),
                          {'id': 'sample-job.7', 'reconciled': True})
         self.assertEqual(self.native.count_create(), 1)
 
+    def test_reconcile_complete_requires_an_explicit_issue_id(self):
+        self.pending()
+        with self.assertRaisesRegex(ValueError, 'issue-id'):
+            coordination.reconcile_request(self.project, CHILD['request_id'], 'operator-1', 'checked',
+                                           'complete', self.native)
+        self.assertEqual(self.receipt()['status'], 'pending')
+
+    def test_reconcile_complete_refuses_a_planted_same_label_issue(self):
+        # A raw contributor can compute request:<sha(request_id)> and create an
+        # issue carrying that label; it must not be accepted as the reservation.
+        self.pending()
+        identity = coordination.content_hash({'request_id': CHILD['request_id']})
+        self.native.issues.append({'id': 'pp-k3n', 'labels': ['request:' + identity]})
+        self.native.details['pp-k3n'] = {'id': 'pp-k3n', 'title': 'Planted by contributor',
+                                         'created_by': 'mallory', 'parent': 'attacker-job'}
+        with self.assertRaisesRegex(ValueError, 'request-content'):
+            coordination.reconcile_request(self.project, CHILD['request_id'], 'operator-1', 'attached',
+                                           'complete', self.native, issue_id='pp-k3n')
+        self.assertNotIn('id', self.receipt())
+
+    def test_released_receipt_ignores_a_planted_same_label_issue(self):
+        # A planted issue carrying only the guessable request: label must not
+        # block an operator from releasing the stuck reservation either.
+        self.pending()
+        identity = coordination.content_hash({'request_id': CHILD['request_id']})
+        self.native.issues.append({'id': 'pp-k3n', 'labels': ['request:' + identity]})
+        result = coordination.reconcile_request(self.project, CHILD['request_id'], 'operator-1',
+                                                'planted issue is not ours', 'released', self.native)
+        self.assertEqual(result['status'], 'released')
+        self.assertEqual(self.receipt()['status'], 'released')
+
+    def test_reconcile_complete_reads_back_parent_creator_and_title(self):
+        self.native.create_outcome = 'lost-response'
+        with self.assertRaises(RuntimeError):
+            coordination.apply_native(copy.deepcopy(CHILD), 'alice', self.native, self.project)
+        result = coordination.reconcile_request(self.project, CHILD['request_id'], 'operator-1',
+                                                'lost response', 'complete', self.native,
+                                                issue_id='sample-job.7')
+        self.assertEqual(result['issue'], {'id': 'sample-job.7', 'title': CHILD['title'],
+                                           'creator': 'alice', 'parent': CHILD['parent']})
+        self.assertEqual(self.receipt()['reconciliation']['issue'], result['issue'])
+
+    def test_reconcile_complete_refuses_a_different_explicit_issue(self):
+        self.native.create_outcome = 'lost-response'
+        with self.assertRaises(RuntimeError):
+            coordination.apply_native(copy.deepcopy(CHILD), 'alice', self.native, self.project)
+        with self.assertRaisesRegex(ValueError, 'does not match'):
+            coordination.reconcile_request(self.project, CHILD['request_id'], 'operator-1', 'lost',
+                                           'complete', self.native, issue_id='sample-job.99')
+
+    def test_identical_complete_retry_is_idempotent(self):
+        self.native.create_outcome = 'lost-response'
+        with self.assertRaises(RuntimeError):
+            coordination.apply_native(copy.deepcopy(CHILD), 'alice', self.native, self.project)
+        coordination.reconcile_request(self.project, CHILD['request_id'], 'operator-1',
+                                       'lost response', 'complete', self.native,
+                                       issue_id='sample-job.7', at='2026-09-25T00:00:00Z')
+        stored = self.receipt()
+        again = coordination.reconcile_request(self.project, CHILD['request_id'], 'operator-1',
+                                               'lost response', 'complete', self.native,
+                                               issue_id='sample-job.7', at='2026-09-26T00:00:00Z')
+        self.assertTrue(again['already'])
+        self.assertFalse(again['reconciled'])
+        self.assertEqual(again['status'], 'complete')
+        self.assertEqual(again['id'], 'sample-job.7')
+        self.assertEqual(self.receipt(), stored)
+        for actor, issue_id in (('operator-2', 'sample-job.7'), ('operator-1', 'sample-job.99')):
+            with self.subTest(actor=actor, issue_id=issue_id):
+                with self.assertRaisesRegex(ValueError, 'already complete'):
+                    coordination.reconcile_request(self.project, CHILD['request_id'], actor,
+                                                   'lost response', 'complete', self.native,
+                                                   issue_id=issue_id)
+
     def test_reconcile_complete_requires_a_labelled_native_issue(self):
         self.pending()
         with self.assertRaisesRegex(ValueError, 'No labelled native issue'):
             coordination.reconcile_request(self.project, CHILD['request_id'], 'operator-1', 'checked',
-                                           'complete', self.native)
+                                           'complete', self.native, issue_id='sample-job.7')
+
+    def test_actorless_receipt_refuses_a_plain_release_or_failure(self):
+        # The real deployed receipts are {sha256,status:pending} with no actor. A
+        # plain released/failed would store actor None and lock the ID forever.
+        self.stuck()
+        for disposition in ('released', 'failed'):
+            with self.subTest(disposition=disposition):
+                with self.assertRaisesRegex(ValueError, 'no actor'):
+                    coordination.reconcile_request(self.project, CHILD['request_id'], 'operator-1',
+                                                   'plain', disposition, self.native)
+        self.assertEqual(self.receipt()['status'], 'pending')
+
+    def test_actorless_receipt_released_with_any_actor_frees_the_id(self):
+        self.stuck()
+        result = coordination.reconcile_request(self.project, CHILD['request_id'], 'operator-1',
+                                                'open the actorless ID', 'released', self.native,
+                                                any_actor=True, at='2026-09-25T00:00:00Z')
+        self.assertTrue(result['reconciled'])
+        self.assertTrue(result['reconciliation']['any_actor'])
+        self.assertIsNone(self.receipt()['actor'])
+        self.assertEqual(coordination.apply_native(copy.deepcopy(CHILD), 'bob', self.native, self.project)['id'],
+                         'sample-job.7')
+
+    def test_actorless_receipt_failed_with_any_actor_frees_the_id(self):
+        self.stuck()
+        with self.assertRaisesRegex(ValueError, 'no actor'):
+            coordination.reconcile_request(self.project, CHILD['request_id'], 'operator-1',
+                                           'mark failed', 'failed', self.native)
+        result = coordination.reconcile_request(self.project, CHILD['request_id'], 'operator-1',
+                                                'mark failed open', 'failed', self.native, any_actor=True)
+        self.assertTrue(result['reconciliation']['any_actor'])
+        self.assertEqual(coordination.apply_native(copy.deepcopy(CHILD), 'bob', self.native, self.project)['id'],
+                         'sample-job.7')
+
+    def test_recorded_actorless_release_can_be_upgraded_to_any_actor(self):
+        digest = self.stuck()
+        identity = coordination.content_hash({'request_id': CHILD['request_id']})
+        (self.project / '.coordination-requests' / (identity + '.json')).write_text(json.dumps(
+            {'sha256': digest, 'status': 'released', 'error': 'legacy release',
+             'reconciliation': {'actor': 'operator-0', 'reason': 'legacy', 'disposition': 'released',
+                                'at': '2026-01-01T00:00:00Z'}}), encoding='utf-8')
+        result = coordination.reconcile_request(self.project, CHILD['request_id'], 'operator-1',
+                                                'upgrade legacy release', 'released', self.native,
+                                                any_actor=True, at='2026-09-25T00:00:00Z')
+        self.assertTrue(result['upgraded'])
+        self.assertTrue(result['reconciliation']['any_actor'])
+        self.assertEqual(result['reconciliation']['upgraded_by'], 'operator-1')
+        self.assertEqual(coordination.apply_native(copy.deepcopy(CHILD), 'bob', self.native, self.project)['id'],
+                         'sample-job.7')
 
     def test_reconcile_requires_a_reservation(self):
         with self.assertRaisesRegex(ValueError, 'No coordination request reservation'):
@@ -497,7 +643,7 @@ class ReconcileTests(unittest.TestCase):
 
     def test_reconcile_refuses_a_completed_request(self):
         coordination.apply_native(copy.deepcopy(CHILD), 'alice', self.native, self.project)
-        with self.assertRaisesRegex(ValueError, 'not pending'):
+        with self.assertRaisesRegex(ValueError, 'already complete'):
             coordination.reconcile_request(self.project, CHILD['request_id'], 'operator-1', 'checked',
                                            'released', self.native)
 

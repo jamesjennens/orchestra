@@ -238,7 +238,7 @@ class BackupTests(unittest.TestCase):
         journal = self.source / '.coordination-requests'
         journal.mkdir()
         identity = coordination.content_hash({'request_id': 'alice/child-001'})
-        record = {'sha256': 'b' * 64, 'status': 'pending'}
+        record = {'sha256': 'b' * 64, 'status': 'pending', 'actor': 'alice'}
         (journal / (identity + '.json')).write_text(json.dumps(record), encoding='utf-8')
         argv = ['admin.py', '--root', str(self.root), 'reconcile-request', 'source',
                 '--request-id', 'alice/child-001', '--actor', 'operator-1',
@@ -283,10 +283,13 @@ class BackupTests(unittest.TestCase):
         identity = coordination.content_hash({'request_id': 'alice/child-001'})
         record = {'sha256': 'b' * 64, 'status': 'pending', 'actor': 'alice'}
         (journal / (identity + '.json')).write_text(json.dumps(record), encoding='utf-8')
-        issue = json.dumps([{'id': 'sample-job.7', 'labels': ['request:' + identity]}])
+        issue = json.dumps([{'id': 'sample-job.7', 'title': 'Child', 'created_by': 'alice',
+                             'parent': 'sample-job',
+                             'labels': ['request:' + identity, 'request-content:' + 'b' * 64]}])
         argv = ['admin.py', '--root', str(self.root), 'reconcile-request', 'source',
                 '--request-id', 'alice/child-001', '--actor', 'operator-1',
-                '--reason', 'issue exists, original content unknown', '--disposition', 'complete']
+                '--reason', 'issue exists, original content unknown', '--disposition', 'complete',
+                '--issue-id', 'sample-job.7']
         with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', return_value=self.root), \
                 patch.object(admin, 'run_bd', return_value=issue), contextlib.redirect_stdout(io.StringIO()) as out:
             admin.main()
@@ -295,6 +298,7 @@ class BackupTests(unittest.TestCase):
         self.assertEqual(stored['id'], 'sample-job.7')
         self.assertEqual(stored['reconciliation']['disposition'], 'complete')
         self.assertEqual(stored['reconciliation']['completed_from'], 'native')
+        self.assertEqual(stored['reconciliation']['issue']['creator'], 'alice')
         self.assertIn('sample-job.7', out.getvalue())
 
 
