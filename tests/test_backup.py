@@ -232,6 +232,75 @@ class BackupTests(unittest.TestCase):
         self.assertIn((self.root, 'newproject', ['backup', 'init', str(self.root / 'backups' / 'newproject')]), [c.args for c in native.call_args_list])
         backup.assert_called_once_with(self.root, 'newproject')
 
+    def test_reconcile_request_command_releases_under_lock_and_prints_audit(self):
+        (self.source / '.beads').mkdir()
+        (self.source / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+        journal = self.source / '.coordination-requests'
+        journal.mkdir()
+        identity = coordination.content_hash({'request_id': 'alice/child-001'})
+        record = {'sha256': 'b' * 64, 'status': 'pending', 'actor': 'alice'}
+        (journal / (identity + '.json')).write_text(json.dumps(record), encoding='utf-8')
+        argv = ['admin.py', '--root', str(self.root), 'reconcile-request', 'source',
+                '--request-id', 'alice/child-001', '--actor', 'operator-1',
+                '--reason', 'native validation refused before the fix', '--disposition', 'released']
+        with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', return_value=self.root), \
+                patch.object(admin, 'run_bd', return_value='[]') as native, \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            admin.main()
+        self.flock.assert_called_once()
+        native.assert_called_once()
+        self.assertEqual(native.call_args.args[2][:4], ['list', '--all', '--limit', '0'])
+        stored = json.loads((journal / (identity + '.json')).read_text(encoding='utf-8'))
+        self.assertEqual(stored['status'], 'released')
+        self.assertEqual(stored['reconciliation']['actor'], 'operator-1')
+        self.assertEqual(stored['reconciliation']['reason'], 'native validation refused before the fix')
+        self.assertIn('operator-1', out.getvalue())
+
+    def test_reconcile_request_command_opens_the_id_with_any_actor_release(self):
+        (self.source / '.beads').mkdir()
+        (self.source / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+        journal = self.source / '.coordination-requests'
+        journal.mkdir()
+        identity = coordination.content_hash({'request_id': 'alice/child-001'})
+        record = {'sha256': 'b' * 64, 'status': 'pending', 'actor': 'alice'}
+        (journal / (identity + '.json')).write_text(json.dumps(record), encoding='utf-8')
+        argv = ['admin.py', '--root', str(self.root), 'reconcile-request', 'source',
+                '--request-id', 'alice/child-001', '--actor', 'operator-1',
+                '--reason', 'handover to bob', '--disposition', 'released', '--any-actor']
+        with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', return_value=self.root), \
+                patch.object(admin, 'run_bd', return_value='[]'), contextlib.redirect_stdout(io.StringIO()):
+            admin.main()
+        stored = json.loads((journal / (identity + '.json')).read_text(encoding='utf-8'))
+        self.assertEqual(stored['status'], 'released')
+        self.assertEqual(stored['actor'], 'alice')
+        self.assertTrue(stored['reconciliation']['any_actor'])
+
+    def test_reconcile_request_command_completes_from_a_labelled_native_issue(self):
+        (self.source / '.beads').mkdir()
+        (self.source / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+        journal = self.source / '.coordination-requests'
+        journal.mkdir()
+        identity = coordination.content_hash({'request_id': 'alice/child-001'})
+        record = {'sha256': 'b' * 64, 'status': 'pending', 'actor': 'alice'}
+        (journal / (identity + '.json')).write_text(json.dumps(record), encoding='utf-8')
+        issue = json.dumps([{'id': 'sample-job.7', 'title': 'Child', 'created_by': 'alice',
+                             'parent': 'sample-job',
+                             'labels': ['request:' + identity, 'request-content:' + 'b' * 64]}])
+        argv = ['admin.py', '--root', str(self.root), 'reconcile-request', 'source',
+                '--request-id', 'alice/child-001', '--actor', 'operator-1',
+                '--reason', 'issue exists, original content unknown', '--disposition', 'complete',
+                '--issue-id', 'sample-job.7']
+        with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', return_value=self.root), \
+                patch.object(admin, 'run_bd', return_value=issue), contextlib.redirect_stdout(io.StringIO()) as out:
+            admin.main()
+        stored = json.loads((journal / (identity + '.json')).read_text(encoding='utf-8'))
+        self.assertEqual(stored['status'], 'complete')
+        self.assertEqual(stored['id'], 'sample-job.7')
+        self.assertEqual(stored['reconciliation']['disposition'], 'complete')
+        self.assertEqual(stored['reconciliation']['completed_from'], 'native')
+        self.assertEqual(stored['reconciliation']['issue']['creator'], 'alice')
+        self.assertIn('sample-job.7', out.getvalue())
+
 
 if __name__ == '__main__':
     unittest.main()
