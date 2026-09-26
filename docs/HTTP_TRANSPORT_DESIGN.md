@@ -349,6 +349,8 @@ binding is deferred with the job/artifact routes. A syntactically valid attachme
 therefore rejected with `501 not_implemented` rather than accepted and dropped. The
 service never returns `201` while discarding submitted evidence.
 
+An exact retry must be sent no more than 29 days after the original attempt (the journal's `JOURNAL_RETRY_HORIZON_SECONDS`); inside that horizon it is never re-executed, and an older retry is unsupported.
+
 Every mutation that can be retried accepts an idempotency key scoped to
 authenticated principal, project and operation route. The key namespace does
 not include the request payload: store the canonical request hash separately,
@@ -533,7 +535,8 @@ the same boundary:
   `JOURNAL_MAX_SKEW_SECONDS` (24 h) makes the store suspect (the first step records
   `anchor = high_water`); once the raw clock has run for
   `JOURNAL_SUSPECT_SETTLE_SECONDS` (1 h) after the step the next write clears it. While
-  suspect the trusted clock is `min(now, anchor + 24 h)` and reclaim/tombstone deletion
+  suspect the trusted clock is `min(now, anchor + 24 h)` (rev10: anchor plus the time
+  elapsed since the step, capped at 24 h) and reclaim/tombstone deletion
   do not run; otherwise it is `now`. Rows are stamped with the raw clock. After a
   weekend the first hour is suspect and then normal operation resumes with no
   operator. A forward jump is held for an hour; a jump that persists longer is
@@ -551,6 +554,25 @@ the same boundary:
   coordination file is created.
 * *Route on HTTP rows.* The HTTP service sends the route with a keyed mutation, so the
   journal row records it (and the operation hash binds it).
+
+**Current build status (rev10).** Revision 10 answers the round-9 review:
+
+* *An accepted jump can no longer age a tombstone out.* Rev9 aged tombstones on the raw
+  clock, so a +8 day jump that settled after the hour deleted tombstones still inside
+  their real 30-day horizon and a 25.8-day-old identity re-executed. Schema 6 persists
+  `jump_credit` (the non-decreasing total of every suspect forward step, added when the
+  step is observed) and a per-tombstone `aged_from = reclaimed_at - jump_credit`; a
+  tombstone is deleted only when `aged_from < now - jump_credit - horizon`, using the
+  `(state, aged_from)` index. `--reset-high-water` never reduces the credit. Receipt
+  reclaim still uses the raw clock once not suspect (worst case `rc=2`).
+* *Client retry contract.* A step of 24 h or less is not suspect and not credited, so an
+  exact retry must be no older than `JOURNAL_RETRY_HORIZON_SECONDS` (29 days); inside it
+  a retry is never re-executed, an older one is unsupported.
+* *Trusted clock during a jump.* While suspect the trusted clock is
+  `clamp(anchor + (now - suspect_since), anchor, anchor + 24 h)`, counting only time
+  elapsed since the step, so a 60-second-old receipt replays during a jump.
+* *Snapshots* are converted to `journal_mode=DELETE`, leaving no `-wal`/`-shm` in
+  `backups/`.
 
 
 Credential issuance is the deliberate exception to replaying a secret. The

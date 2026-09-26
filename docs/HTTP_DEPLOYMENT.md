@@ -173,6 +173,12 @@ Mutating calls accept an `Idempotency-Key`. On an uncertain `503` the client
 raises `UncertainOutcome` carrying the key: retry the identical request with that
 key to reconcile. Never retry an uncertain mutation with a new key.
 
+**Retry contract.** An exact retry must be sent no more than 29 days (`JOURNAL_RETRY_HORIZON_SECONDS`, the 30-day tombstone horizon minus the 24 h skew allowance) after the original attempt. Inside that horizon a
+retry replays the recorded result, reports uncertainty or is refused as expired; it
+is never re-executed, whatever the server clock did. An older retry is unsupported: its
+tombstone may have aged out and the effect may run again. Reconcile canonical state and
+use a new key instead.
+
 ## 7. Secrets, rotation and redaction
 
 - Password verifiers are stored with memory-hard `scrypt`; plaintext passwords,
@@ -193,7 +199,8 @@ Back up, in one coordinated snapshot:
    operation store** `<PROJECT>/.http-operations.sqlite3` — `admin.py backup PROJECT`
    captures all three together (Dolt via `bd backup`, the coordination sidecar, and a
    consistent `sqlite3` backup-API snapshot of the operation store in
-   `<RUNTIME_ROOT>/backups/<PROJECT>.http-operations.sqlite3`),
+   `<RUNTIME_ROOT>/backups/<PROJECT>.http-operations.sqlite3`, converted to
+   `journal_mode=DELETE` so it is one self-contained file with no `-wal`/`-shm`),
 2. this service's `--state` document (accounts, membership, revocation state and
    audit) **and its record store** `<state>.records.sqlite3` (HTTP idempotency
    receipts and committed results).
@@ -267,36 +274,48 @@ The store keeps the same three concepts:
   observed.
 * **tombstones** — every reclaimed identity becomes a compact row (`state='expired'`:
   operation id, request hash, principal, times) that keeps refusing an exact retry as
-  expired. A tombstone is removed only when its age exceeds `JOURNAL_TOMBSTONE_SECONDS`
-  (default 30 days) measured against the trusted clock; a still-live tombstone is never
-  dropped to satisfy the byte or count budget.
+  expired. A tombstone ages on the *confirmed timeline*: it records
+  `aged_from = reclaimed_at - jump_credit` and is removed only when
+  `aged_from < now - jump_credit - JOURNAL_TOMBSTONE_SECONDS` (default 30 days), i.e.
+  when its age excluding every suspect forward step credited since it was reclaimed
+  passes the horizon. A clock jump therefore never ages a tombstone out (an accepted
+  jump extends retention by its length; an idle gap of more than 24 h, such as a
+  weekend, extends it by the gap), and a still-live tombstone is never dropped to
+  satisfy the byte or count budget.
 * **trusted clock** — `meta` holds `high_water` (the largest raw clock any write has
-  seen; it never decreases), `suspect`, `anchor` and `suspect_since`. Every write
-  observes the raw clock: a step of more than `JOURNAL_MAX_SKEW_SECONDS` (24 h) since
-  `high_water` makes the store *suspect* (the first such step records
+  seen; it never decreases), `suspect`, `anchor`, `suspect_since` and `jump_credit` (a
+  non-decreasing total of every suspect forward step). Every write observes the raw
+  clock: a step of more than `JOURNAL_MAX_SKEW_SECONDS` (24 h) since `high_water` makes
+  the store *suspect* and is added to `jump_credit` (the first such step records
   `anchor = high_water`; a further big step restarts `suspect_since` but keeps the
   anchor); once the raw clock has run for `JOURNAL_SUSPECT_SETTLE_SECONDS` (1 h) after
-  the step the next write clears it; a backward step is never suspect. The trusted
-  clock is `now`, or `min(now, anchor + 24 h)` while suspect, and decides every
-  replay/expiry question on the read and write paths (the HTTP record store uses the
-  same rule). Rows are stamped with the raw clock. Reclaim and tombstone deletion run
-  only while the store is not suspect, against the raw clock.
+  the step the next write clears it; a backward step is never suspect and never
+  credited. The trusted clock is `now`, or while suspect
+  `clamp(anchor + (now - suspect_since), anchor, anchor + 24 h)` — only the time
+  elapsed since the step counts — and decides every replay/expiry question on the read
+  and write paths (the HTTP record store uses the same rule). Rows are stamped with the
+  raw clock. Receipt reclaim runs only while the store is not suspect, against the raw
+  clock; tombstone deletion also waits for a non-suspect store and uses the confirmed
+  timeline above.
 
-  *Effect.* After an idle weekend the first write is suspect for one hour — expiry is
-  evaluated at `anchor + 24 h`, so a receipt older than that may still replay instead
-  of being refused, which is harmless — and then normal operation resumes without an
-  operator. A genuine forward jump (for example +8 days) is held for an hour: an
-  uncertain reservation keeps reporting `124`, a committed receipt from before the jump
-  is refused as expired at the capped clock (never re-executed), and a clock corrected
-  inside the hour replays it again.
+  *Effect.* After an idle weekend the first write is suspect for one hour, with the
+  trusted clock held near the anchor, so an old receipt may still replay instead of
+  being refused (harmless); then normal operation resumes without an operator. **While
+  consecutive writes stay more than 24 h apart the store stays suspect**: reclaim
+  pauses and old receipts keep replaying until two writes fall within 24 h and an hour
+  passes. During a genuine forward jump (for example +8 days) a 60-second-old receipt
+  replays and an uncertain reservation keeps reporting `124`.
 
   *Residual risk.* A jump that persists for longer than the settle hour is accepted:
   receipts still inside their real window can then be compacted to tombstones, so an
-  exact retry is refused as expired (reconcile and use a fresh `operation_id`); a retry
-  is never re-executed. A jump that is later corrected leaves `high_water` in the
-  future, so the store stays suspect (expiry capped, reclaim paused) until the raw
-  clock passes the jumped time plus an hour, and a repeat of the same jump would not be
-  detected again. After correcting a wrong clock, run `--reset-high-water` (below).
+  exact retry is refused as expired (reconcile and use a fresh `operation_id`); no
+  tombstone inside the retry horizon is deleted and nothing is re-executed. **A jump
+  that is later corrected keeps the store suspect for about the length of the jump**
+  (`high_water` is left in the future; the trusted clock stays at the anchor and
+  reclaim pauses), and a repeat of the same jump would not be detected again, until
+  `--reset-high-water` (below). A clock step of 24 h or less is not suspect and not
+  credited, which is why the client retry contract (section 6) is the horizon minus
+  24 h.
 
 An exact retry inside its window replays the committed response or reports `124`
 uncertainty; outside it (or after reclaim) it is refused as expired with `rc=2`. It is
@@ -355,13 +374,26 @@ sudo -u <SERVICE_USER> python3 admin.py --root <RUNTIME_ROOT> journal <PROJECT> 
     --prune-before <EPOCH_SECONDS>
 ```
 
-`--reset-high-water` sets `high_water` to the current clock and clears suspicion. No
+`--reset-high-water` sets `high_water` to the current clock and clears suspicion; it
+never reduces `jump_credit`, so tombstones keep ageing on the confirmed timeline. No
 operator action is needed after an idle gap (suspicion settles by itself after an
 hour). Use it after correcting a clock that had jumped forward: it re-arms jump
 detection and ends the capped-expiry period at once. It removes no identity by itself.
-Rev7/rev8 stores are upgraded on first open in one transaction: a store whose
+Older stores are upgraded on first open in one transaction. A rev7/rev8 store whose
 `high_water` is more than 24 h old starts suspect (`anchor = high_water`) and settles an
-hour later like any idle gap.
+hour later like any idle gap. Schema 6 (this revision; from a rev9 schema-5 store or
+older) adds `jump_credit = 0`, the `aged_from` column (set to `reclaimed_at` for
+existing tombstones) and the `(state, aged_from)` index, which replaces
+`(state, reclaimed_at)`; a crash during the upgrade leaves the previous schema intact.
+
+**Upgrade note: the route is part of the operation hash.** From this revision the HTTP
+service sends the canonical route with every keyed mutation, so the journal row
+records it and `operation_hash` binds it. A mutation journaled by an earlier revision
+over HTTP (route recorded as empty), whose result is not in the service record store
+(an uncertain first attempt), and retried after the upgrade inside its replay window, is
+refused as `Operation identity reused with a different request` (`rc=2`,
+HTTP `400`) rather than replayed; it is never re-executed. Upgrade while no HTTP
+mutation is awaiting a retry, or reconcile such a retry through a canonical read.
 
 `--prune-before` is the only operation that removes a record without a tombstone, so it
 is the only one that can make an exact retry repeat its effect. Reconcile the canonical

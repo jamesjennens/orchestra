@@ -12,6 +12,11 @@ Design points (see ``docs/HTTP_TRANSPORT_DESIGN.md`` sections 6 and 7):
 * every retryable mutation can carry an ``Idempotency-Key``; an uncertain ``503``
   raises :class:`UncertainOutcome` carrying the same key instead of reporting a
   fabricated success, so the caller reconciles with an exact retry,
+* **retry contract:** an exact retry must be sent no more than 29 days after the
+  original attempt (``http_authority.JOURNAL_RETRY_HORIZON_SECONDS``). Inside that
+  horizon it replays, reports uncertainty or is refused as expired - it is never
+  re-executed; an older retry is unsupported and may run the effect again, so
+  reconcile and use a new key instead,
 * errors are surfaced as :class:`HttpApiError` with the server's stable code,
   message, detail and request id.
 
