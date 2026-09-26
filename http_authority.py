@@ -31,14 +31,17 @@ from both sides of the process seam:
   attachment, task mismatch, malformed payload) raised before the effect's first
   native write through the injected runner is proven pre-effect: the identity is
   released and the real error keeps the canonical ``rc=2`` message. Identity
-  retention is a bounded, tombstoned receipt policy: a committed receipt is
-  replayable for a short window and then compacted to a durable tombstone that still
-  refuses an exact retry, an uncertain reservation stays live (and fails closed) for
-  the long window, and a clock jump larger than the skew allowance stops reclaim from
-  dropping a live identity. Reclaim never *drops* an identity: the store is a SQLite
-  database with one indexed row per identity, and a budget is met by compacting a
-  terminal receipt or by keeping a digest instead of an oversized body. If the
-  identities genuinely cannot be held inside the configured bounds the mutation fails
+  retention is a **time-only**, tombstoned receipt policy: a committed receipt is
+  replayable for its whole window and is compacted to a durable tombstone only once
+  that window has genuinely closed, an uncertain reservation stays live (and fails
+  closed) for the long window, and a clock jump larger than the skew allowance is not
+  accepted — reclaim, compaction and the read-path expiry decision all use the same
+  trusted clock. Neither the byte budget nor the tombstone budget can evict a live
+  identity: the size is *reported* by :meth:`OperationJournal.stats` (and
+  ``admin.py journal``) instead. Reclaim never *drops* an identity: the store is a
+  SQLite database with one indexed row per identity, and an oversized response is kept
+  as a digest instead of a body. The only admission bound is the live-identity count:
+  when the journal genuinely cannot hold one more live identity the mutation fails
   closed (``124``, :class:`JournalFull`) with the pre-existing store untouched, so an
   exact retry is refused as expired rather than re-executed.
 
@@ -57,56 +60,55 @@ from pathlib import Path
 SCHEMA_VERSION = 1
 
 # ------------------------------------------------------- operation journal bounds
-#: Hard capacity of one project's *live* operation journal, in entries. It is a
-#: safety backstop, not the ordinary bound: a closed receipt window is compacted to a
-#: tombstone, and under capacity pressure the oldest terminal (committed) receipts
-#: are compacted before a write is refused, so ordinary load never refuses a write.
-#: Only genuinely live reservations (``in_progress``/``unknown``) fail closed with
-#: ``124`` when the journal cannot also hold them.
+#: Hard capacity of one project's *live* operation journal, in entries. Revision 8
+#: makes this the *only* admission bound: retention is by time, so a live identity is
+#: never evicted to make room (not for the byte budget and not for the tombstone
+#: budget), and the journal refuses a mutation with ``124`` only when the live
+#: identities genuinely cannot hold one more. Tombstones never count against it, so
+#: accumulated tombstones can never block a write.
 JOURNAL_LIMIT = 100000
 #: How long an *uncertain* reservation (``in_progress``/``unknown``) stays live. This
 #: is the long-lived window: such an identity may correspond to a committed native
 #: effect whose outcome was never observed, so it is retained (and an exact retry
 #: reports uncertainty) until an operator reconciles it or this window closes.
 JOURNAL_RETENTION_SECONDS = 7 * 24 * 60 * 60
-#: How long a *committed* receipt keeps its replayable response envelope. It is
-#: deliberately far shorter than the uncertain window: a lost-response retry happens
-#: within seconds or minutes, while holding every committed envelope for a week is
-#: what let a busy project reach the entry limit. Once this window closes the record
-#: is compacted to a tombstone and an exact retry is refused as expired, never re-run.
+#: How long a *committed* receipt keeps its replayable response envelope. This is a
+#: time-only retention window: for the whole of it an exact retry REPLAYS the recorded
+#: envelope, and only once it has genuinely closed (against the trusted clock) is the
+#: record compacted to a tombstone and an exact retry refused as expired, never re-run.
 JOURNAL_COMMITTED_RETENTION_SECONDS = 24 * 60 * 60
 #: How long a compact tombstone (operation id + request hash + principal) keeps
 #: refusing a retry of a reclaimed identity. A tombstone is the durable replacement
-#: for "the record was dropped", so reclaim no longer turns a duplicate into a new
-#: effect.
+#: for "the record was dropped", so reclaim never turns a duplicate into a new effect.
 JOURNAL_TOMBSTONE_SECONDS = 30 * 24 * 60 * 60
-#: Count bound for the compact tombstone set. It is deliberately a backstop *above*
-#: what the byte budget permits at the default settings (a tombstone is ~200 B against
-#: an 8 MiB budget), so it normally never binds. When it does bind, the reply is an
-#: explicit fail-closed ``124``: a still-live tombstone is NEVER dropped to honour it,
-#: because dropping one is exactly what let an exact retry re-execute its effect.
-#: Raise this (or ``max_bytes``) for a project with a higher identity rate, or let the
-#: tombstones age out; ``--prune-before`` remains the explicit operator override.
+#: Count bound for the compact tombstone set. It is a *reported* backstop: a still-live
+#: tombstone is NEVER dropped to honour it (dropping one is exactly what let an exact
+#: retry re-execute), and reaching it never blocks a write — reclaim simply stops and
+#: leaves the remaining closed-window records in place, where an exact retry is still
+#: refused as expired. ``--prune-before`` remains the explicit operator override.
 JOURNAL_TOMBSTONE_LIMIT = 100000
-#: A wall-clock jump larger than this is treated as implausible: reclaim and
-#: compaction refuse to drop an identity while ``now`` is this far ahead of the
-#: persisted non-decreasing high-water mark, so a forward clock jump cannot reclaim a
-#: live identity. The mark is never *ratcheted* toward such a clock: it advances only
-#: when the clock is within this tolerance, and ``reset_high_water()`` is the explicit
-#: operator recovery for a genuine correction.
+#: A wall-clock jump larger than this is treated as implausible: reclaim, compaction and
+#: the read-path expiry decision refuse to act while ``now`` is this far ahead of the
+#: persisted non-decreasing high-water mark, so a forward clock jump can neither reclaim
+#: nor expire a live identity. The mark is never *ratcheted* toward such a clock: it
+#: advances only when the clock is within this tolerance, and ``reset_high_water()`` is
+#: the explicit operator recovery for a genuine correction.
 JOURNAL_MAX_SKEW_SECONDS = 24 * 60 * 60
 #: Largest serialized response envelope retained for replay. A larger envelope is
 #: recorded by digest only, so a retry reports uncertainty instead of a truncated
 #: result.
 MAX_ENVELOPE_BYTES = 65536
-#: Largest retained journal payload accepted after a mutation, summed over the live
-#: entries and tombstones (``OperationJournal.stats()['bytes']``). It is enforced by
-#: compacting terminal receipts, never by dropping a still-live tombstone.
+#: Reported byte budget for one project's retained journal payload, summed over live
+#: entries and tombstones (``OperationJournal.stats()['bytes']``). Revision 8 reports it
+#: (``over_bytes``, ``admin.py journal``) instead of enforcing it by eviction: the byte
+#: budget can never compact an in-window receipt or drop a live tombstone. The
+#: admission bound is :data:`JOURNAL_LIMIT`; disk exhaustion is the platform's.
 MAX_JOURNAL_BYTES = 8 * 1024 * 1024
 #: On-disk schema of the journal store. The live store is a SQLite database
 #: (:data:`JOURNAL_FILENAME`); a legacy JSON document (:data:`LEGACY_JOURNAL_FILENAME`)
-#: is read transparently and imported once on first open.
-JOURNAL_SCHEMA = 3
+#: is read transparently and imported in the same transaction that creates the schema,
+#: guarded by the persisted ``legacy_migrated`` marker.
+JOURNAL_SCHEMA = 4
 #: The live operation-journal store, one SQLite database per project directory.
 JOURNAL_FILENAME = '.http-operations.sqlite3'
 #: The pre-revision-7 JSON journal document, kept only as a one-time migration source.
@@ -516,23 +518,29 @@ class OperationJournal:
       ``state='expired'``: operation id, request hash, principal, times) rather than
       dropped, so an exact retry after reclaim is refused as expired instead of
       re-executing.
-    * Under capacity pressure the oldest terminal (committed) receipts are compacted
-      to tombstones first, so ordinary load never refuses a write. Only a journal
-      whose live identities cannot be held inside ``limit``, ``max_bytes`` or
-      ``tombstone_limit`` raises :class:`JournalFull` (``124``): that is the genuinely
-      fail-closed case, and it rolls back so the pre-existing store is untouched.
+    * **Retention is by time only.** A committed receipt is never compacted, deleted or
+      otherwise evicted while its replay window is open, whatever the byte or tombstone
+      count is; only a genuinely closed window is compacted. The byte budget
+      (:data:`MAX_JOURNAL_BYTES`) and the tombstone bound
+      (:data:`JOURNAL_TOMBSTONE_LIMIT`) are *reported* by :meth:`stats` — they never
+      drive eviction and never block a write.
+    * The only admission bound is the live-identity count (``limit``). A journal whose
+      live identities genuinely cannot hold one more raises :class:`JournalFull`
+      (``124``), which rolls back so the pre-existing store is untouched and no effect
+      has run. Accumulated tombstones can never cause that refusal.
     * **No live identity is ever lost to a budget.** A tombstone is removed only when
       ``reclaimed_at + tombstone_seconds`` has genuinely passed against the trusted
-      clock; a still-live tombstone is never dropped to meet the byte or count budget.
-      The byte budget is met by compacting a terminal receipt (which shrinks the
-      record and *adds* the protecting tombstone) or by keeping the response digest
-      instead of its body. When neither is possible the mutation fails closed.
+      clock. When the tombstone bound prevents compaction, the closed-window record
+      stays in place and is still refused as expired.
     * The persisted ``high_water`` mark never decreases and is never ratcheted toward
       a jumped-forward clock: while the clock is more than
       :data:`JOURNAL_MAX_SKEW_SECONDS` ahead of it the mark is left unchanged, so
-      reclaim and compaction stay refused and no live identity is dropped.
+      reclaim, compaction and expiry stay refused and no live identity is dropped.
       :meth:`reset_high_water` is the explicit operator recovery for a genuine clock
       correction.
+    * :meth:`trusted_now` is the ONE clock every write and every replay/expiry decision
+      uses, so a +8 day jump neither stamps a future ``at`` nor expires a live receipt
+      before the correction is accepted.
     * Operator overrides are :meth:`reclaim_expired` (compact closed windows) and
       :meth:`prune` (hard-remove still-live identities after reconciling; the one
       action that can let an exact retry repeat).
@@ -541,9 +549,16 @@ class OperationJournal:
     only, so an exact retry reports uncertainty instead of returning a truncated
     result.
 
+    The store runs in WAL mode and keeps ``live_count``/``tombstone_count``/
+    ``total_bytes`` running totals in ``meta``, updated inside the same transaction as
+    every mutation, so a keyed operation never scans the table to decide admission and
+    latency does not grow with the store's size.
+
     A ``.json`` path is accepted as the pre-revision-7 compatibility path: the SQLite
     store is opened beside the document the caller named (``<name>.sqlite3``), the
-    document is imported once, and it is then renamed to ``<name>.json.migrated``.
+    document is imported **in the same transaction that creates the schema** and guarded
+    by the persisted ``legacy_migrated`` marker, and only then is it renamed to
+    ``<name>.json.migrated``.
     """
 
     def __init__(self, path, limit=JOURNAL_LIMIT, max_envelope=MAX_ENVELOPE_BYTES,
@@ -570,6 +585,10 @@ class OperationJournal:
         self.tombstone_limit = tombstone_limit
         self.max_skew = max_skew
         self._ready = False
+        #: The connection of the creation transaction while ``_migrate_legacy`` runs.
+        #: It keeps that hook a no-argument method (so a crash-injection probe can
+        #: replace it) while the import still lands inside the schema transaction.
+        self._migration_connection = None
 
     # -- store -----------------------------------------------------------------
     @contextmanager
@@ -578,6 +597,9 @@ class OperationJournal:
         try:
             connection.row_factory = sqlite3.Row
             connection.execute('PRAGMA busy_timeout = 30000')
+            # WAL: readers do not block the single writer and the writer does not block
+            # readers, and a point operation no longer pays a rollback-journal sync.
+            connection.execute('PRAGMA journal_mode = WAL')
             connection.execute('PRAGMA synchronous = FULL')
             yield connection
         finally:
@@ -595,42 +617,113 @@ class OperationJournal:
                 raise
             connection.execute('COMMIT')
 
+    # The retained columns. An older store gains the revision-8 columns in place via
+    # ``_ensure_columns``; the directed actor, route and the two precomputed expiry
+    # timestamps make the journal introspectable without recomputing a window.
+    _COLUMNS = (
+        ('operation_id', 'TEXT PRIMARY KEY'),
+        ('state', 'TEXT NOT NULL'),
+        ('request_hash', 'TEXT'),
+        ('principal', 'TEXT'),
+        ('at', 'REAL NOT NULL'),
+        ('envelope', 'TEXT'),
+        ('envelope_sha256', 'TEXT'),
+        ('envelope_omitted', 'INTEGER NOT NULL DEFAULT 0'),
+        ('bytes', 'INTEGER NOT NULL DEFAULT 0'),
+        ('reclaimed_at', 'REAL'),
+        ('actor', 'TEXT'),
+        ('route', 'TEXT'),
+        ('replay_until', 'REAL'),
+        ('expires_at', 'REAL'),
+    )
+
+    def _create_schema(self, connection):
+        connection.execute('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value)')
+        connection.execute('CREATE TABLE IF NOT EXISTS operations (%s)'
+                           % ', '.join('%s %s' % column for column in self._COLUMNS))
+        connection.execute('CREATE INDEX IF NOT EXISTS operations_state_at '
+                           'ON operations (state, at)')
+        connection.execute('CREATE INDEX IF NOT EXISTS operations_tombstone_age '
+                           'ON operations (reclaimed_at)')
+        self._ensure_columns(connection)
+        connection.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema', ?)",
+            (JOURNAL_SCHEMA,))
+
+    def _ensure_columns(self, connection):
+        """Add any revision-8 column an existing store is missing, then backfill it."""
+        present = {row[1] for row in connection.execute('PRAGMA table_info(operations)')}
+        for name, declaration in self._COLUMNS:
+            if name in present:
+                continue
+            # PRAGMA output cannot be parameterised; the names are module constants.
+            connection.execute('ALTER TABLE operations ADD COLUMN %s %s' % (name, declaration))
+        connection.execute(
+            'UPDATE operations SET replay_until = at + CASE state '
+            "WHEN 'committed' THEN ? WHEN 'expired' THEN 0 ELSE ? END "
+            'WHERE replay_until IS NULL',
+            (self.committed_retention, self.retention))
+        connection.execute(
+            'UPDATE operations SET expires_at = CASE WHEN state = ? '
+            'THEN COALESCE(reclaimed_at, at) + ? '
+            "ELSE at + CASE state WHEN 'committed' THEN ? ELSE ? END END "
+            'WHERE expires_at IS NULL',
+            ('expired', self.tombstone_seconds, self.committed_retention, self.retention))
+
     def _ensure_store(self):
-        """Create the schema and import a legacy JSON document exactly once."""
+        """Create the schema and import a legacy JSON document in ONE transaction.
+
+        The ``legacy_migrated`` marker is checked on every open, so a store left behind
+        by a process that crashed between schema creation and the legacy import is
+        completed on the next open: the marker is absent and the legacy document is
+        still there. A crash at any point therefore leaves either the untouched legacy
+        document (this transaction rolled back) or a fully migrated store — never an
+        empty store that silently ignores the JSON.
+        """
         if self._ready:
             return
-        if not self.path.exists():
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self._transaction() as connection:
-                connection.execute('CREATE TABLE IF NOT EXISTS meta ('
-                                   'key TEXT PRIMARY KEY, value)')
-                connection.execute('CREATE TABLE IF NOT EXISTS operations ('
-                                   'operation_id TEXT PRIMARY KEY, state TEXT NOT NULL, '
-                                   'request_hash TEXT, principal TEXT, at REAL NOT NULL, '
-                                   'envelope TEXT, envelope_sha256 TEXT, '
-                                   'envelope_omitted INTEGER NOT NULL DEFAULT 0, '
-                                   'bytes INTEGER NOT NULL DEFAULT 0, reclaimed_at REAL)')
-                connection.execute('CREATE INDEX IF NOT EXISTS operations_state_at '
-                                   'ON operations (state, at)')
-                connection.execute(
-                    "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema', ?)",
-                    (JOURNAL_SCHEMA,))
-            self._migrate_legacy()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        rename = False
+        with self._transaction() as connection:
+            self._create_schema(connection)
+            marker = connection.execute(
+                "SELECT value FROM meta WHERE key = 'legacy_migrated'").fetchone()
+            if marker is None:
+                previous = self._migration_connection
+                self._migration_connection = connection
+                try:
+                    imported = self._migrate_legacy()
+                finally:
+                    self._migration_connection = previous
+                if imported is not None:
+                    connection.execute(
+                        "INSERT OR REPLACE INTO meta (key, value) VALUES "
+                        "('legacy_migrated', ?)", (JOURNAL_SCHEMA,))
+                    rename = True
+            self._ensure_totals(connection)
+        if rename and self.legacy_path is not None and self.legacy_path.is_file():
+            try:
+                self.legacy_path.replace(
+                    self.legacy_path.with_name(self.legacy_path.name + '.migrated'))
+            except OSError:
+                pass
         self._ready = True
 
     def _migrate_legacy(self):
+        """Import the legacy JSON document inside the open creation transaction.
+
+        Returns the number of identities imported, or ``None`` when the marker must NOT
+        be set (no document, or a document that could not be read), so a later open
+        retries instead of abandoning a file that is still present.
+        """
+        connection = self._migration_connection
         legacy = self.legacy_path
-        if legacy is None or not legacy.is_file():
+        if connection is None or legacy is None or not legacy.is_file():
             return 0
         document = read_legacy_journal(legacy)
         if document is None:
-            return 0
-        imported = self.import_document(document)
-        try:
-            legacy.replace(legacy.with_name(legacy.name + '.migrated'))
-        except OSError:
-            pass
-        return imported
+            return None
+        return self._import_records(connection, document)
 
     @staticmethod
     def _record_bytes(operation_id, record):
@@ -648,14 +741,70 @@ class OperationJournal:
             return 0.0
 
     @staticmethod
-    def _totals(connection):
+    def _meta(connection, key, default=None):
+        row = connection.execute('SELECT value FROM meta WHERE key = ?', (key,)).fetchone()
+        return default if row is None or row[0] is None else row[0]
+
+    @staticmethod
+    def _meta_number(connection, key):
+        row = connection.execute('SELECT value FROM meta WHERE key = ?', (key,)).fetchone()
+        try:
+            return int(float(row[0])) if row is not None and row[0] is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _adjust(connection, *, live=0, tombstones=0, bytes_=0):
+        """Apply a delta to the running totals (same transaction as the row write)."""
+        if not (live or tombstones or bytes_):
+            return
+        for key, delta in (('live_count', live), ('tombstone_count', tombstones),
+                           ('total_bytes', bytes_)):
+            if not delta:
+                continue
+            current = OperationJournal._meta_number(connection, key) or 0
+            connection.execute(
+                'INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)',
+                (key, int(current + delta)))
+
+    @staticmethod
+    def _recount(connection):
+        """Recompute the running totals from the table (repair/migration only)."""
         row = connection.execute(
             'SELECT COUNT(*), COALESCE(SUM(bytes), 0), '
             "COALESCE(SUM(CASE WHEN state = 'expired' THEN 1 ELSE 0 END), 0) "
             'FROM operations').fetchone()
         total, size, tombstones = int(row[0]), int(row[1]), int(row[2])
-        return {'total': total, 'entries': total - tombstones, 'tombstones': tombstones,
-                'bytes': size}
+        live = total - tombstones
+        for key, value in (('live_count', live), ('tombstone_count', tombstones),
+                           ('total_bytes', size)):
+            connection.execute(
+                'INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)', (key, value))
+        return {'total': live, 'entries': live, 'tombstones': tombstones, 'bytes': size}
+    @classmethod
+    def _ensure_totals(cls, connection):
+        """Establish the running totals when any of them is missing."""
+        if all(cls._meta_number(connection, key) is not None
+               for key in ('live_count', 'tombstone_count', 'total_bytes')):
+            return False
+        cls._recount(connection)
+        return True
+
+    @classmethod
+    def _totals(cls, connection):
+        """Running totals — one indexed meta read, never a table scan.
+
+        The write path must stay flat as the store grows, so admission, capacity
+        messages and the reported size all read the counters that the same transaction
+        as every row write maintains. :meth:`_recount` (a full scan) is the repair path
+        and is asserted equal to these counters by the tests.
+        """
+        if cls._ensure_totals(connection):
+            pass
+        live = cls._meta_number(connection, 'live_count') or 0
+        tombstones = cls._meta_number(connection, 'tombstone_count') or 0
+        size = cls._meta_number(connection, 'total_bytes') or 0
+        return {'total': live, 'entries': live, 'tombstones': tombstones, 'bytes': size}
 
     @staticmethod
     def _row_record(row):
@@ -667,17 +816,29 @@ class OperationJournal:
             record['envelope_omitted'] = True
         if row['reclaimed_at'] is not None:
             record['reclaimed_at'] = row['reclaimed_at']
+        for column in ('actor', 'route'):
+            if row[column] is not None:
+                record[column] = row[column]
+        for column in ('replay_until', 'expires_at'):
+            if row[column] is not None:
+                record[column] = row[column]
         return record
 
     def _upsert(self, connection, operation_id, record):
+        """Write one identity row and keep the running totals in step.
+
+        The old row (if any) is read by primary key first so the counters change by a
+        delta instead of a table scan; ``at`` is stamped with the trusted clock so a
+        skewed write can never store a future timestamp.
+        """
         state = record.get('state')
         if state not in ('in_progress', 'committed', 'unknown', 'expired'):
             state = 'unknown'
         stored = record.get('envelope')
         envelope = None if stored is None else self._serialized(stored)
+        at = self._clamp_at(connection, record.get('at'))
         normalised = {'state': state, 'request_hash': record.get('request_hash'),
-                      'principal': record.get('principal'),
-                      'at': float(record.get('at') or time.time())}
+                      'principal': record.get('principal'), 'at': at}
         if stored is not None:
             normalised['envelope'] = stored
         if record.get('envelope_sha256') is not None:
@@ -686,28 +847,40 @@ class OperationJournal:
             normalised['envelope_omitted'] = True
         reclaimed = record.get('reclaimed_at')
         if state == 'expired' and reclaimed is None:
-            reclaimed = normalised['at']
+            reclaimed = at
             normalised['reclaimed_at'] = reclaimed
+        window = self.window(normalised)
+        replay_until = at + window
+        if state == 'expired':
+            expires_at = float(reclaimed) + self.tombstone_seconds
+        else:
+            expires_at = replay_until
         size = self._record_bytes(operation_id, normalised)
+        previous = connection.execute(
+            'SELECT state, bytes FROM operations WHERE operation_id = ?',
+            (operation_id,)).fetchone()
         connection.execute(
             'INSERT OR REPLACE INTO operations (operation_id, state, request_hash, '
             'principal, at, envelope, envelope_sha256, envelope_omitted, bytes, '
-            'reclaimed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            'reclaimed_at, actor, route, replay_until, expires_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (operation_id, state, normalised['request_hash'], normalised['principal'],
              normalised['at'], envelope, normalised.get('envelope_sha256'),
              1 if normalised.get('envelope_omitted') else 0, size,
-             float(reclaimed) if reclaimed is not None else None))
+             float(reclaimed) if reclaimed is not None else None,
+             record.get('actor'), record.get('route'), replay_until, expires_at))
+        was_tombstone = previous is not None and previous['state'] == 'expired'
+        is_tombstone = state == 'expired'
+        old_bytes = int(previous['bytes']) if previous is not None else 0
+        live = (0 if is_tombstone else 1) - (0 if previous is None else
+                                             (0 if was_tombstone else 1))
+        tombstones = (1 if is_tombstone else 0) - (1 if was_tombstone else 0)
+        self._adjust(connection, live=live, tombstones=tombstones,
+                     bytes_=size - old_bytes)
         return True
 
-    def import_document(self, document, *, high_water=None):
-        """Import or merge identities into the store (migration and operator restore).
-
-        ``document`` is either this journal's own ``{'high_water', 'entries',
-        'tombstones'}`` shape or a legacy flat ``operation_id -> record`` mapping.
-        Existing rows are replaced. Returns the number of identities imported; the
-        import is one transaction, so it either lands whole or not at all.
-        """
-        self._ensure_store()
+    def _import_records(self, connection, document, high_water=None):
+        """Write one legacy/exported document's rows inside an OPEN transaction."""
         if not isinstance(document, dict):
             return 0
         if isinstance(document.get('entries'), dict) or \
@@ -725,28 +898,39 @@ class OperationJournal:
                 tombstone.setdefault('state', 'expired')
                 records.append((key, tombstone))
         imported = 0
-        with self._transaction() as connection:
-            for key, record in records:
-                if self._upsert(connection, key, record):
-                    imported += 1
-            if high_water is not None:
-                mark = high_water
-            try:
-                requested = float(mark) if mark else 0.0
-            except (TypeError, ValueError):
-                requested = 0.0
-            current = self._high_water(connection)
-            if requested > current:
-                connection.execute(
-                    "INSERT OR REPLACE INTO meta (key, value) VALUES ('high_water', ?)",
-                    (requested,))
-            elif current <= 0:
-                # A legacy flat document has no mark: establish it at the current
-                # clock, exactly as the previous reader did.
-                connection.execute(
-                    "INSERT OR REPLACE INTO meta (key, value) VALUES ('high_water', ?)",
-                    (time.time(),))
+        for key, record in records:
+            if self._upsert(connection, key, record):
+                imported += 1
+        if high_water is not None:
+            mark = high_water
+        try:
+            requested = float(mark) if mark else 0.0
+        except (TypeError, ValueError):
+            requested = 0.0
+        current = self._high_water(connection)
+        if requested > current:
+            connection.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('high_water', ?)",
+                (requested,))
+        elif current <= 0:
+            # A legacy flat document has no mark: establish it at the current clock,
+            # exactly as the previous reader did.
+            connection.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('high_water', ?)",
+                (time.time(),))
         return imported
+
+    def import_document(self, document, *, high_water=None):
+        """Import or merge identities into the store (migration and operator restore).
+
+        ``document`` is either this journal's own ``{'high_water', 'entries',
+        'tombstones'}`` shape or a legacy flat ``operation_id -> record`` mapping.
+        Existing rows are replaced. Returns the number of identities imported; the
+        import is one transaction, so it either lands whole or not at all.
+        """
+        self._ensure_store()
+        with self._transaction() as connection:
+            return self._import_records(connection, document, high_water)
 
     def _blank(self):
         return {'schema': JOURNAL_SCHEMA, 'high_water': self._document_high_water(),
@@ -836,69 +1020,121 @@ class OperationJournal:
         return self.retention
 
     def expired(self, entry, now=None):
-        """Whether ``entry``'s idempotency receipt window has closed."""
+        """Whether ``entry``'s idempotency receipt window has closed.
+
+        The decision uses the SAME trusted clock as a write (:meth:`trusted_now`), so a
+        forward jump that has not been accepted cannot expire a receipt that is still
+        inside its window: during a +8 day jump a 60-second-old committed receipt
+        replays and a live uncertain reservation still reports uncertainty (``124``).
+        """
         if not isinstance(entry, dict):
             return False
         if entry.get('state') == 'expired':
             return True
+        return entry.get('at', 0) + self.window(entry) <= self.trusted_now(now)
+
+    # -- trusted clock ---------------------------------------------------------
+    def _trusted_from(self, now, high):
+        """``min(now, high + max_skew)``, taken at the strict end.
+
+        While the clock is within :data:`JOURNAL_MAX_SKEW_SECONDS` of the persisted
+        non-decreasing high-water mark it is accepted as-is. Once it is implausibly
+        ahead the mark itself is used: the jump has not been accepted (reclaim refuses
+        too), so no live identity may be expired or stamped with it. ``high <= 0`` means
+        the mark is not established yet, so the clock is used unchanged.
+        """
+        if high is None or high <= 0:
+            return now
+        if now > high + self.max_skew:
+            return high
+        return now
+
+    def trusted_now(self, now=None, connection=None, high=None):
+        """The one clock used to stamp rows and to decide replay vs expired.
+
+        Reading the high-water mark opens a short connection when one is not supplied;
+        that is one indexed ``meta`` point read, not a table scan.
+        """
         moment = time.time() if now is None else now
-        return entry.get('at', 0) + self.window(entry) <= moment
+        if high is None:
+            if connection is not None:
+                high = self._high_water(connection)
+            else:
+                with self._connection() as opened:
+                    high = self._high_water(opened)
+        return self._trusted_from(moment, high)
+
+    def _clamp_at(self, connection, at):
+        """Stamp a stored ``at`` with the trusted clock (never a future timestamp)."""
+        moment = time.time() if at is None else float(at)
+        return self._trusted_from(moment, self._high_water(connection))
 
     # -- compaction / bounds ---------------------------------------------------
     def _skewed(self, high, now):
         return high > 0 and now > high + self.max_skew
 
     def _over(self, connection):
-        """Whether the store exceeds any configured bound (the fail-closed trigger)."""
-        totals = self._totals(connection)
-        return (totals['entries'] > self.limit or
-                totals['bytes'] > self.max_bytes or
-                totals['tombstones'] > self.tombstone_limit)
+        """Whether the store exceeds the one bound that can refuse a write.
+
+        Only the live-identity count can refuse: the byte budget and the tombstone
+        count are reported, never enforced by eviction and never an admission trigger,
+        so a store full of tombstones can never block a keyed write.
+        """
+        return self._totals(connection)['entries'] > self.limit
 
     def _capacity_message(self, connection):
         totals = self._totals(connection)
-        return ('Operation journal is at capacity (%d live identities, %d tombstones, '
-                '%d bytes; limits %d/%d/%d) and cannot hold another identity without '
-                'dropping a live tombstone or reservation'
-                % (totals['entries'], totals['tombstones'], totals['bytes'],
-                   self.limit, self.tombstone_limit, self.max_bytes))
+        return ('Operation journal is at capacity (%d live identities out of %d; '
+                '%d tombstones, %d bytes) and cannot hold another live identity. '
+                'Reclaim closed receipt windows, let tombstones age out, or raise the '
+                'reviewed JOURNAL_LIMIT'
+                % (totals['entries'], self.limit, totals['tombstones'], totals['bytes']))
 
     def _tombstone(self, connection, operation_id, now):
-        """Compact one record to a tombstone unless a budget forbids it.
+        """Compact one CLOSED-WINDOW record to a tombstone, unless a bound forbids it.
 
-        Returns False, leaving the record in place, when the tombstone count bound is
-        reached or when the tombstone would grow an already-over-budget store. It never
-        removes an identity: the caller either compacts a closed/terminal record (which
-        keeps refusing an exact retry) or stops, and the mutation fails closed.
+        The caller only passes records whose own retention window has genuinely closed
+        (see :meth:`_reclaim`). Returns False, leaving the record in place, when the
+        tombstone count bound is reached: the record then stays a closed-window entry
+        that is still refused as expired, so no identity is lost and no write is
+        blocked by the tombstones already present.
         """
         row = connection.execute('SELECT * FROM operations WHERE operation_id = ?',
                                  (operation_id,)).fetchone()
         if row is None or row['state'] == 'expired':
             return False
-        record = {'state': 'expired', 'request_hash': row['request_hash'],
-                  'principal': row['principal'], 'at': row['at'], 'reclaimed_at': now}
-        size = self._record_bytes(operation_id, record)
         totals = self._totals(connection)
         if totals['tombstones'] + 1 > self.tombstone_limit:
             return False
-        if size > int(row['bytes']) and totals['bytes'] > self.max_bytes:
-            return False
+        record = {'state': 'expired', 'request_hash': row['request_hash'],
+                  'principal': row['principal'], 'at': row['at'], 'reclaimed_at': now,
+                  'actor': row['actor'], 'route': row['route']}
+        size = self._record_bytes(operation_id, record)
+        window = self.window({'state': 'expired'})
+        expires_at = float(now) + self.tombstone_seconds
         connection.execute(
             "UPDATE operations SET state = 'expired', envelope = NULL, "
-            'envelope_omitted = 0, bytes = ?, reclaimed_at = ? WHERE operation_id = ?',
-            (size, now, operation_id))
+            'envelope_omitted = 0, bytes = ?, reclaimed_at = ?, replay_until = ?, '
+            'expires_at = ? WHERE operation_id = ?',
+            (size, now, float(row['at']) + window, expires_at, operation_id))
+        delta = size - int(row['bytes'])
+        self._adjust(connection, live=-1, tombstones=1, bytes_=delta)
         return True
 
     def _reclaim(self, connection, now, high):
-        """Compact every closed-window identity to a tombstone. Returns the count.
+        """Compact every CLOSED-WINDOW identity to a tombstone. Returns the count.
 
-        Returns 0 without touching anything while the clock is implausibly far ahead of
-        the high-water mark, so a forward jump cannot drop a live identity. Stops early
-        when a budget would be exceeded and leaves the remaining records in place: an
-        expired entry still refuses an exact retry, so no identity is lost to a budget.
+        A committed receipt is a candidate only once its own
+        :data:`JOURNAL_COMMITTED_RETENTION_SECONDS` window has genuinely closed against
+        the trusted clock; an in-window receipt is never a candidate, whatever the byte
+        or tombstone budget is. Returns 0 without touching anything while the clock is
+        implausibly far ahead of the high-water mark. Stops early when the tombstone
+        bound is reached and leaves the remaining closed-window records in place, where
+        an exact retry is still refused as expired, so no identity is lost.
         """
         if self._skewed(high, now):
             return 0
+        trusted = self._trusted_from(now, high)
         compacted = 0
         while True:
             rows = connection.execute(
@@ -906,12 +1142,12 @@ class OperationJournal:
                 "((state = 'committed' AND at + ? <= ?) OR "
                 "(state IN ('in_progress', 'unknown') AND at + ? <= ?)) "
                 'ORDER BY at ASC LIMIT 500',
-                (self.committed_retention, now, self.retention, now)).fetchall()
+                (self.committed_retention, trusted, self.retention, trusted)).fetchall()
             if not rows:
                 break
             progress = False
             for row in rows:
-                if not self._tombstone(connection, row['operation_id'], now):
+                if not self._tombstone(connection, row['operation_id'], trusted):
                     return compacted
                 compacted += 1
                 progress = True
@@ -922,49 +1158,35 @@ class OperationJournal:
     def _drop_stale_tombstones(self, connection, now, high):
         """Remove only tombstones genuinely outside their refusal window by age.
 
-        This is the *only* place a tombstone is deleted. It uses the trusted clock, so a
-        forward jump cannot expire one, and it is never used to satisfy a byte budget: a
-        still-live tombstone is never dropped, whatever the store's size.
+        This is the *only* place an identity row is deleted by a budget-free policy. It
+        uses the trusted clock, so a forward jump cannot expire one, and it is never
+        used to satisfy the byte or count budget: a still-live tombstone stays.
         """
-        trusted = now if high <= 0 else min(now, high + self.max_skew)
+        trusted = self._trusted_from(now, high)
+        row = connection.execute(
+            "SELECT COUNT(*), COALESCE(SUM(bytes), 0) FROM operations "
+            "WHERE state = 'expired' AND reclaimed_at + ? <= ?",
+            (self.tombstone_seconds, trusted)).fetchone()
+        removed, size = int(row[0]), int(row[1])
+        if not removed:
+            return 0
         connection.execute(
             "DELETE FROM operations WHERE state = 'expired' AND reclaimed_at + ? <= ?",
             (self.tombstone_seconds, trusted))
+        self._adjust(connection, tombstones=-removed, bytes_=-size)
+        return removed
 
-    def _compact(self, connection, now, protect=None):
-        """Compact the oldest terminal receipt to a tombstone. Never a live one.
+    def _fit(self, connection, now, high):
+        """Reclaim what time has genuinely closed; report whether a write may proceed.
 
-        Refuses under an implausible clock: a forward jump plus capacity pressure must
-        not compact a committed receipt that is still inside its replay window.
-        """
-        if self._skewed(self._high_water(connection), now):
-            return False
-        row = connection.execute(
-            "SELECT operation_id FROM operations WHERE state = 'committed' "
-            'AND operation_id != ? ORDER BY at ASC LIMIT 1',
-            (protect or '',)).fetchone()
-        if row is None:
-            return False
-        return self._tombstone(connection, row['operation_id'], now)
-
-    def _fit(self, connection, now, high, protect=None):
-        """Bring the store back inside its bounds without losing an identity.
-
-        Order matters: reclaim closed windows, drop genuinely stale tombstones, then
-        meet any remaining byte or count pressure by compacting terminal receipts, which
-        shrinks the store *and adds* the tombstone that protects the identity. A
-        freshly created tombstone is never a candidate for removal. When the bounds
-        cannot be met without dropping a live tombstone or reservation this returns
-        False and the caller fails closed.
+        There is no eviction path for a live identity here. The only thing that can make
+        this return False is the live-identity count: the byte budget and the tombstone
+        count are reported by :meth:`stats`, never enforced by compacting an in-window
+        receipt or dropping a tombstone.
         """
         if not self._skewed(high, now):
             self._reclaim(connection, now, high)
             self._drop_stale_tombstones(connection, now, high)
-        guard = 0
-        while self._over(connection) and guard <= self.limit:
-            if not self._compact(connection, now, protect):
-                break
-            guard += 1
         return not self._over(connection)
 
     def lookup(self, operation_id):
@@ -980,20 +1202,24 @@ class OperationJournal:
         """Reserve a new identity, compacting terminal receipts under pressure.
 
         Raises :class:`JournalFull` only when the live identities plus this new one
-        cannot be held inside the bounds without dropping a still-live tombstone or
-        reservation. The transaction is rolled back, so the pre-existing store is left
-        exactly as it was and no effect has run.
+        genuinely exceed the live-identity bound. No live identity is ever evicted to
+        make room, so the only thing that can refuse is a journal that is really full.
+        The transaction is rolled back, so the pre-existing store is left exactly as it
+        was and no effect has run.
         """
         if not isinstance(operation_id, str) or not operation_id:
             raise ValueError('operation_id must be a non-empty string')
         self._ensure_store()
         with self._transaction() as connection:
             now = time.time()
+            high = self._high_water(connection)
+            trusted = self._trusted_from(now, high)
             self._upsert(connection, operation_id, {
                 'state': 'in_progress', 'request_hash': request_hash,
-                'principal': principal, 'at': now})
+                'principal': principal, 'at': trusted,
+                'actor': self._actor, 'route': self._route})
             high = self._advance_high_water(connection, now)
-            if not self._fit(connection, now, high, protect=operation_id):
+            if not self._fit(connection, now, high):
                 raise JournalFull(self._capacity_message(connection))
 
     def complete(self, operation_id, envelope, request_hash, principal):
@@ -1001,23 +1227,24 @@ class OperationJournal:
         self._ensure_store()
         with self._transaction() as connection:
             now = time.time()
+            trusted = self._trusted_from(now, self._high_water(connection))
             stored, digest, omitted = self._bounded(envelope)
             record = {'state': 'committed', 'request_hash': request_hash,
-                      'principal': principal, 'at': now, 'envelope': stored,
-                      'envelope_sha256': digest}
+                      'principal': principal, 'at': trusted, 'envelope': stored,
+                      'envelope_sha256': digest,
+                      'actor': self._actor, 'route': self._route}
             if omitted:
                 record['envelope_omitted'] = True
             self._upsert(connection, operation_id, record)
             high = self._advance_high_water(connection, now)
-            fitted = self._fit(connection, now, high, protect=operation_id)
-            if not fitted and not omitted:
-                # Keep the identity and its digest, drop only the oversized body.
-                record['envelope'] = None
-                record['envelope_omitted'] = True
-                self._upsert(connection, operation_id, record)
-                fitted = self._fit(connection, now, high, protect=operation_id)
-            if not fitted:
+            if not self._fit(connection, now, high):
                 raise JournalFull(self._capacity_message(connection))
+
+    #: The directed actor label and canonical route of the guarded mutation. The
+    #: journal created by :func:`run_guarded` carries them so every row records which
+    #: actor and route the identity was directed at, not only the principal digest.
+    _actor = None
+    _route = None
 
     def mark_unknown(self, operation_id):
         """Keep a reservation whose outcome is not known to be pre-effect."""
@@ -1030,7 +1257,7 @@ class OperationJournal:
             now = time.time()
             record = self._row_record(row)
             record['state'] = 'unknown'
-            record['at'] = now
+            record['at'] = self._trusted_from(now, self._high_water(connection))
             self._upsert(connection, operation_id, record)
             self._advance_high_water(connection, now)
 
@@ -1038,19 +1265,29 @@ class OperationJournal:
         """Release a reservation that is proven pre-effect."""
         self._ensure_store()
         with self._transaction() as connection:
+            row = connection.execute(
+                'SELECT state, bytes FROM operations WHERE operation_id = ?',
+                (operation_id,)).fetchone()
             connection.execute('DELETE FROM operations WHERE operation_id = ?',
                                (operation_id,))
+            if row is not None:
+                tombstone = row['state'] == 'expired'
+                self._adjust(connection, live=0 if tombstone else -1,
+                             tombstones=-1 if tombstone else 0,
+                             bytes_=-int(row['bytes']))
             self._advance_high_water(connection, time.time())
 
     def reclaim_expired(self, now=None):
         """Compact every closed-window identity to a tombstone. Returns the count.
 
-        This is automatic under capacity pressure; it is also the operator action for
-        a deployment that wants to compact the journal before the limit is reached.
-        Unlike :meth:`prune` it never lets an exact retry repeat: the tombstone keeps
-        refusing the reclaimed identity as expired. Compaction stops at the tombstone
-        budget and leaves the remaining expired records in place, where they are still
-        refused as expired, so no identity is lost to a budget.
+        This is the automatic maintenance step on every write and the operator action
+        for a deployment that wants to compact the journal before the limit is reached.
+        Only a record whose OWN window has genuinely closed is a candidate: an in-window
+        committed receipt is never compacted, whatever the byte budget says. Unlike
+        :meth:`prune` it never lets an exact retry repeat: the tombstone keeps refusing
+        the reclaimed identity as expired. Compaction stops at the tombstone bound and
+        leaves the remaining closed-window records in place, where they are still
+        refused as expired, so no identity is lost.
         """
         self._ensure_store()
         moment = time.time() if now is None else now
@@ -1071,43 +1308,80 @@ class OperationJournal:
         """
         self._ensure_store()
         with self._transaction() as connection:
-            removed = connection.execute(
-                "SELECT COUNT(*) FROM operations WHERE state != 'expired' AND at < ?",
-                (before,)).fetchone()[0]
+            live_row = connection.execute(
+                "SELECT COUNT(*), COALESCE(SUM(bytes), 0) FROM operations "
+                "WHERE state != 'expired' AND at < ?", (before,)).fetchone()
+            tomb_row = connection.execute(
+                "SELECT COUNT(*), COALESCE(SUM(bytes), 0) FROM operations "
+                "WHERE state = 'expired' AND at < ?", (before,)).fetchone()
+            removed = int(live_row[0])
             connection.execute(
                 "DELETE FROM operations WHERE state != 'expired' AND at < ?", (before,))
             connection.execute(
                 "DELETE FROM operations WHERE state = 'expired' AND at < ?", (before,))
-        return int(removed)
+            self._adjust(connection, live=-removed, tombstones=-int(tomb_row[0]),
+                         bytes_=-(int(live_row[1]) + int(tomb_row[1])))
+        return removed
 
     def stats(self, now=None):
-        """Operator-visible state of the store.
+        """Operator-visible size and state of the store — report, never evict.
 
-        ``bytes`` is the retained payload the byte budget governs (summed over live
-        entries and tombstones); ``file_bytes`` is the SQLite file's size on disk.
+        Every number is authoritative: the by-state counts and byte sums come from the
+        table (this is an operator/admin call, not the write path), the running totals
+        are cross-checked against a recount, and ``live_bytes``/``tombstone_bytes`` plus
+        ``over_bytes``/``over_tombstones``/``over_limit`` show where the store stands
+        against the configured bounds. ``journal_mode`` reports the SQLite mode (``wal``)
+        and ``integrity`` the SQLite integrity check.
         """
         self._ensure_store()
         moment = time.time() if now is None else now
         with self._connection() as connection:
-            totals = self._totals(connection)
             high = self._high_water(connection)
+            trusted = self._trusted_from(moment, high)
             states = {'in_progress': 0, 'committed': 0, 'unknown': 0}
+            live_bytes = 0
+            tombstone_bytes = 0
+            tombstones = 0
             expired = 0
-            for row in connection.execute(
-                    "SELECT state, at FROM operations WHERE state != 'expired'"):
+            for row in connection.execute('SELECT state, at, bytes FROM operations'):
+                size = int(row['bytes'] or 0)
+                if row['state'] == 'expired':
+                    tombstones += 1
+                    tombstone_bytes += size
+                    continue
                 if row['state'] in states:
                     states[row['state']] += 1
-                if self.expired({'state': row['state'], 'at': row['at']}, moment):
+                live_bytes += size
+                if self.expired({'state': row['state'], 'at': row['at']}, trusted):
                     expired += 1
+            live = states['in_progress'] + states['committed'] + states['unknown']
+            self._ensure_totals(connection)
+            running = self._totals(connection)
+            totals_bytes = live_bytes + tombstone_bytes
+            recount = {'total': live, 'entries': live, 'tombstones': tombstones,
+                       'bytes': totals_bytes}
+            mode = connection.execute('PRAGMA journal_mode').fetchone()[0]
             skewed = self._skewed(high, moment)
-        return {'total': totals['entries'], 'limit': self.limit,
+        totals_bytes = live_bytes + tombstone_bytes
+        return {'total': live, 'limit': self.limit,
                 'retention': self.retention,
                 'committed_retention': self.committed_retention,
+                'tombstone_seconds': self.tombstone_seconds,
                 'expired': expired, 'reclaimable': 0 if skewed else expired,
-                'states': states, 'tombstones': totals['tombstones'],
+                'states': states, 'tombstones': tombstones,
                 'tombstone_limit': self.tombstone_limit,
                 'high_water': high, 'clock_skewed': skewed,
-                'bytes': totals['bytes'],
+                'bytes': totals_bytes,
+                'live_bytes': live_bytes, 'tombstone_bytes': tombstone_bytes,
+                'limit_bytes': self.max_bytes,
+                'live': live,
+                'over_limit': live > self.limit,
+                'over_bytes': totals_bytes > self.max_bytes,
+                'over_tombstones': tombstones > self.tombstone_limit,
+                'running_totals': running,
+                'recount': recount,
+                'running_totals_match': running == recount,
+                'journal_mode': mode,
                 'file_bytes': self.path.stat().st_size if self.path.exists() else 0,
                 'schema': JOURNAL_SCHEMA}
 
@@ -1173,6 +1447,12 @@ def run_guarded(request, journal_path, effect, authority_config=None,
         # when this launch actually has a trusted authority store.
         principal = principal_key(request, trusted)
         if journal is not None:
+            # The directed actor label and canonical route are recorded with the row, so
+            # the journal reports what an identity was aimed at, not only its principal.
+            actor = request.get('actor')
+            route = request.get('route')
+            journal._actor = actor if isinstance(actor, str) and actor else None
+            journal._route = route if isinstance(route, str) and route else None
             request_hash = operation_hash(request, trusted)
             entry = journal.lookup(operation_id)
             if entry is not None:

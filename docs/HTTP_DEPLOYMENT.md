@@ -212,14 +212,18 @@ matching state snapshot; restore both together. A state document whose
 ### Operation journal recovery (idempotency receipts)
 
 Each project keeps its idempotency receipts in `<PROJECT>/.http-operations.sqlite3`: a
-SQLite database (stdlib `sqlite3`, one transaction per keyed mutation) with one indexed
-row per identity. Revision 7 replaced the older whole-document
+SQLite database (stdlib `sqlite3`, WAL mode, one transaction per keyed mutation) with
+one indexed row per identity. Revision 7 replaced the older whole-document
 `<PROJECT>/.http-operations.json`, whose read/modify/rewrite cost grew with the journal
-and whose byte budget could drop a live record. On first open, if the database does not
-exist and a legacy `.http-operations.json` is present in the same project directory, its
-entries, tombstones and high-water mark are imported in one transaction and the document
-is renamed to `.http-operations.json.migrated` (kept for audit; the import happens
-once).
+and whose byte budget could drop a live record.
+
+The legacy document is imported **in the same transaction that creates the schema**,
+guarded by a persisted `meta['legacy_migrated']` marker that is checked on every open.
+A crash between schema creation and the import therefore leaves either the untouched
+`.http-operations.json` (the transaction rolled back) or a fully migrated store; the
+next open finishes the migration rather than silently ignoring the still-present JSON.
+Only after the commit succeeds is the document renamed to
+`.http-operations.json.migrated` (kept for audit; the import happens once).
 
 The store keeps the same three concepts:
 
@@ -233,28 +237,49 @@ The store keeps the same three concepts:
   expired. A tombstone is removed only when its age exceeds `JOURNAL_TOMBSTONE_SECONDS`
   (default 30 days) measured against the trusted clock; a still-live tombstone is never
   dropped to satisfy the byte or count budget.
-* **high_water** — a non-decreasing wall-clock mark. Reclaim and compaction refuse to
-  drop anything while the clock is more than `JOURNAL_MAX_SKEW_SECONDS` ahead of it, and
-  the mark is never ratcheted toward a jumped-forward clock, so a forward jump cannot
-  reclaim identities whose receipt window is still open.
+* **high_water** — a non-decreasing wall-clock mark. Reclaim, compaction and the
+  replay/expiry decision refuse to act while the clock is more than
+  `JOURNAL_MAX_SKEW_SECONDS` ahead of it, and the mark is never ratcheted toward a
+  jumped-forward clock, so a forward jump can neither reclaim nor expire an identity
+  whose receipt window is still open. `trusted_now()` (the same clock rows are stamped
+  with) is used on the read path too, so during a +8 day jump a 60-second-old committed
+  receipt replays and a live uncertain reservation reports `124` instead of both being
+  refused as expired.
 
 An exact retry inside its window replays the committed response or reports `124`
 uncertainty; outside it (or after reclaim) it is refused as expired with `rc=2`. It is
-never re-executed. Ordinary load never refuses a write: when the store reaches its entry
-or byte bound the endpoint compacts the oldest terminal (committed) receipts to
-tombstones first, which shrinks the store *and* adds the tombstone that protects the
-identity. If the identities genuinely cannot be held inside the configured bounds - live
-reservations that may not be compacted, or a full tombstone budget - the mutation fails
-closed with `124`, the transaction is rolled back so the pre-existing store is untouched,
-and no effect is attempted. `stats()['bytes']` is the retained payload that
-`MAX_JOURNAL_BYTES` governs (live entries plus tombstones); `stats()['file_bytes']` is
-the database file's size on disk.
+never re-executed.
+
+**Retention is by time only.** A committed receipt is never compacted, deleted or
+otherwise evicted while its window is open, whatever the store's size; the byte budget
+(`MAX_JOURNAL_BYTES`) and the tombstone bound (`JOURNAL_TOMBSTONE_LIMIT`) are
+**reported**, never enforced by eviction, and accumulated tombstones never block a
+write. The one admission bound is the live-identity count (`JOURNAL_LIMIT`): when the
+store genuinely cannot hold one more live identity the mutation fails closed with `124`,
+the transaction is rolled back so the pre-existing store is untouched, and no effect is
+attempted. `stats()` reports `live_bytes`, `tombstone_bytes`, `bytes`, `limit_bytes`
+(`MAX_JOURNAL_BYTES`), `over_bytes`/`over_tombstones`/`over_limit`, `journal_mode` and
+`running_totals_match`; `stats()['file_bytes']` is the database file's size on disk. The
+store keeps `live_count`/`tombstone_count`/`total_bytes` running totals in `meta`,
+updated inside the same transaction as every row write, so a keyed operation never scans
+the table and latency does not grow with the store's size. Each row also carries the
+directed `actor`, the canonical `route` and the precomputed `replay_until`/`expires_at`
+timestamps.
+
+The HTTP service's own idempotency receipts and committed canonical results live in a
+second SQLite store beside the service state document (`<state>.records.sqlite3`,
+`http_auth.RecordStore`, WAL, time-only retention). They used to live inside the
+`http.json` state document, where the result map evicted by count/bytes and the
+idempotency map grew without bound; `http.json` no longer grows with the number of keyed
+operations and no keyed operation rewrites it. Back up the two files together: the
+state document and the records store.
 
 An operator intervenes for inspection, for a stuck unknown identity, to shorten a
 window, or after a genuine clock correction:
 
 ```sh
-# inspect: entry/tombstone counts, per-state counts, expired/reclaimable count, bytes
+# inspect: per-state counts, tombstones, expired/reclaimable, live/tombstone bytes,
+# configured bounds, over-budget flags, journal_mode and file bytes
 sudo -u <SERVICE_USER> python3 admin.py --root <RUNTIME_ROOT> journal <PROJECT>
 
 # compact closed receipt windows now (safe; reclaim writes tombstones, never drops)
@@ -284,12 +309,19 @@ task/comment state first, then prune that identity, then let the client issue a 
 cannot interleave with a live mutation; it is a local operator action and is never
 exposed over HTTP.
 
-If a project's identity rate exceeds what the configured bounds can hold, the mutation
-fails closed with `124` rather than dropping a live tombstone. The remedies are to let
-tombstones age out, to `--prune-before` after reconciliation, or to raise the deployment
-limits (`JOURNAL_LIMIT`, `MAX_JOURNAL_BYTES`, `JOURNAL_TOMBSTONE_LIMIT`) with a reviewed
-change. The store is one local file inside the project directory and is included in a
-native project backup.
+If a project's live identity count exceeds `JOURNAL_LIMIT` inside the receipt windows,
+the mutation fails closed with `124` rather than dropping a live identity. The remedies
+are to let the windows close (a closed window is compacted to a tombstone and stops
+counting as live), to `--prune-before` after reconciliation, or to raise the reviewed
+`JOURNAL_LIMIT`. A large byte total is *reported* (`over_bytes`) rather than relieved by
+eviction; size is the operator's signal to raise the reviewed `MAX_JOURNAL_BYTES`, move
+the store to a larger volume, or shorten the committed window. The store is one local
+file inside the project directory: `admin.py backup PROJECT` takes a consistent
+`sqlite3.Connection.backup()` snapshot of it (under the same backup lock as the
+coordination sidecar) into `<RUNTIME_ROOT>/backups/<PROJECT>.http-operations.sqlite3`,
+and `admin.py restore-new PROJECT DESTINATION` restores that snapshot into the newly
+created project. `bd backup` itself covers Dolt only, so the snapshot is what makes the
+claim in this section true.
 
 ## 9. SSH compatibility
 

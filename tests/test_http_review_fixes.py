@@ -53,11 +53,17 @@ HTTP result map, with a class per round-5 request:
                                        capacity pressure compact to tombstones that
                                        refuse a retry (never re-run); a jumped-forward
                                        clock cannot reclaim a live identity
-20. ``JournalBoundsCase``            -> sustained load past the old 2000/8 MiB limits is
-                                       never refused; only live reservations fail closed;
-                                       tombstones are bounded
-21. ``ResultsBoundCase``             -> ``canonical.results`` is bounded by count/bytes
-                                       and an evicted local result still never duplicates
+20. ``JournalBoundsCase``            -> retention is by time only: an in-window receipt
+                                       is never evicted by the byte or tombstone budget,
+                                       tombstones never block a write, only a genuinely
+                                       full live set fails closed, and the admin size
+                                       report is accurate
+21. ``ResultsBoundCase``             -> results and idempotency receipts live in the
+                                       SQLite record store with time-only retention;
+                                       ``http.json`` no longer carries them
+22. ``JournalBackupCase``            -> the journal is captured by a consistent sqlite
+                                       snapshot under the backup lock and restored by
+                                       ``restore-new``
 """
 import argparse
 import http.client
@@ -77,16 +83,16 @@ sys.path.insert(0, str(ROOT))
 
 import http_authority
 import http_service
-from http_auth import HttpError, Service, Store
+from http_auth import (IDEMPOTENCY_TTL_SECONDS, RESULT_RETENTION_SECONDS, HttpError,
+                       Service, Store, now_iso)
 from http_authority import (AuthorityConfig, JOURNAL_COMMITTED_RETENTION_SECONDS,
                             JOURNAL_MAX_SKEW_SECONDS, JOURNAL_RETENTION_SECONDS,
                             JOURNAL_TOMBSTONE_LIMIT, LEGACY_JOURNAL_FILENAME,
                             MAX_ENVELOPE_BYTES, MAX_JOURNAL_BYTES,
                             JournalFull, NativeRunner, OperationJournal, PreEffectFailure,
                             is_mutating_invocation, journal_path, principal_key, run_guarded)
-from http_service import (EndpointBackend, InProcessBackend, RESULTS_LIMIT, RESULTS_MAX_BYTES,
-                          UncertainOutcome, build_backend, create_server, remember_result,
-                          MAX_BODY_BYTES)
+from http_service import (EndpointBackend, InProcessBackend, UncertainOutcome, build_backend,
+                          create_server, result_is_stored, MAX_BODY_BYTES)
 
 TMP_ROOT = Path(os.environ.get('ORCHESTRA_TEST_TMP', str(ROOT / '.runtime' / 'test-tmp')))
 ADMIN = 'root-admin'
@@ -1242,59 +1248,113 @@ class JournalBoundsCase(unittest.TestCase):
 
     def test_sustained_load_past_the_old_entry_limit_is_never_refused(self):
         path = self.tmp / 'sustained.json'
-        # The old journal refused every new identity above 2000 live records. Here the
-        # limit is pinned to the old value; the new policy compacts terminal receipts
-        # instead of refusing.
-        self._seed(path, 2000)
+        # Revision 8: the same docstring invariant holds *without* evicting an in-window
+        # receipt. The old journal refused every new identity above its 2000-record
+        # document cap; here the journal fills to exactly the configured live bound
+        # (2000) with 500 new keyed operations and refuses none of them, and not one
+        # in-window receipt is turned into a tombstone to make room.
+        seeded = 1500
+        self._seed(path, seeded)
         records = []
 
         def effect():
             records.append('ran')
             return {'returncode': 0, 'stdout': 'ran', 'stderr': ''}
 
+        added = 500
         refused = 0
-        for index in range(150):
+        for index in range(added):
             result = run_guarded(dict(self.request, operation_id='op-new-%05d' % index),
                                  path, effect, journal_options={'limit': 2000})
             if result['returncode'] != 0:
                 refused += 1
         self.assertEqual(0, refused)
-        self.assertEqual(150, len(records))
+        self.assertEqual(added, len(records))
         stats = OperationJournal(str(path), limit=2000).stats()
-        self.assertLessEqual(stats['total'], 2000)
-        self.assertGreater(stats['tombstones'], 0)
-        # A compacted seed is a tombstone, not a lost identity: its exact retry is
-        # refused as expired and never re-runs. ``op-fill-01999`` is the oldest seed,
-        # so it is the first to be compacted.
-        old = run_guarded(dict(self.request, operation_id='op-fill-01999'), path, effect,
-                          journal_options={'limit': 2000})
-        self.assertEqual(2, old['returncode'], old)
-        self.assertIn('expired', old['stderr'])
-        self.assertEqual(150, len(records))
+        self.assertEqual(seeded + added, stats['total'])
+        # No in-window receipt was compacted by the entry bound: there is nothing to
+        # tombstone, because every record is still inside its replay window.
+        self.assertEqual(0, stats['tombstones'])
+        # Every one of the 2000 in-window identities REPLAYS; none re-executes.
+        before = len(records)
+        outcomes = {}
+        for index in range(seeded):
+            retry = run_guarded(dict(self.request, operation_id='op-fill-%05d' % index),
+                                path, effect, journal_options={'limit': 2000})
+            outcomes[retry['returncode']] = outcomes.get(retry['returncode'], 0) + 1
+        self.assertEqual({0: seeded}, outcomes)
+        self.assertEqual(before, len(records))
 
-    def test_byte_budget_past_the_old_document_cap_is_compacted_not_refused(self):
+    def test_in_window_receipts_are_never_tombstoned_by_the_byte_budget(self):
+        # The reviewer's pinned case (a): a tiny MAX_JOURNAL_BYTES with large envelopes
+        # must not cost an in-window receipt. Every exact retry of an identity still
+        # inside its committed window REPLAYS (rc=0) and never re-executes, and no
+        # in-window committed row is tombstoned.
+        path = self.tmp / 'tiny-bytes.json'
+        envelope = {'returncode': 0, 'stdout': 'Z' * 61440, 'stderr': ''}
+        request = dict(self.request)
+        options = {'max_bytes': 4096, 'limit': 100000}
+        journal = OperationJournal(str(path), **options)
+        for index in range(40):
+            key = 'op-%04d' % index
+            journal.reserve(key, http_authority.operation_hash(request),
+                            principal_key(request))
+            journal.complete(key, envelope, http_authority.operation_hash(request),
+                             principal_key(request))
+        stats = journal.stats()
+        # The 2.4 MB of in-window receipts exceed the 4 KiB reported budget: report, do
+        # not evict.
+        self.assertTrue(stats['over_bytes'])
+        self.assertGreater(stats['bytes'], 4096)
+        self.assertEqual(0, stats['tombstones'])
+        self.assertEqual(40, stats['states']['committed'])
+        self.assertTrue(stats['running_totals_match'])
+        records, effect = ledger()
+        outcomes = {}
+        for index in range(40):
+            retry = run_guarded(dict(request, operation_id='op-%04d' % index), path, effect,
+                                journal_options=options)
+            outcomes[retry['returncode']] = outcomes.get(retry['returncode'], 0) + 1
+        self.assertEqual({0: 40}, outcomes)
+        self.assertEqual([], records)
+        for index in range(40):
+            self.assertEqual('committed', journal.lookup('op-%04d' % index)['state'])
+
+    def test_byte_budget_past_the_old_document_cap_is_reported_not_evicted(self):
         path = self.tmp / 'bytes.json'
         big = {'returncode': 0, 'stdout': 'Z' * 49152, 'stderr': ''}
         self._seed(path, 200, envelope=big)
         self.assertGreater(OperationJournal(str(path)).stats()['bytes'], MAX_JOURNAL_BYTES)
         records, effect = ledger()
         result = run_guarded(dict(self.request, operation_id='op-after-bytes'), path, effect)
-        # The old byte-cap journal refused this with rc=124 while every record was live.
+        # The old byte-cap journal either refused this with rc=124 or compacted live
+        # receipts; revision 8 accepts the write and reports the size.
         self.assertEqual(0, result['returncode'], result)
         self.assertEqual(['ran'], records)
-        self.assertLessEqual(OperationJournal(str(path)).stats()['bytes'], MAX_JOURNAL_BYTES)
-        self.assertGreater(OperationJournal(str(path)).stats()['tombstones'], 0)
+        stats = OperationJournal(str(path)).stats()
+        self.assertGreater(stats['bytes'], MAX_JOURNAL_BYTES)
+        self.assertTrue(stats['over_bytes'])
+        self.assertFalse(stats['over_limit'])
+        # Nothing in window was evicted: no tombstone exists and every seeded identity
+        # still replays its recorded envelope.
+        self.assertEqual(0, stats['tombstones'])
+        before = len(records)
+        for index in range(200):
+            retry = run_guarded(dict(self.request, operation_id='op-fill-%05d' % index),
+                                path, effect)
+            self.assertEqual(0, retry['returncode'], retry)
+        self.assertEqual(before, len(records))
 
     def test_byte_pressure_keeps_every_identity_and_never_re_executes(self):
-        # The P1 defect: _fit() dropped the tombstone it had just created to get under
-        # MAX_JOURNAL_BYTES, so 60 KB envelopes pushed identities out of both buckets and
-        # a retry sweep re-ran all of them. No identity may be lost now.
+        # The P1 defect: _fit() compacted/dropped in-window identities to get under
+        # MAX_JOURNAL_BYTES, so 60 KB envelopes pushed receipts out of both buckets and
+        # a retry sweep re-ran them. No identity may be lost now, and no in-window
+        # receipt may be tombstoned by the byte budget.
         path = self.tmp / 'pressure.json'
         envelope = {'returncode': 0, 'stdout': 'Z' * 61440, 'stderr': ''}
         request = dict(self.request)
         journal = OperationJournal(str(path))
-        # ~150 x 60 KB is past the 8 MiB payload budget, so every later write is under
-        # byte pressure and compacts a terminal receipt to a tombstone.
+        # ~160 x 60 KB is far past the 8 MiB reported budget.
         for index in range(160):
             key = 'op-%04d' % index
             journal.reserve(key, http_authority.operation_hash(request),
@@ -1302,32 +1362,141 @@ class JournalBoundsCase(unittest.TestCase):
             journal.complete(key, envelope, http_authority.operation_hash(request),
                              principal_key(request))
         stats = journal.stats()
-        self.assertLessEqual(stats['bytes'], MAX_JOURNAL_BYTES)
-        self.assertGreater(stats['tombstones'], 0)
+        self.assertTrue(stats['over_bytes'])
+        self.assertEqual(0, stats['tombstones'])
+        self.assertEqual(160, stats['states']['committed'])
         # No identity is in the "no entry and no tombstone" bucket.
         missing = [index for index in range(160)
                    if journal.lookup('op-%04d' % index) is None]
         self.assertEqual([], missing)
-        # Every exact retry is either a replay of the live receipt or refused as
-        # expired; none re-executes, and the count of effects never rises.
+        # Every exact retry REPLAYS the recorded envelope; none re-executes.
         records, effect = ledger()
         outcomes = {}
         for index in range(160):
             retry = run_guarded(dict(request, operation_id='op-%04d' % index), path, effect)
             outcomes[retry['returncode']] = outcomes.get(retry['returncode'], 0) + 1
         self.assertEqual([], records)
-        self.assertEqual(set(outcomes), {0, 2})
-        # A tombstoned identity stays refused on the very next write after compaction.
-        reclaimed = [index for index in range(160)
-                     if journal.lookup('op-%04d' % index)['state'] == 'expired']
-        self.assertTrue(reclaimed)
-        journal.reserve('op-later', 'hash', 'actor:x')
-        for index in reclaimed:
+        self.assertEqual({0: 160}, outcomes)
+        # A later write still succeeds: the byte budget never blocks admission.
+        later = run_guarded(dict(request, operation_id='op-later'), path, effect,
+                            journal_options={'max_bytes': 4096})
+        self.assertEqual(0, later['returncode'], later)
+        self.assertEqual(1, len(records))
+        for index in range(160):
             entry = journal.lookup('op-%04d' % index)
-            self.assertEqual('expired', entry['state'])
+            self.assertEqual('committed', entry['state'])
             retry = run_guarded(dict(request, operation_id='op-%04d' % index), path, effect)
-            self.assertEqual(2, retry['returncode'], retry)
+            self.assertEqual(0, retry['returncode'], retry)
+        self.assertEqual(1, len(records))
+
+    def test_tombstones_at_their_own_budget_never_block_a_keyed_op(self):
+        # The reviewer's pinned case (b): a store whose tombstone set is at (or past) its
+        # own budget must never turn a keyed op into rc=124. This is the saturation
+        # scenario (30k tombstones + in-window committed receipts) that took ~32 s and
+        # returned 124 at revision 7.
+        path = self.tmp / 'saturated.json'
+        now = time.time()
+        envelope = {'returncode': 0, 'stdout': 'seeded', 'stderr': ''}
+        tombstones = {'tomb-%05d' % index: {
+            'state': 'expired', 'request_hash': 'h' * 64, 'principal': 'actor:x',
+            'at': now - 86400 - index, 'reclaimed_at': now - index} for index in range(500)}
+        entries = {'op-fill-%05d' % index: self._record('committed', now - index, envelope)
+                   for index in range(200)}
+        OperationJournal(str(path)).import_document(
+            {'schema': 2, 'high_water': now, 'entries': entries, 'tombstones': tombstones})
+        journal = OperationJournal(str(path), tombstone_limit=100)
+        stats = journal.stats()
+        self.assertEqual(500, stats['tombstones'])
+        self.assertGreater(stats['tombstones'], stats['tombstone_limit'])
+        self.assertTrue(stats['over_tombstones'])
+        records, effect = ledger()
+        start = time.perf_counter()
+        result = run_guarded(dict(self.request, operation_id='op-after-tombstones'), path,
+                             effect, journal_options={'tombstone_limit': 100})
+        elapsed = time.perf_counter() - start
+        self.assertEqual(0, result['returncode'], result)
+        self.assertEqual(['ran'], records)
+        # Bounded work: no compaction loop over the tombstone set.
+        self.assertLess(elapsed, 5.0)
+        self.assertIsNotNone(journal.lookup('op-after-tombstones'))
+        # And the in-window receipts are all still committed and replayable.
+        for index in range(200):
+            self.assertEqual('committed',
+                             journal.lookup('op-fill-%05d' % index)['state'])
+
+    def test_a_genuinely_full_live_journal_fails_closed_with_no_effect(self):
+        # The reviewer's pinned case (c): a genuinely full store (the live-identity bound
+        # reached by in-window receipts that may not be compacted) fails closed rc=124,
+        # rolls back, leaves the store intact and attempts no effect.
+        path = self.tmp / 'genuinely-full.json'
+        moment = time.time()
+        envelope = {'returncode': 0, 'stdout': 'seeded', 'stderr': ''}
+        OperationJournal(str(path)).import_document(
+            {'schema': 2, 'high_water': moment,
+             'entries': {'op-fill-%d' % index: self._record('committed', moment, envelope)
+                         for index in range(4)},
+             'tombstones': {}})
+        journal = OperationJournal(str(path), limit=4)
+        self.assertEqual(4, journal.stats()['total'])
+        records, effect = ledger()
+        before = [journal.lookup('op-fill-%d' % index) for index in range(4)]
+        result = run_guarded(dict(self.request, operation_id='op-over-limit'), path, effect,
+                             journal_options={'limit': 4})
+        self.assertEqual(124, result['returncode'], result)
+        self.assertIn('no effect was attempted', result['stderr'])
         self.assertEqual([], records)
+        self.assertIsNone(journal.lookup('op-over-limit'))
+        self.assertEqual(before, [journal.lookup('op-fill-%d' % index) for index in range(4)])
+        self.assertEqual(4, journal.stats()['total'])
+        # No corruption: the store still replays and still refuses cleanly.
+        for index in range(4):
+            retry = run_guarded(dict(self.request, operation_id='op-fill-%d' % index), path,
+                                effect, journal_options={'limit': 4})
+            self.assertEqual(0, retry['returncode'], retry)
+        self.assertEqual([], records)
+
+    def test_the_admin_size_report_is_accurate(self):
+        # The reviewer's pinned case (d): report the size via admin instead of evicting.
+        import sqlite3
+        path = self.tmp / 'report.json'
+        envelope = {'returncode': 0, 'stdout': 'X' * 4096, 'stderr': ''}
+        journal = OperationJournal(str(path))
+        moment = time.time()
+        for index in range(5):
+            key = 'op-live-%d' % index
+            journal.reserve(key, 'hash', 'actor:x')
+            journal.complete(key, envelope, 'hash', 'actor:x')
+        journal.import_document({'tombstones': {
+            'op-tomb-%d' % index: {'state': 'expired', 'request_hash': 'h',
+                                   'principal': 'actor:x', 'at': moment - 10,
+                                   'reclaimed_at': moment - 10}
+            for index in range(3)}})
+        stats = journal.stats()
+        conn = sqlite3.connect(str(journal.path))
+        live = conn.execute("SELECT COUNT(*), COALESCE(SUM(bytes),0) FROM operations "
+                            "WHERE state != 'expired'").fetchone()
+        tomb = conn.execute("SELECT COUNT(*), COALESCE(SUM(bytes),0) FROM operations "
+                            "WHERE state = 'expired'").fetchone()
+        mode = conn.execute('PRAGMA journal_mode').fetchone()[0]
+        conn.close()
+        self.assertEqual(int(live[0]), stats['live'])
+        self.assertEqual(int(live[0]), stats['states']['committed'])
+        self.assertEqual(int(live[1]), stats['live_bytes'])
+        self.assertEqual(int(tomb[0]), stats['tombstones'])
+        self.assertEqual(int(tomb[1]), stats['tombstone_bytes'])
+        self.assertEqual(int(live[1]) + int(tomb[1]), stats['bytes'])
+        self.assertEqual(MAX_JOURNAL_BYTES, stats['limit_bytes'])
+        self.assertEqual(JOURNAL_TOMBSTONE_LIMIT, stats['tombstone_limit'])
+        self.assertEqual(journal.limit, stats['limit'])
+        self.assertEqual('wal', mode)
+        self.assertEqual('wal', stats['journal_mode'])
+        self.assertTrue(stats['running_totals_match'])
+        # The running totals really are the table's totals.
+        self.assertEqual(stats['live'], stats['running_totals']['entries'])
+        self.assertEqual(stats['bytes'], stats['running_totals']['bytes'])
+        self.assertEqual(stats['tombstones'], stats['running_totals']['tombstones'])
+        self.assertEqual(stats['running_totals'], stats['recount'])
+        self.assertEqual(stats['file_bytes'], journal.path.stat().st_size)
 
     def test_tombstones_are_count_bounded_without_dropping_a_live_one(self):
         path = self.tmp / 'tombstones.json'
@@ -1870,19 +2039,203 @@ class JournalRetentionCase(unittest.TestCase):
             self.assertEqual(baseline, len(records))
             self.assertEqual(0, OperationJournal(str(path)).stats()['tombstones'])
             # A genuine clock correction is accepted only by the explicit operator
-            # reset; reclaim then compacts closed windows to tombstones.
+            # reset; reclaim then compacts closed windows to tombstones. The two
+            # original identities (at `real`) and the six skewed writes all expire: the
+            # skewed rows were stamped with the TRUSTED clock (the persisted mark), not
+            # with the jumped-forward wall clock, so they carry no future `at` and are
+            # inside their committed window only until the real window closes.
             clock[0] = real + 8 * 24 * 3600
             self.assertEqual(0, OperationJournal(str(path)).reclaim_expired())
             self.assertEqual(clock[0], OperationJournal(str(path)).reset_high_water())
-            self.assertEqual(2, OperationJournal(str(path)).reclaim_expired())
+            for index in range(6):
+                skewed = OperationJournal(str(path)).lookup('op-skew-%d' % index)
+                self.assertLessEqual(skewed['at'], real + JOURNAL_MAX_SKEW_SECONDS + 1)
+                self.assertLess(skewed['at'], clock[0])
+            self.assertEqual(8, OperationJournal(str(path)).reclaim_expired())
             stats = OperationJournal(str(path)).stats()
             self.assertFalse(stats['clock_skewed'])
-            self.assertEqual(2, stats['tombstones'])
+            self.assertEqual(8, stats['tombstones'])
             refused = run_guarded(dict(request, operation_id='op-k'), path, effect)
             self.assertEqual(2, refused['returncode'], refused)
             self.assertEqual(baseline, len(records))
         finally:
             time.time = real_time
+
+    def test_a_read_during_a_forward_jump_uses_the_trusted_clock(self):
+        # The reviewer's pinned +8 d read-path probe: a 60-second-old committed receipt
+        # REPLAYS (rc=0) and a live uncertain reservation reports 124, instead of both
+        # being refused as expired by the raw wall clock.
+        path = self.tmp / 'read-skew.json'
+        request = dict(self.request)
+        digest = http_authority.operation_hash(request)
+        principal = principal_key(request)
+        journal = OperationJournal(str(path))
+        journal.reserve('op-k', digest, principal)
+        journal.complete('op-k', {'returncode': 0, 'stdout': 'keeper', 'stderr': ''},
+                         digest, principal)
+        journal.reserve('op-ku', digest, principal)
+        journal.mark_unknown('op-ku')
+        real = time.time()
+        records, effect = ledger()
+        clock = [real + 8 * 24 * 3600]
+        real_time = time.time
+        try:
+            time.time = lambda: clock[0]
+            committed = run_guarded(dict(request, operation_id='op-k'), path, effect)
+            self.assertEqual(0, committed['returncode'], committed)
+            self.assertEqual('keeper', committed['stdout'])
+            uncertain = run_guarded(dict(request, operation_id='op-ku'), path, effect)
+            self.assertEqual(124, uncertain['returncode'], uncertain)
+            self.assertIn('unknown', uncertain['stderr'])
+            self.assertEqual([], records)
+            # A fresh write during the jump is stamped with the trusted clock, never
+            # the jumped-forward one.
+            run_guarded(dict(request, operation_id='op-during'), path, effect)
+            during = journal.lookup('op-during')
+            self.assertLessEqual(during['at'], real + JOURNAL_MAX_SKEW_SECONDS + 1)
+            self.assertLess(during['at'], clock[0])
+            # Corrected to 60 s after the real write: still a replay, still uncertain.
+            clock[0] = real + 60
+            again = run_guarded(dict(request, operation_id='op-k'), path, effect)
+            self.assertEqual(0, again['returncode'], again)
+            self.assertEqual(1, len(records))
+            # A receipt genuinely past its window under an ACCEPTED clock is refused:
+            # advance the mark with ordinary writes inside the skew allowance first.
+            for step, operation in ((0.6, 'op-advance-1'), (1.3, 'op-advance-2')):
+                clock[0] = real + step * 24 * 3600
+                advanced = run_guarded(dict(request, operation_id=operation), path, effect)
+                self.assertEqual(0, advanced['returncode'], advanced)
+            clock[0] = real + 1.3 * 24 * 3600 + 60
+            stale = run_guarded(dict(request, operation_id='op-k'), path, effect)
+            self.assertEqual(2, stale['returncode'], stale)
+            self.assertIn('expired', stale['stderr'])
+            self.assertEqual(3, len(records))
+        finally:
+            time.time = real_time
+
+    def test_a_crash_between_schema_creation_and_legacy_import_still_migrates(self):
+        # The reviewer's P1 probe: a crash after the schema exists but before the legacy
+        # import must not leave an empty store that ignores the still-present JSON.
+        path = self.tmp / 'crash.json'
+        request = dict(self.request)
+        digest = http_authority.operation_hash(request)
+        principal = principal_key(request)
+        legacy = {'schema': 2, 'high_water': time.time(),
+                  'entries': {'op-legacy': {
+                      'state': 'committed', 'request_hash': digest, 'principal': principal,
+                      'at': time.time(), 'envelope': {'returncode': 0, 'stdout': 'LEGACY',
+                                                      'stderr': ''}}},
+                  'tombstones': {}}
+        path.write_text(json.dumps(legacy), encoding='utf-8')
+
+        class Crash(Exception):
+            pass
+
+        original = OperationJournal._migrate_legacy
+        calls = []
+
+        def crashing(self):
+            # Fail exactly at the schema/import boundary, inside the creation
+            # transaction; the injected failure must roll that transaction back.
+            calls.append('crashed')
+            raise Crash('crash between schema creation and the legacy import')
+
+        try:
+            OperationJournal._migrate_legacy = crashing
+            crashed = OperationJournal(str(path))
+            with self.assertRaises(Crash):
+                crashed.lookup('op-legacy')
+        finally:
+            OperationJournal._migrate_legacy = original
+        self.assertEqual(['crashed'], calls)
+        # The crash left the legacy document untouched and the store without a marker.
+        self.assertTrue(path.is_file())
+        self.assertFalse(path.with_name(path.name + '.migrated').exists())
+        # The next open completes the migration instead of ignoring the JSON.
+        recovered = OperationJournal(str(path))
+        entry = recovered.lookup('op-legacy')
+        self.assertIsNotNone(entry, 'crashed migration lost the legacy journal')
+        self.assertEqual('committed', entry['state'])
+        self.assertTrue(path.with_name(path.name + '.migrated').is_file())
+        self.assertFalse(path.exists())
+        records, effect = ledger()
+        replay = run_guarded(dict(request, operation_id='op-legacy'), path, effect)
+        self.assertEqual(0, replay['returncode'], replay)
+        self.assertEqual('LEGACY', replay['stdout'])
+        self.assertEqual([], records)
+
+    def test_a_crashed_migration_process_replays_the_committed_legacy_identity(self):
+        # The literal reviewer driver: a subprocess whose _migrate_legacy calls
+        # os._exit(9) after the schema has been created, then the same identity retried.
+        if os.name != 'posix':
+            self.skipTest('crash injection uses os._exit semantics on POSIX')
+        path = self.tmp / 'crashproc.json'
+        request = dict(self.request)
+        digest = http_authority.operation_hash(request)
+        principal = principal_key(request)
+        path.write_text(json.dumps({
+            'schema': 2, 'high_water': time.time(),
+            'entries': {'op-legacy': {
+                'state': 'committed', 'request_hash': digest, 'principal': principal,
+                'at': time.time(),
+                'envelope': {'returncode': 0, 'stdout': 'LEGACY', 'stderr': ''}}},
+            'tombstones': {}}), encoding='utf-8')
+        code = ("import sys, os; sys.path.insert(0, %r); import http_authority as H\n"
+                "H.OperationJournal._migrate_legacy = lambda self: os._exit(9)\n"
+                "H.OperationJournal(%r).lookup('x')" % (str(ROOT), str(path)))
+        completed = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True)
+        self.assertEqual(9, completed.returncode, completed.stderr)
+        self.assertTrue(path.is_file())
+        records, effect = ledger()
+        replay = run_guarded(dict(request, operation_id='op-legacy'), path, effect)
+        self.assertEqual(0, replay['returncode'], replay)
+        self.assertEqual('LEGACY', replay['stdout'])
+        self.assertEqual([], records)
+
+    def test_wal_running_totals_and_the_directed_columns(self):
+        # P2e/P3: WAL is on, the running totals equal a recount, and every row carries
+        # the directed actor, route, replay_until and expires_at.
+        import sqlite3
+        path = self.tmp / 'wal.json'
+        request = dict(self.request, route='tasks.create')
+        request['actor'] = 'worker-1'
+        records, effect = ledger()
+        run_guarded(dict(request, operation_id='op-committed'), path, effect)
+
+        def uncertain_effect():
+            raise RuntimeError('after the reservation')
+
+        run_guarded(dict(request, operation_id='op-unknown'), path, uncertain_effect)
+        store = OperationJournal(str(path)).path
+        connection = sqlite3.connect(str(store))
+        connection.row_factory = sqlite3.Row
+        mode = connection.execute('PRAGMA journal_mode').fetchone()[0]
+        rows = {row['operation_id']: row for row in
+                connection.execute('SELECT * FROM operations')}
+        columns = {row[1] for row in connection.execute('PRAGMA table_info(operations)')}
+        connection.close()
+        self.assertEqual('wal', mode)
+        for column in ('actor', 'route', 'replay_until', 'expires_at'):
+            self.assertIn(column, columns)
+        committed = rows['op-committed']
+        self.assertEqual('worker-1', committed['actor'])
+        self.assertEqual('tasks.create', committed['route'])
+        self.assertAlmostEqual(committed['at'] + JOURNAL_COMMITTED_RETENTION_SECONDS,
+                               committed['replay_until'], delta=1)
+        self.assertAlmostEqual(committed['replay_until'], committed['expires_at'], delta=1)
+        unknown = rows['op-unknown']
+        self.assertEqual('unknown', unknown['state'])
+        self.assertEqual('worker-1', unknown['actor'])
+        self.assertAlmostEqual(unknown['at'] + JOURNAL_RETENTION_SECONDS,
+                               unknown['replay_until'], delta=1)
+        journal = OperationJournal(str(path))
+        stats = journal.stats()
+        self.assertTrue(stats['running_totals_match'])
+        self.assertEqual(stats['running_totals'], stats['recount'])
+        # The journal is written and read through the trusted clock, which is the raw
+        # clock here because no jump has happened.
+        self.assertAlmostEqual(time.time(), journal.trusted_now(), delta=5)
+        self.assertEqual(2, stats['total'])
 
     def test_a_legacy_json_journal_is_migrated_once_and_keeps_its_identities(self):
         path = self.tmp / 'legacy.json'
@@ -2121,10 +2474,24 @@ class JournalOperatorCommandCase(unittest.TestCase):
         inspected = self._run()
         self.assertEqual(2, inspected['stats']['total'])
         self.assertEqual(1, inspected['stats']['expired'])
+        # The default inspection is the size report the reviewer asked for: rows by
+        # state, bytes on disk and the configured bounds.
+        for field in ('states', 'tombstones', 'live_bytes', 'tombstone_bytes', 'bytes',
+                      'limit', 'limit_bytes', 'tombstone_limit', 'over_bytes',
+                      'over_tombstones', 'over_limit', 'journal_mode', 'file_bytes',
+                      'running_totals', 'recount', 'running_totals_match'):
+            self.assertIn(field, inspected['stats'])
+        self.assertTrue(inspected['stats']['running_totals_match'])
+        self.assertEqual('wal', inspected['stats']['journal_mode'])
+        self.assertFalse(inspected['stats']['over_limit'])
+        # ``--stats`` is the same explicit inspection.
+        explicit = self._run('--stats')
+        self.assertEqual(inspected['stats']['total'], explicit['stats']['total'])
         reclaimed = self._run('--reclaim-expired')
         self.assertEqual(1, reclaimed['reclaimed'])
         self.assertEqual(1, reclaimed['stats']['total'])
         self.assertEqual(1, reclaimed['stats']['tombstones'])
+        self.assertGreater(reclaimed['stats']['tombstone_bytes'], 0)
         pruned = self._run('--prune-before', str(time.time() + 1))
         self.assertEqual(1, pruned['pruned'])
         self.assertEqual(0, pruned['stats']['total'])
@@ -2161,58 +2528,211 @@ class JournalOperatorCommandCase(unittest.TestCase):
 
 
 class ResultsBoundCase(EndpointCase):
-    """21. The canonical result replay map is bounded and never duplicates on eviction."""
+    """21. Results and idempotency receipts live in the store with time-only retention."""
 
-    def test_remember_result_bounds_by_count_and_bytes(self):
-        results = {}
-        for index in range(50):
-            remember_result(results, 'k-%02d' % index, {'blob': 'Z' * 200},
-                            limit=1000, max_bytes=2000)
-        self.assertLess(len(results), 50)
-        self.assertLessEqual(len(json.dumps(results, separators=(',', ':'))), 3000)
-        counted = {}
-        for index in range(12):
-            remember_result(counted, 'k-%02d' % index, {'ok': True}, limit=8)
-        self.assertEqual(8, len(counted))
-        self.assertNotIn('k-00', counted)
-        self.assertIn('k-11', counted)
-
-    def test_results_map_does_not_grow_without_bound(self):
+    def test_the_state_document_never_carries_results_or_receipts(self):
         alex, project = self.setup_project()
-        original = http_service.RESULTS_LIMIT
-        http_service.RESULTS_LIMIT = 8
-        try:
-            for index in range(24):
-                created = self.create_task(alex, project, 'task %d' % index,
-                                           key='bound-key-%05d' % index)
-                self.assertEqual(201, created.status, created.data)
-            results = self.service.state['canonical']['results']
-            self.assertLessEqual(len(results), 8)
-        finally:
-            http_service.RESULTS_LIMIT = original
+        for index in range(24):
+            created = self.create_task(alex, project, 'task %d' % index,
+                                       key='bound-key-%05d' % index)
+            self.assertEqual(201, created.status, created.data)
+        state = self.service.state
+        # Neither map is in the JSON document any more, so it cannot grow with the
+        # number of keyed operations.
+        self.assertNotIn('idempotency', state)
+        self.assertNotIn('results', state['canonical'])
+        document = json.loads(self.service.store.path.read_text(encoding='utf-8'))
+        self.assertNotIn('idempotency', document)
+        self.assertNotIn('results', document['canonical'])
+        stats = self.service.store.records.stats()
+        self.assertEqual(24, stats['kinds']['result']['total'])
+        self.assertEqual(24, stats['kinds']['idempotency']['total'])
+        self.assertEqual('wal', stats['journal_mode'])
+        # No count/byte eviction: every one of the 24 records is retained.
+        self.assertGreater(stats['kinds']['result']['total'], 8)
 
-    def test_an_evicted_local_result_still_never_duplicates_the_effect(self):
+    def test_a_keyed_retry_is_served_from_the_record_store(self):
         alex, project = self.setup_project()
-        original = http_service.RESULTS_LIMIT
-        http_service.RESULTS_LIMIT = 2
-        try:
-            first = self.create_task(alex, project, 'evict me', key='steady-key-0001')
-            self.assertEqual(201, first.status, first.data)
-            task_id = first.data['id']
-            for index in range(6):
-                self.create_task(alex, project, 'filler %d' % index,
-                                 key='filler-key-%05d' % index)
-            results = self.service.state['canonical']['results']
-            self.assertLessEqual(len(results), 2)
-            retry = self.create_task(alex, project, 'evict me', key='steady-key-0001')
+        first = self.create_task(alex, project, 'first', key='stable-key-0001')
+        self.assertEqual(201, first.status, first.data)
+        # The replay path is the record store, not a JSON map inside the state document.
+        self.assertNotIn('results', self.service.state['canonical'])
+        for _ in range(4):
+            retry = self.create_task(alex, project, 'first', key='stable-key-0001')
             self.assertEqual(201, retry.status, retry.data)
-            # The durable endpoint journal replays the same identity, so the locals
-            # eviction never repeats the create.
-            self.assertEqual(task_id, retry.data['id'])
-            self.assertEqual(1, len([row for row in self.canonical_rows()
-                                     if row.get('title') == 'evict me']))
-        finally:
-            http_service.RESULTS_LIMIT = original
+            self.assertEqual(first.data['id'], retry.data['id'])
+        self.assertEqual(1, self.service.store.records.stats()['kinds']['result']['total'])
+        self.assertEqual(1, len([row for row in self.canonical_rows()
+                                 if row.get('title') == 'first']))
+
+    def test_a_stored_result_is_replayed_and_never_duplicates_the_effect(self):
+        alex, project = self.setup_project()
+        first = self.create_task(alex, project, 'keeper', key='steady-key-0001')
+        self.assertEqual(201, first.status, first.data)
+        task_id = first.data['id']
+        for index in range(6):
+            self.create_task(alex, project, 'filler %d' % index,
+                             key='filler-key-%05d' % index)
+        retry = self.create_task(alex, project, 'keeper', key='steady-key-0001')
+        self.assertEqual(201, retry.status, retry.data)
+        self.assertEqual(task_id, retry.data['id'])
+        # The results are retained by time, not evicted by count: the older record is
+        # still there (revision 7 would have evicted it at its 2-entry/2 MiB bound).
+        self.assertEqual(7, self.service.store.records.stats()['kinds']['result']['total'])
+        self.assertEqual(1, len([row for row in self.canonical_rows()
+                                 if row.get('title') == 'keeper']))
+
+    def test_records_are_purged_by_age_only(self):
+        alex, project = self.setup_project()
+        created = self.create_task(alex, project, 'aged', key='aged-key-0001')
+        self.assertEqual(201, created.status, created.data)
+        records = self.service.store.records
+        self.assertEqual(1, records.stats()['kinds']['result']['total'])
+        # Nothing is due yet: no record is dropped by count or size.
+        self.assertEqual(0, records.purge())
+        self.assertEqual(1, records.stats()['kinds']['result']['total'])
+        # Past the retention window the record really is removed.
+        future = time.time() + RESULT_RETENTION_SECONDS + 60
+        self.assertGreaterEqual(records.purge(now=future), 1)
+        self.assertEqual(0, records.stats()['kinds'].get('result', {}).get('total', 0))
+
+    def test_a_legacy_state_document_migrates_its_keyed_records_once(self):
+        alex, project = self.setup_project()
+        document = json.loads(self.service.store.path.read_text(encoding='utf-8'))
+        digest = 'd' * 64
+        document['idempotency'] = {digest: {
+            'principal': 'usr_legacy', 'project_id': project, 'route': 'tasks.create',
+            'request_hash': 'h', 'state': 'committed', 'status': 201,
+            'response': {'id': 'legacy-task'}, 'canonical': True,
+            'created_at': now_iso(time.time()),
+            'expires_at': time.time() + IDEMPOTENCY_TTL_SECONDS}}
+        document['canonical']['results'] = {'legacy-key': {'id': 'legacy-task'}}
+        self.service.store.path.write_text(json.dumps(document), encoding='utf-8')
+        reloaded = Store(self.service.store.path)
+        state = reloaded.state
+        self.assertNotIn('idempotency', state)
+        self.assertNotIn('results', state['canonical'])
+        record = reloaded.records.get('idempotency', digest)
+        self.assertIsNotNone(record)
+        self.assertEqual('legacy-task', record['response']['id'])
+        self.assertEqual({'id': 'legacy-task'},
+                         reloaded.records.get('result', 'legacy-key')['result'])
+        # The migrated document is persisted without the maps.
+        on_disk = json.loads(reloaded.path.read_text(encoding='utf-8'))
+        self.assertNotIn('idempotency', on_disk)
+        self.assertNotIn('results', on_disk['canonical'])
+
+    def test_result_helpers_read_and_write_the_record_store(self):
+        alex, project = self.setup_project()
+        self.assertFalse(result_is_stored(self.service, 'probe-key'))
+        self.service.result_put('probe-key', {'ok': True})
+        self.assertTrue(result_is_stored(self.service, 'probe-key'))
+        self.assertEqual({'ok': True}, self.service.result_get('probe-key'))
+        self.assertFalse(self.service.has_result('absent-key'))
+
+    def test_the_admin_size_report_covers_the_records_store(self):
+        alex, project = self.setup_project()
+        self.create_task(alex, project, 'reported', key='report-key-0001')
+        stats = self.service.store.records.stats()
+        self.assertEqual(1, stats['kinds']['result']['total'])
+        self.assertGreater(stats['kinds']['result']['bytes'], 0)
+        self.assertGreater(stats['file_bytes'], 0)
+
+
+class JournalBackupCase(unittest.TestCase):
+    """22. The project journal is captured by a native backup and restored by restore-new."""
+
+    def setUp(self):
+        import types as _types
+        from unittest.mock import patch
+        self._patch = patch
+        self.tmp = unique_dir('journalbackup-')
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.root = self.tmp / 'root'
+        self.source = self.root / 'projects' / 'source'
+        self.source.mkdir(parents=True)
+        (self.root / 'backups' / 'source').mkdir(parents=True)
+        self._fake_fcntl = _types.SimpleNamespace(flock=lambda *a, **k: None, LOCK_EX=2)
+        self._modules = patch.dict(sys.modules, {'fcntl': self._fake_fcntl})
+        self._modules.start()
+        self.addCleanup(self._modules.stop)
+
+    def _seed(self, operation_id):
+        request = {'project': 'source', 'actor': 'worker-1', 'action': 'bd',
+                   'args': ['create', 'x'], 'route': 'tasks.create'}
+        journal = OperationJournal(str(journal_path(self.source)))
+        journal.reserve(operation_id, http_authority.operation_hash(request),
+                        principal_key(request))
+        journal.complete(operation_id,
+                         {'returncode': 0, 'stdout': 'BACKED-UP', 'stderr': ''},
+                         http_authority.operation_hash(request), principal_key(request))
+        return request
+
+    def test_a_consistent_snapshot_is_taken_and_restored(self):
+        import admin
+        request = self._seed('op-backed-up')
+        self._seed('op-second')
+        with self._patch.object(admin, 'run_bd', return_value='synced'):
+            self.assertEqual('synced', admin.backup_project(self.root, 'source'))
+        snapshot = admin.journal_snapshot_path(self.root, 'source')
+        self.assertTrue(snapshot.is_file(), 'backup did not capture the journal')
+        # The snapshot is a readable journal database with both identities.
+        admin._check_journal_database(snapshot)
+        import sqlite3
+        connection = sqlite3.connect(str(snapshot))
+        ids = {row[0] for row in connection.execute('SELECT operation_id FROM operations')}
+        connection.close()
+        self.assertEqual({'op-backed-up', 'op-second'}, ids)
+        # Live writes after the backup do not reach the snapshot.
+        self._seed('op-after-backup')
+        # Restore into a new project directory and replay the backed-up identity.
+        destination = self.root / 'projects' / 'destination'
+        destination.mkdir()
+        restored = admin.restore_journal(snapshot, destination / admin.JOURNAL_STORE_NAME)
+        self.assertEqual(destination / admin.JOURNAL_STORE_NAME, restored)
+        restored_journal = OperationJournal(str(journal_path(destination)))
+        self.assertEqual('committed', restored_journal.lookup('op-backed-up')['state'])
+        self.assertIsNone(restored_journal.lookup('op-after-backup'))
+        records, effect = ledger()
+        replay = run_guarded(dict(request, operation_id='op-backed-up'),
+                             journal_path(destination), effect)
+        self.assertEqual(0, replay['returncode'], replay)
+        self.assertEqual('BACKED-UP', replay['stdout'])
+        self.assertEqual([], records)
+
+    def test_restore_new_restores_the_journal_snapshot(self):
+        import admin
+        import contextlib
+        import io
+        from unittest.mock import patch as _patch
+        self._seed('op-restored')
+        with self._patch.object(admin, 'run_bd', return_value='synced'):
+            admin.backup_project(self.root, 'source')
+
+        def fake_add(root, name):
+            (root / 'projects' / name).mkdir(parents=True, exist_ok=True)
+
+        argv = ['admin.py', '--root', str(self.root), 'restore-new', 'source', 'destination']
+        with _patch.object(admin, 'add_project', side_effect=fake_add), \
+                _patch.object(admin, 'run_bd', return_value='restored'), \
+                _patch.object(sys, 'argv', argv), contextlib.redirect_stdout(io.StringIO()):
+            admin.main()
+        destination = self.root / 'projects' / 'destination'
+        restored = OperationJournal(str(journal_path(destination)))
+        self.assertEqual('committed', restored.lookup('op-restored')['state'])
+
+    def test_a_missing_snapshot_is_not_an_error_but_a_corrupt_one_is_refused(self):
+        import admin
+        self._seed('op-x')
+        self.assertIsNone(admin.snapshot_journal(self.source / 'absent.sqlite3',
+                                                 self.root / 'backups' / 'absent.sqlite3'))
+        self.assertIsNone(admin.restore_journal(self.root / 'backups' / 'absent.sqlite3',
+                                                self.tmp / 'nowhere.sqlite3'))
+        corrupt = self.root / 'backups' / 'corrupt.sqlite3'
+        corrupt.write_bytes(b'not a database at all')
+        with self.assertRaises(ValueError):
+            admin.restore_journal(corrupt, self.tmp / 'target.sqlite3')
+        self.assertFalse((self.tmp / 'target.sqlite3').exists())
 
 
 if __name__ == '__main__':

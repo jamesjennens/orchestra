@@ -31,9 +31,10 @@ from urllib.parse import parse_qs, urlsplit
 
 from http_auth import (CAP_ACCOUNTS_ADMIN, CAP_APPROVE, CAP_CHECKPOINTS, CAP_FEEDBACK,
                        CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_READ, CAP_REVIEWS,
-                       CAP_TASKS, HttpError, Service, Store, authority_request, conflict,
-                       forbidden, invalid, not_found, not_implemented, now_iso,
-                       request_hash, unauthenticated, uncertain, unsupported)
+                       CAP_TASKS, RESULT_RETENTION_SECONDS, HttpError, Service, Store,
+                       authority_request, conflict, forbidden, invalid, not_found,
+                       not_implemented, now_iso, request_hash, unauthenticated,
+                       uncertain, unsupported)
 
 KIT_VERSION = '0.1.0'
 MAX_BODY_BYTES = 262144
@@ -44,13 +45,6 @@ MAX_FILENAME = 128
 MAX_PAGE = 100
 DEFAULT_PAGE = 50
 MAX_CURSOR = 512
-# Bounds on the service state's committed-result replay map (``canonical.results``).
-# The durable exactly-once identity is the endpoint operation journal; this map is
-# only the fast replay path, so it is bounded by both entry count and serialized
-# bytes and evicts the oldest entry. The endpoint journal still refuses or replays a
-# retry whose local result was evicted, so an eviction never duplicates an effect.
-RESULTS_LIMIT = 2048
-RESULTS_MAX_BYTES = 2 * 1024 * 1024
 IDEMPOTENCY_HEADER = 'Idempotency-Key'
 ATTACHMENT_MEDIA_TYPES = ('text/plain', 'text/markdown')
 # One identifier pattern for every route parameter. Canonical Orchestra ids contain
@@ -165,44 +159,15 @@ def read_cursor(principal, project_id, query, cursor):
     return {'o': data['o'], 'x': data.get('x')}
 
 
-def remember_result(results, key, value, limit=None, max_bytes=None):
-    """Insert one committed result into the bounded replay map, evicting the oldest.
+def result_is_stored(service, key):
+    """True when the service's record store already holds a canonical result.
 
-    ``results`` is the service state's ``canonical.results`` document. It grows with
-    every new idempotency key, so without a bound the state file grows without limit;
-    the bound is by entry count first, then by serialized bytes, always dropping the
-    oldest insertions (dict order is insertion order). A retry whose local result was
-    evicted still reaches the durable endpoint journal, which replays or refuses the
-    same operation identity instead of repeating the effect.
+    The result replay path used to be a bounded JSON map inside ``http.json`` with a
+    2048-entry / 2 MiB count+byte eviction; it now lives in the SQLite record store
+    (``Store.records``) with time-only retention, so the JSON document neither grows
+    with the number of keyed operations nor is rewritten by one.
     """
-    if limit is None:
-        limit = RESULTS_LIMIT
-    if max_bytes is None:
-        max_bytes = RESULTS_MAX_BYTES
-    results[key] = value
-    while len(results) > limit and len(results) > 1:
-        results.pop(next(iter(results)), None)
-    try:
-        current = len(json.dumps(results, separators=(',', ':'),
-                                 ensure_ascii=False).encode('utf-8'))
-    except (TypeError, ValueError):
-        return results
-    if current <= max_bytes or len(results) <= 1:
-        return results
-    sizes = []
-    for entry_key, entry_value in results.items():
-        try:
-            size = len(json.dumps(entry_value, separators=(',', ':'),
-                                  ensure_ascii=False).encode('utf-8'))
-        except (TypeError, ValueError):
-            size = 0
-        sizes.append((entry_key, size))
-    for entry_key, size in sizes[:-1]:
-        if current <= max_bytes:
-            break
-        results.pop(entry_key, None)
-        current -= size + len(entry_key) + 4
-    return results
+    return service.has_result(key)
 
 
 # ------------------------------------------------------------------ backend seam
@@ -234,9 +199,6 @@ class InProcessBackend:
     def state(self):
         return self.service.state['canonical']
 
-    def _results(self):
-        return self.state.setdefault('results', {})
-
     def _result_key(self, principal, project_id, route, key, target):
         return request_hash({'u': principal.user_id, 'c': principal.credential_id or '-',
                              'p': project_id or '-', 'r': route, 't': target or '-',
@@ -255,11 +217,11 @@ class InProcessBackend:
         with self.service.store.lock:
             if authorize is not None:
                 authorize()
-            if result_key is not None and result_key in self._results():
-                return self._results()[result_key]
+            if result_key is not None and self.service.has_result(result_key):
+                return self.service.result_get(result_key)
             result = self._dispatch(route, principal, project_id, payload)
             if result_key is not None:
-                remember_result(self._results(), result_key, result)
+                self.service.result_put(result_key, result)
             self.service.store.save()
         if self.faults.get(route, 0) > 0:
             self.faults[route] -= 1
@@ -506,9 +468,6 @@ class EndpointBackend:
     def state(self):
         return self.service.state['canonical']
 
-    def _results(self):
-        return self.state.setdefault('results', {})
-
     def _result_key(self, principal, project_id, route, key, target):
         return request_hash({'u': principal.user_id, 'c': principal.credential_id or '-',
                              'p': project_id or '-', 'r': route, 't': target or '-',
@@ -597,8 +556,8 @@ class EndpointBackend:
         with self.service.store.lock:
             if authorize is not None:
                 authorize()
-            if result_key is not None and result_key in self._results():
-                return self._results()[result_key]
+            if result_key is not None and self.service.has_result(result_key):
+                return self.service.result_get(result_key)
         # The durable canonical operation identity is the same deterministic digest as
         # the local result key, so an exact retry after a lost response carries the
         # identity the endpoint journaled with the effect.
@@ -629,7 +588,7 @@ class EndpointBackend:
         # changed the authority the effect ran under.
         if result_key is not None:
             with self.service.store.lock:
-                remember_result(self._results(), result_key, result)
+                self.service.result_put(result_key, result)
                 self.service.store.save()
         if self.faults.get(route, 0) > 0:
             self.faults[route] -= 1

@@ -401,19 +401,30 @@ in server-side configuration rather than request data:
   (kept for audit). A row is an entry (`in_progress`/`committed`/`unknown`) or a
   tombstone (`state='expired'`); a commit or a reclaim is one small write instead of a
   whole-document re-serialisation, so keyed latency no longer grows with the journal.
-* *Journal bounds.* The store is bounded by live entry count (`JOURNAL_LIMIT`),
-  `MAX_ENVELOPE_BYTES` per retained envelope, the retained payload size
-  (`MAX_JOURNAL_BYTES`, entries plus tombstones) and a compact tombstone count
-  (`JOURNAL_TOMBSTONE_LIMIT`). An oversized response envelope is recorded by digest and
-  a retry reports uncertainty instead of returning a truncated result. Reclaim never
-  drops a record: it compacts it to a tombstone that still refuses an exact retry. Under
-  capacity pressure the oldest terminal (committed) receipts are compacted first, which
-  shrinks the store and adds the protecting tombstone, so ordinary load does not refuse
-  a write. A tombstone is removed only by age (`JOURNAL_TOMBSTONE_SECONDS`) against the
-  trusted clock; a still-live tombstone is *never* dropped to satisfy the byte or count
-  budget. When the identities genuinely cannot be held - live reservations, or a full
-  tombstone budget - the mutation fails closed with `124`, rolls back, and the
-  pre-existing store is untouched.
+* *Journal bounds.* Retention is **by time only**. A committed receipt is never
+  compacted, deleted or otherwise evicted while its own replay window is open, whatever
+  the store's size; the byte budget (`MAX_JOURNAL_BYTES`, entries plus tombstones) and
+  the compact tombstone count (`JOURNAL_TOMBSTONE_LIMIT`) are reported by
+  `OperationJournal.stats()` and `admin.py journal`, never enforced by eviction, and
+  accumulated tombstones never block a write. `MAX_ENVELOPE_BYTES` still bounds one
+  retained envelope: an oversized response is recorded by digest and a retry reports
+  uncertainty instead of returning a truncated result. Reclaim never drops a record: it
+  compacts a genuinely closed window to a tombstone that still refuses an exact retry,
+  and a tombstone is removed only by age (`JOURNAL_TOMBSTONE_SECONDS`) against the
+  trusted clock. The single admission bound is the live-identity count
+  (`JOURNAL_LIMIT`); when the store genuinely cannot hold one more live identity the
+  mutation fails closed with `124`, rolls back, and the pre-existing store is untouched.
+* *Journal maintenance.* The store runs in WAL mode, keeps
+  `live_count`/`tombstone_count`/`total_bytes` running totals in `meta` (updated in the
+  same transaction as every row write, so admission and the reported size never scan the
+  table), and records the directed `actor`, the canonical `route` and the precomputed
+  `replay_until`/`expires_at` per row. `trusted_now()` is the single clock used to stamp
+  a row and to decide replay-versus-expired, so a forward jump that has not been accepted
+  can neither create a future `at` nor expire a live receipt.
+* *Service record store.* The HTTP service's idempotency receipts and committed
+  canonical results live in `<state>.records.sqlite3` (`http_auth.RecordStore`, WAL,
+  time-only retention) rather than inside `http.json`, so the state document no longer
+  grows with the number of keyed operations and no keyed operation rewrites it.
 * *Affected non-HTTP callers.* `endpoint.py` is also the SSH worker entry. Every SSH
   request that carries an `operation_id`, and every `brief`/`history`/`checkpoint`
   request that passes through the guarded branch, uses the same journal and the same
@@ -482,6 +493,36 @@ the same boundary:
   unchanged, so reclaim and compaction stay refused. `admin.py journal
   --reset-high-water` is the explicit operator recovery for a genuine correction, after
   which reclaim compacts closed windows to tombstones as usual.
+
+**Current build status (rev8).** Revision 8 answers the seven round-7 review requests at
+the same boundary:
+
+* *Byte budget no longer evicts in-window receipts.* `_compact()` tombstoned the oldest
+  committed row whenever the store exceeded `MAX_JOURNAL_BYTES`, with no replay-window
+  check, and tombstones counted toward the same budget; 60 KB envelopes collapsed the
+  effective replay window to about 2.2 h, and at saturation 41k tombstones made every
+  keyed op `124` after about 32 s of compaction under the project lock. Retention is now
+  by time only: `_fit()` reclaims only genuinely closed windows, the byte and tombstone
+  budgets are reported (`stats()['over_bytes']`, `over_tombstones`) instead of enforced,
+  tombstones never block a write, and the only refusal is the live-identity bound
+  failing closed with `124`, rolled back, no effect attempted.
+* *Crash-atomic legacy migration.* The schema, the legacy-document import and the
+  `legacy_migrated` marker commit in ONE transaction, and the marker is checked on every
+  open, so a crash between schema creation and the import leaves the legacy JSON intact
+  and the next open completes the import instead of ignoring the file.
+* *Journal backup/restore.* `admin.py backup` takes a consistent
+  `sqlite3.Connection.backup()` snapshot of the project journal under the backup lock and
+  `restore-new` restores it, so the store really is included in a native project backup
+  (`bd backup` covers Dolt only).
+* *The state document no longer holds keyed records.* HTTP results and idempotency
+  receipts moved into a SQLite record store with time-only retention.
+* *Flat latency.* WAL plus `meta` running totals remove the per-operation full-table
+  scans; the journal rows also carry the directed actor, route, `replay_until` and
+  `expires_at`.
+* *Trusted clock on the read path.* `expired()` uses the same trusted clock as a write,
+  so during a +8 day jump a 60 s-old committed receipt replays and a live uncertain
+  reservation reports `124`; a skewed write is clamped so it can never store a future
+  `at`.
 
 
 Credential issuance is the deliberate exception to replaying a secret. The

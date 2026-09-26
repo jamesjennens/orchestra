@@ -16,9 +16,13 @@ security boundary described in ``docs/HTTP_TRANSPORT_DESIGN.md``:
 
 Only the Python standard library is used, and nothing here imports ``fcntl`` or any
 POSIX-only module, so the same code runs on a Windows workstation and a Linux office
-service. State is one JSON document written with an atomic replace. Multi-process
-concurrency is out of scope for the disposable validation build; the service is a
-single process with a per-process lock, and the deployment runbook pins that.
+service. Authorization state is one JSON document written with an atomic replace;
+idempotency receipts and canonical result replays live in a SQLite record store beside
+it (:class:`RecordStore`) with time-only retention, so the JSON document no longer
+grows with the number of keyed operations and no keyed operation rewrites it.
+Multi-process concurrency is out of scope for the disposable validation build; the
+service is a single process with a per-process lock, and the deployment runbook pins
+that.
 """
 import hashlib
 import hmac
@@ -26,6 +30,7 @@ import json
 import os
 import re
 import secrets
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -53,6 +58,15 @@ IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60
 LOGIN_WINDOW_SECONDS = 5 * 60
 LOGIN_MAX_ATTEMPTS = 10
 AUDIT_LIMIT = 10000
+#: How long a committed canonical result stays replayable in the record store. It is a
+#: time-only retention: nothing is ever evicted by entry count or serialized bytes, and
+#: once this window has closed the record is dropped, after which the durable endpoint
+#: operation journal still refuses or replays the same identity instead of repeating it.
+RESULT_RETENTION_SECONDS = 24 * 60 * 60
+#: SQLite sidecar holding the idempotency receipts and committed results, beside the
+#: service state document. Both used to live inside the JSON document with a count/byte
+#: eviction (results) or unbounded growth (idempotency).
+RECORD_STORE_SUFFIX = '.records.sqlite3'
 
 # Capabilities are the single authority vocabulary for every route. A route names
 # the capability it needs; the Service decides whether the live principal holds it.
@@ -234,19 +248,153 @@ def _blank_state():
         'projects': {},
         'memberships': {},
         'audit': [],
-        'idempotency': {},
         'canonical': {'tasks': {}, 'checkpoints': {}, 'contributions': {}, 'feedback': {}},
     }
 
 
+#: Sentinel meaning "the record store holds no such result", so a canonical result that
+#: legitimately *is* ``None`` is still reported as a hit.
+_RESULT_MISSING = object()
+
+
+class RecordStore:
+    """SQLite sidecar for the service's keyed records with TIME-ONLY retention.
+
+    Revision 7 kept the HTTP idempotency receipts in ``state['idempotency']`` (deleted
+    only when the same key was looked up again after its TTL, so it grew without bound)
+    and the committed canonical results in ``state['canonical']['results']`` with a
+    2048-entry / 2 MiB count+byte eviction. Both made every keyed operation rewrite the
+    whole JSON document. Both now live here, in one SQLite table with a ``kind``
+    discriminator, in WAL mode:
+
+    * ``get``/``put``/``delete`` are indexed point operations on ``(kind, key)``.
+    * ``purge`` removes only records whose own ``expires_at`` has genuinely passed.
+      There is deliberately no count or byte eviction: the durable endpoint operation
+      journal is what makes a retry safe, so a record is dropped by *age* alone.
+    """
+
+    def __init__(self, path, clock=time.time):
+        self.path = Path(path)
+        self.clock = clock
+        self._ensure()
+
+    def _connection(self):
+        connection = sqlite3.connect(str(self.path), timeout=30, isolation_level=None)
+        connection.row_factory = sqlite3.Row
+        connection.execute('PRAGMA busy_timeout = 30000')
+        connection.execute('PRAGMA journal_mode = WAL')
+        connection.execute('PRAGMA synchronous = FULL')
+        return connection
+
+    def _ensure(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self._connection() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            connection.execute(
+                'CREATE TABLE IF NOT EXISTS records ('
+                'kind TEXT NOT NULL, key TEXT NOT NULL, payload TEXT, '
+                'created_at REAL NOT NULL, expires_at REAL, '
+                'PRIMARY KEY (kind, key))')
+            connection.execute('CREATE INDEX IF NOT EXISTS records_expiry '
+                               'ON records (kind, expires_at)')
+            connection.execute('COMMIT')
+
+    def _now(self):
+        return self.clock()
+
+    def get(self, kind, key):
+        """The stored record, or ``None``. Never returns an expired record."""
+        with self._connection() as connection:
+            row = connection.execute(
+                'SELECT payload, expires_at FROM records WHERE kind = ? AND key = ?',
+                (kind, key)).fetchone()
+        if row is None:
+            return None
+        if row['expires_at'] is not None and row['expires_at'] <= self._now():
+            self.delete(kind, key)
+            return None
+        try:
+            record = json.loads(row['payload'])
+        except (TypeError, ValueError):
+            return None
+        return record if isinstance(record, dict) else None
+
+    def put(self, kind, key, record, ttl=None):
+        """Insert or replace one record, honouring ``record['expires_at']`` if given."""
+        moment = self._now()
+        expires = record.get('expires_at') if isinstance(record, dict) else None
+        if not isinstance(expires, (int, float)):
+            expires = moment + float(ttl if ttl is not None else IDEMPOTENCY_TTL_SECONDS)
+        with self._connection() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            connection.execute(
+                'INSERT OR REPLACE INTO records (kind, key, payload, created_at, '
+                'expires_at) VALUES (?, ?, ?, ?, ?)',
+                (kind, key, json.dumps(record, ensure_ascii=False, sort_keys=True),
+                 moment, float(expires)))
+            # Time-only retention is enforced here, on the same transaction, so the
+            # table cannot grow without a matching expiry sweep.
+            connection.execute('DELETE FROM records WHERE kind = ? AND expires_at <= ?',
+                               (kind, moment))
+            connection.execute('COMMIT')
+        return record
+
+    def delete(self, kind, key):
+        with self._connection() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            connection.execute('DELETE FROM records WHERE kind = ? AND key = ?',
+                               (kind, key))
+            connection.execute('COMMIT')
+
+    def purge(self, kind=None, now=None):
+        """Delete only records past their own ``expires_at``. Returns the count."""
+        moment = self._now() if now is None else now
+        with self._connection() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            if kind is None:
+                row = connection.execute(
+                    'SELECT COUNT(*) FROM records WHERE expires_at <= ?', (moment,)).fetchone()
+                connection.execute('DELETE FROM records WHERE expires_at <= ?', (moment,))
+            else:
+                row = connection.execute(
+                    'SELECT COUNT(*) FROM records WHERE kind = ? AND expires_at <= ?',
+                    (kind, moment)).fetchone()
+                connection.execute('DELETE FROM records WHERE kind = ? AND expires_at <= ?',
+                                   (kind, moment))
+            connection.execute('COMMIT')
+        return int(row[0])
+
+    def stats(self, now=None):
+        """Operator-visible record counts and byte sizes, by kind and expiry."""
+        moment = self._now() if now is None else now
+        with self._connection() as connection:
+            kinds = {}
+            for row in connection.execute(
+                    'SELECT kind, COUNT(*) AS total, '
+                    'COALESCE(SUM(LENGTH(payload)), 0) AS bytes, '
+                    'SUM(CASE WHEN expires_at <= ? THEN 1 ELSE 0 END) AS due '
+                    'FROM records GROUP BY kind', (moment,)):
+                kinds[row['kind']] = {'total': int(row['total']),
+                                      'bytes': int(row['bytes']),
+                                      'expired': int(row['due'] or 0)}
+            mode = connection.execute('PRAGMA journal_mode').fetchone()[0]
+            total = connection.execute('SELECT COUNT(*) FROM records').fetchone()[0]
+        return {'records': int(total), 'kinds': kinds, 'journal_mode': mode,
+                'file_bytes': self.path.stat().st_size if self.path.exists() else 0}
+
+
 class Store:
-    """Atomic JSON persistence. One writer process, guarded by an in-process lock."""
+    """Atomic JSON persistence plus the SQLite record store. One writer process."""
 
     def __init__(self, path, clock=time.time):
         self.path = Path(path)
         self.clock = clock
         self.lock = threading.RLock()
         self.state = self._load()
+        self.records = RecordStore(
+            self.path.with_name(self.path.name + RECORD_STORE_SUFFIX),
+            clock=lambda: self.clock())
+        self._migrate_records()
 
     def now(self):
         return self.clock()
@@ -263,6 +411,34 @@ class Store:
         for key, value in base.items():
             data.setdefault(key, value)
         return data
+
+    def _migrate_records(self):
+        """Move a pre-revision-8 ``idempotency``/``results`` document into the store.
+
+        A state document written by revision 7 or earlier still carries both maps. They
+        are imported once into the record store (honouring each recorded ``expires_at``)
+        and then removed from the JSON document, so a restart keeps every live receipt
+        without ever rewriting the document again.
+        """
+        moved = False
+        legacy_idempotency = self.state.pop('idempotency', None)
+        if isinstance(legacy_idempotency, dict) and legacy_idempotency:
+            for digest, record in legacy_idempotency.items():
+                if isinstance(digest, str) and isinstance(record, dict):
+                    self.records.put('idempotency', digest, record,
+                                     ttl=IDEMPOTENCY_TTL_SECONDS)
+            moved = True
+        canonical = self.state.get('canonical')
+        if isinstance(canonical, dict):
+            legacy_results = canonical.pop('results', None)
+            if isinstance(legacy_results, dict) and legacy_results:
+                for key, value in legacy_results.items():
+                    if isinstance(key, str):
+                        self.records.put('result', key, {'result': value},
+                                         ttl=RESULT_RETENTION_SECONDS)
+                moved = True
+        if moved:
+            self.save()
 
     def save(self):
         # One unique temporary per write, then an atomic replace. A fixed
@@ -307,6 +483,7 @@ class Service:
                  session_absolute=SESSION_ABSOLUTE_SECONDS,
                  credential_ttl=CREDENTIAL_TTL_SECONDS, reset_ttl=RESET_TTL_SECONDS,
                  idempotency_ttl=IDEMPOTENCY_TTL_SECONDS,
+                 result_retention=RESULT_RETENTION_SECONDS,
                  login_max_attempts=LOGIN_MAX_ATTEMPTS):
         self.store = store
         self.session_idle = session_idle
@@ -314,6 +491,7 @@ class Service:
         self.credential_ttl = credential_ttl
         self.reset_ttl = reset_ttl
         self.idempotency_ttl = idempotency_ttl
+        self.result_retention = result_retention
         self.login_max_attempts = login_max_attempts
         self._failures = {}
 
@@ -936,11 +1114,8 @@ class Service:
             return None
         digest = self._idempotency_key(principal, project_id, route, key)
         with self.store.lock:
-            record = self.state['idempotency'].get(digest)
+            record = self.store.records.get('idempotency', digest)
             if record is None:
-                return None
-            if record['expires_at'] <= self._now():
-                del self.state['idempotency'][digest]
                 return None
             if record['request_hash'] != body_hash:
                 raise conflict('Idempotency key reused with a different request payload')
@@ -961,15 +1136,16 @@ class Service:
         ``('new', digest, None)`` when this caller now owns the key. A second
         concurrent identical request can therefore never overwrite the reservation:
         it sees ``in_progress`` and either reconciles (canonical) or gets a 409.
+
+        The record lives in the SQLite record store, not in the JSON state document, so
+        a keyed operation no longer rewrites that document and its retention is by time
+        only (``purge`` deletes past ``expires_at``; there is no count/byte eviction).
         """
         if key is None:
             return ('new', None, None)
         digest = self._idempotency_key(principal, project_id, route, key)
         with self.store.lock:
-            record = self.state['idempotency'].get(digest)
-            if record is not None and record['expires_at'] <= self._now():
-                del self.state['idempotency'][digest]
-                record = None
+            record = self.store.records.get('idempotency', digest)
             if record is not None:
                 if record['request_hash'] != body_hash:
                     raise conflict('Idempotency key reused with a different request payload')
@@ -978,14 +1154,13 @@ class Service:
                 if record['state'] == 'unknown' or record.get('canonical'):
                     return ('reconcile', digest, None)
                 raise conflict('An identical request is already in progress')
-            self.state['idempotency'][digest] = {
+            self.store.records.put('idempotency', digest, {
                 'principal': principal.user_id, 'project_id': project_id, 'route': route,
                 'request_hash': body_hash, 'state': 'in_progress', 'status': None,
                 'response': None, 'canonical': bool(canonical),
                 'created_at': now_iso(self._now()),
                 'expires_at': self._now() + self.idempotency_ttl,
-            }
-            self.store.save()
+            })
         return ('new', digest, None)
 
     def idempotency_begin(self, principal, project_id, route, key, body_hash):
@@ -993,38 +1168,54 @@ class Service:
             return None
         digest = self._idempotency_key(principal, project_id, route, key)
         with self.store.lock:
-            self.state['idempotency'][digest] = {
+            self.store.records.put('idempotency', digest, {
                 'principal': principal.user_id, 'project_id': project_id, 'route': route,
                 'request_hash': body_hash, 'state': 'in_progress', 'status': None,
                 'response': None, 'created_at': now_iso(self._now()),
                 'expires_at': self._now() + self.idempotency_ttl,
-            }
-            self.store.save()
+            })
         return digest
 
     def idempotency_commit(self, digest, status, response):
         if digest is None:
             return
         with self.store.lock:
-            record = self.state['idempotency'].get(digest)
+            record = self.store.records.get('idempotency', digest)
             if record is not None:
                 record.update(state='committed', status=status, response=response)
-                self.store.save()
+                self.store.records.put('idempotency', digest, record)
 
     def idempotency_unknown(self, digest):
         if digest is None:
             return
         with self.store.lock:
-            record = self.state['idempotency'].get(digest)
+            record = self.store.records.get('idempotency', digest)
             if record is not None:
                 record['state'] = 'unknown'
-                self.store.save()
+                self.store.records.put('idempotency', digest, record)
 
     def idempotency_release(self, digest):
         if digest is None:
             return
         with self.store.lock:
-            self.state['idempotency'].pop(digest, None)
+            self.store.records.delete('idempotency', digest)
+
+    # -- canonical result replay (record store, time-only retention) -------------
+    def result_get(self, key):
+        """The committed canonical result for ``key``, or ``_RESULT_MISSING``."""
+        record = self.store.records.get('result', key)
+        if record is None:
+            return _RESULT_MISSING
+        return record.get('result')
+
+    def has_result(self, key):
+        """Whether the record store holds a result for ``key`` (a stored ``None`` counts)."""
+        return self.store.records.get('result', key) is not None
+
+    def result_put(self, key, value):
+        """Record one committed canonical result with time-only retention."""
+        self.store.records.put('result', key, {'result': value},
+                              ttl=self.result_retention)
 
     # -- HTTP-facing copies (never expose secrets) -----------------------------
     def export_state(self):
