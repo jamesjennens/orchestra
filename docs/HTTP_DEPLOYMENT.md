@@ -1,0 +1,513 @@
+# Office HTTP service: installation, TLS and recovery runbook
+
+**Status:** runbook for the disposable `.19` implementation. It describes a
+deployment shape but does not authorize one. No office hostname, certificate,
+secret store, network policy or backup key is selected here; the office owner
+supplies them. Nothing in this document was executed against a live host.
+
+The service is `http_service.py` (wire protocol and authorization), backed by
+`http_auth.py` (accounts, sessions, credentials, membership, audit, idempotency).
+Both use the Python standard library only. `http_client.py` is the worker/CLI
+transport; the existing SSH/local `client.py` transport is unchanged and remains
+the operator path.
+
+## 1. What the service is and is not
+
+It is an authenticated adapter to canonical coordination data: browser sessions
+and project-scoped worker credentials gate every route, and organization is by
+project membership (`owner`, `contributor`, `viewer`) with a global superuser.
+
+It is **not** a replacement for repository permissions, TLS termination, host
+isolation, or the canonical database's own access controls. It never grants Git
+merge, deployment or host authority.
+
+## 2. Components and paths
+
+| Item | Value |
+| --- | --- |
+| Service | `http_service.py` (stdlib `ThreadingHTTPServer`) |
+| Auth core | `http_auth.py` |
+| Client | `http_client.py` |
+| Canonical binding | `--backend endpoint` (default) via `EndpointBackend` -> `endpoint.py`; `--backend inprocess` is a disposable local check only |
+| Private state | one JSON document at `--state` (e.g. `<RUNTIME_ROOT>/http-state.json`) |
+| Python | 3.10 or newer; no third-party packages |
+| Listener | loopback by default (`127.0.0.1:8443`), fronted by the reverse proxy |
+
+The state document contains only password verifiers, hashed session/credential
+tokens, membership, idempotency records and audit events. It must live outside
+source control on a private path owned by the service account.
+
+The `endpoint` backend runs the canonical `endpoint.py` client as the service
+account and is the only binding that touches canonical coordination data. The
+HTTP layer never reads or writes canonical storage directly. The `inprocess`
+backend keeps canonical records inside the service state and exists solely for
+disposable local validation; it is not a deployment backend.
+
+## 3. Provisioning a host (placeholders)
+
+```sh
+# 1. dedicated least-privilege account and private runtime root
+sudo useradd --system --home <RUNTIME_ROOT> --shell /usr/sbin/nologin <SERVICE_USER>
+sudo install -d -m 0700 -o <SERVICE_USER> -g <SERVICE_USER> <RUNTIME_ROOT>
+sudo install -d -m 0700 -o <SERVICE_USER> -g <SERVICE_USER> <RUNTIME_ROOT>/secrets
+
+# 2. the kit (pinned revision; no packages to install)
+sudo -u <SERVICE_USER> git clone <KIT_REPO_URL> <RUNTIME_ROOT>/kit
+cd <RUNTIME_ROOT>/kit && git checkout <PINNED_COMMIT>
+
+# 3. one-time superuser bootstrap; there is no default or shared password
+sudo -u <SERVICE_USER> python3 http_service.py \
+  --state <RUNTIME_ROOT>/http-state.json --bootstrap-user <ADMIN_USERNAME>
+# the operator types the password at the prompt; it is never echoed or logged
+```
+
+Bootstrap refuses to run once any account exists, so it cannot silently reset a
+live deployment. Create ordinary accounts through the API and hand each user a
+single-use reset value; only redemption changes the verifier.
+
+## 4. Service unit
+
+```ini
+# /etc/systemd/system/orchestra-http.service  (placeholders, not installed here)
+[Unit]
+Description=Orchestra authenticated HTTP service
+After=network-online.target
+
+[Service]
+User=<SERVICE_USER>
+Group=<SERVICE_USER>
+WorkingDirectory=<RUNTIME_ROOT>/kit
+ExecStart=/usr/bin/python3 http_service.py \
+  --state <RUNTIME_ROOT>/http-state.json \
+  --host 127.0.0.1 --port 8443 \
+  --backend endpoint \
+  --endpoint <RUNTIME_ROOT>/kit/endpoint.py \
+  --root <RUNTIME_ROOT> \
+  --trusted-proxy 127.0.0.1
+Restart=on-failure
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=<RUNTIME_ROOT>
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`--trusted-proxy ADDR` (repeatable, address or CIDR) names the peers whose
+forwarded headers the service will believe. A reverse proxy on the same host is
+`--trusted-proxy 127.0.0.1`. Enable it **only** for the configured proxy address:
+forwarded headers from any other peer are ignored, so a client cannot spoof the
+throttle key or claim `https`.
+
+That last point is what makes browser cookies safe under the documented TLS
+deployment. TLS terminates at the proxy, so the loopback connection to the
+service is plaintext and is **not** treated as secure by itself. The service marks
+the session cookie `Secure` only when the request arrived over TLS at the service
+or when a trusted peer sent `X-Forwarded-Proto: https`. A plaintext loopback
+request, or an `X-Forwarded-Proto` header from an untrusted peer, does not earn a
+`Secure` cookie. The proxy must set `X-Forwarded-Proto https` (see section 5).
+
+TLS may also terminate at the service itself with
+`--cert <CERT_PATH> --key <KEY_PATH>` (TLS 1.2 minimum). The service refuses a
+plaintext non-loopback listener unless `--allow-plaintext-non-loopback` is passed
+explicitly for a disposable test.
+
+## 5. Reverse proxy (example shape)
+
+```nginx
+# placeholders only; the office owner chooses the real hostname and certificate
+server {
+    listen 443 ssl;
+    server_name <HOSTNAME>;
+    ssl_certificate     <CERT_PATH>;
+    ssl_certificate_key <KEY_PATH>;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    client_max_body_size 300k;          # matches the service body bound
+
+    location / {
+        proxy_pass http://127.0.0.1:8443;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_read_timeout 60s;
+    }
+}
+```
+
+The proxy must reject or redirect plaintext, validate its certificate chain,
+enforce a body limit, and preserve only the documented forwarding headers. It
+should set `X-Forwarded-Proto https` and the service must name the proxy address
+with `--trusted-proxy` for that header to be believed (section 4); otherwise
+browser session cookies are issued without `Secure`. Do not add a wildcard CORS
+origin: credentialed requests require an explicit origin list and the service
+sends `Cache-Control: no-store` on every response.
+
+## 6. Worker clients
+
+```sh
+export ORCHESTRA_HTTP_URL=https://<HOSTNAME>
+export ORCHESTRA_PASSWORD='...'          # read from the environment, never an argv
+python3 http_client.py login --username <USERNAME>
+# the client prints the session token to stdout; keep it out of shell history/logs
+python3 http_client.py --token "$TOKEN" call GET /v1/projects
+```
+
+A project owner or superuser issues a project-scoped credential once; the secret
+is shown only in that `201` response. For unattended workers, store it in the
+operator's secret store and use it as a bearer token. An exact retry of a lost
+issuance returns `200` metadata with `secret_available:false`; it never re-delivers
+the secret. Revoke and reissue instead.
+
+A credential is bound to one project and to its `scopes` list (`read`, `tasks`,
+`checkpoints`, `reviews`, `feedback`). It may always read the project it is scoped
+to; a write route requires the matching scope. No credential can administer
+accounts or projects, issue or revoke credentials, or approve a review, whatever
+the role of the account that issued it. Issuing a credential never lends the
+issuer's authority to it.
+
+Mutating calls accept an `Idempotency-Key`. On an uncertain `503` the client
+raises `UncertainOutcome` carrying the key: retry the identical request with that
+key to reconcile. Never retry an uncertain mutation with a new key.
+
+**Retry contract.** An exact retry sent no more than 29 days
+(`JOURNAL_RETRY_HORIZON_SECONDS`, the 30-day tombstone horizon minus the 24 h skew
+allowance) after the original attempt replays the recorded result, reports
+uncertainty or is refused as expired; it is never re-executed, **as long as the total
+uncredited forward clock error stays below 24 h** (`JOURNAL_MAX_SKEW_SECONDS`). A
+forward step of 24 h or less is not suspect and not credited, and such steps add up:
+three false +23 h steps with no correction re-execute retries about 28.4-29.1 days
+old. Keep the host clock NTP-disciplined; after correcting a clock that ran ahead, run
+`admin.py journal <PROJECT> --reset-high-water`. Tombstones already aged out during the
+error are not restored. An older retry is unsupported: its tombstone may have aged out
+and the effect may run again. Reconcile canonical state and use a new key instead.
+
+Service-local routes (credential issue, account and project create, membership
+changes) are not backed by the canonical journal: their exact-retry window is the HTTP
+idempotency record's (`IDEMPOTENCY_TTL_SECONDS`, 24 h). That record expires on the same
+confirmed timeline (see the record store in section 8), so a clock jump never shortens
+it; a retry after the window is treated as a new request.
+
+## 7. Secrets, rotation and redaction
+
+- Password verifiers are stored with memory-hard `scrypt`; plaintext passwords,
+  reset values, session cookies and bearer tokens are never stored or logged.
+- TLS keys, the password used at bootstrap and issued worker secrets live in
+  `<RUNTIME_ROOT>/secrets` or the operator's secret store, never in Git.
+- Rotate deployment secrets and revoke all sessions/credentials if compromise is
+  suspected. Disabling an account immediately revokes its sessions and credentials.
+- Audit events record time, request id, authenticated user id, project, action,
+  outcome and a short redacted reason. They never contain request bodies,
+  `Authorization` headers, cookies, passwords, reset values or attachment content.
+
+### Clock jumps and time-based expiry
+
+Every place that ages or deletes by time, and what an accepted clock jump does to it:
+
+| Item | Clock | Can a jump re-execute an effect? | Security direction |
+|---|---|---|---|
+| Journal tombstones (`http_authority`) | confirmed timeline (`aged_from`, `jump_credit`) | No (within the retry contract) | n/a |
+| Journal receipt reclaim, uncertain expiry | raw, only when not suspect | No: worst case `rc=2` refusal | n/a |
+| HTTP idempotency records and committed results (`RecordStore`) | confirmed timeline (`expires_confirmed`) | No: a retry replays or is refused | n/a |
+| Sessions (idle and absolute), worker credentials, reset tokens | raw absolute expiry | No | A forward jump expires existing ones **early** (safe). Anything issued or refreshed during a forward jump that is later corrected lives **late**, by the jump length; a clock set backwards extends every live one by the step |
+| Login throttle window (in memory) | raw | No | A forward jump clears it early (a few extra attempts); a backward step keeps it longer (safe) |
+| Audit log (`AUDIT_LIMIT`) | count-bounded; timestamps only | No | none |
+
+After correcting a clock that ran **ahead**, revoke the sessions, worker credentials and
+reset tokens issued during the error window (they carry `created_at` on the wrong
+clock), then run `--reset-high-water`. After correcting a clock that ran **behind**,
+nothing is extended.
+
+## 8. Backup, restore and rollback
+
+Back up, in one coordinated snapshot:
+
+1. the canonical coordination database and its sidecar, **and each project's
+   operation store** `<PROJECT>/.http-operations.sqlite3` — `admin.py backup PROJECT`
+   captures all three together (Dolt via `bd backup`, the coordination sidecar, and a
+   consistent `sqlite3` backup-API snapshot of the operation store in
+   `<RUNTIME_ROOT>/backups/<PROJECT>.http-operations.sqlite3`, converted to
+   `journal_mode=DELETE` so it is one self-contained file with no `-wal`/`-shm`),
+2. this service's `--state` document (accounts, membership, revocation state and
+   audit) **and its record store** `<state>.records.sqlite3` (HTTP idempotency
+   receipts and committed results).
+
+The two SQLite stores run in WAL mode, so never copy the bare `.sqlite3` file of a
+live store with `cp`: committed pages may still be in the `-wal` file. Take a
+consistent copy with the SQLite backup API instead — `admin.py backup` does this for
+the operation store; for the record store (or any store taken outside `admin.py`),
+stop the service or use:
+
+```sh
+sudo -u <SERVICE_USER> python3 -c "import sqlite3,sys; s=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True); d=sqlite3.connect(sys.argv[2]); s.backup(d); d.close(); s.close()" \
+    <RUNTIME_ROOT>/http-state.json.records.sqlite3 <BACKUP_DIR>/http-state.json.records.sqlite3
+```
+
+Take the state document and its record store in the same service stop (or back to
+back, state document first) so they describe the same moment. Encrypt off-machine
+copies, restrict the key to the backup owner, and define retention before rollout.
+Restore drill on an **isolated** deployment:
+
+```sh
+sudo systemctl stop orchestra-http
+sudo -u <SERVICE_USER> install -m 0600 <RESTORED_STATE> <RUNTIME_ROOT>/http-state.json
+sudo -u <SERVICE_USER> install -m 0600 <RESTORED_STATE>.records.sqlite3 \
+    <RUNTIME_ROOT>/http-state.json.records.sqlite3
+sudo -u <SERVICE_USER> rm -f <RUNTIME_ROOT>/http-state.json.records.sqlite3-wal \
+    <RUNTIME_ROOT>/http-state.json.records.sqlite3-shm
+sudo -u <SERVICE_USER> python3 -m json.tool <RUNTIME_ROOT>/http-state.json > /dev/null
+sudo -u <SERVICE_USER> python3 -c "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute('PRAGMA quick_check').fetchone()[0])" \
+    <RUNTIME_ROOT>/http-state.json.records.sqlite3      # ok
+# a project, including its operation store, is restored into a NEW project name:
+sudo -u <SERVICE_USER> python3 admin.py --root <RUNTIME_ROOT> restore-new <PROJECT> <NEW_PROJECT>
+sudo systemctl start orchestra-http
+curl -fsS http://127.0.0.1:8443/healthz          # {"status":"ok"}
+```
+
+`restore-new` validates the operation-store snapshot first (read-only open,
+`PRAGMA quick_check`, the `operations` and `meta` tables) and refuses a corrupt
+snapshot before it creates the destination project, runs the Dolt restore or writes
+any coordination file. The restored store replaces any stale `-wal`/`-shm` sidecars.
+Without the record store the service starts with an empty receipt set (a lost-response
+retry then falls through to the operation store, which still replays or refuses it).
+
+After restore, verify hashes, revocation state, memberships and audit continuity,
+then cut over explicitly. Rollback is the previous pinned kit revision plus its
+matching state snapshot; restore both together. A state document whose
+`schema_version` is not understood fails closed at startup rather than guessing.
+
+### Operation journal recovery (idempotency receipts)
+
+Each project keeps its idempotency receipts in `<PROJECT>/.http-operations.sqlite3`: a
+SQLite database (stdlib `sqlite3`, WAL mode, one transaction per keyed mutation) with
+one indexed row per identity. Revision 7 replaced the older whole-document
+`<PROJECT>/.http-operations.json`, whose read/modify/rewrite cost grew with the journal
+and whose byte budget could drop a live record.
+
+The legacy document is imported **in the same transaction that creates the schema**,
+guarded by a persisted `meta['legacy_migrated']` marker that is checked on every open.
+A crash between schema creation and the import therefore leaves either the untouched
+`.http-operations.json` (the transaction rolled back) or a fully migrated store; the
+next open finishes the migration rather than silently ignoring the still-present JSON.
+Only after the commit succeeds is the document renamed to
+`.http-operations.json.migrated` (kept for audit; the import happens once).
+
+The store keeps the same three concepts:
+
+* **live entries** — a *committed* receipt keeps its replayable response for
+  `JOURNAL_COMMITTED_RETENTION_SECONDS` (default 1 day); an *uncertain* reservation
+  (`in_progress`/`unknown`) stays live for `JOURNAL_RETENTION_SECONDS` (default 7 days)
+  because it may correspond to a committed native write whose outcome was never
+  observed.
+* **tombstones** — every reclaimed identity becomes a compact row (`state='expired'`:
+  operation id, request hash, principal, times) that keeps refusing an exact retry as
+  expired. A tombstone ages on the *confirmed timeline*: it records
+  `aged_from = reclaimed_at - jump_credit` and is removed only when
+  `aged_from < now - jump_credit - JOURNAL_TOMBSTONE_SECONDS` (default 30 days), i.e.
+  when its age excluding every suspect forward step credited since it was reclaimed
+  passes the horizon. A clock jump therefore never ages a tombstone out (an accepted
+  jump extends retention by its length; an idle gap of more than 24 h, such as a
+  weekend, extends it by the gap), and a still-live tombstone is never dropped to
+  satisfy the byte or count budget.
+* **trusted clock** — `meta` holds `high_water` (the largest raw clock any write has
+  seen; it never decreases), `suspect`, `anchor`, `suspect_since` and `jump_credit` (a
+  non-decreasing total of every suspect forward step). Every write observes the raw
+  clock: a step of more than `JOURNAL_MAX_SKEW_SECONDS` (24 h) since `high_water` makes
+  the store *suspect* and is added to `jump_credit` (the first such step records
+  `anchor = high_water`; a further big step restarts `suspect_since` but keeps the
+  anchor); once the raw clock has run for `JOURNAL_SUSPECT_SETTLE_SECONDS` (1 h) after
+  the step the next write clears it; a backward step is never suspect and never
+  credited. The trusted clock is `now`, or while suspect
+  `clamp(anchor + (now - suspect_since), anchor, anchor + 24 h)` — only the time
+  elapsed since the step counts — and decides every replay/expiry question on the read
+  and write paths (the HTTP record store uses the same rule). Rows are stamped with the
+  raw clock. Receipt reclaim runs only while the store is not suspect, against the raw
+  clock; tombstone deletion also waits for a non-suspect store and uses the confirmed
+  timeline above.
+
+  *Effect.* After an idle weekend the first write is suspect for one hour, with the
+  trusted clock held near the anchor, so an old receipt may still replay instead of
+  being refused (harmless); then normal operation resumes without an operator. **While
+  consecutive writes stay more than 24 h apart the store stays suspect**: reclaim
+  pauses and old receipts keep replaying until two writes fall within 24 h and an hour
+  passes. During a genuine forward jump (for example +8 days) a 60-second-old receipt
+  replays and an uncertain reservation keeps reporting `124`.
+
+  *Residual risk.* A jump that persists for longer than the settle hour is accepted:
+  receipts still inside their real window can then be compacted to tombstones, so an
+  exact retry is refused as expired (reconcile and use a fresh `operation_id`); no
+  tombstone inside the retry horizon is deleted and nothing is re-executed. **A jump
+  that is later corrected keeps the store suspect for about the length of the jump**
+  (`high_water` is left in the future; the trusted clock stays at the anchor and
+  reclaim pauses), and a repeat of the same jump would not be detected again, until
+  `--reset-high-water` (below). A clock step of 24 h or less is not suspect and not
+  credited, which is why the client retry contract (section 6) is the horizon minus
+  24 h and holds only while the total uncredited forward clock error stays below 24 h.
+
+  *Sparse projects.* A project whose writes are always more than 24 h apart credits
+  every gap, so its `jump_credit` grows at about real time and its few tombstones
+  effectively never age out. This is safe (one small row per identity) and ends as soon
+  as writes fall within 24 h of each other.
+
+An exact retry inside its window replays the committed response or reports `124`
+uncertainty; outside it (or after reclaim) it is refused as expired with `rc=2`. It is
+never re-executed.
+
+**Retention is by time only.** A committed receipt is never compacted, deleted or
+otherwise evicted while its window is open, whatever the store's size; the byte budget
+(`MAX_JOURNAL_BYTES`) and the advisory tombstone size (`JOURNAL_TOMBSTONE_LIMIT`) are
+**reported**, never enforced by eviction; the tombstone count never stops reclaim and
+never blocks a write (tombstones age out by time only). The one admission bound is the live-identity count (`JOURNAL_LIMIT`): when the
+store genuinely cannot hold one more live identity the mutation fails closed with `124`,
+the transaction is rolled back so the pre-existing store is untouched, and no effect is
+attempted. `stats()` reports `live_bytes`, `tombstone_bytes`, `bytes`, `limit_bytes`
+(`MAX_JOURNAL_BYTES`), `over_bytes`/`over_tombstones`/`over_limit`, `journal_mode` and
+`running_totals_match`, plus the clock state `high_water`, `suspect`, `anchor`,
+`suspect_since`, `clock_skewed` (= `suspect`) and `trusted_now` as of the call
+(`clock_persisted` is the stored row); `stats()['file_bytes']` is the database file's
+size on disk. The
+store keeps `live_count`/`tombstone_count`/`total_bytes` running totals in `meta`,
+updated inside the same transaction as every row write, so a keyed operation never scans
+the table and latency does not grow with the store's size. Tombstone ageing is a
+range scan on the `(state, reclaimed_at)` index, and schema upgrades (columns,
+backfill, indexes, clock state; schema 5 in this revision) run once, atomically, on the
+first open by the new code, never on every open. Each row also carries the
+directed `actor`, the canonical `route` and the precomputed `replay_until`/`expires_at`
+timestamps.
+
+The HTTP service's own idempotency receipts and committed canonical results live in a
+second SQLite store beside the service state document (`<state>.records.sqlite3`,
+`http_auth.RecordStore`, WAL, time-only retention). It keeps its own trusted-clock state
+and `jump_credit` in its own `meta` table (the same rules as the journal, mirrored, not
+shared rows), stores each record's expiry on the confirmed timeline
+(`expires_confirmed = expires_at - jump_credit` at write time), and treats a record as
+expired, or deletes it, only when `expires_confirmed < now - jump_credit` (clamped
+trusted clock while suspect; no deletion while suspect). A clock jump therefore never
+ages an HTTP idempotency record or committed result out early. An older record store is
+upgraded atomically on open (`expires_confirmed = expires_at`, credit 0). They used to live inside the
+`http.json` state document, where the result map evicted by count/bytes and the
+idempotency map grew without bound; `http.json` no longer grows with the number of keyed
+operations and no keyed operation rewrites it. Back up the two files together: the
+state document and the records store.
+
+An operator intervenes for inspection, for a stuck unknown identity, to shorten a
+window, or after a genuine clock correction:
+
+```sh
+# inspect: per-state counts, tombstones, expired/reclaimable, live/tombstone bytes,
+# configured bounds, over-budget flags, journal_mode and file bytes
+sudo -u <SERVICE_USER> python3 admin.py --root <RUNTIME_ROOT> journal <PROJECT>
+
+# compact closed receipt windows now (safe; reclaim writes tombstones, never drops)
+sudo -u <SERVICE_USER> python3 admin.py --root <RUNTIME_ROOT> journal <PROJECT> --reclaim-expired
+
+# override either window for one inspection/compaction (seconds)
+sudo -u <SERVICE_USER> python3 admin.py --root <RUNTIME_ROOT> journal <PROJECT> \
+    --retention 604800 --committed-retention 86400 --reclaim-expired
+
+# after correcting a wrong clock: high_water = now and clear suspicion
+sudo -u <SERVICE_USER> python3 admin.py --root <RUNTIME_ROOT> journal <PROJECT> --reset-high-water
+
+# explicit override after reconciling canonical state: remove a still-live identity
+sudo -u <SERVICE_USER> python3 admin.py --root <RUNTIME_ROOT> journal <PROJECT> \
+    --prune-before <EPOCH_SECONDS>
+```
+
+`--reset-high-water` sets `high_water` to the current clock and clears suspicion; it
+never reduces `jump_credit`, so tombstones keep ageing on the confirmed timeline. No
+operator action is needed after an idle gap (suspicion settles by itself after an
+hour). Use it after correcting a clock that had jumped forward: it re-arms jump
+detection and ends the capped-expiry period at once. It removes no identity by itself.
+Older stores are upgraded on first open in one transaction. The credit always
+starts at 0: schema 4 and 5 stores were never deployed, so no step before the upgrade
+is credited. A rev7/rev8 store whose
+`high_water` is more than 24 h old starts suspect (`anchor = high_water`) and settles an
+hour later like any idle gap. Schema 6 (this revision; from a rev9 schema-5 store or
+older) adds `jump_credit = 0`, the `aged_from` column (set to `reclaimed_at` for
+existing tombstones) and the `(state, aged_from)` index, which replaces
+`(state, reclaimed_at)`; a crash during the upgrade leaves the previous schema intact.
+
+**Upgrade note: the route is part of the operation hash.** From this revision the HTTP
+service sends the canonical route with every keyed mutation, so the journal row
+records it and `operation_hash` binds it. A mutation journaled by an earlier revision
+over HTTP (route recorded as empty), whose result is not in the service record store
+(an uncertain first attempt), and retried after the upgrade inside its replay window, is
+refused as `Operation identity reused with a different request` (`rc=2`,
+HTTP `400`) rather than replayed; it is never re-executed. Upgrade while no HTTP
+mutation is awaiting a retry, or reconcile such a retry through a canonical read.
+
+`--prune-before` is the only operation that removes a record without a tombstone, so it
+is the only one that can make an exact retry repeat its effect. Reconcile the canonical
+task/comment state first, then prune that identity, then let the client issue a fresh
+`operation_id`. Every journal command runs under the project coordination lock, so it
+cannot interleave with a live mutation; it is a local operator action and is never
+exposed over HTTP.
+
+If a project's live identity count exceeds `JOURNAL_LIMIT` inside the receipt windows,
+the mutation fails closed with `124` rather than dropping a live identity. The remedies
+are to let the windows close (a closed window is compacted to a tombstone and stops
+counting as live), to `--prune-before` after reconciliation, or to raise the reviewed
+`JOURNAL_LIMIT`. A large byte total is *reported* (`over_bytes`) rather than relieved by
+eviction; size is the operator's signal to raise the reviewed `MAX_JOURNAL_BYTES`, move
+the store to a larger volume, or shorten the committed window. The store is one local
+file inside the project directory: `admin.py backup PROJECT` takes a consistent
+`sqlite3.Connection.backup()` snapshot of it (under the same backup lock as the
+coordination sidecar) into `<RUNTIME_ROOT>/backups/<PROJECT>.http-operations.sqlite3`,
+and `admin.py restore-new PROJECT DESTINATION` restores that snapshot into the newly
+created project. `bd backup` itself covers Dolt only, so the snapshot is what makes the
+claim in this section true.
+
+## 9. SSH compatibility
+
+SSH and local transports keep their existing actor/config contract and gain no
+HTTP roles. HTTP principals are never inferred from an actor string; mapping
+legacy actor-owned claims to a stable user id is an explicit migration action in
+the pilot phase, not part of this service.
+
+## 10. Known limitations of this disposable build
+
+- The canonical binding is implemented for the full route surface:
+  `EndpointBackend` provides `invoke`, `list_tasks`, `get_task`, `task_history` and
+  `list_feedback`, maps task mutations onto `bd create/update` and
+  checkpoints/reviews onto the canonical structured `checkpoint`/`review` actions,
+  and re-checks authority when it writes the durable idempotency receipt. A
+  disposable subprocess test (`tests/test_http_review_fixes.py`) exercises the HTTP
+  surface through this seam against durable file-backed canonical state, including
+  uncertain-write reconciliation after a restart. Confirming the exact `bd` argv
+  against a live pinned runtime still needs a POSIX host with `bd`; this
+  workstation has neither.
+- **Explicitly unresolved routes.** The jobs alias and artifact-content routes are
+  not implemented. `POST`/`GET /v1/projects/{id}/feedback` fail closed with
+  `501 not_implemented` on the canonical backend because the dedicated feedback
+  stream ships with `kittrial-5bb.13`; the service never substitutes its own store
+  for canonical feedback. Attachment uploads are validated and bounded but only
+  their metadata and digest are retained, so **UI readiness is not claimed**.
+- Administrative audit coverage is partial: login outcomes, authorization
+  denials and every successful idempotent mutation are recorded; a per-field
+  before/after administrative trail is not implemented.
+- The state store is a single JSON document guarded by one in-process lock, written
+  with a unique temporary and an atomic replace. Run exactly one service process;
+  multi-process or multi-host scale-out is out of scope and would need a
+  transactional store. The store lock is also the authority/revocation boundary: a
+  revocation cannot interleave between an authority check and the mutation it
+  authorizes.
+- The final-owner invariant is enforced for every caller, including a superuser.
+  Recovery is explicit and accepted: assign `owner` to another member first, then
+  demote, remove or disable the previous sole owner. Review approval is owner-only;
+  a contributor cannot approve, and a worker credential never can.
+
+## 11. Unresolved office decisions (owner, before rollout)
+
+1. Hostname, certificate operator and renewal process.
+2. Reverse-proxy trust boundary and whether the proxy terminates TLS or the
+   service does.
+3. Secret-store location and backup-key owner.
+4. Retention period and recovery objectives for audit, state and backups.
+5. Whether to bind an external identity provider (SSO) or MFA, and when.
+6. Network exposure and any approved browser origin list.
+
+Until these are recorded, this service is a disposable local validation build,
+not an office deployment.

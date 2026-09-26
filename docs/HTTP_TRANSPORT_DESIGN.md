@@ -343,6 +343,14 @@ content hashes while streaming, and reject traversal, symlinks, ambiguous
 encodings and archive bombs. Download authorization is checked independently;
 the original filename is display metadata only.
 
+**Current build status (rev3).** The `.19` service validates attachment bounds,
+filenames and media types, but no route persists attachment content yet: the artifact
+binding is deferred with the job/artifact routes. A syntactically valid attachment is
+therefore rejected with `501 not_implemented` rather than accepted and dropped. The
+service never returns `201` while discarding submitted evidence.
+
+An exact retry of a canonical mutation sent no more than 29 days after the original attempt (the journal's `JOURNAL_RETRY_HORIZON_SECONDS`) is never re-executed, as long as the total uncredited forward clock error (forward steps of 24 h or less that were not real elapsed time) stays below 24 h; recover with `--reset-high-water` after correcting the clock. An older retry is unsupported. A service-local route's exact-retry window is the 24 h HTTP idempotency record, kept on the same confirmed timeline.
+
 Every mutation that can be retried accepts an idempotency key scoped to
 authenticated principal, project and operation route. The key namespace does
 not include the request payload: store the canonical request hash separately,
@@ -353,6 +361,234 @@ result; it must not duplicate a task, comment, attachment registration or
 role change. Idempotency does not make a non-transactional external side effect
 exactly once, so the response and reconciliation protocol must expose unknown
 outcomes.
+
+**Current build status (rev3).** Reservation, mutation and receipt are atomic for
+in-process mutations, and every canonical mutation carries a deterministic operation
+identity that the endpoint journals durably with the effect. A retry after a lost
+response replays the recorded canonical envelope instead of repeating the effect; an
+authority change persisted first is observed by the endpoint immediately before the
+effect under the same cross-process lock. Attachments excepted, see above.
+
+**Current build status (rev4).** The authority and identity boundary is now expressed
+in server-side configuration rather than request data:
+
+* *Authority location.* The live-authority document and its lock are passed to
+  `endpoint.py` as launch arguments (`--authority-store`, `--authority-lock`) by the
+  trusted HTTP service, exactly like `--root`. `store`/`lock` fields inside a request
+  body are ignored even when the configuration is present, and without a
+  configuration the whole `authority` block is ignored (the SSH compatibility path
+  has no HTTP principal to check). `--require-authority` marks the trusted mutation
+  launch, so a mutation that omits the descriptor is refused with `126` instead of
+  silently skipping the live check. An SSH-shaped request that supplies hostile
+  `authority.store`/`authority.lock` therefore cannot read a chosen server file or
+  create a lock at a chosen path.
+* *Identity.* `operation_hash` binds the authenticated principal, the actor label,
+  the route, the project, the action arguments and the attachments. A client-supplied
+  `operation_id` reused by a *different* principal is a clean conflict (`2`), never a
+  replay of another principal's committed envelope; an exact retry by the same
+  principal still replays.
+* *Exceptions.* An express `PreEffectFailure`, or a validation/refusal exception
+  (`ValueError`/`KeyError`/`TypeError`/`IndexError`/`UnicodeError`) raised before the
+  effect's first native write, releases the reservation and reports the real error at
+  `rc=2`. Any other exception (a `subprocess` timeout, an `OSError`, a mid-flow error
+  after a write) keeps the reservation and reports `124` uncertainty, because the
+  write may already have committed. The pre-write test is the instrumented
+  `NativeRunner` injected into the effect (`endpoint.py`): it is the effect's only
+  route to `bin/bd`, records whether a mutating invocation was attempted, and treats
+  an unrecognized verb as a write.
+* *Journal store.* The live journal is `<PROJECT>/.http-operations.sqlite3`, a SQLite
+  database (stdlib `sqlite3`) with one indexed row per identity and one transaction per
+  `reserve`/`complete`/`lookup`. The pre-revision-7 `operation_id -> envelope` JSON
+  document is imported once on first open and renamed `.http-operations.json.migrated`
+  (kept for audit). A row is an entry (`in_progress`/`committed`/`unknown`) or a
+  tombstone (`state='expired'`); a commit or a reclaim is one small write instead of a
+  whole-document re-serialisation, so keyed latency no longer grows with the journal.
+* *Journal bounds.* Retention is **by time only**. A committed receipt is never
+  compacted, deleted or otherwise evicted while its own replay window is open, whatever
+  the store's size; the byte budget (`MAX_JOURNAL_BYTES`, entries plus tombstones) and
+  the compact tombstone count (`JOURNAL_TOMBSTONE_LIMIT`) are reported by
+  `OperationJournal.stats()` and `admin.py journal`, never enforced by eviction, and
+  accumulated tombstones never block a write. `MAX_ENVELOPE_BYTES` still bounds one
+  retained envelope: an oversized response is recorded by digest and a retry reports
+  uncertainty instead of returning a truncated result. Reclaim never drops a record: it
+  compacts a genuinely closed window to a tombstone that still refuses an exact retry,
+  and a tombstone is removed only by age (`JOURNAL_TOMBSTONE_SECONDS`) against the
+  trusted clock. The single admission bound is the live-identity count
+  (`JOURNAL_LIMIT`); when the store genuinely cannot hold one more live identity the
+  mutation fails closed with `124`, rolls back, and the pre-existing store is untouched.
+* *Journal maintenance.* The store runs in WAL mode, keeps
+  `live_count`/`tombstone_count`/`total_bytes` running totals in `meta` (updated in the
+  same transaction as every row write, so admission and the reported size never scan the
+  table), and records the directed `actor`, the canonical `route` and the precomputed
+  `replay_until`/`expires_at` per row. Replay-versus-expired is decided with the
+  trusted clock (see rev9 below); rows are stamped with the raw clock.
+* *Service record store.* The HTTP service's idempotency receipts and committed
+  canonical results live in `<state>.records.sqlite3` (`http_auth.RecordStore`, WAL,
+  time-only retention) rather than inside `http.json`, so the state document no longer
+  grows with the number of keyed operations and no keyed operation rewrites it.
+* *Affected non-HTTP callers.* `endpoint.py` is also the SSH worker entry. Every SSH
+  request that carries an `operation_id`, and every `brief`/`history`/`checkpoint`
+  request that passes through the guarded branch, uses the same journal and the same
+  bounds; SSH does **not** run the live-authority check (there is no HTTP principal)
+  and cannot opt into or out of it from request data. `InProcessBackend` (disposable
+  local validation) keeps its own receipt store and is unaffected.
+
+**Current build status (rev5).** Revision 5 answers the three round-5 review requests
+at the same boundary:
+
+* *Pre-effect validation.* Refusals raised by the guarded effects (`work`/`review`/
+  `handoff`/`lifecycle`/`coordinate`/`brief`/`history`/`checkpoint`) before any native
+  write keep `rc=2` and their real message instead of being flattened to a generic
+  `124`, and the operation identity is released so an identical retry re-executes
+  rather than returning `124` forever. Over HTTP this restores the `400 invalid`
+  response for, for example, approve-without-contribution. A failure after a write is
+  unchanged: the identity stays held and the caller sees `124`.
+* *Journal retention.* Retention is split by state. A committed receipt is replayable
+  for `JOURNAL_COMMITTED_RETENTION_SECONDS` (default 1 day): inside that window an
+  exact retry replays its recorded envelope. An uncertain reservation
+  (`in_progress`/`unknown`) is the only long-lived record and stays live for
+  `JOURNAL_RETENTION_SECONDS` (default 7 days); it is never evicted while its window
+  is open and an exact retry reports uncertainty. When a window closes the record is
+  compacted to a *tombstone* (operation id + request hash + principal), so an exact
+  retry after reclaim is refused as expired with `rc=2` rather than re-executed.
+  A persisted, non-decreasing `high_water` mark plus a skew allowance
+  (`JOURNAL_MAX_SKEW_SECONDS`) stops reclaim from dropping a live identity when the
+  wall clock jumps implausibly far forward. The receipt windows are the documented
+  limit of the idempotency guarantee; `admin.py journal --prune-before EPOCH` is the
+  only action that removes a record without a tombstone, so it is the only one that
+  can let an exact retry repeat.
+* *Operator tooling.* `admin.py journal PROJECT [--retention SECONDS]
+  [--committed-retention SECONDS] [--reclaim-expired] [--reset-high-water]
+  [--prune-before EPOCH]` inspects the journal in place (entries, tombstones, per-state
+  counts, expired/reclaimable count, retained bytes, file bytes, clock-skew flag) and is
+  the explicit recovery path: `--reclaim-expired` compacts closed windows into
+  tombstones, `--reset-high-water` accepts the current clock as the high-water mark
+  after a genuine clock correction, and `--prune-before EPOCH` hard-removes a still-live
+  identity after the operator has reconciled canonical state. All run under the project
+  coordination lock.
+* *Principal binding.* A request's `authority` descriptor binds the operation identity
+  only when the endpoint was launched with a live-authority store. On the
+  unauthenticated SSH path the descriptor is caller-controlled and is ignored, so an
+  SSH request cannot assert another principal's identity for the journal.
+
+**Current build status (rev7).** Revision 7 answers the three round-6 review requests at
+the same boundary:
+
+* *Byte pressure never loses an identity.* The previous `_fit()` dropped the oldest
+  tombstones - including still-live ones - to get the document under `MAX_JOURNAL_BYTES`,
+  so under 60 KB envelopes the identity it had just compacted was dropped on the next
+  write and an exact retry re-executed the effect. A tombstone is now removed only by
+  age against the trusted clock; the byte budget is met by compacting a terminal receipt
+  (which shrinks the store and adds the protecting tombstone) or by retaining the digest
+  instead of an oversized body; and when the bounds cannot be met the mutation fails
+  closed with `124`, rolled back, pre-existing store intact, no effect attempted. The
+  count bound behaves the same way: reclaim stops at it and leaves the remaining closed
+  records in place, where they still refuse an exact retry.
+* *Journal throughput.* The whole-document JSON journal (re-serialised several times per
+  operation under the coordination lock, 619 ms median at the 20k-ops/7-day steady
+  state) is replaced by the indexed SQLite store, with one transaction per keyed
+  operation and the same public API, retention semantics and idempotency invariants. The
+  legacy document is imported once and kept as `.http-operations.json.migrated`.
+* *Skew guard.* `high_water` no longer ratchets toward a jumped-forward clock: while the
+  clock is more than `JOURNAL_MAX_SKEW_SECONDS` ahead of the mark the mark is left
+  unchanged, so reclaim and compaction stay refused. `admin.py journal
+  --reset-high-water` is the explicit operator recovery for a genuine correction, after
+  which reclaim compacts closed windows to tombstones as usual.
+
+**Current build status (rev8).** Revision 8 answers the seven round-7 review requests at
+the same boundary:
+
+* *Byte budget no longer evicts in-window receipts.* `_compact()` tombstoned the oldest
+  committed row whenever the store exceeded `MAX_JOURNAL_BYTES`, with no replay-window
+  check, and tombstones counted toward the same budget; 60 KB envelopes collapsed the
+  effective replay window to about 2.2 h, and at saturation 41k tombstones made every
+  keyed op `124` after about 32 s of compaction under the project lock. Retention is now
+  by time only: `_fit()` reclaims only genuinely closed windows, the byte and tombstone
+  budgets are reported (`stats()['over_bytes']`, `over_tombstones`) instead of enforced,
+  tombstones never block a write, and the only refusal is the live-identity bound
+  failing closed with `124`, rolled back, no effect attempted.
+* *Crash-atomic legacy migration.* The schema, the legacy-document import and the
+  `legacy_migrated` marker commit in ONE transaction, and the marker is checked on every
+  open, so a crash between schema creation and the import leaves the legacy JSON intact
+  and the next open completes the import instead of ignoring the file.
+* *Journal backup/restore.* `admin.py backup` takes a consistent
+  `sqlite3.Connection.backup()` snapshot of the project journal under the backup lock and
+  `restore-new` restores it, so the store really is included in a native project backup
+  (`bd backup` covers Dolt only).
+* *The state document no longer holds keyed records.* HTTP results and idempotency
+  receipts moved into a SQLite record store with time-only retention.
+* *Flat latency.* WAL plus `meta` running totals remove the per-operation full-table
+  scans; the journal rows also carry the directed actor, route, `replay_until` and
+  `expires_at`.
+* *Trusted clock on the read path.* `expired()` uses the same trusted clock as a write,
+  so during a +8 day jump a 60 s-old committed receipt replays and a live uncertain
+  reservation reports `124`; a skewed write is clamped so it can never store a future
+  `at`. (Superseded by the rev9 trusted clock below.)
+
+**Current build status (rev9).** Revision 9 answers the round-8 review:
+
+* *Idle gaps no longer freeze the clock.* Rev8 advanced `high_water` only while the
+  clock was within 24 h of it, so an ordinary weekend froze the trusted clock for good
+  (no reclaim, rows stamped with the old mark, refusals from day 1.4 at a scaled limit).
+  Each store (journal and `RecordStore`) now persists `high_water` (largest raw clock
+  seen by a write), `suspect`, `anchor` and `suspect_since`. A step of more than
+  `JOURNAL_MAX_SKEW_SECONDS` (24 h) makes the store suspect (the first step records
+  `anchor = high_water`); once the raw clock has run for
+  `JOURNAL_SUSPECT_SETTLE_SECONDS` (1 h) after the step the next write clears it. While
+  suspect the trusted clock is `min(now, anchor + 24 h)` (rev10: anchor plus the time
+  elapsed since the step, capped at 24 h) and reclaim/tombstone deletion
+  do not run; otherwise it is `now`. Rows are stamped with the raw clock. After a
+  weekend the first hour is suspect and then normal operation resumes with no
+  operator. A forward jump is held for an hour; a jump that persists longer is
+  accepted (in-window receipts may then become refused tombstones; never
+  re-executed). A refused (`JournalFull`) write still commits its clock observation
+  and time-based maintenance, so a full journal can settle and reclaim.
+* *Flat latency at 30-day steady state.* Schema 5 adds a `(state, reclaimed_at)` index
+  so tombstone ageing is a range scan over stale tombstones only, and the column
+  backfills run once in the schema-upgrade transaction instead of on every open.
+* *The tombstone count never gates reclaim.* `JOURNAL_TOMBSTONE_LIMIT` is advisory
+  (`over_tombstones`); closed receipts are always compacted, so they never count
+  toward `JOURNAL_LIMIT`.
+* *restore-new validates first.* The journal snapshot is opened read-only and checked
+  (`PRAGMA quick_check`, required tables) before any project, Dolt restore or
+  coordination file is created.
+* *Route on HTTP rows.* The HTTP service sends the route with a keyed mutation, so the
+  journal row records it (and the operation hash binds it).
+
+**Current build status (rev10).** Revision 10 answers the round-9 review:
+
+* *An accepted jump can no longer age a tombstone out.* Rev9 aged tombstones on the raw
+  clock, so a +8 day jump that settled after the hour deleted tombstones still inside
+  their real 30-day horizon and a 25.8-day-old identity re-executed. Schema 6 persists
+  `jump_credit` (the non-decreasing total of every suspect forward step, added when the
+  step is observed) and a per-tombstone `aged_from = reclaimed_at - jump_credit`; a
+  tombstone is deleted only when `aged_from < now - jump_credit - horizon`, using the
+  `(state, aged_from)` index. `--reset-high-water` never reduces the credit. Receipt
+  reclaim still uses the raw clock once not suspect (worst case `rc=2`).
+* *Client retry contract.* A step of 24 h or less is not suspect and not credited, so an
+  exact retry must be no older than `JOURNAL_RETRY_HORIZON_SECONDS` (29 days); inside it
+  a retry is never re-executed while the total uncredited forward clock error stays
+  below 24 h (rev11 wording), and an older one is unsupported.
+* *Trusted clock during a jump.* While suspect the trusted clock is
+  `clamp(anchor + (now - suspect_since), anchor, anchor + 24 h)`, counting only time
+  elapsed since the step, so a 60-second-old receipt replays during a jump.
+* *Snapshots* are converted to `journal_mode=DELETE`, leaving no `-wal`/`-shm` in
+  `backups/`.
+
+**Current build status (rev11).** Revision 11 answers the round-10 review:
+
+* *HTTP idempotency records on the confirmed timeline.* `RecordStore` deleted records
+  with `expires_at <= raw now` once suspicion cleared, so after an accepted +8 day jump
+  and a correction an exact retry of `credentials.issue` 10 minutes after the original
+  issued a second credential. Each record now stores
+  `expires_confirmed = expires_at - jump_credit` (its own mirrored clock state and
+  credit, schema 2, upgraded atomically with credit 0) and is expired or deleted only
+  when `expires_confirmed < now - jump_credit`; rewriting a reservation keeps its
+  original confirmed expiry.
+* *Contract wording.* The retry guarantee holds while the total uncredited forward clock
+  error stays below 24 h; steps of 24 h or less compose (three false +23 h steps
+  re-execute retries about 28.4-29.1 days old). No dense-write crediting was added.
+
 
 Credential issuance is the deliberate exception to replaying a secret. The
 issuance idempotency record stores the credential ID, request hash, status and

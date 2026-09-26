@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 import socket
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -16,6 +17,11 @@ from pathlib import Path
 from contextlib import contextmanager
 from bootstrap import install as install_binaries
 from requirements import content_hash
+
+#: The live operation-journal store inside one project directory. It is included in a
+#: native project backup through ``snapshot_journal``/``restore_journal`` below (`bd
+#: backup` itself covers Dolt only).
+JOURNAL_STORE_NAME='.http-operations.sqlite3'
 
 def checked(cmd, **kwargs):
     return subprocess.run(list(map(str,cmd)),text=True,encoding='utf-8',capture_output=True,check=True,**kwargs)
@@ -186,6 +192,97 @@ def validate_coordination_files(files):
             from feedback import validate_quarantine_record
             validate_quarantine_record(name,record)
 
+def journal_snapshot_path(root,name):
+    """Where ``backup_project`` stores the project's operation-journal snapshot."""
+    validate_name(name)
+    return root/'backups'/(name+JOURNAL_STORE_NAME)
+
+def snapshot_journal(source,destination):
+    """Consistent SQLite snapshot of ``source`` into ``destination`` (or None).
+
+    Uses the stdlib ``sqlite3.Connection.backup()`` API, which copies a live database
+    page-by-page inside SQLite itself, so the snapshot is consistent even while a
+    keyed mutation holds the project coordination lock. A missing source is not an
+    error: a project that has never run a keyed operation has no journal yet.
+    """
+    source=Path(source)
+    if not source.is_file():
+        return None
+    destination=Path(destination)
+    destination.parent.mkdir(parents=True,exist_ok=True)
+    temporary=destination.with_name(destination.name+'.tmp')
+    if temporary.exists():temporary.unlink()
+    _copy_sqlite(source,temporary)
+    os.replace(temporary,destination)
+    return destination
+
+def restore_journal(snapshot,destination):
+    """Restore a journal snapshot into ``destination`` (or None when there is none).
+
+    Restores through the same sqlite backup API into a temporary file and then
+    replaces the destination, so a half-written file can never become the live store;
+    any stale ``-wal``/``-shm`` sidecars of the destination are removed so the restored
+    database is authoritative. A snapshot that is not a readable journal database is
+    refused before the destination is touched.
+    """
+    snapshot=Path(snapshot)
+    if not snapshot.is_file():
+        return None
+    _check_journal_database(snapshot)
+    destination=Path(destination)
+    temporary=destination.with_name(destination.name+'.restore')
+    if temporary.exists():temporary.unlink()
+    _copy_sqlite(snapshot,temporary)
+    os.replace(temporary,destination)
+    for suffix in ('-wal','-shm'):
+        sidecar=destination.with_name(destination.name+suffix)
+        if sidecar.exists():sidecar.unlink()
+    return destination
+
+def _copy_sqlite(source,destination):
+    from_connection=sqlite3.connect('file:%s?mode=ro'%source.as_posix(),uri=True)
+    try:
+        to_connection=sqlite3.connect(str(destination))
+        try:
+            from_connection.backup(to_connection)
+            # The copy inherits the live store's WAL header; a snapshot is a single
+            # self-contained file, so switch it to rollback-journal mode (no -wal/-shm
+            # left in backups/). A restored store is reopened in WAL by the journal.
+            to_connection.execute('PRAGMA journal_mode = DELETE').fetchone()
+        finally:
+            to_connection.close()
+    finally:
+        from_connection.close()
+
+#: Tables a journal snapshot must contain to be restorable.
+JOURNAL_REQUIRED_TABLES=('operations','meta')
+
+def _check_journal_database(path):
+    """Refuse a journal snapshot that is not a sound operation-journal database.
+
+    Opens the snapshot read-only and runs ``PRAGMA quick_check`` plus a schema check
+    (the required tables), so a truncated or corrupt snapshot is refused before
+    anything is created or replaced.
+    """
+    try:
+        connection=sqlite3.connect('file:%s?mode=ro'%Path(path).as_posix(),uri=True)
+    except sqlite3.Error as error:
+        raise ValueError('Journal snapshot is not a readable SQLite database: %s'%error) from None
+    try:
+        try:
+            check=[row[0] for row in connection.execute('PRAGMA quick_check')]
+            tables={row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+        except sqlite3.DatabaseError as error:
+            raise ValueError('Journal snapshot is not a readable SQLite database: %s'%error) from None
+    finally:
+        connection.close()
+    if check!=['ok']:
+        raise ValueError('Journal snapshot failed PRAGMA quick_check: %s'%'; '.join(map(str,check[:3])))
+    missing=[name for name in JOURNAL_REQUIRED_TABLES if name not in tables]
+    if missing:
+        raise ValueError('Journal snapshot does not contain the operation-journal schema (missing %s)'%', '.join(missing))
+
 def _atomic_write_bytes(path,content):
     fd,temporary=tempfile.mkstemp(prefix=path.name+'.',suffix='.restore',dir=str(path.parent))
     try:
@@ -249,12 +346,16 @@ def backup_project(root,name):
             files['.feedback.jsonl']={'text':feedback.read_text(encoding='utf-8')}
             for record in sorted(path.glob(FEED_NAME+'.*'+QUARANTINE_SUFFIX)):
                 if record.is_symlink():raise ValueError('Feedback quarantine must not be a symlink')
-                name=record.name
+                quarantine_name=record.name
                 content=record.read_bytes()
                 backup={'base64':base64.b64encode(content).decode('ascii')}
-                validate_quarantine_record(name,backup)
-                files[name]=backup
+                validate_quarantine_record(quarantine_name,backup)
+                files[quarantine_name]=backup
         validate_coordination_files(files)
+        # The idempotency journal is a second local store inside the project directory;
+        # take its consistent snapshot in the same critical section as the coordination
+        # sidecar so a backup never pairs one store's state with the other's.
+        snapshot_journal(path/JOURNAL_STORE_NAME,journal_snapshot_path(root,name))
         output=run_bd(root,name,['backup','sync'])
         atomic(bundle,{'schema_version':1,'status':'complete','files':files})
         return output
@@ -317,6 +418,19 @@ def main():
     a.add_argument('--any-actor',action='store_true',dest='any_actor',
                    help='with --disposition released (or failed on a receipt with no recorded actor), open the request ID to any actor')
     a=sub.add_parser('service');a.add_argument('action',choices=['start','stop','restart','status'])
+    a=sub.add_parser('journal');a.add_argument('project')
+    a.add_argument('--retention',type=float,default=None,
+                   help='uncertain-reservation window in seconds for this command (default 7 days)')
+    a.add_argument('--committed-retention',type=float,dest='committed_retention',default=None,
+                   help='replayable committed-receipt window in seconds (default 1 day)')
+    a.add_argument('--reclaim-expired',action='store_true',
+                   help='compact identities whose receipt window has closed into tombstones')
+    a.add_argument('--prune-before',type=float,default=None,
+                   help='hard-remove identities last touched before this epoch second (after reconciling)')
+    a.add_argument('--reset-high-water',action='store_true',dest='reset_high_water',
+                   help='set the high-water mark to the current clock and clear clock suspicion (after a clock correction)')
+    a.add_argument('--stats',action='store_true',
+                   help='report the journal size (rows by state, bytes on disk, bounds); this is the default inspection')
     args=p.parse_args();root=root_path(args.root)
     if args.command=='install':install(root,args.port,args.unit)
     elif args.command=='add-project':add_project(root,args.project)
@@ -351,6 +465,41 @@ def main():
             fcntl.flock(lock,fcntl.LOCK_EX)
             print(json.dumps(handoff(path,args.actor,payload,run,operator=True)))
     elif args.command=='backup':print(backup_project(root,args.project))
+    elif args.command=='journal':
+        import fcntl
+        from http_authority import OperationJournal, journal_path
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        if args.retention is not None and args.retention<=0:raise ValueError('Retention must be a positive number of seconds')
+        if args.committed_retention is not None and args.committed_retention<=0:
+            raise ValueError('Committed retention must be a positive number of seconds')
+        options={}
+        if args.retention is not None:options['retention']=args.retention
+        if args.committed_retention is not None:options['committed_retention']=args.committed_retention
+        journal=OperationJournal(str(journal_path(path)),**options)
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            report={'project':args.project}
+            if args.reset_high_water:
+                report['high_water']=journal.reset_high_water()
+            if args.reclaim_expired:report['reclaimed']=journal.reclaim_expired()
+            if args.prune_before is not None:report['pruned']=journal.prune(args.prune_before)
+            report['stats']=journal.stats()
+        print(json.dumps(report,sort_keys=True))
+        if not args.reclaim_expired and args.prune_before is None and not args.reset_high_water:
+            print('Size report (the default inspection; --stats is the same). Retention is by TIME ONLY: a '
+                  'committed receipt is never compacted while its own replay window is open; the byte '
+                  'budget (limit_bytes) and the advisory tombstone size (tombstone_limit) are reported '
+                  '(over_bytes/over_tombstones), never enforced by eviction, and never block a write. '
+                  'The only refusal is the live-identity count (limit) genuinely being reached, which fails '
+                  'closed with rc=124. Use --reclaim-expired to compact closed receipt windows now, or '
+                  '--prune-before EPOCH to hard-remove a still-live identity after reconciling canonical '
+                  'state (an exact retry of a pruned identity can repeat its effect; a reclaimed one is '
+                  'refused as expired). Clock: a step of more than 24 h since the last write makes the '
+                  'journal suspect (suspect/anchor/suspect_since) for one hour; expiry is then capped at '
+                  'anchor+24h and reclaim waits, and suspicion clears by itself. --reset-high-water sets '
+                  'high_water to now and clears suspicion (use it after correcting a wrong clock).',
+                  file=__import__('sys').stderr)
     elif args.command=='restore-new':
         validate_name(args.project);validate_name(args.destination)
         backup=root/'backups'/args.project
@@ -358,9 +507,18 @@ def main():
         if args.project==args.destination:raise ValueError('Restore requires a different destination')
         with backup_lock(root,args.project):
             coordination_backup(root,args.project)
+            # Validate the journal snapshot BEFORE creating anything: a corrupt snapshot
+            # must fail the restore with no destination project, Dolt restore or
+            # coordination files left behind.
+            snapshot=journal_snapshot_path(root,args.project)
+            if snapshot.is_file():_check_journal_database(snapshot)
             add_project(root,args.destination)
             print(run_bd(root,args.destination,['backup','restore',str(backup),'--force']))
             restore_coordination(root,args.project,args.destination)
+            restored=restore_journal(snapshot,
+                                     project_dir(root,args.destination)/JOURNAL_STORE_NAME)
+            if restored is None:
+                print('Backup has no operation-journal snapshot; the restored project starts with an empty identity journal.')
         print('Restored only into the newly created project; retained original issue IDs. Never use this clone as a second live tracker.')
 
 if __name__=='__main__':
