@@ -6,7 +6,9 @@ The kit pins Beads 1.2.2 and Dolt 2.2.0, verifies release checksums, installs an
 
 ## Start here
 
-We are now using the harness to develop the harness. Start with the [draft BRD](docs/BRD.md), its [exact requirement manifest](docs/requirements-baseline.json), the [proposed system design](docs/SYSTEM_DESIGN.md) and [first implementation sequence](docs/IMPLEMENTATION_PLAN.md). The workflow direction is accepted; the detailed baseline remains a review candidate. The offline validator and BRD publisher are implemented: see [usage](docs/REQUIREMENTS.md). [Native export adaptation, revision impact views and an acknowledged-plan launch gate](docs/REQUIREMENTS_INTEGRATION.md) are also available through ordinary CLI commands.
+**Starting or joining a project:** follow the concise [human start guide](start_here/README.md). It distinguishes project provisioning from starting a worker session and points to server-owned setup.
+
+**Developing the Orchestra kit:** start with the [draft BRD](docs/BRD.md), its [exact requirement manifest](docs/requirements-baseline.json), the [proposed system design](docs/SYSTEM_DESIGN.md) and [first implementation sequence](docs/IMPLEMENTATION_PLAN.md). The workflow direction is accepted; the detailed baseline remains a review candidate. The offline validator and BRD publisher are implemented: see [usage](docs/REQUIREMENTS.md). [Native export adaptation, revision impact views and an acknowledged-plan launch gate](docs/REQUIREMENTS_INTEGRATION.md) are also available through ordinary CLI commands.
 
 - Operators: [installation and recovery](docs/OPERATIONS.md).
 - Project direction and remaining work: [implementation plan](docs/PLAN.md).
@@ -17,7 +19,7 @@ We are now using the harness to develop the harness. Start with the [draft BRD](
 - Copilot and remote development: [office setup](docs/COPILOT_REMOTE_DEV.md).
 - Optional headless workers: [Cline launch and recovery](docs/CLINE_WORKERS.md), [Hermes planning and resumption](docs/HERMES_WORKERS.md).
 - Contributors and agents: [working agreement](docs/WORKFLOW.md).
-- Starting a new worker: [copy-paste prompt](templates/WORKER_PROMPT.md), with project placeholders and PowerShell/POSIX commands.
+- Copyable [worker](templates/WORKER_PROMPT.md), [coordinator](templates/COORDINATOR_PROMPT.md), [fleet](templates/FLEET_PROMPT.md) and [subagent](templates/SUBAGENT_PROMPT.md) prompts; fill in project-owned placeholders and keep private settings out of the repository.
 - Starting from an empty directory: [server onboarding](docs/ONBOARDING.md). One SSH command returns shared rules and the private project entry point; no existing project checkout is required.
 - Practical isolation, preflight, contribution delivery and the review queue: [worker guide](docs/WORKER_GUIDE.md), also served as `docs worker-guide`.
 - Unique worker identity: [session registration](docs/SESSIONS.md). `start --name NAME` allocates an actor and returns onboarding; names may repeat, actor IDs must not be shared.
