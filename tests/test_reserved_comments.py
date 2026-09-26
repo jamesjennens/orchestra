@@ -167,7 +167,7 @@ class ReservedPrefixTests(unittest.TestCase):
         check_raw_request(['comments', 'list', 'task-1', '--json'], {})
         self.assertEqual(raw_comment_bodies(['update', 'task-1'], {}), [])
 
-    def test_requirement_revision_validated_and_task_bound(self):
+    def test_requirement_revision_raw_write_always_rejected(self):
         import copy
         import json as jsonlib
         from pathlib import Path as Pathlib
@@ -175,21 +175,24 @@ class ReservedPrefixTests(unittest.TestCase):
         from export_requirements import revision_comment
         from requirements import content_hash
         record = {'id': 'trial-task', 'title': 'T', 'description': 'd',
-                  'acceptance_state': 'draft', 'revision': 1}
+                  'acceptance_state': 'accepted', 'revision': 2, 'key': 'R01'}
         record['sha256'] = content_hash(record)
         body = revision_comment(record)
         self.assertTrue(body.startswith(REQUIREMENT_PREFIX))
-        # Valid canonical record on its own task passes; task mismatch,
-        # malformed JSON and wrong schema are rejected.
-        self.assertTrue(is_legitimate_writer(body, task='trial-task'))
-        check_raw_request(['comments', 'add', 'trial-task', body, '--json'], {})
-        self.assertFalse(is_legitimate_writer(body, task='other-task'))
-        with self.assertRaisesRegex(ValueError, r'Refusing raw'):
-            check_raw_request(['comments', 'add', 'other-task', body, '--json'], {})
+        # The dedicated requirement_records.py command is the only writer:
+        # raw comments add is rejected even for a canonical, task-bound record,
+        # and even for the actor named in the record's own fields.
+        self.assertFalse(is_legitimate_writer(body, task='trial-task'))
+        self.assertFalse(is_legitimate_writer(body, actor='mallory/session9', task='trial-task'))
+        for target in ('trial-task', 'other-task'):
+            with self.subTest(target=target):
+                with self.assertRaisesRegex(ValueError, r'Refusing raw'):
+                    check_raw_request(['comments', 'add', target, body, '--json'], {})
         with self.assertRaisesRegex(ValueError, r'Refusing raw'):
             check_comment_body(REQUIREMENT_PREFIX + '{invalid json', 'positional')
         with self.assertRaisesRegex(ValueError, r'Refusing raw'):
             check_comment_body(REQUIREMENT_PREFIX + '{"rev": 1}', 'positional')
+        self.assertIsNotNone(reserved_match(body))
 
     def test_rejected_write_leaves_no_native_record(self):
         # Endpoint-level wiring: rejected bodies raise before the native
@@ -546,6 +549,26 @@ class ReservedLabelNamespaceTests(unittest.TestCase):
             with self.subTest(args=str(args)):
                 self.assertIsNotNone(reserved_label_in_args(args))
 
+    def test_reserved_requirement_labels_refused_on_writes(self):
+        # kittrial-pth.26 review P2/P3: requirement_records.py is the only
+        # writer of the controlled requirement labels. A raw
+        # `update X --add-label requirement:accepted` (the reviewer probe) and
+        # the type labels must not be writable on the contributor path.
+        cases = (
+            ['update', 'req-1', '--add-label', 'requirement:accepted'],
+            ['update', 'req-1', '--add-label=requirement:draft'],
+            ['update', 'req-1', '--remove-label', 'requirement:accepted'],
+            ['update', 'req-1', '--set-labels', 'requirement'],
+            ['update', 'req-1', '--set-labels=brd-section'],
+            ['create', '--title', 'x', '--labels', 'requirement'],
+            ['create', '--title', 'x', '--labels', 'brd-section'],
+            ['create', '--title', 'x', '--labels', 'ok,requirement:draft'],
+            ['create', '--title', 'x', '-l', 'requirement:accepted'],
+        )
+        for args in cases:
+            with self.subTest(args=str(args)):
+                self.assertIsNotNone(reserved_label_in_args(args))
+
     def test_ordinary_labels_and_read_filters_still_work(self):
         self.assertIsNone(reserved_label_in_args(
             ['create', '--title', 'x', '--labels', 'backend,reviewed']))
@@ -557,11 +580,18 @@ class ReservedLabelNamespaceTests(unittest.TestCase):
             ['update', 'task-1', '--add-label', 'reviewed']))
         self.assertIsNone(reserved_label_in_args(
             ['update', 'task-1', '--set-labels', 'a,b']))
+        # `requirements` and `requirement-ish` are not the controlled labels.
+        self.assertIsNone(reserved_label_in_args(
+            ['update', 'task-1', '--add-label', 'requirements']))
+        self.assertIsNone(reserved_label_in_args(
+            ['create', '--title', 'x', '--labels', 'requirement-ish']))
         # Reads that filter on the reserved namespace are not label writes.
         self.assertIsNone(reserved_label_in_args(
             ['list', '-l', self.RESERVED[0]]))
         self.assertIsNone(reserved_label_in_args(
             ['ready', '--label', self.RESERVED[0]]))
+        self.assertIsNone(reserved_label_in_args(
+            ['list', '-l', 'requirement:accepted']))
         self.assertIsNone(reserved_label_in_args(None))
 
     def test_endpoint_order_refuses_before_native_write(self):
@@ -584,6 +614,9 @@ class ReservedLabelNamespaceTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             guarded(['create', '--title', 'x', '--labels', self.RESERVED[0]], {})
+        # requirement label and raw revision bypasses are refused too.
+        with self.assertRaises(ValueError):
+            guarded(['update', 'req-1', '--add-label', 'requirement:accepted'], {})
         with self.assertRaises(ValueError):
             guarded(['comments', '@attachment:k', 'add', 'task-1'],
                     {'k': {'flag': '--file', 'text': forged_review_body()}})

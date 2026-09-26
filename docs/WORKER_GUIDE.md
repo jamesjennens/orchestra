@@ -43,17 +43,25 @@ for reserved machine-record prefixes (`Kind: contribution-review-v1`,
 `Kind: task-checkpoint-v1`, `Kind: lifecycle-v1`,
 `Kind: requirement-revision-v1`, `Kind: task-handoff-v1`,
 `Kind: task-handoff-complete-v1`, `Kind: plan-registration.`). Raw review,
-checkpoint, lifecycle and handoff records are rejected before any native
-mutation. Requirement revisions and worker-plan registrations retain their
-supported raw transport only after schema, canonical content and applicable
-actor/task checks. Rejected writes name the dedicated
-structured operation (`review`, `checkpoint`, `lifecycle record`, `handoff`,
+checkpoint, lifecycle, handoff and requirement records are rejected before any
+native mutation; worker-plan registrations retain their supported raw transport
+only after schema, canonical content and applicable actor/task checks. Rejected
+writes name the dedicated structured operation (`review`, `checkpoint`,
+`lifecycle record`, `handoff`, `requirement_records.py draft|revise`,
 `worker_gate.py register`). Ordinary prose remains valid.
 
-When a requirement or BRD narrative record also needs its controlled type/state
-labels, use the dedicated `requirement_records.py draft|revise` operation
+The controlled requirement labels (`requirement`, `brd-section`,
+`requirement:draft`, `requirement:accepted`) are reserved too: raw
+`create`/`update` label writes are refused, so acceptance cannot be forged with
+`update X --add-label requirement:accepted`.
+
+Contributors draft requirement records with the dedicated
+`requirement_records.py draft|revise` operation
 ([native integration](REQUIREMENTS_INTEGRATION.md#draft-or-revise-a-requirement-record-in-one-step))
-instead of a raw comment. Operators label records that already exist with
+and may only write `requirement:draft`. Acceptance of a record and demotion of
+an accepted record are owner/operator-only and require F3 acceptance evidence
+(named owners plus decision/evidence ids) through
+`admin.py requirement-apply`. Operators type records that already exist with
 `admin.py requirement-backfill`.
 
 ## Make review-ready work discoverable

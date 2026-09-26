@@ -81,7 +81,7 @@ RESERVED = (
     (REVIEW_PREFIX, 'contribution/review record', 'review TASK --file payload.json'),
     (CHECKPOINT_PREFIX, 'task checkpoint', 'checkpoint TASK --file checkpoint.json'),
     (LIFECYCLE_PREFIX, 'lifecycle evidence record', 'lifecycle.py record --file event.json'),
-    (REQUIREMENT_PREFIX, 'requirement revision', 'the requirement revision workflow'),
+    (REQUIREMENT_PREFIX, 'requirement revision', 'requirement_records.py draft|revise'),
     (HANDOFF_PREFIX, 'handoff intent', 'handoff TASK --file handoff.json'),
     (HANDOFF_COMPLETE_PREFIX, 'handoff completion', 'handoff TASK --file handoff.json'),
     (PLAN_PREFIX, 'worker plan registration', 'worker_gate.py register'),
@@ -548,9 +548,17 @@ def raw_file_flag_in_args(args):
 # content mismatch") and planting both labels can reconcile a victim
 # create-child to an attacker issue. Reads (`list -l request:...`) stay usable
 # because only the create/update label-writing flags are inspected.
+#
+# requirement_records.py is the only writer of the controlled requirement type
+# and state labels (`requirement`, `brd-section`, `requirement:draft`,
+# `requirement:accepted`). The raw path must not be able to accept a record
+# (`update X --add-label requirement:accepted`) or flip its type label, so
+# `requirement:` joins the reserved prefixes and the two type labels are
+# reserved exactly.
 # ---------------------------------------------------------------------------
 
-RESERVED_LABEL_PREFIXES = ('request:', 'request-content:')
+RESERVED_LABEL_PREFIXES = ('request:', 'request-content:', 'requirement:')
+RESERVED_EXACT_LABELS = frozenset({'requirement', 'brd-section'})
 LABEL_WRITE_FLAGS = {
     'create': {'--labels', '-l'},
     'update': {'--add-label', '--set-labels', '--remove-label'},
@@ -624,6 +632,8 @@ def reserved_label_in_args(args):
     for value in _label_values(args):
         for part in value.split(','):
             label = part.strip()
+            if label in RESERVED_EXACT_LABELS:
+                return label
             for prefix in RESERVED_LABEL_PREFIXES:
                 if label.startswith(prefix):
                     return label
@@ -891,14 +901,16 @@ def reserved_match(body):
 
 
 def is_legitimate_writer(body, actor=None, task=None):
-    """True when a reserved-prefix body is a validated supported write.
+    """True when a reserved-prefix body is a validated supported raw write.
 
-    worker_gate plan registrations, handoff intents/completions and
-    requirement revisions written through their documented routes carry
-    exact canonical bytes bound to the requesting actor/task; those must
-    pass. Anything else is forged. Without actor/task context (pure
-    helper use) only context-free canonical validity is checked; the
-    endpoint always supplies context and fails closed on mismatch.
+    worker_gate plan registrations written through their documented route carry
+    exact canonical bytes bound to the requesting actor/task; those must pass.
+    Handoff and requirement records are never legitimate on the raw path: they
+    use structured operations whose authority (ownership, kind/key/state, F3
+    acceptance evidence) cannot be established from self-asserted comment
+    fields. Without actor/task context (pure helper use) only context-free
+    canonical validity is checked; the endpoint always supplies context and
+    fails closed on mismatch.
     """
     if not isinstance(body, str):
         return False
@@ -918,12 +930,12 @@ def is_legitimate_writer(body, actor=None, task=None):
         # handoff records are rejected unconditionally.
         return False
     if body.startswith(REQUIREMENT_PREFIX):
-        record = parse_requirement_record(body)
-        if record is None:
-            return False
-        if task is not None and record.get('id') != task:
-            return False
-        return True
+        # Requirement revisions are written only through the dedicated
+        # requirement_records.py operation (internal run path, kind/key/state
+        # and F3 acceptance authority checked). Raw endpoint revision comments
+        # are rejected unconditionally, even canonical ones: a canonical
+        # accepted revision must not be postable by an arbitrary actor.
+        return False
     return False
 
 

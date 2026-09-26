@@ -183,13 +183,15 @@ def execute(root,request):
     # cannot switch project. `--` ends flag parsing, as in bd itself, so a body
     # operand after it is not a flag.
     if operator_only_in_args(args) is not None:raise ValueError('Connection/identity/file configuration flags are operator-only')
-    # The reserved coordination label namespaces are written only by
-    # coordination.py through its internal run path; the raw contributor bd
-    # path must not plant request:/request-content: labels, nor reach them by
-    # inheriting them from a labelled parent or by replacing the labels of an
-    # existing holder (checked under the lock below, before the native write).
+    # The reserved coordination/requirement label namespaces are written only
+    # by coordination.py and requirement_records.py through their internal run
+    # paths; the raw contributor bd path must not plant request:/
+    # request-content: labels or the controlled requirement type/state labels,
+    # nor reach them by inheriting them from a labelled parent or by replacing
+    # the labels of an existing holder (checked under the lock below, before
+    # the native write).
     label=reserved_label_in_args(args)
-    if label is not None:raise ValueError('Reserved request/request-content labels are operator-only; use the coordination request workflow (coordination.py)')
+    if label is not None:raise ValueError('Reserved coordination/requirement labels are operator-only; use the coordination request workflow (coordination.py) or the requirement command (requirement_records.py draft|revise)')
     # Positional dep/comment IDs are fine; file inputs must be transported explicitly.
     # Command-aware: `-f` is --file on comments/create but --force on close, so a
     # legitimate force-close is no longer refused as a raw server path.

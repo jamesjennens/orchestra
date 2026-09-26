@@ -307,6 +307,12 @@ def main():
     a=sub.add_parser('set-onboarding');a.add_argument('project');a.add_argument('--file',required=True)
     a=sub.add_parser('handoff');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('requirement-backfill');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('requirement-apply');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('requirement-reconcile');a.add_argument('project');a.add_argument('--operation-id',required=True)
+    a.add_argument('--actor',required=True);a.add_argument('--reason',required=True)
+    a.add_argument('--disposition',choices=['failed','released','complete'],default='released')
+    a.add_argument('--issue-id',dest='issue_id',default=None,
+                   help='with --disposition complete, the exact native record to confirm')
     for command in ('backup','restore-new'):
         a=sub.add_parser(command);a.add_argument('project')
         if command=='restore-new':a.add_argument('destination')
@@ -361,6 +367,26 @@ def main():
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             print(json.dumps(backfill(payload,args.actor,run,path)))
+    elif args.command=='requirement-apply':
+        import fcntl
+        from requirement_records import apply_native
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        payload=json.loads(Path(args.file).read_text(encoding='utf-8-sig'))
+        def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            print(json.dumps(apply_native(payload,args.actor,run,path,operator=True)))
+    elif args.command=='requirement-reconcile':
+        import fcntl
+        from requirement_records import reconcile
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            print(json.dumps(reconcile(path,args.operation_id,args.actor,args.reason,
+                                       args.disposition,run,issue_id=args.issue_id)))
     elif args.command=='backup':print(backup_project(root,args.project))
     elif args.command=='restore-new':
         validate_name(args.project);validate_name(args.destination)

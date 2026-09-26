@@ -75,20 +75,55 @@ python requirement_records.py draft  --config client.json --project example --ac
 python requirement_records.py revise --config client.json --project example --actor alex --file record.json
 ```
 
+- The contributor operation may only write **draft** revisions:
+  `acceptance_state` must be `draft`, and an accepted record can be neither
+  selected nor demoted. Acceptance and demotion are owner/operator-only.
 - `draft` creates the record at revision 1 labeled `requirement:draft`, or
-  selects an existing `task` id and applies the labels to it; it needs `parent`
-  only when creating.
-- `revise` selects an existing `task`, must write exactly the next revision and
-  may move the record to `requirement:accepted`.
+  selects an existing `task` id that already carries the `requirement` or
+  `brd-section` type label; it needs `parent` only when creating. Untyped
+  records, ordinary tasks and epics are refused, so the command cannot relabel
+  an arbitrary record.
+- `revise` selects an existing `task`, must write exactly the next revision, and
+  is bound to the record's existing kind and key: a `requirement` record cannot
+  be revised as `brd-section`, and a keyed record cannot change key.
 - `kind` is `requirement` (needs `key`) or `brd-section` (narrative, no key).
+  Requirement keys are unique across the project.
 - Labels are controlled: they are derived from `kind` and `acceptance_state`. A
   caller-supplied `labels` field is refused, and unrelated labels are untouched.
+  The contributor guard also refuses raw `update --add-label requirement...` and
+  raw `comments add` of any `requirement-revision-v1` body, so this operation is
+  the only writer.
 - Retrying the same `operation_id` with identical content reconciles without a
   second record, comment or label write; reusing it with different content is
-  refused. An uncertain create with no visible record stops for operator
-  reconciliation instead of allocating a new id.
+  refused. A native `bd create --dry-run` preflight and the revision check run
+  before any receipt is written, so a refusal reserves nothing. A receipt stays
+  pending only for an uncertain real-write failure and is completed with
+  `admin.py requirement-reconcile`.
 - `decided_by` from the open kittrial-pth.25 change proposal is not accepted
   yet, so passing it is refused rather than written as an unvalidated field.
+
+### Accept a record or demote an accepted record (owner/operator)
+
+F3 requires named owners and recorded evidence for acceptance. Only the operator
+route may set `requirement:accepted`, or move an accepted record back to draft,
+and either transition carries an `acceptance` object. `manifest_sha256` is not
+caller-supplied: the command binds it to the exact revision it writes.
+
+```json
+{"schema_version": 1, "operation_id": "session-1/req-1-r2", "kind": "requirement",
+ "task": "sample-job.7", "title": "R01: Intent", "key": "R01",
+ "description": "## Requirement\n...", "revision": 2, "acceptance_state": "accepted",
+ "acceptance": {"owners": ["owner-a"], "approvers": ["owner-a"], "policy": "any-owner",
+                "decision_id": "decision-2026-09-25", "evidence": "review 01a0d..."}}
+```
+
+```sh
+python admin.py --root /path/to/runtime requirement-apply \
+  --project example --actor operator --file record.json
+```
+
+Acceptance without evidence, a contributor acceptance attempt, and contributor
+demotion are all refused before any native write.
 
 ### Backfill labels on existing records (operator)
 
@@ -107,9 +142,23 @@ python admin.py --root /path/to/runtime requirement-backfill \
   --project example --actor operator --file backfill.json
 ```
 
-The command is idempotent: an identical repeated run reports `changed: false`.
+A record backfilled to `requirement:accepted` needs an `evidence` field
+(a nonempty decision/evidence pointer); a draft entry must not carry one. The
+command is idempotent: an identical repeated run reports `changed: false`.
 Unknown records, duplicate entries and caller-supplied labels are refused before
 any native write.
+
+### Reconcile an uncertain requirement operation (operator)
+
+```sh
+python admin.py --root /path/to/runtime requirement-reconcile \
+  --project example --operation-id session-1/req-1 --actor operator \
+  --disposition complete --issue-id sample-job.7 --reason "confirmed native record"
+```
+
+`complete` requires the exact native record id and confirms it before the receipt
+is completed. `failed`/`released` is allowed only when the operator confirms no
+native record was created, so the operation ID can be resubmitted.
 
 ## Require an acknowledged plan before launching
 

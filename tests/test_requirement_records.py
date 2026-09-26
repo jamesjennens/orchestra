@@ -1,5 +1,6 @@
 import copy
 import json
+import os
 import sys
 import tempfile
 import types
@@ -16,7 +17,12 @@ from requirements import content_hash
 
 
 class Native:
-    """Stateful native seam: exported rows plus create/comment/update writes."""
+    """Stateful native seam: exported rows plus create/comment/update writes.
+
+    `--dry-run` is a read-only preflight: it validates the parent and returns
+    without writing, exactly like the pinned bd. `writes()` counts only real
+    mutations so a refusal can be checked for zero native writes.
+    """
 
     def __init__(self):
         self.calls = []
@@ -27,8 +33,12 @@ class Native:
         self.comment_outcome = 'ok'
         self.update_outcome = 'ok'
 
-    def seed(self, task, title='Seeded record', description='Seeded body', labels=None, comments=None):
-        row = dict(id=task, title=title, description=description, issue_type='task',
+    def seed(self, task, title='Seeded record', description='Seeded body', labels=None,
+             comments=None, issue_type='task'):
+        existing = next((row for row in self.rows if row['id'] == task), None)
+        if existing is not None:
+            return existing
+        row = dict(id=task, title=title, description=description, issue_type=issue_type,
                    status='open', labels=list(labels or []), comments=list(comments or []))
         self.rows.append(row)
         return row
@@ -41,20 +51,33 @@ class Native:
         if args[0] == 'export':
             return '\n'.join(json.dumps(row) for row in self.rows) + '\n'
         if args[0] == 'create':
+            parent = args[args.index('--parent') + 1] if '--parent' in args else None
+            known = {row['id'] for row in self.rows}
+            if parent is not None and parent not in known:
+                raise ValueError('parent not found: ' + parent)
+            if '--dry-run' in args:
+                return json.dumps({'dry_run': True})
+            if self.create_outcome == 'fail-after-preflight':
+                raise ValueError('native create failed after preflight')
             if self.create_outcome == 'not-written':
                 raise RuntimeError('create not written')
             self.counter += 1
             task = 'req-%d' % self.counter
             labels = args[args.index('--labels') + 1].split(',') if '--labels' in args else []
-            self.rows.append(dict(id=task, title=args[args.index('--title') + 1],
-                                  description=args[args.index('--description') + 1],
-                                  issue_type='task', status='open', labels=labels, comments=[]))
+            row = dict(id=task, title=args[args.index('--title') + 1],
+                       description=args[args.index('--description') + 1],
+                       issue_type='task', status='open', labels=labels, comments=[])
+            if parent is not None:
+                row['parent'] = parent
+            self.rows.append(row)
             if self.create_outcome == 'lost-response':
                 raise RuntimeError('create committed, response lost')
             return json.dumps({'id': task})
         if args[0] == 'comments':
             if args[1] == 'add':
                 task, body = args[2], args[3]
+                if self.comment_outcome == 'fail':
+                    raise ValueError('native comment failed')
                 if self.comment_outcome == 'not-written':
                     raise RuntimeError('comment not written')
                 row = self.row(task)
@@ -66,6 +89,8 @@ class Native:
                 return json.dumps({'id': comment_id})
             return json.dumps(self.row(args[1])['comments'])
         if args[0] == 'update':
+            if self.update_outcome == 'fail':
+                raise ValueError('native update failed')
             if self.update_outcome == 'not-written':
                 raise RuntimeError('update not written')
             row = self.row(args[1])
@@ -81,6 +106,20 @@ class Native:
 
     def count(self, *prefix):
         return sum(call[:len(prefix)] == list(prefix) for call in self.calls)
+
+    def writes(self, *prefix):
+        """Real mutating calls only; `--dry-run` preflights are excluded."""
+        prefix = list(prefix)
+        result = []
+        for call in self.calls:
+            if '--dry-run' in call:
+                continue
+            if not prefix:
+                if call[0] in ('create', 'comments', 'update'):
+                    result.append(call)
+            elif call[:len(prefix)] == prefix:
+                result.append(call)
+        return result
 
     def comments(self, task):
         return [c for c in self.row(task)['comments'] if c['text'].startswith(REVISION_PREFIX)]
@@ -99,12 +138,14 @@ class RequirementRecordTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         self.project = Path(temp.name)
         self.native = Native()
+        self.native.seed('job-1')
 
-    def apply(self, payload, actor='alice'):
-        return rr.apply_native(copy.deepcopy(payload), actor, self.native, self.project)
+    def apply(self, payload, actor='alice', operator=False):
+        return rr.apply_native(copy.deepcopy(payload), actor, self.native, self.project,
+                               operator=operator)
 
     def _without_none(self, payload):
-        for name in ('task', 'parent', 'key', 'revision', 'title', 'description'):
+        for name in ('task', 'parent', 'key', 'revision', 'title', 'description', 'acceptance'):
             if name in payload and payload[name] is None:
                 payload.pop(name)
         return payload
@@ -121,9 +162,25 @@ class RequirementRecordTests(unittest.TestCase):
         payload = dict(schema_version=1, operation_id='op-2', operation='revise',
                        kind='requirement', task='req-1', title='R01: Intent', key='R01',
                        description='Revised statement.', revision=2,
-                       acceptance_state='accepted')
+                       acceptance_state='draft')
         payload.update(extra)
         return self._without_none(payload)
+
+    def acceptance(self, **extra):
+        data = {'owners': ['owner-a'], 'approvers': ['owner-a'], 'policy': 'any-owner',
+                'decision_id': 'decision-1', 'evidence': 'review-1'}
+        data.update(extra)
+        return data
+
+    def accept(self, **extra):
+        payload = self.revise(operation_id='op-accept', acceptance_state='accepted',
+                              description='Accepted statement.', acceptance=self.acceptance())
+        payload.update(extra)
+        return self._without_none(payload)
+
+    def receipts(self):
+        journal = self.project / '.requirement-requests'
+        return sorted(journal.glob('*.json')) if journal.is_dir() else []
 
     # --- draft ---------------------------------------------------------
 
@@ -143,10 +200,13 @@ class RequirementRecordTests(unittest.TestCase):
         # the posted body is a schema-valid supported revision record
         self.assertEqual(reserved_comments.parse_requirement_record(
             self.native.comments('req-1')[0]['text']), record)
-        create = next(call for call in self.native.calls if call[0] == 'create')
+        create = next(call for call in self.native.writes('create'))
         self.assertIn('--no-inherit-labels', create)
         self.assertEqual(create[create.index('--parent') + 1], 'job-1')
         self.assertEqual(create[create.index('--type') + 1], 'task')
+        # a dry-run preflight precedes the single real create
+        self.assertEqual(self.native.count('create'), 2)
+        self.assertEqual(len(self.native.writes('create')), 1)
 
     def test_draft_retry_is_idempotent(self):
         first = self.apply(self.draft())
@@ -154,18 +214,32 @@ class RequirementRecordTests(unittest.TestCase):
         self.assertEqual(second['id'], first['id'])
         self.assertTrue(second['reconciled'])
         self.assertFalse(second['created'])
-        self.assertEqual(self.native.count('create'), 1)
+        self.assertEqual(len(self.native.writes('create')), 1)
         self.assertEqual(len(self.native.comments('req-1')), 1)
 
-    def test_draft_selects_existing_record_without_creating(self):
-        self.native.seed('req-x')
+    def test_draft_selects_typed_existing_record_without_creating(self):
+        self.native.seed('req-x', labels=['requirement'])
         result = self.apply(self.draft(operation_id='op-select', task='req-x', parent=None))
         self.assertEqual(result['id'], 'req-x')
         self.assertFalse(result['created'])
-        self.assertEqual(self.native.count('create'), 0)
+        self.assertEqual(self.native.writes('create'), [])
         labels = set(self.native.row('req-x')['labels'])
         self.assertLessEqual({'requirement', 'requirement:draft'}, labels)
         self.assertEqual(self.native.record('req-x', 1)['id'], 'req-x')
+
+    def test_draft_refuses_untyped_ordinary_task_and_epic(self):
+        # Reproduces the reviewer probes: bob's ordinary task and an epic job
+        # must not be relabelled as requirement/requirement:draft.
+        self.native.seed('pp-550', title="bob's ordinary task")
+        self.native.seed('pp-q2u', title='epic job', issue_type='epic')
+        for task in ('pp-550', 'pp-q2u'):
+            with self.subTest(task=task):
+                before = list(self.native.writes())
+                with self.assertRaisesRegex(ValueError, 'not a requirement/brd-section record'):
+                    self.apply(self.draft(operation_id='sel-' + task, task=task, parent=None))
+                self.assertEqual(self.native.writes(), before)
+                self.assertEqual(self.native.row(task)['labels'], [])
+                self.assertEqual(self.native.comments(task), [])
 
     def test_draft_rejects_unknown_task_and_ambiguous_parent(self):
         with self.assertRaisesRegex(ValueError, 'Unknown requirement record'):
@@ -189,20 +263,20 @@ class RequirementRecordTests(unittest.TestCase):
             self.apply(self.draft(acceptance_state='accepted'))
         with self.assertRaisesRegex(ValueError, 'revision 1'):
             self.apply(self.draft(revision=2))
-        self.assertEqual(self.native.count('create'), 0)
+        self.assertEqual(self.native.writes('create'), [])
 
     # --- revise --------------------------------------------------------
 
-    def test_revise_posts_next_revision_and_switches_state_label(self):
+    def test_revise_posts_next_revision_and_keeps_draft_state(self):
         self.apply(self.draft())
         result = self.apply(self.revise())
         self.assertEqual(result['revision'], 2)
         labels = set(self.native.row('req-1')['labels'])
-        self.assertLessEqual({'requirement', 'requirement:accepted'}, labels)
-        self.assertNotIn('requirement:draft', labels)
+        self.assertIn('requirement:draft', labels)
+        self.assertNotIn('requirement:accepted', labels)
         self.assertEqual(len(self.native.comments('req-1')), 2)
-        self.assertEqual(self.native.record('req-1', 2)['acceptance_state'], 'accepted')
-        self.assertEqual(self.native.count('create'), 1)
+        self.assertEqual(self.native.record('req-1', 2)['acceptance_state'], 'draft')
+        self.assertEqual(len(self.native.writes('create')), 1)
 
     def test_revise_retry_reconciles_and_bad_revisions_are_refused(self):
         self.apply(self.draft())
@@ -221,7 +295,7 @@ class RequirementRecordTests(unittest.TestCase):
                 self.assertEqual(len(self.native.comments('req-1')), before)
 
     def test_revise_requires_an_existing_revision(self):
-        self.native.seed('req-x')
+        self.native.seed('req-x', labels=['requirement'])
         with self.assertRaisesRegex(ValueError, 'use draft first'):
             self.apply(self.revise(operation_id='op-bare', task='req-x', revision=1))
         self.assertEqual(self.native.comments('req-x'), [])
@@ -231,6 +305,99 @@ class RequirementRecordTests(unittest.TestCase):
             self.apply(self.revise(operation_id='op-no-task', task=None))
         with self.assertRaisesRegex(ValueError, 'needs the next revision number'):
             self.apply(self.revise(operation_id='op-no-rev', revision=None))
+
+    def test_revise_refuses_cross_kind_swap(self):
+        # Reproduces the reviewer probe: kind=brd-section on a keyed requirement
+        # swapped the type label and dropped the key.
+        self.apply(self.draft())
+        before = list(self.native.writes())
+        with self.assertRaisesRegex(ValueError, 'cross-kind'):
+            self.apply(self.revise(operation_id='op-kind', kind='brd-section', key=None,
+                                   revision=2))
+        self.assertEqual(self.native.writes(), before)
+        self.assertLessEqual({'requirement', 'requirement:draft'},
+                             set(self.native.row('req-1')['labels']))
+        self.assertEqual(self.native.record('req-1', 1)['key'], 'R01')
+        self.assertFalse(any(label.startswith('brd-section')
+                             for label in self.native.row('req-1')['labels']))
+
+    def test_revise_refuses_key_swap(self):
+        self.apply(self.draft())
+        before = list(self.native.writes())
+        with self.assertRaisesRegex(ValueError, 'key is bound'):
+            self.apply(self.revise(operation_id='op-key', key='R99', revision=2))
+        self.assertEqual(self.native.writes(), before)
+
+    def test_requirement_keys_are_unique(self):
+        self.apply(self.draft(operation_id='key-1'))
+        before = list(self.native.writes())
+        with self.assertRaisesRegex(ValueError, 'keys must be unique'):
+            self.apply(self.draft(operation_id='key-2', key='R01'))
+        self.assertEqual(self.native.writes(), before)
+
+    # --- contributor drafts only, operator accepts with F3 evidence ----
+
+    def test_contributor_cannot_accept_and_reserves_nothing(self):
+        self.apply(self.draft())
+        before = list(self.native.writes())
+        with self.assertRaisesRegex(ValueError, 'Contributors may only draft'):
+            self.apply(self.accept(), actor='alice')
+        self.assertEqual(self.native.writes(), before)
+        self.assertEqual(self.native.row('req-1')['labels'].count('requirement:accepted'), 0)
+
+    def test_contributor_cannot_demote_an_accepted_record(self):
+        self.apply(self.draft())
+        self.apply(self.accept(), operator=True)
+        self.assertLessEqual({'requirement', 'requirement:accepted'},
+                             set(self.native.row('req-1')['labels']))
+        before = list(self.native.writes())
+        with self.assertRaisesRegex(ValueError, 'demote'):
+            self.apply(self.revise(operation_id='op-demote', revision=3), actor='mallory')
+        self.assertEqual(self.native.writes(), before)
+        labels = set(self.native.row('req-1')['labels'])
+        self.assertIn('requirement:accepted', labels)
+        self.assertNotIn('requirement:draft', labels)
+
+    def test_operator_accepts_with_f3_evidence(self):
+        self.apply(self.draft())
+        result = self.apply(self.accept(), operator=True)
+        self.assertEqual(result['revision'], 2)
+        self.assertEqual(result['acceptance_state'], 'accepted')
+        labels = set(self.native.row('req-1')['labels'])
+        self.assertIn('requirement:accepted', labels)
+        self.assertNotIn('requirement:draft', labels)
+        record = self.native.record('req-1', 2)
+        self.assertEqual(record['acceptance_state'], 'accepted')
+        self.assertEqual(result['acceptance']['manifest_sha256'], record['sha256'])
+        self.assertEqual(result['acceptance']['owners'], ['owner-a'])
+
+    def test_operator_accept_without_evidence_is_refused(self):
+        self.apply(self.draft())
+        before = list(self.native.writes())
+        payload = self.revise(operation_id='op-no-evidence', revision=2,
+                              acceptance_state='accepted')
+        with self.assertRaisesRegex(ValueError, 'F3 acceptance evidence'):
+            self.apply(payload, operator=True)
+        self.assertEqual(self.native.writes(), before)
+
+    def test_operator_accept_rejects_incomplete_evidence(self):
+        self.apply(self.draft())
+        before = list(self.native.writes())
+        payload = self.accept(operation_id='op-bad-evidence',
+                              acceptance=self.acceptance(owners=[]))
+        with self.assertRaisesRegex(ValueError, 'invalid acceptance evidence'):
+            self.apply(payload, operator=True)
+        self.assertEqual(self.native.writes(), before)
+
+    def test_operator_demotion_also_requires_evidence(self):
+        self.apply(self.draft())
+        self.apply(self.accept(), operator=True)
+        with self.assertRaisesRegex(ValueError, 'F3 acceptance evidence'):
+            self.apply(self.revise(operation_id='op-demote-1', revision=3), operator=True)
+        result = self.apply(self.revise(operation_id='op-demote-2', revision=3,
+                                        acceptance=self.acceptance()), operator=True)
+        self.assertEqual(result['acceptance_state'], 'draft')
+        self.assertIn('requirement:draft', self.native.row('req-1')['labels'])
 
     # --- controlled labels and refused fields --------------------------
 
@@ -252,7 +419,14 @@ class RequirementRecordTests(unittest.TestCase):
 
     def test_arbitrary_state_label_is_replaced_not_trusted(self):
         self.native.seed('req-x', labels=['requirement', 'requirement:accepted', 'triage'])
-        self.apply(self.draft(operation_id='op-flip', task='req-x', parent=None))
+        # A contributor may not demote an accepted record; the operator path
+        # replaces a stale accepted label only with evidence.
+        with self.assertRaisesRegex(ValueError, 'demote'):
+            self.apply(self.draft(operation_id='op-flip', task='req-x', parent=None))
+        self.assertEqual(set(self.native.row('req-x')['labels']),
+                         {'requirement', 'requirement:accepted', 'triage'})
+        self.apply(self.draft(operation_id='op-flip-op', task='req-x', parent=None,
+                              acceptance=self.acceptance()), operator=True)
         labels = set(self.native.row('req-x')['labels'])
         self.assertIn('requirement:draft', labels)
         self.assertNotIn('requirement:accepted', labels)
@@ -268,19 +442,20 @@ class RequirementRecordTests(unittest.TestCase):
 
     def test_operation_id_reuse_with_different_content_is_refused(self):
         self.apply(self.draft())
-        with self.assertRaisesRegex(ValueError, 'different content or actor'):
+        with self.assertRaisesRegex(ValueError, 'different content'):
             self.apply(self.draft(description='A different statement.'))
-        self.assertEqual(self.native.count('create'), 1)
+        self.assertEqual(len(self.native.writes('create')), 1)
 
     def test_lost_create_response_reconciles_without_duplicate(self):
+        self.native.seed('job-1')
         self.native.create_outcome = 'lost-response'
         with self.assertRaises(RuntimeError):
             self.apply(self.draft())
         self.native.create_outcome = 'ok'
         result = self.apply(self.draft())
         self.assertTrue(result['reconciled'])
-        self.assertEqual(self.native.count('create'), 1)
-        self.assertEqual(len(self.native.rows), 1)
+        self.assertEqual(len(self.native.writes('create')), 1)
+        self.assertEqual(len(self.native.rows), 2)  # job-1 + req-1
         self.assertEqual(len(self.native.comments('req-1')), 1)
 
     def test_lost_create_without_native_record_fails_closed(self):
@@ -290,8 +465,8 @@ class RequirementRecordTests(unittest.TestCase):
         self.native.create_outcome = 'ok'
         with self.assertRaisesRegex(ValueError, 'outcome uncertain'):
             self.apply(self.draft())
-        self.assertEqual(self.native.count('create'), 1)
-        self.assertEqual(self.native.rows, [])
+        self.assertEqual(len(self.native.writes('create')), 1)
+        self.assertEqual([row['id'] for row in self.native.rows], ['job-1'])
 
     def test_lost_comment_response_reconciles_without_duplicate(self):
         self.apply(self.draft())
@@ -309,7 +484,7 @@ class RequirementRecordTests(unittest.TestCase):
                                         author='other', created_at='2026-09-25T00:00:00Z')])
         with self.assertRaisesRegex(ValueError, 'malformed requirement revision comment'):
             self.apply(self.draft(operation_id='op-bad', task='req-x', parent=None))
-        self.assertEqual(self.native.count('comments', 'add'), 0)
+        self.assertEqual(self.native.writes('comments', 'add'), [])
 
     def test_foreign_revision_comment_fails_closed(self):
         record = dict(id='req-other', title='t', description='d', revision=1,
@@ -322,12 +497,84 @@ class RequirementRecordTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'belongs to another record'):
             self.apply(self.draft(operation_id='op-foreign', task='req-x', parent=None))
 
+    # --- burned operation IDs ------------------------------------------
+
+    def test_bad_parent_reserves_nothing_and_corrected_retry_succeeds(self):
+        self.native.seed('job-1')
+        with self.assertRaisesRegex(ValueError, 'parent not found'):
+            self.apply(self.draft(parent='pp-nope'))
+        self.assertEqual(self.native.writes(), [])
+        self.assertEqual(self.receipts(), [])
+        result = self.apply(self.draft(parent='job-1'))
+        self.assertEqual(result['id'], 'req-1')
+        self.assertEqual(len(self.native.writes('create')), 1)
+
+    def test_refused_revise_reserves_nothing_and_corrected_retry_succeeds(self):
+        self.apply(self.draft())
+        with self.assertRaisesRegex(ValueError, 'must write revision 2'):
+            self.apply(self.revise(operation_id='op-badrev', revision=99))
+        self.assertEqual(len(self.receipts()), 1)  # only the completed op-1
+        result = self.apply(self.revise(operation_id='op-badrev', revision=2))
+        self.assertEqual(result['revision'], 2)
+
+    def test_uncertain_create_leaves_pending_that_reconcile_completes(self):
+        self.native.seed('job-1')
+        self.native.create_outcome = 'lost-response'
+        with self.assertRaises(RuntimeError):
+            self.apply(self.draft())
+        receipts = self.receipts()
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(json.loads(receipts[0].read_text())['status'], 'pending')
+        result = rr.reconcile(self.project, 'op-1', 'operator', 'confirmed native record',
+                              'complete', self.native, issue_id='req-1')
+        self.assertEqual(result['status'], 'complete')
+        self.assertEqual(result['issue']['id'], 'req-1')
+        self.assertEqual(json.loads(receipts[0].read_text())['status'], 'complete')
+
+    def test_uncertain_create_without_record_reconcile_releases_and_retry_succeeds(self):
+        self.native.seed('job-1')
+        self.native.create_outcome = 'fail-after-preflight'
+        with self.assertRaisesRegex(ValueError, 'outcome is uncertain'):
+            self.apply(self.draft())
+        self.assertEqual([row['id'] for row in self.native.rows], ['job-1'])
+        result = rr.reconcile(self.project, 'op-1', 'operator', 'no record created',
+                              'released', self.native)
+        self.assertEqual(result['status'], 'released')
+        self.native.create_outcome = 'ok'
+        result = self.apply(self.draft())
+        self.assertEqual(result['id'], 'req-1')
+
+    def test_reconcile_is_idempotent(self):
+        self.native.seed('job-1')
+        self.native.create_outcome = 'fail-after-preflight'
+        with self.assertRaises(ValueError):
+            self.apply(self.draft())
+        first = rr.reconcile(self.project, 'op-1', 'operator', 'no record', 'released',
+                             self.native)
+        second = rr.reconcile(self.project, 'op-1', 'operator', 'no record', 'released',
+                              self.native)
+        self.assertTrue(first['reconciled'])
+        self.assertTrue(second['already'])
+
+    def test_requirement_journal_symlink_is_refused(self):
+        target = self.project / 'real-journal'
+        target.mkdir()
+        link = self.project / '.requirement-requests'
+        try:
+            os.symlink(target, link, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest('symlink creation not permitted in this environment')
+        with self.assertRaisesRegex(ValueError, 'symlink'):
+            self.apply(self.draft())
+        self.assertEqual(self.native.calls, [])
+
     # --- operator backfill ---------------------------------------------
 
     def backfill(self, **extra):
         payload = dict(schema_version=1, operation_id='bf-1', records=[
             dict(task='req-1', kind='requirement', acceptance_state='draft'),
-            dict(task='req-2', kind='brd-section', acceptance_state='accepted')])
+            dict(task='req-2', kind='brd-section', acceptance_state='accepted',
+                 evidence='review-2')])
         payload.update(extra)
         return payload
 
@@ -341,11 +588,11 @@ class RequirementRecordTests(unittest.TestCase):
         self.assertEqual(set(self.native.row('req-2')['labels']), {'brd-section', 'requirement:accepted'})
         # backfill never posts a revision comment
         self.assertEqual(self.native.count('comments', 'add'), 0)
-        updates = self.native.count('update')
+        updates = len(self.native.writes('update'))
         retry = rr.backfill(self.backfill(), 'operator', self.native, self.project)
         self.assertFalse(retry['changed'])
         self.assertTrue(retry['reconciled'])
-        self.assertEqual(self.native.count('update'), updates)
+        self.assertEqual(len(self.native.writes('update')), updates)
 
     def test_backfill_refuses_unknown_records_and_arbitrary_labels_before_writing(self):
         self.native.seed('req-1')
@@ -354,17 +601,35 @@ class RequirementRecordTests(unittest.TestCase):
                 dict(task='req-1', kind='requirement', acceptance_state='draft'),
                 dict(task='missing', kind='requirement', acceptance_state='draft')]),
                 'operator', self.native, self.project)
-        self.assertEqual(self.native.count('update'), 0)
+        self.assertEqual(self.native.writes('update'), [])
         with self.assertRaisesRegex(ValueError, 'arbitrary label'):
             rr.backfill(self.backfill(operation_id='bf-bad', records=[
                 dict(task='req-1', kind='requirement', acceptance_state='draft', labels=['x'])]),
                 'operator', self.native, self.project)
         with self.assertRaisesRegex(ValueError, 'repeats record'):
             rr.backfill(self.backfill(operation_id='bf-dup', records=[
-                dict(task='req-1', kind='requirement', acceptance_state='draft'),
+                dict(task='req-1', kind='requirement', acceptance_state='accepted',
+                     evidence='e1'),
+                dict(task='req-1', kind='requirement', acceptance_state='accepted',
+                     evidence='e2')]),
+                'operator', self.native, self.project)
+        self.assertEqual(self.native.writes('update'), [])
+
+    def test_backfill_accepted_requires_evidence(self):
+        self.native.seed('req-1')
+        before = list(self.native.writes())
+        with self.assertRaisesRegex(ValueError, 'evidence field'):
+            rr.backfill(self.backfill(operation_id='bf-noev', records=[
                 dict(task='req-1', kind='requirement', acceptance_state='accepted')]),
                 'operator', self.native, self.project)
-        self.assertEqual(self.native.count('update'), 0)
+        self.assertEqual(self.native.writes(), before)
+        # evidence on a draft entry is a caller error too
+        with self.assertRaisesRegex(ValueError, 'applies only to an accepted record'):
+            rr.backfill(self.backfill(operation_id='bf-draftev', records=[
+                dict(task='req-1', kind='requirement', acceptance_state='draft',
+                     evidence='e')]),
+                'operator', self.native, self.project)
+        self.assertEqual(self.native.writes(), before)
 
     # --- CLI and routing ------------------------------------------------
 
@@ -396,7 +661,7 @@ class RequirementRecordTests(unittest.TestCase):
             self.assertEqual(captured['action'], 'requirement')
             self.assertEqual(captured['args'], ['draft', '--file', 'record.json'])
 
-    def test_endpoint_dispatches_the_requirement_action(self):
+    def test_endpoint_dispatches_the_requirement_action_as_a_contributor(self):
         if 'fcntl' not in sys.modules:
             stub = types.ModuleType('fcntl')
             stub.LOCK_EX = 1
@@ -405,8 +670,8 @@ class RequirementRecordTests(unittest.TestCase):
         import endpoint
         seen = {}
 
-        def fake_apply(payload, actor, run, project):
-            seen.update(payload=payload, actor=actor, project=str(project))
+        def fake_apply(payload, actor, run, project, operator=False):
+            seen.update(payload=payload, actor=actor, project=str(project), operator=operator)
             return {'id': 'req-1'}
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -425,6 +690,7 @@ class RequirementRecordTests(unittest.TestCase):
         self.assertEqual(json.loads(answer['stdout']), {'id': 'req-1'})
         self.assertEqual(seen['payload']['operation'], 'draft')
         self.assertEqual(seen['actor'], 'alice')
+        self.assertFalse(seen['operator'])
 
 
 if __name__ == '__main__':
