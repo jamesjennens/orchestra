@@ -3064,7 +3064,7 @@ class TrustedClockCase(unittest.TestCase):
         self._rev8_store(self.clock[0] - 60)
         stats = self.journal().stats()
         self.assertFalse(stats['clock_persisted']['suspect'])
-        self.assertEqual(self.clock[0] - 60, stats['clock_persisted']['high_water'])
+        self.assertEqual(self.clock[0], stats['clock_persisted']['high_water'])
         self.assertEqual(0, self.run_op('op-old-0')['returncode'])
         self.assertEqual([], self.records)
 

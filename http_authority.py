@@ -809,11 +809,11 @@ class OperationJournal:
         high = state['high_water']
         if high is None:
             return
-        now = time.time()
-        if now - high > self.max_skew:
-            state.update(suspect=True, anchor=high, suspect_since=now)
-        else:
-            state.update(suspect=False, anchor=None, suspect_since=None)
+        # Exactly the transition of a write observing ``now`` on a store that is not yet
+        # suspect: suspect with ``anchor = high_water`` and ``suspect_since = now`` after a
+        # gap of more than ``max_skew``, and ``high_water = max(high_water, now)``.
+        state = clock_advance({'high_water': high, 'suspect': False}, time.time(),
+                              self.max_skew, self.settle)
         # ``suspect`` is persisted (as 0 when clear), so the upgrade happens once.
         clock_persist(connection, state)
 
