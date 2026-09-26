@@ -750,6 +750,52 @@ class ReservedLabelMutationGuardTests(unittest.TestCase):
         self.assertIsNotNone(label_guard_request(
             ['create', 'inh', '--parent', 'task-1', '--no-inherit-labels=false']))
 
+    def test_no_inherit_labels_parses_exactly_as_strconv_parsebool(self):
+        # kittrial-5bb.30 review request bool-parse-mismatch: pflag uses Go's
+        # strconv.ParseBool, so `=f`/`=F` mean False (bd inherits) and must
+        # keep the guard active, while anything unparseable is rejected by bd
+        # itself and must fail closed here too.
+        for value in ('f', 'F', '0', 'false', 'False', 'FALSE'):
+            with self.subTest(value=value):
+                request = label_guard_request(
+                    ['create', 'x', '--parent', 'H',
+                     '--no-inherit-labels=' + value])
+                self.assertIsNotNone(request)
+                self.assertEqual(request['kind'], 'inherit')
+                self.assertFalse(request['ambiguous'])
+                self.assertEqual(request['target'], 'H')
+        for value in ('1', 't', 'T', 'TRUE', 'true', 'True'):
+            with self.subTest(value=value):
+                self.assertIsNone(label_guard_request(
+                    ['create', 'x', '--parent', 'H',
+                     '--no-inherit-labels=' + value]))
+        self.assertIsNone(label_guard_request(
+            ['create', 'x', '--parent', 'H', '--no-inherit-labels']))
+        for value in ('maybe', 'yes', '2', ''):
+            with self.subTest(value=value):
+                request = label_guard_request(
+                    ['create', 'x', '--parent', 'H',
+                     '--no-inherit-labels=' + value])
+                self.assertIsNotNone(request)
+                self.assertTrue(request['ambiguous'])
+        # An unparseable value is refused even with no parent to read, so the
+        # guard never lets a spelling bd rejects reach the native command.
+        self.assertTrue(label_guard_request(
+            ['create', 'x', '--no-inherit-labels=maybe'])['ambiguous'])
+        # A repeated flag where any occurrence is unparseable fails closed,
+        # because pflag errors on that occurrence regardless of order.
+        self.assertTrue(label_guard_request(
+            ['create', 'x', '--parent', 'H',
+             '--no-inherit-labels=false',
+             '--no-inherit-labels=maybe'])['ambiguous'])
+        self.assertTrue(label_guard_request(
+            ['create', 'x', '--parent', 'H',
+             '--no-inherit-labels=maybe',
+             '--no-inherit-labels=false'])['ambiguous'])
+        self.assertIsNone(label_guard_request(
+            ['create', 'x', '--parent', 'H',
+             '--no-inherit-labels=false', '--no-inherit-labels=1']))
+
     def test_create_without_parent_needs_nothing(self):
         self.assertIsNone(label_guard_request(['create', 'x', '--json']))
         self.assertIsNone(label_guard_request(

@@ -25,11 +25,14 @@ FORBIDDEN={'--directory','-C','--db','--repo','--global','--actor','--author','-
 FILE_FLAGS={'--body-file','--design-file','--file','-f'}
 
 def _native_labels(root,path,actor,task):
-    """Labels of one native issue, read through the pinned bd client.
+    """Canonical id and labels of one native issue, read through pinned bd.
 
     Used only by _guard_reserved_labels(), which runs under the same
     coordination lock as the write it guards, so the read cannot race a
-    kit-mediated mutation.
+    kit-mediated mutation. bd resolves an issue id by unambiguous suffix, so
+    the argv token (`3q2`) is not always the canonical row id (`pp-3q2`);
+    the returned rows are matched against the token and an unresolved or
+    ambiguous read raises rather than reporting "no labels".
     """
     p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,'show',task,'--json'],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=60)
     if p.returncode:raise ValueError('Could not read the current labels of %s before the label write, so the reserved-label guard cannot verify it: %s'%(task,(p.stderr or p.stdout).strip()))
@@ -37,10 +40,17 @@ def _native_labels(root,path,actor,task):
     except ValueError:raise ValueError('Could not parse the current labels of %s before the label write; refusing.'%(task,))
     if isinstance(rows,dict):rows=[rows]
     if not isinstance(rows,list):raise ValueError('Unexpected native read for %s; refusing the label write.'%(task,))
-    labels=set()
+    matched={}
     for row in rows:
-        if isinstance(row,dict) and row.get('id')==task:labels.update(row.get('labels') or [])
-    return labels
+        if not isinstance(row,dict):continue
+        rid=row.get('id')
+        if not isinstance(rid,str):continue
+        if rid==task or rid.endswith('.'+task) or rid.endswith('-'+task):
+            matched.setdefault(rid,set(row.get('labels') or []))
+    if len(matched)!=1:
+        raise ValueError('Could not resolve %s to exactly one native issue before the label write (matched: %s), so the reserved-label guard cannot verify it; refusing. Pass the canonical issue id.'%(task,', '.join(sorted(matched)) or 'none'))
+    rid,labels=next(iter(matched.items()))
+    return rid,labels
 
 def _guard_reserved_labels(root,path,args,actor):
     """Read-before-write guard for the reserved label namespace.
@@ -54,16 +64,18 @@ def _guard_reserved_labels(root,path,args,actor):
     request=label_guard_request(args)
     if request is None:return
     if request['ambiguous']:
-        raise ValueError('Refusing label-affecting request: the flags could not be resolved unambiguously, so the reserved request/request-content namespace cannot be verified; no native write was attempted. Pass one explicit target (and one --parent) with no unknown flags.')
+        raise ValueError('Refusing label-affecting request: the flags could not be resolved unambiguously, so the reserved request/request-content namespace cannot be verified; no native write was attempted. Pass one explicit target (and one --parent) with no unknown flags and a valid --no-inherit-labels value.')
     if request['kind']=='inherit':
-        label=first_reserved_label(list(_native_labels(root,path,actor,request['target'])))
+        canonical,labels=_native_labels(root,path,actor,request['target'])
+        label=first_reserved_label(list(labels))
         if label is not None:
-            raise ValueError('Refusing create --parent %s: the parent currently holds the reserved label %s, and bd copies parent labels onto a new child unless --no-inherit-labels is given, which would make a second holder of the coordination namespace. Re-run with --no-inherit-labels, or use the coordination create-child workflow (coordination.py).'%(request['target'],label))
+            raise ValueError('Refusing create --parent %s: the parent currently holds the reserved label %s, and bd copies parent labels onto a new child unless --no-inherit-labels is given, which would make a second holder of the coordination namespace. Re-run with --no-inherit-labels, or use the coordination create-child workflow (coordination.py).'%(canonical,label))
         return
     for target in request['targets']:
-        label=first_reserved_label(list(_native_labels(root,path,actor,target)))
+        canonical,labels=_native_labels(root,path,actor,target)
+        label=first_reserved_label(list(labels))
         if label is not None:
-            raise ValueError('Refusing to replace labels on %s: it currently holds the reserved label %s, which only coordination.py may write. Use the coordination workflow (coordination.py); --add-label remains available for ordinary labels.'%(target,label))
+            raise ValueError('Refusing to replace labels on %s: it currently holds the reserved label %s, which only coordination.py may write. Use the coordination workflow (coordination.py); --add-label remains available for ordinary labels.'%(canonical,label))
 
 def execute(root,request):
     name=request['project'];path=project_dir(root,name)

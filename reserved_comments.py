@@ -701,13 +701,32 @@ BD_LONG_BOOL_FLAGS = {
 LABEL_REPLACING_FLAGS = ('--set-labels', '--remove-label')
 
 
-def _flag_truthy(value):
-    """pflag boolean value: bare `--flag` is True, `--flag=false` is False."""
-    if value is True or value is None:
+# pflag parses boolean flag values with Go's strconv.ParseBool, which accepts
+# exactly these literals and rejects everything else (including `no`, `yes`,
+# `2` and the empty value of `--flag=`). The guard must mirror that table
+# exactly: a value the guard reads as "false" while bd reads it as invalid or
+# true would let a reserved label through, so anything unrecognised fails
+# closed rather than defaulting to either answer.
+_GO_TRUE_LITERALS = frozenset(('1', 't', 'T', 'TRUE', 'true', 'True'))
+_GO_FALSE_LITERALS = frozenset(('0', 'f', 'F', 'FALSE', 'false', 'False'))
+
+
+def _parse_go_bool(value):
+    """Tri-state pflag boolean: True, False, or None when the value is invalid.
+
+    `_bd_scan()` records a bare `--flag` as Python True; an explicit value
+    (`--flag=v`, including the empty `--flag=`) arrives as the raw string.
+    """
+    if value is True:
         return True
+    if value is False:
+        return False
     if isinstance(value, str):
-        return value.strip().lower() not in ('false', '0', 'no')
-    return bool(value)
+        if value in _GO_TRUE_LITERALS:
+            return True
+        if value in _GO_FALSE_LITERALS:
+            return False
+    return None
 
 
 def _bd_scan(args, command):
@@ -802,8 +821,8 @@ def label_guard_request(args):
           must be read before the replacement.
 
     Anything the scan cannot resolve (unknown flag, repeated --parent, missing
-    parent value, no target operand) is reported as ambiguous so the caller
-    fails closed rather than guessing.
+    parent value, an unparseable --no-inherit-labels value, no target operand)
+    is reported as ambiguous so the caller fails closed rather than guessing.
     """
     if not isinstance(args, list) or not args:
         return None
@@ -814,12 +833,28 @@ def label_guard_request(args):
     ambiguous = bool(unknown)
     if command == 'create':
         parents = [value for name, value in flags if name == '--parent']
-        if not parents:
-            return None
-        no_inherit = any(
-            name == '--no-inherit-labels' and _flag_truthy(value)
-            for name, value in flags)
+        # Any `--no-inherit-labels` value bd cannot parse makes bd reject the
+        # whole command with an error, so the guard refuses too instead of
+        # guessing which spelling bd would have used. Otherwise an explicit
+        # truthy value disables the inheritance guard; `=f`/`=F`/`=0`/... mean
+        # inheritance, exactly as strconv.ParseBool reads them.
+        no_inherit = False
+        invalid_bool = False
+        for name, value in flags:
+            if name != '--no-inherit-labels':
+                continue
+            parsed = _parse_go_bool(value)
+            if parsed is None:
+                invalid_bool = True
+            elif parsed:
+                no_inherit = True
+        if invalid_bool:
+            return {'kind': 'inherit',
+                    'target': parents[0] if parents else None,
+                    'ambiguous': True}
         if no_inherit:
+            return None
+        if not parents:
             return None
         if len(parents) > 1 or not parents[0]:
             ambiguous = True
