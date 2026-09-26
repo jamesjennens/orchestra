@@ -326,6 +326,8 @@ def main():
                    help='compact identities whose receipt window has closed into tombstones')
     a.add_argument('--prune-before',type=float,default=None,
                    help='hard-remove identities last touched before this epoch second (after reconciling)')
+    a.add_argument('--reset-high-water',action='store_true',dest='reset_high_water',
+                   help='accept the current clock as the high-water mark after a genuine clock correction')
     args=p.parse_args();root=root_path(args.root)
     if args.command=='install':install(root,args.port,args.unit)
     elif args.command=='add-project':add_project(root,args.project)
@@ -362,7 +364,7 @@ def main():
     elif args.command=='backup':print(backup_project(root,args.project))
     elif args.command=='journal':
         import fcntl
-        from http_authority import OperationJournal
+        from http_authority import OperationJournal, journal_path
         path=project_dir(root,args.project)
         if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
         if args.retention is not None and args.retention<=0:raise ValueError('Retention must be a positive number of seconds')
@@ -371,19 +373,26 @@ def main():
         options={}
         if args.retention is not None:options['retention']=args.retention
         if args.committed_retention is not None:options['committed_retention']=args.committed_retention
-        journal=OperationJournal(str(path/'.http-operations.json'),**options)
+        journal=OperationJournal(str(journal_path(path)),**options)
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             report={'project':args.project}
+            if args.reset_high_water:
+                report['high_water']=journal.reset_high_water()
             if args.reclaim_expired:report['reclaimed']=journal.reclaim_expired()
             if args.prune_before is not None:report['pruned']=journal.prune(args.prune_before)
             report['stats']=journal.stats()
         print(json.dumps(report,sort_keys=True))
-        if not args.reclaim_expired and args.prune_before is None:
+        if not args.reclaim_expired and args.prune_before is None and not args.reset_high_water:
             print('Inspect only. Closed receipt windows are compacted to tombstones automatically under '
                   'capacity pressure; use --reclaim-expired to compact now, or --prune-before EPOCH to '
                   'hard-remove a still-live identity after reconciling canonical state (an exact retry of '
-                  'a pruned identity can repeat its effect; a reclaimed one is refused as expired).',
+                  'a pruned identity can repeat its effect; a reclaimed one is refused as expired). A '
+                  'still-live tombstone is never dropped to satisfy the byte or count budget: if the '
+                  'journal genuinely cannot hold the identities it fails closed with rc=124 until the '
+                  'tombstones age out or the limits are raised. Use --reset-high-water only to accept a '
+                  'corrected clock after a real time jump; reclaim stays refused while the clock is more '
+                  'than the skew allowance ahead of the persisted mark.',
                   file=__import__('sys').stderr)
     elif args.command=='restore-new':
         validate_name(args.project);validate_name(args.destination)

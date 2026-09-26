@@ -79,9 +79,11 @@ import http_authority
 import http_service
 from http_auth import HttpError, Service, Store
 from http_authority import (AuthorityConfig, JOURNAL_COMMITTED_RETENTION_SECONDS,
-                            JOURNAL_RETENTION_SECONDS, MAX_ENVELOPE_BYTES, MAX_JOURNAL_BYTES,
+                            JOURNAL_MAX_SKEW_SECONDS, JOURNAL_RETENTION_SECONDS,
+                            JOURNAL_TOMBSTONE_LIMIT, LEGACY_JOURNAL_FILENAME,
+                            MAX_ENVELOPE_BYTES, MAX_JOURNAL_BYTES,
                             JournalFull, NativeRunner, OperationJournal, PreEffectFailure,
-                            is_mutating_invocation, principal_key, run_guarded)
+                            is_mutating_invocation, journal_path, principal_key, run_guarded)
 from http_service import (EndpointBackend, InProcessBackend, RESULTS_LIMIT, RESULTS_MAX_BYTES,
                           UncertainOutcome, build_backend, create_server, remember_result,
                           MAX_BODY_BYTES)
@@ -1208,7 +1210,13 @@ class ExceptionUncertaintyCase(unittest.TestCase):
 
 
 class JournalBoundsCase(unittest.TestCase):
-    """20. Sustained load past the old limits never refuses; tombstones are bounded."""
+    """20. Sustained load past the old limits never refuses; tombstones are bounded.
+
+    The store is the indexed SQLite journal (revision 7). Fixtures seed it through
+    ``import_document()`` - the same importer the legacy-JSON migration uses - and the
+    byte budget is read from ``stats()['bytes']`` (the retained payload the bound
+    governs) rather than from a JSON document's file size.
+    """
 
     def setUp(self):
         self.tmp = unique_dir('bounds6-')
@@ -1229,7 +1237,7 @@ class JournalBoundsCase(unittest.TestCase):
                                 self._record(state, moment - index, envelope)
                                 for index in range(count)},
                     'tombstones': {}}
-        path.write_text(json.dumps(document), encoding='utf-8')
+        OperationJournal(str(path)).import_document(document)
         return document
 
     def test_sustained_load_past_the_old_entry_limit_is_never_refused(self):
@@ -1268,16 +1276,60 @@ class JournalBoundsCase(unittest.TestCase):
         path = self.tmp / 'bytes.json'
         big = {'returncode': 0, 'stdout': 'Z' * 49152, 'stderr': ''}
         self._seed(path, 200, envelope=big)
-        self.assertGreater(path.stat().st_size, MAX_JOURNAL_BYTES)
+        self.assertGreater(OperationJournal(str(path)).stats()['bytes'], MAX_JOURNAL_BYTES)
         records, effect = ledger()
         result = run_guarded(dict(self.request, operation_id='op-after-bytes'), path, effect)
         # The old byte-cap journal refused this with rc=124 while every record was live.
         self.assertEqual(0, result['returncode'], result)
         self.assertEqual(['ran'], records)
-        self.assertLessEqual(path.stat().st_size, MAX_JOURNAL_BYTES)
+        self.assertLessEqual(OperationJournal(str(path)).stats()['bytes'], MAX_JOURNAL_BYTES)
         self.assertGreater(OperationJournal(str(path)).stats()['tombstones'], 0)
 
-    def test_tombstones_are_count_bounded(self):
+    def test_byte_pressure_keeps_every_identity_and_never_re_executes(self):
+        # The P1 defect: _fit() dropped the tombstone it had just created to get under
+        # MAX_JOURNAL_BYTES, so 60 KB envelopes pushed identities out of both buckets and
+        # a retry sweep re-ran all of them. No identity may be lost now.
+        path = self.tmp / 'pressure.json'
+        envelope = {'returncode': 0, 'stdout': 'Z' * 61440, 'stderr': ''}
+        request = dict(self.request)
+        journal = OperationJournal(str(path))
+        # ~150 x 60 KB is past the 8 MiB payload budget, so every later write is under
+        # byte pressure and compacts a terminal receipt to a tombstone.
+        for index in range(160):
+            key = 'op-%04d' % index
+            journal.reserve(key, http_authority.operation_hash(request),
+                            principal_key(request))
+            journal.complete(key, envelope, http_authority.operation_hash(request),
+                             principal_key(request))
+        stats = journal.stats()
+        self.assertLessEqual(stats['bytes'], MAX_JOURNAL_BYTES)
+        self.assertGreater(stats['tombstones'], 0)
+        # No identity is in the "no entry and no tombstone" bucket.
+        missing = [index for index in range(160)
+                   if journal.lookup('op-%04d' % index) is None]
+        self.assertEqual([], missing)
+        # Every exact retry is either a replay of the live receipt or refused as
+        # expired; none re-executes, and the count of effects never rises.
+        records, effect = ledger()
+        outcomes = {}
+        for index in range(160):
+            retry = run_guarded(dict(request, operation_id='op-%04d' % index), path, effect)
+            outcomes[retry['returncode']] = outcomes.get(retry['returncode'], 0) + 1
+        self.assertEqual([], records)
+        self.assertEqual(set(outcomes), {0, 2})
+        # A tombstoned identity stays refused on the very next write after compaction.
+        reclaimed = [index for index in range(160)
+                     if journal.lookup('op-%04d' % index)['state'] == 'expired']
+        self.assertTrue(reclaimed)
+        journal.reserve('op-later', 'hash', 'actor:x')
+        for index in reclaimed:
+            entry = journal.lookup('op-%04d' % index)
+            self.assertEqual('expired', entry['state'])
+            retry = run_guarded(dict(request, operation_id='op-%04d' % index), path, effect)
+            self.assertEqual(2, retry['returncode'], retry)
+        self.assertEqual([], records)
+
+    def test_tombstones_are_count_bounded_without_dropping_a_live_one(self):
         path = self.tmp / 'tombstones.json'
         journal = OperationJournal(str(path), limit=1000, tombstone_limit=4,
                                    committed_retention=10, max_skew=10 ** 9)
@@ -1286,11 +1338,58 @@ class JournalBoundsCase(unittest.TestCase):
             journal.reserve(key, 'hash', 'actor:x')
             journal.complete(key, {'returncode': 0, 'stdout': 'x', 'stderr': ''},
                              'hash', 'actor:x')
-        self.assertEqual(20, journal.reclaim_expired(now=time.time() + 60))
+        # Reclaim stops at the tombstone budget and leaves the rest as expired entries,
+        # where they are still refused as expired. Before revision 7 it silently dropped
+        # the oldest tombstones, which is what let a retry re-execute.
+        self.assertEqual(4, journal.reclaim_expired(now=time.time() + 60))
         stats = journal.stats()
-        self.assertEqual(0, stats['total'])
         self.assertEqual(4, stats['tombstones'])
-        self.assertLessEqual(stats['tombstones'], stats['tombstone_limit'])
+        self.assertEqual(4, stats['tombstone_limit'])
+        self.assertEqual(16, stats['total'])
+        identities = list(journal._load()) + list(journal._tombstones())
+        self.assertEqual(20, len(identities))
+        self.assertEqual(20, len(set(identities)))
+        records, effect = ledger()
+        for index in range(20):
+            retry = run_guarded(dict(self.request, operation_id='op-%03d' % index), path,
+                                effect,
+                                journal_options={'limit': 1000, 'tombstone_limit': 4,
+                                                 'committed_retention': 10,
+                                                 'max_skew': 10 ** 9})
+            self.assertEqual(2, retry['returncode'], retry)
+        self.assertEqual([], records)
+        # A mutation that can only satisfy the entry budget by compacting a receipt to a
+        # tombstone - when the tombstone budget is full - fails closed, leaves the store
+        # intact and attempts no effect.
+        before = [journal.lookup('op-%03d' % index) for index in range(20)]
+        result = run_guarded(dict(self.request, operation_id='op-over-budget'), path, effect,
+                             journal_options={'limit': 15, 'tombstone_limit': 4,
+                                              'committed_retention': 10,
+                                              'max_skew': 10 ** 9})
+        self.assertEqual(124, result['returncode'], result)
+        self.assertEqual([], records)
+        self.assertIsNone(journal.lookup('op-over-budget'))
+        self.assertEqual(before, [journal.lookup('op-%03d' % index) for index in range(20)])
+        self.assertEqual(4, journal.stats()['tombstones'])
+
+    def test_fail_closed_leaves_the_store_intact_and_attempts_no_effect(self):
+        path = self.tmp / 'closed.json'
+        journal = OperationJournal(str(path), limit=2, max_envelope=64)
+        request = dict(self.request)
+        for index in range(2):
+            key = 'op-live-%d' % index
+            journal.reserve(key, 'hash', 'actor:x')
+            journal.mark_unknown(key)
+        records, effect = ledger()
+        before = [journal.lookup('op-live-%d' % index) for index in range(2)]
+        retry = run_guarded(dict(request, operation_id='op-blocked'), path, effect,
+                            journal_options={'limit': 2, 'max_envelope': 64})
+        self.assertEqual(124, retry['returncode'], retry)
+        self.assertIn('no effect was attempted', retry['stderr'])
+        self.assertEqual([], records)
+        self.assertIsNone(journal.lookup('op-blocked'))
+        self.assertEqual(before, [journal.lookup('op-live-%d' % index) for index in range(2)])
+        self.assertEqual(2, journal.stats()['total'])
 
     def test_oversized_envelope_is_reported_uncertain_not_replayed(self):
         path = self.tmp / 'big.json'
@@ -1550,13 +1649,15 @@ class JournalRetentionCase(unittest.TestCase):
                                 self._record(state, moment - index)
                                 for index in range(count)},
                     'tombstones': {}}
-        path.write_text(json.dumps(document), encoding='utf-8')
+        OperationJournal(str(path)).import_document(document)
         return document
 
     def _age(self, path, operation_id, seconds):
-        document = json.loads(path.read_text(encoding='utf-8'))
-        document['entries'][operation_id]['at'] = time.time() - seconds
-        path.write_text(json.dumps(document), encoding='utf-8')
+        journal = OperationJournal(str(path))
+        record = journal.lookup(operation_id)
+        self.assertIsNotNone(record)
+        record['at'] = time.time() - seconds
+        journal.import_document({'entries': {operation_id: record}})
 
     def test_a_full_journal_of_live_reservations_still_fails_closed(self):
         path = self.tmp / 'live.json'
@@ -1600,13 +1701,12 @@ class JournalRetentionCase(unittest.TestCase):
         path = self.tmp / 'stale.json'
         request = dict(self.request, operation_id='op-stale')
         moment = time.time() - JOURNAL_COMMITTED_RETENTION_SECONDS - 60
-        path.write_text(json.dumps({
-            'schema': 2, 'high_water': time.time(), 'tombstones': {},
+        OperationJournal(str(path)).import_document({
+            'high_water': time.time(), 'tombstones': {},
             'entries': {'op-stale': {
                 'state': 'committed', 'request_hash': http_authority.operation_hash(request),
                 'principal': principal_key(request), 'at': moment,
-                'envelope': {'returncode': 0, 'stdout': 'stale', 'stderr': ''}}}}),
-            encoding='utf-8')
+                'envelope': {'returncode': 0, 'stdout': 'stale', 'stderr': ''}}}})
         records, effect = ledger()
         result = run_guarded(request, path, effect)
         self.assertEqual(2, result['returncode'], result)
@@ -1635,7 +1735,9 @@ class JournalRetentionCase(unittest.TestCase):
         path = self.tmp / 'mixed.json'
         document = self._seed(path, 2, age=JOURNAL_COMMITTED_RETENTION_SECONDS + 60)
         document['entries']['op-fresh'] = self._record('committed', time.time())
-        path.write_text(json.dumps(document), encoding='utf-8')
+        OperationJournal(str(path)).import_document({'entries':
+                                                     {'op-fresh':
+                                                      document['entries']['op-fresh']}})
         journal = OperationJournal(str(path))
         self.assertEqual(2, journal.reclaim_expired())
         fresh = journal.lookup('op-fresh')
@@ -1716,6 +1818,124 @@ class JournalRetentionCase(unittest.TestCase):
         self.assertEqual('seeded', replay['stdout'])
         self.assertEqual([], records)
 
+    def test_repeated_saves_never_ratchet_the_high_water_mark(self):
+        # The P3 defect: _advance_high_water() ran on every save as
+        # max(high, min(now, high + max_skew)), so repeated writes ratcheted the mark
+        # up to a jumped-forward clock and reclaim then tombstoned a 60 s-old committed
+        # receipt and a live uncertain reservation.
+        path = self.tmp / 'ratchet.json'
+        request = dict(self.request)
+        digest = http_authority.operation_hash(request)
+        principal = principal_key(request)
+        journal = OperationJournal(str(path))
+        journal.reserve('op-k', digest, principal)
+        journal.complete('op-k', {'returncode': 0, 'stdout': 'keeper', 'stderr': ''},
+                         digest, principal)
+        journal.reserve('op-u', digest, principal)
+        journal.mark_unknown('op-u')
+        start = journal.stats()['high_water']
+        real = time.time()
+        clock = [real]
+        real_time = time.time
+        records, effect = ledger()
+        try:
+            time.time = lambda: clock[0]
+            clock[0] = real + 8 * 24 * 3600
+            for index in range(6):
+                result = run_guarded(dict(request, operation_id='op-skew-%d' % index), path,
+                                     effect)
+                self.assertEqual(0, result['returncode'], result)
+                stats = OperationJournal(str(path)).stats()
+                self.assertTrue(stats['clock_skewed'])
+                self.assertLessEqual(stats['high_water'], start + JOURNAL_MAX_SKEW_SECONDS + 1)
+                self.assertEqual(0, stats['tombstones'])
+                self.assertEqual('committed',
+                                 OperationJournal(str(path)).lookup('op-k')['state'])
+                self.assertEqual('unknown',
+                                 OperationJournal(str(path)).lookup('op-u')['state'])
+            # Reclaim stays refused while the mark is implausibly behind the clock.
+            self.assertEqual(0, OperationJournal(str(path)).reclaim_expired())
+            self.assertEqual(0, OperationJournal(str(path)).stats()['tombstones'])
+            # The six skewed writes are six genuinely new operations: each ran once.
+            self.assertEqual(6, len(records))
+            baseline = len(records)
+            # Once the clock is corrected the committed receipt REPLAYS and the
+            # uncertain reservation reports uncertainty; nothing was ever tombstoned.
+            clock[0] = real + 60
+            replay = run_guarded(dict(request, operation_id='op-k'), path, effect)
+            self.assertEqual(0, replay['returncode'], replay)
+            self.assertEqual('keeper', replay['stdout'])
+            uncertain = run_guarded(dict(request, operation_id='op-u'), path, effect)
+            self.assertEqual(124, uncertain['returncode'], uncertain)
+            self.assertEqual(baseline, len(records))
+            self.assertEqual(0, OperationJournal(str(path)).stats()['tombstones'])
+            # A genuine clock correction is accepted only by the explicit operator
+            # reset; reclaim then compacts closed windows to tombstones.
+            clock[0] = real + 8 * 24 * 3600
+            self.assertEqual(0, OperationJournal(str(path)).reclaim_expired())
+            self.assertEqual(clock[0], OperationJournal(str(path)).reset_high_water())
+            self.assertEqual(2, OperationJournal(str(path)).reclaim_expired())
+            stats = OperationJournal(str(path)).stats()
+            self.assertFalse(stats['clock_skewed'])
+            self.assertEqual(2, stats['tombstones'])
+            refused = run_guarded(dict(request, operation_id='op-k'), path, effect)
+            self.assertEqual(2, refused['returncode'], refused)
+            self.assertEqual(baseline, len(records))
+        finally:
+            time.time = real_time
+
+    def test_a_legacy_json_journal_is_migrated_once_and_keeps_its_identities(self):
+        path = self.tmp / 'legacy.json'
+        moment = time.time() - JOURNAL_COMMITTED_RETENTION_SECONDS - 60
+        request = dict(self.request)
+        legacy = {'schema': 2, 'high_water': time.time(),
+                  'entries': {'op-legacy-live': self._record('committed', time.time())},
+                  'tombstones': {'op-legacy-tomb':
+                                 {'state': 'expired',
+                                  'request_hash': http_authority.operation_hash(request),
+                                  'principal': principal_key(request), 'at': moment,
+                                  'reclaimed_at': moment}}}
+        path.write_text(json.dumps(legacy), encoding='utf-8')
+        journal = OperationJournal(str(path))
+        # The store is beside the document the caller named, and the legacy document is
+        # imported exactly once and kept for audit under a .migrated name.
+        self.assertEqual('legacy.sqlite3', journal.path.name)
+        self.assertEqual('committed', journal.lookup('op-legacy-live')['state'])
+        self.assertTrue(journal.path.is_file())
+        self.assertTrue(path.with_name('legacy.json.migrated').is_file())
+        self.assertFalse(path.exists())
+        self.assertEqual('expired', journal.lookup('op-legacy-tomb')['state'])
+        self.assertEqual(2, len(journal._load()) + len(journal._tombstones()))
+        records, effect = ledger()
+        retry = run_guarded(dict(request, operation_id='op-legacy-tomb'), path, effect)
+        self.assertEqual(2, retry['returncode'], retry)
+        replay = run_guarded(dict(request, operation_id='op-legacy-live'), path, effect)
+        self.assertEqual(0, replay['returncode'], replay)
+        self.assertEqual('seeded', replay['stdout'])
+        self.assertEqual([], records)
+        # The legacy flat (schema-1) shape migrates too.
+        flat = self.tmp / 'flat.json'
+        flat.write_text(json.dumps({'op-flat': self._record('committed', time.time())}),
+                        encoding='utf-8')
+        migrated = OperationJournal(str(flat))
+        self.assertEqual('committed', migrated.lookup('op-flat')['state'])
+        self.assertGreater(migrated.stats()['high_water'], 0)
+
+    def test_the_default_store_path_is_the_documented_sqlite_file(self):
+        project = self.tmp / 'projects' / 'p'
+        project.mkdir(parents=True)
+        self.assertEqual('.http-operations.sqlite3', journal_path(project).name)
+        self.assertEqual('.http-operations.json', LEGACY_JOURNAL_FILENAME)
+        # The live store is one indexed row per identity, not a whole-document rewrite.
+        journal = OperationJournal(str(journal_path(project)))
+        journal.reserve('op-one', 'hash', 'actor:x')
+        journal.complete('op-one', {'returncode': 0, 'stdout': 'x', 'stderr': ''},
+                         'hash', 'actor:x')
+        self.assertEqual('committed', journal.lookup('op-one')['state'])
+        self.assertGreater(journal_path(project).stat().st_size, 0)
+        self.assertGreaterEqual(JOURNAL_TOMBSTONE_LIMIT, 1)
+        self.assertEqual(JOURNAL_TOMBSTONE_LIMIT, journal.stats()['tombstone_limit'])
+
 
 class SshPrincipalClaimCase(unittest.TestCase):
     """3. ssh-can-claim-principal."""
@@ -1784,25 +2004,31 @@ class JournalRetentionHttpCase(EndpointCase):
 
     def test_past_window_receipts_do_not_lock_out_authenticated_http_writes(self):
         alex, project = self.setup_project()
-        journal_path = self.canonical_root / project / '.http-operations.json'
-        journal_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy = self.canonical_root / project / LEGACY_JOURNAL_FILENAME
+        legacy.parent.mkdir(parents=True, exist_ok=True)
         moment = time.time() - JOURNAL_COMMITTED_RETENTION_SECONDS - 60
         # 2500 records is past the old 2000-entry limit; the endpoint must compact
-        # them to tombstones instead of refusing the authenticated mutation.
+        # them to tombstones instead of refusing the authenticated mutation. This also
+        # exercises the one-time legacy-document migration through the real endpoint.
         data = {'schema': 2, 'high_water': time.time(), 'tombstones': {}, 'entries': {}}
         for index in range(2500):
             data['entries']['op-seed-%05d' % index] = {
                 'state': 'committed', 'request_hash': 'seed', 'principal': 'actor:seed',
                 'at': moment - index,
                 'envelope': {'returncode': 0, 'stdout': 'seeded', 'stderr': ''}}
-        journal_path.write_text(json.dumps(data), encoding='utf-8')
+        legacy.write_text(json.dumps(data), encoding='utf-8')
         created = self.create_task(alex, project, 'after a full expired journal',
                                    key='after-full-journal-0001')
         # rev4/rev5 refused every authenticated mutation with 503/124 until an operator
         # pruned by hand.
         self.assertEqual(201, created.status, created.data)
-        reloaded = json.loads(journal_path.read_text(encoding='utf-8'))
-        self.assertEqual(2500, len(reloaded['tombstones']))
+        journal = OperationJournal(str(journal_path(legacy.parent)))
+        self.assertEqual(2500, journal.stats()['tombstones'])
+        # The migrated document is kept for audit and is not read a second time.
+        self.assertTrue(legacy.with_name(legacy.name + '.migrated').is_file())
+        self.assertFalse(legacy.exists())
+        identities = list(journal._load()) + list(journal._tombstones())
+        self.assertEqual(2501, len(identities))
 
 
 @unittest.skipUnless(os.name == 'posix', 'endpoint.py imports fcntl; POSIX only')
@@ -1882,8 +2108,8 @@ class JournalOperatorCommandCase(unittest.TestCase):
         return json.loads(completed.stdout)
 
     def test_inspect_reclaim_and_prune(self):
-        journal_path = self.project / '.http-operations.json'
-        journal_path.write_text(json.dumps({
+        legacy = self.project / LEGACY_JOURNAL_FILENAME
+        legacy.write_text(json.dumps({
             'op-expired': {'state': 'committed', 'request_hash': 'h',
                            'principal': 'actor:x',
                            'at': time.time() - JOURNAL_RETENTION_SECONDS - 60,
@@ -1898,9 +2124,40 @@ class JournalOperatorCommandCase(unittest.TestCase):
         reclaimed = self._run('--reclaim-expired')
         self.assertEqual(1, reclaimed['reclaimed'])
         self.assertEqual(1, reclaimed['stats']['total'])
+        self.assertEqual(1, reclaimed['stats']['tombstones'])
         pruned = self._run('--prune-before', str(time.time() + 1))
         self.assertEqual(1, pruned['pruned'])
         self.assertEqual(0, pruned['stats']['total'])
+
+    def test_reset_high_water_is_the_explicit_clock_recovery(self):
+        journal = OperationJournal(str(journal_path(self.project)))
+        journal.reserve('op-committed', 'h', 'actor:x')
+        journal.complete('op-committed', {'returncode': 0, 'stdout': '', 'stderr': ''},
+                         'h', 'actor:x')
+        record = journal.lookup('op-committed')
+        record['at'] = time.time() - JOURNAL_COMMITTED_RETENTION_SECONDS - 60
+        journal.import_document({'entries': {'op-committed': record}})
+        real = journal.stats()['high_water']
+        ahead = real + 8 * 24 * 3600
+        # While the clock is implausibly ahead of the persisted mark, reclaim refuses and
+        # the closed-window identity is not dropped.
+        self.assertEqual(0, journal.reclaim_expired(now=ahead))
+        stats = journal.stats(now=ahead)
+        self.assertTrue(stats['clock_skewed'])
+        self.assertEqual(0, stats['reclaimable'])
+        self.assertEqual(0, stats['tombstones'])
+        self.assertEqual('committed', journal.lookup('op-committed')['state'])
+        # The operator reset accepts the corrected clock; reclaim then compacts the
+        # closed window to a tombstone rather than dropping the identity.
+        reset = self._run('--reset-high-water')
+        self.assertAlmostEqual(time.time(), reset['high_water'], delta=30)
+        self.assertFalse(reset['stats']['clock_skewed'])
+        reclaimed = self._run('--reset-high-water', '--reclaim-expired')
+        self.assertEqual(1, reclaimed['reclaimed'])
+        self.assertEqual(1, reclaimed['stats']['tombstones'])
+        self.assertEqual('expired',
+                         OperationJournal(str(journal_path(self.project))).lookup(
+                             'op-committed')['state'])
 
 
 class ResultsBoundCase(EndpointCase):

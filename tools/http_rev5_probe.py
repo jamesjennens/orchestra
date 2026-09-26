@@ -136,11 +136,28 @@ def ok(stdout='ok'):
 
 
 def read_journal(path):
+    """The journal identities, from the legacy JSON document or the live store.
+
+    Revision 7 replaced the whole-document JSON journal with a SQLite store beside it,
+    so this reads whichever exists (a legacy document is still honoured when present).
+    """
+    path = Path(path)
     try:
-        data = json.loads(Path(path).read_text(encoding='utf-8'))
+        data = json.loads(path.read_text(encoding='utf-8'))
+        return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
+        pass
+    store = path.with_suffix('.sqlite3')
+    if not store.exists():
         return {}
-    return data if isinstance(data, dict) else {}
+    try:
+        import http_authority
+        if hasattr(http_authority, 'OperationJournal'):
+            document = http_authority.OperationJournal(str(store)).export_document()
+            return document if isinstance(document, dict) else {}
+    except Exception:
+        return {}
+    return {}
 
 
 # ------------------------------------------------- A. pre-write refusal -> rc=2

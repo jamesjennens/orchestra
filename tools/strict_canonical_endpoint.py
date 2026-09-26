@@ -272,7 +272,9 @@ def main():
         return
     root = Path(arguments.root)
     canonical = Canonical(root, request.get('project', 'project'))
-    journal_path = canonical.path / '.http-operations.json'
+    journal_path = (http_authority.journal_path(canonical.path)
+                    if http_authority is not None and hasattr(http_authority, 'journal_path')
+                    else canonical.path / '.http-operations.json')
     tmp = canonical.path / '.attachments'
     tmp.mkdir(parents=True, exist_ok=True)
     config = None

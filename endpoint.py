@@ -25,7 +25,7 @@ from reserved_comments import (check_raw_request, comment_target,
                                first_reserved_label, label_guard_request,
                                operator_only_in_args, raw_file_flag_in_args,
                                reserved_label_in_args)
-from http_authority import AuthorityConfig, NativeRunner, run_guarded
+from http_authority import AuthorityConfig, NativeRunner, journal_path, run_guarded
 
 ALLOWED={'list','show','ready','search','count','create','update','close','reopen','comments','dep','state','lint'}
 # Legacy name kept for operators reading this file; enforcement is the
@@ -123,7 +123,7 @@ def execute(root,request,authority_config=None,require_authority=False):
             return {'returncode':0,'stdout':json.dumps(work_execute(path,actor,action,args,request.get('attachments',{}),runner),ensure_ascii=False,indent=2)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            return run_guarded(request,path/'.http-operations.json',work_effect,
+            return run_guarded(request,journal_path(path),work_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
     if action in ('onboard','docs'):
@@ -143,7 +143,7 @@ def execute(root,request,authority_config=None,require_authority=False):
             return {'returncode':0,'stdout':briefing_execute(root,path,name,actor,action,args,request.get('attachments',{}),runner),'stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            return run_guarded(request,path/'.http-operations.json',briefing_effect,
+            return run_guarded(request,journal_path(path),briefing_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
     if action in ('lifecycle','coordinate'):
@@ -164,7 +164,7 @@ def execute(root,request,authority_config=None,require_authority=False):
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            return run_guarded(request,path/'.http-operations.json',lifecycle_effect,
+            return run_guarded(request,journal_path(path),lifecycle_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
     if action == 'feedback':
@@ -238,7 +238,7 @@ def execute(root,request,authority_config=None,require_authority=False):
                 return {'returncode':p.returncode,'stdout':p.stdout,'stderr':p.stderr}
             runner=NativeRunner(bd_dispatch)
             def bd_effect():return runner(final)
-            return run_guarded(request,path/'.http-operations.json',bd_effect,
+            return run_guarded(request,journal_path(path),bd_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
 

@@ -394,16 +394,26 @@ in server-side configuration rather than request data:
   `NativeRunner` injected into the effect (`endpoint.py`): it is the effect's only
   route to `bin/bd`, records whether a mutating invocation was attempted, and treats
   an unrecognized verb as a write.
-* *Journal bounds.* `.http-operations.json` is bounded by entry count
-  (`JOURNAL_LIMIT`), `MAX_ENVELOPE_BYTES` per retained envelope and
-  `MAX_JOURNAL_BYTES` per document, and a compact tombstone set bounded by count
-  (`JOURNAL_TOMBSTONE_LIMIT`), age (`JOURNAL_TOMBSTONE_SECONDS`) and the same byte
-  budget. An oversized response envelope is recorded by digest and a retry reports
-  uncertainty instead of returning a truncated result. Reclaim never drops a record:
-  it compacts it to a tombstone that still refuses an exact retry. Under capacity
-  pressure the oldest terminal (committed) receipts are compacted first, so ordinary
-  load does not refuse a write, while genuinely live uncertain reservations still
-  fail closed with `124`.
+* *Journal store.* The live journal is `<PROJECT>/.http-operations.sqlite3`, a SQLite
+  database (stdlib `sqlite3`) with one indexed row per identity and one transaction per
+  `reserve`/`complete`/`lookup`. The pre-revision-7 `operation_id -> envelope` JSON
+  document is imported once on first open and renamed `.http-operations.json.migrated`
+  (kept for audit). A row is an entry (`in_progress`/`committed`/`unknown`) or a
+  tombstone (`state='expired'`); a commit or a reclaim is one small write instead of a
+  whole-document re-serialisation, so keyed latency no longer grows with the journal.
+* *Journal bounds.* The store is bounded by live entry count (`JOURNAL_LIMIT`),
+  `MAX_ENVELOPE_BYTES` per retained envelope, the retained payload size
+  (`MAX_JOURNAL_BYTES`, entries plus tombstones) and a compact tombstone count
+  (`JOURNAL_TOMBSTONE_LIMIT`). An oversized response envelope is recorded by digest and
+  a retry reports uncertainty instead of returning a truncated result. Reclaim never
+  drops a record: it compacts it to a tombstone that still refuses an exact retry. Under
+  capacity pressure the oldest terminal (committed) receipts are compacted first, which
+  shrinks the store and adds the protecting tombstone, so ordinary load does not refuse
+  a write. A tombstone is removed only by age (`JOURNAL_TOMBSTONE_SECONDS`) against the
+  trusted clock; a still-live tombstone is *never* dropped to satisfy the byte or count
+  budget. When the identities genuinely cannot be held - live reservations, or a full
+  tombstone budget - the mutation fails closed with `124`, rolls back, and the
+  pre-existing store is untouched.
 * *Affected non-HTTP callers.* `endpoint.py` is also the SSH worker entry. Every SSH
   request that carries an `operation_id`, and every `brief`/`history`/`checkpoint`
   request that passes through the guarded branch, uses the same journal and the same
@@ -436,16 +446,42 @@ at the same boundary:
   only action that removes a record without a tombstone, so it is the only one that
   can let an exact retry repeat.
 * *Operator tooling.* `admin.py journal PROJECT [--retention SECONDS]
-  [--committed-retention SECONDS] [--reclaim-expired] [--prune-before EPOCH]` inspects
-  the journal in place (entries, tombstones, per-state counts, expired/reclaimable
-  count, bytes, clock-skew flag) and is the explicit recovery path:
-  `--reclaim-expired` compacts closed windows into tombstones and
-  `--prune-before EPOCH` hard-removes a still-live identity after the operator has
-  reconciled canonical state. Both run under the project coordination lock.
+  [--committed-retention SECONDS] [--reclaim-expired] [--reset-high-water]
+  [--prune-before EPOCH]` inspects the journal in place (entries, tombstones, per-state
+  counts, expired/reclaimable count, retained bytes, file bytes, clock-skew flag) and is
+  the explicit recovery path: `--reclaim-expired` compacts closed windows into
+  tombstones, `--reset-high-water` accepts the current clock as the high-water mark
+  after a genuine clock correction, and `--prune-before EPOCH` hard-removes a still-live
+  identity after the operator has reconciled canonical state. All run under the project
+  coordination lock.
 * *Principal binding.* A request's `authority` descriptor binds the operation identity
   only when the endpoint was launched with a live-authority store. On the
   unauthenticated SSH path the descriptor is caller-controlled and is ignored, so an
   SSH request cannot assert another principal's identity for the journal.
+
+**Current build status (rev7).** Revision 7 answers the three round-6 review requests at
+the same boundary:
+
+* *Byte pressure never loses an identity.* The previous `_fit()` dropped the oldest
+  tombstones - including still-live ones - to get the document under `MAX_JOURNAL_BYTES`,
+  so under 60 KB envelopes the identity it had just compacted was dropped on the next
+  write and an exact retry re-executed the effect. A tombstone is now removed only by
+  age against the trusted clock; the byte budget is met by compacting a terminal receipt
+  (which shrinks the store and adds the protecting tombstone) or by retaining the digest
+  instead of an oversized body; and when the bounds cannot be met the mutation fails
+  closed with `124`, rolled back, pre-existing store intact, no effect attempted. The
+  count bound behaves the same way: reclaim stops at it and leaves the remaining closed
+  records in place, where they still refuse an exact retry.
+* *Journal throughput.* The whole-document JSON journal (re-serialised several times per
+  operation under the coordination lock, 619 ms median at the 20k-ops/7-day steady
+  state) is replaced by the indexed SQLite store, with one transaction per keyed
+  operation and the same public API, retention semantics and idempotency invariants. The
+  legacy document is imported once and kept as `.http-operations.json.migrated`.
+* *Skew guard.* `high_water` no longer ratchets toward a jumped-forward clock: while the
+  clock is more than `JOURNAL_MAX_SKEW_SECONDS` ahead of the mark the mark is left
+  unchanged, so reclaim and compaction stay refused. `admin.py journal
+  --reset-high-water` is the explicit operator recovery for a genuine correction, after
+  which reclaim compacts closed windows to tombstones as usual.
 
 
 Credential issuance is the deliberate exception to replaying a secret. The
