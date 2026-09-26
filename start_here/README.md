@@ -33,18 +33,28 @@ actor on later runs. Never use `start` to replace an interrupted worker.
 ## From an empty directory
 
 1. Obtain service access and the owner/operator-provided bootstrap command before
-   proceeding. For a **new worker only** on an SSH deployment, the bootstrap
-   command has this form; replace every placeholder with the approved installation
-   values. A returning worker skips `start` and resumes its saved actor:
+   proceeding. Create a dedicated local working directory for this worker and
+   project before starting it; never launch from another worker's directory or
+   another project's checkout. Keep one directory/checkout per actor. Save the full
+   actor and the project-specific client configuration privately in that directory
+   (outside Git or locally ignored), and never commit or share them. For a **new
+   worker only** on an SSH deployment, the bootstrap command has this form; replace
+   every placeholder with the approved installation values. A returning worker
+   uses its existing directory and skips `start`:
 
    ```sh
    ssh REPLACE_WITH_APPROVED_SSH_ALIAS python3 REPLACE_WITH_INSTALLED_KIT_PATH/worker.py --root REPLACE_WITH_COORDINATION_RUNTIME_PATH --project REPLACE_PROJECT start --name REPLACE_READABLE_NAME
    ```
 
-   The server-owned [onboarding instructions](../docs/ONBOARDING.md) explain this
-   bootstrap and how to fetch the **installed** client/helper set. Check `onboard`
-   for client/kit version parity. Keep private connection settings outside the
-   repository or in a local ignored file.
+   Run the bootstrap from the new worker's own local working directory. The server
+   returns the allocated actor and the server-owned project entry. Save the exact
+   actor and request ID privately. Use the installed client, endpoint and
+   `client.local.json` values supplied by that project entry; do not reuse or infer
+   configuration from another project. The server-owned [onboarding
+   instructions](../docs/ONBOARDING.md) explain how to fetch the **installed**
+   client/helper set. Check `onboard` for client/kit version parity. If onboarding
+   fails after registration, keep the actor and retry `onboard`; do not register
+   again.
 2. Clone the repository into your own directory using the project-provided URL and
    authentication method. Do not use another contributor's checkout or virtual
    environment.
@@ -126,8 +136,10 @@ actor on later runs. Never use `start` to replace an interrupted worker.
    claims. Do not run `client.py` from the project clone unless that repository is
    the Orchestra kit itself.
 7. Read the task, dependencies, history and current owners. Recheck overlapping
-   files/interfaces, atomically claim the task, register the complete plan and pass
-   any required acknowledgement or launch gate before editing. Follow the linked
+   files/interfaces. Choose one unheld task from `ready --json`, claim it atomically,
+   register the complete plan and pass any required acknowledgement or launch gate
+   before editing. Do not claim another task until this one has been delivered.
+   Follow the linked
    [`worker guide`](../docs/WORKER_GUIDE.md) and
    [`review workflow`](../docs/REVIEWS.md).
 
@@ -140,6 +152,15 @@ integrated change. Contribution-branch push permission, merge permission, deploy
 permission and live verification are separate; follow the project owner's policy.
 Keep the task open while awaiting review unless its acceptance explicitly says
 otherwise.
+
+After delivery, a loop-capable harness may continue only when the project and
+harness explicitly permit it: at the configured interval, check review feedback on
+your own tasks with `work --mine` first, then check `ready --json` for one next
+claimable task. Stop at the deadline or when you have no actionable open or
+pending-review task and `ready --json` has no unheld task; do not wait on work held
+by other actors or keep polling an empty queue. In office/person-started mode, do
+not poll or loop: finish one bounded turn and end with a one-line status for the
+person.
 
 ## Machine-specific settings are examples, not defaults
 

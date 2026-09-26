@@ -1,3 +1,4 @@
+import io
 import json
 import sys
 import tempfile
@@ -122,11 +123,26 @@ class SessionTests(unittest.TestCase):
     def test_worker_start_uses_allocated_actor_for_onboarding(self):
         record={'actor':'session-'+str(uuid.uuid4()),'name':'worker','request_id':str(uuid.uuid4()),'created_at':'2026-09-16T00:00:00+00:00'}
         replies=[{'returncode':0,'stdout':json.dumps({'session':record}),'stderr':''},{'returncode':0,'stdout':'Instructions','stderr':''}]
-        with patch.object(sys,'argv',['worker.py','--root','/srv/runtime','--project','example','start','--name','worker']),patch('onboarding.execute'),patch('admin.root_path',return_value=self.path),patch('worker.request',side_effect=replies) as request,patch('sys.stdout'):
+        stdout=io.StringIO()
+        with patch.object(sys,'argv',['worker.py','--root','/srv/runtime','--project','example','start','--name','worker']),patch('onboarding.execute'),patch('admin.root_path',return_value=self.path),patch('worker.request',side_effect=replies) as request,patch('sys.stdout',stdout):
             self.assertEqual(worker.main(),0)
         self.assertIsNone(request.call_args_list[0].args[2])
         self.assertEqual(request.call_args_list[1].args[2],record['actor'])
         self.assertEqual(request.call_args_list[1].kwargs['action'],'onboard')
+        self.assertIn(record['actor'],stdout.getvalue())
+        self.assertIn('one working directory and checkout per actor',stdout.getvalue())
+        self.assertIn('ready --json',stdout.getvalue())
+        self.assertIn('status for the person',stdout.getvalue())
+
+    def test_worker_start_onboarding_failure_keeps_registered_actor(self):
+        record={'actor':'session-'+str(uuid.uuid4()),'name':'worker','request_id':str(uuid.uuid4()),'created_at':'2026-09-16T00:00:00+00:00'}
+        replies=[{'returncode':0,'stdout':json.dumps({'session':record}),'stderr':''},{'returncode':2,'stdout':'','stderr':'onboarding unavailable'}]
+        stdout=io.StringIO();stderr=io.StringIO()
+        with patch.object(sys,'argv',['worker.py','--root','/srv/runtime','--project','example','start','--name','worker']),patch('onboarding.execute'),patch('admin.root_path',return_value=self.path),patch('worker.request',side_effect=replies) as request,patch('sys.stdout',stdout),patch('sys.stderr',stderr):
+            self.assertEqual(worker.main(),2)
+        self.assertEqual(request.call_args_list[1].args[2],record['actor'])
+        self.assertIn(record['actor'],stdout.getvalue())
+        self.assertIn('do not register another actor',stderr.getvalue())
 
     def test_worker_does_not_register_when_onboarding_missing(self):
         with patch.object(sys,'argv',['worker.py','--root','/srv/runtime','--project','example','start','--name','worker']),patch('onboarding.execute',side_effect=ValueError('missing')),patch('admin.root_path',return_value=self.path),patch('worker.request') as request:

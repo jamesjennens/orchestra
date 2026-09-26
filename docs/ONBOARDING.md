@@ -6,7 +6,7 @@ Start a worker in an empty directory. It needs SSH access to the configured serv
 ssh beads-team python3 /home/beads/orchestra/worker.py --root /home/beads/beads-runtime --project example start --name cline
 ```
 
-`worker.py start` allocates a durable actor and prints it with onboarding instructions. Save the actor for subsequent commands and resumption; the readable name need not be unique. See [session registration and retries](SESSIONS.md). `onboard` and `docs [NAME]` remain read-only for existing actors. Bootstrap uses the installed endpoint locally and cannot claim tasks or write task records. Normal contributions use `client.py` and their configured project endpoint, including any project-specific guard. SSH access retains the existing trusted-team security model.
+`worker.py start` allocates a durable actor and prints it with onboarding instructions. Run it for a new worker from that worker's dedicated local working directory; use one directory and checkout per actor, never another worker's directory or another project's checkout. Save the full actor privately in that directory alongside the exact client configuration supplied by the server-owned project entry, outside Git or in local ignored state. Use the installed client and printed project-specific endpoint/configuration; do not copy settings from another project. The readable name need not be unique. See [session registration and retries](SESSIONS.md). `onboard` and `docs [NAME]` remain read-only for existing actors. Bootstrap uses the installed endpoint locally and cannot claim tasks or write task records. Normal contributions use `client.py` and their configured project endpoint, including any project-specific guard. SSH access retains the existing trusted-team security model.
 
 With a configured client, the equivalent is:
 
@@ -34,15 +34,27 @@ The project entry point should explicitly supersede obsolete checkout-local coor
 ## Minimal prompt
 
 ```text
-Work from your own directory. Run the following start command with a
-readable name; save the allocated actor and follow the returned instructions:
+Create a new, private working directory for this worker and project, then run the
+following start command once with a readable name. Save the full returned actor
+and the printed client configuration privately in that directory; do not commit or
+share them. Use no other actor's directory or another project's checkout:
 
 REPLACE_WITH_SSH_BOOTSTRAP_COMMAND
 
-Inspect the assigned task REPLACE_TASK_ID (or find appropriate unclaimed
-work). Obtain your own repository checkout as instructed. Respect existing
-claims and register your plan before implementation. Do not depend on
-another worker's local checkout or start another coordination database.
+Use the installed client/config printed in the returned project entry. Inspect
+task ownership and dependencies, then choose one unheld task from `ready --json`.
+Claim it atomically and register/verify your plan before implementation. Do not
+claim another task until this one is delivered. Follow the project's Delivery
+section; if absent or unclear, ask the coordinator rather than guessing.
+
+Only if the harness and project explicitly permit a loop, check every
+REPLACE_INTERVAL_MINUTES minutes for review feedback on your own tasks with
+`work --mine` first, then look for the next task with `ready --json`. Stop at
+REPLACE_DEADLINE or when you have no actionable open or pending-review task and
+`ready --json` has no unheld task. Do not wait on work held by other actors. In
+office/person-started mode, do not poll or loop; end each turn with a one-line
+status for the person. Do not depend on another worker's checkout or start another
+coordination database.
 ```
 
 For workers already connected, use the client `onboard` command in that prompt. The longer [worker prompt](../templates/WORKER_PROMPT.md) remains a reference, but no longer needs to be pasted into every new session.

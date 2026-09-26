@@ -8,9 +8,31 @@ New workers should let the server allocate their actor ID. Readable names do not
 ssh beads-team python3 /home/beads/orchestra/worker.py --root /home/beads/beads-runtime --project example start --name cline
 ```
 
-Replace the installation paths/host/project. The command prints a registration record, an actor such as `session-UUID`, and the normal onboarding instructions. Save that actor and use it as `--actor` on subsequent commands. Do not invent or truncate it. Another worker using the same readable name gets a different actor.
+Replace the installation paths/host/project. Run the command for a new worker from
+that worker's dedicated local working directory; keep one directory/checkout per
+actor and never use another worker's directory or another project's checkout. The
+command prints a registration record, an actor such as `session-UUID`, and the
+normal onboarding instructions. Save the exact actor privately in that directory
+alongside the client configuration supplied in the server-owned project entry,
+outside Git or in local ignored state. Use that installed client and exact
+project-specific configuration; do not copy settings from another project. Do not
+invent or truncate the actor. Another worker using the same readable name gets a
+different actor.
 
 `start` registers a session; `onboard` only reads instructions for an existing actor. Resuming the same worker uses its saved actor, for example `worker.py ... --actor SAVED_ACTOR onboard`. Do not register a replacement identity merely because the session was interrupted; task and merge ownership still belong to the original actor. A genuinely new worker registers separately and follows explicit handoff rules.
+
+If onboarding fails after registration, retain the printed actor and retry
+`onboard` with that actor after correcting the reported issue. Do not call `start`
+again. For a new task, select one unheld item from `ready --json`, claim it
+atomically, and finish/deliver it before claiming another. Follow the project's
+server-provided Delivery section; ask the coordinator if it is absent or ambiguous.
+
+Only an explicitly loop-capable and authorized harness may check every N minutes
+for review feedback on the actor's own tasks with `work --mine` first, then the
+next task with `ready --json`. Stop at the configured deadline or when there is
+no actionable open or pending-review task owned by this actor and no unheld task
+in `ready`; do not wait on other actors' held tasks. Office/person-started turns
+do not poll or loop; end each turn with a one-line status for the person.
 
 ## Register with an installed client
 
