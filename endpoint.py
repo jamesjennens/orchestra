@@ -14,13 +14,68 @@ from render import render
 from lifecycle import apply_native
 from version import report
 from reserved_comments import (check_raw_request, comment_target,
-                               operator_only_in_args, reserved_label_in_args)
+                               first_reserved_label, label_guard_request,
+                               operator_only_in_args, raw_file_flag_in_args,
+                               reserved_label_in_args)
 
 ALLOWED={'list','show','ready','search','count','create','update','close','reopen','comments','dep','state','lint'}
 # Legacy name kept for operators reading this file; enforcement is the
 # spelling-aware reserved_comments.operator_only_in_args() below.
 FORBIDDEN={'--directory','-C','--db','--repo','--global','--actor','--author','--profile','--graph','--config','--metadata'}
 FILE_FLAGS={'--body-file','--design-file','--file','-f'}
+
+def _native_labels(root,path,actor,task):
+    """Canonical id and labels of one native issue, read through pinned bd.
+
+    Used only by _guard_reserved_labels(), which runs under the same
+    coordination lock as the write it guards, so the read cannot race a
+    kit-mediated mutation. bd resolves an issue id by unambiguous suffix, so
+    the argv token (`3q2`) is not always the canonical row id (`pp-3q2`);
+    the returned rows are matched against the token and an unresolved or
+    ambiguous read raises rather than reporting "no labels".
+    """
+    p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,'show',task,'--json'],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=60)
+    if p.returncode:raise ValueError('Could not read the current labels of %s before the label write, so the reserved-label guard cannot verify it: %s'%(task,(p.stderr or p.stdout).strip()))
+    try:rows=json.loads(p.stdout)
+    except ValueError:raise ValueError('Could not parse the current labels of %s before the label write; refusing.'%(task,))
+    if isinstance(rows,dict):rows=[rows]
+    if not isinstance(rows,list):raise ValueError('Unexpected native read for %s; refusing the label write.'%(task,))
+    matched={}
+    for row in rows:
+        if not isinstance(row,dict):continue
+        rid=row.get('id')
+        if not isinstance(rid,str):continue
+        if rid==task or rid.endswith('.'+task) or rid.endswith('-'+task):
+            matched.setdefault(rid,set(row.get('labels') or []))
+    if len(matched)!=1:
+        raise ValueError('Could not resolve %s to exactly one native issue before the label write (matched: %s), so the reserved-label guard cannot verify it; refusing. Pass the canonical issue id.'%(task,', '.join(sorted(matched)) or 'none'))
+    rid,labels=next(iter(matched.items()))
+    return rid,labels
+
+def _guard_reserved_labels(root,path,args,actor):
+    """Read-before-write guard for the reserved label namespace.
+
+    Refusing a reserved label *value* is not enough: bd copies parent labels
+    onto `create --parent X` children, and `--set-labels`/`--remove-label`
+    replace labels on an existing issue. Both are read first, under the lock
+    the mutation will hold, so a reserved label can neither reach a
+    contributor-created issue nor be removed from an operator-created holder.
+    """
+    request=label_guard_request(args)
+    if request is None:return
+    if request['ambiguous']:
+        raise ValueError('Refusing label-affecting request: the flags could not be resolved unambiguously, so the reserved request/request-content namespace cannot be verified; no native write was attempted. Pass one explicit target (and one --parent) with no unknown flags and a valid --no-inherit-labels value.')
+    if request['kind']=='inherit':
+        canonical,labels=_native_labels(root,path,actor,request['target'])
+        label=first_reserved_label(list(labels))
+        if label is not None:
+            raise ValueError('Refusing create --parent %s: the parent currently holds the reserved label %s, and bd copies parent labels onto a new child unless --no-inherit-labels is given, which would make a second holder of the coordination namespace. Re-run with --no-inherit-labels, or use the coordination create-child workflow (coordination.py).'%(canonical,label))
+        return
+    for target in request['targets']:
+        canonical,labels=_native_labels(root,path,actor,target)
+        label=first_reserved_label(list(labels))
+        if label is not None:
+            raise ValueError('Refusing to replace labels on %s: it currently holds the reserved label %s, which only coordination.py may write. Use the coordination workflow (coordination.py); --add-label remains available for ordinary labels.'%(canonical,label))
 
 def execute(root,request):
     name=request['project'];path=project_dir(root,name)
@@ -123,10 +178,15 @@ def execute(root,request):
     if operator_only_in_args(args) is not None:raise ValueError('Connection/identity/file configuration flags are operator-only')
     # The reserved coordination label namespaces are written only by
     # coordination.py through its internal run path; the raw contributor bd
-    # path must not plant request:/request-content: labels.
+    # path must not plant request:/request-content: labels, nor reach them by
+    # inheriting them from a labelled parent or by replacing the labels of an
+    # existing holder (checked under the lock below, before the native write).
     label=reserved_label_in_args(args)
     if label is not None:raise ValueError('Reserved request/request-content labels are operator-only; use the coordination request workflow (coordination.py)')
     # Positional dep/comment IDs are fine; file inputs must be transported explicitly.
+    # Command-aware: `-f` is --file on comments/create but --force on close, so a
+    # legitimate force-close is no longer refused as a raw server path.
+    if raw_file_flag_in_args(args) is not None:raise ValueError('Use client attachment transport; raw server file paths are not accepted')
     # Raw comments add bodies (positional and transported file inputs) must not
     # carry forged machine-record prefixes: those records require their
     # dedicated structured operations with chain/ownership validation.
@@ -139,7 +199,6 @@ def execute(root,request):
         attachments=request.get('attachments',{})
         final=[]
         for i,a in enumerate(args):
-            if a.split('=',1)[0] in FILE_FLAGS:raise ValueError('Use client attachment transport; raw server file paths are not accepted')
             if a.startswith('@attachment:'):
                 key=a.partition(':')[2]
                 item=attachments.get(key)
@@ -149,6 +208,7 @@ def execute(root,request):
             else: final.append(a)
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
+            _guard_reserved_labels(root,path,args,actor)
             p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*final],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
         return {'returncode':p.returncode,'stdout':p.stdout,'stderr':p.stderr}
 
