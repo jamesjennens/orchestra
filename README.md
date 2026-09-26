@@ -20,7 +20,7 @@ The kit pins Beads 1.2.2 and Dolt 2.2.0, verifies release checksums, installs an
 - Optional headless workers: [Cline launch and recovery](docs/CLINE_WORKERS.md), [Hermes planning and resumption](docs/HERMES_WORKERS.md).
 - Contributors and agents: [working agreement](docs/WORKFLOW.md).
 - Copyable [worker](templates/WORKER_PROMPT.md), [coordinator](templates/COORDINATOR_PROMPT.md), [fleet](templates/FLEET_PROMPT.md) and [subagent](templates/SUBAGENT_PROMPT.md) prompts; fill in project-owned placeholders and keep private settings out of the repository.
-- Starting from an empty directory: [server onboarding](docs/ONBOARDING.md). One SSH command returns shared rules and the private project entry point; no existing project checkout is required.
+- Starting from an empty directory: [server onboarding](docs/ONBOARDING.md). One SSH command returns shared rules and the private project entry point; no existing project checkout is required. This is the current home/interim route; the intended office web interface with per-person and per-agent identities is still in progress.
 - Practical isolation, preflight, contribution delivery and the review queue: [worker guide](docs/WORKER_GUIDE.md), also served as `docs worker-guide`.
 - Unique worker identity: [session registration](docs/SESSIONS.md). `start --name NAME` allocates an actor and returns onboarding; names may repeat, actor IDs must not be shared.
 - Returning workers and review corrections: [resume, authorized handoff and structured contribution reviews](docs/REVIEWS.md), with `work --mine` and current review queues.

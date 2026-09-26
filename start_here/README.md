@@ -4,13 +4,20 @@ This is the short path into an Orchestra-coordinated project. Beads is the canon
 coordination service; a repository checkout is not a second coordination database.
 Project provisioning and worker registration are separate operations.
 
+The intended office path is a web interface with per-person and per-agent identities
+on a service-account-hosted server; each agent identity is owned by a person. That
+route is still in progress. The SSH/private-config instructions below and the fleet
+prompt are current interim or home-use options, not the recommended office setup.
+
 ## Choose the path
 
 - **Starting a project:** the repository owner fills in
   [`templates/READ_ME_FIRST.md`](../templates/READ_ME_FIRST.md), links the working
   agreement from `README.md` and `AGENTS.md`, and asks the service operator to create
-  the canonical Beads project and install its private onboarding entry. Follow
-  [`docs/ONBOARDING.md`](../docs/ONBOARDING.md) and
+  the canonical Beads project and install its private onboarding entry based on
+  [`templates/PROJECT_ONBOARDING.md`](../templates/PROJECT_ONBOARDING.md). The owner
+  or operator must provide service access and the installation-specific bootstrap
+  command; follow the [server onboarding instructions](../docs/ONBOARDING.md) and
   [`docs/OPERATIONS.md`](../docs/OPERATIONS.md). Do not run operator commands or
   initialize another database without that authority.
 - **Joining an existing project:** obtain its connection instructions from the
@@ -25,9 +32,19 @@ actor on later runs. Never use `start` to replace an interrupted worker.
 
 ## From an empty directory
 
-1. Use the approved server instructions to fetch the **installed** client/helper set
-   and create private connection settings. Check `onboard` for client/kit version
-   parity. Keep settings outside the repository or in a local ignored file.
+1. Obtain service access and the owner/operator-provided bootstrap command before
+   proceeding. For a **new worker only** on an SSH deployment, the bootstrap
+   command has this form; replace every placeholder with the approved installation
+   values. A returning worker skips `start` and resumes its saved actor:
+
+   ```sh
+   ssh REPLACE_WITH_APPROVED_SSH_ALIAS python3 REPLACE_WITH_INSTALLED_KIT_PATH/worker.py --root REPLACE_WITH_COORDINATION_RUNTIME_PATH --project REPLACE_PROJECT start --name REPLACE_READABLE_NAME
+   ```
+
+   The server-owned [onboarding instructions](../docs/ONBOARDING.md) explain this
+   bootstrap and how to fetch the **installed** client/helper set. Check `onboard`
+   for client/kit version parity. Keep private connection settings outside the
+   repository or in a local ignored file.
 2. Clone the repository into your own directory using the project-provided URL and
    authentication method. Do not use another contributor's checkout or virtual
    environment.
@@ -61,26 +78,53 @@ actor on later runs. Never use `start` to replace an interrupted worker.
    git status --short --branch
    git fetch origin
    git rev-parse origin/REPLACE_BASE_BRANCH
-   git switch --create task/REPLACE_TASK_ID origin/REPLACE_BASE_BRANCH
+   git switch --no-track --create task/REPLACE_TASK_ID origin/REPLACE_BASE_BRANCH
    git rev-parse HEAD
    git status --short --branch
    ```
 
    Use the task's agreed base and branch policy; do not assume `main` or discard
-   existing work. Verify required imports and checks from this checkout's own
-   interpreter in the same execution context where you will work.
-6. For a new worker, use the project-provided bootstrap once or register through the
-   installed client. For an existing worker, resume before selecting unrelated work.
-   With a configured client:
+   existing work. The new branch must not track the base branch. When authorized to
+   publish the contribution branch, push it explicitly:
 
    ```sh
-   python client.py --config client.local.json --project PROJECT -- session register --name READABLE_NAME
-   python client.py --config client.local.json --project PROJECT --actor ACTOR -- session resume
-   python client.py --config client.local.json --project PROJECT --actor ACTOR -- work --mine
+   git push --set-upstream origin task/REPLACE_TASK_ID
    ```
 
-   Use the actor returned by registration, not the readable name. A returning worker
-   uses only the saved actor; check its requested revisions before other claims.
+   Verify required imports and checks from this checkout's own interpreter in the
+   same execution context where you will work.
+6. A new worker must choose exactly one registration route: run the owner-provided
+   bootstrap from step 1 once, or register through the **installed client path**
+   using the interpreter created in step 4. Do not do both. If registering through
+   the client:
+
+   ```powershell
+   & $python 'REPLACE_WITH_INSTALLED_CLIENT_PATH' --config 'REPLACE_WITH_PRIVATE_CONFIG_PATH' --project REPLACE_PROJECT -- session register --name REPLACE_READABLE_NAME
+   ```
+
+   ```sh
+   "$python" REPLACE_WITH_INSTALLED_CLIENT_PATH --config REPLACE_WITH_PRIVATE_CONFIG_PATH --project REPLACE_PROJECT -- session register --name REPLACE_READABLE_NAME
+   ```
+
+   Save the returned actor and request ID privately. For an existing worker, skip
+   registration and resume the saved actor before selecting unrelated work:
+
+   ```powershell
+   & $python 'REPLACE_WITH_INSTALLED_CLIENT_PATH' --config 'REPLACE_WITH_PRIVATE_CONFIG_PATH' --project REPLACE_PROJECT --actor REPLACE_ACTOR -- session resume
+   & $python 'REPLACE_WITH_INSTALLED_CLIENT_PATH' --config 'REPLACE_WITH_PRIVATE_CONFIG_PATH' --project REPLACE_PROJECT --actor REPLACE_ACTOR -- work --mine
+   ```
+
+   ```sh
+   "$python" REPLACE_WITH_INSTALLED_CLIENT_PATH --config REPLACE_WITH_PRIVATE_CONFIG_PATH --project REPLACE_PROJECT --actor REPLACE_ACTOR -- session resume
+   "$python" REPLACE_WITH_INSTALLED_CLIENT_PATH --config REPLACE_WITH_PRIVATE_CONFIG_PATH --project REPLACE_PROJECT --actor REPLACE_ACTOR -- work --mine
+   ```
+
+   Use the actor returned by registration, not the readable name. Registration
+   prints a request ID before sending; if the response is uncertain, retry with that
+   same request ID and readable name rather than registering again. A returning
+   worker uses only its saved actor; check its requested revisions before other
+   claims. Do not run `client.py` from the project clone unless that repository is
+   the Orchestra kit itself.
 7. Read the task, dependencies, history and current owners. Recheck overlapping
    files/interfaces, atomically claim the task, register the complete plan and pass
    any required acknowledgement or launch gate before editing. Follow the linked
@@ -142,4 +186,8 @@ Copy the relevant template and fill its placeholders:
 [worker](../templates/WORKER_PROMPT.md),
 [fleet](../templates/FLEET_PROMPT.md) or
 [subagent](../templates/SUBAGENT_PROMPT.md). These are task prompts, not new
-authorization or role-enforcement mechanisms.
+authorization or role-enforcement mechanisms. Before using a copied guide or
+prompt, replace every marked value in the prompt you intend to run. Scan the
+instantiated prompt text for leftover `REPLACE_` placeholders and stop until none
+remain; do not scan these generic source templates, which intentionally contain
+placeholders. For example: `rg -n 'REPLACE_' filled-prompt.txt`.

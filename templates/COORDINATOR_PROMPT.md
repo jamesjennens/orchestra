@@ -43,8 +43,9 @@ Own final domain/design decisions and authorized merge/push, deployment and scop
 outcome verification. State the intended outcome, observation window/timezone and
 applicable source/release/environment; a deployment permission or successful
 process exit is not live verification. Fix an obvious bounded defect only in an
-isolated integration branch, record its commit and proportionate checks, and never
-edit an active worker checkout. Never reuse approval for changed content. Return
+isolated integration branch, record its commit and proportionate checks, and obtain
+an independent review of the coordinator-authored fix before integrating it. Never
+edit an active worker checkout or reuse approval for changed content. Return
 substantive design/reasoning revisions through structured review; prefer concise,
 reproducible investigations over permanent tools unless ongoing use warrants their
 maintenance. Limit new implementation when review backlog grows; let workers stop

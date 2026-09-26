@@ -1,5 +1,8 @@
 # Fleet prompt
 
+Use this SSH/private-config workflow only as a current home/interim option; the
+intended office web route with person-owned agent identities is still in progress.
+
 ```text
 Project: REPLACE_PROJECT
 Coordinator: REPLACE_SAVED_COORDINATOR_ACTOR
