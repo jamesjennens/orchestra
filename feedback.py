@@ -18,6 +18,9 @@ MAX_EVIDENCE = 20
 MAX_LINK = 2000
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@/-]{0,160}\Z")
 QUARANTINE_SUFFIX = ".incomplete"
+QUARANTINE_NAME = re.compile(
+    re.escape(FEED_NAME) + r"\.(?:[a-f0-9]{16}|[a-f0-9]{64})" + re.escape(QUARANTINE_SUFFIX) + r"\Z"
+)
 
 
 def _identifier(value, field):
@@ -166,6 +169,7 @@ def validate_feed_text(text):
         lines.pop()
     previous = 0
     operations = {}
+    entry_ids = set()
     entries = []
     for line in lines:
         if line.endswith("\r"):
@@ -177,15 +181,30 @@ def validate_feed_text(text):
         except json.JSONDecodeError:
             raise ValueError("Feedback feed contains invalid JSON") from None
         _validate_entry(entry, previous + 1)
-        if entry["kind"] == "correction" and entry["supersedes"] not in {
-                item["entry_id"] for item in entries}:
+        if entry["kind"] == "correction" and entry["supersedes"] not in entry_ids:
             raise ValueError("Correction target must precede the correction")
         if entry["operation_id"] in operations and operations[entry["operation_id"]] != entry:
             raise ValueError("Duplicate feedback operation has conflicting content")
         operations[entry["operation_id"]] = entry
+        entry_ids.add(entry["entry_id"])
         entries.append(entry)
         previous = entry["sequence"]
     return entries
+
+
+def validate_quarantine_record(name, record):
+    if not isinstance(name, str) or not QUARANTINE_NAME.fullmatch(name):
+        raise ValueError("Invalid feedback quarantine path")
+    if not isinstance(record, dict) or set(record) != {"base64"} or not isinstance(record["base64"], str):
+        raise ValueError("Invalid feedback quarantine backup")
+    try:
+        content = base64.b64decode(record["base64"], validate=True)
+    except (ValueError, binascii.Error):
+        raise ValueError("Invalid feedback quarantine encoding") from None
+    if (not content or base64.b64encode(content).decode("ascii") != record["base64"]
+            or not hashlib.sha256(content).hexdigest().startswith(name[len(FEED_NAME) + 1:-len(QUARANTINE_SUFFIX)])):
+        raise ValueError("Feedback quarantine digest does not match its path")
+    return content
 
 
 def _assert_regular(path):
@@ -216,6 +235,18 @@ def _write_quarantine_temporary(fd, tail):
         os.fsync(stream.fileno())
 
 
+def _cleanup_temporary_recovery_files(path):
+    if not path.parent.is_dir():
+        return
+    temporary_name = re.compile(
+        re.escape(path.name) + r"\.[A-Za-z0-9_-]{8,}\.(?:recovery|quarantine)\Z"
+    )
+    for candidate in path.parent.iterdir():
+        if (temporary_name.fullmatch(candidate.name) and not candidate.is_symlink()
+                and candidate.is_file()):
+            candidate.unlink()
+
+
 def _fsync_directory(path):
     try:
         directory_fd = os.open(str(path), os.O_RDONLY)
@@ -228,25 +259,31 @@ def _fsync_directory(path):
 
 
 def _quarantine(path, tail):
-    quarantine = path.with_name(path.name + "." + hashlib.sha256(tail).hexdigest()[:16] + QUARANTINE_SUFFIX)
-    if quarantine.is_symlink():
-        raise ValueError("Feedback recovery quarantine path is a symlink")
-    if quarantine.exists():
-        if quarantine.read_bytes() != tail:
-            raise ValueError("Feedback recovery quarantine path already exists")
-        return
-    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".quarantine", dir=str(path.parent))
-    try:
-        _write_quarantine_temporary(fd, tail)
-        os.replace(temporary, quarantine)
-        _fsync_directory(path.parent)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+    digest = hashlib.sha256(tail).hexdigest()
+    names = (digest[:16], digest)
+    for value in names:
+        quarantine = path.with_name(path.name + "." + value + QUARANTINE_SUFFIX)
+        if quarantine.is_symlink():
+            raise ValueError("Feedback recovery quarantine path is a symlink")
+        if quarantine.exists():
+            if quarantine.read_bytes() == tail:
+                return
+            continue
+        fd, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".quarantine", dir=str(path.parent))
+        try:
+            _write_quarantine_temporary(fd, tail)
+            os.replace(temporary, quarantine)
+            _fsync_directory(path.parent)
+            return
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+    raise ValueError("Feedback recovery quarantine paths already contain different bytes")
 
 
 def _read(path):
     _assert_regular(path)
+    _cleanup_temporary_recovery_files(path)
     if not path.exists():
         return []
     raw = path.read_bytes()

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sys
 import tempfile
@@ -40,6 +41,21 @@ class FeedbackTests(unittest.TestCase):
         feedback.add(self.path, "session-one", payload("op-1"))
         with self.assertRaisesRegex(ValueError, "different content"):
             feedback.add(self.path, "session-one", payload("op-1", body="changed"))
+
+    def test_large_correction_chain_validates(self):
+        entries = []
+        previous = None
+        for sequence in range(1, 5001):
+            kind = "feedback" if sequence == 1 else "correction"
+            entry = feedback._make_entry(
+                sequence, "session-one",
+                payload("linear-%d" % sequence, supersedes=previous),
+                kind,
+            )
+            entries.append(json.dumps(entry, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+            previous = entry["entry_id"]
+        validated = feedback.validate_feed_text("\n".join(entries) + "\n")
+        self.assertEqual(len(validated), 5000)
 
     def test_cursor_paging_is_stable(self):
         for number in range(3):
@@ -143,6 +159,35 @@ class FeedbackTests(unittest.TestCase):
         self.assertEqual(feedback.list_entries(self.path)["entries"], [])
         self.assertEqual(feedback.list_entries(self.path)["entries"], [])
         self.assertEqual(len(list(self.path.parent.glob(self.path.name + ".*.incomplete"))), 1)
+
+    def test_conflicting_legacy_quarantine_name_falls_back_without_overwrite(self):
+        tail = b'{"partial":'
+        legacy = self.path.with_name(
+            self.path.name + "." + hashlib.sha256(tail).hexdigest()[:16]
+            + feedback.QUARANTINE_SUFFIX
+        )
+        legacy.write_bytes(b"different existing evidence")
+        self.path.write_bytes(tail)
+
+        self.assertEqual(feedback.list_entries(self.path)["entries"], [])
+        full_digest = hashlib.sha256(tail).hexdigest()
+        quarantine = self.path.with_name(
+            self.path.name + "." + full_digest + feedback.QUARANTINE_SUFFIX
+        )
+        self.assertEqual(legacy.read_bytes(), b"different existing evidence")
+        self.assertEqual(quarantine.read_bytes(), tail)
+        self.assertEqual(feedback.list_entries(self.path)["entries"], [])
+
+    def test_orphaned_recovery_temporaries_are_removed_on_retry(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        recovery = self.path.with_name(self.path.name + ".deadbeef.recovery")
+        quarantine = self.path.with_name(self.path.name + ".deadbeef.quarantine")
+        recovery.write_bytes(b"partial recovery")
+        quarantine.write_bytes(b"partial quarantine")
+
+        self.assertEqual(feedback.list_entries(self.path)["entries"], [])
+        self.assertFalse(recovery.exists())
+        self.assertFalse(quarantine.exists())
 
     def test_unicode_jsonl_separators_round_trip_and_exact_retry(self):
         body = "before\u0085middle\u2028line\u2029paragraph"

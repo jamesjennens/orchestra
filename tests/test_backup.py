@@ -1,4 +1,5 @@
 """Native backup/coordination sidecar ordering and recovery validation."""
+import base64
 import contextlib
 import io
 import json
@@ -119,6 +120,37 @@ class BackupTests(unittest.TestCase):
         restored = feedback.list_entries(restored_path)['entries'][0]
         self.assertEqual(restored['body'], payload['body'])
         self.assertTrue(feedback.add(restored_path, 'session-one', payload)['reconciled'])
+
+    def test_feedback_quarantine_evidence_is_backed_up_and_restored_as_bytes(self):
+        feed_path = self.source / feedback.FEED_NAME
+        feedback.add(feed_path, 'session-one', {
+            'operation_id': 'quarantine-backup-op',
+            'created_at': '2026-09-19T23:00:00+00:00',
+            'body': 'valid prefix',
+            'source': {'task': 'kittrial-5bb.13', 'version': 'base-1'},
+            'evidence': ['test://backup'],
+            'triage': {'task': 'kittrial-5bb.13', 'label': 'review'},
+            'reminder': {'kind': 'none', 'text': ''},
+            'supersedes': None,
+        })
+        tail = b'\xfftruncated json'
+        with feed_path.open('ab') as stream:
+            stream.write(tail)
+
+        with patch.object(admin, 'run_bd', return_value='synced'):
+            admin.backup_project(self.root, 'source')
+        files = json.loads(self.bundle.read_text(encoding='utf-8'))['files']
+        quarantine_name = next(name for name in files if name.endswith(feedback.QUARANTINE_SUFFIX))
+        self.assertEqual(base64.b64decode(files[quarantine_name]['base64']), tail)
+
+        admin.restore_coordination(self.root, 'source', 'destination')
+        restored = self.destination / quarantine_name
+        self.assertEqual(restored.read_bytes(), tail)
+        self.assertEqual(len(feedback.list_entries(self.destination / feedback.FEED_NAME)['entries']), 1)
+
+        files[quarantine_name]['base64'] = base64.b64encode(b'different bytes').decode('ascii')
+        with self.assertRaisesRegex(ValueError, 'digest does not match'):
+            admin.validate_coordination_files(files)
 
     def test_sidecar_completion_failure_leaves_pending_after_native_success(self):
         real_atomic = coordination.atomic

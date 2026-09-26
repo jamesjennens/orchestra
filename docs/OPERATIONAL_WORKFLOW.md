@@ -47,6 +47,12 @@ inside JSON strings round-trip normally. `reminder.kind` may be
 `none`, `checkpoint` or `handoff` and is informational only; it never interrupts a
 worker.
 
+Durable `.feedback.jsonl.*.incomplete` tails are included as base64 bytes in the
+coordination backup sidecar and restored unchanged. A later feed read removes
+orphaned temporary recovery files left by a killed process. If an existing legacy
+truncated-digest quarantine name contains different bytes, recovery preserves it
+and retries under the full-digest name; it never overwrites conflicting evidence.
+
 ## Connect and refresh
 
 SSH remains the default configuration:
