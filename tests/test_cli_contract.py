@@ -22,6 +22,7 @@ import coordination
 import native
 import onboarding
 import work
+from requirements import canonical_bytes
 from test_briefing import PROJECT, TASK, checkpoint, rows
 
 ITEM_FIELDS = {
@@ -478,6 +479,84 @@ class NativeDocumentClassificationTests(unittest.TestCase):
         self.assertEqual(state['task'], 'kittrial-5bb.7')
         self.assertNotIn('PRIVATE-DESC', ''.join(warnings))
 
+    def test_two_indented_documents_are_refused_not_silently_picked(self):
+        with self.assertRaises(ValueError) as caught:
+            self.split(self.DOC + self.MERGE)
+        message = str(caught.exception)
+        self.assertIn('more than one JSON document', message)
+        self.assertIn('withheld', message)
+        self.assertNotIn('PRIVATE-DESC', message)
+        self.assertNotIn('private-label', message)
+        self.assertNotIn('kittrial-5bb.7', message)
+
+    def test_one_line_row_beside_an_indented_document_is_refused(self):
+        row = '{"id": "row-1", "text": "PRIVATE-ROW"}\n'
+        for stdout in (row + self.DOC, self.DOC + row):
+            with self.subTest(stdout=stdout[:12]):
+                with self.assertRaises(ValueError) as caught:
+                    self.split(stdout)
+                message = str(caught.exception)
+                self.assertIn('more than one JSON document', message)
+                self.assertNotIn('PRIVATE-ROW', message)
+                self.assertNotIn('PRIVATE-DESC', message)
+
+    def test_multi_document_refusal_is_bounded(self):
+        with self.assertRaises(ValueError) as caught:
+            self.split(self.DOC + self.MERGE + self.SHOW)
+        message = str(caught.exception)
+        self.assertTrue(message.startswith(
+            'Native stdout carries more than one JSON document (exit 0)'))
+        self.assertIn('sha256:', message)
+        self.assertLess(len(message), 300)
+
+    def test_warning_object_beside_one_line_row_is_one_data_line_and_a_note(self):
+        row = '{"id": "row-1", "text": "PRIVATE-ROW"}\n'
+        notice = '{"warning": "beads.role not configured"}\n'
+        for stdout in (row + notice, notice + row):
+            with self.subTest(stdout=stdout[:12]):
+                output, stderr = self.split(stdout)
+                self.assertEqual(json.loads(output), {'id': 'row-1', 'text': 'PRIVATE-ROW'})
+                self.assertEqual(len(output.strip().splitlines()), 1)
+                self.assertIn(native.NOISE_PREFIX, stderr)
+                self.assertIn('beads.role', stderr)
+                self.assertNotIn('warning', output)
+
+    def test_multi_line_warning_object_is_a_note_not_a_document(self):
+        stdout = ('{\n  "warning": "beads.role not configured",\n  "code": 3\n}\n'
+                  '{"id": "row-1"}\n')
+        output, stderr = self.split(stdout)
+        self.assertEqual(json.loads(output), {'id': 'row-1'})
+        self.assertEqual(stderr.count(native.NOISE_PREFIX), 4)
+        self.assertNotIn('beads.role', output)
+
+    def test_whole_stream_null_is_kept_for_backward_compatibility(self):
+        output, stderr = self.split('null\n')
+        self.assertEqual(output, 'null\n')
+        self.assertEqual(stderr, '')
+        self.assertIsNone(json.loads(output))
+        # coordination.py/handoff.py consume this with `or []`.
+        self.assertEqual(json.loads(output) or [], [])
+
+    def test_null_beside_a_row_is_a_note_not_a_data_row(self):
+        output, stderr = self.split('null\n{"id": 1}\n')
+        self.assertEqual(json.loads(output), {'id': 1})
+        self.assertIn(native.NOISE_PREFIX + 'null', stderr)
+
+    def test_lone_diagnostic_object_is_refused_as_a_documented_tightening(self):
+        for stdout in ('{"message": "nothing happened"}\n',
+                       '{"warning": "beads.role not configured"}\n'):
+            with self.subTest(stdout=stdout):
+                with self.assertRaises(ValueError) as caught:
+                    self.split(stdout)
+                self.assertIn('Native stdout is not JSON', str(caught.exception))
+
+    def test_every_export_row_survives_a_warning_line(self):
+        rows_text = ''.join(json.dumps({'id': number}) + '\n' for number in range(5))
+        output, stderr = self.split(self.WARNING + rows_text)
+        self.assertEqual([json.loads(line)['id'] for line in output.splitlines()],
+                         [0, 1, 2, 3, 4])
+        self.assertEqual(stderr.count(native.NOISE_PREFIX), 1)
+
 
 class NativeNoiseShapeTests(unittest.TestCase):
     """Noise that happens to be valid JSON is still not result data."""
@@ -555,6 +634,32 @@ class RedactionBoundaryTests(unittest.TestCase):
         self.assertNotIn('/srv/state', value)
         self.assertIn('<path>', value)
         self.assertIn('locked', value)
+
+    def test_unquoted_windows_path_with_trailing_space_segment_is_removed_whole(self):
+        value = native.redact(
+            r'error: cannot open C:\Users\James Smith\private notes: locked')
+        self.assertNotIn('Smith', value)
+        self.assertNotIn('notes', value)
+        self.assertNotIn('private', value)
+        self.assertIn('<path>', value)
+        for word in ('cannot', 'open', 'locked'):
+            self.assertIn(word, value)
+
+    def test_unquoted_windows_path_prose_survives_when_the_path_has_no_space(self):
+        value = native.redact(r'error: cannot open C:\db file is locked')
+        self.assertEqual(value, 'error: cannot open <path> file is locked')
+
+    def test_tilde_path_loses_the_tilde_and_every_segment(self):
+        self.assertEqual(native.redact('error: cannot read ~/x'),
+                         'error: cannot read <path>')
+        self.assertEqual(native.redact(r'error: cannot read ~\private\tok.txt'),
+                         'error: cannot read <path>')
+
+    def test_space_broken_tilde_path_loses_every_segment(self):
+        value = native.redact('error: cannot read ~/private notes/tok.txt')
+        for token in ('private', 'notes', 'tok.txt', '~'):
+            self.assertNotIn(token, value)
+        self.assertIn('<path>', value)
 
 
 class CheckpointFieldNameBoundTests(unittest.TestCase):
@@ -675,6 +780,90 @@ class HelpConsistencyTests(unittest.TestCase):
                       payload['limits']['error field names'])
 
 
+class CheckpointJsonFlagTests(unittest.TestCase):
+    """`checkpoint --json` is accepted in any position, and help says so."""
+
+    def run_checkpoint(self, args):
+        data = rows()
+        text = canonical_bytes(checkpoint(data)).decode()
+        calls = []
+
+        def run(argv):
+            calls.append(argv)
+            if argv[:1] == ['export']:
+                return '\n'.join(json.dumps(row) for row in data) + '\n'
+            if argv[:2] == ['comments', 'add']:
+                return json.dumps({'id': 'cp-new'}) + '\n'
+            raise AssertionError('unexpected native command %r' % (argv,))
+
+        output = briefing.execute(KIT, KIT, PROJECT, 'alice/session', 'checkpoint',
+                                  list(args), {'0': {'flag': '--file', 'text': text}}, run)
+        return json.loads(output), calls
+
+    def test_json_is_accepted_in_every_position(self):
+        positions = ([TASK, '@attachment:0', '--json'],
+                     ['--json', TASK, '@attachment:0'],
+                     [TASK, '--json', '@attachment:0'])
+        for args in positions:
+            with self.subTest(args=args):
+                result, calls = self.run_checkpoint(args)
+                self.assertEqual(result, {'comment_id': 'cp-new', 'reconciled': False})
+                self.assertEqual(calls[-1][:2], ['comments', 'add'])
+
+    def test_json_does_not_change_the_saved_checkpoint(self):
+        self.assertEqual(self.run_checkpoint([TASK, '@attachment:0'])[0],
+                         self.run_checkpoint([TASK, '@attachment:0', '--json'])[0])
+
+    def test_json_alone_still_names_the_usable_form(self):
+        with self.assertRaisesRegex(ValueError, r'--file checkpoint\.json'):
+            briefing.execute(KIT, KIT, PROJECT, 'alice/session', 'checkpoint',
+                             [TASK, '--json'], {}, fail_run)
+
+    def test_help_usage_and_option_list_agree_with_the_behaviour(self):
+        payload = work.help_payload('checkpoint')
+        self.assertIn('--json', payload['usage'])
+        self.assertIn('[--json]', payload['usage'])
+        option = next(entry for entry in payload['options'] if entry['flag'] == '--json')
+        self.assertIn('any position', option['description'])
+        self.assertTrue(any('--json' in note for note in payload['notes']))
+        # The documented positions are exactly the ones the command accepts.
+        self.run_checkpoint([TASK, '@attachment:0', '--json'])
+
+
+class RawCommentsPassthroughContractTests(unittest.TestCase):
+    """`comments list TASK --json` stays a raw, parseable `bd` passthrough."""
+
+    def invoke(self, response, action_args):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'config.json'
+            config.write_text('{}', encoding='utf-8')
+            with patch.object(sys, 'argv', ['client.py', '--config', str(config),
+                                            '--project', 'example', '--actor',
+                                            'alice/session', '--', *action_args]), \
+                    patch.object(client, 'request', return_value=response) as request, \
+                    patch('sys.stdout', new_callable=io.StringIO) as output, \
+                    patch('sys.stderr', new_callable=io.StringIO):
+                code = client.main()
+        return code, output.getvalue(), request
+
+    def test_comments_list_json_is_forwarded_verbatim_and_parses(self):
+        body = json.dumps([{'id': '1', 'text': 'a comment'}])
+        code, output, request = self.invoke(
+            dict(stdout=body + '\n', stderr='', returncode=0),
+            ['comments', 'list', TASK, '--json'])
+        self.assertEqual(code, 0)
+        self.assertEqual(request.call_args.args[3], ['comments', 'list', TASK, '--json'])
+        self.assertEqual(request.call_args.args[4], 'bd')
+        self.assertEqual(json.loads(output), [{'id': '1', 'text': 'a comment'}])
+
+    def test_comments_task_json_keeps_the_flag_at_the_end(self):
+        code, output, request = self.invoke(
+            dict(stdout='[]\n', stderr='', returncode=0), ['comments', TASK, '--json'])
+        self.assertEqual(code, 0)
+        self.assertEqual(request.call_args.args[3], ['comments', TASK, '--json'])
+        self.assertEqual(json.loads(output), [])
+
+
 class ClientCaptureTests(unittest.TestCase):
     """`--out` is a client-owned UTF-8 capture that no shell can re-encode."""
 
@@ -774,6 +963,25 @@ class RevisionContractDocumentationTests(unittest.TestCase):
         for phrase in ('FF FE', 'EF BB BF', 'utf-8-sig', 'cmd /c', '--out FILE'):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, text)
+
+    def test_multi_document_and_whole_stream_null_policy_are_documented(self):
+        text = self.text()
+        for phrase in ('at most one data document per stream',
+                       'Native stdout carries more than one JSON document',
+                       'whole-stream `null`',
+                       'warning/notice shape'):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, text)
+
+    def test_checkpoint_json_flag_is_documented_with_its_usage(self):
+        text = self.text()
+        self.assertIn('checkpoint TASK --file checkpoint.json [--json]', text)
+        self.assertIn('`--json` is accepted in any position', text)
+
+    def test_tilde_and_space_broken_path_redaction_are_documented(self):
+        text = self.text()
+        self.assertIn('home-relative `~/`/`~\\` tokens', text)
+        self.assertIn('`~/x` becomes', text)
 
 
 if __name__ == '__main__':

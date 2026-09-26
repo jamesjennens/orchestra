@@ -53,22 +53,36 @@ structured result:
   any first line that is itself longer than one diagnostic line — is withheld behind
   `[native output withheld: N line(s), M characters, sha256:<12 hex>]`, so an operator
   can correlate with server logs without the payload appearing in the error.
-- **stdout is expected to carry only JSON, and is classified by one policy.** The whole
-  stream is decoded first: when it is one JSON object or array — indented or not — that
-  object/array is the result document, with any non-JSON warning lines before or after
-  it re-labelled on `stderr`. A multi-line document always outranks single-line
-  candidates, so an indented document wrapped in warnings never degrades into the one
-  fragment line that happens to parse alone. Line mode (JSON Lines, one result row per
-  line) is used only when every data line is a complete JSON object or array; a line
-  that is a bare scalar (`42`, `"label"`) or a log-record object
-  (`{"level": "warn"}`, keys drawn only from `level`, `severity`, `time`/`timestamp`/
-  `ts`, `msg`/`message`, `logger`, `caller`, `thread`, `module`, `service`,
-  `component`, `pid`) is noise: it is noted on `stderr`, never kept as a data row.
-  stdout that contains no result document at all — including a lone scalar, a lone log
-  record, or a truncated JSON document — fails with `Native stdout is not JSON
-  (exit 0)` naming the bounded, redacted first line or the withheld-output label —
-  never a bare `JSONDecodeError`. A truncated JSON Lines stream keeps its complete rows
-  and notes the incomplete one.
+- **stdout is expected to carry only JSON, and is classified by one policy.**
+  That policy is **at most one data document per stream.** The whole stream is
+  decoded first: when it
+  is one JSON object or array — indented or not — that object/array is the result
+  document, with any non-JSON warning lines before or after it re-labelled on
+  `stderr`. A single multi-line line-anchored document is one document even when
+  wrapped in warning lines, so it never degrades into the one fragment line that
+  happens to parse alone. Line mode (JSON Lines, one result row per line) is used
+  only when no multi-line document is present and every data line is a complete
+  JSON object or array; every one of those rows is returned together (the native
+  `export --all` shape), so no row is dropped. Two data documents in one stream —
+  two indented documents, or an indented document plus a one-line row — are
+  **refused**: `Native stdout carries more than one JSON document (exit 0)`
+  followed by the withheld-output count and digest, never a silent pick of one
+  document with the others re-labelled as notes (that was data loss with rc `0`).
+  A line that is a bare scalar (`42`, `"label"`) or a diagnostic object is never a
+  data row: a log record (`{"level": "warn"}`, keys drawn only from `level`,
+  `severity`, `time`/`timestamp`/`ts`, `msg`/`message`, `logger`, `caller`,
+  `thread`, `module`, `service`, `component`, `pid`) or a warning/notice shape
+  (`{"warning": ...}`, keys drawn only from the log keys plus `warning(s)`, `warn`,
+  `notice(s)`, `error(s)`, `hint(s)`, `detail(s)`, `reason(s)`, `code`) is a note on
+  `stderr`. A warning object next to a one-line row therefore yields one data line
+  and one note. A whole-stream `null` is kept verbatim as a compatible empty
+  result (base accepted it; callers use `json.loads(...) or []`); any other bare
+  scalar, including a lone diagnostic object such as `{"message": ...}`, leaves no
+  data document and fails with `Native stdout is not JSON (exit 0)` naming the
+  bounded, redacted first line or the withheld-output label — never a bare
+  `JSONDecodeError`. The lone-diagnostic refusal is a deliberate tightening
+  against base, which accepted it. A truncated JSON Lines stream keeps its
+  complete rows and notes the incomplete one.
 - **Forwarded stdout-noise lines are capped.** At most 8 noise lines are re-labelled
   individually as `native stdout note:`, each redacted or withheld like the diagnostic
   line; any remaining lines become one `native output withheld` note with a count and
@@ -84,19 +98,27 @@ reproduced in the error or in logs.
 The single diagnostic or note line that is echoed has whole path-shaped tokens
 replaced by `<path>`, in this order: quoted spans that contain a path separator
 (`"C:\Users\James Smith\private notes\db.txt"` becomes `"<path>"`), URLs
-(`file:///…`, `https://…`), absolute Windows/UNC paths (spaces inside directory
-segments are kept together, so an unquoted `C:\Users\James Smith\private notes\db.txt`
-is removed whole), absolute POSIX paths, and relative path tokens that look like a
+(`file:///…`, `https://…`), home-relative `~/`/`~\` tokens (`~/x` becomes
+`<path>`, so the leading `~` never survives), absolute Windows/UNC paths
+(spaces inside and between directory segments are kept together, so an unquoted
+`C:\Users\James Smith\private notes` loses **every** segment, including the last
+space-free one), absolute POSIX paths, and relative path tokens that look like a
 path (two or more separators, or a dotted final segment, so `data/private/tok.txt`
 becomes `<path>`). A two-segment token without a dot — an actor such as
 `alice/session` — is deliberately left alone; it is an identity, not a path.
 
-This is a reviewed boundary, not complete sanitisation: a *relative* single-segment
-prefix can survive when the token has only one separator and no dot, an unquoted path
-whose last space-containing segment is followed by more text is removed only up to its
-last space-free segment, and other private-looking values (tokens, message bodies)
-are not pattern-matched. The bound that matters is that the echo is one short line and
-that path-shaped tokens lose their whole path, not just a suffix.
+An unquoted Windows path is taken greedily over space-separated segments once the
+path proper contains a space (so `...\private notes` is removed whole); if the
+path proper contains no space, the following space-separated text is ordinary
+prose and is kept, so `cannot open C:\db file is locked` stays readable. A
+space-broken home-relative path such as `~/private notes/tok.txt` becomes
+`<path> <path>`: the tilde token and the following relative token are each removed
+whole.
+
+This is a reviewed boundary, not complete sanitisation: other private-looking
+values (tokens, message bodies) are not pattern-matched. The bound that matters is
+that the echo is one short line and that path-shaped tokens lose their whole path,
+not just a suffix.
 
 
 ## Command help
@@ -122,8 +144,12 @@ native command, takes the coordination lock or needs an attachment.
 `work --help` returns machine-readable usage, options, limits, output shape, identity
 fields and exit codes. The briefing commands return the same envelope with their own
 usage, options, limits and notes. `work --json` is accepted for consistency; `work`
-always returns JSON, so the flag is a no-op. Help is data, not a `SystemExit`, so it
-survives the endpoint envelope.
+always returns JSON, so the flag is a no-op. The same is true of `checkpoint`:
+`--json` is accepted in any position (`checkpoint TASK --file checkpoint.json --json`,
+`checkpoint --json TASK --file checkpoint.json`) and the saved checkpoint is returned
+as JSON on stdout, exactly as the usage line and option list say. The `checkpoint`
+usage line is `checkpoint TASK --file checkpoint.json [--json]`. Help is data, not a
+`SystemExit`, so it survives the endpoint envelope.
 
 ## `work`: list/queue shape
 
@@ -207,6 +233,7 @@ a clear refusal, not a wrong read.
 | `checkpoint` | whole payload | <= 80 KB canonical bytes |
 | any checkpoint error | listed unknown/missing field names | <= 8 names, each <= 60 characters |
 | forwarded `native stdout note:` lines | individually re-labelled | <= 8; the rest withheld with a count and digest |
+| data documents in one native stdout stream | one document, or a line-mode row stream | more than one document with a multi-line document present is refused, not silently picked |
 
 Out-of-range values fail with a nonzero exit code and an error that names the option or
 field **and** the limit, for example:
@@ -250,7 +277,7 @@ attachment paths are resolved relative to the caller's directory unless absolute
 ### PowerShell capture
 
 Windows PowerShell 5.1 `>` / `Out-File` does not write UTF-8. Executed on Windows
-PowerShell 5.1 (revision probe `evidence/rev2/windows-ps/`):
+PowerShell 5.1 (revision probe; its raw logs are kept outside this repository):
 
 | Capture | Bytes written | Decodes as |
 | --- | --- | --- |

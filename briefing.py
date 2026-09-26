@@ -284,6 +284,7 @@ def help_notes(action):
     if action=='history':
         return ['Pages are snapshot-bound; pass next_cursor back to continue the same snapshot.']
     return ['A JSON file attachment is required; payload.task must equal TASK.',
+            '--json is accepted in any position; the saved checkpoint is always returned as JSON on stdout.',
             'Every unresolved item must be carried forward unchanged or explicitly resolved with reason and evidence.']
 
 def execute(root,path,project,actor,action,args,attachments,run):
@@ -292,7 +293,13 @@ def execute(root,path,project,actor,action,args,attachments,run):
     if help_requested(args):
         return json.dumps(help_payload(action),ensure_ascii=False,indent=2)+'\n'
     if action=='checkpoint':
-        if len(args)!=2 or not args[1].startswith('@attachment:'):raise ValueError('Use checkpoint TASK --file checkpoint.json')
+        # Structured output is always JSON, so --json is accepted in any position
+        # (consistent with work/review/handoff/brief/history). It is dropped
+        # before the positional check so `checkpoint TASK --file x --json`,
+        # `checkpoint --json TASK --file x` and `checkpoint TASK --json --file x`
+        # all behave the same.
+        args=[token for token in args if token!='--json']
+        if len(args)!=2 or not args[1].startswith('@attachment:'):raise ValueError('Use checkpoint TASK --file checkpoint.json [--json]')
         item=attachments.get(args[1].partition(':')[2],{})
         if item.get('flag') not in ('--file','-f') or not isinstance(item.get('text'),str):raise ValueError('Checkpoint needs a JSON file attachment')
         rows=[json.loads(x) for x in run(['export','--all']).splitlines() if x.strip()]

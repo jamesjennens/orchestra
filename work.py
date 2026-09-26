@@ -43,7 +43,7 @@ def help_payload(action='work'):
         'brief': 'brief TASK [--items-offset N] [--items-limit N] [--json]',
         'history': 'history TASK [--limit N] [--since TIME] [--cursor TOKEN] '
                    '[--body-budget BYTES]',
-        'checkpoint': 'checkpoint TASK --file checkpoint.json',
+        'checkpoint': 'checkpoint TASK --file checkpoint.json [--json]',
     }
     payload = {'schema_version': 1, 'contract': CONTRACT_VERSION, 'command': action,
                'usage': usage.get(action, action),
@@ -131,7 +131,8 @@ def help_options(action):
         return [
             {'flag': 'TASK', 'description': 'task the checkpoints belong to'},
             {'flag': '--file checkpoint.json', 'description': 'transport the checkpoint payload as text'},
-            *common,
+            {'flag': '--json', 'description': 'accepted in any position; the saved checkpoint is always returned as JSON'},
+            {'flag': '-h, --help', 'description': 'return this help as JSON on stdout with exit code 0'},
         ]
     return common
 
