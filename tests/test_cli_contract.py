@@ -30,6 +30,8 @@ ITEM_FIELDS = {
     'pending_review_items', 'pending_handoff_requests', 'pending_handoff_total',
     'pending_handoff_next_offset', 'lifecycle', 'lifecycle_scope',
     'lifecycle_matches_contribution', 'error',
+    # Additive fields from the shared review-state projection (kittrial-5bb.24).
+    'workflow_state', 'integration',
 }
 BRIEF_FIELDS = {
     'task', 'title', 'owner', 'status', 'activity_cursor', 'checkpoint', 'intent',

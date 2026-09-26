@@ -168,7 +168,10 @@ Each `items[]` entry has `task` (the **native task ID**, e.g. `kittrial-5bb.7`),
 record's comment ID**, not a Git SHA and not `latest_comment_id`), `commit`,
 `pending_review_items`, `pending_handoff_requests`, `pending_handoff_total`,
 `pending_handoff_next_offset`, `lifecycle`, `lifecycle_scope`,
-`lifecycle_matches_contribution` and `error`.
+`lifecycle_matches_contribution`, `error`, and the additive `workflow_state` and
+`integration` fields from the shared review-state projection. `review_state` may be
+`integrated`; `workflow_state` keeps the raw workflow state. See
+[REVIEWS.md](REVIEWS.md) for their meaning.
 
 `show TASK --json` returns native issue rows. `comments TASK --json` returns native
 comment rows. In raw rows a task's `assignee` is a plain string; in briefing/history
