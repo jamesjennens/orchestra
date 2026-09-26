@@ -49,42 +49,69 @@ from both sides of the process seam:
 
 Trusted clock
 -------------
-Each store persists four values in its ``meta`` table: ``high_water`` (the largest raw
+Each store persists five values in its ``meta`` table: ``high_water`` (the largest raw
 clock ever observed by a write; it never decreases), ``suspect`` (bool), ``anchor`` (the
-``high_water`` at the moment suspicion began) and ``suspect_since`` (the raw clock when
-suspicion began). Every write transaction observes the raw clock ``now``
+``high_water`` at the moment suspicion began), ``suspect_since`` (the raw clock when
+suspicion began) and ``jump_credit`` (a non-decreasing running total, in seconds, of
+every suspect forward step). Every write transaction observes the raw clock ``now``
 (:func:`clock_advance`):
 
 * ``high_water`` unset: ``high_water = now``, not suspect.
-* ``now - high_water > JOURNAL_MAX_SKEW_SECONDS`` (a step of more than 24 h): the store
-  becomes suspect. The first such step records ``anchor = high_water``; a further big
-  step restarts ``suspect_since`` but keeps the original anchor.
+* ``step = now - high_water > JOURNAL_MAX_SKEW_SECONDS`` (a step of more than 24 h):
+  the store becomes suspect and ``jump_credit += step``. The first such step records
+  ``anchor = high_water``; a further big step restarts ``suspect_since`` (and adds its
+  own step to the credit) but keeps the original anchor.
 * otherwise, a suspect store whose clock has run for
   :data:`JOURNAL_SUSPECT_SETTLE_SECONDS` (1 h) since the step is cleared: the step is
   accepted as real time.
-* always ``high_water = max(high_water, now)``. A backward step is never suspect.
+* always ``high_water = max(high_water, now)``. A backward step is never suspect and
+  never changes the credit.
 
-``trusted_now`` is ``now`` when not suspect and ``min(now, anchor + max_skew)`` while
-suspect (:func:`clock_trusted`). It is used for every expiry and replay-window decision,
-on the read path (evaluated against the transition the next write would make, so a read
-before the first write after a jump is already protected) and on the write path, and by
-``http_auth.RecordStore`` too. Rows are stamped with the RAW clock: a future stamp left
-by a later-corrected jump only lengthens that row's retention. Reclaim (committed ->
-tombstone after the replay window, uncertain -> tombstone after the long window) and
-tombstone deletion (after the tombstone horizon) run only while the store is not
-suspect, and use the raw clock.
+``trusted_now`` is ``now`` when not suspect and, while suspect, only the time elapsed
+since the step, counted from the anchor: ``clamp(anchor + (now - suspect_since),
+anchor, anchor + max_skew)`` (:func:`clock_trusted`). It is used for every expiry and
+replay-window decision, on the read path (evaluated against the transition the next
+write would make, so a read before the first write after a jump is already protected)
+and on the write path, and by ``http_auth.RecordStore`` too. Rows are stamped with the
+RAW clock: a future stamp left by a later-corrected jump only lengthens that row's
+retention. Receipt reclaim (committed -> tombstone after the replay window, uncertain ->
+tombstone after the long window) runs only while the store is not suspect, against the
+raw clock; its worst case after an accepted jump is an exact retry refused as expired
+(``rc=2``), never a re-execution.
 
-Effect: after an idle weekend the first write is suspect for one hour (expiry is
-evaluated at ``anchor + 24 h``, so a receipt older than that may still replay instead
-of being refused - harmless), then normal operation resumes with no operator action. A
-genuine forward jump is held for an hour. **Residual risk:** a jump that persists for
-longer than the settle period is accepted, so receipts still inside their window may
-then be compacted to tombstones and an exact retry is refused as expired; a retry is
-never re-executed. A jump that is corrected leaves ``high_water`` in the future, so a
-later repeat of the same jump would not be detected again and the store stays suspect
-until the raw clock passes the jumped time plus the settle period; after correcting a
-clock run ``admin.py journal PROJECT --reset-high-water`` (``high_water = now``, clears
-suspicion) to re-arm detection.
+**Tombstones age on the confirmed timeline.** A tombstone records ``aged_from =
+reclaimed_at - jump_credit`` (the credit at the moment it was reclaimed) and is deleted
+only when ``aged_from < now - jump_credit - JOURNAL_TOMBSTONE_SECONDS``, i.e. when its
+age *excluding every suspect forward step since it was reclaimed* exceeds the horizon.
+Tombstone ageing therefore never consumes unconfirmed forward time: an accepted jump
+extends retention by the jump length, and an idle gap of more than 24 h (a weekend)
+extends it by the gap, which is safe. :meth:`OperationJournal.reset_high_water` never
+reduces the credit.
+
+**Client retry contract.** A step of 24 h or less is never suspect, so it is not
+credited. An exact retry must therefore be no older than
+:data:`JOURNAL_RETRY_HORIZON_SECONDS` (``JOURNAL_TOMBSTONE_SECONDS -
+JOURNAL_MAX_SKEW_SECONDS``, 29 days) after the original attempt. Inside that horizon a
+retry replays, reports ``124`` or is refused as expired (``rc=2``) - it is never
+re-executed, whatever the clock did. An older retry is unsupported: its tombstone may
+have been aged out and the effect may run again. Use a fresh ``operation_id`` after
+reconciling instead.
+
+Effect: after an idle weekend the first write is suspect for one hour, with the
+trusted clock held near the anchor (receipts older than their window may still replay
+instead of being refused - harmless), then normal operation resumes with no operator
+action. While consecutive writes stay more than 24 h apart the store stays suspect:
+reclaim pauses and old receipts keep replaying until two writes fall within 24 h and an
+hour passes. During a forward jump a 60-second-old receipt replays and an uncertain
+reservation reports ``124``. **Residual risk:** a jump that persists for longer than
+the settle period is accepted: receipts still inside their real window may then be
+compacted to tombstones and an exact retry is refused as expired; no identity inside
+the retry horizon is deleted and nothing is re-executed. A jump that is corrected
+leaves ``high_water`` in the future, so the store stays suspect (trusted clock held at
+the anchor, reclaim paused) for about the length of the jump, and a later repeat of the
+same jump would not be detected again; after correcting a clock run ``admin.py journal
+PROJECT --reset-high-water`` (``high_water = now``, clears suspicion, keeps the credit)
+to re-arm detection.
 
 Nothing here imports ``fcntl`` at module import time, so the same module imports on a
 Windows workstation and a Linux office host.
@@ -136,6 +163,10 @@ JOURNAL_MAX_SKEW_SECONDS = 24 * 60 * 60
 #: How long the raw clock must keep running after a suspect step before the step is
 #: accepted and suspicion clears on the next write.
 JOURNAL_SUSPECT_SETTLE_SECONDS = 60 * 60
+#: The client retry contract: an exact retry must be no older than this after the
+#: original attempt (the tombstone horizon minus the largest uncredited clock step).
+#: Inside it a retry is never re-executed; an older retry is unsupported.
+JOURNAL_RETRY_HORIZON_SECONDS = JOURNAL_TOMBSTONE_SECONDS - JOURNAL_MAX_SKEW_SECONDS
 #: Largest serialized response envelope retained for replay. A larger envelope is
 #: recorded by digest only, so a retry reports uncertainty instead of a truncated
 #: result.
@@ -149,11 +180,12 @@ MAX_JOURNAL_BYTES = 8 * 1024 * 1024
 #: On-disk schema of the journal store. The live store is a SQLite database
 #: (:data:`JOURNAL_FILENAME`); a legacy JSON document (:data:`LEGACY_JOURNAL_FILENAME`)
 #: is read transparently and imported in the same transaction that creates the schema,
-#: guarded by the persisted ``legacy_migrated`` marker. Schema 5 adds the persisted
-#: trusted-clock state and the ``(state, reclaimed_at)`` index; an older store is
-#: upgraded (columns, backfill, index, clock state) in one transaction on first open,
-#: and an up-to-date store runs no DDL or backfill on open.
-JOURNAL_SCHEMA = 5
+#: guarded by the persisted ``legacy_migrated`` marker. Schema 5 added the persisted
+#: trusted-clock state; schema 6 adds ``jump_credit``, the ``aged_from`` tombstone column
+#: and the ``(state, aged_from)`` index (replacing ``(state, reclaimed_at)``). An older
+#: store is upgraded (columns, backfill, index, clock state) in one transaction on first
+#: open, and an up-to-date store runs no DDL or backfill on open.
+JOURNAL_SCHEMA = 6
 #: The live operation-journal store, one SQLite database per project directory.
 JOURNAL_FILENAME = '.http-operations.sqlite3'
 #: The pre-revision-7 JSON journal document, kept only as a one-time migration source.
@@ -167,7 +199,7 @@ def journal_path(project_dir):
 
 # --------------------------------------------------------------- trusted clock
 #: The ``meta`` keys of the persisted trusted-clock state.
-CLOCK_KEYS = ('high_water', 'suspect', 'anchor', 'suspect_since')
+CLOCK_KEYS = ('high_water', 'suspect', 'anchor', 'suspect_since', 'jump_credit')
 
 
 def _float_or_none(value):
@@ -181,14 +213,15 @@ def clock_state(connection):
     """Read the persisted trusted-clock state from a store's ``meta`` table."""
     values = {}
     for row in connection.execute(
-            'SELECT key, value FROM meta WHERE key IN (?, ?, ?, ?)', CLOCK_KEYS):
+            'SELECT key, value FROM meta WHERE key IN (?, ?, ?, ?, ?)', CLOCK_KEYS):
         values[row[0]] = row[1]
     high = _float_or_none(values.get('high_water'))
     suspect = _float_or_none(values.get('suspect'))
     return {'high_water': high if high is not None and high > 0 else None,
             'suspect': bool(suspect),
             'anchor': _float_or_none(values.get('anchor')),
-            'suspect_since': _float_or_none(values.get('suspect_since'))}
+            'suspect_since': _float_or_none(values.get('suspect_since')),
+            'jump_credit': _float_or_none(values.get('jump_credit')) or 0.0}
 
 
 def clock_advance(state, now, max_skew=JOURNAL_MAX_SKEW_SECONDS,
@@ -204,24 +237,39 @@ def clock_advance(state, now, max_skew=JOURNAL_MAX_SKEW_SECONDS,
     suspect = bool(state.get('suspect'))
     anchor = state.get('anchor')
     since = state.get('suspect_since')
+    credit = float(state.get('jump_credit') or 0.0)
     if high is None:
-        return {'high_water': now, 'suspect': False, 'anchor': None, 'suspect_since': None}
-    if now - high > max_skew:
+        return {'high_water': now, 'suspect': False, 'anchor': None, 'suspect_since': None,
+                'jump_credit': credit}
+    step = now - high
+    if step > max_skew:
         if not suspect or anchor is None:
             anchor = high
         suspect = True
         since = now
+        # Every suspect forward step is credited when it is observed, so tombstone
+        # ageing never consumes it (see "Tombstones age on the confirmed timeline").
+        credit += step
     elif suspect and since is not None and now - since >= settle:
         suspect, anchor, since = False, None, None
     return {'high_water': max(high, now), 'suspect': suspect,
             'anchor': anchor if suspect else None,
-            'suspect_since': since if suspect else None}
+            'suspect_since': since if suspect else None,
+            'jump_credit': credit}
 
 
 def clock_trusted(state, now, max_skew=JOURNAL_MAX_SKEW_SECONDS):
-    """``now`` when not suspect; ``min(now, anchor + max_skew)`` while suspect."""
+    """The trusted clock: ``now`` when not suspect.
+
+    While suspect only the time elapsed since the step counts, from the anchor:
+    ``clamp(anchor + (now - suspect_since), anchor, anchor + max_skew)``. A receipt
+    written just before a jump therefore still replays during it.
+    """
     if state.get('suspect') and state.get('anchor') is not None:
-        return min(float(now), float(state['anchor']) + max_skew)
+        anchor = float(state['anchor'])
+        since = state.get('suspect_since')
+        elapsed = float(now) - float(since) if since is not None else 0.0
+        return min(max(anchor + elapsed, anchor), anchor + max_skew)
     return float(now)
 
 
@@ -244,6 +292,7 @@ def clock_report(state):
             'suspect': bool(state.get('suspect')),
             'anchor': state.get('anchor'),
             'suspect_since': state.get('suspect_since'),
+            'jump_credit': float(state.get('jump_credit') or 0.0),
             'clock_skewed': bool(state.get('suspect'))}
 
 # --------------------------------------------------------------- capability model
@@ -656,15 +705,17 @@ class OperationJournal:
       (``124``), which rolls back so the pre-existing store is untouched and no effect
       has run. Accumulated tombstones can never cause that refusal.
     * **No live identity is ever lost to a budget.** A tombstone is removed only when
-      ``reclaimed_at + tombstone_seconds`` has passed, and only while the clock is not
-      suspect. The tombstone count never gates compaction.
+      its confirmed-timeline age (``aged_from``, excluding credited jumps) exceeds
+      ``tombstone_seconds``, and only while the clock is not suspect. The tombstone count never gates compaction.
     * **Trusted clock** (module docstring): ``meta`` holds ``high_water`` (largest raw
       clock seen by a write), ``suspect``, ``anchor`` and ``suspect_since``. A step of
       more than :data:`JOURNAL_MAX_SKEW_SECONDS` makes the store suspect for
-      :data:`JOURNAL_SUSPECT_SETTLE_SECONDS`; :meth:`trusted_now` (``now``, or
-      ``min(now, anchor + max_skew)`` while suspect) decides every replay/expiry
-      question, rows are stamped with the raw clock, and reclaim/tombstone deletion run
-      only while not suspect. :meth:`reset_high_water` is the operator recovery.
+      :data:`JOURNAL_SUSPECT_SETTLE_SECONDS` and is added to ``jump_credit``;
+      :meth:`trusted_now` (``now``, or the anchor plus the time elapsed since the step,
+      capped at ``max_skew``, while suspect) decides every replay/expiry question, rows
+      are stamped with the raw clock, reclaim and tombstone deletion run only while not
+      suspect, and tombstones age on the confirmed timeline (``aged_from``) so a jump
+      never ages one out. :meth:`reset_high_water` is the operator recovery.
     * Operator overrides are :meth:`reclaim_expired` (compact closed windows) and
       :meth:`prune` (hard-remove still-live identities after reconciling; the one
       action that can let an exact retry repeat).
@@ -761,6 +812,9 @@ class OperationJournal:
         ('route', 'TEXT'),
         ('replay_until', 'REAL'),
         ('expires_at', 'REAL'),
+        # Schema 6: the tombstone's reclaim time on the confirmed timeline
+        # (``reclaimed_at - jump_credit`` at reclaim); tombstone ageing compares it.
+        ('aged_from', 'REAL'),
     )
 
     def _stored_schema(self, connection):
@@ -782,13 +836,15 @@ class OperationJournal:
                            % ', '.join('%s %s' % column for column in self._COLUMNS))
         connection.execute('CREATE INDEX IF NOT EXISTS operations_state_at '
                            'ON operations (state, at)')
-        # Schema 5: tombstone ageing filters ``state = 'expired' AND reclaimed_at <= ?``,
-        # so the index leads with the state and is a range scan over stale tombstones
-        # only. It replaces the schema-4 ``(reclaimed_at)`` index.
-        connection.execute('CREATE INDEX IF NOT EXISTS operations_state_reclaimed '
-                           'ON operations (state, reclaimed_at)')
-        connection.execute('DROP INDEX IF EXISTS operations_tombstone_age')
         self._ensure_columns(connection)
+        # Schema 6: tombstone ageing filters ``state = 'expired' AND aged_from < ?``, so
+        # the index leads with the state and is a range scan over stale tombstones only.
+        # It replaces the schema-5 ``(state, reclaimed_at)`` and schema-4
+        # ``(reclaimed_at)`` indexes.
+        connection.execute('CREATE INDEX IF NOT EXISTS operations_state_aged '
+                           'ON operations (state, aged_from)')
+        connection.execute('DROP INDEX IF EXISTS operations_state_reclaimed')
+        connection.execute('DROP INDEX IF EXISTS operations_tombstone_age')
         self._upgrade_clock(connection)
         connection.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema', ?)",
@@ -804,6 +860,11 @@ class OperationJournal:
         gap, so the upgrade can neither freeze nor jump the trusted clock.
         """
         state = clock_state(connection)
+        if connection.execute("SELECT 1 FROM meta WHERE key = 'jump_credit'").fetchone() \
+                is None:
+            # Schema 5 -> 6 (and older): no step has been credited yet.
+            connection.execute("INSERT OR REPLACE INTO meta (key, value) VALUES "
+                               "('jump_credit', 0.0)")
         if connection.execute("SELECT 1 FROM meta WHERE key = 'suspect'").fetchone():
             return
         high = state['high_water']
@@ -814,7 +875,9 @@ class OperationJournal:
         # gap of more than ``max_skew``, and ``high_water = max(high_water, now)``.
         state = clock_advance({'high_water': high, 'suspect': False}, time.time(),
                               self.max_skew, self.settle)
-        # ``suspect`` is persisted (as 0 when clear), so the upgrade happens once.
+        # ``suspect`` is persisted (as 0 when clear), so the upgrade happens once. The
+        # schema-6 credit starts at zero: an older store has credited no step.
+        state['jump_credit'] = 0.0
         clock_persist(connection, state)
 
     def _ensure_columns(self, connection):
@@ -840,6 +903,11 @@ class OperationJournal:
             "ELSE at + CASE state WHEN 'committed' THEN ? ELSE ? END END "
             'WHERE expires_at IS NULL',
             ('expired', self.tombstone_seconds, self.committed_retention, self.retention))
+        # Schema 6: an existing tombstone was reclaimed with no credited step, so its
+        # confirmed-timeline reclaim time is its raw reclaim time.
+        connection.execute(
+            "UPDATE operations SET aged_from = COALESCE(reclaimed_at, at) "
+            "WHERE state = 'expired' AND aged_from IS NULL")
 
     def _ensure_store(self):
         """Create or upgrade the schema and import a legacy document in ONE transaction.
@@ -996,7 +1064,7 @@ class OperationJournal:
         for column in ('actor', 'route'):
             if row[column] is not None:
                 record[column] = row[column]
-        for column in ('replay_until', 'expires_at'):
+        for column in ('replay_until', 'expires_at', 'aged_from'):
             if row[column] is not None:
                 record[column] = row[column]
         return record
@@ -1029,6 +1097,14 @@ class OperationJournal:
         if state == 'expired' and reclaimed is None:
             reclaimed = at
             normalised['reclaimed_at'] = reclaimed
+        aged_from = None
+        if state == 'expired':
+            # An imported tombstone keeps its recorded confirmed-timeline time, else its
+            # raw reclaim time (the most conservative value: it credits every step since).
+            aged_from = record.get('aged_from')
+            aged_from = float(aged_from) if isinstance(aged_from, (int, float)) \
+                else float(reclaimed)
+            normalised['aged_from'] = aged_from
         window = self.window(normalised)
         replay_until = at + window
         if state == 'expired':
@@ -1042,13 +1118,14 @@ class OperationJournal:
         connection.execute(
             'INSERT OR REPLACE INTO operations (operation_id, state, request_hash, '
             'principal, at, envelope, envelope_sha256, envelope_omitted, bytes, '
-            'reclaimed_at, actor, route, replay_until, expires_at) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            'reclaimed_at, actor, route, replay_until, expires_at, aged_from) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (operation_id, state, normalised['request_hash'], normalised['principal'],
              normalised['at'], envelope, normalised.get('envelope_sha256'),
              1 if normalised.get('envelope_omitted') else 0, size,
              float(reclaimed) if reclaimed is not None else None,
-             record.get('actor'), record.get('route'), replay_until, expires_at))
+             record.get('actor'), record.get('route'), replay_until, expires_at,
+             aged_from))
         was_tombstone = previous is not None and previous['state'] == 'expired'
         is_tombstone = state == 'expired'
         old_bytes = int(previous['bytes']) if previous is not None else 0
@@ -1162,7 +1239,8 @@ class OperationJournal:
     def reset_high_water(self, now=None):
         """Operator recovery after a clock correction. Returns the new mark.
 
-        Sets ``high_water`` to the current clock and clears suspicion, which both
+        Sets ``high_water`` to the current clock and clears suspicion (``jump_credit``
+        is kept, never reduced), which both
         accepts a corrected clock immediately and re-arms jump detection after a
         corrected forward jump left ``high_water`` in the future. It removes no identity
         by itself: a subsequent ``reclaim_expired`` still compacts a closed window to a
@@ -1171,8 +1249,12 @@ class OperationJournal:
         self._ensure_store()
         moment = float(time.time() if now is None else now)
         with self._transaction() as connection:
+            # The jump credit is never reduced: tombstones keep ageing on the confirmed
+            # timeline across a reset.
+            credit = clock_state(connection)['jump_credit']
             clock_persist(connection, {'high_water': moment, 'suspect': False,
-                                       'anchor': None, 'suspect_since': None})
+                                       'anchor': None, 'suspect_since': None,
+                                       'jump_credit': credit})
         return moment
 
     @staticmethod
@@ -1202,10 +1284,12 @@ class OperationJournal:
         """Whether ``entry``'s idempotency receipt window has closed.
 
         The decision uses the trusted clock (:meth:`trusted_now`): while the store is
-        (or the next write would make it) suspect, the clock is capped at
-        ``anchor + max_skew``, so an unaccepted forward jump cannot expire a receipt
-        that is still inside its window: during a +8 day jump a 60-second-old committed
-        receipt replays and a live uncertain reservation still reports ``124``.
+        (or the next write would make it) suspect, only the time elapsed since the step
+        counts, from the anchor (``clamp(anchor + (now - suspect_since), anchor,
+        anchor + max_skew)``). An unaccepted forward jump therefore cannot expire a
+        receipt that is still inside its real window: during a +8 day jump a
+        60-second-old committed receipt replays and a live uncertain reservation still
+        reports ``124``.
         """
         if not isinstance(entry, dict):
             return False
@@ -1216,8 +1300,9 @@ class OperationJournal:
     def trusted_now(self, now=None, connection=None):
         """The trusted clock for expiry and replay-window decisions.
 
-        ``now`` when not suspect, ``min(now, anchor + max_skew)`` while suspect,
-        evaluated against the transition the next write would make (one ``meta`` read,
+        ``now`` when not suspect, ``clamp(anchor + (now - suspect_since), anchor,
+        anchor + max_skew)`` while suspect, evaluated against the transition the next
+        write would make (one ``meta`` read,
         not a table scan). Rows are never stamped with it; they carry the raw clock.
         """
         moment = time.time() if now is None else now
@@ -1248,8 +1333,12 @@ class OperationJournal:
                 'reviewed JOURNAL_LIMIT'
                 % (totals['entries'], self.limit, totals['tombstones'], totals['bytes']))
 
-    def _tombstone(self, connection, operation_id, now):
+    def _tombstone(self, connection, operation_id, now, credit=0.0):
         """Compact one CLOSED-WINDOW record to a tombstone stamped with raw ``now``.
+
+        ``aged_from = now - credit`` places the tombstone on the confirmed timeline
+        (``credit`` is the store's ``jump_credit``), so its ageing never consumes a
+        suspect forward step.
 
         The caller only passes records whose own retention window has genuinely closed
         (see :meth:`_reclaim`). There is no count gate: the tombstone count is reported
@@ -1260,17 +1349,18 @@ class OperationJournal:
                                  (operation_id,)).fetchone()
         if row is None or row['state'] == 'expired':
             return False
+        aged_from = float(now) - float(credit)
         record = {'state': 'expired', 'request_hash': row['request_hash'],
                   'principal': row['principal'], 'at': row['at'], 'reclaimed_at': now,
-                  'actor': row['actor'], 'route': row['route']}
+                  'actor': row['actor'], 'route': row['route'], 'aged_from': aged_from}
         size = self._record_bytes(operation_id, record)
         window = self.window({'state': 'expired'})
         expires_at = float(now) + self.tombstone_seconds
         connection.execute(
             "UPDATE operations SET state = 'expired', envelope = NULL, "
             'envelope_omitted = 0, bytes = ?, reclaimed_at = ?, replay_until = ?, '
-            'expires_at = ? WHERE operation_id = ?',
-            (size, now, float(row['at']) + window, expires_at, operation_id))
+            'expires_at = ?, aged_from = ? WHERE operation_id = ?',
+            (size, now, float(row['at']) + window, expires_at, aged_from, operation_id))
         delta = size - int(row['bytes'])
         self._adjust(connection, live=-1, tombstones=1, bytes_=delta)
         return True
@@ -1302,30 +1392,35 @@ class OperationJournal:
             if not rows:
                 break
             for row in rows:
-                if self._tombstone(connection, row['operation_id'], now):
+                if self._tombstone(connection, row['operation_id'], now,
+                                   clock.get('jump_credit') or 0.0):
                     compacted += 1
         return compacted
 
     def _drop_stale_tombstones(self, connection, now, clock):
-        """Remove only tombstones outside their refusal window by age (raw clock).
+        """Remove only tombstones older than the horizon on the CONFIRMED timeline.
 
-        This is the *only* place an identity row is deleted by a budget-free policy. It
-        runs only while the store is not suspect, so an unaccepted forward jump cannot
-        age one out, and it is never used to satisfy the byte or count budget.
+        A tombstone is deleted only when ``aged_from < now - jump_credit - horizon``:
+        its age excluding every suspect forward step credited since it was reclaimed.
+        An accepted forward jump therefore extends retention by the jump length rather
+        than ageing tombstones out, so no identity inside the client retry horizon
+        (:data:`JOURNAL_RETRY_HORIZON_SECONDS`) is ever deleted by a clock jump. It also
+        runs only while the store is not suspect, and is never used to satisfy the byte
+        or count budget. This is the *only* place an identity row is deleted by policy.
         """
         if clock.get('suspect'):
             return 0
-        # ``state = 'expired' AND reclaimed_at <= ?`` is a range scan over the stale
-        # tombstones only, on the schema-5 (state, reclaimed_at) index.
-        stale_before = now - self.tombstone_seconds
+        # ``state = 'expired' AND aged_from < ?`` is a range scan over the stale
+        # tombstones only, on the schema-6 (state, aged_from) index.
+        stale_before = now - float(clock.get('jump_credit') or 0.0) - self.tombstone_seconds
         row = connection.execute(
             "SELECT COUNT(*), COALESCE(SUM(bytes), 0) FROM operations "
-            "WHERE state = 'expired' AND reclaimed_at <= ?", (stale_before,)).fetchone()
+            "WHERE state = 'expired' AND aged_from < ?", (stale_before,)).fetchone()
         removed, size = int(row[0]), int(row[1])
         if not removed:
             return 0
         connection.execute(
-            "DELETE FROM operations WHERE state = 'expired' AND reclaimed_at <= ?",
+            "DELETE FROM operations WHERE state = 'expired' AND aged_from < ?",
             (stale_before,))
         self._adjust(connection, tombstones=-removed, bytes_=-size)
         return removed

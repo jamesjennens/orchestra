@@ -245,6 +245,10 @@ def _copy_sqlite(source,destination):
         to_connection=sqlite3.connect(str(destination))
         try:
             from_connection.backup(to_connection)
+            # The copy inherits the live store's WAL header; a snapshot is a single
+            # self-contained file, so switch it to rollback-journal mode (no -wal/-shm
+            # left in backups/). A restored store is reopened in WAL by the journal.
+            to_connection.execute('PRAGMA journal_mode = DELETE').fetchone()
         finally:
             to_connection.close()
     finally:

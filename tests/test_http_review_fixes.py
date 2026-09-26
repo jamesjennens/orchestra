@@ -2047,11 +2047,10 @@ class JournalRetentionCase(unittest.TestCase):
             time.time = real_time
 
     def test_a_read_during_a_forward_jump_uses_the_trusted_clock(self):
-        # Revision 9 trusted clock: during a +8 d jump the store is suspect and the
-        # trusted clock is capped at anchor + 24 h. A live uncertain reservation still
-        # reports 124; a committed receipt from before the jump is refused as expired
-        # at the capped clock (never re-executed). After the correction (inside the
-        # settle hour) the 60-second-old receipt replays again.
+        # Revision 10 trusted clock: during a +8 d jump the store is suspect and the
+        # trusted clock counts only the time elapsed since the step, from the anchor.
+        # A 60-second-old committed receipt replays and a live uncertain reservation
+        # reports 124, during the jump and after the correction.
         path = self.tmp / 'read-skew.json'
         request = dict(self.request)
         digest = http_authority.operation_hash(request)
@@ -2068,9 +2067,12 @@ class JournalRetentionCase(unittest.TestCase):
         real_time = time.time
         try:
             time.time = lambda: clock[0]
-            self.assertLessEqual(journal.trusted_now(), real + JOURNAL_MAX_SKEW_SECONDS + 1)
+            # While suspect only the time elapsed since the step counts: the trusted
+            # clock is the anchor, so the 60-second-old receipt REPLAYS during the jump.
+            self.assertLessEqual(journal.trusted_now(), real + 1)
             committed = run_guarded(dict(request, operation_id='op-k'), path, effect)
-            self.assertEqual(2, committed['returncode'], committed)
+            self.assertEqual(0, committed['returncode'], committed)
+            self.assertEqual('keeper', committed['stdout'])
             uncertain = run_guarded(dict(request, operation_id='op-ku'), path, effect)
             self.assertEqual(124, uncertain['returncode'], uncertain)
             self.assertIn('unknown', uncertain['stderr'])
@@ -2096,11 +2098,15 @@ class JournalRetentionCase(unittest.TestCase):
             # The operator reset re-arms detection; normal expiry then resumes.
             OperationJournal(str(path)).reset_high_water()
             self.assertFalse(journal.stats()['suspect'])
+            # Writes less than 24 h apart keep the store trusted; the receipt's window
+            # then closes on the real clock and it is refused, never re-run.
+            clock[0] = real + 0.6 * 24 * 3600
+            run_guarded(dict(request, operation_id='op-steady'), path, effect)
             clock[0] = real + 1.3 * 24 * 3600
             stale = run_guarded(dict(request, operation_id='op-k'), path, effect)
             self.assertEqual(2, stale['returncode'], stale)
             self.assertIn('expired', stale['stderr'])
-            self.assertEqual(1, len(records))
+            self.assertEqual(2, len(records))
         finally:
             time.time = real_time
 
@@ -2779,8 +2785,8 @@ class JournalBackupCase(unittest.TestCase):
         self.assertIn('meta', str(caught.exception))
 
 
-class TrustedClockCase(unittest.TestCase):
-    """23. Revision 9 trusted clock: suspicion settles; idle gaps never freeze the journal."""
+class ClockHarness(unittest.TestCase):
+    """Shared fixture for the trusted-clock cases (patched clock, one journal path)."""
 
     HOUR = 3600
     DAY = 24 * 3600
@@ -2812,6 +2818,49 @@ class TrustedClockCase(unittest.TestCase):
 
     def journal(self, **options):
         return OperationJournal(str(self.path), **options)
+
+    def _rev8_store(self, high_water, rows=3):
+        """Build a schema-4 (revision 8) store: high_water only, no clock state."""
+        import sqlite3
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(str(self.path))
+        connection.execute('CREATE TABLE meta (key TEXT PRIMARY KEY, value)')
+        connection.execute('CREATE TABLE operations (%s)' % ', '.join(
+            '%s %s' % column for column in OperationJournal._COLUMNS))
+        connection.execute('CREATE INDEX operations_state_at ON operations (state, at)')
+        connection.execute('CREATE INDEX operations_tombstone_age ON operations (reclaimed_at)')
+        request = self.request('seed')
+        for index in range(rows):
+            connection.execute(
+                'INSERT INTO operations (operation_id, state, request_hash, principal, at, '
+                'envelope, bytes) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                ('op-old-%d' % index, 'committed', http_authority.operation_hash(request),
+                 principal_key(request), high_water - index,
+                 json.dumps({'returncode': 0, 'stdout': 'old', 'stderr': ''}), 10))
+        for key, value in (('schema', 4), ('high_water', high_water), ('live_count', rows),
+                           ('tombstone_count', 0), ('total_bytes', 10 * rows),
+                           ('legacy_migrated', 4)):
+            connection.execute('INSERT INTO meta (key, value) VALUES (?, ?)', (key, value))
+        connection.commit()
+        connection.close()
+
+    def _schema_view(self):
+        import sqlite3
+        connection = sqlite3.connect(str(self.path))
+        try:
+            meta = dict(connection.execute('SELECT key, value FROM meta'))
+            indexes = {row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'")}
+            nulls = connection.execute(
+                'SELECT COUNT(*) FROM operations WHERE replay_until IS NULL '
+                'OR expires_at IS NULL').fetchone()[0]
+        finally:
+            connection.close()
+        return meta, indexes, nulls
+
+
+class TrustedClockCase(ClockHarness):
+    """23. Revision 9 trusted clock: suspicion settles; idle gaps never freeze the journal."""
 
     def test_an_idle_gap_settles_without_an_operator(self):
         for gap in (30 * self.HOUR, 2.6 * self.DAY):
@@ -2899,11 +2948,14 @@ class TrustedClockCase(unittest.TestCase):
         self.assertEqual(124, self.run_op('op-ku')['returncode'])
         self.assertEqual(ran + 1, len(self.records))
         self.assertEqual(0, self.journal().stats()['tombstones'])
-        # Two real days later, still suspect (the jump left high_water in the future):
-        # expiry is capped at anchor + 24 h, so the old receipt is refused and the
-        # uncertain one still reports 124; nothing is re-executed.
+        # Two real days later, still suspect (the jump left high_water in the future,
+        # so no time has elapsed since the step): the trusted clock stays at the anchor,
+        # so the receipt still replays and the uncertain one reports 124; nothing is
+        # re-executed and nothing is reclaimed.
         self.clock[0] = real + 2 * self.DAY
-        self.assertEqual(2, self.run_op('op-k')['returncode'])
+        self.assertTrue(self.journal().stats()['suspect'])
+        self.assertEqual(real, self.journal().trusted_now())
+        self.assertEqual(0, self.run_op('op-k')['returncode'])
         self.assertEqual(124, self.run_op('op-ku')['returncode'])
         self.assertEqual(ran + 1, len(self.records))
         # The operator reset re-arms detection and normal operation resumes.
@@ -2953,7 +3005,14 @@ class TrustedClockCase(unittest.TestCase):
         self.assertTrue(stats['suspect'])
         self.assertEqual(real, stats['anchor'])
         self.assertEqual(real + 5 * self.DAY, stats['suspect_since'])
-        self.assertEqual(real + self.DAY, self.journal().trusted_now())
+        # Nothing has elapsed since the latest step: the trusted clock is the anchor,
+        # and it advances with the time elapsed after the step, capped at 24 h.
+        self.assertEqual(real, self.journal().trusted_now())
+        self.clock[0] += 1800
+        self.assertEqual(real + 1800, self.journal().trusted_now())
+        state = {'suspect': True, 'anchor': 100.0, 'suspect_since': 200.0}
+        self.assertEqual(100.0 + self.DAY, http_authority.clock_trusted(state, 200.0 + 2 * self.DAY))
+        self.assertEqual(100.0, http_authority.clock_trusted(state, 50.0))
 
     def test_reset_high_water_clears_suspicion(self):
         real = self.clock[0]
@@ -2983,45 +3042,6 @@ class TrustedClockCase(unittest.TestCase):
         self.assertEqual(0, self.run_op('op-new', **options)['returncode'])
         self.assertEqual(3, self.journal(**options).stats()['tombstones'])
 
-    def _rev8_store(self, high_water, rows=3):
-        """Build a schema-4 (revision 8) store: high_water only, no clock state."""
-        import sqlite3
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(str(self.path))
-        connection.execute('CREATE TABLE meta (key TEXT PRIMARY KEY, value)')
-        connection.execute('CREATE TABLE operations (%s)' % ', '.join(
-            '%s %s' % column for column in OperationJournal._COLUMNS))
-        connection.execute('CREATE INDEX operations_state_at ON operations (state, at)')
-        connection.execute('CREATE INDEX operations_tombstone_age ON operations (reclaimed_at)')
-        request = self.request('seed')
-        for index in range(rows):
-            connection.execute(
-                'INSERT INTO operations (operation_id, state, request_hash, principal, at, '
-                'envelope, bytes) VALUES (?, ?, ?, ?, ?, ?, ?)',
-                ('op-old-%d' % index, 'committed', http_authority.operation_hash(request),
-                 principal_key(request), high_water - index,
-                 json.dumps({'returncode': 0, 'stdout': 'old', 'stderr': ''}), 10))
-        for key, value in (('schema', 4), ('high_water', high_water), ('live_count', rows),
-                           ('tombstone_count', 0), ('total_bytes', 10 * rows),
-                           ('legacy_migrated', 4)):
-            connection.execute('INSERT INTO meta (key, value) VALUES (?, ?)', (key, value))
-        connection.commit()
-        connection.close()
-
-    def _schema_view(self):
-        import sqlite3
-        connection = sqlite3.connect(str(self.path))
-        try:
-            meta = dict(connection.execute('SELECT key, value FROM meta'))
-            indexes = {row[0] for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'index'")}
-            nulls = connection.execute(
-                'SELECT COUNT(*) FROM operations WHERE replay_until IS NULL '
-                'OR expires_at IS NULL').fetchone()[0]
-        finally:
-            connection.close()
-        return meta, indexes, nulls
-
     def test_a_rev8_store_far_in_the_past_upgrades_atomically(self):
         from unittest.mock import patch
         old = self.clock[0] - 10 * self.DAY
@@ -3034,7 +3054,7 @@ class TrustedClockCase(unittest.TestCase):
         meta, indexes, nulls = self._schema_view()
         self.assertEqual(4, int(meta['schema']))
         self.assertNotIn('suspect', meta)
-        self.assertNotIn('operations_state_reclaimed', indexes)
+        self.assertNotIn('operations_state_aged', indexes)
         self.assertEqual(3, nulls)
         # A clean open upgrades everything in one transaction.
         self.assertEqual('committed', self.journal().lookup('op-old-0')['state'])
@@ -3043,7 +3063,7 @@ class TrustedClockCase(unittest.TestCase):
         self.assertEqual(1, int(meta['suspect']))
         self.assertEqual(old, float(meta['anchor']))
         self.assertEqual(self.clock[0], float(meta['suspect_since']))
-        self.assertIn('operations_state_reclaimed', indexes)
+        self.assertIn('operations_state_aged', indexes)
         self.assertNotIn('operations_tombstone_age', indexes)
         self.assertEqual(0, nulls)
         # The upgraded store settles like any idle gap: no freeze.
@@ -3075,11 +3095,11 @@ class TrustedClockCase(unittest.TestCase):
         try:
             plan = ' '.join(str(row) for row in connection.execute(
                 "EXPLAIN QUERY PLAN SELECT COUNT(*), COALESCE(SUM(bytes), 0) FROM operations "
-                "WHERE state = 'expired' AND reclaimed_at <= ?", (0,)))
+                "WHERE state = 'expired' AND aged_from < ?", (0,)))
         finally:
             connection.close()
-        self.assertIn('operations_state_reclaimed', plan)
-        self.assertIn('reclaimed_at<?', plan.replace(' ', ''))
+        self.assertIn('operations_state_aged', plan)
+        self.assertIn('aged_from<?', plan.replace(' ', ''))
 
 
 class RecordStoreClockCase(unittest.TestCase):
@@ -3097,21 +3117,220 @@ class RecordStoreClockCase(unittest.TestCase):
         start = self.clock[0]
         self.store.put('idempotency', 'k', {'v': 1}, ttl=3600)
         self.clock[0] = start + 8 * 24 * 3600
-        # Read during the jump: the trusted clock is capped at anchor + 24 h, which is
-        # past this 1 h record's expiry, so it is reported expired.
-        self.assertIsNone(self.store.get('idempotency', 'k'))
+        # Read during the jump: only the time elapsed since the step counts, so the
+        # 1 h record is still live.
+        self.assertEqual({'v': 1}, self.store.get('idempotency', 'k'))
         self.store.put('idempotency', 'k2', {'v': 2}, ttl=48 * 3600)
         stats = self.store.stats()
         self.assertTrue(stats['suspect'])
         self.assertEqual(start, stats['anchor'])
-        # A record written during the jump carries the raw clock and stays live; the
-        # store deletes nothing by age while suspect or after it settles early.
-        self.assertEqual({'v': 2}, self.store.get('idempotency', 'k2'))
         self.assertEqual(0, self.store.purge())
-        self.clock[0] += 3600 + 1
-        self.assertEqual(0, self.store.purge())
+        self.assertEqual({'v': 1}, self.store.get('idempotency', 'k'))
+        # 61 minutes after the step: accepted, and the 1 h record is purged by age.
+        self.clock[0] += 3600 + 60
+        self.assertEqual(1, self.store.purge())
         self.assertFalse(self.store.stats()['suspect'])
+        self.assertIsNone(self.store.get('idempotency', 'k'))
         self.assertEqual({'v': 2}, self.store.get('idempotency', 'k2'))
+
+
+class ConfirmedTimelineCase(ClockHarness):
+    """26. Revision 10: tombstones age on the confirmed timeline (jump credit)."""
+
+    def test_an_accepted_jump_never_ages_out_a_tombstone_inside_its_real_horizon(self):
+        # The reviewer's probe-jump-accepted: 26 days of traffic, a +8 d jump that
+        # persists past the settle hour with traffic, then a correction.
+        start = self.clock[0]
+        for index in range(104):
+            self.clock[0] = start + index * 6 * self.HOUR
+            self.assertEqual(0, self.run_op('h-%d' % index)['returncode'])
+        real = self.clock[0]
+        self.assertEqual(0, self.run_op('op-fresh')['returncode'])
+        ran = len(self.records)
+        self.clock[0] = real + 8 * self.DAY
+        for index in range(8):
+            self.clock[0] += 600
+            self.assertEqual(0, self.run_op('jump-%d' % index)['returncode'])
+        stats = self.journal().stats()
+        self.assertFalse(stats['suspect'])
+        self.assertAlmostEqual(8 * self.DAY, stats['jump_credit'], delta=700)
+        # Every identity is still recorded: the accepted jump aged no tombstone out.
+        for index in range(104):
+            self.assertIsNotNone(self.journal().lookup('h-%d' % index), index)
+        self.clock[0] = real + 2 * self.HOUR
+        ran = len(self.records)
+        for index in range(104):
+            retry = self.run_op('h-%d' % index)
+            self.assertIn(retry['returncode'], (0, 2), retry)
+        self.assertIn(self.run_op('op-fresh')['returncode'], (0, 2))
+        self.assertEqual(ran, len(self.records))
+        # The credit extends retention by the jump: with steady traffic after the
+        # correction, h-0 (reclaimed about day 1) goes only once its confirmed-timeline
+        # age passes the horizon, i.e. about 8 days later than on the raw clock.
+        moment = real + 2 * self.HOUR
+        index = 0
+        while moment < start + 40 * self.DAY:
+            moment += 12 * self.HOUR
+            self.clock[0] = moment
+            self.run_op('later-%d' % index)
+            index += 1
+            if moment < start + 39 * self.DAY:
+                self.assertIsNotNone(self.journal().lookup('h-0'), moment - start)
+        self.assertIsNone(self.journal().lookup('h-0'))
+        self.assertAlmostEqual(8 * self.DAY, self.journal().stats()['jump_credit'], delta=700)
+
+    def test_a_60_second_receipt_replays_during_a_jump(self):
+        real = self.clock[0]
+        self.assertEqual(0, self.run_op('op-k')['returncode'])
+        self.clock[0] = real + 60 + 8 * self.DAY
+        ran = len(self.records)
+        replay = self.run_op('op-k')
+        self.assertEqual(0, replay['returncode'], replay)
+        self.assertEqual(ran, len(self.records))
+        self.assertEqual(0, self.run_op('op-new')['returncode'])
+        self.clock[0] += 1800
+        self.assertEqual(0, self.run_op('op-k')['returncode'])
+        self.assertEqual(real + 1800, self.journal().trusted_now())
+
+    def test_a_corrected_jump_keeps_its_credit_across_reset(self):
+        real = self.clock[0]
+        self.run_op('op-1')
+        self.clock[0] = real + 8 * self.DAY
+        self.run_op('op-2')
+        self.clock[0] = real + 120
+        self.run_op('op-3')
+        stats = self.journal().stats()
+        self.assertTrue(stats['suspect'])
+        self.assertAlmostEqual(8 * self.DAY, stats['jump_credit'], delta=1)
+        self.journal().reset_high_water()
+        stats = self.journal().stats()
+        self.assertFalse(stats['suspect'])
+        self.assertAlmostEqual(8 * self.DAY, stats['jump_credit'], delta=1)
+        # A backward step never changes the credit.
+        self.clock[0] -= self.DAY
+        self.run_op('op-4')
+        self.assertAlmostEqual(8 * self.DAY, self.journal().stats()['jump_credit'], delta=1)
+
+    def test_weekend_gaps_keep_the_tombstone_count_bounded(self):
+        # 60 simulated days: an op every 2 h from 08:00 to 18:00 on weekdays, nothing at
+        # weekends (a ~62 h gap, credited). Tombstone retention is the horizon plus the
+        # gaps credited since reclaim; the count stops growing and nothing inside the
+        # horizon is deleted.
+        start = self.clock[0]
+        issued = {}
+        counts = {}
+        for day in range(60):
+            if day % 7 in (5, 6):
+                continue
+            for slot in range(6):
+                self.clock[0] = start + day * self.DAY + (8 + 2 * slot) * self.HOUR
+                operation = 'w-%d-%d' % (day, slot)
+                self.assertEqual(0, self.run_op(operation)['returncode'])
+                issued[operation] = self.clock[0]
+            counts[day] = self.journal().stats()['tombstones']
+            if day % 7 != 4:
+                continue
+            # No identity inside the real horizon has been deleted.
+            for operation, moment in issued.items():
+                if self.clock[0] - moment < 30 * self.DAY:
+                    self.assertIsNotNone(self.journal().lookup(operation), operation)
+        stats = self.journal().stats()
+        credit = stats['jump_credit']
+        self.assertGreater(credit, 7 * 60 * self.HOUR)
+        # Every surviving identity is younger than the horizon plus the total credit.
+        for operation, moment in issued.items():
+            if self.journal().lookup(operation) is not None:
+                self.assertLess(self.clock[0] - moment, 30 * self.DAY + credit + self.DAY)
+        # Bounded: the oldest identities have been deleted and the count has levelled.
+        self.assertIsNone(self.journal().lookup('w-0-0'))
+        late = [counts[day] for day in sorted(counts) if day >= 50]
+        self.assertLessEqual(max(late) - min(late), 15)
+        self.assertLess(stats['tombstones'], len(issued))
+
+    def _rev9_store(self, high_water, suspect=False):
+        """Build a schema-5 (revision 9) store: clock state, (state, reclaimed_at) index,
+        no ``aged_from`` column and no ``jump_credit``."""
+        import sqlite3
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(str(self.path))
+        columns = [column for column in OperationJournal._COLUMNS if column[0] != 'aged_from']
+        connection.execute('CREATE TABLE meta (key TEXT PRIMARY KEY, value)')
+        connection.execute('CREATE TABLE operations (%s)' % ', '.join(
+            '%s %s' % column for column in columns))
+        connection.execute('CREATE INDEX operations_state_at ON operations (state, at)')
+        connection.execute('CREATE INDEX operations_state_reclaimed '
+                           'ON operations (state, reclaimed_at)')
+        request = self.request('seed')
+        for index in range(3):
+            connection.execute(
+                'INSERT INTO operations (operation_id, state, request_hash, principal, at, '
+                'bytes, reclaimed_at, replay_until, expires_at) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                ('tomb-%d' % index, 'expired', http_authority.operation_hash(request),
+                 principal_key(request), high_water - 2 * self.DAY, 10,
+                 high_water - self.DAY - index, high_water - 2 * self.DAY,
+                 high_water + 29 * self.DAY))
+        for key, value in (('schema', 5), ('high_water', high_water),
+                           ('suspect', 1 if suspect else 0), ('live_count', 0),
+                           ('tombstone_count', 3), ('total_bytes', 30),
+                           ('legacy_migrated', 5)):
+            connection.execute('INSERT INTO meta (key, value) VALUES (?, ?)', (key, value))
+        connection.commit()
+        connection.close()
+
+    def test_a_rev9_store_upgrades_to_schema_6_atomically(self):
+        import sqlite3
+        from unittest.mock import patch
+        high = self.clock[0] - 60
+        self._rev9_store(high)
+        with patch.object(OperationJournal, '_upgrade_clock',
+                          side_effect=RuntimeError('killed during upgrade')):
+            with self.assertRaises(RuntimeError):
+                self.journal().lookup('tomb-0')
+        meta, indexes, _ = self._schema_view()
+        self.assertEqual(5, int(meta['schema']))
+        self.assertNotIn('jump_credit', meta)
+        self.assertIn('operations_state_reclaimed', indexes)
+        connection = sqlite3.connect(str(self.path))
+        columns = {row[1] for row in connection.execute('PRAGMA table_info(operations)')}
+        connection.close()
+        self.assertNotIn('aged_from', columns)
+        # Clean open: one transaction adds the column, backfills it, swaps the index
+        # and initialises the credit.
+        self.assertEqual('expired', self.journal().lookup('tomb-0')['state'])
+        meta, indexes, _ = self._schema_view()
+        self.assertEqual(6, int(meta['schema']))
+        self.assertEqual(0.0, float(meta['jump_credit']))
+        self.assertIn('operations_state_aged', indexes)
+        self.assertNotIn('operations_state_reclaimed', indexes)
+        for index in range(3):
+            row = self.journal().lookup('tomb-%d' % index)
+            self.assertEqual(row['reclaimed_at'], row['aged_from'])
+        self.assertFalse(self.journal().stats()['suspect'])
+        self.assertEqual(0, self.run_op('op-new')['returncode'])
+
+    def test_a_rev8_store_gets_zero_credit_on_upgrade(self):
+        self._rev8_store(self.clock[0] - 10 * self.DAY)
+        stats = self.journal().stats()
+        self.assertTrue(stats['suspect'])
+        self.assertEqual(0.0, stats['clock_persisted']['jump_credit'])
+
+    def test_backup_snapshots_are_rollback_journal_files(self):
+        import sqlite3
+        import admin
+        self.run_op('op-1')
+        destination = self.tmp / 'backups' / 'p.http-operations.sqlite3'
+        admin.snapshot_journal(self.path, destination)
+        self.assertEqual([destination.name],
+                         sorted(path.name for path in destination.parent.iterdir()))
+        connection = sqlite3.connect(str(destination))
+        try:
+            self.assertEqual('delete',
+                             connection.execute('PRAGMA journal_mode').fetchone()[0])
+        finally:
+            connection.close()
+        self.assertEqual([destination.name],
+                         sorted(path.name for path in destination.parent.iterdir()))
 
 
 if __name__ == '__main__':

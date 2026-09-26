@@ -278,7 +278,8 @@ class RecordStore:
       (``http_authority`` module docstring): ``meta`` holds ``high_water``,
       ``suspect``, ``anchor`` and ``suspect_since``; every write transaction observes
       the raw clock; whether a record has expired is decided against the trusted clock
-      (``min(now, anchor + max_skew)`` while suspect); ``created_at`` is stamped with
+      (while suspect, the anchor plus the time elapsed since the step, capped at
+      ``anchor + max_skew``); ``created_at`` is stamped with
       the raw clock; and expired records are deleted only while the store is not
       suspect, against the raw clock.
     """
@@ -420,8 +421,10 @@ class RecordStore:
         moment = float(self._now() if now is None else now)
         with self._connection() as connection:
             connection.execute('BEGIN IMMEDIATE')
+            credit = clock_state(connection)['jump_credit']
             clock_persist(connection, {'high_water': moment, 'suspect': False,
-                                       'anchor': None, 'suspect_since': None})
+                                       'anchor': None, 'suspect_since': None,
+                                       'jump_credit': credit})
             connection.execute('COMMIT')
         return moment
 
