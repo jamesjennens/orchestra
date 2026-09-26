@@ -115,6 +115,110 @@ class NativeLabelResolutionTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 _native_labels(self.root, self.path, 'worker', 'pp-3q2')
 
+    def test_guard_refuses_a_parent_holding_requirement_labels(self):
+        # kittrial-pth.26 item 1: an accepted requirement parent must not hand
+        # requirement/requirement:accepted to a raw `create --parent` child, so
+        # a contributor cannot mint an accepted requirement by inheritance.
+        rows = [{'id': 'pp-req.1',
+                 'labels': ['requirement', 'requirement:accepted']}]
+        with mock.patch.object(endpoint.subprocess, 'run', _rows_run(rows)):
+            with self.assertRaises(ValueError) as caught:
+                _guard_reserved_labels(self.root, self.path,
+                                       ['create', 'child', '--parent', 'pp-req.1'],
+                                       'mallory')
+        message = str(caught.exception)
+        self.assertIn('Refusing create --parent pp-req.1:', message)
+        self.assertRegex(message, r'reserved label requirement')
+
+    def test_guard_refuses_a_backfilled_requirement_parent_without_request_labels(self):
+        # The .30 request-namespace guard cannot see this parent: it holds only
+        # the controlled requirement labels (operator backfill). The extended
+        # guard must still refuse the inheritance.
+        rows = [{'id': 'pp-back.1', 'labels': ['requirement', 'requirement:draft']}]
+        with mock.patch.object(endpoint.subprocess, 'run', _rows_run(rows)):
+            with self.assertRaises(ValueError):
+                _guard_reserved_labels(self.root, self.path,
+                                       ['create', 'child', '--parent', 'pp-back.1'],
+                                       'mallory')
+
+    def test_guard_allows_explicit_no_inherit_from_a_requirement_parent(self):
+        # The documented safe route: opt out of inheritance, then no reserved
+        # label can reach the child and no native read is needed before it.
+        for value in ('', '=1', '=true', '=T'):
+            with self.subTest(value=value):
+                with mock.patch.object(endpoint.subprocess, 'run') as run:
+                    _guard_reserved_labels(
+                        self.root, self.path,
+                        ['create', 'child', '--parent', 'pp-req.1',
+                         '--no-inherit-labels' + value], 'mallory')
+                    run.assert_not_called()
+
+    def test_guard_refuses_set_labels_on_a_requirement_holder(self):
+        # kittrial-pth.26 item 2: `--set-labels` replaces the whole set, so a
+        # replacement that names no reserved value would silently drop the
+        # operator's acceptance and the coordination namespace.
+        rows = [{'id': 'pp-req.1',
+                 'labels': ['requirement', 'requirement:accepted']}]
+        with mock.patch.object(endpoint.subprocess, 'run', _rows_run(rows)):
+            with self.assertRaises(ValueError) as caught:
+                _guard_reserved_labels(self.root, self.path,
+                                       ['update', 'pp-req.1', '--set-labels',
+                                        'keep'], 'mallory')
+        message = str(caught.exception)
+        self.assertIn('Refusing to replace labels on pp-req.1:', message)
+        self.assertRegex(message, r'reserved label requirement')
+
+    def test_guard_refuses_set_labels_on_a_mixed_namespace_holder(self):
+        # A record holding both namespaces is refused too; the refusal names one
+        # of the reserved labels it currently holds.
+        rows = [{'id': 'pp-req.1',
+                 'labels': ['requirement', 'requirement:accepted',
+                            'request:' + 'a' * 64,
+                            'request-content:' + 'b' * 64]}]
+        with mock.patch.object(endpoint.subprocess, 'run', _rows_run(rows)):
+            with self.assertRaises(ValueError) as caught:
+                _guard_reserved_labels(self.root, self.path,
+                                       ['update', 'pp-req.1', '--set-labels',
+                                        'keep'], 'mallory')
+        message = str(caught.exception)
+        self.assertIn('Refusing to replace labels on pp-req.1:', message)
+        self.assertRegex(message, r'reserved label (requirement|request)')
+
+    def test_guard_refuses_remove_label_on_a_requirement_holder(self):
+        rows = [{'id': 'pp-req.1', 'labels': ['requirement:accepted']}]
+        with mock.patch.object(endpoint.subprocess, 'run', _rows_run(rows)):
+            with self.assertRaises(ValueError):
+                _guard_reserved_labels(self.root, self.path,
+                                       ['update', 'pp-req.1', '--remove-label',
+                                        'triage'], 'mallory')
+
+    def test_guard_allows_ordinary_labels_on_a_requirement_holder(self):
+        # --add-label can only add, and adding a reserved value is refused by
+        # reserved_label_in_args(); ordinary labels stay available.
+        rows = [{'id': 'pp-req.1', 'labels': ['requirement']}]
+        with mock.patch.object(endpoint.subprocess, 'run', _rows_run(rows)):
+            _guard_reserved_labels(self.root, self.path,
+                                   ['update', 'pp-req.1', '--add-label',
+                                    'reviewed'], 'mallory')
+            _guard_reserved_labels(self.root, self.path,
+                                   ['create', 'child', '--parent', 'pp-req.1',
+                                    '--no-inherit-labels'], 'mallory')
+        rows = [{'id': 'pp-plain', 'labels': ['a']}]
+        with mock.patch.object(endpoint.subprocess, 'run', _rows_run(rows)):
+            _guard_reserved_labels(self.root, self.path,
+                                   ['update', 'pp-plain', '--set-labels', 'b'],
+                                   'mallory')
+
+    def test_guard_requirement_refusal_resolves_a_short_token(self):
+        rows = [{'id': 'pp-req.1', 'labels': ['requirement:accepted']}]
+        with mock.patch.object(endpoint.subprocess, 'run', _rows_run(rows)):
+            with self.assertRaises(ValueError) as caught:
+                _guard_reserved_labels(self.root, self.path,
+                                       ['update', 'req.1', '--set-labels',
+                                        'keep'], 'mallory')
+        self.assertIn('Refusing to replace labels on pp-req.1:',
+                      str(caught.exception))
+
     def test_guard_refuses_a_holder_reached_by_short_token(self):
         rows = [{'id': 'pp-3q2', 'labels': ['request:B', 'plain']}]
         with mock.patch.object(endpoint.subprocess, 'run', _rows_run(rows)):
@@ -238,6 +342,134 @@ class NativeLabelResolutionTests(unittest.TestCase):
                         _guard_reserved_labels(self.root, self.path, args,
                                                'worker')
                     run.assert_not_called()
+
+
+class _EndpointRootMixin:
+    """A disposable root/project for driving endpoint.execute end to end."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix='endpoint-dispatch-')
+        self.root = Path(self._tmp.name)
+        (self.root / 'bin').mkdir()
+        (self.root / 'bin' / 'bd').write_text('', encoding='utf-8')
+        (self.root / 'deployment.private.json').write_text(
+            '{"password": "x", "unit": "none", "port": "1"}', encoding='utf-8')
+        (self.root / 'projects' / 'pp' / '.beads').mkdir(parents=True)
+        (self.root / 'projects' / 'pp' / '.beads' / 'metadata.json').write_text(
+            '{}', encoding='utf-8')
+        self.addCleanup(self._tmp.cleanup)
+
+    def execute(self, action, payload, actor='alice'):
+        return endpoint.execute(self.root, {
+            'project': 'pp', 'actor': actor, 'action': action,
+            'args': [json.dumps(payload)]})
+
+    def bd(self, args, actor='mallory'):
+        return endpoint.execute(self.root, {
+            'project': 'pp', 'actor': actor, 'action': 'bd', 'args': args})
+
+    def out(self, result):
+        return json.loads(result['stdout'])
+
+
+@unittest.skipIf(endpoint is None, 'endpoint imports fcntl (POSIX-only)')
+class EndpointSingleDispatchTests(_EndpointRootMixin, unittest.TestCase):
+    """kittrial-pth.26 rev3 P1 endpoint-double-dispatch.
+
+    endpoint.execute kept the lifecycle/coordinate block twice, so both actions
+    ran twice under the lock and the caller saw the second, reconciled result: a
+    fresh merge-release returned {released:false,available:true} and a fresh
+    lifecycle write returned reconciled:true. Each request must dispatch once.
+    """
+
+    def test_lifecycle_dispatches_exactly_once(self):
+        calls = []
+
+        def apply(payload, actor, run):
+            calls.append(payload)
+            return {'event_id': 'e1', 'reconciled': len(calls) > 1}
+
+        with mock.patch.object(endpoint, 'apply_native', apply):
+            result = self.execute('lifecycle',
+                                  {'schema_version': 1, 'operation_id': 'lc1'})
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(self.out(result)['reconciled'])
+
+    def test_coordinate_dispatches_exactly_once(self):
+        import coordination
+        counts = {}
+
+        def apply(payload, actor, run, path):
+            operation = payload.get('operation')
+            counts[operation] = counts.get(operation, 0) + 1
+            if operation == 'merge-release':
+                return {'released': counts[operation] == 1}
+            return {'reconciled': counts[operation] > 1}
+
+        with mock.patch.object(coordination, 'apply_native', apply):
+            release = self.out(self.execute('coordinate',
+                                            {'operation': 'merge-release'}))
+            acquire = self.out(self.execute('coordinate',
+                                            {'operation': 'merge-acquire'}))
+        self.assertEqual(counts, {'merge-release': 1, 'merge-acquire': 1})
+        self.assertTrue(release['released'])
+        self.assertFalse(acquire['reconciled'])
+
+    def test_requirement_dispatches_exactly_once_not_lifecycle(self):
+        import requirement_records
+        calls = []
+
+        def apply(payload, actor, run, path):
+            calls.append(payload)
+            return {'id': 'r1', 'reconciled': len(calls) > 1}
+
+        with mock.patch.object(requirement_records, 'apply_native', apply):
+            result = self.execute('requirement', {'operation_id': 'r1'})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.out(result)['id'], 'r1')
+
+
+@unittest.skipIf(endpoint is None, 'endpoint imports fcntl (POSIX-only)')
+class EndpointLabelAliasGuardTests(_EndpointRootMixin, unittest.TestCase):
+    """kittrial-pth.26 rev3 P1 hidden-label-alias at the endpoint seam."""
+
+    RESERVED = ('requirement', 'requirement:accepted', 'requirement:draft',
+                'brd-section', 'request:' + 'a' * 64,
+                'requirement,requirement:accepted')
+
+    def test_create_label_alias_is_refused_before_any_native_write(self):
+        with mock.patch.object(endpoint.subprocess, 'run') as run:
+            for value in self.RESERVED:
+                for args in (['create', 'x', '--label', value],
+                             ['create', 'x', '--label=' + value]):
+                    with self.subTest(args=str(args)):
+                        with self.assertRaisesRegex(
+                                ValueError, 'Reserved coordination/requirement labels'):
+                            self.bd(args)
+            run.assert_not_called()
+
+    def test_unrecognized_create_update_flag_is_refused(self):
+        with mock.patch.object(endpoint.subprocess, 'run') as run:
+            for args in (['create', 'x', '--labell', 'requirement'],
+                         ['update', 'x', '--set-label', 'requirement'],
+                         ['update', 'x', '--mystery']):
+                with self.subTest(args=str(args)):
+                    with self.assertRaisesRegex(ValueError, 'unrecognized flag'):
+                        self.bd(args)
+            run.assert_not_called()
+
+    def test_ordinary_labels_still_reach_the_native_client_once(self):
+        def proc(argv, **kwargs):
+            return _Proc(0, '{"id": "pp-1"}', '')
+
+        for args in (['create', 'x', '--label', 'frontend,bug', '--json'],
+                     ['create', 'x', '--labels', 'frontend', '--json'],
+                     ['create', 'x', '-l', 'frontend', '--json'],
+                     ['update', 'pp-1', '--add-label', 'reviewed', '--json']):
+            with self.subTest(args=str(args)):
+                with mock.patch.object(endpoint.subprocess, 'run', proc):
+                    result = self.bd(args)
+                self.assertEqual(result['returncode'], 0)
 
 
 if __name__ == '__main__':

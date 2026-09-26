@@ -41,14 +41,37 @@ A local commit alone is insufficient. Uncommitted files and local-only evidence 
 Raw `comments add` bodies (positional text and `--file` inputs) are checked
 for reserved machine-record prefixes (`Kind: contribution-review-v1`,
 `Kind: task-checkpoint-v1`, `Kind: lifecycle-v1`,
-`Kind: requirement-revision-v1`, `Kind: task-handoff-v1`,
+`Kind: requirement-revision-v1`, `Kind: requirement-acceptance-v1`,
+`Kind: task-handoff-v1`,
 `Kind: task-handoff-complete-v1`, `Kind: plan-registration.`). Raw review,
-checkpoint, lifecycle and handoff records are rejected before any native
-mutation. Requirement revisions and worker-plan registrations retain their
+checkpoint, lifecycle, handoff, requirement and requirement-acceptance records
+are rejected before any native mutation; worker-plan registrations retain their
 supported raw transport only after schema, canonical content and applicable
-actor/task checks. Rejected writes name the dedicated
-structured operation (`review`, `checkpoint`, `lifecycle record`, `handoff`,
+actor/task checks. Rejected writes name the dedicated structured operation
+(`review`, `checkpoint`, `lifecycle record`, `handoff`,
+`requirement_records.py draft|revise`, `admin.py requirement-apply`,
 `worker_gate.py register`). Ordinary prose remains valid.
+
+The controlled requirement labels (`requirement`, `brd-section`,
+`requirement:draft`, `requirement:accepted`) are reserved too, on values and by
+read-before-write: raw `create`/`update` label writes are refused, a raw
+`create --parent X` inherits nothing when X holds one of them, and a raw
+`--set-labels`/`--remove-label` on such a record is refused. Acceptance cannot be
+forged with `update X --add-label requirement:accepted`, inherited from an
+accepted parent, or stripped by replacing a record's labels.
+
+Contributors draft requirement records with the dedicated
+`requirement_records.py draft|revise` operation
+([native integration](REQUIREMENTS_INTEGRATION.md#draft-or-revise-a-requirement-record-in-one-step))
+and may only write `requirement:draft`; a draft must not carry an `acceptance`
+object. Revise follows the **trusted-team** model documented there: any
+contributor actor may revise any draft, and the actor string is an attribution,
+not an authenticated owner identity. Acceptance of a record and demotion of an
+accepted record are owner/operator-only and require F3 acceptance evidence
+(named owners plus decision/evidence ids) through `admin.py requirement-apply`,
+which also writes the durable `requirement-acceptance-v1` evidence record on the
+native record. Operators type records that already exist with
+`admin.py requirement-backfill`.
 
 ## Make review-ready work discoverable
 

@@ -24,7 +24,7 @@ from version import report
 from reserved_comments import (check_raw_request, comment_target,
                                first_reserved_label, label_guard_request,
                                operator_only_in_args, raw_file_flag_in_args,
-                               reserved_label_in_args)
+                               reserved_label_in_args, unresolved_bd_flags)
 from http_authority import AuthorityConfig, NativeRunner, journal_path, run_guarded
 
 ALLOWED={'list','show','ready','search','count','create','update','close','reopen','comments','dep','state','lint'}
@@ -67,24 +67,26 @@ def _guard_reserved_labels(root,path,args,actor):
     Refusing a reserved label *value* is not enough: bd copies parent labels
     onto `create --parent X` children, and `--set-labels`/`--remove-label`
     replace labels on an existing issue. Both are read first, under the lock
-    the mutation will hold, so a reserved label can neither reach a
-    contributor-created issue nor be removed from an operator-created holder.
+    the mutation will hold, so a reserved label (a coordination `request:`/
+    `request-content:` label, or a controlled requirement type/state label)
+    can neither reach a contributor-created issue nor be removed from an
+    operator-created holder.
     """
     request=label_guard_request(args)
     if request is None:return
     if request['ambiguous']:
-        raise ValueError('Refusing label-affecting request: the flags could not be resolved unambiguously, so the reserved request/request-content namespace cannot be verified; no native write was attempted. Pass one explicit target (and one --parent) with no unknown flags and a valid --no-inherit-labels value.')
+        raise ValueError('Refusing label-affecting request: the flags could not be resolved unambiguously, so the reserved request/request-content/requirement label namespace cannot be verified; no native write was attempted. Pass one explicit target (and one --parent) with no unknown flags and a valid --no-inherit-labels value.')
     if request['kind']=='inherit':
         canonical,labels=_native_labels(root,path,actor,request['target'])
         label=first_reserved_label(list(labels))
         if label is not None:
-            raise ValueError('Refusing create --parent %s: the parent currently holds the reserved label %s, and bd copies parent labels onto a new child unless --no-inherit-labels is given, which would make a second holder of the coordination namespace. Re-run with --no-inherit-labels, or use the coordination create-child workflow (coordination.py).'%(canonical,label))
+            raise ValueError('Refusing create --parent %s: the parent currently holds the reserved label %s, and bd copies parent labels onto a new child unless --no-inherit-labels is given, which would make a second holder of the coordination/requirement namespace (for example a child that inherits requirement:accepted without F3 acceptance evidence). Re-run with --no-inherit-labels, or use the coordination create-child workflow (coordination.py).'%(canonical,label))
         return
     for target in request['targets']:
         canonical,labels=_native_labels(root,path,actor,target)
         label=first_reserved_label(list(labels))
         if label is not None:
-            raise ValueError('Refusing to replace labels on %s: it currently holds the reserved label %s, which only coordination.py may write. Use the coordination workflow (coordination.py); --add-label remains available for ordinary labels.'%(canonical,label))
+            raise ValueError('Refusing to replace labels on %s: it currently holds the reserved label %s, which only coordination.py and requirement_records.py may write. Replacing or removing it would silently drop the coordination namespace or an operator acceptance; use the coordination workflow (coordination.py) or the requirement command (requirement_records.py draft|revise, admin.py requirement-apply); --add-label remains available for ordinary labels.'%(canonical,label))
 
 def execute(root,request,authority_config=None,require_authority=False):
     name=request['project'];path=project_dir(root,name)
@@ -146,7 +148,7 @@ def execute(root,request,authority_config=None,require_authority=False):
             return run_guarded(request,journal_path(path),briefing_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
-    if action in ('lifecycle','coordinate'):
+    if action in ('lifecycle','coordinate','requirement'):
         args=request.get('args',[])
         if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):raise ValueError('Expected one JSON payload')
         payload=json.loads(args[0])
@@ -158,9 +160,12 @@ def execute(root,request,authority_config=None,require_authority=False):
         runner=NativeRunner(run)
         def lifecycle_effect():
             if action=='lifecycle':result=apply_native(payload,actor,runner)
-            else:
+            elif action=='coordinate':
                 from coordination import apply_native as coordinate
                 result=coordinate(payload,actor,runner,path)
+            else:
+                from requirement_records import apply_native as requirement_apply
+                result=requirement_apply(payload,actor,runner,path)
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
@@ -200,13 +205,23 @@ def execute(root,request,authority_config=None,require_authority=False):
     # cannot switch project. `--` ends flag parsing, as in bd itself, so a body
     # operand after it is not a flag.
     if operator_only_in_args(args) is not None:raise ValueError('Connection/identity/file configuration flags are operator-only')
-    # The reserved coordination label namespaces are written only by
-    # coordination.py through its internal run path; the raw contributor bd
-    # path must not plant request:/request-content: labels, nor reach them by
-    # inheriting them from a labelled parent or by replacing the labels of an
-    # existing holder (checked under the lock below, before the native write).
+    # The reserved coordination/requirement label namespaces are written only
+    # by coordination.py and requirement_records.py through their internal run
+    # paths; the raw contributor bd path must not plant request:/
+    # request-content: labels or the controlled requirement type/state labels,
+    # nor reach them by inheriting them from a labelled parent or by replacing
+    # the labels of an existing holder (checked under the lock below, before
+    # the native write).
     label=reserved_label_in_args(args)
-    if label is not None:raise ValueError('Reserved request/request-content labels are operator-only; use the coordination request workflow (coordination.py)')
+    if label is not None:raise ValueError('Reserved coordination/requirement labels are operator-only; use the coordination request workflow (coordination.py) or the requirement command (requirement_records.py draft|revise)')
+    # bd 1.2.2 accepts the undocumented `create --label` alias of --labels, so a
+    # table built only from --help missed a whole label-writing spelling. Every
+    # accepted alias is now in the table above; an unresolvable create/update
+    # flag could still be another hidden/deprecated alias (or a value-taking
+    # flag the scan would misread), so it fails closed here rather than being
+    # assumed harmless.
+    unrecognized=unresolved_bd_flags(args)
+    if unrecognized:raise ValueError('Refusing create/update with unrecognized flag(s) %s: the reserved coordination/requirement label namespace cannot be verified, so no native write was attempted. Pass only documented bd 1.2.2 flags.'%(', '.join(str(token) for token in unrecognized),))
     # Positional dep/comment IDs are fine; file inputs must be transported explicitly.
     # Command-aware: `-f` is --file on comments/create but --force on close, so a
     # legitimate force-close is no longer refused as a raw server path.

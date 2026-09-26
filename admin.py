@@ -164,7 +164,7 @@ def validate_coordination_files(files):
     if not isinstance(files,dict):raise ValueError('Invalid coordination files map')
     for name,record in files.items():
         quarantine = isinstance(name,str) and re.fullmatch(r'\.feedback\.jsonl\.(?:[a-f0-9]{16}|[a-f0-9]{64})\.incomplete',name)
-        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries)/[a-f0-9]{64}\.json',name)
+        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-backfills)/[a-f0-9]{64}\.json',name)
         if name not in ('.merge-context.json','ONBOARDING.md','.sessions.json','.feedback.jsonl') and not quarantine and not journal:raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
         if name=='.sessions.json':
@@ -183,6 +183,12 @@ def validate_coordination_files(files):
             from handoff import validate_recovery
             validate_recovery(record)
             if name!='.handoff-recoveries/'+content_hash({'request_id':record['request_id']})+'.json':raise ValueError('Handoff recovery path mismatch')
+        if name.startswith('.requirement-requests/'):
+            from requirement_records import validate_receipt
+            validate_receipt(record)
+        if name.startswith('.requirement-backfills/'):
+            from requirement_records import validate_receipt
+            validate_receipt(record,backfill=True)
         if name=='ONBOARDING.md' and (set(record)!={'text'} or not isinstance(record['text'],str) or not record['text'].strip() or len(record['text'].encode('utf-8'))>8000):raise ValueError('Invalid onboarding backup')
         if name=='.feedback.jsonl':
             from feedback import validate_feed_text
@@ -335,6 +341,19 @@ def backup_project(root,name):
         for record in recoveries.glob('*.json'):
             if record.is_symlink():raise ValueError('Handoff recovery record must not be a symlink')
             files['.handoff-recoveries/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
+        # The requirement journals are the operator's recovery cache for
+        # requirement-apply/backfill: back them up so a restore keeps the F3
+        # acceptance evidence and the pending/reconciled operation IDs.
+        requirement_requests=path/'.requirement-requests'
+        if requirement_requests.is_symlink():raise ValueError('Requirement request journal must not be a symlink')
+        for record in requirement_requests.glob('*.json'):
+            if record.is_symlink():raise ValueError('Requirement request receipt must not be a symlink')
+            files['.requirement-requests/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
+        requirement_backfills=path/'.requirement-backfills'
+        if requirement_backfills.is_symlink():raise ValueError('Requirement backfill journal must not be a symlink')
+        for record in requirement_backfills.glob('*.json'):
+            if record.is_symlink():raise ValueError('Requirement backfill receipt must not be a symlink')
+            files['.requirement-backfills/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
         if (path/'ONBOARDING.md').exists() or (path/'ONBOARDING.md').is_symlink():
             from onboarding import read_document, PROJECT_LIMIT
             files['ONBOARDING.md']={'text':read_document(path,'ONBOARDING.md',PROJECT_LIMIT)}
@@ -381,6 +400,15 @@ def restore_coordination(root,source,destination):
     for name in files:
         target=path/name
         if target.is_symlink() or target.parent.is_symlink() or target.with_suffix('.tmp').is_symlink():raise ValueError('Coordination restore paths must not be symlinks')
+    # Validate every requirement receipt before the first write, so a malformed
+    # one cannot create a journal directory or a partial restore.
+    for name,record in files.items():
+        if name.startswith('.requirement-requests/'):
+            from requirement_records import validate_receipt
+            validate_receipt(record)
+        elif name.startswith('.requirement-backfills/'):
+            from requirement_records import validate_receipt
+            validate_receipt(record,backfill=True)
     for name,record in files.items():
         target=project_dir(root,destination)/name
         target.parent.mkdir(exist_ok=True)
@@ -407,6 +435,13 @@ def main():
     a=sub.add_parser('add-project');a.add_argument('project')
     a=sub.add_parser('set-onboarding');a.add_argument('project');a.add_argument('--file',required=True)
     a=sub.add_parser('handoff');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('requirement-backfill');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('requirement-apply');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('requirement-reconcile');a.add_argument('project');a.add_argument('--operation-id',required=True)
+    a.add_argument('--actor',required=True);a.add_argument('--reason',required=True)
+    a.add_argument('--disposition',choices=['failed','released','complete'],default='released')
+    a.add_argument('--issue-id',dest='issue_id',default=None,
+                   help='with --disposition complete, the exact native record to confirm')
     for command in ('backup','restore-new'):
         a=sub.add_parser(command);a.add_argument('project')
         if command=='restore-new':a.add_argument('destination')
@@ -464,6 +499,36 @@ def main():
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             print(json.dumps(handoff(path,args.actor,payload,run,operator=True)))
+    elif args.command=='requirement-backfill':
+        import fcntl
+        from requirement_records import backfill
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        payload=json.loads(Path(args.file).read_text(encoding='utf-8-sig'))
+        def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            print(json.dumps(backfill(payload,args.actor,run,path)))
+    elif args.command=='requirement-apply':
+        import fcntl
+        from requirement_records import apply_native
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        payload=json.loads(Path(args.file).read_text(encoding='utf-8-sig'))
+        def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            print(json.dumps(apply_native(payload,args.actor,run,path,operator=True)))
+    elif args.command=='requirement-reconcile':
+        import fcntl
+        from requirement_records import reconcile
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            print(json.dumps(reconcile(path,args.operation_id,args.actor,args.reason,
+                                       args.disposition,run,issue_id=args.issue_id)))
     elif args.command=='backup':print(backup_project(root,args.project))
     elif args.command=='journal':
         import fcntl

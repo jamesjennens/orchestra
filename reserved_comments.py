@@ -11,15 +11,98 @@ This module is import-safe on all platforms (no fcntl). endpoint.py enforces
 it on the contributor `bd` path before any native mutation.
 """
 from briefing import PREFIX as CHECKPOINT_PREFIX
-from export_requirements import REVISION_PREFIX as REQUIREMENT_PREFIX
+from export_requirements import (ACCEPTANCE_PREFIX,
+                                 REVISION_PREFIX as REQUIREMENT_PREFIX)
 from handoff import (
     COMPLETE_PREFIX as HANDOFF_COMPLETE_PREFIX,
     INTENT_PREFIX as HANDOFF_PREFIX,
     parse_identity as parse_handoff_identity,
 )
 from lifecycle import PREFIX as LIFECYCLE_PREFIX
+from requirements import ACCEPTANCE_FIELDS, SHA256_TEXT
 from review_workflow import PREFIX as REVIEW_PREFIX
 from worker_gate import PREFIX as PLAN_PREFIX, parse_body as parse_plan_body
+
+
+# The caller-supplied half of the contract acceptance object. `manifest_sha256`
+# is bound by the command, never supplied: at record level the bound name is
+# `record_sha256` (the accepted revision's content hash), because the hash of a
+# whole publication manifest does not exist when a single record is accepted.
+ACCEPTANCE_DECISION_FIELDS = tuple(name for name in ACCEPTANCE_FIELDS
+                                   if name != 'manifest_sha256')
+ACCEPTANCE_SOURCES = ('requirement-apply', 'requirement-backfill')
+ACCEPTANCE_RECORD_FIELDS = ('schema_version', 'source', 'id', 'revision',
+                            'record_sha256', 'acceptance_state', 'decision',
+                            'evidence', 'operator', 'at', 'sha256')
+
+
+def parse_acceptance_record(body):
+    """Return the durable acceptance record iff it passes the full schema.
+
+    Mirror of parse_requirement_record for `Kind: requirement-acceptance-v1`:
+    exact canonical bytes, exact field set, a revision binding and a content
+    hash, plus the contract's own F3 owner/approver/policy validation for an
+    acceptance decision. Only a record the operator acceptance route could
+    produce passes, so the raw comment path cannot forge acceptance evidence.
+    """
+    if not isinstance(body, str) or not body.startswith(ACCEPTANCE_PREFIX):
+        return None
+    rest = body[len(ACCEPTANCE_PREFIX):]
+    try:
+        from export_requirements import parse_json
+        from requirements import canonical_bytes, content_hash
+        record = parse_json(rest)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(record, dict) or set(record) != set(ACCEPTANCE_RECORD_FIELDS):
+        return None
+    if type(record.get('schema_version')) is not int or record['schema_version'] != 1:
+        return None
+    if record.get('source') not in ACCEPTANCE_SOURCES:
+        return None
+    if not isinstance(record.get('id'), str) or not record['id'].strip():
+        return None
+    revision = record.get('revision')
+    digest = record.get('record_sha256')
+    if revision is not None and (isinstance(revision, bool)
+                                 or not isinstance(revision, int) or revision < 1):
+        return None
+    if digest is not None and (not isinstance(digest, str)
+                               or not SHA256_TEXT.match(digest)):
+        return None
+    if (revision is None) != (digest is None):
+        return None
+    if record.get('acceptance_state') not in ('draft', 'accepted'):
+        return None
+    if not isinstance(record.get('operator'), str) or not record['operator'].strip():
+        return None
+    if not isinstance(record.get('at'), str) or not record['at'].strip():
+        return None
+    if record['source'] == 'requirement-apply':
+        decision = record.get('decision')
+        if revision is None or record.get('evidence') is not None:
+            return None
+        if not isinstance(decision, dict) or set(decision) != set(ACCEPTANCE_DECISION_FIELDS):
+            return None
+        try:
+            from requirements import _validate_acceptance
+            _validate_acceptance(dict(decision, manifest_sha256=digest),
+                                 {'sha256': digest})
+        except (ValueError, TypeError):
+            return None
+    else:
+        if record.get('decision') is not None:
+            return None
+        if not isinstance(record.get('evidence'), str) or not record['evidence'].strip():
+            return None
+    try:
+        if content_hash(record) != record.get('sha256'):
+            return None
+        if canonical_bytes(record).decode() != rest:
+            return None
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return None
+    return record
 
 
 def parse_requirement_record(body):
@@ -81,7 +164,8 @@ RESERVED = (
     (REVIEW_PREFIX, 'contribution/review record', 'review TASK --file payload.json'),
     (CHECKPOINT_PREFIX, 'task checkpoint', 'checkpoint TASK --file checkpoint.json'),
     (LIFECYCLE_PREFIX, 'lifecycle evidence record', 'lifecycle.py record --file event.json'),
-    (REQUIREMENT_PREFIX, 'requirement revision', 'the requirement revision workflow'),
+    (REQUIREMENT_PREFIX, 'requirement revision', 'requirement_records.py draft|revise'),
+    (ACCEPTANCE_PREFIX, 'requirement acceptance evidence', 'admin.py requirement-apply'),
     (HANDOFF_PREFIX, 'handoff intent', 'handoff TASK --file handoff.json'),
     (HANDOFF_COMPLETE_PREFIX, 'handoff completion', 'handoff TASK --file handoff.json'),
     (PLAN_PREFIX, 'worker plan registration', 'worker_gate.py register'),
@@ -548,11 +632,38 @@ def raw_file_flag_in_args(args):
 # content mismatch") and planting both labels can reconcile a victim
 # create-child to an attacker issue. Reads (`list -l request:...`) stay usable
 # because only the create/update label-writing flags are inspected.
+#
+# requirement_records.py is the only writer of the controlled requirement type
+# and state labels (`requirement`, `brd-section`, `requirement:draft`,
+# `requirement:accepted`). The raw path must not be able to accept a record
+# (`update X --add-label requirement:accepted`) or flip its type label, so
+# `requirement:` joins the reserved prefixes and the two type labels are
+# reserved exactly.
+#
+# The same namespace feeds BOTH checks: the label-*value* check below and the
+# read-before-write guard (`first_reserved_label`, endpoint._guard_reserved_labels).
+# Extending it here therefore closes the two routes that do not name a reserved
+# value: `create --parent X` inheriting `requirement`/`requirement:accepted`
+# from a labelled parent (kittrial-pth.26 review P1), and `update X --set-labels`
+# replacing the labels of a record that currently holds them (review P2). One
+# guard, not a second parallel one.
 # ---------------------------------------------------------------------------
 
-RESERVED_LABEL_PREFIXES = ('request:', 'request-content:')
+RESERVED_LABEL_PREFIXES = ('request:', 'request-content:', 'requirement:')
+RESERVED_EXACT_LABELS = frozenset({'requirement', 'brd-section'})
+# Every label-writing spelling accepted by the pinned bd 1.2.2, verified by
+# driving the binary (`bd create --help` / `bd update --help` plus a behaviour
+# probe of each candidate). `create` accepts the UNDOCUMENTED `--label` alias of
+# `--labels` (it is hidden from --help; bd 1.2.2 review item hidden-label-alias),
+# so a table built from --help alone missed `create --label requirement`.
+# `--tag`/`--tags`, `--add-labels`, `--set-label` and `--remove-labels` are NOT
+# bd 1.2.2 flags (`unknown flag`); `-l` and `--label(s)` are the only create
+# spellings and `--add-label`/`--set-labels`/`--remove-label` the only update
+# spellings. An unknown create/update flag still fails closed through
+# unresolved_bd_flags()/label_guard_request(), so a future hidden alias cannot
+# silently reopen this route.
 LABEL_WRITE_FLAGS = {
-    'create': {'--labels', '-l'},
+    'create': {'--labels', '--label', '-l'},
     'update': {'--add-label', '--set-labels', '--remove-label'},
 }
 
@@ -617,16 +728,34 @@ def _label_values(args):
     return values
 
 
+def reserved_label(label):
+    """The label's own text when it sits in a reserved namespace, else None.
+
+    One predicate shared by the value check (`reserved_label_in_args`) and the
+    read-before-write guard (`first_reserved_label`), so a namespace extended
+    here is enforced on every route at once. `requirement`/`brd-section` are
+    reserved exactly; `requirement:draft`/`requirement:accepted` and the
+    request namespaces are reserved by prefix.
+    """
+    if not isinstance(label, str):
+        return None
+    if label in RESERVED_EXACT_LABELS:
+        return label
+    for prefix in RESERVED_LABEL_PREFIXES:
+        if label.startswith(prefix):
+            return label
+    return None
+
+
 def reserved_label_in_args(args):
     """First reserved-namespace label written by a create/update label flag."""
     if not isinstance(args, list):
         return None
     for value in _label_values(args):
         for part in value.split(','):
-            label = part.strip()
-            for prefix in RESERVED_LABEL_PREFIXES:
-                if label.startswith(prefix):
-                    return label
+            label = reserved_label(part.strip())
+            if label is not None:
+                return label
     return None
 
 
@@ -635,11 +764,9 @@ def first_reserved_label(labels):
     if not isinstance(labels, (list, tuple)):
         return None
     for label in labels:
-        if not isinstance(label, str):
-            continue
-        for prefix in RESERVED_LABEL_PREFIXES:
-            if label.startswith(prefix):
-                return label
+        found = reserved_label(label)
+        if found is not None:
+            return found
     return None
 
 
@@ -670,7 +797,7 @@ BD_LONG_VALUE_FLAGS = {
         '--context', '--defer', '--deps', '--description', '--design',
         '--design-file', '--due', '--estimate', '--event-actor',
         '--event-category', '--event-payload', '--event-target',
-        '--external-ref', '--file', '--graph', '--id', '--labels',
+        '--external-ref', '--file', '--graph', '--id', '--label', '--labels',
         '--metadata', '--mol-type', '--notes', '--parent', '--priority',
         '--repo', '--skills', '--spec-id', '--title', '--type', '--waits-for',
         '--waits-for-gate', '--wisp-type',
@@ -808,6 +935,25 @@ def _bd_scan(args, command):
     return flags, operands, unknown
 
 
+def unresolved_bd_flags(args):
+    """Unresolvable create/update flags; a non-empty list must fail the guard.
+
+    The raw create/update path resolves its flag surface from the pinned bd
+    1.2.2 inventory, which includes the undocumented `create --label` alias of
+    `--labels`. A token outside that inventory could be another hidden or
+    deprecated label-writing alias (or a value-taking flag whose value the scan
+    would misread as a flag), so it is refused rather than assumed harmless.
+    bd itself rejects a genuinely unknown flag, so this only tightens the guard.
+    """
+    if not isinstance(args, list) or not args:
+        return []
+    command = args[0] if isinstance(args[0], str) else None
+    if command not in ('create', 'update'):
+        return []
+    _, _, unknown = _bd_scan(args, command)
+    return list(unknown)
+
+
 def label_guard_request(args):
     """Describe the read-before-write reserved-label check an argv list needs.
 
@@ -823,6 +969,9 @@ def label_guard_request(args):
     Anything the scan cannot resolve (unknown flag, repeated --parent, missing
     parent value, an unparseable --no-inherit-labels value, no target operand)
     is reported as ambiguous so the caller fails closed rather than guessing.
+    An unknown flag is NEVER discarded before the branch decision: it could be
+    an undocumented label alias (bd 1.2.2 accepts `create --label`) or a
+    replacement switch, so it keeps the request ambiguous in both branches.
     """
     if not isinstance(args, list) or not args:
         return None
@@ -850,19 +999,17 @@ def label_guard_request(args):
                 invalid_bool = True
             else:
                 no_inherit = parsed
-        if invalid_bool:
+        if invalid_bool or ambiguous:
             return {'kind': 'inherit',
                     'target': parents[0] if parents else None,
                     'ambiguous': True}
-        if no_inherit:
-            return None
-        if not parents:
+        if no_inherit or not parents:
             return None
         if len(parents) > 1 or not parents[0]:
-            ambiguous = True
-        return {'kind': 'inherit', 'target': parents[0], 'ambiguous': ambiguous}
+            return {'kind': 'inherit', 'target': parents[0], 'ambiguous': True}
+        return {'kind': 'inherit', 'target': parents[0], 'ambiguous': False}
     replacing = [name for name, _ in flags if name in LABEL_REPLACING_FLAGS]
-    if not replacing:
+    if not replacing and not ambiguous:
         return None
     # `@attachment:` tokens are transport placeholders, not issue IDs; the
     # endpoint expands them into file flags after this guard.
@@ -880,25 +1027,49 @@ COMMENT_NO_VALUE_FLAGS = BD_GLOBAL_BOOL_FLAGS
 COMMENT_FLAGS_WITH_VALUE = {'-f', '--file'}
 
 
+# Machine records are canonical UTF-8 with `\n` line endings. A client that
+# prepends a UTF-8 BOM or sends CRLF produces a body the strict parsers ignore,
+# so a "lookalike" acceptance/revision record would otherwise be posted as
+# ordinary prose (kittrial-pth.26 review: BOM/CRLF lookalikes pass as ordinary
+# comments). The raw path refuses such a body too: one reserved-prefix view is
+# computed by dropping a single leading BOM and folding CRLF to LF, and a match
+# there is reserved. Legitimate writers emit exact canonical bytes, so nothing
+# valid is refused (a BOM/CRLF plan registration was never canonical).
+def _reserved_prefix_view(body):
+    """Drop one leading BOM and fold CRLF, for lookalike-prefix matching."""
+    view = body[1:] if body.startswith('\ufeff') else body
+    if '\r\n' in view:
+        view = view.replace('\r\n', '\n')
+    return view
+
+
 def reserved_match(body):
-    """Return (prefix, kind, operation) for a reserved body, else None."""
+    """Return (prefix, kind, operation) for a reserved body, else None.
+
+    A body that is a reserved prefix only after dropping a leading BOM or
+    folding CRLF is matched as well, so a lookalike cannot slip through as
+    ordinary prose.
+    """
     if not isinstance(body, str):
         return None
-    for prefix, kind, operation in RESERVED:
-        if body.startswith(prefix):
-            return (prefix, kind, operation)
+    for view in (body, _reserved_prefix_view(body)):
+        for prefix, kind, operation in RESERVED:
+            if view.startswith(prefix):
+                return (prefix, kind, operation)
     return None
 
 
 def is_legitimate_writer(body, actor=None, task=None):
-    """True when a reserved-prefix body is a validated supported write.
+    """True when a reserved-prefix body is a validated supported raw write.
 
-    worker_gate plan registrations, handoff intents/completions and
-    requirement revisions written through their documented routes carry
-    exact canonical bytes bound to the requesting actor/task; those must
-    pass. Anything else is forged. Without actor/task context (pure
-    helper use) only context-free canonical validity is checked; the
-    endpoint always supplies context and fails closed on mismatch.
+    worker_gate plan registrations written through their documented route carry
+    exact canonical bytes bound to the requesting actor/task; those must pass.
+    Handoff, requirement revision and requirement acceptance records are never
+    legitimate on the raw path: they use structured operations whose authority
+    (ownership, kind/key/state, F3 acceptance evidence) cannot be established
+    from self-asserted comment fields. Without actor/task context (pure helper
+    use) only context-free canonical validity is checked; the endpoint always
+    supplies context and fails closed on mismatch.
     """
     if not isinstance(body, str):
         return False
@@ -918,12 +1089,17 @@ def is_legitimate_writer(body, actor=None, task=None):
         # handoff records are rejected unconditionally.
         return False
     if body.startswith(REQUIREMENT_PREFIX):
-        record = parse_requirement_record(body)
-        if record is None:
-            return False
-        if task is not None and record.get('id') != task:
-            return False
-        return True
+        # Requirement revisions are written only through the dedicated
+        # requirement_records.py operation (internal run path, kind/key/state
+        # and F3 acceptance authority checked). Raw endpoint revision comments
+        # are rejected unconditionally, even canonical ones: a canonical
+        # accepted revision must not be postable by an arbitrary actor.
+        return False
+    if body.startswith(ACCEPTANCE_PREFIX):
+        # Durable F3 acceptance evidence is written only by the operator
+        # acceptance route (admin.py requirement-apply) bound to the exact
+        # revision hash; a self-asserted acceptance comment must never pass.
+        return False
     return False
 
 
