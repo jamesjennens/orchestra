@@ -1135,14 +1135,20 @@ class OperationJournal:
         if self._skewed(high, now):
             return 0
         trusted = self._trusted_from(now, high)
+        # Compare the bare indexed column against a precomputed threshold (``at <= ?``,
+        # not ``at + ? <= ?``) so the (state, at) index is an index range scan rather
+        # than a full-table scan on every write.
+        committed_before = trusted - self.committed_retention
+        active_before = trusted - self.retention
         compacted = 0
         while True:
             rows = connection.execute(
-                'SELECT operation_id, state, at FROM operations WHERE '
-                "((state = 'committed' AND at + ? <= ?) OR "
-                "(state IN ('in_progress', 'unknown') AND at + ? <= ?)) "
-                'ORDER BY at ASC LIMIT 500',
-                (self.committed_retention, trusted, self.retention, trusted)).fetchall()
+                "SELECT operation_id FROM operations WHERE state = 'committed' "
+                'AND at <= ? ORDER BY at ASC LIMIT 500', (committed_before,)).fetchall()
+            rows += connection.execute(
+                "SELECT operation_id FROM operations WHERE state IN ('in_progress', "
+                "'unknown') AND at <= ? ORDER BY at ASC LIMIT 500",
+                (active_before,)).fetchall()
             if not rows:
                 break
             progress = False
@@ -1163,16 +1169,17 @@ class OperationJournal:
         used to satisfy the byte or count budget: a still-live tombstone stays.
         """
         trusted = self._trusted_from(now, high)
+        # ``reclaimed_at <= ?`` keeps this an index range scan on operations_tombstone_age.
+        stale_before = trusted - self.tombstone_seconds
         row = connection.execute(
             "SELECT COUNT(*), COALESCE(SUM(bytes), 0) FROM operations "
-            "WHERE state = 'expired' AND reclaimed_at + ? <= ?",
-            (self.tombstone_seconds, trusted)).fetchone()
+            "WHERE state = 'expired' AND reclaimed_at <= ?", (stale_before,)).fetchone()
         removed, size = int(row[0]), int(row[1])
         if not removed:
             return 0
         connection.execute(
-            "DELETE FROM operations WHERE state = 'expired' AND reclaimed_at + ? <= ?",
-            (self.tombstone_seconds, trusted))
+            "DELETE FROM operations WHERE state = 'expired' AND reclaimed_at <= ?",
+            (stale_before,))
         self._adjust(connection, tombstones=-removed, bytes_=-size)
         return removed
 
