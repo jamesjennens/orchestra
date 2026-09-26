@@ -159,6 +159,20 @@ def describe_contribution_mismatch(op, supplied, current, latest):
                 f'reference the current contribution instead ({expected}).')
     return f'Review operation {op} supplied {supplied}, but {expected}.'
 
+def receipt(state, rows, task):
+    """The shared projection for a review receipt: effective state plus raw state.
+
+    A review write returns the SAME effective state the reads (`review TASK`,
+    `brief`, `work`) report, so an approval whose scoped integration evidence was
+    recorded earlier is receipted as `integrated`, not `awaiting-integration`.
+    `workflow_state` and `integration` stay additive and describe how that state
+    was derived.
+    """
+    from review_state import effective, scopes_for
+    answer = effective(state, scopes_for(rows, task))
+    return {key: answer[key] for key in ('review_state', 'workflow_state', 'integration')}
+
+
 def projection(ordered):
     contribution = None; pending = {}; approved = False; latest = None
     for p, c in ordered:
@@ -208,15 +222,16 @@ def execute(rows, task, actor, payload, run):
     if len(matches) != 1 or matches[0].get('issue_type') == 'event':
         raise ValueError('Task missing, duplicated or is an event')
     issue = matches[0]; ordered = records(issue); state = projection(ordered)
+    effective_state = receipt(state, rows, task)['review_state']
     # Exact retries remain recoverable after ownership changes or later revisions.
     for p, c in ordered:
         if p['operation_id'] == payload['operation_id']:
             if p == payload and c['author'] == actor:
-                return dict(comment_id=str(c['id']), reconciled=True, review_state=state['review_state'])
+                return dict(comment_id=str(c['id']), reconciled=True, **receipt(state, rows, task))
             raise ValueError('Operation ID already used with different payload or actor')
     if payload['previous'] != state['latest_comment_id']:
         raise StaleReviewPrevious(task, payload['previous'],
-                                  state['latest_comment_id'], state['review_state'])
+                                  state['latest_comment_id'], effective_state)
     if payload['operation'] in ('contribute', 'respond') and (not issue.get('assignee') or actor != issue['assignee']):
         raise ValueError('Only the current assigned owner may contribute/respond; resume or handoff first')
     if payload['operation'] == 'request-changes' and issue.get('status') == 'closed':
@@ -224,4 +239,4 @@ def execute(rows, task, actor, payload, run):
     # Validate the entire transition before the sole native mutation.
     preview = projection(ordered + [(payload, {'id': 'pending-write', 'author': actor, 'created_at': 'pending'})])
     result = json.loads(run(['comments', 'add', task, PREFIX + canonical_bytes(payload).decode(), '--json']))
-    return dict(comment_id=str(result['id']), reconciled=False, review_state=preview['review_state'])
+    return dict(comment_id=str(result['id']), reconciled=False, **receipt(preview, rows, task))

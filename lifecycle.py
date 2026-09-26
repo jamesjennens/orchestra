@@ -59,35 +59,114 @@ def native_event(row):
     return {'task':parents[0],'dimension':dimension,'value':value,'payload':payload,'id':row['id'],'order':order,'created_at':row.get('created_at','')}
 
 
+def latest_event(events,task,dim):
+    """Newest trusted event for one task/dimension, or None when ambiguous.
+
+    Native set-state allocates monotonically increasing hierarchical child IDs, so
+    a numeric suffix orders events. A missing or duplicated order is ambiguous and
+    is never trusted, matching the conservative view the whole kit documents.
+    """
+    found=events.get((task,dim),[])
+    if not found or any(e['order'] is None for e in found):return None
+    orders=[e['order'] for e in found]
+    if len(set(orders))!=len(orders):return None
+    return max(found,key=lambda e:e['order'])
+
+
+def label_agrees(labels,event,dim):
+    """The native ``dim:`` label must name exactly the event value."""
+    return event is not None and [v for v in labels if v.startswith(dim+':')]==[dim+':'+event['value']]
+
+
 def project_facts(rows):
     events={}
     for row in rows:
         event=native_event(row)
         if event and event['dimension'] in (*DIMENSIONS,'lifecycle-scope'):
             events.setdefault((event['task'],event['dimension']),[]).append(event)
-    def latest(task,dim):
-        found=events.get((task,dim),[])
-        if not found or any(e['order'] is None for e in found):return None
-        orders=[e['order'] for e in found]
-        if len(set(orders))!=len(orders):return None
-        return max(found,key=lambda e:e['order'])
     result=[]
     for row in rows:
         if row.get('issue_type')=='event':continue
         labels=row.get('labels') or []
-        def agrees(event,dim):return event is not None and [v for v in labels if v.startswith(dim+':')]==[dim+':'+event['value']]
-        scope_event=latest(row['id'],'lifecycle-scope')
-        scope=scope_event['payload']['scope'] if agrees(scope_event,'lifecycle-scope') and scope_event['payload'] else None
+        scope_event=latest_event(events,row['id'],'lifecycle-scope')
+        scope=scope_event['payload']['scope'] if label_agrees(labels,scope_event,'lifecycle-scope') and scope_event['payload'] else None
         facts={}
         for dim in DIMENSIONS:
-            e=latest(row['id'],dim)
-            valid=scope is not None and agrees(e,dim) and e['payload'] is not None and e['payload']['scope']==scope
+            e=latest_event(events,row['id'],dim)
+            valid=scope is not None and label_agrees(labels,e,dim) and e['payload'] is not None and e['payload']['scope']==scope
             facts[dim]={'value':e['value'] if valid else 'unknown',
                         'event_id':e['id'] if e else None,
                         'evidence':e['payload']['evidence'] if valid else [],
                         'provenance':e['payload']['provenance'] if valid else None}
         result.append({'id':row['id'],'title':row.get('title',''),'status':row.get('status'), 'scope':scope,'facts':facts,
                        'has_lifecycle':any((row['id'],dim) in events for dim in (*DIMENSIONS,'lifecycle-scope'))})
+    return result
+
+
+def integration_evidence(rows):
+    """Per-scope ``integrated`` evidence, newest recorded scope first.
+
+    ``project_facts`` reports only the newest scope and treats older evidence as
+    unknown once a later scope is recorded. Integration is decided per scope: a
+    contribution counts as integrated when ANY scope whose ``source_commit``
+    equals its full commit records ``integrated=passed``, regardless of scope
+    order. This reader exposes those values without changing ``project_facts``.
+
+    Trust is decided here once with the same rule ``project_facts`` applies: the
+    newest ``lifecycle-scope`` event must agree with the native
+    ``lifecycle-scope:`` label, the newest ``integrated`` event must agree with
+    the native ``integrated:`` label, and event ordering must be unambiguous.
+    Otherwise no scoped value is trusted. A newest unstructured (manual)
+    assertion or a tampered lifecycle-scope label therefore yields no trusted
+    value for any scope, never a guess, and `project_facts` and this reader can no
+    longer disagree about the same events.
+
+    Cost is linear in rows: each row is parsed once, each scoped integrated
+    payload is hashed once, and the NEWEST recording of each scope token is kept
+    in a single pass, so a recurring token keeps its newest position instead of an
+    older one.
+    """
+    events={}
+    for row in rows:
+        event=native_event(row)
+        if event:events.setdefault((event['task'],event['dimension']),[]).append(event)
+    result=[]
+    for row in rows:
+        if row.get('issue_type')=='event':continue
+        task=row['id'];labels=row.get('labels') or []
+        scope_event=latest_event(events,task,'lifecycle-scope')
+        scope_trusted=(scope_event is not None and scope_event['payload'] is not None
+                       and label_agrees(labels,scope_event,'lifecycle-scope'))
+        trusted=None
+        found=events.get((task,'integrated'),[])
+        orders=[e['order'] for e in found]
+        if (found and scope_trusted and all(o is not None for o in orders)
+                and len(set(orders))==len(orders)):
+            newest=max(found,key=lambda e:e['order'])
+            if newest['payload'] is not None and label_agrees(labels,newest,'integrated'):
+                trusted=found
+        # One pass over the trusted integrated events: hash each payload once.
+        trusted_facts={}
+        for event in (trusted or []):
+            payload=event['payload']
+            if not payload:continue
+            key=(event['order'],event['id']);token=content_hash(payload['scope'])
+            if token not in trusted_facts or key>trusted_facts[token][0]:
+                trusted_facts[token]=(key,{'value':event['value'],'event_id':event['id'],
+                                           'evidence':payload['evidence'],'provenance':payload['provenance']})
+        # One pass over the recorded scopes: the newest recording of a token wins.
+        scopes={}
+        for event in events.get((task,'lifecycle-scope'),[]):
+            payload=event['payload']
+            if not payload:continue
+            key=(event['order'] if event['order'] is not None else -1,event['id'])
+            if event['value'] not in scopes or key>scopes[event['value']][0]:
+                scopes[event['value']]=(key,event,payload['scope'])
+        entries=[]
+        for token,(key,event,scope_value) in sorted(scopes.items(),key=lambda kv:(kv[1][0],kv[0]),reverse=True):
+            entries.append({'scope_token':token,'scope':scope_value,'order':event['order'],
+                            'integrated':dict(trusted_facts[token][1]) if token in trusted_facts else None})
+        result.append({'id':task,'scopes':entries})
     return result
 
 
