@@ -123,6 +123,19 @@ Review operation approve supplied unknown, but no current contribution has been 
 
 Read the current ids from `review TASK`. A refusal changes nothing: the review state, the pending items and the comment chain stay exactly as they were, so correct the payload and resubmit with a new operation ID. An **exact** repeat of an already-recorded operation — same operation ID, same canonical payload, same actor — still reconciles to the original comment without writing a second record, including after a later handoff or later reviews.
 
+## Stale `previous`: the refusal returns the current head
+
+Every new operation compares `previous` with the chain's current `latest_comment_id`. A mismatch is refused before any native write, and the refusal carries the current values so the retry does not need a blind extra fetch:
+
+```text
+Stale review workflow previous; reread brief. Current latest_comment_id is record-B and review_state is changes-requested; re-read the chain content before deciding.
+{"code":"stale-previous","http_status":409,"latest_comment_id":"record-B","review_state":"changes-requested","supplied_previous":"record-A","task":"example-task"}
+```
+
+The first line is the human refusal; the second is the same structured error as one canonical JSON line. The CLI prints both on stderr, writes nothing and exits with status 2. `latest_comment_id` is `null` when no review record exists yet, which is the actionable value for the first write. An HTTP transport returns the same JSON object as the `409` detail.
+
+The returned values are an identifier and a state label, not the chain content. Re-read `review TASK` before deciding, then resubmit with a new operation ID and `previous` set to the returned `latest_comment_id`. The field saves one round trip; it never replaces reading.
+
 ## Discover current work
 
 ```sh
