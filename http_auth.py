@@ -279,9 +279,19 @@ class RecordStore:
       ``suspect``, ``anchor`` and ``suspect_since``; every write transaction observes
       the raw clock; whether a record has expired is decided against the trusted clock
       (while suspect, the anchor plus the time elapsed since the step, capped at
-      ``anchor + max_skew``); ``created_at`` is stamped with
-      the raw clock; and expired records are deleted only while the store is not
-      suspect, against the raw clock.
+      ``anchor + max_skew``); ``created_at`` is stamped with the raw clock.
+    * **Records expire on the confirmed timeline**, exactly like journal tombstones
+      (``aged_from``). The store keeps its OWN trusted-clock state and ``jump_credit``
+      in its own ``meta`` table (a mirror of the journal's rules, not shared rows: the
+      record store is one file per service, the journal one per project, and each
+      observes the same host clock through its own writes). Each row stores
+      ``expires_confirmed = expires_at - jump_credit`` (credit at write time); a record
+      is expired, and deleted, only when ``expires_confirmed < now - jump_credit``
+      (with the clamped trusted clock while suspect), and nothing is deleted by age
+      while the store is suspect. An accepted forward jump therefore never ages an
+      idempotency record out, so an exact retry of a service-local route (credential
+      issue, account/project create, membership changes) replays or is refused, never
+      re-executed, while the total uncredited forward clock error stays below 24 h.
     """
 
     def __init__(self, path, clock=time.time, max_skew=JOURNAL_MAX_SKEW_SECONDS,
@@ -300,20 +310,55 @@ class RecordStore:
         connection.execute('PRAGMA synchronous = FULL')
         return connection
 
+    #: Schema of the record store. Schema 2 (revision 11) adds ``expires_confirmed``,
+    #: the record's expiry on the confirmed timeline, and its ``(kind,
+    #: expires_confirmed)`` index (replacing ``(kind, expires_at)``).
+    SCHEMA = 2
+
     def _ensure(self):
+        """Create or upgrade the store in ONE transaction.
+
+        An older store (schema 1: ``expires_at`` only) gains ``expires_confirmed``
+        backfilled to ``expires_at`` (no step has been credited: ``jump_credit`` starts
+        at 0), the new index replaces the old one, and the schema marker is written, all
+        in the same ``BEGIN IMMEDIATE`` transaction, so a crash leaves either the old
+        store or the fully upgraded one.
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connection() as connection:
             connection.execute('BEGIN IMMEDIATE')
-            connection.execute(
-                'CREATE TABLE IF NOT EXISTS records ('
-                'kind TEXT NOT NULL, key TEXT NOT NULL, payload TEXT, '
-                'created_at REAL NOT NULL, expires_at REAL, '
-                'PRIMARY KEY (kind, key))')
-            connection.execute('CREATE INDEX IF NOT EXISTS records_expiry '
-                               'ON records (kind, expires_at)')
-            connection.execute('CREATE TABLE IF NOT EXISTS meta '
-                               '(key TEXT PRIMARY KEY, value)')
+            try:
+                connection.execute('CREATE TABLE IF NOT EXISTS meta '
+                                   '(key TEXT PRIMARY KEY, value)')
+                row = connection.execute(
+                    "SELECT value FROM meta WHERE key = 'records_schema'").fetchone()
+                if row is None or int(float(row[0])) < self.SCHEMA:
+                    self._upgrade(connection)
+            except BaseException:
+                connection.execute('ROLLBACK')
+                raise
             connection.execute('COMMIT')
+
+    def _upgrade(self, connection):
+        connection.execute(
+            'CREATE TABLE IF NOT EXISTS records ('
+            'kind TEXT NOT NULL, key TEXT NOT NULL, payload TEXT, '
+            'created_at REAL NOT NULL, expires_at REAL, expires_confirmed REAL, '
+            'PRIMARY KEY (kind, key))')
+        columns = {row[1] for row in connection.execute('PRAGMA table_info(records)')}
+        if 'expires_confirmed' not in columns:
+            connection.execute('ALTER TABLE records ADD COLUMN expires_confirmed REAL')
+        connection.execute('UPDATE records SET expires_confirmed = expires_at '
+                           'WHERE expires_confirmed IS NULL')
+        connection.execute('CREATE INDEX IF NOT EXISTS records_confirmed '
+                           'ON records (kind, expires_confirmed)')
+        connection.execute('DROP INDEX IF EXISTS records_expiry')
+        if connection.execute("SELECT 1 FROM meta WHERE key = 'jump_credit'").fetchone() \
+                is None:
+            connection.execute("INSERT OR REPLACE INTO meta (key, value) VALUES "
+                               "('jump_credit', 0.0)")
+        connection.execute("INSERT OR REPLACE INTO meta (key, value) VALUES "
+                           "('records_schema', ?)", (self.SCHEMA,))
 
     def _now(self):
         return self.clock()
@@ -324,28 +369,46 @@ class RecordStore:
         clock_persist(connection, state)
         return state
 
+    def _view(self, connection, moment):
+        return clock_advance(clock_state(connection), moment, self.max_skew, self.settle)
+
     def trusted_now(self, now=None, connection=None):
         """The trusted clock the next write would see (expiry decisions only)."""
         moment = self._now() if now is None else now
         if connection is None:
             with self._connection() as opened:
-                state = clock_state(opened)
+                view = self._view(opened, moment)
         else:
-            state = clock_state(connection)
-        return clock_trusted(clock_advance(state, moment, self.max_skew, self.settle),
-                             moment, self.max_skew)
+            view = self._view(connection, moment)
+        return clock_trusted(view, moment, self.max_skew)
+
+    def confirmed_now(self, now=None, connection=None):
+        """``trusted_now - jump_credit``: the current time on the confirmed timeline.
+
+        A record has expired only when ``expires_confirmed < confirmed_now``. While the
+        store is suspect the trusted clock is held near the anchor *and* the pending
+        step is already in the credit, so a record only looks younger (it replays
+        rather than being refused) - never older.
+        """
+        moment = self._now() if now is None else now
+        if connection is None:
+            with self._connection() as opened:
+                view = self._view(opened, moment)
+        else:
+            view = self._view(connection, moment)
+        return clock_trusted(view, moment, self.max_skew) - float(view['jump_credit'] or 0.0)
 
     def get(self, kind, key):
         """The stored record, or ``None``. Never returns an expired record."""
         moment = self._now()
         with self._connection() as connection:
             row = connection.execute(
-                'SELECT payload, expires_at FROM records WHERE kind = ? AND key = ?',
+                'SELECT payload, expires_confirmed FROM records WHERE kind = ? AND key = ?',
                 (kind, key)).fetchone()
-            trusted = self.trusted_now(moment, connection) if row is not None else None
+            confirmed = self.confirmed_now(moment, connection) if row is not None else None
         if row is None:
             return None
-        if row['expires_at'] is not None and row['expires_at'] <= trusted:
+        if row['expires_confirmed'] is not None and row['expires_confirmed'] < confirmed:
             self.delete(kind, key)
             return None
         try:
@@ -355,27 +418,45 @@ class RecordStore:
         return record if isinstance(record, dict) else None
 
     def put(self, kind, key, record, ttl=None):
-        """Insert or replace one record, honouring ``record['expires_at']`` if given."""
+        """Insert or replace one record, honouring ``record['expires_at']`` if given.
+
+        The raw ``expires_at`` is converted to the confirmed timeline with the credit at
+        write time (``expires_confirmed = expires_at - jump_credit``). Rewriting an
+        existing record with the same ``expires_at`` (commit/unknown of a reservation)
+        keeps its original ``expires_confirmed``, so a step credited in between can
+        never shorten it.
+        """
         moment = self._now()
         expires = record.get('expires_at') if isinstance(record, dict) else None
         if not isinstance(expires, (int, float)):
             expires = moment + float(ttl if ttl is not None else IDEMPOTENCY_TTL_SECONDS)
+        expires = float(expires)
         with self._connection() as connection:
             connection.execute('BEGIN IMMEDIATE')
             try:
                 clock = self._observe(connection, moment)
+                credit = float(clock['jump_credit'] or 0.0)
+                previous = connection.execute(
+                    'SELECT expires_at, expires_confirmed FROM records '
+                    'WHERE kind = ? AND key = ?', (kind, key)).fetchone()
+                if previous is not None and previous['expires_at'] == expires and \
+                        previous['expires_confirmed'] is not None:
+                    confirmed = float(previous['expires_confirmed'])
+                else:
+                    confirmed = expires - credit
                 connection.execute(
                     'INSERT OR REPLACE INTO records (kind, key, payload, created_at, '
-                    'expires_at) VALUES (?, ?, ?, ?, ?)',
+                    'expires_at, expires_confirmed) VALUES (?, ?, ?, ?, ?, ?)',
                     (kind, key, json.dumps(record, ensure_ascii=False, sort_keys=True),
-                     moment, float(expires)))
+                     moment, expires, confirmed))
                 # Time-only retention is enforced here, on the same transaction, so the
                 # table cannot grow without a matching expiry sweep. It is skipped while
-                # the clock is suspect, so an unaccepted jump cannot age records out.
+                # the clock is suspect and compares the confirmed timeline, so a clock
+                # jump can never age a record out early.
                 if not clock['suspect']:
                     connection.execute(
-                        'DELETE FROM records WHERE kind = ? AND expires_at <= ?',
-                        (kind, moment))
+                        'DELETE FROM records WHERE kind = ? AND expires_confirmed < ?',
+                        (kind, moment - credit))
             except BaseException:
                 connection.execute('ROLLBACK')
                 raise
@@ -391,10 +472,11 @@ class RecordStore:
             connection.execute('COMMIT')
 
     def purge(self, kind=None, now=None):
-        """Delete only records past their own ``expires_at``. Returns the count.
+        """Delete only records past their own expiry on the confirmed timeline.
 
         A write transaction: it observes the clock and deletes nothing while the store
-        is suspect.
+        is suspect; otherwise it deletes ``expires_confirmed < now - jump_credit``.
+        Returns the count.
         """
         moment = self._now() if now is None else now
         with self._connection() as connection:
@@ -403,21 +485,25 @@ class RecordStore:
             if clock['suspect']:
                 connection.execute('COMMIT')
                 return 0
+            threshold = moment - float(clock['jump_credit'] or 0.0)
             if kind is None:
                 row = connection.execute(
-                    'SELECT COUNT(*) FROM records WHERE expires_at <= ?', (moment,)).fetchone()
-                connection.execute('DELETE FROM records WHERE expires_at <= ?', (moment,))
+                    'SELECT COUNT(*) FROM records WHERE expires_confirmed < ?',
+                    (threshold,)).fetchone()
+                connection.execute('DELETE FROM records WHERE expires_confirmed < ?',
+                                   (threshold,))
             else:
                 row = connection.execute(
-                    'SELECT COUNT(*) FROM records WHERE kind = ? AND expires_at <= ?',
-                    (kind, moment)).fetchone()
-                connection.execute('DELETE FROM records WHERE kind = ? AND expires_at <= ?',
-                                   (kind, moment))
+                    'SELECT COUNT(*) FROM records WHERE kind = ? AND expires_confirmed < ?',
+                    (kind, threshold)).fetchone()
+                connection.execute(
+                    'DELETE FROM records WHERE kind = ? AND expires_confirmed < ?',
+                    (kind, threshold))
             connection.execute('COMMIT')
         return int(row[0])
 
     def reset_high_water(self, now=None):
-        """Operator recovery after a clock correction (see ``OperationJournal``)."""
+        """Operator recovery after a clock correction (never reduces ``jump_credit``)."""
         moment = float(self._now() if now is None else now)
         with self._connection() as connection:
             connection.execute('BEGIN IMMEDIATE')
@@ -435,19 +521,21 @@ class RecordStore:
             clock = clock_state(connection)
             view = clock_advance(clock, moment, self.max_skew, self.settle)
             trusted = clock_trusted(view, moment, self.max_skew)
+            confirmed = trusted - float(view['jump_credit'] or 0.0)
             kinds = {}
             for row in connection.execute(
                     'SELECT kind, COUNT(*) AS total, '
                     'COALESCE(SUM(LENGTH(payload)), 0) AS bytes, '
-                    'SUM(CASE WHEN expires_at <= ? THEN 1 ELSE 0 END) AS due '
-                    'FROM records GROUP BY kind', (trusted,)):
+                    'SUM(CASE WHEN expires_confirmed < ? THEN 1 ELSE 0 END) AS due '
+                    'FROM records GROUP BY kind', (confirmed,)):
                 kinds[row['kind']] = {'total': int(row['total']),
                                       'bytes': int(row['bytes']),
                                       'expired': int(row['due'] or 0)}
             mode = connection.execute('PRAGMA journal_mode').fetchone()[0]
             total = connection.execute('SELECT COUNT(*) FROM records').fetchone()[0]
         report = {'records': int(total), 'kinds': kinds, 'journal_mode': mode,
-                  'trusted_now': trusted,
+                  'trusted_now': trusted, 'confirmed_now': confirmed,
+                  'schema': self.SCHEMA,
                   'file_bytes': self.path.stat().st_size if self.path.exists() else 0}
         report.update(clock_report(view))
         report['clock_persisted'] = clock_report(clock)

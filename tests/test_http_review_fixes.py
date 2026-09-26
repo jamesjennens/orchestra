@@ -2593,9 +2593,13 @@ class ResultsBoundCase(EndpointCase):
         self.assertEqual(0, records.purge(now=future))
         self.assertTrue(records.stats(now=future)['suspect'])
         self.assertEqual(1, records.stats()['kinds']['result']['total'])
-        # Once the clock has run for the settle hour the record really is removed.
-        self.assertGreaterEqual(records.purge(now=future + 3600), 1)
+        # The 24 h step itself is credited (it was not confirmed time), so after the
+        # settle hour the record is still inside its confirmed window...
+        self.assertEqual(0, records.purge(now=future + 3600))
         self.assertFalse(records.stats(now=future + 3600)['suspect'])
+        self.assertEqual(0, records.purge(now=future + 23 * 3600))
+        # ...and is removed once confirmed time (steps under 24 h) passes its window.
+        self.assertGreaterEqual(records.purge(now=future + 46 * 3600), 1)
         self.assertEqual(0, records.stats()['kinds'].get('result', {}).get('total', 0))
 
     def test_a_legacy_state_document_migrates_its_keyed_records_once(self):
@@ -3331,6 +3335,188 @@ class ConfirmedTimelineCase(ClockHarness):
             connection.close()
         self.assertEqual([destination.name],
                          sorted(path.name for path in destination.parent.iterdir()))
+
+
+class RecordStoreConfirmedTimelineCase(unittest.TestCase):
+    """27. Revision 11: HTTP idempotency records expire on the confirmed timeline."""
+
+    DAY = 86400
+
+    def setUp(self):
+        from http_auth import RecordStore
+        self.RecordStore = RecordStore
+        self.tmp = unique_dir('recordconfirmed11-')
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.clock = [time.time()]
+        self.path = self.tmp / 'state.json.records.sqlite3'
+        self.store = RecordStore(self.path, clock=lambda: self.clock[0])
+
+    def _accepted_jump(self, real):
+        self.clock[0] = real + 8 * self.DAY
+        for index in range(8):
+            self.clock[0] += 600
+            self.store.put('idempotency', 'other-%d' % index,
+                           {'state': 'in_progress', 'expires_at': self.clock[0] + self.DAY})
+        stats = self.store.stats()
+        self.assertFalse(stats['suspect'])
+        self.assertGreaterEqual(stats['jump_credit'], 8 * self.DAY)
+
+    def test_an_accepted_jump_never_ages_a_record_out(self):
+        start = self.clock[0]
+        self.store.put('idempotency', 'orig', {'state': 'committed', 'status': 201,
+                                               'expires_at': start + self.DAY})
+        self.clock[0] += 120
+        real = self.clock[0]
+        self._accepted_jump(real)
+        self.assertEqual(0, self.store.purge())
+        self.clock[0] = real + 180
+        self.assertEqual(201, self.store.get('idempotency', 'orig')['status'])
+        # With steady traffic after the correction it expires once its confirmed age
+        # passes 24 h, i.e. about 8 days (the credited jump) later than on the raw clock.
+        self.store.reset_high_water()
+        index = 0
+        while self.clock[0] < start + 9.5 * self.DAY:
+            self.clock[0] += 12 * 3600
+            self.store.put('result', 'tick-%d' % index, {'result': index})
+            index += 1
+            if self.clock[0] < start + 8.9 * self.DAY:
+                self.assertIsNotNone(self.store.get('idempotency', 'orig'))
+        self.assertIsNone(self.store.get('idempotency', 'orig'))
+
+    def test_rewriting_a_reservation_keeps_its_confirmed_expiry(self):
+        start = self.clock[0]
+        record = {'state': 'in_progress', 'expires_at': start + self.DAY}
+        self.store.put('idempotency', 'k', record)
+        self._accepted_jump(start + 60)
+        record['state'] = 'committed'
+        self.store.put('idempotency', 'k', record)
+        self.clock[0] = start + 23 * 3600
+        self.assertEqual('committed', self.store.get('idempotency', 'k')['state'])
+
+    def _schema1_store(self, path, expires):
+        import sqlite3
+        connection = sqlite3.connect(str(path))
+        connection.execute('CREATE TABLE records (kind TEXT NOT NULL, key TEXT NOT NULL, '
+                           'payload TEXT, created_at REAL NOT NULL, expires_at REAL, '
+                           'PRIMARY KEY (kind, key))')
+        connection.execute('CREATE INDEX records_expiry ON records (kind, expires_at)')
+        connection.execute('CREATE TABLE meta (key TEXT PRIMARY KEY, value)')
+        connection.execute("INSERT INTO records VALUES ('idempotency', 'old', ?, ?, ?)",
+                           (json.dumps({'state': 'committed'}), self.clock[0], expires))
+        connection.execute("INSERT INTO meta VALUES ('high_water', ?)", (self.clock[0],))
+        connection.commit()
+        connection.close()
+
+    def _schema_view(self, path):
+        import sqlite3
+        connection = sqlite3.connect(str(path))
+        try:
+            columns = {row[1] for row in connection.execute('PRAGMA table_info(records)')}
+            indexes = {row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'")}
+            meta = dict(connection.execute('SELECT key, value FROM meta'))
+            rows = connection.execute(
+                'SELECT expires_at, %s FROM records' % (
+                    'expires_confirmed' if 'expires_confirmed' in columns else 'NULL'
+                )).fetchall()
+        finally:
+            connection.close()
+        return columns, indexes, meta, rows
+
+    def test_a_schema_1_record_store_upgrades_atomically(self):
+        from unittest.mock import patch
+        path = self.tmp / 'old.records.sqlite3'
+        expires = self.clock[0] + self.DAY
+        self._schema1_store(path, expires)
+        original = self.RecordStore._upgrade
+
+        def killed(store, connection):
+            original(store, connection)
+            raise RuntimeError('killed during upgrade')
+        with patch.object(self.RecordStore, '_upgrade', killed):
+            with self.assertRaises(RuntimeError):
+                self.RecordStore(path, clock=lambda: self.clock[0])
+        columns, indexes, meta, _ = self._schema_view(path)
+        self.assertNotIn('expires_confirmed', columns)
+        self.assertIn('records_expiry', indexes)
+        self.assertNotIn('records_schema', meta)
+        store = self.RecordStore(path, clock=lambda: self.clock[0])
+        columns, indexes, meta, rows = self._schema_view(path)
+        self.assertIn('expires_confirmed', columns)
+        self.assertIn('records_confirmed', indexes)
+        self.assertNotIn('records_expiry', indexes)
+        self.assertEqual(2, int(meta['records_schema']))
+        self.assertEqual(0.0, float(meta['jump_credit']))
+        self.assertEqual([(expires, expires)], rows)
+        self.assertEqual('committed', store.get('idempotency', 'old')['state'])
+
+    def test_an_exact_credential_retry_after_an_accepted_jump_replays_over_http(self):
+        # The reviewer's probe-http-credential-jump through the real HTTP service.
+        import threading
+        import urllib.request
+        import http_auth as auth
+        clock = self.clock
+        state = self.tmp / 'http.json'
+        auth.Store(str(state), clock=lambda: clock[0])
+        Service.bootstrap_superuser(auth.Store(str(state), clock=lambda: clock[0]),
+                                    'admin', ADMIN_PASSWORD)
+        service = Service(auth.Store(str(state), clock=lambda: clock[0]))
+
+        class Args:
+            backend = 'inprocess'
+        httpd = create_server(service, build_backend(service, Args), host='127.0.0.1',
+                              port=0)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        base = 'http://127.0.0.1:%d' % httpd.server_address[1]
+
+        def call(method, path, body=None, token=None, key=None):
+            headers = {'Content-Type': 'application/json'}
+            if token:
+                headers['Authorization'] = 'Bearer ' + token
+            if key:
+                headers['Idempotency-Key'] = key
+            request = urllib.request.Request(
+                base + path, data=json.dumps(body).encode() if body is not None else None,
+                method=method, headers=headers)
+            try:
+                with urllib.request.urlopen(request) as reply:
+                    return reply.status, json.loads(reply.read() or b'null')
+            except urllib.error.HTTPError as error:
+                return error.code, json.loads(error.read() or b'null')
+
+        def login():
+            status, body = call('POST', '/v1/sessions',
+                                {'username': 'admin', 'password': ADMIN_PASSWORD})
+            self.assertEqual(201, status, body)
+            return body['session']['token']
+        token = login()
+        self.assertEqual(201, call('POST', '/v1/projects',
+                                   {'name': 'proj one', 'project_id': 'p1'}, token,
+                                   key='proj-key-00001')[0])
+        body = {'label': 'ci worker', 'scopes': ['tasks'], 'actor': 'ci'}
+        status, first = call('POST', '/v1/projects/p1/worker-credentials', body, token,
+                             key='cred-key-000001')
+        self.assertEqual(201, status, first)
+        real = clock[0]
+        clock[0] = real + 8 * self.DAY
+        token = login()
+        for index in range(8):
+            clock[0] += 600
+            call('POST', '/v1/projects', {'name': 'filler %d' % index}, token,
+                 key='filler-key-%05d' % index)
+        self.assertFalse(service.store.records.stats()['suspect'])
+        clock[0] = real + 600
+        token = login()
+        status, retry = call('POST', '/v1/projects/p1/worker-credentials', body, token,
+                             key='cred-key-000001')
+        self.assertIn(status, (200, 201, 409), retry)
+        if status in (200, 201):
+            self.assertEqual(first['credential']['id'], retry['credential']['id'])
+        labelled = [credential for credential in service.state['credentials'].values()
+                    if credential.get('label') == 'ci worker']
+        self.assertEqual(1, len(labelled))
 
 
 if __name__ == '__main__':
