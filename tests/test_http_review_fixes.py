@@ -1787,6 +1787,15 @@ class PreEffectValidationCase(unittest.TestCase):
         self.assertTrue(is_mutating_invocation([]))
         self.assertTrue(is_mutating_invocation(['brand-new-verb']))
 
+    def test_plain_dry_run_preflight_is_not_a_write(self):
+        self.assertFalse(is_mutating_invocation(['create', 'x', '--parent', 'p-1', '--dry-run']))
+        self.assertFalse(is_mutating_invocation(['update', 'task-1', '--status', 'open', '--dry-run']))
+        self.assertTrue(is_mutating_invocation(['create', 'x', '--dry-run=false']))
+        self.assertTrue(is_mutating_invocation(['create', 'x', '--dry-run', '--dry-run=false']))
+        self.assertTrue(is_mutating_invocation(['create', 'x', '--', '--dry-run']))
+        self.assertTrue(is_mutating_invocation(['comments', 'add', 'task-1', '--dry-run']))
+        self.assertTrue(is_mutating_invocation(['close', 'task-1', '--dry-run']))
+
 
 class JournalRetentionCase(unittest.TestCase):
     """19. Short committed receipts, durable tombstones and the clock-skew guard."""

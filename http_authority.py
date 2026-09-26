@@ -621,12 +621,30 @@ READ_ONLY_BD_VERBS = frozenset({'export', 'list', 'show', 'ready', 'search',
 REFUSAL_EXCEPTIONS = (ValueError, KeyError, TypeError, IndexError, UnicodeError)
 
 
+def _is_plain_dry_run(argv):
+    """True only for an unambiguous ``--dry-run`` before any ``--`` terminator.
+
+    Any ``--dry-run=VALUE`` spelling counts as a possible write, so a value such as
+    ``--dry-run=false`` can never be mistaken for a read.
+    """
+    options = list(argv[1:])
+    if '--' in options:
+        options = options[:options.index('--')]
+    if any(isinstance(a, str) and a.startswith('--dry-run=') for a in options):
+        return False
+    return '--dry-run' in options
+
+
 def is_mutating_invocation(argv):
     """Whether one injected ``bin/bd`` argv can change canonical/native state."""
     if not isinstance(argv, (list, tuple)) or not argv or not isinstance(argv[0], str):
         return True
     verb = argv[0]
     if verb in READ_ONLY_BD_VERBS:
+        return False
+    if verb in ('create', 'update') and _is_plain_dry_run(argv):
+        # A validation preflight (`create ... --dry-run`) writes nothing, so a refusal
+        # from it is a clean pre-effect failure, not an uncertain write.
         return False
     if verb == 'comments':
         return len(argv) > 1 and argv[1] == 'add'
