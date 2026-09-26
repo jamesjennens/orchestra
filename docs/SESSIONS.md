@@ -8,9 +8,46 @@ New workers should let the server allocate their actor ID. Readable names do not
 ssh beads-team python3 /home/beads/orchestra/worker.py --root /home/beads/beads-runtime --project example start --name cline
 ```
 
-Replace the installation paths/host/project. The command prints a registration record, an actor such as `session-UUID`, and the normal onboarding instructions. Save that actor and use it as `--actor` on subsequent commands. Do not invent or truncate it. Another worker using the same readable name gets a different actor.
+Replace the installation paths/host/project. Run the command for a new worker from
+that worker's dedicated local working directory; keep one directory/checkout per
+actor and never use another worker's directory or another project's checkout. The
+command prints a registration record, an actor such as `session-UUID`, and the
+normal onboarding instructions. Save the exact actor privately in that directory
+alongside the client configuration supplied in the server-owned project entry,
+outside Git or in local ignored state. Use that installed client and exact
+project-specific configuration; do not copy settings from another project. Do not
+invent or truncate the actor. Another worker using the same readable name gets a
+different actor.
 
 `start` registers a session; `onboard` only reads instructions for an existing actor. Resuming the same worker uses its saved actor, for example `worker.py ... --actor SAVED_ACTOR onboard`. Do not register a replacement identity merely because the session was interrupted; task and merge ownership still belong to the original actor. A genuinely new worker registers separately and follows explicit handoff rules.
+
+If onboarding fails after registration, retain the printed actor and retry
+`onboard` with that actor after correcting the reported issue. Do not call `start`
+again. For a new task, use an explicitly assigned task if one was supplied; otherwise
+select one unheld item from `ready --json`. A task is held by another actor if it
+is assigned to that actor or has an in-progress claim belonging to that actor;
+unheld means neither applies. Claim one task atomically and finish/deliver it
+before claiming another. The Delivery section is supplied by the separate
+onboarding-template dependency (.36); ask the coordinator if it is absent or
+ambiguous in the server-provided entry.
+
+Run these through the installed client, not as bare shell commands (replace the
+example client/config/project/actor with the server-provided values):
+
+```sh
+python orchestra-client.py --config client.local.json --project PROJECT --actor ACTOR -- ready --json
+python orchestra-client.py --config client.local.json --project PROJECT --actor ACTOR -- work --mine
+```
+
+Only an explicitly loop-capable and authorized harness may, after delivery, check
+every N minutes for review feedback on the actor's own tasks first, then check
+`ready --json` for one next unheld task. Continue when one is available; do not
+stop just because the previous task was delivered. Stop at the configured deadline
+or, after checking both sources, when there is no actionable open or pending-review
+task owned by this actor and no unheld task in `ready`. Use the full
+client-prefixed examples above, and do not wait on other actors' held tasks or poll
+an empty queue indefinitely. Office/person-started turns do not poll or loop; end
+each turn with a one-line status for the person.
 
 ## Register with an installed client
 
