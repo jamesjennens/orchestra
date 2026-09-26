@@ -212,38 +212,56 @@ matching state snapshot; restore both together. A state document whose
 ### Operation journal recovery (idempotency receipts)
 
 Each project keeps its idempotency receipts in
-`<PROJECT>/.http-operations.json`: one entry per canonical mutation that carried an
-`operation_id`. An entry stays replayable for the receipt window (default 7 days,
-`http_authority.JOURNAL_RETENTION_SECONDS`). Inside the window an exact retry replays
-the committed response or reports `124` uncertainty; it never repeats the effect.
+`<PROJECT>/.http-operations.json`: one record per canonical mutation that carried an
+`operation_id`. The document has three parts (schema 2; a schema-1 flat file is read
+transparently and rewritten on the next mutation):
 
-A busy project does **not** need routine pruning. When the journal reaches
-`JOURNAL_LIMIT` (2000) entries the endpoint reclaims only identities whose receipt
-window has closed; live identities always fail closed with `124`, and expired
-identities are never locked out. An operator only intervenes for inspection or for a
-stuck unknown identity:
+* **entries** — the live identities. A *committed* receipt keeps its replayable
+  response for `JOURNAL_COMMITTED_RETENTION_SECONDS` (default 1 day); an *uncertain*
+  reservation (`in_progress`/`unknown`) stays live for
+  `JOURNAL_RETENTION_SECONDS` (default 7 days) because it may correspond to a
+  committed native write whose outcome was never observed.
+* **tombstones** — a compact record (operation id, request hash, principal, times) for
+  every reclaimed identity. It keeps refusing an exact retry as expired, so reclaiming
+  can never turn a retry into a duplicate effect. Tombstones are bounded by count
+  (`JOURNAL_TOMBSTONE_LIMIT`), age (`JOURNAL_TOMBSTONE_SECONDS`) and the journal byte
+  budget.
+* **high_water** — a non-decreasing wall-clock mark. Reclaim refuses to drop anything
+  while the clock is more than `JOURNAL_MAX_SKEW_SECONDS` ahead of it, so a clock jump
+  cannot reclaim identities whose receipt window is still open.
+
+An exact retry inside its window replays the committed response or reports `124`
+uncertainty; outside it (or after reclaim) it is refused as expired with `rc=2`. It is
+never re-executed. Ordinary load never refuses a write: when the journal reaches its
+entry or byte bound the endpoint compacts the oldest terminal (committed) receipts to
+tombstones first, and only genuinely live uncertain reservations fail closed with
+`124`.
+
+An operator only intervenes for inspection, for a stuck unknown identity, or to
+shorten a window:
 
 ```sh
-# inspect: totals, per-state counts, expired/reclaimable count and bytes
+# inspect: entry/tombstone counts, per-state counts, expired/reclaimable count and bytes
 sudo -u <SERVICE_USER> python3 admin.py --root <RUNTIME_ROOT> journal <PROJECT>
 
-# compact closed receipt windows now (safe; expired retries were already refused)
+# compact closed receipt windows now (safe; reclaim writes tombstones, never drops)
 sudo -u <SERVICE_USER> python3 admin.py --root <RUNTIME_ROOT> journal <PROJECT> --reclaim-expired
 
-# override the window for one inspection/compaction (seconds)
+# override either window for one inspection/compaction (seconds)
 sudo -u <SERVICE_USER> python3 admin.py --root <RUNTIME_ROOT> journal <PROJECT> \
-    --retention 86400 --reclaim-expired
+    --retention 604800 --committed-retention 86400 --reclaim-expired
 
 # explicit override after reconciling canonical state: remove a still-live identity
 sudo -u <SERVICE_USER> python3 admin.py --root <RUNTIME_ROOT> journal <PROJECT> \
     --prune-before <EPOCH_SECONDS>
 ```
 
-`--prune-before` is the only operation that can make an exact retry repeat its
-effect. Reconcile the canonical task/comment state first, then prune that identity,
-then let the client issue a fresh `operation_id`. Every journal command runs under the
-project coordination lock, so it cannot interleave with a live mutation; it is a
-local operator action and is never exposed over HTTP.
+`--prune-before` is the only operation that removes a record without a tombstone, so it
+is the only one that can make an exact retry repeat its effect. Reconcile the canonical
+task/comment state first, then prune that identity, then let the client issue a fresh
+`operation_id`. Every journal command runs under the project coordination lock, so it
+cannot interleave with a live mutation; it is a local operator action and is never
+exposed over HTTP.
 
 ## 9. SSH compatibility
 

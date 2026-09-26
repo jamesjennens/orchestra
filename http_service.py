@@ -44,6 +44,13 @@ MAX_FILENAME = 128
 MAX_PAGE = 100
 DEFAULT_PAGE = 50
 MAX_CURSOR = 512
+# Bounds on the service state's committed-result replay map (``canonical.results``).
+# The durable exactly-once identity is the endpoint operation journal; this map is
+# only the fast replay path, so it is bounded by both entry count and serialized
+# bytes and evicts the oldest entry. The endpoint journal still refuses or replays a
+# retry whose local result was evicted, so an eviction never duplicates an effect.
+RESULTS_LIMIT = 2048
+RESULTS_MAX_BYTES = 2 * 1024 * 1024
 IDEMPOTENCY_HEADER = 'Idempotency-Key'
 ATTACHMENT_MEDIA_TYPES = ('text/plain', 'text/markdown')
 # One identifier pattern for every route parameter. Canonical Orchestra ids contain
@@ -158,6 +165,46 @@ def read_cursor(principal, project_id, query, cursor):
     return {'o': data['o'], 'x': data.get('x')}
 
 
+def remember_result(results, key, value, limit=None, max_bytes=None):
+    """Insert one committed result into the bounded replay map, evicting the oldest.
+
+    ``results`` is the service state's ``canonical.results`` document. It grows with
+    every new idempotency key, so without a bound the state file grows without limit;
+    the bound is by entry count first, then by serialized bytes, always dropping the
+    oldest insertions (dict order is insertion order). A retry whose local result was
+    evicted still reaches the durable endpoint journal, which replays or refuses the
+    same operation identity instead of repeating the effect.
+    """
+    if limit is None:
+        limit = RESULTS_LIMIT
+    if max_bytes is None:
+        max_bytes = RESULTS_MAX_BYTES
+    results[key] = value
+    while len(results) > limit and len(results) > 1:
+        results.pop(next(iter(results)), None)
+    try:
+        current = len(json.dumps(results, separators=(',', ':'),
+                                 ensure_ascii=False).encode('utf-8'))
+    except (TypeError, ValueError):
+        return results
+    if current <= max_bytes or len(results) <= 1:
+        return results
+    sizes = []
+    for entry_key, entry_value in results.items():
+        try:
+            size = len(json.dumps(entry_value, separators=(',', ':'),
+                                  ensure_ascii=False).encode('utf-8'))
+        except (TypeError, ValueError):
+            size = 0
+        sizes.append((entry_key, size))
+    for entry_key, size in sizes[:-1]:
+        if current <= max_bytes:
+            break
+        results.pop(entry_key, None)
+        current -= size + len(entry_key) + 4
+    return results
+
+
 # ------------------------------------------------------------------ backend seam
 class UncertainOutcome(Exception):
     """A canonical mutation may have committed but its result was not observed."""
@@ -212,7 +259,7 @@ class InProcessBackend:
                 return self._results()[result_key]
             result = self._dispatch(route, principal, project_id, payload)
             if result_key is not None:
-                self._results()[result_key] = result
+                remember_result(self._results(), result_key, result)
             self.service.store.save()
         if self.faults.get(route, 0) > 0:
             self.faults[route] -= 1
@@ -582,7 +629,7 @@ class EndpointBackend:
         # changed the authority the effect ran under.
         if result_key is not None:
             with self.service.store.lock:
-                self._results()[result_key] = result
+                remember_result(self._results(), result_key, result)
                 self.service.store.save()
         if self.faults.get(route, 0) > 0:
             self.faults[route] -= 1

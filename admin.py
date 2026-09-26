@@ -319,11 +319,13 @@ def main():
     a=sub.add_parser('service');a.add_argument('action',choices=['start','stop','restart','status'])
     a=sub.add_parser('journal');a.add_argument('project')
     a.add_argument('--retention',type=float,default=None,
-                   help='idempotency receipt window in seconds for this command (default 7 days)')
+                   help='uncertain-reservation window in seconds for this command (default 7 days)')
+    a.add_argument('--committed-retention',type=float,dest='committed_retention',default=None,
+                   help='replayable committed-receipt window in seconds (default 1 day)')
     a.add_argument('--reclaim-expired',action='store_true',
-                   help='remove identities whose receipt window has closed')
+                   help='compact identities whose receipt window has closed into tombstones')
     a.add_argument('--prune-before',type=float,default=None,
-                   help='remove identities last touched before this epoch second (after reconciling)')
+                   help='hard-remove identities last touched before this epoch second (after reconciling)')
     args=p.parse_args();root=root_path(args.root)
     if args.command=='install':install(root,args.port,args.unit)
     elif args.command=='add-project':add_project(root,args.project)
@@ -364,8 +366,11 @@ def main():
         path=project_dir(root,args.project)
         if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
         if args.retention is not None and args.retention<=0:raise ValueError('Retention must be a positive number of seconds')
+        if args.committed_retention is not None and args.committed_retention<=0:
+            raise ValueError('Committed retention must be a positive number of seconds')
         options={}
         if args.retention is not None:options['retention']=args.retention
+        if args.committed_retention is not None:options['committed_retention']=args.committed_retention
         journal=OperationJournal(str(path/'.http-operations.json'),**options)
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
@@ -375,8 +380,10 @@ def main():
             report['stats']=journal.stats()
         print(json.dumps(report,sort_keys=True))
         if not args.reclaim_expired and args.prune_before is None:
-            print('Inspect only. Expired identities are reclaimed automatically under capacity pressure; '
-                  'use --reclaim-expired to compact now, or --prune-before EPOCH after reconciling canonical state.',
+            print('Inspect only. Closed receipt windows are compacted to tombstones automatically under '
+                  'capacity pressure; use --reclaim-expired to compact now, or --prune-before EPOCH to '
+                  'hard-remove a still-live identity after reconciling canonical state (an exact retry of '
+                  'a pruned identity can repeat its effect; a reclaimed one is refused as expired).',
                   file=__import__('sys').stderr)
     elif args.command=='restore-new':
         validate_name(args.project);validate_name(args.destination)

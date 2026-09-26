@@ -31,9 +31,12 @@ from both sides of the process seam:
   attachment, task mismatch, malformed payload) raised before the effect's first
   native write through the injected runner is proven pre-effect: the identity is
   released and the real error keeps the canonical ``rc=2`` message. Identity
-  retention is a timed receipt window: inside it an exact retry replays or reports
-  uncertainty, outside it the retry is refused as expired and the record becomes
-  reclaimable, so a busy project cannot be locked out at the entry limit.
+  retention is a bounded, tombstoned receipt policy: a committed receipt is
+  replayable for a short window and then compacted to a durable tombstone that still
+  refuses an exact retry, an uncertain reservation stays live (and fails closed) for
+  the long window, and a clock jump larger than the skew allowance stops reclaim from
+  dropping a live identity. Ordinary load therefore never refuses a write, while a
+  reclaimed identity is refused as expired rather than re-executed.
 
 Nothing here imports ``fcntl`` at module import time, so the same module imports on a
 Windows workstation and a Linux office host.
@@ -49,30 +52,47 @@ from pathlib import Path
 SCHEMA_VERSION = 1
 
 # ------------------------------------------------------- operation journal bounds
-#: Hard capacity of one project's *live* operation journal. An identity whose
-#: idempotency receipt window is still open is never evicted: at capacity a new
-#: guarded mutation fails closed (``124``) rather than silently dropping a live
-#: identity and letting a later retry repeat an effect. Once a window has closed the
-#: identity is *expired*: a retry of it is refused as expired (never replayed and
-#: never re-run), and the record is reclaimable so a busy project cannot be locked
-#: out permanently. Recovery is automatic (reclaim on capacity pressure) and manual
-#: (:meth:`OperationJournal.reclaim_expired` / :meth:`prune` through ``admin.py
-#: journal``).
-JOURNAL_LIMIT = 2000
-#: How long an operation identity stays a replayable idempotency receipt, measured
-#: from its last touch. Inside the window an exact retry replays a committed result
-#: or reports uncertainty, and a not-yet-committed identity keeps its reservation.
-#: Outside it the identity has expired: the endpoint refuses it as expired and the
-#: record may be reclaimed. The window is the documented limit of the idempotency
-#: guarantee; an operator can shorten it per command with ``admin.py journal
-#: --retention``.
+#: Hard capacity of one project's *live* operation journal, in entries. It is a
+#: safety backstop, not the ordinary bound: a closed receipt window is compacted to a
+#: tombstone, and under capacity pressure the oldest terminal (committed) receipts
+#: are compacted before a write is refused, so ordinary load never refuses a write.
+#: Only genuinely live reservations (``in_progress``/``unknown``) fail closed with
+#: ``124`` when the journal cannot also hold them.
+JOURNAL_LIMIT = 100000
+#: How long an *uncertain* reservation (``in_progress``/``unknown``) stays live. This
+#: is the long-lived window: such an identity may correspond to a committed native
+#: effect whose outcome was never observed, so it is retained (and an exact retry
+#: reports uncertainty) until an operator reconciles it or this window closes.
 JOURNAL_RETENTION_SECONDS = 7 * 24 * 60 * 60
+#: How long a *committed* receipt keeps its replayable response envelope. It is
+#: deliberately far shorter than the uncertain window: a lost-response retry happens
+#: within seconds or minutes, while holding every committed envelope for a week is
+#: what let a busy project reach the entry limit. Once this window closes the record
+#: is compacted to a tombstone and an exact retry is refused as expired, never re-run.
+JOURNAL_COMMITTED_RETENTION_SECONDS = 24 * 60 * 60
+#: How long a compact tombstone (operation id + request hash + principal) keeps
+#: refusing a retry of a reclaimed identity. A tombstone is the durable replacement
+#: for "the record was dropped", so reclaim no longer turns a duplicate into a new
+#: effect.
+JOURNAL_TOMBSTONE_SECONDS = 30 * 24 * 60 * 60
+#: Count bound for the compact tombstone set; the oldest tombstones are dropped past
+#: it. Generous relative to the entry bound because a tombstone is ~an order of
+#: magnitude smaller than a receipt.
+JOURNAL_TOMBSTONE_LIMIT = 20000
+#: A wall-clock jump larger than this is treated as implausible: reclaim refuses to
+#: drop an identity while ``now`` is this far ahead of the persisted non-decreasing
+#: high-water mark, so a forward clock jump cannot reclaim a live identity.
+JOURNAL_MAX_SKEW_SECONDS = 24 * 60 * 60
 #: Largest serialized response envelope retained for replay. A larger envelope is
 #: recorded by digest only, so a retry reports uncertainty instead of a truncated
 #: result.
 MAX_ENVELOPE_BYTES = 65536
 #: Largest serialized journal document accepted after a mutation.
 MAX_JOURNAL_BYTES = 8 * 1024 * 1024
+#: On-disk schema of the journal document (entries + tombstones + high-water mark).
+#: A legacy flat ``operation_id -> record`` document is read transparently and
+#: rewritten in this shape on the next mutation.
+JOURNAL_SCHEMA = 2
 
 # --------------------------------------------------------------- capability model
 CAP_READ = 'read'
@@ -430,21 +450,29 @@ class OperationJournal:
     The caller holds the project coordination lock, so a plain read/modify/write of
     one JSON document is serialized; the write is an atomic replace.
 
-    Retention is a timed, documented boundary, not an implicit count eviction:
+    One coherent, bounded policy replaces both the old hard count lockout (a busy
+    project refused writes above 2000 live identities) and the old "reclaim drops the
+    record" path (a reclaimed retry re-ran its effect):
 
-    * An identity stays a replayable idempotency receipt for
-      :data:`JOURNAL_RETENTION_SECONDS` after its last touch. Inside that window an
-      exact retry replays a committed envelope or reports uncertainty; it is never
-      re-run.
-    * Outside the window the identity is *expired*: :meth:`expired` is true, the
-      endpoint refuses a retry of it as expired (never replayed, never re-run), and
-      the record may be reclaimed. Reclamation happens automatically only under
-      capacity pressure (:meth:`reserve`) and explicitly through
-      :meth:`reclaim_expired` or :meth:`prune`, so an operator always has a
-      deterministic recovery path.
-    * Capacity for *live* identities still fails closed: if the journal is full of
-      unexpired identities a new reservation raises :class:`JournalFull` and the
-      guarded mutation returns ``124``.
+    * A **committed** receipt keeps its replayable envelope for
+      :data:`JOURNAL_COMMITTED_RETENTION_SECONDS`. Inside it an exact retry replays
+      the recorded result; it is never re-run.
+    * An **uncertain** reservation (``in_progress``/``unknown``) is the only
+      long-lived record. It stays live for :data:`JOURNAL_RETENTION_SECONDS`, keeps
+      failing closed, and is never evicted while its window is open.
+    * A record whose window has closed is **compacted to a tombstone** (operation id,
+      request hash, principal, times) rather than dropped, so an exact retry after
+      reclaim is refused as expired instead of re-executing.
+    * Under capacity pressure the oldest terminal (committed) receipts are compacted
+      to tombstones first, so ordinary load never refuses a write. Only a journal
+      whose live uncertain reservations cannot be held raises :class:`JournalFull`
+      (``124``): that is the genuinely fail-closed case.
+    * The persisted ``high_water`` mark never decreases. Reclaim refuses to drop an
+      identity while the wall clock is more than :data:`JOURNAL_MAX_SKEW_SECONDS`
+      ahead of it, so a forward clock jump cannot reclaim a live receipt.
+    * Operator overrides are :meth:`reclaim_expired` (compact closed windows) and
+      :meth:`prune` (hard-remove still-live identities after reconciling; the one
+      action that can let an exact retry repeat).
 
     A response envelope larger than :data:`MAX_ENVELOPE_BYTES` is recorded by digest
     only, so an exact retry reports uncertainty instead of returning a truncated
@@ -452,39 +480,90 @@ class OperationJournal:
     """
 
     def __init__(self, path, limit=JOURNAL_LIMIT, max_envelope=MAX_ENVELOPE_BYTES,
-                 max_bytes=MAX_JOURNAL_BYTES, retention=JOURNAL_RETENTION_SECONDS):
+                 max_bytes=MAX_JOURNAL_BYTES, retention=JOURNAL_RETENTION_SECONDS,
+                 committed_retention=JOURNAL_COMMITTED_RETENTION_SECONDS,
+                 tombstone_seconds=JOURNAL_TOMBSTONE_SECONDS,
+                 tombstone_limit=JOURNAL_TOMBSTONE_LIMIT,
+                 max_skew=JOURNAL_MAX_SKEW_SECONDS):
         self.path = Path(path)
         self.limit = limit
         self.max_envelope = max_envelope
         self.max_bytes = max_bytes
         self.retention = retention
+        self.committed_retention = committed_retention
+        self.tombstone_seconds = tombstone_seconds
+        self.tombstone_limit = tombstone_limit
+        self.max_skew = max_skew
 
-    def _load(self):
+    # -- document shape --------------------------------------------------------
+    @staticmethod
+    def _blank():
+        return {'schema': JOURNAL_SCHEMA, 'high_water': 0.0,
+                'entries': {}, 'tombstones': {}}
+
+    def _document(self):
+        """The journal document, reading a legacy flat schema-1 file transparently."""
         try:
             data = json.loads(self.path.read_text(encoding='utf-8'))
         except (OSError, ValueError):
-            return {}
-        return data if isinstance(data, dict) else {}
+            return self._blank()
+        if not isinstance(data, dict):
+            return self._blank()
+        if data.get('schema') == JOURNAL_SCHEMA and isinstance(data.get('entries'), dict):
+            document = self._blank()
+            document['high_water'] = float(data.get('high_water') or 0) or time.time()
+            document['entries'] = {key: value for key, value in data['entries'].items()
+                                   if isinstance(value, dict)}
+            document['tombstones'] = {
+                key: value for key, value in (data.get('tombstones') or {}).items()
+                if isinstance(value, dict)}
+            return document
+        # Legacy flat document (schema 1): operation_id -> record, no high-water mark.
+        # Treat the first read as establishing the mark at the current clock.
+        document = self._blank()
+        document['high_water'] = time.time()
+        document['entries'] = {key: value for key, value in data.items()
+                               if isinstance(value, dict)}
+        return document
 
-    def _save(self, data):
+    def _load(self):
+        """The live entries, for callers that only need the identity records."""
+        return self._document()['entries']
+
+    def _save(self, document):
+        self._advance_high_water(document)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_name(self.path.name + '.tmp')
-        temporary.write_text(json.dumps(data), encoding='utf-8')
+        temporary.write_text(json.dumps(document), encoding='utf-8')
         temporary.replace(self.path)
+
+    def _advance_high_water(self, document):
+        """Advance the non-decreasing high-water mark by at most ``max_skew``.
+
+        Bounding the step means a single forward clock jump cannot certify itself as
+        the new truthful time: reclaim keeps refusing until the clock comes back near
+        the mark or ordinary writes slowly re-establish it.
+        """
+        now = time.time()
+        high = float(document.get('high_water') or 0)
+        if high <= 0:
+            document['high_water'] = now
+        else:
+            document['high_water'] = max(high, min(now, high + self.max_skew))
 
     @staticmethod
     def _serialized(data):
         return json.dumps(data, ensure_ascii=False)
 
-    def _enforce(self, data):
-        if len(data) > self.limit:
-            raise JournalFull('Operation journal is at capacity (%d entries)' % self.limit)
+    def _document_bytes(self, document):
         try:
-            text = self._serialized(data)
+            return len(self._serialized(document).encode('utf-8'))
         except (TypeError, ValueError):
-            raise JournalFull('Operation journal is not serializable')
-        if len(text.encode('utf-8')) > self.max_bytes:
-            raise JournalFull('Operation journal exceeds its byte budget')
+            return self.max_bytes + 1
+
+    def _over(self, document):
+        return (len(document['entries']) > self.limit or
+                self._document_bytes(document) > self.max_bytes)
 
     def _bounded(self, envelope):
         try:
@@ -496,113 +575,252 @@ class OperationJournal:
             return None, hashlib.sha256(raw).hexdigest(), True
         return envelope, hashlib.sha256(raw).hexdigest(), False
 
+    def window(self, entry):
+        """The retention window that applies to one record."""
+        state = entry.get('state') if isinstance(entry, dict) else None
+        if state == 'expired':
+            return 0
+        if state == 'committed':
+            return self.committed_retention
+        return self.retention
+
     def expired(self, entry, now=None):
         """Whether ``entry``'s idempotency receipt window has closed."""
         if not isinstance(entry, dict):
             return False
+        if entry.get('state') == 'expired':
+            return True
         moment = time.time() if now is None else now
-        return entry.get('at', 0) + self.retention <= moment
+        return entry.get('at', 0) + self.window(entry) <= moment
 
-    def _reclaim(self, data, now=None):
-        """Drop only entries whose receipt window has closed. Returns the count."""
-        moment = time.time() if now is None else now
-        stale = [key for key, value in data.items()
-                 if isinstance(value, dict) and self.expired(value, moment)]
+    # -- compaction / bounds ---------------------------------------------------
+    def _skewed(self, document, now):
+        high = float(document.get('high_water') or 0)
+        return high > 0 and now > high + self.max_skew
+
+    def _trusted_now(self, document, now):
+        """``now`` clamped to the high-water mark plus the skew allowance.
+
+        Age-based drops use this so a forward clock jump cannot expire a record (or
+        drop a tombstone) whose real age is still inside its window.
+        """
+        high = float(document.get('high_water') or 0)
+        if high <= 0:
+            return now
+        return min(now, high + self.max_skew)
+
+    def _tombstone(self, document, key, record, now):
+        document['tombstones'][key] = {
+            'state': 'expired', 'request_hash': record.get('request_hash'),
+            'principal': record.get('principal'), 'at': record.get('at', now),
+            'reclaimed_at': now}
+        document['entries'].pop(key, None)
+
+    def _reclaim(self, document, now):
+        """Compact every closed-window identity to a tombstone. Returns the count.
+
+        Returns 0 without touching anything while the clock is implausibly far ahead
+        of the high-water mark, so a forward jump cannot drop a live identity.
+        """
+        if self._skewed(document, now):
+            return 0
+        entries = document['entries']
+        stale = [key for key, value in entries.items()
+                 if isinstance(value, dict) and self.expired(value, now)]
         for key in stale:
-            data.pop(key, None)
+            self._tombstone(document, key, entries[key], now)
         return len(stale)
 
-    def lookup(self, operation_id):
-        entry = self._load().get(operation_id)
-        return entry if isinstance(entry, dict) else None
+    def _compact(self, document, now, protect=None):
+        """Compact the oldest terminal receipt to a tombstone. Never a live one.
 
+        Refuses under an implausible clock: a forward jump plus capacity pressure must
+        not compact a committed receipt that is still inside its replay window.
+        """
+        if self._skewed(document, now):
+            return False
+        entries = document['entries']
+        candidates = [key for key, value in entries.items()
+                      if key != protect and isinstance(value, dict)
+                      and value.get('state') == 'committed']
+        if not candidates:
+            return False
+        oldest = min(candidates, key=lambda key: entries[key].get('at', 0))
+        self._tombstone(document, oldest, entries[oldest], now)
+        return True
+
+    @staticmethod
+    def _drop_oldest_tombstone(tombstones):
+        oldest = min(tombstones, key=lambda key: tombstones[key].get('reclaimed_at', 0))
+        tombstones.pop(oldest, None)
+
+    def _bound_tombstones(self, document, now):
+        """Drop only stale/over-limit tombstones. Returns the count dropped."""
+        tombstones = document['tombstones']
+        dropped = 0
+        trusted = self._trusted_now(document, now)
+        stale = [key for key, value in tombstones.items()
+                 if isinstance(value, dict) and
+                 value.get('reclaimed_at', 0) + self.tombstone_seconds <= trusted]
+        for key in stale:
+            tombstones.pop(key, None)
+            dropped += 1
+        while len(tombstones) > self.tombstone_limit:
+            self._drop_oldest_tombstone(tombstones)
+            dropped += 1
+        if not tombstones:
+            return dropped
+        current = self._document_bytes(document)
+        if current <= self.max_bytes:
+            return dropped
+        sizes = []
+        for key, value in tombstones.items():
+            try:
+                size = len(json.dumps(value, ensure_ascii=False).encode('utf-8'))
+            except (TypeError, ValueError):
+                size = 0
+            sizes.append((value.get('reclaimed_at', 0), key, size))
+        sizes.sort()
+        for _, key, size in sizes:
+            if current <= self.max_bytes:
+                break
+            tombstones.pop(key, None)
+            current -= size + len(key) + 6
+            dropped += 1
+        return dropped
+
+    def _fit(self, document, now, protect=None):
+        """Bring the document back inside its bounds without losing an identity."""
+        self._reclaim(document, now)
+        self._bound_tombstones(document, now)
+        guard = 0
+        while self._over(document) and guard <= len(document['entries']):
+            if not self._compact(document, now, protect):
+                break
+            guard += 1
+            self._bound_tombstones(document, now)
+        return not self._over(document)
+
+    def lookup(self, operation_id):
+        document = self._document()
+        entry = document['entries'].get(operation_id)
+        if isinstance(entry, dict):
+            return entry
+        tombstone = document['tombstones'].get(operation_id)
+        return tombstone if isinstance(tombstone, dict) else None
+
+    # -- mutations -------------------------------------------------------------
     def reserve(self, operation_id, request_hash, principal):
-        data = self._load()
-        data[operation_id] = {'state': 'in_progress', 'request_hash': request_hash,
-                              'principal': principal, 'at': time.time()}
-        try:
-            self._enforce(data)
-        except JournalFull:
-            # Capacity pressure. Live identities still fail closed; only identities
-            # whose idempotency window has closed are reclaimed.
-            if not self._reclaim(data):
-                raise
-            self._enforce(data)
-        self._save(data)
+        """Reserve a new identity, compacting terminal receipts under pressure.
+
+        Raises :class:`JournalFull` only when live uncertain reservations plus this
+        new one cannot be held inside the bounds; committed receipts and closed
+        windows never cause a refusal by themselves.
+        """
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError('operation_id must be a non-empty string')
+        document = self._document()
+        now = time.time()
+        document['entries'][operation_id] = {
+            'state': 'in_progress', 'request_hash': request_hash,
+            'principal': principal, 'at': now}
+        if not self._fit(document, now, protect=operation_id):
+            raise JournalFull('Operation journal is at capacity (%d live identities)'
+                              % self.limit)
+        self._save(document)
 
     def complete(self, operation_id, envelope, request_hash, principal):
-        data = self._load()
+        document = self._document()
+        now = time.time()
         stored, digest, omitted = self._bounded(envelope)
-        record = {'state': 'committed', 'request_hash': request_hash, 'principal': principal,
-                  'at': time.time(), 'envelope': stored, 'envelope_sha256': digest}
+        record = {'state': 'committed', 'request_hash': request_hash,
+                  'principal': principal, 'at': now, 'envelope': stored,
+                  'envelope_sha256': digest}
         if omitted:
             record['envelope_omitted'] = True
-        data[operation_id] = record
-        if omitted is False and len(self._serialized(data).encode('utf-8')) > self.max_bytes:
+        document['entries'][operation_id] = record
+        fitted = self._fit(document, now, protect=operation_id)
+        if not fitted and not omitted:
             # Keep the identity and its digest, drop only the oversized body.
             record['envelope'] = None
             record['envelope_omitted'] = True
-        self._enforce(data)
-        self._save(data)
+            fitted = self._fit(document, now, protect=operation_id)
+        if not fitted:
+            raise JournalFull('Operation journal is at capacity (%d live identities)'
+                              % self.limit)
+        self._save(document)
 
     def mark_unknown(self, operation_id):
         """Keep a reservation whose outcome is not known to be pre-effect."""
-        data = self._load()
-        record = data.get(operation_id)
+        document = self._document()
+        record = document['entries'].get(operation_id)
         if isinstance(record, dict):
             record['state'] = 'unknown'
             record['at'] = time.time()
-            self._save(data)
+            self._save(document)
 
     def discard(self, operation_id):
-        data = self._load()
-        if data.pop(operation_id, None) is not None:
-            self._save(data)
+        document = self._document()
+        if document['entries'].pop(operation_id, None) is not None:
+            self._save(document)
 
     def reclaim_expired(self, now=None):
-        """Remove every identity whose receipt window has closed. Returns the count.
+        """Compact every closed-window identity to a tombstone. Returns the count.
 
-        This is automatic under capacity pressure; it is also an operator action for
+        This is automatic under capacity pressure; it is also the operator action for
         a deployment that wants to compact the journal before the limit is reached.
-        A caller retrying an expired identity is refused as expired while the record
-        remains; once reclaimed the retry is indistinguishable from a new operation,
-        so canonical state must be reconciled before reusing an old operation_id.
+        Unlike :meth:`prune` it never lets an exact retry repeat: the tombstone keeps
+        refusing the reclaimed identity as expired.
         """
-        data = self._load()
-        removed = self._reclaim(data, now)
-        if removed:
-            self._save(data)
+        document = self._document()
+        moment = time.time() if now is None else now
+        removed = self._reclaim(document, moment)
+        dropped = self._bound_tombstones(document, moment)
+        if removed or dropped:
+            self._save(document)
         return removed
 
     def prune(self, before):
-        """Explicitly remove entries last touched before ``before`` (epoch seconds).
+        """Hard-remove identities last touched before ``before`` (epoch seconds).
 
-        This is the operator override for identities that are still inside their
-        receipt window (for example after reconciling a stuck unknown). After a prune
-        an exact retry of a pruned operation can repeat the effect, so canonical state
-        must be reconciled first. Returns the count removed.
+        This is the explicit operator override for a still-live identity (for example
+        after reconciling a stuck unknown). It is deliberately the *only* action that
+        removes a record without a tombstone, so after a prune an exact retry of the
+        pruned operation can repeat the effect: reconcile canonical state first, then
+        have the client use a fresh ``operation_id``. Returns the count removed.
         """
-        data = self._load()
-        removed = [key for key, value in data.items()
+        document = self._document()
+        removed = [key for key, value in document['entries'].items()
                    if isinstance(value, dict) and value.get('at', 0) < before]
         for key in removed:
-            data.pop(key, None)
-        if removed:
-            self._save(data)
+            document['entries'].pop(key, None)
+        stales = [key for key, value in document['tombstones'].items()
+                  if isinstance(value, dict) and value.get('at', 0) < before]
+        for key in stales:
+            document['tombstones'].pop(key, None)
+        if removed or stales:
+            self._save(document)
         return len(removed)
 
-    def stats(self):
-        data = self._load()
+    def stats(self, now=None):
+        document = self._document()
+        entries = document['entries']
+        moment = time.time() if now is None else now
         states = {'in_progress': 0, 'committed': 0, 'unknown': 0}
-        now = time.time()
         expired = 0
-        for value in data.values():
+        for value in entries.values():
             if isinstance(value, dict) and value.get('state') in states:
                 states[value['state']] += 1
-            if isinstance(value, dict) and self.expired(value, now):
+            if isinstance(value, dict) and self.expired(value, moment):
                 expired += 1
-        return {'total': len(data), 'limit': self.limit, 'retention': self.retention,
-                'expired': expired, 'reclaimable': expired, 'states': states,
+        skewed = self._skewed(document, moment)
+        return {'total': len(entries), 'limit': self.limit,
+                'retention': self.retention,
+                'committed_retention': self.committed_retention,
+                'expired': expired, 'reclaimable': 0 if skewed else expired,
+                'states': states, 'tombstones': len(document['tombstones']),
+                'tombstone_limit': self.tombstone_limit,
+                'high_water': document['high_water'], 'clock_skewed': skewed,
                 'bytes': self.path.stat().st_size if self.path.exists() else 0}
 
 
@@ -613,7 +831,7 @@ def _envelope(code, stderr='', **extra):
 
 
 def run_guarded(request, journal_path, effect, authority_config=None,
-                require_authority=False, runner=None):
+                require_authority=False, runner=None, journal_options=None):
     """Run one canonical mutation through the live-authority and identity boundary.
 
     Returns the canonical response envelope (the same shape ``endpoint.py`` emits).
@@ -631,6 +849,9 @@ def run_guarded(request, journal_path, effect, authority_config=None,
       (rc=2, real message, identity released) from an exception that may follow a
       committed write (rc=124, identity held). Without one, only an explicit
       :class:`PreEffectFailure` releases the reservation.
+    * ``journal_options`` are optional :class:`OperationJournal` constructor overrides
+      (limits, retention, skew allowance) for tests and operator tooling; the
+      canonical endpoint passes none, so production uses the module defaults.
     * The authority lock is held across re-validation and the effect, so an HTTP-side
       revocation that committed first is observed here and the effect never runs.
     """
@@ -658,7 +879,8 @@ def run_guarded(request, journal_path, effect, authority_config=None,
                 return _envelope(126, stderr='%s\n' % denied.message,
                                  authority_status=denied.status)
         operation_id = request.get('operation_id')
-        journal = OperationJournal(journal_path) if operation_id else None
+        journal = (OperationJournal(journal_path, **(journal_options or {}))
+                   if operation_id else None)
         # The principal half of the identity comes from the request descriptor only
         # when this launch actually has a trusted authority store.
         principal = principal_key(request, trusted)
@@ -673,12 +895,13 @@ def run_guarded(request, journal_path, effect, authority_config=None,
                     return _envelope(2, stderr='Operation identity reused with a different '
                                                'request\n')
                 if journal.expired(entry):
-                    # Same principal and request, but the receipt window has closed: the
-                    # identity is refused as expired rather than replayed or re-run.
-                    return _envelope(2, stderr='Operation identity expired: it is older than '
-                                               'the %d second idempotency receipt window. '
-                                               'Reconcile canonical state and use a fresh '
-                                               'operation_id.\n' % journal.retention)
+                    # Same principal and request, but the receipt window has closed (or
+                    # the record is a tombstone from an earlier reclaim): the identity is
+                    # refused as expired rather than replayed or re-run.
+                    return _envelope(2, stderr='Operation identity expired: its idempotency '
+                                               'receipt window has closed. Reconcile '
+                                               'canonical state and use a fresh '
+                                               'operation_id.\n')
                 if entry.get('state') == 'committed':
                     if entry.get('envelope_omitted') or entry.get('envelope') is None:
                         return _envelope(124, stderr='Operation is committed but its response '

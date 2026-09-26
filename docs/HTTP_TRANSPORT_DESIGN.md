@@ -394,12 +394,16 @@ in server-side configuration rather than request data:
   `NativeRunner` injected into the effect (`endpoint.py`): it is the effect's only
   route to `bin/bd`, records whether a mutating invocation was attempted, and treats
   an unrecognized verb as a write.
-* *Journal bounds.* `.http-operations.json` is bounded by `JOURNAL_LIMIT` entries,
-  `MAX_ENVELOPE_BYTES` per retained envelope and `MAX_JOURNAL_BYTES` per document.
-  An oversized response envelope is recorded by digest and a retry reports
-  uncertainty instead of returning a truncated result. Retention is a *timed receipt
-  window* (see rev5 below), not an implicit count eviction: live identities are never
-  dropped, and capacity for genuinely new identities still fails closed with `124`.
+* *Journal bounds.* `.http-operations.json` is bounded by entry count
+  (`JOURNAL_LIMIT`), `MAX_ENVELOPE_BYTES` per retained envelope and
+  `MAX_JOURNAL_BYTES` per document, and a compact tombstone set bounded by count
+  (`JOURNAL_TOMBSTONE_LIMIT`), age (`JOURNAL_TOMBSTONE_SECONDS`) and the same byte
+  budget. An oversized response envelope is recorded by digest and a retry reports
+  uncertainty instead of returning a truncated result. Reclaim never drops a record:
+  it compacts it to a tombstone that still refuses an exact retry. Under capacity
+  pressure the oldest terminal (committed) receipts are compacted first, so ordinary
+  load does not refuse a write, while genuinely live uncertain reservations still
+  fail closed with `124`.
 * *Affected non-HTTP callers.* `endpoint.py` is also the SSH worker entry. Every SSH
   request that carries an `operation_id`, and every `brief`/`history`/`checkpoint`
   request that passes through the guarded branch, uses the same journal and the same
@@ -417,24 +421,27 @@ at the same boundary:
   rather than returning `124` forever. Over HTTP this restores the `400 invalid`
   response for, for example, approve-without-contribution. A failure after a write is
   unchanged: the identity stays held and the caller sees `124`.
-* *Journal retention.* An identity is a replayable idempotency receipt for
-  `JOURNAL_RETENTION_SECONDS` (default 7 days) after its last touch. Inside that window
-  an exact retry replays a committed envelope or reports uncertainty, and a live
-  reservation is never evicted. Outside the window the identity is *expired*: the
-  endpoint refuses a retry as expired with `rc=2` (never replayed, never re-run) while
-  the record remains, and the record becomes reclaimable. Reclamation runs
-  automatically only under capacity pressure, so a normally busy project reaches the
-  entry limit only with live identities and still fails closed; expired identities are
-  reclaimed instead of locking the project out. The receipt window is the documented
-  limit of the idempotency guarantee: once an expired record has been reclaimed, a
-  retry of that old `operation_id` is indistinguishable from a new operation, so
-  canonical state must be reconciled before reusing it.
+* *Journal retention.* Retention is split by state. A committed receipt is replayable
+  for `JOURNAL_COMMITTED_RETENTION_SECONDS` (default 1 day): inside that window an
+  exact retry replays its recorded envelope. An uncertain reservation
+  (`in_progress`/`unknown`) is the only long-lived record and stays live for
+  `JOURNAL_RETENTION_SECONDS` (default 7 days); it is never evicted while its window
+  is open and an exact retry reports uncertainty. When a window closes the record is
+  compacted to a *tombstone* (operation id + request hash + principal), so an exact
+  retry after reclaim is refused as expired with `rc=2` rather than re-executed.
+  A persisted, non-decreasing `high_water` mark plus a skew allowance
+  (`JOURNAL_MAX_SKEW_SECONDS`) stops reclaim from dropping a live identity when the
+  wall clock jumps implausibly far forward. The receipt windows are the documented
+  limit of the idempotency guarantee; `admin.py journal --prune-before EPOCH` is the
+  only action that removes a record without a tombstone, so it is the only one that
+  can let an exact retry repeat.
 * *Operator tooling.* `admin.py journal PROJECT [--retention SECONDS]
-  [--reclaim-expired] [--prune-before EPOCH]` inspects the journal in place (total,
-  per-state counts, expired/reclaimable count, bytes) and is the explicit recovery
-  path: `--reclaim-expired` compacts closed windows and `--prune-before EPOCH` removes
-  a still-live identity after the operator has reconciled canonical state. Both run
-  under the project coordination lock.
+  [--committed-retention SECONDS] [--reclaim-expired] [--prune-before EPOCH]` inspects
+  the journal in place (entries, tombstones, per-state counts, expired/reclaimable
+  count, bytes, clock-skew flag) and is the explicit recovery path:
+  `--reclaim-expired` compacts closed windows into tombstones and
+  `--prune-before EPOCH` hard-removes a still-live identity after the operator has
+  reconciled canonical state. Both run under the project coordination lock.
 * *Principal binding.* A request's `authority` descriptor binds the operation identity
   only when the endpoint was launched with a live-authority store. On the
   unauthenticated SSH path the descriptor is caller-controlled and is ignored, so an
