@@ -151,6 +151,7 @@ def request(config,project,actor,args,action='bd',path=None):
 def main():
     p=argparse.ArgumentParser();p.add_argument('--version',action='store_true')
     p.add_argument('--config');p.add_argument('--project');p.add_argument('--actor')
+    p.add_argument('--out',help='write the command result to this path as UTF-8 instead of stdout')
     p.add_argument('args',nargs=argparse.REMAINDER);a=p.parse_args()
     if a.version:
         print(line(report(Path(__file__).resolve().parent, "client")))
@@ -202,6 +203,16 @@ def main():
         parity = "unknown" if client["source_commit"] == "unknown" or kit_source == "unknown" else (
             "match" if client["source_commit"] == kit_source else "mismatch")
         output += 'Orchestra provenance parity: %s\n' % parity
+    if a.out:
+        # Client-owned capture: the result is written as UTF-8 without a BOM and
+        # with LF line endings, so no shell redirection encoding (PowerShell 5.1
+        # `>` writes UTF-16LE, or UTF-8 with a BOM when a profile sets Out-File
+        # encoding) can corrupt it. A failed command writes no file and keeps its
+        # error on stderr.
+        if result['returncode'] == 0:
+            with open(a.out,'w',encoding='utf-8',newline='') as capture:
+                capture.write(output)
+        sys.stderr.write(result['stderr']);return result['returncode']
     sys.stdout.write(output);sys.stderr.write(result['stderr']);return result['returncode']
 
 if __name__=='__main__':

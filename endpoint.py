@@ -9,6 +9,7 @@ import sys
 import tempfile
 from pathlib import Path
 from admin import environment,project_dir,root_path
+import native
 from render import render
 from lifecycle import apply_native
 from version import report
@@ -30,29 +31,31 @@ def execute(root,request):
         args=request.get('args',[])
         if not isinstance(args,list) or any(not isinstance(a,str) or '\0' in a for a in args):raise ValueError('Expected argument list')
         if args[:1]!=['register'] and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}',actor):raise ValueError('Supply a session actor')
+        session_warnings=[]
         def export():
-            p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','export','--all'],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
-            if p.returncode:raise ValueError(p.stderr or p.stdout)
-            return p.stdout
+            stdout,warnings=native.split(native.run(native.argv(root,path,actor,['export','--all'],scoped=False),environment(root)))
+            if warnings:session_warnings.append(warnings)
+            return stdout
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             result=session_execute(path,name,args,export,actor=actor)
         result['provenance'] = {'kit': report(Path(__file__).resolve().parent, 'kit')}
-        return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''}
+        return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(session_warnings)}
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}',actor):raise ValueError('Supply a short contributor/session actor')
     action=request.get('action','bd')
     if action in ('handoff','review','work'):
         from work import execute as work_execute
         args=request.get('args',[])
         if not isinstance(args,list) or any(not isinstance(x,str) or '\0' in x for x in args):raise ValueError('Expected argument list')
+        run_warnings=[]
         def run(argv):
-            p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*argv],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
-            if p.returncode:raise ValueError(p.stderr or p.stdout)
-            return p.stdout
+            stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warnings:run_warnings.append(warnings)
+            return stdout
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             result=work_execute(path,actor,action,args,request.get('attachments',{}),run)
-        return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False,indent=2)+'\n','stderr':''}
+        return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False,indent=2)+'\n','stderr':''.join(run_warnings)}
     if action in ('onboard','docs'):
         from onboarding import execute as onboard
         return {'returncode':0,'stdout':onboard(Path(__file__).resolve().parent,path,name,actor,action,request.get('args',[])),'stderr':''}
@@ -60,29 +63,31 @@ def execute(root,request):
         from briefing import execute as briefing_execute
         args=request.get('args',[])
         if not isinstance(args,list) or any(not isinstance(x,str) or '\0' in x for x in args):raise ValueError('Expected argument list')
+        run_warnings=[]
         def run(argv):
-            p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*argv],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
-            if p.returncode:raise ValueError(p.stderr or p.stdout)
-            return p.stdout
+            stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warnings:run_warnings.append(warnings)
+            return stdout
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             output=briefing_execute(root,path,name,actor,action,args,request.get('attachments',{}),run)
-        return {'returncode':0,'stdout':output,'stderr':''}
+        return {'returncode':0,'stdout':output,'stderr':''.join(run_warnings)}
     if action in ('lifecycle','coordinate'):
         args=request.get('args',[])
         if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):raise ValueError('Expected one JSON payload')
         payload=json.loads(args[0])
+        run_warnings=[]
         def run(argv):
-            p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*argv],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
-            if p.returncode:raise ValueError(p.stderr or p.stdout)
-            return p.stdout
+            stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warnings:run_warnings.append(warnings)
+            return stdout
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             if action=='lifecycle':result=apply_native(payload,actor,run)
             else:
                 from coordination import apply_native as coordinate
                 result=coordinate(payload,actor,run,path)
-        return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''}
+        return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
     if action=='view':
         target=request.get('path','CURRENT.md')
         viewroot=(path/'views').resolve();view=(viewroot/target).resolve()
@@ -94,7 +99,7 @@ def execute(root,request):
             p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','export','--all'],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
             if p.returncode:return {'returncode':p.returncode,'stdout':p.stdout,'stderr':p.stderr}
             rows=[json.loads(line) for line in p.stdout.splitlines() if line.strip()]
-            return {'returncode':0,'stdout':json.dumps(render(rows,path/'views'))+'\n','stderr':''}
+            return {'returncode':0,'stdout':json.dumps(render(rows,path/'views'))+'\n','stderr':p.stderr}
     if action!='bd':raise ValueError('Unknown action')
     args=request.get('args',[])
     if not isinstance(args,list) or not args or any(not isinstance(a,str) or '\0' in a for a in args):raise ValueError('Expected argument list')
