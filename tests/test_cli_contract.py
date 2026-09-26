@@ -457,6 +457,22 @@ class NativeDocumentClassificationTests(unittest.TestCase):
         self.assertIn('Native stdout is not JSON', message)
         self.assertNotIn('PRIVATE-LABEL', message)
 
+    def test_malformed_outer_document_cannot_return_an_indented_nested_object(self):
+        streams = (
+            '{\n  "comments": [\n'
+            '    {"id": "nested", "text": "PRIVATE-COMMENT"}\n'
+            'WARNING: interrupted\n',
+            '[\n  {"id": "nested", "text": "PRIVATE-COMMENT"}\n'
+            'WARNING: interrupted\n',
+        )
+        for index, stdout in enumerate(streams):
+            with self.subTest(index=index):
+                with self.assertRaises(ValueError) as caught:
+                    self.split(stdout)
+                message = str(caught.exception)
+                self.assertIn('Native stdout is not JSON', message)
+                self.assertNotIn('PRIVATE-COMMENT', message)
+
     def test_json_lines_stream_is_unchanged(self):
         output, stderr = self.split('{"id": 1}\n{"id": 2}\n')
         self.assertEqual([json.loads(line)['id'] for line in output.splitlines()],
