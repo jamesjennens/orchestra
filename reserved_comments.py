@@ -135,6 +135,25 @@ BD_SHORT_BOOL_FLAGS = frozenset('hqv')
 # `-C` past the guard (`list -rC`, `ready -uC`).
 BD_GLOBAL_SHORT_FLAGS = {'C': 'value', 'h': 'bool', 'q': 'bool',
                          'v': 'bool', 'V': 'bool'}
+# `bd dep` has subcommands whose own shorthand inventories differ from the
+# parent: `-b/--blocks` exists only on the parent (`bd dep <id> --blocks <id>`),
+# `-t` is --type on add/list and `-d` is --max-depth on tree. Keying the whole
+# command to the parent table refused every one of those legitimate short forms
+# (kittrial-5bb.30). Verified against the pinned bd 1.2.2 help output, including
+# native rejection of `-b` on `dep add`/`dep list`
+# (`unknown shorthand flag: 'b' in -b`).
+BD_DEP_PARENT_SHORT_FLAGS = {'b': 'value', 'h': 'bool'}
+BD_DEP_SUBCOMMAND_ALIASES = {
+    'add': 'add', 'cycles': 'cycles', 'list': 'list', 'relate': 'relate',
+    'remove': 'remove', 'rm': 'remove', 'tree': 'tree',
+    'unrelate': 'unrelate',
+}
+# `bd dep` long flags that take a value; used only to skip the value while
+# locating the subcommand token.
+BD_DEP_VALUE_LONG_FLAGS = {
+    '--blocks', '--blocked-by', '--depends-on', '--file', '--type',
+    '--direction', '--format', '--max-depth', '--status',
+}
 BD_COMMAND_SHORT_FLAGS = {
     'comments': {'add': {'a': 'value', 'f': 'value', 'h': 'bool'}},
     'list': {'a': 'value', 'l': 'value', 'n': 'value', 'p': 'value',
@@ -152,7 +171,15 @@ BD_COMMAND_SHORT_FLAGS = {
                's': 'value', 't': 'value'},
     'close': {'f': 'bool', 'r': 'value'},
     'reopen': {'r': 'value'},
-    'dep': {'b': 'value'},
+    'dep': {
+        'add': {'t': 'value', 'h': 'bool'},
+        'cycles': {'h': 'bool'},
+        'list': {'t': 'value', 'h': 'bool'},
+        'relate': {'h': 'bool'},
+        'remove': {'h': 'bool'},
+        'tree': {'d': 'value', 'h': 'bool'},
+        'unrelate': {'h': 'bool'},
+    },
     'state': {},
     'lint': {'s': 'value', 't': 'value'},
 }
@@ -163,16 +190,61 @@ def _short_flag_table(command, subcommand=None):
 
     Without command context callers get the conservative command-agnostic
     union (`a`/`f`/`C` are operator-only), which is what the helper tests
-    exercise.
+    exercise. With command context the command's own inventory is used; for
+    `comments` and `dep` the subcommand selects the inventory, and a `dep`
+    invocation without a subcommand (`bd dep <id> --blocks <id>`) gets the
+    parent table where `-b` lives.
     """
     if command is None:
         return None
     table = dict(BD_GLOBAL_SHORT_FLAGS)
     if command == 'comments':
         table.update(BD_COMMAND_SHORT_FLAGS['comments'].get(subcommand) or {})
+    elif command == 'dep':
+        if subcommand is None:
+            table.update(BD_DEP_PARENT_SHORT_FLAGS)
+        else:
+            table.update(BD_COMMAND_SHORT_FLAGS['dep'].get(subcommand)
+                         or BD_DEP_PARENT_SHORT_FLAGS)
     else:
         table.update(BD_COMMAND_SHORT_FLAGS.get(command) or {})
     return table
+
+
+def _dep_subcommand(args):
+    """Alias-normalized subcommand of a `bd dep` invocation, or None.
+
+    `bd dep <issue-id> --blocks <id>` puts a positional issue ID where a
+    subcommand would be, so an operand that is not a known subcommand resolves
+    to None: the parent table, the only place `-b` is defined. Flag values are
+    consumed so a value cannot be mistaken for the subcommand.
+    """
+    index = 1
+    while index < len(args):
+        token = args[index]
+        if not isinstance(token, str):
+            index += 1
+            continue
+        if token == '--':
+            return None
+        if len(token) > 1 and token.startswith('--'):
+            name, sep, _ = token.partition('=')
+            if name in BD_DEP_VALUE_LONG_FLAGS or name in BD_GLOBAL_VALUE_FLAGS:
+                index += 1 if sep else 2
+            else:
+                index += 1
+            continue
+        if len(token) > 1 and token.startswith('-'):
+            body = token[1:]
+            eq = body.find('=')
+            chars = body[:eq] if eq != -1 else body
+            if eq == -1 and 'C' in chars and chars.index('C') == len(chars) - 1:
+                index += 2
+            else:
+                index += 1
+            continue
+        return BD_DEP_SUBCOMMAND_ALIASES.get(token)
+    return None
 
 
 def _bd_command_context(args):
@@ -191,6 +263,8 @@ def _bd_command_context(args):
                     and not token.startswith('@attachment:')):
                 subcommand = token
                 break
+    elif command == 'dep':
+        subcommand = _dep_subcommand(args)
     return command, subcommand
 
 
@@ -410,6 +484,60 @@ def operator_only_in_args(args):
     return None
 
 
+def _raw_file_flag_token(token, command, subcommand):
+    """File-flag name for one raw server-path token, or None.
+
+    Long file spellings are refused everywhere. `-f` is a file flag only where
+    bd defines it as --file (`comments add` and `create`); on `close` it is
+    --force, and treating the bare token as a path refused a legitimate
+    force-close (kittrial-5bb.30). A shorthand unknown to the command is
+    ambiguous and returns the token, matching operator_only_flag().
+    """
+    if not isinstance(token, str) or len(token) < 2 or not token.startswith('-'):
+        return None
+    if token.startswith('--'):
+        name = token.partition('=')[0]
+        return name if name in OPERATOR_ONLY_FILE_FLAGS else None
+    body = token[1:]
+    end = body.find('=')
+    chars = body[:end] if end != -1 else body
+    table = _short_flag_table(command, subcommand)
+    for ch in chars:
+        if ch == 'f' and (command is None or command in ('comments', 'create')):
+            return '--file'
+        spec = None if table is None else table.get(ch)
+        if spec is None:
+            return token
+        if spec == 'bool':
+            continue
+        # A value-taking shorthand consumes the rest of the cluster.
+        break
+    return None
+
+
+def raw_file_flag_in_args(args):
+    """First raw server-side file-path flag in an argv list, or None.
+
+    Command-aware replacement for endpoint's legacy `token in FILE_FLAGS`
+    membership test, so `-f` means --force on `close` instead of a raw path.
+    `--` ends flag parsing as in bd/pflag.
+    """
+    if not isinstance(args, list):
+        return None
+    command, subcommand = _bd_command_context(args)
+    end_of_flags = False
+    for token in args:
+        if token == '--':
+            end_of_flags = True
+            continue
+        if end_of_flags:
+            continue
+        name = _raw_file_flag_token(token, command, subcommand)
+        if name is not None:
+            return name
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Reserved coordination label namespaces.
 #
@@ -500,6 +628,214 @@ def reserved_label_in_args(args):
                 if label.startswith(prefix):
                     return label
     return None
+
+
+def first_reserved_label(labels):
+    """First reserved-namespace label in a native label list, or None."""
+    if not isinstance(labels, (list, tuple)):
+        return None
+    for label in labels:
+        if not isinstance(label, str):
+            continue
+        for prefix in RESERVED_LABEL_PREFIXES:
+            if label.startswith(prefix):
+                return label
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Reserved-label read-before-write guard.
+#
+# Refusing a reserved label *value* is not enough. Two routes still moved the
+# namespace on the contributor path (kittrial-5bb.30):
+#   * bd copies parent labels onto a child created with `create --parent X`
+#     unless `--no-inherit-labels` is given, so a contributor child of an
+#     operator issue holding request:REAL,request-content:<sha> became a second
+#     holder ("Duplicate native request records"); `--labels` does not prevent
+#     it.
+#   * `update X --set-labels ...` replaces the whole set, so a replacement that
+#     names no reserved value stripped request:/request-content: from the
+#     operator issue and left a planted child as the only holder.
+# Both need the affected issue's current labels, so endpoint.execute reads them
+# through the native client under the same project lock as the write.
+# ---------------------------------------------------------------------------
+
+# Long flags of the two guarded commands that take a value, verified against
+# the pinned bd 1.2.2 help output. A value-taking long flag consumes the next
+# argv token unless the value is `=joined`, which is what keeps a decoy token
+# such as `--title --parent X` from being read as a real flag.
+BD_LONG_VALUE_FLAGS = {
+    'create': {
+        '--acceptance', '--append-notes', '--assignee', '--body-file',
+        '--context', '--defer', '--deps', '--description', '--design',
+        '--design-file', '--due', '--estimate', '--event-actor',
+        '--event-category', '--event-payload', '--event-target',
+        '--external-ref', '--file', '--graph', '--id', '--labels',
+        '--metadata', '--mol-type', '--notes', '--parent', '--priority',
+        '--repo', '--skills', '--spec-id', '--title', '--type', '--waits-for',
+        '--waits-for-gate', '--wisp-type',
+    },
+    'update': {
+        '--acceptance', '--add-label', '--append-notes', '--assignee',
+        '--await-id', '--body-file', '--defer', '--description', '--design',
+        '--design-file', '--due', '--estimate', '--external-ref', '--metadata',
+        '--notes', '--parent', '--priority', '--remove-label', '--session',
+        '--set-labels', '--set-metadata', '--spec-id', '--status', '--title',
+        '--type', '--unset-metadata',
+    },
+}
+BD_LONG_BOOL_FLAGS = {
+    'create': {
+        '--dry-run', '--ephemeral', '--force', '--no-history',
+        '--no-inherit-labels', '--silent', '--stdin', '--validate',
+    },
+    'update': {
+        '--allow-empty-description', '--claim', '--ephemeral', '--history',
+        '--no-history', '--persistent', '--stdin',
+    },
+}
+# Label-replacing writes: `--set-labels` replaces the whole set and
+# `--remove-label` drops named labels, so either can take the reserved
+# namespace off a holder. `--add-label`/`--labels` can only add, and adding a
+# reserved value is already refused by reserved_label_in_args().
+LABEL_REPLACING_FLAGS = ('--set-labels', '--remove-label')
+
+
+def _flag_truthy(value):
+    """pflag boolean value: bare `--flag` is True, `--flag=false` is False."""
+    if value is True or value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() not in ('false', '0', 'no')
+    return bool(value)
+
+
+def _bd_scan(args, command):
+    """Structurally scan a create/update argv list.
+
+    Returns (flags, operands, unknown): `flags` is an ordered list of
+    (name, value) with the command's verified long and short inventories, so
+    values are consumed and never mistaken for operands or flags; `operands`
+    are the positional tokens; `unknown` holds tokens whose flag shape could
+    not be resolved, which makes the scan ambiguous and fails closed.
+    """
+    value_long = BD_LONG_VALUE_FLAGS.get(command, set()) | BD_GLOBAL_VALUE_FLAGS
+    bool_long = BD_LONG_BOOL_FLAGS.get(command, set()) | BD_GLOBAL_BOOL_FLAGS
+    table = _short_flag_table(command)
+    flags = []
+    operands = []
+    unknown = []
+    index = 1
+    end_of_flags = False
+    while index < len(args):
+        token = args[index]
+        if not isinstance(token, str):
+            unknown.append(token)
+            index += 1
+            continue
+        if end_of_flags:
+            operands.append(token)
+            index += 1
+            continue
+        if token == '--':
+            end_of_flags = True
+            index += 1
+            continue
+        if len(token) > 1 and token.startswith('--'):
+            name, sep, value = token.partition('=')
+            if name in value_long:
+                if not sep:
+                    value = (args[index + 1]
+                             if index + 1 < len(args)
+                             and isinstance(args[index + 1], str) else None)
+                    index += 1
+                flags.append((name, value))
+            elif name in bool_long:
+                flags.append((name, value if sep else True))
+            else:
+                unknown.append(token)
+            index += 1
+            continue
+        if len(token) > 1 and token.startswith('-'):
+            body = token[1:]
+            end = body.find('=')
+            chars = body[:end] if end != -1 else body
+            attached = body[end + 1:] if end != -1 else None
+            position = 0
+            while position < len(chars):
+                ch = chars[position]
+                spec = table.get(ch) if table else None
+                if spec is None:
+                    unknown.append(token)
+                    break
+                if spec == 'value':
+                    if attached is not None and position == len(chars) - 1:
+                        value = attached
+                    elif position < len(chars) - 1:
+                        value = chars[position + 1:]
+                    else:
+                        value = (args[index + 1]
+                                 if index + 1 < len(args)
+                                 and isinstance(args[index + 1], str) else None)
+                        index += 1
+                    flags.append(('-' + ch, value))
+                    break
+                flags.append(('-' + ch, True))
+                position += 1
+            index += 1
+            continue
+        operands.append(token)
+        index += 1
+    return flags, operands, unknown
+
+
+def label_guard_request(args):
+    """Describe the read-before-write reserved-label check an argv list needs.
+
+    Returns None when the invocation cannot move a reserved label, else a dict:
+
+      {'kind': 'inherit', 'target': parent_id|None, 'ambiguous': bool}
+          `create --parent X` without an effective --no-inherit-labels: X's
+          labels must be read before the child inherits them.
+      {'kind': 'replace', 'targets': [id, ...], 'ambiguous': bool}
+          `update ... --set-labels/--remove-label`: every named target's labels
+          must be read before the replacement.
+
+    Anything the scan cannot resolve (unknown flag, repeated --parent, missing
+    parent value, no target operand) is reported as ambiguous so the caller
+    fails closed rather than guessing.
+    """
+    if not isinstance(args, list) or not args:
+        return None
+    command = args[0] if isinstance(args[0], str) else None
+    if command not in ('create', 'update'):
+        return None
+    flags, operands, unknown = _bd_scan(args, command)
+    ambiguous = bool(unknown)
+    if command == 'create':
+        parents = [value for name, value in flags if name == '--parent']
+        if not parents:
+            return None
+        no_inherit = any(
+            name == '--no-inherit-labels' and _flag_truthy(value)
+            for name, value in flags)
+        if no_inherit:
+            return None
+        if len(parents) > 1 or not parents[0]:
+            ambiguous = True
+        return {'kind': 'inherit', 'target': parents[0], 'ambiguous': ambiguous}
+    replacing = [name for name, _ in flags if name in LABEL_REPLACING_FLAGS]
+    if not replacing:
+        return None
+    # `@attachment:` tokens are transport placeholders, not issue IDs; the
+    # endpoint expands them into file flags after this guard.
+    targets = [token for token in operands
+               if not token.startswith('@attachment:')]
+    if not targets:
+        # bd would fall back to the last touched issue, which the guard cannot
+        # resolve: fail closed.
+        ambiguous = True
+    return {'kind': 'replace', 'targets': targets, 'ambiguous': ambiguous}
 
 
 # Backwards-compatible aliases for the previous flag tables.

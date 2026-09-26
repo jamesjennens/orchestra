@@ -19,10 +19,13 @@ from reserved_comments import (
     check_comment_body,
     check_raw_request,
     comment_target,
+    first_reserved_label,
     is_legitimate_writer,
+    label_guard_request,
     operator_only_flag,
     operator_only_in_args,
     raw_comment_bodies,
+    raw_file_flag_in_args,
     reserved_label_in_args,
     reserved_match,
 )
@@ -587,6 +590,287 @@ class ReservedLabelNamespaceTests(unittest.TestCase):
         self.assertEqual(calls, [])
         guarded(['create', '--title', 'x', '--labels', 'backend'], {})
         self.assertEqual(len(calls), 1)
+
+
+class DepSubcommandShorthandTests(unittest.TestCase):
+    """kittrial-5bb.30 P3: `bd dep` keyed its whole shorthand inventory to the
+    parent (`-b`), so the legitimate subcommand short forms `dep add -t`,
+    `dep list -t` and `dep tree -d` were refused as operator-only. Native bd
+    1.2.2 accepts them and rejects `-b` on those subcommands.
+    """
+
+    def test_dep_subcommand_short_forms_allowed(self):
+        for args in (
+            ['dep', 'add', 'task-2', 'task-1', '-t', 'related'],
+            ['dep', 'add', 'task-2', 'task-1', '-t=related'],
+            ['dep', 'add', 'task-2', 'task-1', '-trelated'],
+            ['dep', 'list', 'task-1', '-t', 'blocks'],
+            ['dep', 'tree', 'task-1', '-d', '3'],
+            ['dep', 'tree', 'task-1', '-d3'],
+        ):
+            with self.subTest(args=str(args)):
+                self.assertIsNone(operator_only_in_args(args), msg=str(args))
+
+    def test_dep_parent_and_alias_forms_still_allowed(self):
+        for args in (
+            ['dep', 'task-1', '-b', 'task-2'],
+            ['dep', 'task-1', '--blocks', 'task-2'],
+            ['dep', 'rm', 'task-2', 'task-1'],
+            ['dep', 'remove', 'task-2', 'task-1'],
+            ['dep', 'relate', 'task-1', 'task-2'],
+            ['dep', 'unrelate', 'task-1', 'task-2'],
+            ['dep', 'cycles'],
+            ['dep', 'add', 'task-2', 'task-1'],
+            ['dep', '--json', 'list', 'task-1', '-t', 'blocks'],
+        ):
+            with self.subTest(args=str(args)):
+                self.assertIsNone(operator_only_in_args(args), msg=str(args))
+
+    def test_directory_smuggling_still_refused_for_dep(self):
+        for args, expected in (
+            (['dep', 'list', 'task-1', '-C/tmp/other'], '--directory'),
+            (['dep', 'add', 'task-2', 'task-1', '-C', '/tmp/other'], '--directory'),
+            (['dep', 'tree', 'task-1', '-hC/tmp'], '--directory'),
+        ):
+            with self.subTest(args=str(args)):
+                self.assertEqual(operator_only_in_args(args), expected)
+        # `-b` is unknown on `dep add` (bd rejects it natively), so that
+        # subcommand's table fails closed on it instead of accepting it.
+        self.assertIsNotNone(
+            operator_only_in_args(['dep', 'add', 'task-2', 'task-1', '-b', 'task-1']))
+        # A value-taking subcommand shorthand consumes the rest of the cluster,
+        # so `-dC/tmp` is a depth value that bd itself rejects; it is not a
+        # directory switch and the operator-only guard leaves it alone.
+        self.assertIsNone(
+            operator_only_in_args(['dep', 'tree', 'task-1', '-dC/tmp']))
+
+    def test_unknown_dep_subcommand_shorthand_fails_closed(self):
+        self.assertIsNotNone(
+            operator_only_in_args(['dep', 'tree', 'task-1', '-XC/tmp']))
+        self.assertIsNotNone(
+            operator_only_in_args(['dep', 'add', 'a', 'b', '-qC/tmp']))
+
+
+class CloseForceShorthandTests(unittest.TestCase):
+    """kittrial-5bb.30 P3: `close -f` is --force, but endpoint's legacy
+    FILE_FLAGS membership test refused the bare token as a raw server path.
+    """
+
+    def test_close_force_is_not_a_file_flag(self):
+        self.assertIsNone(raw_file_flag_in_args(['close', 'task-1', '-f']))
+        self.assertIsNone(raw_file_flag_in_args(['close', '-rf', 'done']))
+        self.assertIsNone(operator_only_in_args(['close', 'task-1', '-f']))
+
+    def test_file_flags_still_refused_where_bd_means_file(self):
+        self.assertEqual(
+            raw_file_flag_in_args(['create', 'title', '-f', 'notes.md']),
+            '--file')
+        self.assertEqual(
+            raw_file_flag_in_args(['create', 'title', '-fnotes.md']),
+            '--file')
+        self.assertEqual(
+            raw_file_flag_in_args(['comments', 'add', 'task-1', 'x', '-f', 'n']),
+            '--file')
+        for args, expected in (
+            (['comments', 'add', 'task-1', 'x', '--file=n'], '--file'),
+            (['update', 'task-1', '--body-file', 'n'], '--body-file'),
+            (['update', 'task-1', '--design-file=n'], '--design-file'),
+        ):
+            with self.subTest(args=str(args)):
+                self.assertEqual(raw_file_flag_in_args(args), expected)
+
+    def test_double_dash_and_unknown_cluster_stay_closed(self):
+        # `--` ends flag parsing: a later `-f` is an operand, not a flag.
+        self.assertIsNone(raw_file_flag_in_args(['close', 'task-1', '--', '-f']))
+        # An unknown shorthand is ambiguous and fails closed.
+        self.assertIsNotNone(raw_file_flag_in_args(['state', '-Xf']))
+        # `-rC/tmp` on list is a directory switch, caught by the operator-only
+        # guard before the file-flag check (which is about raw paths only).
+        self.assertIsNone(raw_file_flag_in_args(['list', '-rC/tmp']))
+        self.assertEqual(operator_only_in_args(['list', '-rC/tmp']), '--directory')
+
+    def test_endpoint_order_allows_force_close(self):
+        # Mirror endpoint.execute's bd path: an operator-only flag or a raw
+        # file path refuses before the native call; `close -f` reaches it once.
+        calls = []
+
+        def native(args):
+            calls.append(list(args))
+
+        def guarded(args):
+            if operator_only_in_args(args) is not None:
+                raise ValueError('operator-only')
+            if raw_file_flag_in_args(args) is not None:
+                raise ValueError('raw file path')
+            native(args)
+
+        guarded(['close', 'task-1', '-f'])
+        self.assertEqual(calls, [['close', 'task-1', '-f']])
+        with self.assertRaises(ValueError):
+            guarded(['create', 'title', '-f', 'notes.md'])
+        with self.assertRaises(ValueError):
+            guarded(['show', 'task-1', '-C/tmp/other'])
+        self.assertEqual(len(calls), 1)
+
+
+class ReservedLabelMutationGuardTests(unittest.TestCase):
+    """kittrial-5bb.30 P2: refusing a reserved label *value* left two routes
+    open. bd copies parent labels onto `create --parent X` children unless
+    --no-inherit-labels is given, and `update --set-labels` replaces the whole
+    set, so a replacement naming no reserved value strips request:/
+    request-content: from an operator-created holder. label_guard_request()
+    describes the read-before-write check endpoint.execute applies under the
+    project lock.
+    """
+
+    def test_create_parent_requires_a_parent_read(self):
+        request = label_guard_request(
+            ['create', 'inh', '--parent', 'task-1', '--json'])
+        self.assertEqual(request['kind'], 'inherit')
+        self.assertEqual(request['target'], 'task-1')
+        self.assertFalse(request['ambiguous'])
+        # --labels does not stop inheritance, so the guard still applies.
+        request = label_guard_request(
+            ['create', 'inh', '--labels', 'plain', '--parent', 'task-1'])
+        self.assertEqual(request['target'], 'task-1')
+        # Value flags before --parent are consumed, not mistaken for operands.
+        request = label_guard_request(
+            ['create', '-p', '1', '-l', 'a,b', '--parent=task-1', '--json'])
+        self.assertEqual(request['target'], 'task-1')
+
+    def test_no_inherit_labels_disables_the_guard(self):
+        for args in (
+            ['create', 'inh', '--parent', 'task-1', '--no-inherit-labels'],
+            ['create', 'inh', '--no-inherit-labels', '--parent', 'task-1'],
+            ['create', 'inh', '--parent', 'task-1', '--no-inherit-labels=true'],
+        ):
+            with self.subTest(args=str(args)):
+                self.assertIsNone(label_guard_request(args))
+        # An explicit false still inherits: keep guarding.
+        self.assertIsNotNone(label_guard_request(
+            ['create', 'inh', '--parent', 'task-1', '--no-inherit-labels=false']))
+
+    def test_create_without_parent_needs_nothing(self):
+        self.assertIsNone(label_guard_request(['create', 'x', '--json']))
+        self.assertIsNone(label_guard_request(
+            ['create', 'x', '--deps', 'parent-child:task-1', '--json']))
+        self.assertIsNone(label_guard_request(['show', 'task-1']))
+        self.assertIsNone(label_guard_request(None))
+
+    def test_ambiguous_create_parent_fails_closed(self):
+        # bd's last --parent wins, so a repeated flag must not be resolved by
+        # taking the first occurrence.
+        request = label_guard_request(
+            ['create', 'x', '--parent', 'safe', '--parent', 'task-1'])
+        self.assertTrue(request['ambiguous'])
+        # A missing or empty parent value cannot be resolved.
+        request = label_guard_request(['create', 'x', '--parent'])
+        self.assertTrue(request['ambiguous'])
+        request = label_guard_request(['create', 'x', '--parent='])
+        self.assertTrue(request['ambiguous'])
+        request = label_guard_request(
+            ['create', 'x', '--mystery', '--parent', 'task-1'])
+        self.assertTrue(request['ambiguous'])
+
+    def test_decoy_parent_value_is_not_a_parent_flag(self):
+        # `--title --parent X` makes --parent the title's value; the scan
+        # consumes it, so this is not a create-with-parent at all.
+        self.assertIsNone(label_guard_request(
+            ['create', 'x', '--title', '--parent', 'task-1', '--json']))
+        # A real --parent after the decoy is still found and guarded.
+        request = label_guard_request(
+            ['create', 'x', '--title', '--no-inherit-labels',
+             '--parent', 'task-1'])
+        self.assertEqual(request['kind'], 'inherit')
+        self.assertFalse(request['ambiguous'])
+
+    def test_update_label_replacement_requires_target_reads(self):
+        request = label_guard_request(
+            ['update', 'task-1', '--set-labels', 'plain'])
+        self.assertEqual(request['kind'], 'replace')
+        self.assertEqual(request['targets'], ['task-1'])
+        self.assertFalse(request['ambiguous'])
+        # Every named target is read (bd update accepts several ids).
+        request = label_guard_request(
+            ['update', 'task-1', 'task-2', '--remove-label', 'plain'])
+        self.assertEqual(request['targets'], ['task-1', 'task-2'])
+        # Label values are consumed, not read as targets.
+        request = label_guard_request(
+            ['update', 'task-1', '--set-labels', 'a,b', '--remove-label', 'c'])
+        self.assertEqual(request['targets'], ['task-1'])
+        # `@attachment:` transport placeholders are not ids.
+        request = label_guard_request(
+            ['update', 'task-1', '@attachment:k', '--set-labels', 'a'])
+        self.assertEqual(request['targets'], ['task-1'])
+
+    def test_update_without_replacing_flags_needs_nothing(self):
+        self.assertIsNone(label_guard_request(
+            ['update', 'task-1', '--add-label', 'plain']))
+        self.assertIsNone(label_guard_request(
+            ['update', 'task-1', '--parent', 'task-2']))
+        self.assertIsNone(label_guard_request(
+            ['update', 'task-1', '--status', 'in_progress', '--claim']))
+        self.assertIsNone(label_guard_request(['create', 'x']))
+
+    def test_no_target_or_unknown_flag_fails_closed(self):
+        # bd falls back to the last touched issue; the guard cannot resolve it.
+        self.assertTrue(label_guard_request(
+            ['update', '--set-labels', 'plain'])['ambiguous'])
+        self.assertTrue(label_guard_request(
+            ['update', 'task-1', '--mystery', '--set-labels', 'a'])['ambiguous'])
+
+    def test_first_reserved_label(self):
+        self.assertEqual(first_reserved_label(['a', 'request:x']), 'request:x')
+        self.assertEqual(
+            first_reserved_label(['a', 'request-content:y']), 'request-content:y')
+        self.assertIsNone(first_reserved_label(['a', 'b']))
+        self.assertIsNone(first_reserved_label([]))
+        self.assertIsNone(first_reserved_label(None))
+        self.assertIsNone(first_reserved_label('request:x'))
+
+    def test_guard_refuses_reserved_holder_before_native_write(self):
+        # Mirror endpoint.execute's locked section: the read-before-write guard
+        # runs inside the lock, before the single native mutation.
+        calls = []
+        holders = {'coordinated': ['request:REAL', 'plain'],
+                   'ordinary': ['a', 'b']}
+
+        def labels(task):
+            return list(holders.get(task, []))
+
+        def guarded(args):
+            request = label_guard_request(args)
+            if request is None:
+                return native(args)
+            if request['ambiguous']:
+                raise ValueError('ambiguous label write')
+            if request['kind'] == 'inherit':
+                if first_reserved_label(labels(request['target'])) is not None:
+                    raise ValueError('reserved parent')
+                return native(args)
+            for target in request['targets']:
+                if first_reserved_label(labels(target)) is not None:
+                    raise ValueError('reserved holder')
+            return native(args)
+
+        def native(args):
+            calls.append(list(args))
+
+        with self.assertRaises(ValueError):
+            guarded(['create', 'inh', '--parent', 'coordinated', '--json'])
+        with self.assertRaises(ValueError):
+            guarded(['update', 'coordinated', '--set-labels', 'plain'])
+        with self.assertRaises(ValueError):
+            guarded(['update', 'coordinated', '--remove-label', 'plain'])
+        self.assertEqual(calls, [])
+        # Safe forms still reach the native write exactly once each.
+        guarded(['create', 'inh', '--parent', 'coordinated',
+                 '--no-inherit-labels', '--json'])
+        guarded(['create', 'inh', '--parent', 'ordinary', '--json'])
+        guarded(['update', 'ordinary', '--set-labels', 'a'])
+        guarded(['update', 'coordinated', '--add-label', 'ok'])
+        guarded(['close', 'coordinated', '-f'])
+        self.assertEqual(len(calls), 5)
 
 
 if __name__ == '__main__':
