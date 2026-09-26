@@ -1,4 +1,5 @@
 """Native backup/coordination sidecar ordering and recovery validation."""
+import base64
 import contextlib
 import io
 import json
@@ -13,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import admin
 import coordination
 import handoff
+import feedback
 
 
 class BackupTests(unittest.TestCase):
@@ -92,6 +94,63 @@ class BackupTests(unittest.TestCase):
         self.assertEqual(json.loads(self.bundle.read_text(encoding='utf-8'))['files']['.sessions.json'],registry)
         admin.restore_coordination(self.root,'source','destination')
         self.assertEqual(json.loads((self.destination/'.sessions.json').read_text()),registry)
+
+    def test_feedback_feed_is_backed_up_and_restored_as_private_text(self):
+        feed_path = self.source/'.feedback.jsonl'
+        payload = {
+            'operation_id': 'backup-op',
+            'created_at': '2026-09-19T23:00:00+00:00',
+            'body': 'private \u0085 \u2028 \u2029 text',
+            'source': {'task': 'kittrial-5bb.13', 'version': 'base-1'},
+            'evidence': ['test://backup'],
+            'triage': {'task': 'kittrial-5bb.13', 'label': 'review'},
+            'reminder': {'kind': 'none', 'text': ''},
+            'supersedes': None,
+        }
+        feedback.add(feed_path, 'session-one', payload)
+        self.assertEqual(feedback.list_entries(feed_path)['entries'][0]['body'], payload['body'])
+        feed = feed_path.read_text(encoding='utf-8')
+        with patch.object(admin, 'run_bd', return_value='synced'):
+            admin.backup_project(self.root, 'source')
+        data = json.loads(self.bundle.read_text(encoding='utf-8'))
+        self.assertEqual(data['files']['.feedback.jsonl'], {'text': feed})
+        admin.restore_coordination(self.root, 'source', 'destination')
+        restored_path = self.destination/'.feedback.jsonl'
+        self.assertEqual(restored_path.read_text(encoding='utf-8'), feed)
+        restored = feedback.list_entries(restored_path)['entries'][0]
+        self.assertEqual(restored['body'], payload['body'])
+        self.assertTrue(feedback.add(restored_path, 'session-one', payload)['reconciled'])
+
+    def test_feedback_quarantine_evidence_is_backed_up_and_restored_as_bytes(self):
+        feed_path = self.source / feedback.FEED_NAME
+        feedback.add(feed_path, 'session-one', {
+            'operation_id': 'quarantine-backup-op',
+            'created_at': '2026-09-19T23:00:00+00:00',
+            'body': 'valid prefix',
+            'source': {'task': 'kittrial-5bb.13', 'version': 'base-1'},
+            'evidence': ['test://backup'],
+            'triage': {'task': 'kittrial-5bb.13', 'label': 'review'},
+            'reminder': {'kind': 'none', 'text': ''},
+            'supersedes': None,
+        })
+        tail = b'\xfftruncated json'
+        with feed_path.open('ab') as stream:
+            stream.write(tail)
+
+        with patch.object(admin, 'run_bd', return_value='synced'):
+            admin.backup_project(self.root, 'source')
+        files = json.loads(self.bundle.read_text(encoding='utf-8'))['files']
+        quarantine_name = next(name for name in files if name.endswith(feedback.QUARANTINE_SUFFIX))
+        self.assertEqual(base64.b64decode(files[quarantine_name]['base64']), tail)
+
+        admin.restore_coordination(self.root, 'source', 'destination')
+        restored = self.destination / quarantine_name
+        self.assertEqual(restored.read_bytes(), tail)
+        self.assertEqual(len(feedback.list_entries(self.destination / feedback.FEED_NAME)['entries']), 1)
+
+        files[quarantine_name]['base64'] = base64.b64encode(b'different bytes').decode('ascii')
+        with self.assertRaisesRegex(ValueError, 'digest does not match'):
+            admin.validate_coordination_files(files)
 
     def test_sidecar_completion_failure_leaves_pending_after_native_success(self):
         real_atomic = coordination.atomic

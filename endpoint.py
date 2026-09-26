@@ -88,6 +88,15 @@ def execute(root,request):
                 from coordination import apply_native as coordinate
                 result=coordinate(payload,actor,run,path)
         return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
+    if action == 'feedback':
+        from feedback import execute as feedback_execute
+        args=request.get('args',[])
+        if not isinstance(args,list) or any(not isinstance(x,str) or '\0' in x for x in args):
+            raise ValueError('Expected argument list')
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            result=feedback_execute(path/'.feedback.jsonl',actor,args,request.get('attachments',{}))
+        return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''}
     if action=='view':
         target=request.get('path','CURRENT.md')
         viewroot=(path/'views').resolve();view=(viewroot/target).resolve()

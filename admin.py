@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Operator commands for an isolated, user-systemd Beads/Dolt deployment."""
 import argparse
+import base64
 import csv
 import io
 import json
@@ -9,6 +10,7 @@ import re
 import secrets
 import socket
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from contextlib import contextmanager
@@ -155,7 +157,9 @@ def backup_lock(root,name):
 def validate_coordination_files(files):
     if not isinstance(files,dict):raise ValueError('Invalid coordination files map')
     for name,record in files.items():
-        if name not in ('.merge-context.json','ONBOARDING.md','.sessions.json') and not re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries)/[a-f0-9]{64}\.json',name):raise ValueError('Invalid coordination backup path')
+        quarantine = isinstance(name,str) and re.fullmatch(r'\.feedback\.jsonl\.(?:[a-f0-9]{16}|[a-f0-9]{64})\.incomplete',name)
+        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries)/[a-f0-9]{64}\.json',name)
+        if name not in ('.merge-context.json','ONBOARDING.md','.sessions.json','.feedback.jsonl') and not quarantine and not journal:raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
         if name=='.sessions.json':
             from sessions import validate
@@ -174,6 +178,32 @@ def validate_coordination_files(files):
             validate_recovery(record)
             if name!='.handoff-recoveries/'+content_hash({'request_id':record['request_id']})+'.json':raise ValueError('Handoff recovery path mismatch')
         if name=='ONBOARDING.md' and (set(record)!={'text'} or not isinstance(record['text'],str) or not record['text'].strip() or len(record['text'].encode('utf-8'))>8000):raise ValueError('Invalid onboarding backup')
+        if name=='.feedback.jsonl':
+            from feedback import validate_feed_text
+            if set(record) != {'text'}:raise ValueError('Invalid feedback backup')
+            validate_feed_text(record['text'])
+        if quarantine:
+            from feedback import validate_quarantine_record
+            validate_quarantine_record(name,record)
+
+def _atomic_write_bytes(path,content):
+    fd,temporary=tempfile.mkstemp(prefix=path.name+'.',suffix='.restore',dir=str(path.parent))
+    try:
+        with os.fdopen(fd,'wb') as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary,path)
+        try:
+            directory_fd=os.open(str(path.parent),os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):os.unlink(temporary)
 
 def backup_project(root,name):
     import fcntl
@@ -211,6 +241,19 @@ def backup_project(root,name):
         if (path/'ONBOARDING.md').exists() or (path/'ONBOARDING.md').is_symlink():
             from onboarding import read_document, PROJECT_LIMIT
             files['ONBOARDING.md']={'text':read_document(path,'ONBOARDING.md',PROJECT_LIMIT)}
+        feedback=path/'.feedback.jsonl'
+        if feedback.exists() or feedback.is_symlink():
+            if feedback.is_symlink():raise ValueError('Feedback feed must not be a symlink')
+            from feedback import FEED_NAME, QUARANTINE_SUFFIX, _read as read_feedback, validate_quarantine_record
+            read_feedback(feedback)
+            files['.feedback.jsonl']={'text':feedback.read_text(encoding='utf-8')}
+            for record in sorted(path.glob(FEED_NAME+'.*'+QUARANTINE_SUFFIX)):
+                if record.is_symlink():raise ValueError('Feedback quarantine must not be a symlink')
+                name=record.name
+                content=record.read_bytes()
+                backup={'base64':base64.b64encode(content).decode('ascii')}
+                validate_quarantine_record(name,backup)
+                files[name]=backup
         validate_coordination_files(files)
         output=run_bd(root,name,['backup','sync'])
         atomic(bundle,{'schema_version':1,'status':'complete','files':files})
@@ -247,6 +290,13 @@ def restore_coordination(root,source,destination):
         if name=='ONBOARDING.md':
             from onboarding import write_project
             write_project(target,record['text'])
+        elif name=='.feedback.jsonl':
+            temporary=target.with_suffix('.tmp')
+            temporary.write_text(record['text'],encoding='utf-8',newline='\n')
+            os.replace(temporary,target)
+        elif re.fullmatch(r'\.feedback\.jsonl\.(?:[a-f0-9]{16}|[a-f0-9]{64})\.incomplete',name):
+            from feedback import validate_quarantine_record
+            _atomic_write_bytes(target,validate_quarantine_record(name,record))
         else:atomic(target,record)
 
 def main():
