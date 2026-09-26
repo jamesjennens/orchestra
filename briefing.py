@@ -25,6 +25,10 @@ BRIEF_MISTAKEN_FLAGS={
     '--limit':'use --items-limit for the unresolved-item page size',
     '--offset':'use --items-offset for the unresolved-item page offset',
 }
+# `brief` is a compact read: the complete prior-contribution chain stays available
+# through `review TASK`, so the embedded view carries only a bounded recent slice
+# (without summaries) plus a total and a pointer.
+PRIOR_BRIEF_LIMIT=5
 
 def token(data):return base64.urlsafe_b64encode(canonical_bytes(data)).decode().rstrip('=')
 
@@ -162,6 +166,9 @@ def brief(rows,project,task,offset=0,limit=5,operators=None):
     # answer is additive as `review.integration.matches_contribution`.
     matches_contribution=None if not review.get('contribution') else (facts['scope'] or {}).get('source_commit','').lower()==review['contribution']['commit'].lower()
     pending=review.get('pending_requests',[])
+    priors=review.get('prior_contributions') or []
+    bounded_priors=[{key:c[key] for key in ('comment_id','commit','relation','timestamp')}
+                    for c in priors[-PRIOR_BRIEF_LIMIT:]]
     review_next={'changes-requested':'Address the outstanding review requests for the current contribution; read review '+task+'.',
                  'awaiting-review':'Reviewer: retrieve and verify the current contribution, then record review feedback or approval.',
                  'awaiting-integration':'Authorized integrator: integrate the approved contribution and record scoped integration evidence.',
@@ -173,7 +180,9 @@ def brief(rows,project,task,offset=0,limit=5,operators=None):
             'current_position':p['summary'] if p else 'No checkpoint yet; current position and unresolved items have not been summarized.',
             'next_action':review_next.get(review['review_state'],p['next_action'] if p else 'Read the task description, acceptance criteria and any history, then publish a checkpoint.'),
             'unresolved':{'coverage':'explicit checkpoint items only; unsummarized prose is not classified','total':len(items) if p else None,'items':items[offset:offset+limit],'next_offset':offset+limit if offset+limit<len(items) else None},
-            'review':dict(review,pending_requests=pending[:5],pending_total=len(pending),more='review '+task if len(pending)>5 else None),
+            'review':dict(review,pending_requests=pending[:5],pending_total=len(pending),more='review '+task if len(pending)>5 else None,
+                          prior_contributions=bounded_priors,prior_contributions_total=len(priors),
+                          prior_contributions_more='review '+task if len(priors)>PRIOR_BRIEF_LIMIT else None),
             'lifecycle_matches_contribution':matches_contribution,
             'dependencies':{'total':len(deps),'items':[{k:clip(d.get(k),160) for k in ('depends_on_id','type')} for d in deps[:8]],'omitted':max(0,len(deps)-8)},
             'lifecycle':{dim:dict(value=f['value'],event_id=f['event_id']) for dim,f in facts['facts'].items()},

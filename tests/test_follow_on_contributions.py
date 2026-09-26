@@ -2,10 +2,15 @@
 
 An additive second change to a task whose contribution is already integrated uses
 the optional ``follows`` relation instead of being forced to declare that it
-``supersedes`` (retracts) the integrated revision. These tests pin the additive
-relation, backward compatibility of existing ``supersedes`` chains, and the
-end-to-end projection that shows both the integrated prior change and the new
-pending one while the prior lifecycle facts stay intact.
+``supersedes`` (retracts) the integrated revision. These tests pin:
+
+* the integration precondition for ``follows`` (refused with zero native writes
+  for an awaiting-review prior, an approved-but-unintegrated prior, and a prior
+  whose integration commit does not match the follow-on ``base_commit``);
+* the accepted additive follow-on on an integrated prior;
+* the bounded ``brief`` prior-contribution slice with a complete ``review TASK``;
+* what remains visible for a prior contribution after the follow-on records its
+  own lifecycle scope (record/commit/relation, not re-scoped lifecycle facts).
 """
 import json
 import sys
@@ -20,13 +25,16 @@ from requirements import content_hash
 
 COMMIT_1 = 'a' * 40
 COMMIT_2 = 'd' * 40
+COMMIT_3 = '9' * 40
 MERGE_1 = 'e' * 40
+MERGE_2 = 'f' * 40
 
 
 class FollowOnChainTests(unittest.TestCase):
     def setUp(self):
         self.issue = dict(id='task-1', title='Follow-on task', assignee='worker',
                           status='in_progress', labels=[], comments=[])
+        self.rows = [self.issue]
         self.count = 0
 
     def payload(self, op, **extra):
@@ -34,8 +42,8 @@ class FollowOnChainTests(unittest.TestCase):
         return dict(schema_version=1, operation=op, operation_id='op-' + str(self.count),
                     task='task-1', previous=w.project(self.issue)['latest_comment_id'], **extra)
 
-    def contribution(self, commit, **extra):
-        p = dict(repository='ssh://git.example/project', commit=commit, base_commit='b' * 40,
+    def contribution(self, commit, base='b' * 40, **extra):
+        p = dict(repository='ssh://git.example/project', commit=commit, base_commit=base,
                  delivery=dict(kind='bundle', path='koopa:/deliveries/' + commit[:7] + '.bundle',
                                sha256='c' * 64),
                  summary='Implementation and test evidence',
@@ -50,48 +58,51 @@ class FollowOnChainTests(unittest.TestCase):
         return json.dumps({'id': cid})
 
     def send(self, p, actor='worker'):
-        return w.execute([self.issue], 'task-1', actor, p, self.run_native)
+        return w.execute(self.rows, 'task-1', actor, p, self.run_native)
 
-    def lifecycle_rows(self, comments, source_commit):
-        """Task rows with scoped lifecycle evidence marking source_commit integrated."""
-        rows = [dict(_type='issue', id='task-1', title='Follow-on task', issue_type='task',
-                     status='in_progress', assignee='worker', labels=[], comments=comments,
-                     created_at='2026-09-16T00:00:00Z', updated_at='2026-09-16T00:00:00Z')]
-
+    def record_lifecycle(self, source_commit, integration_commit, scope_op='scope-1', integrated=True):
+        """Append scoped lifecycle evidence marking source_commit integrated."""
         def run(args):
             if args == ['export', '--all']:
-                return ''.join(json.dumps(r) + '\n' for r in rows)
+                return ''.join(json.dumps(r) + '\n' for r in self.rows)
             assert args[0] == 'set-state', args
             dim, value = args[2].split('=', 1)
-            issue = rows[0]
+            issue = self.issue
             old = next((x.split(':', 1)[1] for x in issue['labels'] if x.startswith(dim + ':')), None)
             issue['labels'] = [x for x in issue['labels'] if not x.startswith(dim + ':')] + [dim + ':' + value]
-            event_id = 'task-1.' + str(len(rows))
+            event_id = 'task-1.' + str(len(self.rows))
             reason = args[args.index('--reason') + 1]
             description = (('Set ' if old is None else 'Changed ') + dim +
                            (' to ' if old is None else ' from ' + old + ' to ') + value +
                            '\n\nReason: ' + reason)
-            rows.append(dict(_type='issue', id=event_id, issue_type='event',
-                             title='State change: ' + dim + ' \u2192 ' + value, description=description,
-                             status='closed', created_by='worker', created_at='2026-09-16T00:00:00Z',
-                             dependencies=[dict(issue_id=event_id, depends_on_id='task-1',
-                                                type='parent-child')]))
+            self.rows.append(dict(_type='issue', id=event_id, issue_type='event',
+                                  title='State change: ' + dim + ' \u2192 ' + value,
+                                  description=description, status='closed', created_by='worker',
+                                  created_at='2026-09-16T00:00:00Z',
+                                  dependencies=[dict(issue_id=event_id, depends_on_id='task-1',
+                                                     type='parent-child')]))
             return json.dumps(dict(changed=True, dimension=dim, event_id=event_id, new_value=value))
 
-        scope = {'source_commit': source_commit, 'integration_commit': MERGE_1,
+        scope = {'source_commit': source_commit, 'integration_commit': integration_commit,
                  'release_id': '', 'environment': ''}
         base = dict(schema_version=1, task='task-1', scope=scope, evidence=['commit:' + source_commit],
                     provenance='performed', actor='worker')
-        lifecycle.apply_native(dict(base, operation_id='scope-1', dimension='lifecycle-scope',
+        lifecycle.apply_native(dict(base, operation_id=scope_op, dimension='lifecycle-scope',
                                     value=content_hash(scope)), 'worker', run)
-        lifecycle.apply_native(dict(base, operation_id='integrated-1', dimension='integrated',
-                                    value='passed'), 'worker', run)
-        return rows
+        if integrated:
+            lifecycle.apply_native(dict(base, operation_id=scope_op + '-int', dimension='integrated',
+                                        value='passed'), 'worker', run)
 
-    def test_additive_follow_on_keeps_prior_contribution_visible(self):
+    def integration_case(self):
+        """Contribution 1 approved and integrated at MERGE_1, base scope on COMMIT_1."""
         first = self.send(self.contribution(COMMIT_1))['comment_id']
         self.send(self.payload('approve', contribution=first, summary='Reviewed'), 'reviewer')
-        second = self.send(self.contribution(COMMIT_2, base_commit=MERGE_1,
+        self.record_lifecycle(COMMIT_1, MERGE_1)
+        return first
+
+    def test_additive_follow_on_keeps_prior_contribution_visible(self):
+        first = self.integration_case()
+        second = self.send(self.contribution(COMMIT_2, base=MERGE_1,
                                              supersedes=None, follows=first))['comment_id']
         state = w.project(self.issue)
         self.assertEqual(state['review_state'], 'awaiting-review')
@@ -103,6 +114,44 @@ class FollowOnChainTests(unittest.TestCase):
         self.assertEqual(prior['relation'], 'follows')
         self.assertEqual(prior['commit'], COMMIT_1)
         self.assertIsNone(prior['supersedes'])
+
+    def test_awaiting_review_prior_is_refused_without_write(self):
+        first = self.send(self.contribution(COMMIT_1))['comment_id']
+        before = len(self.issue['comments'])
+        with self.assertRaisesRegex(ValueError, 'not integrated'):
+            self.send(self.contribution(COMMIT_2, base=MERGE_1, supersedes=None, follows=first))
+        self.assertEqual(len(self.issue['comments']), before)
+
+    def test_approved_but_unintegrated_prior_is_refused_without_write(self):
+        first = self.send(self.contribution(COMMIT_1))['comment_id']
+        self.send(self.payload('approve', contribution=first, summary='Reviewed'), 'reviewer')
+        self.assertEqual(w.project(self.issue)['review_state'], 'awaiting-integration')
+        before = len(self.issue['comments'])
+        with self.assertRaisesRegex(ValueError, 'not integrated'):
+            self.send(self.contribution(COMMIT_2, base=MERGE_1, supersedes=None, follows=first))
+        self.assertEqual(len(self.issue['comments']), before)
+
+    def test_integrated_prior_with_mismatched_base_is_refused_without_write(self):
+        first = self.integration_case()
+        before = len(self.issue['comments'])
+        with self.assertRaisesRegex(ValueError, 'must equal the prior integration commit'):
+            self.send(self.contribution(COMMIT_2, base=COMMIT_3, supersedes=None, follows=first))
+        self.assertEqual(len(self.issue['comments']), before)
+        # The exact integration commit is accepted.
+        self.send(self.contribution(COMMIT_2, base=MERGE_1, supersedes=None, follows=first))
+        self.assertEqual(len(self.issue['comments']), before + 1)
+
+    def test_minimum_rule_when_scoped_evidence_is_unavailable(self):
+        payload = dict(operation='contribute', follows='1', base_commit='b' * 40)
+        pending = dict(contribution={'commit': COMMIT_1}, review_state='awaiting-integration',
+                       pending_requests=[])
+        w.require_integrated_follow_on(payload, pending, None)
+        for state in (dict(pending, review_state='awaiting-review'),
+                      dict(pending, review_state='changes-requested'),
+                      dict(pending, review_state='awaiting-integration',
+                           pending_requests=[{'item': 'fix'}])):
+            with self.assertRaisesRegex(ValueError, 'without scoped integration evidence'):
+                w.require_integrated_follow_on(payload, state, None)
 
     def test_legacy_supersede_chain_still_tags_the_replaced_revision(self):
         first = self.send(self.contribution(COMMIT_1))['comment_id']
@@ -128,23 +177,62 @@ class FollowOnChainTests(unittest.TestCase):
             self.send(self.contribution(COMMIT_1, supersedes=None, follows='anything'))
         self.assertEqual(len(self.issue['comments']), before)
 
-    def test_brief_shows_integrated_prior_and_pending_follow_on(self):
-        first = self.send(self.contribution(COMMIT_1))['comment_id']
-        self.send(self.payload('approve', contribution=first, summary='Reviewed'), 'reviewer')
-        rows = self.lifecycle_rows(self.issue['comments'], COMMIT_1)
-        self.issue = rows[0]
-        second = self.send(self.contribution(COMMIT_2, base_commit=MERGE_1,
-                                             supersedes=None, follows=first))['comment_id']
+    def test_brief_bounds_long_prior_chain_and_review_stays_complete(self):
+        summary = 'S' * 500
+        for i in range(30):
+            p = self.contribution('%040x' % (i + 1))
+            p['summary'] = summary
+            self.send(p)
+        complete = w.project(self.issue)
+        self.assertEqual(len(complete['prior_contributions']), 29)
+        self.assertTrue(all('summary' in c for c in complete['prior_contributions']))
 
-        result = briefing.brief(rows, 'proj', 'task-1')
+        result = briefing.brief(self.rows, 'proj', 'task-1')
         review = result['review']
-        self.assertEqual(review['review_state'], 'awaiting-review')
-        self.assertEqual(review['contribution']['comment_id'], second)
-        self.assertEqual([c['comment_id'] for c in review['prior_contributions']], [first])
-        self.assertEqual(review['prior_contributions'][0]['relation'], 'follows')
-        # The prior revision's scoped integration fact is untouched and still visible.
-        self.assertEqual(result['lifecycle']['integrated']['value'], 'passed')
-        self.assertEqual(result['lifecycle_scope']['source_commit']['text'], COMMIT_1)
+        self.assertEqual(review['prior_contributions_total'], 29)
+        self.assertEqual(len(review['prior_contributions']), briefing.PRIOR_BRIEF_LIMIT)
+        self.assertEqual(review['prior_contributions_more'], 'review task-1')
+        for entry in review['prior_contributions']:
+            self.assertEqual(set(entry), {'comment_id', 'commit', 'relation', 'timestamp'})
+        # The recent slice preserves order and matches the complete projection.
+        self.assertEqual([c['comment_id'] for c in review['prior_contributions']],
+                         [c['comment_id'] for c in complete['prior_contributions'][-briefing.PRIOR_BRIEF_LIMIT:]])
+        # The embedded brief stays small instead of scaling with the chain (base is ~2.7 KB).
+        self.assertLess(len(json.dumps(result, ensure_ascii=False).encode()), 6000)
+        self.assertLess(len(briefing.format_brief(result).encode()), 6000)
+
+    def test_prior_scoped_fact_leaves_scope_but_stays_in_history(self):
+        first = self.integration_case()
+        self.send(self.contribution(COMMIT_2, base=MERGE_1, supersedes=None, follows=first))
+
+        before = briefing.brief(self.rows, 'proj', 'task-1')
+        self.assertEqual(before['lifecycle']['integrated']['value'], 'passed')
+        self.assertEqual(before['lifecycle_scope']['source_commit']['text'], COMMIT_1)
+        self.assertEqual([c['comment_id'] for c in before['review']['prior_contributions']], [first])
+
+        # The follow-on records its own scope: exactly the reviewer's scenario.
+        self.record_lifecycle(COMMIT_2, MERGE_2, scope_op='scope-2')
+        after = briefing.brief(self.rows, 'proj', 'task-1')
+        self.assertEqual(after['lifecycle_scope']['source_commit']['text'], COMMIT_2)
+        self.assertEqual(after['lifecycle']['integrated']['value'], 'passed')
+        prior = after['review']['prior_contributions'][0]
+        self.assertEqual((prior['comment_id'], prior['commit'], prior['relation']),
+                         (first, COMMIT_1, 'follows'))
+        self.assertFalse({'lifecycle', 'integrated', 'review_state', 'facts', 'scope'} & set(prior))
+
+        # The prior's scoped integration evidence is intact in lifecycle history
+        # even though it is no longer the task's current scope.
+        self.assertTrue(any(r.get('issue_type') == 'event' and COMMIT_1 in r.get('description', '')
+                            and 'integrated' in r.get('description', '') for r in self.rows))
+        current = next(r for r in lifecycle.project_facts(self.rows) if r['id'] == 'task-1')
+        self.assertEqual(current['scope']['source_commit'], COMMIT_2)
+        self.assertEqual(current['facts']['integrated']['value'], 'passed')
+
+        from work import queue
+        item = queue(self.rows, 'worker', ['--mine'])['items'][0]
+        self.assertEqual(item['lifecycle_scope']['source_commit'], COMMIT_2)
+        self.assertEqual(item['lifecycle']['integrated'], 'passed')
+        self.assertNotIn('prior_contributions', item)
 
 
 if __name__ == '__main__':

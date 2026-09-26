@@ -20,5 +20,6 @@ Open questions / blockers / risks:
 Next action and owner:
 Review queue (review-ready label, or reason delivery/review readiness is pending):
 Structured contribution comment ID / superseded contribution ID:
+Additive follow-on (follows prior contribution comment ID; base commit = prior integration commit):
 Review requests addressed (request comment/item IDs and response evidence):
 Task status and parent job current-summary updates needed:
