@@ -4,6 +4,7 @@ import io
 import json
 import os
 import shutil
+import stat
 import sys
 import tempfile
 import types
@@ -452,7 +453,11 @@ class AdminVoidRecordTests(unittest.TestCase):
 
         self.assertEqual(cli('operators', 'list'), ['operator'])
         self.assertEqual(cli('operators', 'add', 'coordinator'), ['operator', 'coordinator'])
-        self.assertEqual(cli('operators', 'remove', 'operator'), ['coordinator'])
+        # P2 removal semantics: revocation is explicit, never silent.
+        with self.assertRaisesRegex(ValueError, 'confirm-revoke'):
+            cli('operators', 'remove', 'operator')
+        self.assertEqual(admin.operators(self.root), frozenset({'operator', 'coordinator'}))
+        self.assertEqual(cli('operators', 'remove', 'operator', '--confirm-revoke'), ['coordinator'])
         self.assertEqual(admin.operators(self.root), frozenset({'coordinator'}))
 
     def test_operator_cli_refuses_an_actor_outside_the_allowlist(self):
@@ -467,6 +472,121 @@ class AdminVoidRecordTests(unittest.TestCase):
         wrong = void('c2', 'different bytes')
         with self.assertRaisesRegex(ValueError, 'exact current bytes'):
             self.invoke(wrong)
+        self.assertEqual(self.writes, [])
+
+    # --- P2 render-allowlist ------------------------------------------------
+
+    def test_render_uses_the_same_operator_allowlist_as_work_and_review(self):
+        from render import render
+        bad = broken_review()
+        rows = [native([review_comment('c1', contribute()), bad,
+                        void_comment('v1', void('c2', bad['text'], operator='operator'))])]
+        with patch.dict(os.environ, {'ORCHESTRA_OPERATORS': ''}):
+            authority = admin.operators(self.root)
+            self.assertEqual([(i['task'], i['review_state'])
+                              for i in work.queue(rows, 'worker', [], operators=authority)['items']],
+                             [(TASK, 'awaiting-review')])
+            dest = self.root / 'views-valid'
+            render(rows, dest, authority)
+            row = [line for line in (dest / 'CURRENT.md').read_text(encoding='utf-8').splitlines()
+                   if line.startswith('| ' + TASK)]
+            self.assertEqual(len(row), 1)
+            self.assertIn('| awaiting-review |', row[0])
+            self.assertNotIn('| error |', row[0])
+            # An unconfigured/unavailable allowlist is the same incident the
+            # other reads report (state `error`), not a second, quieter story.
+            dest2 = self.root / 'views-invalid'
+            render(rows, dest2, ())
+            row2 = [line for line in (dest2 / 'CURRENT.md').read_text(encoding='utf-8').splitlines()
+                    if line.startswith('| ' + TASK)]
+            self.assertEqual(len(row2), 1)
+            self.assertIn('| error |', row2[0])
+
+    # --- P2 operator-removal-and-restore ------------------------------------
+
+    def test_operator_removal_revokes_and_readding_restores_void_dispositions(self):
+        bad = broken_review()
+        issue = native([review_comment('c1', contribute()), bad,
+                        void_comment('v1', void('c2', bad['text'], operator='ops'), author='ops')])
+        self.assertEqual(w.project(issue, ('ops',))['review_state'], 'awaiting-review')
+        with self.assertRaisesRegex(ValueError, 'operator reconciliation'):
+            w.project(issue, ('operator',))
+        # Re-adding the operator restores the disposition: nothing was deleted.
+        self.assertEqual(w.project(issue, ('ops',))['review_state'], 'awaiting-review')
+
+    def test_project_backup_carries_the_allowlist_and_restore_reestablishes_it(self):
+        marker = self.root / 'deployment.private.json'
+        marker.write_text(json.dumps({'password': 'x', 'unit': 'none', 'operators': ['operator', 'ops']}),
+                          encoding='utf-8')
+        (self.root / 'backups').mkdir()
+        (self.root / 'projects' / 'other').mkdir()
+        with patch.object(admin, 'run_bd', return_value='synced'):
+            admin.backup_project(self.root, 'trial')
+        bundle = json.loads((self.root / 'backups' / 'trial.coordination.json').read_text(encoding='utf-8'))
+        self.assertEqual(bundle['operators'], ['operator', 'ops'])
+        self.assertEqual(admin.coordination_operators(self.root, 'trial'), ['operator', 'ops'])
+        # A host that does not list `ops` would treat the preserved void as
+        # inert; restore re-establishes the recorded authority and reports it.
+        marker.write_text(json.dumps({'password': 'x', 'unit': 'none', 'operators': ['operator']}),
+                          encoding='utf-8')
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            admin.restore_coordination(self.root, 'trial', 'other')
+        self.assertEqual(json.loads(marker.read_text(encoding='utf-8'))['operators'], ['operator', 'ops'])
+        self.assertIn('ops', out.getvalue())
+        if os.name == 'posix':
+            self.assertEqual(stat.S_IMODE(marker.stat().st_mode), 0o600)
+
+    def test_coordination_backup_refuses_a_malformed_operator_snapshot(self):
+        (self.root / 'backups').mkdir()
+        (self.root / 'backups' / 'trial.coordination.json').write_text(
+            json.dumps({'schema_version': 1, 'status': 'complete', 'files': {}, 'operators': 'not-a-list'}),
+            encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'operators must be a list'):
+            admin.coordination_backup(self.root, 'trial')
+
+    # --- P3 config-write-safety ---------------------------------------------
+
+    def test_operator_config_write_is_atomic_and_private(self):
+        marker = self.root / 'deployment.private.json'
+        os.chmod(marker, 0o664)
+        replaced = []
+        real_replace = os.replace
+        with patch.object(os, 'fsync', wraps=os.fsync) as fsync, \
+                patch.object(os, 'replace',
+                             side_effect=lambda *a, **k: (replaced.append(a), real_replace(*a, **k))[1]):
+            admin.atomic_private_write(marker, json.dumps({'password': 'x', 'operators': ['operator']}))
+        self.assertTrue(replaced, 'config rewrite must go through os.replace')
+        self.assertTrue(fsync.called, 'config rewrite must fsync before replace')
+        self.assertEqual(json.loads(marker.read_text(encoding='utf-8'))['operators'], ['operator'])
+        if os.name == 'posix':
+            # An existing permissive mode must not survive the rewrite.
+            self.assertEqual(stat.S_IMODE(marker.stat().st_mode), 0o600)
+
+    def test_operators_add_rewrites_the_private_config_0600(self):
+        marker = self.root / 'deployment.private.json'
+        os.chmod(marker, 0o664)
+        with patch.object(sys, 'argv', ['admin.py', '--root', str(self.root), 'operators', 'add', 'ops2']), \
+                patch.object(admin, 'root_path', return_value=self.root), \
+                contextlib.redirect_stdout(io.StringIO()):
+            admin.main()
+        self.assertEqual(json.loads(marker.read_text(encoding='utf-8'))['operators'], ['operator', 'ops2'])
+        if os.name == 'posix':
+            self.assertEqual(stat.S_IMODE(marker.stat().st_mode), 0o600)
+        self.assertEqual(admin.operators(self.root), frozenset({'operator', 'ops2'}))
+
+    # --- P3 one authority source --------------------------------------------
+
+    def test_orchestra_operators_env_is_not_an_authority_source(self):
+        with patch.dict(os.environ, {'ORCHESTRA_OPERATORS': 'shell-only'}):
+            # Reads and writes use the config file only.
+            self.assertEqual(admin.operators(self.root), frozenset({'operator'}))
+            # A write command refuses the mismatch loudly instead of letting the
+            # admin shell authorize an actor the endpoint would ignore.
+            with self.assertRaisesRegex(ValueError, 'ORCHESTRA_OPERATORS'):
+                admin.operators(self.root, strict=True)
+            with self.assertRaisesRegex(ValueError, 'ORCHESTRA_OPERATORS'):
+                self.invoke(void('c2', self.rows[0]['comments'][0]['text'], operator='shell-only'),
+                            actor='shell-only')
         self.assertEqual(self.writes, [])
 
 

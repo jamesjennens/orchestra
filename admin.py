@@ -39,15 +39,22 @@ def root_path(value):
 def config(root):
     return json.loads((root/'deployment.private.json').read_text())
 
-def operators(root):
+def operators(root, strict=False):
     """Server-side operator allowlist for void records.
 
-    Deployment configuration (`deployment.private.json`'s `operators`) plus the
-    host `ORCHESTRA_OPERATORS` environment variable. Only these actors may
-    author an operator void: the endpoint supplies this set to every read and
-    the host `void-record` command refuses any other actor. A deployment that
-    configures no operators authorizes nobody, so a forged or self-authored
-    void comment is inert. This is not read from the void payload.
+    The deployment configuration (`deployment.private.json`'s `operators`) is
+    the single authority source. Only these actors may author an operator void:
+    the endpoint supplies this set to every read and the host `void-record`
+    command refuses any other actor. A deployment that configures no operators
+    authorizes nobody, so a forged or self-authored void comment is inert. This
+    is never read from the void payload.
+
+    `ORCHESTRA_OPERATORS` is not an authority source: a value that differs from
+    the deployment configuration used to authorize an actor in an admin shell
+    while the endpoint (config only) ignored the void. With `strict=True`
+    (host-side write commands) that mismatch is refused loudly instead of being
+    accepted in one place and ignored in another. Direct library use may still
+    pass `operators` explicitly to `recovery.configured_operators`.
     """
     found=[]
     marker=root/'deployment.private.json'
@@ -56,9 +63,47 @@ def operators(root):
         if isinstance(value,list):found.extend(value)
         elif isinstance(value,str):found.append(value)
         elif value is not None:raise ValueError('deployment operators must be a list of actor identities')
-    found.extend((os.environ.get('ORCHESTRA_OPERATORS') or '').replace(',',' ').split())
     from recovery import configured_operators
-    return configured_operators(found)
+    allowed=configured_operators(found)
+    if strict:
+        shell=configured_operators((os.environ.get('ORCHESTRA_OPERATORS') or '').replace(',',' ').split())
+        if shell and shell!=allowed:
+            raise ValueError('ORCHESTRA_OPERATORS is set in this shell but is not an authority source; '
+                             'deployment.private.json operators is. Add the actor with `admin.py operators add` '
+                             'or unset ORCHESTRA_OPERATORS before this command.')
+    return allowed
+
+def atomic_private_write(path, text):
+    """Write a private config file atomically at mode 0600.
+
+    `deployment.private.json` also holds the Dolt password, so it must never be
+    truncated in place or left group/world readable. The new bytes go to a
+    sibling temporary file created 0600, are fsynced, and replace the target in
+    one step; an existing permissive mode cannot survive because the
+    replacement is a fresh inode.
+    """
+    import tempfile
+    path=Path(path)
+    fd,tmp=tempfile.mkstemp(prefix='.'+path.name+'.',dir=str(path.parent))
+    try:
+        with os.fdopen(fd,'w',encoding='utf-8') as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp,0o600)
+        os.replace(tmp,path)
+    except BaseException:
+        try: os.unlink(tmp)
+        except OSError: pass
+        raise
+    try:  # POSIX: make the rename durable; not available on every platform.
+        dir_fd=os.open(str(path.parent),os.O_RDONLY)
+        try: os.fsync(dir_fd)
+        finally: os.close(dir_fd)
+    except OSError:
+        pass
+    return path
+
 
 def environment(root):
     env=os.environ.copy()
@@ -397,8 +442,25 @@ def backup_project(root,name):
         # sidecar so a backup never pairs one store's state with the other's.
         snapshot_journal(path/JOURNAL_STORE_NAME,journal_snapshot_path(root,name))
         output=run_bd(root,name,['backup','sync'])
-        atomic(bundle,{'schema_version':1,'status':'complete','files':files})
+        # The deployment operator allowlist travels with the project sidecar so
+        # a restore onto a host that does not list these operators still
+        # preserves the dispositions the backup recorded (`restore_coordination`
+        # re-establishes them). Native backup preserves the void comments; this
+        # preserves the authority the reads need to apply them.
+        atomic(bundle,{'schema_version':1,'status':'complete','files':files,
+                       'operators':sorted(operators(root))})
         return output
+
+def validate_coordination_operators(value):
+    """Validate the optional operator snapshot carried by a backup sidecar."""
+    if value is None:return []
+    if not isinstance(value,list):raise ValueError('Coordination backup operators must be a list')
+    from recovery import identity
+    allowed=[]
+    for item in value:
+        try:allowed.append(identity(item,'Invalid operator identity in coordination backup'))
+        except ValueError:raise ValueError('Invalid operator identity in coordination backup') from None
+    return allowed
 
 def coordination_backup(root,source):
     validate_name(source)
@@ -409,7 +471,40 @@ def coordination_backup(root,source):
     data=json.loads(bundle.read_text(encoding='utf-8'))
     if not isinstance(data,dict) or data.get('schema_version')!=1 or data.get('status')!='complete':raise ValueError('Incomplete coordination backup; recover/reconcile source first')
     validate_coordination_files(data.get('files'))
+    validate_coordination_operators(data.get('operators'))
     return data['files']
+
+def coordination_operators(root,source):
+    """Operator allowlist snapshot in a project sidecar, or [] when absent."""
+    validate_name(source)
+    bundle=root/'backups'/(source+'.coordination.json')
+    if not bundle.is_file() or bundle.is_symlink():return []
+    try:data=json.loads(bundle.read_text(encoding='utf-8'))
+    except ValueError:return []
+    if not isinstance(data,dict):return []
+    return validate_coordination_operators(data.get('operators'))
+
+def merge_operators(root,actors):
+    """Add missing operators to the deployment allowlist; return the added names.
+
+    Restore uses this to re-establish authority recorded in the backup so the
+    restored void dispositions still apply. It is additive only: an operator
+    that the destination deliberately removed is never silently re-granted
+    unless the backup that recorded it is the one being restored, and the added
+    names are reported by the caller.
+    """
+    marker=root/'deployment.private.json'
+    if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
+    from recovery import identity
+    wanted=[identity(item,'Invalid operator identity') for item in actors]
+    cfg=config(root)
+    current=list(cfg.get('operators') or [])
+    added=[item for item in wanted if item not in current]
+    if not added:return []
+    cfg['operators']=current+added
+    atomic_private_write(marker,json.dumps(cfg))
+    return added
+
 
 def restore_coordination(root,source,destination):
     from coordination import atomic
@@ -448,6 +543,12 @@ def restore_coordination(root,source,destination):
             from feedback import validate_quarantine_record
             _atomic_write_bytes(target,validate_quarantine_record(name,record))
         else:atomic(target,record)
+    # Re-establish the operator authority the backup recorded so the restored
+    # void dispositions still apply on a host that does not already list them.
+    snapshot=coordination_operators(root,source)
+    added=merge_operators(root,snapshot) if snapshot else []
+    if added:
+        print('Restored operator allowlist entries that were missing on this host: ' + ', '.join(added))
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('--root',required=True)
@@ -465,6 +566,8 @@ def main():
                    help='with --disposition complete, the exact native record to confirm')
     a=sub.add_parser('void-record');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('operators');a.add_argument('action',choices=['list','add','remove']);a.add_argument('actor',nargs='?')
+    a.add_argument('--confirm-revoke',action='store_true',dest='confirm_revoke',
+                   help='with remove: acknowledge that this operator\'s earlier operator voids stop applying')
     for command in ('backup','restore-new'):
         a=sub.add_parser(command);a.add_argument('project')
         if command=='restore-new':a.add_argument('destination')
@@ -558,7 +661,7 @@ def main():
         path=project_dir(root,args.project)
         payload=json.loads(Path(args.file).read_text(encoding='utf-8-sig'))
         if not isinstance(payload,dict) or not isinstance(payload.get('task'),str):raise ValueError('Void record payload must name its task')
-        authority=operators(root)
+        authority=operators(root, strict=True)
         def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
@@ -571,15 +674,22 @@ def main():
         cfg=config(root)
         current=list(cfg.get('operators') or [])
         if args.action=='list':print(json.dumps({'operators':current}));return
+        # Config is the single authority source; a shell-only ORCHESTRA_OPERATORS
+        # that disagrees is refused before the change rather than applied here
+        # and ignored by the endpoint.
+        operators(root, strict=True)
         if not args.actor:raise ValueError('operators '+args.action+' requires an actor identity')
         actor=identity(args.actor,'Invalid operator identity')
         if args.action=='add':
             if actor not in current:current.append(actor)
-        elif actor in current:current.remove(actor)
+        else:
+            if not args.confirm_revoke:
+                raise ValueError('operators remove revokes ' + actor + ': voids they authored stop applying on reads '
+                                 '(re-add restores them). Re-run with --confirm-revoke to acknowledge this.')
+            if actor in current:current.remove(actor)
         if current:cfg['operators']=current
         else:cfg.pop('operators',None)
-        fd=os.open(marker,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
-        with os.fdopen(fd,'w') as f:json.dump(cfg,f)
+        atomic_private_write(marker,json.dumps(cfg))
         print(json.dumps({'operators':current}))
     elif args.command=='backup':print(backup_project(root,args.project))
     elif args.command=='journal':

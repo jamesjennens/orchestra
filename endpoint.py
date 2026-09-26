@@ -194,7 +194,7 @@ def execute(root,request,authority_config=None,require_authority=False):
             p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','export','--all'],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
             if p.returncode:return {'returncode':p.returncode,'stdout':p.stdout,'stderr':p.stderr}
             rows=[json.loads(line) for line in p.stdout.splitlines() if line.strip()]
-            return {'returncode':0,'stdout':json.dumps(render(rows,path/'views'))+'\n','stderr':p.stderr}
+            return {'returncode':0,'stdout':json.dumps(render(rows,path/'views',configured_operators(root)))+'\n','stderr':p.stderr}
     if action!='bd':raise ValueError('Unknown action')
     args=request.get('args',[])
     if not isinstance(args,list) or not args or any(not isinstance(a,str) or '\0' in a for a in args):raise ValueError('Expected argument list')

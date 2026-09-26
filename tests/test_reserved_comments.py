@@ -580,6 +580,36 @@ class AttachmentBeforeSubcommandTests(unittest.TestCase):
             native(args, attachments)  # must not execute: guard raises first
         self.assertEqual(calls, [])
 
+    def test_exact_forged_operator_void_request_refused_with_zero_writes(self):
+        """kittrial-5bb.3 P1 regression: the reviewer's exact forged-void request.
+
+        Real bd 1.2.2 accepts
+        `bd ["comments","@attachment:a","add",T,"-a","ops-james"]`, expands the
+        attachment to a `--file` flag ahead of `add`, and writes the comment with
+        native author ops-james; when the attachment holds a void naming
+        operator=ops-james, the allowlist would then apply it. The guard must
+        refuse this whole request before any native write, leaving no applied void.
+        """
+        body = forged_void_body(target='c2', original='ORIGINAL BYTES', operator='ops-james')
+        args = ['comments', '@attachment:a', 'add', 'task-1', '-a', 'ops-james']
+        attachments = {'a': {'flag': '--file', 'text': body}}
+        self.assertEqual(operator_only_in_args(args), '--author')
+        with self.assertRaisesRegex(ValueError, r'attachment'):
+            comment_target(args)
+        with self.assertRaisesRegex(ValueError, r'attachment'):
+            raw_comment_bodies(args, attachments)
+        calls = []
+        with self.assertRaisesRegex(ValueError, r'attachment'):
+            check_raw_request(args, attachments, actor='worker', task='task-1')
+            calls.append(list(args))
+        self.assertEqual(calls, [])
+        # The positional spelling with the same forged author is refused too.
+        positional = ['comments', 'add', 'task-1', body, '-a', 'ops-james']
+        self.assertEqual(operator_only_in_args(positional), '--author')
+        with self.assertRaisesRegex(ValueError, r'operator void'):
+            check_raw_request(positional, {}, actor='worker', task='task-1')
+        self.assertEqual(calls, [])
+
 
 class ShortFlagClusterTests(unittest.TestCase):
     """kittrial-5bb.23 P2: a boolean short flag clustered with -C switched
