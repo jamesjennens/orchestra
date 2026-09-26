@@ -234,18 +234,29 @@ def _documents(text):
 
     Starts nested inside a document that already began are skipped, so one
     indented document counts once however many inner objects it contains.
-    Diagnostic objects are not documents.
+    Diagnostic objects are not documents. An undecodable start followed by a
+    more-indented data object is refused rather than returning a nested fragment.
     """
     documents = []
+    first_failed_start = None
+    first_failed_indent = None
     for start in _line_starts(text):
         if documents and start < documents[-1][1]:
             continue
         try:
             value, end = _JSON.raw_decode(text, start)
         except ValueError:
+            if first_failed_start is None:
+                first_failed_start = start
+                line_start = text.rfind('\n', 0, start) + 1
+                first_failed_indent = start - line_start
             continue
         if not isinstance(value, JSON_RESULT_TYPES) or _is_note_object(value):
             continue
+        line_start = text.rfind('\n', 0, start) + 1
+        if (first_failed_start is not None and start > first_failed_start
+                and start - line_start > first_failed_indent):
+            raise ValueError(stdout_failure(text))
         documents.append((start, end))
     return documents
 
