@@ -361,5 +361,92 @@ class BackupTests(unittest.TestCase):
         self.assertIn('sample-job.7', out.getvalue())
 
 
+class RequirementJournalBackupTests(unittest.TestCase):
+    """The requirement journals ride the native backup/restore sidecar.
+
+    kittrial-pth.26 item 3: the F3 acceptance evidence and the pending/released
+    operation IDs live in `.requirement-requests`/`.requirement-backfills`, so a
+    backup that omitted them lost the operator's acceptance on restore.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.source = self.root / 'projects' / 'source'
+        self.destination = self.root / 'projects' / 'destination'
+        self.source.mkdir(parents=True)
+        self.destination.mkdir()
+        (self.root / 'backups' / 'source').mkdir(parents=True)
+        self.bundle = self.root / 'backups' / 'source.coordination.json'
+        self.request_name = '.requirement-requests/' + 'a' * 64 + '.json'
+        self.backfill_name = '.requirement-backfills/' + 'b' * 64 + '.json'
+        self.receipt = {'sha256': 'c' * 64, 'status': 'complete', 'actor': 'operator',
+                        'id': 'source-1.1', 'operation': 'revise', 'revision': 2,
+                        'acceptance': {'owners': ['owner-a'], 'approvers': ['owner-a'],
+                                       'policy': 'any-owner', 'decision_id': 'dec-1',
+                                       'evidence': 'review-1', 'record_sha256': 'd' * 64}}
+        self.backfill = {'sha256': 'e' * 64, 'status': 'complete', 'actor': 'operator',
+                         'records': ['source-1.1'],
+                         'evidence': {'source-1.1': 'decision-bf'}}
+        self.flock = Mock()
+        self.fake_fcntl = types.SimpleNamespace(flock=self.flock, LOCK_EX=2)
+        self.patcher = patch.dict(sys.modules, {'fcntl': self.fake_fcntl})
+        self.patcher.start()
+        self.addCleanup(self.patcher.stop)
+
+    def write_journals(self):
+        for name, record in ((self.request_name, self.receipt),
+                             (self.backfill_name, self.backfill)):
+            path = self.source / name
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(json.dumps(record), encoding='utf-8')
+
+    def test_requirement_journals_round_trip_through_backup_and_restore(self):
+        self.write_journals()
+        with patch.object(admin, 'run_bd', return_value='synced'):
+            admin.backup_project(self.root, 'source')
+        files = json.loads(self.bundle.read_text(encoding='utf-8'))['files']
+        self.assertEqual(files[self.request_name], self.receipt)
+        self.assertEqual(files[self.backfill_name], self.backfill)
+        admin.restore_coordination(self.root, 'source', 'destination')
+        self.assertEqual(json.loads((self.destination / self.request_name).read_text()),
+                         self.receipt)
+        self.assertEqual(json.loads((self.destination / self.backfill_name).read_text()),
+                         self.backfill)
+
+    def test_malformed_requirement_receipt_is_refused_before_native_sync(self):
+        self.write_journals()
+        (self.source / self.request_name).write_text(
+            json.dumps({'status': 'complete', 'actor': 'operator'}), encoding='utf-8')
+        with patch.object(admin, 'run_bd') as native:
+            with self.assertRaises(ValueError):
+                admin.backup_project(self.root, 'source')
+        native.assert_not_called()
+        self.assertEqual(json.loads(self.bundle.read_text(encoding='utf-8'))['status'],
+                         'pending')
+
+    def test_restore_validates_requirement_receipts_before_any_write(self):
+        for name, record in ((self.request_name,
+                              {'sha256': 'nothex', 'status': 'complete'}),
+                             (self.backfill_name,
+                              {'sha256': 'e' * 64, 'status': 'complete',
+                               'actor': 'operator', 'records': []})):
+            with self.subTest(name=name):
+                with patch.object(admin, 'coordination_backup',
+                                  return_value={name: record}):
+                    with self.assertRaises(ValueError):
+                        admin.restore_coordination(self.root, 'source', 'destination')
+                self.assertFalse(list(self.destination.iterdir()))
+
+    def test_requirement_receipt_paths_must_stay_in_their_journal(self):
+        for name in ('.requirement-requests/../../escape.json',
+                     '.requirement-requests/notahash.json',
+                     '.requirement-backfills/' + 'b' * 63 + '.json'):
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    admin.validate_coordination_files({name: self.receipt})
+
+
 if __name__ == '__main__':
     unittest.main()

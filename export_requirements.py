@@ -7,6 +7,10 @@ from pathlib import Path
 from requirements import canonical_bytes, content_hash, load_json, validate_manifest
 
 REVISION_PREFIX = 'Kind: requirement-revision-v1\n'
+# The durable F3 acceptance evidence an operator writes beside a revision. It is
+# a separate reserved machine record so raw `comments add` cannot forge it, and
+# so a restore keeps the acceptance decision even when the local journal is gone.
+ACCEPTANCE_PREFIX = 'Kind: requirement-acceptance-v1\n'
 META = ('schema_version', 'baseline', 'state', 'canonical_project', 'job',
         'authority', 'hash_convention')
 

@@ -115,6 +115,110 @@ class NativeLabelResolutionTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 _native_labels(self.root, self.path, 'worker', 'pp-3q2')
 
+    def test_guard_refuses_a_parent_holding_requirement_labels(self):
+        # kittrial-pth.26 item 1: an accepted requirement parent must not hand
+        # requirement/requirement:accepted to a raw `create --parent` child, so
+        # a contributor cannot mint an accepted requirement by inheritance.
+        rows = [{'id': 'pp-req.1',
+                 'labels': ['requirement', 'requirement:accepted']}]
+        with mock.patch.object(endpoint.subprocess, 'run', _rows_run(rows)):
+            with self.assertRaises(ValueError) as caught:
+                _guard_reserved_labels(self.root, self.path,
+                                       ['create', 'child', '--parent', 'pp-req.1'],
+                                       'mallory')
+        message = str(caught.exception)
+        self.assertIn('Refusing create --parent pp-req.1:', message)
+        self.assertRegex(message, r'reserved label requirement')
+
+    def test_guard_refuses_a_backfilled_requirement_parent_without_request_labels(self):
+        # The .30 request-namespace guard cannot see this parent: it holds only
+        # the controlled requirement labels (operator backfill). The extended
+        # guard must still refuse the inheritance.
+        rows = [{'id': 'pp-back.1', 'labels': ['requirement', 'requirement:draft']}]
+        with mock.patch.object(endpoint.subprocess, 'run', _rows_run(rows)):
+            with self.assertRaises(ValueError):
+                _guard_reserved_labels(self.root, self.path,
+                                       ['create', 'child', '--parent', 'pp-back.1'],
+                                       'mallory')
+
+    def test_guard_allows_explicit_no_inherit_from_a_requirement_parent(self):
+        # The documented safe route: opt out of inheritance, then no reserved
+        # label can reach the child and no native read is needed before it.
+        for value in ('', '=1', '=true', '=T'):
+            with self.subTest(value=value):
+                with mock.patch.object(endpoint.subprocess, 'run') as run:
+                    _guard_reserved_labels(
+                        self.root, self.path,
+                        ['create', 'child', '--parent', 'pp-req.1',
+                         '--no-inherit-labels' + value], 'mallory')
+                    run.assert_not_called()
+
+    def test_guard_refuses_set_labels_on_a_requirement_holder(self):
+        # kittrial-pth.26 item 2: `--set-labels` replaces the whole set, so a
+        # replacement that names no reserved value would silently drop the
+        # operator's acceptance and the coordination namespace.
+        rows = [{'id': 'pp-req.1',
+                 'labels': ['requirement', 'requirement:accepted']}]
+        with mock.patch.object(endpoint.subprocess, 'run', _rows_run(rows)):
+            with self.assertRaises(ValueError) as caught:
+                _guard_reserved_labels(self.root, self.path,
+                                       ['update', 'pp-req.1', '--set-labels',
+                                        'keep'], 'mallory')
+        message = str(caught.exception)
+        self.assertIn('Refusing to replace labels on pp-req.1:', message)
+        self.assertRegex(message, r'reserved label requirement')
+
+    def test_guard_refuses_set_labels_on_a_mixed_namespace_holder(self):
+        # A record holding both namespaces is refused too; the refusal names one
+        # of the reserved labels it currently holds.
+        rows = [{'id': 'pp-req.1',
+                 'labels': ['requirement', 'requirement:accepted',
+                            'request:' + 'a' * 64,
+                            'request-content:' + 'b' * 64]}]
+        with mock.patch.object(endpoint.subprocess, 'run', _rows_run(rows)):
+            with self.assertRaises(ValueError) as caught:
+                _guard_reserved_labels(self.root, self.path,
+                                       ['update', 'pp-req.1', '--set-labels',
+                                        'keep'], 'mallory')
+        message = str(caught.exception)
+        self.assertIn('Refusing to replace labels on pp-req.1:', message)
+        self.assertRegex(message, r'reserved label (requirement|request)')
+
+    def test_guard_refuses_remove_label_on_a_requirement_holder(self):
+        rows = [{'id': 'pp-req.1', 'labels': ['requirement:accepted']}]
+        with mock.patch.object(endpoint.subprocess, 'run', _rows_run(rows)):
+            with self.assertRaises(ValueError):
+                _guard_reserved_labels(self.root, self.path,
+                                       ['update', 'pp-req.1', '--remove-label',
+                                        'triage'], 'mallory')
+
+    def test_guard_allows_ordinary_labels_on_a_requirement_holder(self):
+        # --add-label can only add, and adding a reserved value is refused by
+        # reserved_label_in_args(); ordinary labels stay available.
+        rows = [{'id': 'pp-req.1', 'labels': ['requirement']}]
+        with mock.patch.object(endpoint.subprocess, 'run', _rows_run(rows)):
+            _guard_reserved_labels(self.root, self.path,
+                                   ['update', 'pp-req.1', '--add-label',
+                                    'reviewed'], 'mallory')
+            _guard_reserved_labels(self.root, self.path,
+                                   ['create', 'child', '--parent', 'pp-req.1',
+                                    '--no-inherit-labels'], 'mallory')
+        rows = [{'id': 'pp-plain', 'labels': ['a']}]
+        with mock.patch.object(endpoint.subprocess, 'run', _rows_run(rows)):
+            _guard_reserved_labels(self.root, self.path,
+                                   ['update', 'pp-plain', '--set-labels', 'b'],
+                                   'mallory')
+
+    def test_guard_requirement_refusal_resolves_a_short_token(self):
+        rows = [{'id': 'pp-req.1', 'labels': ['requirement:accepted']}]
+        with mock.patch.object(endpoint.subprocess, 'run', _rows_run(rows)):
+            with self.assertRaises(ValueError) as caught:
+                _guard_reserved_labels(self.root, self.path,
+                                       ['update', 'req.1', '--set-labels',
+                                        'keep'], 'mallory')
+        self.assertIn('Refusing to replace labels on pp-req.1:',
+                      str(caught.exception))
+
     def test_guard_refuses_a_holder_reached_by_short_token(self):
         rows = [{'id': 'pp-3q2', 'labels': ['request:B', 'plain']}]
         with mock.patch.object(endpoint.subprocess, 'run', _rows_run(rows)):

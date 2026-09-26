@@ -58,24 +58,26 @@ def _guard_reserved_labels(root,path,args,actor):
     Refusing a reserved label *value* is not enough: bd copies parent labels
     onto `create --parent X` children, and `--set-labels`/`--remove-label`
     replace labels on an existing issue. Both are read first, under the lock
-    the mutation will hold, so a reserved label can neither reach a
-    contributor-created issue nor be removed from an operator-created holder.
+    the mutation will hold, so a reserved label (a coordination `request:`/
+    `request-content:` label, or a controlled requirement type/state label)
+    can neither reach a contributor-created issue nor be removed from an
+    operator-created holder.
     """
     request=label_guard_request(args)
     if request is None:return
     if request['ambiguous']:
-        raise ValueError('Refusing label-affecting request: the flags could not be resolved unambiguously, so the reserved request/request-content namespace cannot be verified; no native write was attempted. Pass one explicit target (and one --parent) with no unknown flags and a valid --no-inherit-labels value.')
+        raise ValueError('Refusing label-affecting request: the flags could not be resolved unambiguously, so the reserved request/request-content/requirement label namespace cannot be verified; no native write was attempted. Pass one explicit target (and one --parent) with no unknown flags and a valid --no-inherit-labels value.')
     if request['kind']=='inherit':
         canonical,labels=_native_labels(root,path,actor,request['target'])
         label=first_reserved_label(list(labels))
         if label is not None:
-            raise ValueError('Refusing create --parent %s: the parent currently holds the reserved label %s, and bd copies parent labels onto a new child unless --no-inherit-labels is given, which would make a second holder of the coordination namespace. Re-run with --no-inherit-labels, or use the coordination create-child workflow (coordination.py).'%(canonical,label))
+            raise ValueError('Refusing create --parent %s: the parent currently holds the reserved label %s, and bd copies parent labels onto a new child unless --no-inherit-labels is given, which would make a second holder of the coordination/requirement namespace (for example a child that inherits requirement:accepted without F3 acceptance evidence). Re-run with --no-inherit-labels, or use the coordination create-child workflow (coordination.py).'%(canonical,label))
         return
     for target in request['targets']:
         canonical,labels=_native_labels(root,path,actor,target)
         label=first_reserved_label(list(labels))
         if label is not None:
-            raise ValueError('Refusing to replace labels on %s: it currently holds the reserved label %s, which only coordination.py may write. Use the coordination workflow (coordination.py); --add-label remains available for ordinary labels.'%(canonical,label))
+            raise ValueError('Refusing to replace labels on %s: it currently holds the reserved label %s, which only coordination.py and requirement_records.py may write. Replacing or removing it would silently drop the coordination namespace or an operator acceptance; use the coordination workflow (coordination.py) or the requirement command (requirement_records.py draft|revise, admin.py requirement-apply); --add-label remains available for ordinary labels.'%(canonical,label))
 
 def execute(root,request):
     name=request['project'];path=project_dir(root,name)

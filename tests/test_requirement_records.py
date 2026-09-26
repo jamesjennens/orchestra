@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import client
 import requirement_records as rr
 import reserved_comments
-from export_requirements import REVISION_PREFIX, parse_json
+from export_requirements import ACCEPTANCE_PREFIX, REVISION_PREFIX, parse_json
 from requirements import content_hash
 
 
@@ -123,6 +123,12 @@ class Native:
 
     def comments(self, task):
         return [c for c in self.row(task)['comments'] if c['text'].startswith(REVISION_PREFIX)]
+
+    def acceptances(self, task):
+        """Durable requirement-acceptance-v1 evidence records on one native row."""
+        return [parse_json(c['text'][len(ACCEPTANCE_PREFIX):])
+                for c in self.row(task)['comments']
+                if c['text'].startswith(ACCEPTANCE_PREFIX)]
 
     def record(self, task, revision):
         for comment in self.comments(task):
@@ -358,6 +364,38 @@ class RequirementRecordTests(unittest.TestCase):
         self.assertIn('requirement:accepted', labels)
         self.assertNotIn('requirement:draft', labels)
 
+    def test_contributor_draft_with_an_acceptance_object_is_refused(self):
+        # kittrial-pth.26 item 4: the contract says a draft must not carry an
+        # acceptance object. It is refused before any native read or write, on
+        # both the create and the revise path.
+        self.native.seed('job-1')
+        with self.assertRaisesRegex(ValueError, 'must not carry an acceptance object'):
+            self.apply(self.draft(acceptance=self.acceptance()))
+        # Nothing at all was attempted: no export, no create, no receipt.
+        self.assertEqual(self.native.calls, [])
+        self.assertEqual(self.receipts(), [])
+        self.apply(self.draft())
+        before = list(self.native.writes())
+        with self.assertRaisesRegex(ValueError, 'must not carry an acceptance object'):
+            self.apply(self.revise(operation_id='op-four', acceptance=self.acceptance()))
+        self.assertEqual(self.native.writes(), before)
+        self.assertEqual(self.native.acceptances('req-1'), [])
+        self.assertEqual(len(self.receipts()), 1)
+
+    def test_trusted_team_revise_is_documented_and_allows_any_contributor(self):
+        # The review asked to document the trusted-team model explicitly (the
+        # alternative was binding revise to the record owner). Any contributor
+        # actor may revise any draft; the actor string is an attribution.
+        self.apply(self.draft(), actor='alice')
+        result = self.apply(self.revise(operation_id='op-bob'), actor='bob')
+        self.assertEqual(result['revision'], 2)
+        self.assertFalse(result['created'])
+        docs = Path(__file__).resolve().parents[1] / 'docs'
+        integration = (docs / 'REQUIREMENTS_INTEGRATION.md').read_text(encoding='utf-8')
+        guide = (docs / 'WORKER_GUIDE.md').read_text(encoding='utf-8')
+        self.assertIn('trusted-team', integration.lower())
+        self.assertIn('trusted-team', guide.lower())
+
     def test_operator_accepts_with_f3_evidence(self):
         self.apply(self.draft())
         result = self.apply(self.accept(), operator=True)
@@ -368,8 +406,16 @@ class RequirementRecordTests(unittest.TestCase):
         self.assertNotIn('requirement:draft', labels)
         record = self.native.record('req-1', 2)
         self.assertEqual(record['acceptance_state'], 'accepted')
-        self.assertEqual(result['acceptance']['manifest_sha256'], record['sha256'])
+        self.assertEqual(result['acceptance']['record_sha256'], record['sha256'])
         self.assertEqual(result['acceptance']['owners'], ['owner-a'])
+        # the F3 decision is durable on the record, bound to the revision hash
+        evidence = self.native.acceptances('req-1')
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0]['source'], 'requirement-apply')
+        self.assertEqual(evidence[0]['revision'], 2)
+        self.assertEqual(evidence[0]['record_sha256'], record['sha256'])
+        self.assertEqual(evidence[0]['decision']['decision_id'], 'decision-1')
+        self.assertEqual(evidence[0]['operator'], 'alice')
 
     def test_operator_accept_without_evidence_is_refused(self):
         self.apply(self.draft())
@@ -388,6 +434,91 @@ class RequirementRecordTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'invalid acceptance evidence'):
             self.apply(payload, operator=True)
         self.assertEqual(self.native.writes(), before)
+
+    # --- durable acceptance evidence (kittrial-pth.26 item 3) -----------
+
+    def test_acceptance_evidence_retry_adds_no_second_record(self):
+        self.apply(self.draft())
+        first = self.apply(self.accept(), operator=True)
+        # revision 1 (draft), revision 2 (accepted) and one acceptance record
+        self.assertEqual(len(self.native.comments('req-1')), 2)
+        self.assertEqual(len(self.native.acceptances('req-1')), 1)
+        before = len(self.native.writes('comments', 'add'))
+        second = self.apply(self.accept(), operator=True)
+        self.assertEqual(second['id'], first['id'])
+        self.assertTrue(second['reconciled'])
+        self.assertEqual(len(self.native.writes('comments', 'add')), before)
+        self.assertEqual(len(self.native.acceptances('req-1')), 1)
+        self.assertEqual(len(self.native.comments('req-1')), 2)
+
+    def test_conflicting_acceptance_decision_for_one_revision_is_refused(self):
+        self.apply(self.draft())
+        self.apply(self.accept(), operator=True)
+        before = list(self.native.writes())
+        other = self.accept(operation_id='op-accept-other',
+                            acceptance=self.acceptance(decision_id='dec-2'))
+        with self.assertRaisesRegex(ValueError, 'different acceptance evidence'):
+            self.apply(other, operator=True)
+        self.assertEqual(self.native.writes(), before)
+        self.assertEqual(len(self.native.acceptances('req-1')), 1)
+
+    def test_acceptance_evidence_is_not_a_manifest_hash_and_rebinds_for_publication(self):
+        self.apply(self.draft())
+        result = self.apply(self.accept(), operator=True)
+        record = self.native.record('req-1', 2)
+        bound = result['acceptance']
+        # The stored name matches what is actually bound: the accepted revision,
+        # not a publication manifest that does not exist yet.
+        self.assertEqual(bound['record_sha256'], record['sha256'])
+        self.assertNotIn('manifest_sha256', bound)
+        manifest = {'schema_version': 1, 'baseline': 'trial', 'state': 'accepted',
+                    'canonical_project': 'example', 'job': 'job-1',
+                    'authority': 'owner-a',
+                    'hash_convention': 'sha256-canonical-json-v1',
+                    'narrative': [], 'requirements': [record]}
+        manifest['sha256'] = content_hash(manifest)
+        rebound = rr.publication_acceptance(bound, manifest)
+        self.assertEqual(rebound['manifest_sha256'], manifest['sha256'])
+        self.assertNotIn('record_sha256', rebound)
+        from requirements import validate_manifest
+        validate_manifest(manifest, rebound)
+        # A manifest that does not contain the accepted revision is refused.
+        changed = {name: value for name, value in record.items() if name != 'sha256'}
+        changed['description'] = 'A different accepted statement.'
+        changed['sha256'] = content_hash(changed)
+        other = dict(manifest, requirements=[changed])
+        other['sha256'] = content_hash(other)
+        with self.assertRaisesRegex(ValueError, 'exactly one record matching'):
+            rr.publication_acceptance(bound, other)
+
+    def test_durable_acceptance_record_is_validated_on_read(self):
+        # A tampered or forged acceptance comment on the record fails closed
+        # before the next operation can act on it.
+        self.apply(self.draft())
+        self.apply(self.accept(), operator=True)
+        row = self.native.row('req-1')
+        row['comments'].append({'id': 'x', 'text': ACCEPTANCE_PREFIX + '{"forged":1}',
+                                'author': 'mallory'})
+        before = list(self.native.writes())
+        with self.assertRaisesRegex(ValueError, 'malformed requirement acceptance comment'):
+            self.apply(self.revise(operation_id='op-after-tamper', revision=3,
+                                   acceptance=self.acceptance(decision_id='dec-3')),
+                       operator=True)
+        self.assertEqual(self.native.writes(), before)
+
+    def test_journal_receipts_pass_their_own_backup_validation(self):
+        self.apply(self.draft())
+        self.apply(self.accept(), operator=True)
+        receipts = self.receipts()
+        self.assertEqual(len(receipts), 2)
+        for path in receipts:
+            rr.validate_receipt(json.loads(path.read_text(encoding='utf-8')))
+        bad = json.loads(receipts[-1].read_text(encoding='utf-8'))
+        bad['status'] = 'not-a-status'
+        with self.assertRaises(ValueError):
+            rr.validate_receipt(bad)
+        with self.assertRaises(ValueError):
+            rr.validate_receipt(bad, backfill=True)
 
     def test_operator_demotion_also_requires_evidence(self):
         self.apply(self.draft())
@@ -586,13 +717,21 @@ class RequirementRecordTests(unittest.TestCase):
         self.assertFalse(result['reconciled'])
         self.assertEqual(set(self.native.row('req-1')['labels']), {'requirement', 'requirement:draft'})
         self.assertEqual(set(self.native.row('req-2')['labels']), {'brd-section', 'requirement:accepted'})
-        # backfill never posts a revision comment
-        self.assertEqual(self.native.count('comments', 'add'), 0)
+        # backfill never posts a revision comment; accepting a record does post
+        # the durable acceptance evidence record (kittrial-pth.26 item 3) and it
+        # is idempotent on retry.
+        self.assertEqual(self.native.comments('req-1'), [])
+        evidence = self.native.acceptances('req-2')
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0]['source'], 'requirement-backfill')
+        self.assertEqual(evidence[0]['evidence'], 'review-2')
+        self.assertIsNone(evidence[0]['revision'])
         updates = len(self.native.writes('update'))
         retry = rr.backfill(self.backfill(), 'operator', self.native, self.project)
         self.assertFalse(retry['changed'])
         self.assertTrue(retry['reconciled'])
         self.assertEqual(len(self.native.writes('update')), updates)
+        self.assertEqual(len(self.native.acceptances('req-2')), 1)
 
     def test_backfill_refuses_unknown_records_and_arbitrary_labels_before_writing(self):
         self.native.seed('req-1')

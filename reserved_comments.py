@@ -11,15 +11,98 @@ This module is import-safe on all platforms (no fcntl). endpoint.py enforces
 it on the contributor `bd` path before any native mutation.
 """
 from briefing import PREFIX as CHECKPOINT_PREFIX
-from export_requirements import REVISION_PREFIX as REQUIREMENT_PREFIX
+from export_requirements import (ACCEPTANCE_PREFIX,
+                                 REVISION_PREFIX as REQUIREMENT_PREFIX)
 from handoff import (
     COMPLETE_PREFIX as HANDOFF_COMPLETE_PREFIX,
     INTENT_PREFIX as HANDOFF_PREFIX,
     parse_identity as parse_handoff_identity,
 )
 from lifecycle import PREFIX as LIFECYCLE_PREFIX
+from requirements import ACCEPTANCE_FIELDS, SHA256_TEXT
 from review_workflow import PREFIX as REVIEW_PREFIX
 from worker_gate import PREFIX as PLAN_PREFIX, parse_body as parse_plan_body
+
+
+# The caller-supplied half of the contract acceptance object. `manifest_sha256`
+# is bound by the command, never supplied: at record level the bound name is
+# `record_sha256` (the accepted revision's content hash), because the hash of a
+# whole publication manifest does not exist when a single record is accepted.
+ACCEPTANCE_DECISION_FIELDS = tuple(name for name in ACCEPTANCE_FIELDS
+                                   if name != 'manifest_sha256')
+ACCEPTANCE_SOURCES = ('requirement-apply', 'requirement-backfill')
+ACCEPTANCE_RECORD_FIELDS = ('schema_version', 'source', 'id', 'revision',
+                            'record_sha256', 'acceptance_state', 'decision',
+                            'evidence', 'operator', 'at', 'sha256')
+
+
+def parse_acceptance_record(body):
+    """Return the durable acceptance record iff it passes the full schema.
+
+    Mirror of parse_requirement_record for `Kind: requirement-acceptance-v1`:
+    exact canonical bytes, exact field set, a revision binding and a content
+    hash, plus the contract's own F3 owner/approver/policy validation for an
+    acceptance decision. Only a record the operator acceptance route could
+    produce passes, so the raw comment path cannot forge acceptance evidence.
+    """
+    if not isinstance(body, str) or not body.startswith(ACCEPTANCE_PREFIX):
+        return None
+    rest = body[len(ACCEPTANCE_PREFIX):]
+    try:
+        from export_requirements import parse_json
+        from requirements import canonical_bytes, content_hash
+        record = parse_json(rest)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(record, dict) or set(record) != set(ACCEPTANCE_RECORD_FIELDS):
+        return None
+    if type(record.get('schema_version')) is not int or record['schema_version'] != 1:
+        return None
+    if record.get('source') not in ACCEPTANCE_SOURCES:
+        return None
+    if not isinstance(record.get('id'), str) or not record['id'].strip():
+        return None
+    revision = record.get('revision')
+    digest = record.get('record_sha256')
+    if revision is not None and (isinstance(revision, bool)
+                                 or not isinstance(revision, int) or revision < 1):
+        return None
+    if digest is not None and (not isinstance(digest, str)
+                               or not SHA256_TEXT.match(digest)):
+        return None
+    if (revision is None) != (digest is None):
+        return None
+    if record.get('acceptance_state') not in ('draft', 'accepted'):
+        return None
+    if not isinstance(record.get('operator'), str) or not record['operator'].strip():
+        return None
+    if not isinstance(record.get('at'), str) or not record['at'].strip():
+        return None
+    if record['source'] == 'requirement-apply':
+        decision = record.get('decision')
+        if revision is None or record.get('evidence') is not None:
+            return None
+        if not isinstance(decision, dict) or set(decision) != set(ACCEPTANCE_DECISION_FIELDS):
+            return None
+        try:
+            from requirements import _validate_acceptance
+            _validate_acceptance(dict(decision, manifest_sha256=digest),
+                                 {'sha256': digest})
+        except (ValueError, TypeError):
+            return None
+    else:
+        if record.get('decision') is not None:
+            return None
+        if not isinstance(record.get('evidence'), str) or not record['evidence'].strip():
+            return None
+    try:
+        if content_hash(record) != record.get('sha256'):
+            return None
+        if canonical_bytes(record).decode() != rest:
+            return None
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return None
+    return record
 
 
 def parse_requirement_record(body):
@@ -82,6 +165,7 @@ RESERVED = (
     (CHECKPOINT_PREFIX, 'task checkpoint', 'checkpoint TASK --file checkpoint.json'),
     (LIFECYCLE_PREFIX, 'lifecycle evidence record', 'lifecycle.py record --file event.json'),
     (REQUIREMENT_PREFIX, 'requirement revision', 'requirement_records.py draft|revise'),
+    (ACCEPTANCE_PREFIX, 'requirement acceptance evidence', 'admin.py requirement-apply'),
     (HANDOFF_PREFIX, 'handoff intent', 'handoff TASK --file handoff.json'),
     (HANDOFF_COMPLETE_PREFIX, 'handoff completion', 'handoff TASK --file handoff.json'),
     (PLAN_PREFIX, 'worker plan registration', 'worker_gate.py register'),
@@ -555,6 +639,14 @@ def raw_file_flag_in_args(args):
 # (`update X --add-label requirement:accepted`) or flip its type label, so
 # `requirement:` joins the reserved prefixes and the two type labels are
 # reserved exactly.
+#
+# The same namespace feeds BOTH checks: the label-*value* check below and the
+# read-before-write guard (`first_reserved_label`, endpoint._guard_reserved_labels).
+# Extending it here therefore closes the two routes that do not name a reserved
+# value: `create --parent X` inheriting `requirement`/`requirement:accepted`
+# from a labelled parent (kittrial-pth.26 review P1), and `update X --set-labels`
+# replacing the labels of a record that currently holds them (review P2). One
+# guard, not a second parallel one.
 # ---------------------------------------------------------------------------
 
 RESERVED_LABEL_PREFIXES = ('request:', 'request-content:', 'requirement:')
@@ -625,18 +717,34 @@ def _label_values(args):
     return values
 
 
+def reserved_label(label):
+    """The label's own text when it sits in a reserved namespace, else None.
+
+    One predicate shared by the value check (`reserved_label_in_args`) and the
+    read-before-write guard (`first_reserved_label`), so a namespace extended
+    here is enforced on every route at once. `requirement`/`brd-section` are
+    reserved exactly; `requirement:draft`/`requirement:accepted` and the
+    request namespaces are reserved by prefix.
+    """
+    if not isinstance(label, str):
+        return None
+    if label in RESERVED_EXACT_LABELS:
+        return label
+    for prefix in RESERVED_LABEL_PREFIXES:
+        if label.startswith(prefix):
+            return label
+    return None
+
+
 def reserved_label_in_args(args):
     """First reserved-namespace label written by a create/update label flag."""
     if not isinstance(args, list):
         return None
     for value in _label_values(args):
         for part in value.split(','):
-            label = part.strip()
-            if label in RESERVED_EXACT_LABELS:
+            label = reserved_label(part.strip())
+            if label is not None:
                 return label
-            for prefix in RESERVED_LABEL_PREFIXES:
-                if label.startswith(prefix):
-                    return label
     return None
 
 
@@ -645,11 +753,9 @@ def first_reserved_label(labels):
     if not isinstance(labels, (list, tuple)):
         return None
     for label in labels:
-        if not isinstance(label, str):
-            continue
-        for prefix in RESERVED_LABEL_PREFIXES:
-            if label.startswith(prefix):
-                return label
+        found = reserved_label(label)
+        if found is not None:
+            return found
     return None
 
 
@@ -905,12 +1011,12 @@ def is_legitimate_writer(body, actor=None, task=None):
 
     worker_gate plan registrations written through their documented route carry
     exact canonical bytes bound to the requesting actor/task; those must pass.
-    Handoff and requirement records are never legitimate on the raw path: they
-    use structured operations whose authority (ownership, kind/key/state, F3
-    acceptance evidence) cannot be established from self-asserted comment
-    fields. Without actor/task context (pure helper use) only context-free
-    canonical validity is checked; the endpoint always supplies context and
-    fails closed on mismatch.
+    Handoff, requirement revision and requirement acceptance records are never
+    legitimate on the raw path: they use structured operations whose authority
+    (ownership, kind/key/state, F3 acceptance evidence) cannot be established
+    from self-asserted comment fields. Without actor/task context (pure helper
+    use) only context-free canonical validity is checked; the endpoint always
+    supplies context and fails closed on mismatch.
     """
     if not isinstance(body, str):
         return False
@@ -935,6 +1041,11 @@ def is_legitimate_writer(body, actor=None, task=None):
         # and F3 acceptance authority checked). Raw endpoint revision comments
         # are rejected unconditionally, even canonical ones: a canonical
         # accepted revision must not be postable by an arbitrary actor.
+        return False
+    if body.startswith(ACCEPTANCE_PREFIX):
+        # Durable F3 acceptance evidence is written only by the operator
+        # acceptance route (admin.py requirement-apply) bound to the exact
+        # revision hash; a self-asserted acceptance comment must never pass.
         return False
     return False
 

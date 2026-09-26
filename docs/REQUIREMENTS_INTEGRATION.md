@@ -92,7 +92,22 @@ python requirement_records.py revise --config client.json --project example --ac
   caller-supplied `labels` field is refused, and unrelated labels are untouched.
   The contributor guard also refuses raw `update --add-label requirement...` and
   raw `comments add` of any `requirement-revision-v1` body, so this operation is
-  the only writer.
+  the only writer. The same reserved-label guard refuses a raw
+  `create --parent X` whose parent holds a controlled requirement label (a child
+  cannot inherit `requirement:accepted` without F3 evidence) and any raw
+  `update X --set-labels/--remove-label` on a record that holds one, so a
+  replacement cannot silently drop the operator's acceptance. Pass
+  `--no-inherit-labels` when a raw child of a requirement record is genuinely
+  wanted.
+- The contributor path must not carry an `acceptance` object at all: a draft is
+  unaccepted by definition, so a contributor acceptance is refused before any
+  native read or write.
+- Revise follows the **trusted-team** model: any contributor actor may revise any
+  draft requirement record, and the actor string is an attribution, not an
+  authenticated owner identity. `revise` is bound to the record's kind and key,
+  not to the actor who first drafted it, so two contributors may co-edit one
+  draft through successive revisions; the revision comment history records who
+  wrote what.
 - Retrying the same `operation_id` with identical content reconciles without a
   second record, comment or label write; reusing it with different content is
   refused. A native `bd create --dry-run` preflight and the revision check run
@@ -106,8 +121,13 @@ python requirement_records.py revise --config client.json --project example --ac
 
 F3 requires named owners and recorded evidence for acceptance. Only the operator
 route may set `requirement:accepted`, or move an accepted record back to draft,
-and either transition carries an `acceptance` object. `manifest_sha256` is not
-caller-supplied: the command binds it to the exact revision it writes.
+and either transition carries an `acceptance` object. The content hash is not
+caller-supplied: the command binds it to the exact revision it writes, and the
+stored field is `record_sha256` (the accepted revision's content hash). It is
+deliberately not called `manifest_sha256`, because no publication manifest exists
+when a single record is accepted; `publish_brd` keeps that name for the
+manifest-level object, and `requirement_records.publication_acceptance` rebinds a
+record decision to a manifest when a BRD is published.
 
 ```json
 {"schema_version": 1, "operation_id": "session-1/req-1-r2", "kind": "requirement",
@@ -122,8 +142,28 @@ python admin.py --root /path/to/runtime requirement-apply \
   --project example --actor operator --file record.json
 ```
 
-Acceptance without evidence, a contributor acceptance attempt, and contributor
-demotion are all refused before any native write.
+Acceptance without evidence, a contributor acceptance attempt, a contributor
+acceptance object on a draft, and contributor demotion are all refused before any
+native write.
+
+The operator acceptance is **durable on the record**: beside the
+`requirement-revision-v1` comment the command writes one
+`Kind: requirement-acceptance-v1` record bound to that revision:
+
+```text
+Kind: requirement-acceptance-v1
+{"acceptance_state":"accepted","at":"...","decision":{"approvers":["owner-a"],
+ "decision_id":"decision-2026-09-25","evidence":"review 01a0d...",
+ "owners":["owner-a"],"policy":"any-owner"},"evidence":null,"id":"sample-job.7",
+ "operator":"operator","record_sha256":"<64 hex>","revision":2,"schema_version":1,
+ "sha256":"<64 hex>","source":"requirement-apply"}
+```
+
+Every reader of the native record can therefore see the acceptance decision
+without the local journal, and the coordination backup/restore sidecar now
+carries `.requirement-requests/` and `.requirement-backfills/` too. A retry with
+the same decision is idempotent; a different decision for the same revision is
+refused rather than silently rewriting the operator's evidence.
 
 ### Backfill labels on existing records (operator)
 
@@ -146,7 +186,10 @@ A record backfilled to `requirement:accepted` needs an `evidence` field
 (a nonempty decision/evidence pointer); a draft entry must not carry one. The
 command is idempotent: an identical repeated run reports `changed: false`.
 Unknown records, duplicate entries and caller-supplied labels are refused before
-any native write.
+any native write. Accepting by backfill also writes the durable
+`Kind: requirement-acceptance-v1` evidence record (with `source`
+`requirement-backfill`), bound to the record's latest revision when it has one,
+so the evidence is visible on the record and not only in `.requirement-backfills/`.
 
 ### Reconcile an uncertain requirement operation (operator)
 
@@ -158,7 +201,10 @@ python admin.py --root /path/to/runtime requirement-reconcile \
 
 `complete` requires the exact native record id and confirms it before the receipt
 is completed. `failed`/`released` is allowed only when the operator confirms no
-native record was created, so the operation ID can be resubmitted.
+native record was created, so the operation ID can be resubmitted. The
+`.requirement-requests/` and `.requirement-backfills/` journals are part of the
+native backup/restore sidecar (`admin.py backup`, `admin.py restore-new`), so a
+restored project keeps its pending operation IDs and F3 acceptance evidence.
 
 ## Require an acknowledged plan before launching
 

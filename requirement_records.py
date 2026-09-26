@@ -3,35 +3,50 @@
 One locked native operation creates or selects a requirement (or BRD narrative)
 record, applies only the controlled `requirement`/`brd-section` type label and
 the `requirement:draft`/`requirement:accepted` state label, and posts exactly
-one `Kind: requirement-revision-v1` comment. Labels are never caller-supplied:
-the operation derives them from the record kind and acceptance state, so an
-arbitrary label write is refused rather than silently rewritten.
+one `Kind: requirement-revision-v1` comment (plus, only on an operator
+acceptance or demotion, one `Kind: requirement-acceptance-v1` evidence record).
+Labels are never caller-supplied: the operation derives them from the record
+kind and acceptance state, so an arbitrary label write is refused rather than
+silently rewritten.
 
 Authority split (REQUIREMENTS_CONTRACT F3). The contributor route may only write
-*draft* revisions. Acceptance of a record and demotion of an accepted record back
-to draft are owner/operator-only and require F3 acceptance evidence: an
+*draft* revisions and must not carry an `acceptance` object at all: a draft is
+unaccepted by definition, so a contributor acceptance is refused before any
+native read or write. Acceptance of a record and demotion of an accepted record
+back to draft are owner/operator-only and require F3 acceptance evidence: an
 `acceptance` object naming owners/approvers plus a decision id and evidence. The
-operator route is `admin.py requirement-apply`.
+operator route is `admin.py requirement-apply`. An operator acceptance writes a
+durable `Kind: requirement-acceptance-v1` record on the native record, bound to
+the exact revision content hash (`record_sha256`), so the decision is visible to
+every reader and survives a restore; the publication-level `manifest_sha256`
+stays owned by `requirements.py`/`publish_brd.py`, and `publication_acceptance`
+rebinds a record decision to a manifest when a BRD is published.
 
 Selection is closed. `draft` with `task=` only accepts records already carrying
 the `requirement`/`brd-section` type label (or records this command created), and
 `revise` is bound to the record's existing kind and key: cross-kind changes and
-key swaps are refused before any native write.
+key swaps are refused before any native write. Revise follows the trusted-team
+model: any contributor actor may revise any draft (see
+docs/REQUIREMENTS_INTEGRATION.md); the actor string is an attribution, not an
+authenticated owner identity.
 
 Idempotency is native-first. A created record carries `request:<hash>` and
 `request-content:<hash>` labels (the create-child convention), and the revision
-comment itself is the per-revision anchor for selected records. A local receipt
-under `.requirement-requests/` is only a recovery cache: it is deliberately not
-part of the coordination backup, because the native record remains authoritative.
-A native `bd create --dry-run` preflight and the revision check run BEFORE any
-receipt is written, so a refusal reserves nothing; a receipt stays pending only
-for an uncertain real-write failure and can be completed from native state with
-`admin.py requirement-reconcile`.
+comment itself is the per-revision anchor for selected records. The local
+receipts under `.requirement-requests/` and `.requirement-backfills/` are the
+operator's recovery cache and are captured by the coordination backup/restore
+sidecar, while the native record (revision comment plus acceptance record)
+remains authoritative. A native `bd create --dry-run` preflight and the revision
+check run BEFORE any receipt is written, so a refusal reserves nothing; a receipt
+stays pending only for an uncertain real-write failure and can be completed from
+native state with `admin.py requirement-reconcile`.
 
 The operator-only `backfill` path applies the same controlled labels to existing
 records (for example records created through create-child that lack them) and
 never writes a revision comment. Backfilling a record to `requirement:accepted`
-requires an evidence field.
+requires an evidence field and also writes the durable
+`requirement-acceptance-v1` evidence record (bound to the latest revision when
+one exists).
 
 Payload schemas are closed. `schema_version` is the integer 1.
 """
@@ -41,9 +56,10 @@ import time
 from pathlib import Path
 
 from coordination import atomic, identifier
-from export_requirements import REVISION_PREFIX, parse_json, revision_comment
-from requirements import (ACCEPTANCE_FIELDS, canonical_bytes, content_hash,
-                          load_json)
+from export_requirements import (ACCEPTANCE_PREFIX, REVISION_PREFIX, parse_json,
+                                 revision_comment)
+from requirements import (ACCEPTANCE_FIELDS, SHA256_TEXT, canonical_bytes,
+                          content_hash, load_json)
 
 OPERATIONS = ('draft', 'revise')
 KIND_TYPE_LABEL = {'requirement': 'requirement', 'brd-section': 'brd-section'}
@@ -60,6 +76,7 @@ BACKFILL_RECORD_FIELDS = {'task', 'kind', 'acceptance_state', 'evidence'}
 JOURNAL = '.requirement-requests'
 BACKFILL_JOURNAL = '.requirement-backfills'
 RECONCILE_RELEASABLE = ('failed', 'released')
+RECEIPT_STATUSES = ('pending', 'complete', 'failed', 'released')
 
 
 def _refuse_injected_labels(payload, where='requirement payload'):
@@ -95,15 +112,17 @@ def _checked_fields(payload, allowed, where):
 def _validate_acceptance_shape(acceptance):
     """Structural check for caller-supplied F3 acceptance evidence.
 
-    `manifest_sha256` is not caller-supplied: the command binds the acceptance
-    object to the exact revision content hash it is about to write.
+    The content hash is not caller-supplied: the command binds the acceptance
+    object to the exact revision content hash it is about to write, stored as
+    `record_sha256` (not `manifest_sha256`, which names a whole publication
+    manifest and cannot exist when one record is accepted).
     """
     if not isinstance(acceptance, dict):
         raise ValueError('acceptance must be an object naming owners, approvers, policy, '
                          'decision_id and evidence')
     extra = sorted(set(acceptance) - set(ACCEPTANCE_EVIDENCE_FIELDS))
     if extra:
-        raise ValueError('acceptance has unknown field(s): %s (manifest_sha256 is bound by the command)'
+        raise ValueError('acceptance has unknown field(s): %s (record_sha256 is bound by the command)'
                          % ', '.join(extra))
     for name in ACCEPTANCE_EVIDENCE_FIELDS:
         if name not in acceptance:
@@ -111,15 +130,80 @@ def _validate_acceptance_shape(acceptance):
     return acceptance
 
 
-def bind_acceptance(acceptance, record):
-    """Bind F3 evidence to the exact revision content hash via the contract validator."""
-    full = dict(acceptance)
-    full['manifest_sha256'] = record['sha256']
+def bound_acceptance(acceptance):
+    """Validate one record-level F3 decision bound to a revision content hash."""
+    if not isinstance(acceptance, dict):
+        raise ValueError('invalid acceptance evidence: acceptance must be an object')
+    extra = sorted(set(acceptance) - set(ACCEPTANCE_EVIDENCE_FIELDS) - {'record_sha256'})
+    if extra:
+        raise ValueError('invalid acceptance evidence: unknown field(s) ' + ', '.join(extra))
+    digest = acceptance.get('record_sha256')
+    if not isinstance(digest, str) or not SHA256_TEXT.match(digest):
+        raise ValueError('invalid acceptance evidence: record_sha256 must be the accepted '
+                         'revision content hash')
+    for name in ACCEPTANCE_EVIDENCE_FIELDS:
+        if name not in acceptance:
+            raise ValueError('invalid acceptance evidence: missing field ' + name)
     from requirements import _validate_acceptance
+    full = {name: acceptance[name] for name in ACCEPTANCE_EVIDENCE_FIELDS}
+    full['manifest_sha256'] = digest
     try:
-        _validate_acceptance(full, record)
+        _validate_acceptance(full, {'sha256': digest})
     except ValueError as exc:
         raise ValueError('invalid acceptance evidence: %s' % exc) from None
+    return acceptance
+
+
+def bind_acceptance(acceptance, record):
+    """Bind F3 evidence to the exact revision content hash via the contract validator.
+
+    The contract validator checks owners/approvers/policy/decision/evidence and
+    that the bound hash matches the accepted content. The stored object names
+    the binding `record_sha256`, because the thing being accepted here is one
+    requirement revision, not a publication manifest. Use
+    `publication_acceptance` to rebind it to a manifest for `publish_brd`.
+    """
+    _validate_acceptance_shape(acceptance)
+    bound = dict(acceptance)
+    bound['record_sha256'] = record['sha256']
+    bound_acceptance(bound)
+    return bound
+
+
+def publication_acceptance(acceptance, manifest):
+    """Rebind a record-level acceptance to a validated manifest for publish_brd.
+
+    `requirements.validate_manifest` (and therefore `publish_brd`) consumes an
+    acceptance object whose `manifest_sha256` equals the manifest hash. The
+    record-level object stores `record_sha256` instead, so this bridge verifies
+    that the manifest really contains the accepted record at the accepted
+    revision/hash and returns the object the publisher's own validator accepts.
+    """
+    bound_acceptance(acceptance)
+    from requirements import _validate_record
+    if not isinstance(manifest, dict):
+        raise ValueError('manifest must be an object')
+    digest = acceptance['record_sha256']
+    matches = []
+    for group in ('narrative', 'requirements'):
+        for record in manifest.get(group) or []:
+            if not isinstance(record, dict):
+                continue
+            if record.get('sha256') == digest:
+                _validate_record(record, 'manifest.%s' % group, has_key='key' in record)
+                matches.append(record)
+    if len(matches) != 1:
+        raise ValueError('the manifest does not contain exactly one record matching the accepted '
+                         'revision hash %s' % digest)
+    full = {name: acceptance[name] for name in ACCEPTANCE_EVIDENCE_FIELDS}
+    full['manifest_sha256'] = manifest.get('sha256')
+    if not isinstance(full['manifest_sha256'], str):
+        raise ValueError('manifest has no sha256 to bind the acceptance to')
+    from requirements import _validate_acceptance
+    try:
+        _validate_acceptance(full, manifest)
+    except ValueError as exc:
+        raise ValueError('invalid publication acceptance: %s' % exc) from None
     return full
 
 
@@ -281,6 +365,108 @@ def latest_revision(existing):
     return existing[max(existing)] if existing else None
 
 
+def existing_acceptances(row):
+    """Validated durable acceptance ledger for one record; malformed fails closed.
+
+    Keyed by the bound revision (None for a backfill record with no revision
+    comment), so a retry recognises its own evidence and a second, different
+    decision for the same revision is refused rather than silently rewriting
+    the operator's acceptance.
+    """
+    from reserved_comments import parse_acceptance_record
+    found = {}
+    task = row.get('id')
+    for comment in row.get('comments') or []:
+        if not isinstance(comment, dict):
+            raise ValueError('malformed comment on requirement record ' + str(task))
+        text = comment.get('text')
+        if not isinstance(text, str) or not text.startswith(ACCEPTANCE_PREFIX):
+            continue
+        record = parse_acceptance_record(text)
+        if record is None:
+            raise ValueError('malformed requirement acceptance comment on ' + str(task))
+        if record.get('id') != task:
+            raise ValueError('requirement acceptance comment on %s belongs to another record' % (task,))
+        prior = found.get(record['revision'])
+        if prior is not None and prior != record:
+            raise ValueError('conflicting acceptance evidence for one revision on ' + str(task))
+        found[record['revision']] = record
+    return found
+
+
+def acceptance_evidence(bound, task, revision, acceptance_state, actor, at=None):
+    """The durable native acceptance record bound to one revision hash.
+
+    Returns (record, body). `at` defaults to now; pass it in when a single
+    operation writes more than one record so they share a timestamp.
+    """
+    if at is None:
+        at = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    decision = {name: bound[name] for name in ACCEPTANCE_EVIDENCE_FIELDS}
+    record = {'schema_version': 1, 'source': 'requirement-apply', 'id': task,
+              'revision': revision, 'record_sha256': bound['record_sha256'],
+              'acceptance_state': acceptance_state, 'decision': decision,
+              'evidence': None, 'operator': actor, 'at': at}
+    record['sha256'] = content_hash(record)
+    return record, _acceptance_body(record)
+
+
+def backfill_evidence(task, evidence, binding, actor, at=None):
+    """The durable native evidence record for one operator backfill acceptance."""
+    if at is None:
+        at = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    record = {'schema_version': 1, 'source': 'requirement-backfill', 'id': task,
+              'revision': binding['revision'] if binding else None,
+              'record_sha256': binding['sha256'] if binding else None,
+              'acceptance_state': 'accepted', 'decision': None,
+              'evidence': evidence, 'operator': actor, 'at': at}
+    record['sha256'] = content_hash(record)
+    return record, _acceptance_body(record)
+
+
+def _acceptance_body(record):
+    """Self-check a durable acceptance record before it is written natively."""
+    from reserved_comments import parse_acceptance_record
+    body = ACCEPTANCE_PREFIX + canonical_bytes(record).decode('utf-8')
+    if parse_acceptance_record(body) != record:
+        raise ValueError('Refusing to write acceptance evidence that does not pass its own schema')
+    return body
+
+
+def validate_receipt(record, backfill=False):
+    """Structural check for one requirement journal receipt (backup/restore path).
+
+    The journals are the operator's recovery cache; a backup must not carry a
+    malformed one, or a restore would resurrect an unreadable receipt.
+    """
+    if not isinstance(record, dict):
+        raise ValueError('Invalid requirement receipt')
+    digest = record.get('sha256')
+    if not isinstance(digest, str) or not SHA256_TEXT.match(digest):
+        raise ValueError('Invalid requirement receipt content hash')
+    if record.get('status') not in RECEIPT_STATUSES:
+        raise ValueError('Invalid requirement receipt status')
+    actor = record.get('actor')
+    if actor is not None and (not isinstance(actor, str) or not actor.strip()):
+        raise ValueError('Invalid requirement receipt actor')
+    if backfill:
+        records = record.get('records')
+        if not isinstance(records, list) or not records or any(
+                not isinstance(value, str) or not value.strip() for value in records):
+            raise ValueError('Invalid requirement backfill receipt records')
+    else:
+        issue = record.get('id')
+        if issue is not None and (not isinstance(issue, str) or not issue.strip()):
+            raise ValueError('Invalid requirement receipt record id')
+        revision = record.get('revision')
+        if revision is not None and (isinstance(revision, bool)
+                                     or not isinstance(revision, int) or revision < 1):
+            raise ValueError('Invalid requirement receipt revision')
+    if record.get('acceptance') is not None:
+        bound_acceptance(record['acceptance'])
+    return record
+
+
 def existing_kind(row):
     """The record's controlled type label, or None when it is untyped."""
     present = TYPE_LABELS & set(row.get('labels') or [])
@@ -399,11 +585,19 @@ def _check_acceptance(payload, existing, record, operator, row):
     """Enforce the contributor-drafts-only / operator-F3-evidence split.
 
     Returns the acceptance object bound to the new revision hash, or None.
+    A contributor never carries an acceptance object at all: the contract says
+    a draft must not have one, so it is refused rather than validated, bound and
+    echoed (kittrial-pth.26 review item 4).
     """
     target = payload['acceptance_state']
     current = _current_acceptance(row, existing)
     acceptance = payload.get('acceptance')
     if not operator:
+        if acceptance is not None:
+            raise ValueError('A contributor draft must not carry an acceptance object: drafts are '
+                             'unaccepted by definition, and only the owner/operator route '
+                             '(admin.py requirement-apply) may record F3 acceptance evidence. Remove '
+                             'the acceptance field and submit a draft revision.')
         if target == 'accepted':
             raise ValueError('Contributors may only draft requirement records; accepting a record is '
                              'owner/operator-only and requires F3 acceptance evidence (named owners plus '
@@ -417,7 +611,7 @@ def _check_acceptance(payload, existing, record, operator, row):
     if target == 'accepted' or current == 'accepted':
         raise ValueError('Accepting a requirement record or demoting an accepted record requires F3 acceptance '
                          'evidence: an `acceptance` object with owners, approvers, policy, decision_id and '
-                         'evidence (manifest_sha256 is bound to the revision by the command).')
+                         'evidence (record_sha256 is bound to the revision by the command).')
     return None
 
 
@@ -451,13 +645,23 @@ def apply_native(payload, actor, run, project, operator=False):
 
     `operator=True` is the owner/operator route (admin.py requirement-apply);
     only it may accept a record or demote an accepted record, and only with F3
-    acceptance evidence. The contributor route may only write draft revisions.
+    acceptance evidence. The contributor route may only write draft revisions
+    and must not carry an acceptance object. An operator acceptance writes a
+    durable `Kind: requirement-acceptance-v1` record bound to the exact
+    revision hash beside the revision comment, so the evidence survives a
+    restore and is visible to every other reader.
     """
     validate_payload(payload)
     if not operator and payload['acceptance_state'] == 'accepted':
         raise ValueError('Contributors may only draft requirement records; accepting a record is '
                          'owner/operator-only and requires F3 acceptance evidence. Use a draft revision, or ask '
                          'the operator to accept it with admin.py requirement-apply.')
+    if not operator and payload.get('acceptance') is not None:
+        # Fail closed BEFORE the journal directory or any native read/write, so
+        # a refused contributor acceptance reserves and writes nothing at all.
+        raise ValueError('A contributor draft must not carry an acceptance object: drafts are unaccepted '
+                         'by definition, and F3 acceptance evidence is owner/operator-only '
+                         '(admin.py requirement-apply).')
     revision = payload.get('revision', 1)
     identity = content_hash({'operation_id': payload['operation_id']})
     digest = content_hash({'actor': actor, 'payload': payload})
@@ -533,6 +737,24 @@ def apply_native(payload, actor, run, project, operator=False):
     require_bound_key(task, payload, existing)
     _check_revision(payload, revision, existing, record, task)
     bound = _check_acceptance(payload, existing, record, operator, row)
+    # Durable F3 acceptance evidence: a second reserved machine record bound to
+    # the revision hash. Planned before any write so a conflicting decision is
+    # refused with zero native writes, and skipped when this exact decision is
+    # already recorded, so an idempotent retry adds nothing.
+    evidence_body = None
+    if bound is not None:
+        evidence_record, candidate = acceptance_evidence(
+            bound, task, revision, payload['acceptance_state'], actor)
+        prior_evidence = existing_acceptances(row).get(revision)
+        if prior_evidence is not None:
+            if (prior_evidence.get('record_sha256') != evidence_record['record_sha256']
+                    or prior_evidence.get('decision') != evidence_record['decision']):
+                raise ValueError('Revision %d on %s already carries different acceptance evidence; '
+                                 'operator reconciliation required before the decision can be '
+                                 'rewritten.' % (revision, task))
+            evidence_body = None
+        else:
+            evidence_body = candidate
     if prior is None or prior.get('status') != 'complete' or created:
         # A pending receipt is written only immediately before a real native
         # write, so every refusal above reserves nothing.
@@ -544,10 +766,16 @@ def apply_native(payload, actor, run, project, operator=False):
         except (ValueError, OSError) as refusal:
             raise _uncertain(str(refusal), 'revision comment') from None
     apply_controlled_labels(run, task, row.get('labels') or [], payload['kind'], payload['acceptance_state'])
+    if evidence_body is not None:
+        try:
+            run(['comments', 'add', task, evidence_body, '--json'])
+        except (ValueError, OSError) as refusal:
+            raise _uncertain(str(refusal), 'acceptance evidence') from None
     complete = {'sha256': digest, 'status': 'complete', 'actor': actor, 'id': task,
                 'operation': payload['operation'], 'revision': revision}
     if bound is not None:
         complete['acceptance'] = bound
+        complete['acceptance_record'] = True
     atomic(receipt, complete)
     result = {'id': task, 'kind': payload['kind'], 'revision': revision,
               'acceptance_state': payload['acceptance_state'],
@@ -559,7 +787,13 @@ def apply_native(payload, actor, run, project, operator=False):
 
 
 def backfill(payload, actor, run, project):
-    """Operator-only: apply controlled labels to existing records, no revision comment."""
+    """Operator-only: apply controlled labels to existing records, no revision comment.
+
+    Backfilling a record to `requirement:accepted` also writes the durable
+    `requirement-acceptance-v1` evidence record (bound to the latest revision
+    when the record has one), so the operator's evidence is visible on the
+    record itself and survives a restore, not only in `.requirement-backfills`.
+    """
     validate_backfill(payload)
     identity = content_hash({'operation_id': payload['operation_id']})
     digest = content_hash({'actor': actor, 'payload': payload})
@@ -569,7 +803,8 @@ def backfill(payload, actor, run, project):
     if prior is not None and prior.get('sha256') != digest:
         raise ValueError('Operation ID already used for different content or actor')
     rows = read_rows(run)
-    plan, changed = [], False
+    at = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    plan, changed, evidence_writes = [], False, []
     for entry in payload['records']:
         row = find(rows, entry['task'])
         if row is None:
@@ -581,11 +816,30 @@ def backfill(payload, actor, run, project):
         if added or removed:
             changed = True
         plan.append({'task': entry['task'], 'added': added, 'removed': removed})
+        # Plan the durable evidence before any native write: a conflicting or
+        # malformed existing record fails closed with zero writes.
+        if entry['acceptance_state'] == 'accepted':
+            binding = latest_revision(existing_revisions(row))
+            record, body = backfill_evidence(entry['task'], entry['evidence'], binding, actor, at)
+            prior_evidence = existing_acceptances(row).get(record['revision'])
+            if prior_evidence is not None:
+                if prior_evidence.get('source') == 'requirement-apply':
+                    # A real operator F3 decision is already recorded for this
+                    # revision; the backfill leaves the stronger evidence alone.
+                    continue
+                if (prior_evidence.get('source') != 'requirement-backfill'
+                        or prior_evidence.get('evidence') != entry['evidence']):
+                    raise ValueError('Record %s already carries different acceptance evidence; '
+                                     'operator reconciliation required.' % entry['task'])
+                continue
+            evidence_writes.append((entry['task'], body))
     if changed:
         for entry in payload['records']:
             row = find(rows, entry['task'])
             apply_controlled_labels(run, entry['task'], row.get('labels') or [],
                                     entry['kind'], entry['acceptance_state'])
+    for task, body in evidence_writes:
+        run(['comments', 'add', task, body, '--json'])
     record = {'sha256': digest, 'status': 'complete', 'actor': actor,
               'records': [entry['task'] for entry in payload['records']]}
     evidence = {entry['task']: entry['evidence'] for entry in payload['records']

@@ -194,6 +194,60 @@ class ReservedPrefixTests(unittest.TestCase):
             check_comment_body(REQUIREMENT_PREFIX + '{"rev": 1}', 'positional')
         self.assertIsNotNone(reserved_match(body))
 
+    def test_requirement_acceptance_record_is_reserved_and_validated(self):
+        # kittrial-pth.26 item 3: the durable F3 acceptance evidence is its own
+        # reserved machine record. Only the operator acceptance route may write
+        # it; a self-asserted or tampered body never passes.
+        import copy
+        from export_requirements import ACCEPTANCE_PREFIX
+        from reserved_comments import parse_acceptance_record
+        decision = {'decision_id': 'dec-1', 'owners': ['owner-a'],
+                    'approvers': ['owner-a'], 'policy': 'any-owner',
+                    'evidence': 'review-1'}
+        record = {'schema_version': 1, 'source': 'requirement-apply',
+                  'id': 'trial-task', 'revision': 2, 'record_sha256': 'd' * 64,
+                  'acceptance_state': 'accepted', 'decision': decision,
+                  'evidence': None, 'operator': 'operator',
+                  'at': '2026-09-26T00:00:00Z'}
+        record['sha256'] = content_hash(record)
+        body = ACCEPTANCE_PREFIX + canonical_bytes(record).decode('utf-8')
+        self.assertTrue(body.startswith(ACCEPTANCE_PREFIX))
+        self.assertEqual(parse_acceptance_record(body), record)
+        self.assertFalse(is_legitimate_writer(body, actor='operator', task='trial-task'))
+        for target in ('trial-task', 'other-task'):
+            with self.subTest(target=target):
+                with self.assertRaisesRegex(ValueError, r'Refusing raw'):
+                    check_raw_request(['comments', 'add', target, body, '--json'], {})
+        self.assertIsNotNone(reserved_match(body))
+        # A backfill acceptance record carries evidence, not a fake F3 decision.
+        backfill = {'schema_version': 1, 'source': 'requirement-backfill',
+                    'id': 'trial-task', 'revision': None, 'record_sha256': None,
+                    'acceptance_state': 'accepted', 'decision': None,
+                    'evidence': 'decision-bf', 'operator': 'operator',
+                    'at': '2026-09-26T00:00:00Z'}
+        backfill['sha256'] = content_hash(backfill)
+        backfill_body = ACCEPTANCE_PREFIX + canonical_bytes(backfill).decode('utf-8')
+        self.assertEqual(parse_acceptance_record(backfill_body), backfill)
+        # Tampering or schema drift fails closed.
+        cases = []
+        for name, value in (('revision', 3), ('record_sha256', 'e' * 64),
+                            ('decision', dict(decision, owners=[])),
+                            ('source', 'raw'), ('operator', '')):
+            bad = copy.deepcopy(record)
+            bad[name] = value
+            cases.append(bad)
+        unhashed = copy.deepcopy(record)
+        del unhashed['sha256']
+        cases.append(unhashed)
+        for bad in cases:
+            with self.subTest(bad=sorted(bad)):
+                self.assertIsNone(parse_acceptance_record(
+                    ACCEPTANCE_PREFIX + canonical_bytes(bad).decode('utf-8')))
+        # Non-canonical bytes and the wrong prefix are refused too.
+        self.assertIsNone(parse_acceptance_record(ACCEPTANCE_PREFIX + ' {"a": 1}'))
+        self.assertIsNone(parse_acceptance_record(REQUIREMENT_PREFIX + '{}'))
+        self.assertIsNone(parse_acceptance_record(body + ' '))
+
     def test_rejected_write_leaves_no_native_record(self):
         # Endpoint-level wiring: rejected bodies raise before the native
         # mutation. Simulate endpoint.execute's bd path: guard first, then
@@ -568,6 +622,36 @@ class ReservedLabelNamespaceTests(unittest.TestCase):
         for args in cases:
             with self.subTest(args=str(args)):
                 self.assertIsNotNone(reserved_label_in_args(args))
+
+    def test_first_reserved_label_covers_the_requirement_namespace(self):
+        # kittrial-pth.26 items 1/2: the SAME guard used by endpoint for
+        # inheritance/replacement must see the controlled requirement labels,
+        # not only request:/request-content:. One guard, extended.
+        self.assertEqual(first_reserved_label(['requirement']), 'requirement')
+        self.assertEqual(first_reserved_label(['brd-section']), 'brd-section')
+        self.assertEqual(first_reserved_label(['requirement:draft']), 'requirement:draft')
+        self.assertEqual(first_reserved_label(['triage', 'requirement:accepted']),
+                         'requirement:accepted')
+        self.assertEqual(first_reserved_label(['request:' + 'a' * 64]),
+                         'request:' + 'a' * 64)
+        self.assertIsNone(first_reserved_label(['backend', 'reviewed']))
+        self.assertIsNone(first_reserved_label(['requirements', 'requirement-ish']))
+        self.assertIsNone(first_reserved_label([]))
+        self.assertIsNone(first_reserved_label(None))
+        self.assertIsNone(first_reserved_label([1, None]))
+
+    def test_label_guard_request_covers_inheritance_and_replacement(self):
+        self.assertEqual(label_guard_request(
+            ['create', 'child', '--parent', 'req-1']),
+            {'kind': 'inherit', 'target': 'req-1', 'ambiguous': False})
+        self.assertIsNone(label_guard_request(
+            ['create', 'child', '--parent', 'req-1', '--no-inherit-labels']))
+        self.assertEqual(label_guard_request(
+            ['update', 'req-1', '--set-labels', 'keep']),
+            {'kind': 'replace', 'targets': ['req-1'], 'ambiguous': False})
+        self.assertEqual(label_guard_request(
+            ['update', 'req-1', '--remove-label', 'requirement']),
+            {'kind': 'replace', 'targets': ['req-1'], 'ambiguous': False})
 
     def test_ordinary_labels_and_read_filters_still_work(self):
         self.assertIsNone(reserved_label_in_args(
