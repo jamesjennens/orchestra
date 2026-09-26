@@ -485,7 +485,7 @@ class EndpointBackend:
 
     # -- transport -------------------------------------------------------------
     def _endpoint(self, action, project, actor, args, attachments=None, operation_id=None,
-                  authority=None, require_authority=False):
+                  authority=None, require_authority=False, route=None):
         if self.runner is not None:
             return self.runner(action=action, project=project, actor=actor, args=args,
                                attachments=attachments or {}, operation_id=operation_id,
@@ -502,6 +502,10 @@ class EndpointBackend:
             payload['operation_id'] = operation_id
         if authority:
             payload['authority'] = authority
+        # The HTTP route is recorded on the journal row (``operations.route``) and is
+        # part of the operation hash, so the identity is bound to the route as well.
+        if route and operation_id:
+            payload['route'] = route
         argv = [self.python, self.endpoint, '--root', self.root,
                 '--authority-store', self.authority_store,
                 '--authority-lock', self.authority_lock]
@@ -521,10 +525,10 @@ class EndpointBackend:
             raise uncertain('Canonical endpoint returned an invalid response')
 
     def _run(self, action, project, actor, args, attachments=None, operation_id=None,
-             authority=None, require_authority=False):
+             authority=None, require_authority=False, route=None):
         reply = self._endpoint(action, project, actor, args, attachments,
                                operation_id=operation_id, authority=authority,
-                               require_authority=require_authority)
+                               require_authority=require_authority, route=route)
         code = reply.get('returncode') if isinstance(reply, dict) else None
         stderr = (reply.get('stderr') or '') if isinstance(reply, dict) else ''
         stdout = (reply.get('stdout') or '') if isinstance(reply, dict) else ''
@@ -573,7 +577,8 @@ class EndpointBackend:
         try:
             result = self._run(action, project, payload.get('actor') or self._actor(principal),
                                args, attachments, operation_id=operation_id,
-                               authority=authority, require_authority=capability is not None)
+                               authority=authority, require_authority=capability is not None,
+                               route=route)
         except HttpError as failure:
             # The endpoint reported an uncertain outcome (124 or an unclassified
             # failure) for a mutation whose identity it still reserves. Preserve that

@@ -250,21 +250,34 @@ def _copy_sqlite(source,destination):
     finally:
         from_connection.close()
 
+#: Tables a journal snapshot must contain to be restorable.
+JOURNAL_REQUIRED_TABLES=('operations','meta')
+
 def _check_journal_database(path):
+    """Refuse a journal snapshot that is not a sound operation-journal database.
+
+    Opens the snapshot read-only and runs ``PRAGMA quick_check`` plus a schema check
+    (the required tables), so a truncated or corrupt snapshot is refused before
+    anything is created or replaced.
+    """
     try:
         connection=sqlite3.connect('file:%s?mode=ro'%Path(path).as_posix(),uri=True)
     except sqlite3.Error as error:
         raise ValueError('Journal snapshot is not a readable SQLite database: %s'%error) from None
     try:
         try:
+            check=[row[0] for row in connection.execute('PRAGMA quick_check')]
             tables={row[0] for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'")}
         except sqlite3.DatabaseError as error:
             raise ValueError('Journal snapshot is not a readable SQLite database: %s'%error) from None
     finally:
         connection.close()
-    if 'operations' not in tables:
-        raise ValueError('Journal snapshot does not contain the operation-journal schema')
+    if check!=['ok']:
+        raise ValueError('Journal snapshot failed PRAGMA quick_check: %s'%'; '.join(map(str,check[:3])))
+    missing=[name for name in JOURNAL_REQUIRED_TABLES if name not in tables]
+    if missing:
+        raise ValueError('Journal snapshot does not contain the operation-journal schema (missing %s)'%', '.join(missing))
 
 def _atomic_write_bytes(path,content):
     fd,temporary=tempfile.mkstemp(prefix=path.name+'.',suffix='.restore',dir=str(path.parent))
@@ -411,7 +424,7 @@ def main():
     a.add_argument('--prune-before',type=float,default=None,
                    help='hard-remove identities last touched before this epoch second (after reconciling)')
     a.add_argument('--reset-high-water',action='store_true',dest='reset_high_water',
-                   help='accept the current clock as the high-water mark after a genuine clock correction')
+                   help='set the high-water mark to the current clock and clear clock suspicion (after a clock correction)')
     a.add_argument('--stats',action='store_true',
                    help='report the journal size (rows by state, bytes on disk, bounds); this is the default inspection')
     args=p.parse_args();root=root_path(args.root)
@@ -471,16 +484,17 @@ def main():
         print(json.dumps(report,sort_keys=True))
         if not args.reclaim_expired and args.prune_before is None and not args.reset_high_water:
             print('Size report (the default inspection; --stats is the same). Retention is by TIME ONLY: a '
-                  'committed receipt is never compacted while its own replay window is open, and the byte '
-                  'budget (limit_bytes) and tombstone bound (tombstone_limit) are reported '
-                  '(over_bytes/over_tombstones), never enforced by eviction. Tombstones never block a write; '
-                  'the only refusal is the live-identity count (limit) genuinely being reached, which fails '
+                  'committed receipt is never compacted while its own replay window is open; the byte '
+                  'budget (limit_bytes) and the advisory tombstone size (tombstone_limit) are reported '
+                  '(over_bytes/over_tombstones), never enforced by eviction, and never block a write. '
+                  'The only refusal is the live-identity count (limit) genuinely being reached, which fails '
                   'closed with rc=124. Use --reclaim-expired to compact closed receipt windows now, or '
                   '--prune-before EPOCH to hard-remove a still-live identity after reconciling canonical '
                   'state (an exact retry of a pruned identity can repeat its effect; a reclaimed one is '
-                  'refused as expired). Use --reset-high-water only to accept a corrected clock after a real '
-                  'time jump; reclaim, compaction and expiry stay refused while the clock is more than the '
-                  'skew allowance ahead of the persisted mark.',
+                  'refused as expired). Clock: a step of more than 24 h since the last write makes the '
+                  'journal suspect (suspect/anchor/suspect_since) for one hour; expiry is then capped at '
+                  'anchor+24h and reclaim waits, and suspicion clears by itself. --reset-high-water sets '
+                  'high_water to now and clears suspicion (use it after correcting a wrong clock).',
                   file=__import__('sys').stderr)
     elif args.command=='restore-new':
         validate_name(args.project);validate_name(args.destination)
@@ -489,10 +503,15 @@ def main():
         if args.project==args.destination:raise ValueError('Restore requires a different destination')
         with backup_lock(root,args.project):
             coordination_backup(root,args.project)
+            # Validate the journal snapshot BEFORE creating anything: a corrupt snapshot
+            # must fail the restore with no destination project, Dolt restore or
+            # coordination files left behind.
+            snapshot=journal_snapshot_path(root,args.project)
+            if snapshot.is_file():_check_journal_database(snapshot)
             add_project(root,args.destination)
             print(run_bd(root,args.destination,['backup','restore',str(backup),'--force']))
             restore_coordination(root,args.project,args.destination)
-            restored=restore_journal(journal_snapshot_path(root,args.project),
+            restored=restore_journal(snapshot,
                                      project_dir(root,args.destination)/JOURNAL_STORE_NAME)
             if restored is None:
                 print('Backup has no operation-journal snapshot; the restored project starts with an empty identity journal.')

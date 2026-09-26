@@ -34,9 +34,11 @@ from both sides of the process seam:
   retention is a **time-only**, tombstoned receipt policy: a committed receipt is
   replayable for its whole window and is compacted to a durable tombstone only once
   that window has genuinely closed, an uncertain reservation stays live (and fails
-  closed) for the long window, and a clock jump larger than the skew allowance is not
-  accepted — reclaim, compaction and the read-path expiry decision all use the same
-  trusted clock. Neither the byte budget nor the tombstone budget can evict a live
+  closed) for the long window. Expiry and replay decisions use a *trusted* clock that
+  holds a sudden forward step for :data:`JOURNAL_SUSPECT_SETTLE_SECONDS` before
+  accepting it (see "Trusted clock" below); rows are stamped with the raw clock and
+  reclaim/compaction run only while the clock is not suspect. Neither the byte budget
+  nor the tombstone count can evict a live
   identity: the size is *reported* by :meth:`OperationJournal.stats` (and
   ``admin.py journal``) instead. Reclaim never *drops* an identity: the store is a
   SQLite database with one indexed row per identity, and an oversized response is kept
@@ -44,6 +46,45 @@ from both sides of the process seam:
   when the journal genuinely cannot hold one more live identity the mutation fails
   closed (``124``, :class:`JournalFull`) with the pre-existing store untouched, so an
   exact retry is refused as expired rather than re-executed.
+
+Trusted clock
+-------------
+Each store persists four values in its ``meta`` table: ``high_water`` (the largest raw
+clock ever observed by a write; it never decreases), ``suspect`` (bool), ``anchor`` (the
+``high_water`` at the moment suspicion began) and ``suspect_since`` (the raw clock when
+suspicion began). Every write transaction observes the raw clock ``now``
+(:func:`clock_advance`):
+
+* ``high_water`` unset: ``high_water = now``, not suspect.
+* ``now - high_water > JOURNAL_MAX_SKEW_SECONDS`` (a step of more than 24 h): the store
+  becomes suspect. The first such step records ``anchor = high_water``; a further big
+  step restarts ``suspect_since`` but keeps the original anchor.
+* otherwise, a suspect store whose clock has run for
+  :data:`JOURNAL_SUSPECT_SETTLE_SECONDS` (1 h) since the step is cleared: the step is
+  accepted as real time.
+* always ``high_water = max(high_water, now)``. A backward step is never suspect.
+
+``trusted_now`` is ``now`` when not suspect and ``min(now, anchor + max_skew)`` while
+suspect (:func:`clock_trusted`). It is used for every expiry and replay-window decision,
+on the read path (evaluated against the transition the next write would make, so a read
+before the first write after a jump is already protected) and on the write path, and by
+``http_auth.RecordStore`` too. Rows are stamped with the RAW clock: a future stamp left
+by a later-corrected jump only lengthens that row's retention. Reclaim (committed ->
+tombstone after the replay window, uncertain -> tombstone after the long window) and
+tombstone deletion (after the tombstone horizon) run only while the store is not
+suspect, and use the raw clock.
+
+Effect: after an idle weekend the first write is suspect for one hour (expiry is
+evaluated at ``anchor + 24 h``, so a receipt older than that may still replay instead
+of being refused - harmless), then normal operation resumes with no operator action. A
+genuine forward jump is held for an hour. **Residual risk:** a jump that persists for
+longer than the settle period is accepted, so receipts still inside their window may
+then be compacted to tombstones and an exact retry is refused as expired; a retry is
+never re-executed. A jump that is corrected leaves ``high_water`` in the future, so a
+later repeat of the same jump would not be detected again and the store stays suspect
+until the raw clock passes the jumped time plus the settle period; after correcting a
+clock run ``admin.py journal PROJECT --reset-high-water`` (``high_water = now``, clears
+suspicion) to re-arm detection.
 
 Nothing here imports ``fcntl`` at module import time, so the same module imports on a
 Windows workstation and a Linux office host.
@@ -81,19 +122,20 @@ JOURNAL_COMMITTED_RETENTION_SECONDS = 24 * 60 * 60
 #: refusing a retry of a reclaimed identity. A tombstone is the durable replacement
 #: for "the record was dropped", so reclaim never turns a duplicate into a new effect.
 JOURNAL_TOMBSTONE_SECONDS = 30 * 24 * 60 * 60
-#: Count bound for the compact tombstone set. It is a *reported* backstop: a still-live
-#: tombstone is NEVER dropped to honour it (dropping one is exactly what let an exact
-#: retry re-execute), and reaching it never blocks a write — reclaim simply stops and
-#: leaves the remaining closed-window records in place, where an exact retry is still
-#: refused as expired. ``--prune-before`` remains the explicit operator override.
+#: Advisory size for the compact tombstone set. It is *reported only*
+#: (``stats()['over_tombstones']``): it never stops reclaim, never drops a tombstone and
+#: never blocks a write. Tombstone retention is by time alone
+#: (:data:`JOURNAL_TOMBSTONE_SECONDS`); ``--prune-before`` is the explicit operator
+#: override.
 JOURNAL_TOMBSTONE_LIMIT = 100000
-#: A wall-clock jump larger than this is treated as implausible: reclaim, compaction and
-#: the read-path expiry decision refuse to act while ``now`` is this far ahead of the
-#: persisted non-decreasing high-water mark, so a forward clock jump can neither reclaim
-#: nor expire a live identity. The mark is never *ratcheted* toward such a clock: it
-#: advances only when the clock is within this tolerance, and ``reset_high_water()`` is
-#: the explicit operator recovery for a genuine correction.
+#: A raw-clock step larger than this since the last write (``now - high_water``) makes
+#: the store *suspect* (see "Trusted clock" in the module docstring). While suspect the
+#: trusted clock is capped at ``anchor + JOURNAL_MAX_SKEW_SECONDS`` and reclaim and
+#: tombstone deletion do not run.
 JOURNAL_MAX_SKEW_SECONDS = 24 * 60 * 60
+#: How long the raw clock must keep running after a suspect step before the step is
+#: accepted and suspicion clears on the next write.
+JOURNAL_SUSPECT_SETTLE_SECONDS = 60 * 60
 #: Largest serialized response envelope retained for replay. A larger envelope is
 #: recorded by digest only, so a retry reports uncertainty instead of a truncated
 #: result.
@@ -107,8 +149,11 @@ MAX_JOURNAL_BYTES = 8 * 1024 * 1024
 #: On-disk schema of the journal store. The live store is a SQLite database
 #: (:data:`JOURNAL_FILENAME`); a legacy JSON document (:data:`LEGACY_JOURNAL_FILENAME`)
 #: is read transparently and imported in the same transaction that creates the schema,
-#: guarded by the persisted ``legacy_migrated`` marker.
-JOURNAL_SCHEMA = 4
+#: guarded by the persisted ``legacy_migrated`` marker. Schema 5 adds the persisted
+#: trusted-clock state and the ``(state, reclaimed_at)`` index; an older store is
+#: upgraded (columns, backfill, index, clock state) in one transaction on first open,
+#: and an up-to-date store runs no DDL or backfill on open.
+JOURNAL_SCHEMA = 5
 #: The live operation-journal store, one SQLite database per project directory.
 JOURNAL_FILENAME = '.http-operations.sqlite3'
 #: The pre-revision-7 JSON journal document, kept only as a one-time migration source.
@@ -118,6 +163,88 @@ LEGACY_JOURNAL_FILENAME = '.http-operations.json'
 def journal_path(project_dir):
     """The live operation-journal store for one project directory."""
     return Path(project_dir) / JOURNAL_FILENAME
+
+
+# --------------------------------------------------------------- trusted clock
+#: The ``meta`` keys of the persisted trusted-clock state.
+CLOCK_KEYS = ('high_water', 'suspect', 'anchor', 'suspect_since')
+
+
+def _float_or_none(value):
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def clock_state(connection):
+    """Read the persisted trusted-clock state from a store's ``meta`` table."""
+    values = {}
+    for row in connection.execute(
+            'SELECT key, value FROM meta WHERE key IN (?, ?, ?, ?)', CLOCK_KEYS):
+        values[row[0]] = row[1]
+    high = _float_or_none(values.get('high_water'))
+    suspect = _float_or_none(values.get('suspect'))
+    return {'high_water': high if high is not None and high > 0 else None,
+            'suspect': bool(suspect),
+            'anchor': _float_or_none(values.get('anchor')),
+            'suspect_since': _float_or_none(values.get('suspect_since'))}
+
+
+def clock_advance(state, now, max_skew=JOURNAL_MAX_SKEW_SECONDS,
+                  settle=JOURNAL_SUSPECT_SETTLE_SECONDS):
+    """The trusted-clock state after a write observes the raw clock ``now``.
+
+    Pure function (see "Trusted clock" in the module docstring): the write path persists
+    the result with :func:`clock_persist`; the read path evaluates it without persisting,
+    so a read that precedes the first write after a jump is already protected.
+    """
+    now = float(now)
+    high = state.get('high_water')
+    suspect = bool(state.get('suspect'))
+    anchor = state.get('anchor')
+    since = state.get('suspect_since')
+    if high is None:
+        return {'high_water': now, 'suspect': False, 'anchor': None, 'suspect_since': None}
+    if now - high > max_skew:
+        if not suspect or anchor is None:
+            anchor = high
+        suspect = True
+        since = now
+    elif suspect and since is not None and now - since >= settle:
+        suspect, anchor, since = False, None, None
+    return {'high_water': max(high, now), 'suspect': suspect,
+            'anchor': anchor if suspect else None,
+            'suspect_since': since if suspect else None}
+
+
+def clock_trusted(state, now, max_skew=JOURNAL_MAX_SKEW_SECONDS):
+    """``now`` when not suspect; ``min(now, anchor + max_skew)`` while suspect."""
+    if state.get('suspect') and state.get('anchor') is not None:
+        return min(float(now), float(state['anchor']) + max_skew)
+    return float(now)
+
+
+def clock_persist(connection, state):
+    """Write the trusted-clock state inside the caller's open transaction."""
+    for key in CLOCK_KEYS:
+        value = state.get(key)
+        if key == 'suspect':
+            value = 1 if value else 0
+        if value is None:
+            connection.execute('DELETE FROM meta WHERE key = ?', (key,))
+        else:
+            connection.execute('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)',
+                               (key, value))
+
+
+def clock_report(state):
+    """The operator-visible clock fields (``stats()``/``admin.py journal``)."""
+    return {'high_water': state.get('high_water') or 0.0,
+            'suspect': bool(state.get('suspect')),
+            'anchor': state.get('anchor'),
+            'suspect_since': state.get('suspect_since'),
+            'clock_skewed': bool(state.get('suspect'))}
 
 # --------------------------------------------------------------- capability model
 CAP_READ = 'read'
@@ -521,7 +648,7 @@ class OperationJournal:
     * **Retention is by time only.** A committed receipt is never compacted, deleted or
       otherwise evicted while its replay window is open, whatever the byte or tombstone
       count is; only a genuinely closed window is compacted. The byte budget
-      (:data:`MAX_JOURNAL_BYTES`) and the tombstone bound
+      (:data:`MAX_JOURNAL_BYTES`) and the advisory tombstone size
       (:data:`JOURNAL_TOMBSTONE_LIMIT`) are *reported* by :meth:`stats` — they never
       drive eviction and never block a write.
     * The only admission bound is the live-identity count (``limit``). A journal whose
@@ -529,18 +656,15 @@ class OperationJournal:
       (``124``), which rolls back so the pre-existing store is untouched and no effect
       has run. Accumulated tombstones can never cause that refusal.
     * **No live identity is ever lost to a budget.** A tombstone is removed only when
-      ``reclaimed_at + tombstone_seconds`` has genuinely passed against the trusted
-      clock. When the tombstone bound prevents compaction, the closed-window record
-      stays in place and is still refused as expired.
-    * The persisted ``high_water`` mark never decreases and is never ratcheted toward
-      a jumped-forward clock: while the clock is more than
-      :data:`JOURNAL_MAX_SKEW_SECONDS` ahead of it the mark is left unchanged, so
-      reclaim, compaction and expiry stay refused and no live identity is dropped.
-      :meth:`reset_high_water` is the explicit operator recovery for a genuine clock
-      correction.
-    * :meth:`trusted_now` is the ONE clock every write and every replay/expiry decision
-      uses, so a +8 day jump neither stamps a future ``at`` nor expires a live receipt
-      before the correction is accepted.
+      ``reclaimed_at + tombstone_seconds`` has passed, and only while the clock is not
+      suspect. The tombstone count never gates compaction.
+    * **Trusted clock** (module docstring): ``meta`` holds ``high_water`` (largest raw
+      clock seen by a write), ``suspect``, ``anchor`` and ``suspect_since``. A step of
+      more than :data:`JOURNAL_MAX_SKEW_SECONDS` makes the store suspect for
+      :data:`JOURNAL_SUSPECT_SETTLE_SECONDS`; :meth:`trusted_now` (``now``, or
+      ``min(now, anchor + max_skew)`` while suspect) decides every replay/expiry
+      question, rows are stamped with the raw clock, and reclaim/tombstone deletion run
+      only while not suspect. :meth:`reset_high_water` is the operator recovery.
     * Operator overrides are :meth:`reclaim_expired` (compact closed windows) and
       :meth:`prune` (hard-remove still-live identities after reconciling; the one
       action that can let an exact retry repeat).
@@ -566,7 +690,8 @@ class OperationJournal:
                  committed_retention=JOURNAL_COMMITTED_RETENTION_SECONDS,
                  tombstone_seconds=JOURNAL_TOMBSTONE_SECONDS,
                  tombstone_limit=JOURNAL_TOMBSTONE_LIMIT,
-                 max_skew=JOURNAL_MAX_SKEW_SECONDS, legacy_path=None):
+                 max_skew=JOURNAL_MAX_SKEW_SECONDS,
+                 settle=JOURNAL_SUSPECT_SETTLE_SECONDS, legacy_path=None):
         requested = Path(path)
         if legacy_path is None and requested.suffix == '.json':
             self.legacy_path = requested
@@ -584,6 +709,7 @@ class OperationJournal:
         self.tombstone_seconds = tombstone_seconds
         self.tombstone_limit = tombstone_limit
         self.max_skew = max_skew
+        self.settle = settle
         self._ready = False
         #: The connection of the creation transaction while ``_migrate_legacy`` runs.
         #: It keeps that hook a no-argument method (so a crash-injection probe can
@@ -637,21 +763,66 @@ class OperationJournal:
         ('expires_at', 'REAL'),
     )
 
+    def _stored_schema(self, connection):
+        """The schema version this store was last upgraded to (``None`` if new)."""
+        if connection.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                              "AND name = 'meta'").fetchone() is None:
+            return None
+        value = self._meta_number(connection, 'schema')
+        return value
+
     def _create_schema(self, connection):
+        """Create or upgrade the schema inside the caller's open transaction.
+
+        Runs only when the stored schema is older than :data:`JOURNAL_SCHEMA` (or the
+        store is new), so an up-to-date store pays no DDL and no backfill scan on open.
+        """
         connection.execute('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value)')
         connection.execute('CREATE TABLE IF NOT EXISTS operations (%s)'
                            % ', '.join('%s %s' % column for column in self._COLUMNS))
         connection.execute('CREATE INDEX IF NOT EXISTS operations_state_at '
                            'ON operations (state, at)')
-        connection.execute('CREATE INDEX IF NOT EXISTS operations_tombstone_age '
-                           'ON operations (reclaimed_at)')
+        # Schema 5: tombstone ageing filters ``state = 'expired' AND reclaimed_at <= ?``,
+        # so the index leads with the state and is a range scan over stale tombstones
+        # only. It replaces the schema-4 ``(reclaimed_at)`` index.
+        connection.execute('CREATE INDEX IF NOT EXISTS operations_state_reclaimed '
+                           'ON operations (state, reclaimed_at)')
+        connection.execute('DROP INDEX IF EXISTS operations_tombstone_age')
         self._ensure_columns(connection)
+        self._upgrade_clock(connection)
         connection.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema', ?)",
             (JOURNAL_SCHEMA,))
 
+    def _upgrade_clock(self, connection):
+        """Initialise the schema-5 trusted-clock state of an older store.
+
+        A schema-4 (or older) store persisted ``high_water`` only. Its suspicion is
+        initialised from the gap since that mark: a store idle for more than
+        ``max_skew`` starts suspect with ``anchor = high_water`` and
+        ``suspect_since = now``, exactly as if this open were the first write after the
+        gap, so the upgrade can neither freeze nor jump the trusted clock.
+        """
+        state = clock_state(connection)
+        if connection.execute("SELECT 1 FROM meta WHERE key = 'suspect'").fetchone():
+            return
+        high = state['high_water']
+        if high is None:
+            return
+        now = time.time()
+        if now - high > self.max_skew:
+            state.update(suspect=True, anchor=high, suspect_since=now)
+        else:
+            state.update(suspect=False, anchor=None, suspect_since=None)
+        # ``suspect`` is persisted (as 0 when clear), so the upgrade happens once.
+        clock_persist(connection, state)
+
     def _ensure_columns(self, connection):
-        """Add any revision-8 column an existing store is missing, then backfill it."""
+        """Add any revision-8 column an older store is missing, then backfill it.
+
+        Called only from the schema-upgrade transaction, never on an ordinary open: the
+        two backfill statements scan the table.
+        """
         present = {row[1] for row in connection.execute('PRAGMA table_info(operations)')}
         for name, declaration in self._COLUMNS:
             if name in present:
@@ -671,21 +842,27 @@ class OperationJournal:
             ('expired', self.tombstone_seconds, self.committed_retention, self.retention))
 
     def _ensure_store(self):
-        """Create the schema and import a legacy JSON document in ONE transaction.
+        """Create or upgrade the schema and import a legacy document in ONE transaction.
 
-        The ``legacy_migrated`` marker is checked on every open, so a store left behind
-        by a process that crashed between schema creation and the legacy import is
-        completed on the next open: the marker is absent and the legacy document is
-        still there. A crash at any point therefore leaves either the untouched legacy
-        document (this transaction rolled back) or a fully migrated store — never an
-        empty store that silently ignores the JSON.
+        An up-to-date store (``meta['schema'] == JOURNAL_SCHEMA``) only reads the schema
+        version, the ``legacy_migrated`` marker and the running totals, all ``meta``
+        point reads. Otherwise the schema is created or upgraded (indexes, revision-8
+        columns and their backfill, the schema-5 trusted-clock state) in the same
+        transaction as the legacy import. The ``legacy_migrated`` marker is checked on
+        every open, so a store left behind by a process that crashed between schema
+        creation and the legacy import is completed on the next open: the marker is
+        absent and the legacy document is still there. A crash at any point therefore
+        leaves either the untouched previous store/document (this transaction rolled
+        back) or a fully upgraded store.
         """
         if self._ready:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         rename = False
         with self._transaction() as connection:
-            self._create_schema(connection)
+            stored = self._stored_schema(connection)
+            if stored is None or stored < JOURNAL_SCHEMA:
+                self._create_schema(connection)
             marker = connection.execute(
                 "SELECT value FROM meta WHERE key = 'legacy_migrated'").fetchone()
             if marker is None:
@@ -836,7 +1013,10 @@ class OperationJournal:
             state = 'unknown'
         stored = record.get('envelope')
         envelope = None if stored is None else self._serialized(stored)
-        at = self._clamp_at(connection, record.get('at'))
+        # Rows carry the RAW clock (never the trusted mark): a future stamp left by a
+        # later-corrected jump only lengthens that row's retention.
+        at = float(record['at']) if isinstance(record.get('at'), (int, float)) \
+            else time.time()
         normalised = {'state': state, 'request_hash': record.get('request_hash'),
                       'principal': record.get('principal'), 'at': at}
         if stored is not None:
@@ -961,39 +1141,38 @@ class OperationJournal:
         """Export the store in the legacy document shape (backup/audit/migration)."""
         return self._document()
 
-    def _advance_high_water(self, connection, now):
-        """Advance the non-decreasing high-water mark, never toward a jumped clock.
+    # -- trusted clock ---------------------------------------------------------
+    def _observe(self, connection, now):
+        """Advance and persist the trusted-clock state for one write transaction.
 
-        While ``now`` is more than ``max_skew`` ahead of the persisted mark the mark is
-        left unchanged: a forward jump must not certify itself as the new truthful
-        time, so reclaim and compaction keep refusing instead of dropping a live
-        identity. When the clock is within tolerance the mark advances to it, and it
-        never decreases.
+        Returns the new state. Every write transaction calls this exactly once with the
+        raw clock, inside the same transaction as its row writes.
         """
-        high = self._high_water(connection)
-        if high <= 0:
-            high = now
-        elif now <= high + self.max_skew:
-            high = max(high, now)
-        connection.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES ('high_water', ?)",
-            (float(high),))
-        return high
+        state = clock_advance(clock_state(connection), now, self.max_skew, self.settle)
+        clock_persist(connection, state)
+        return state
+
+    def clock(self, now=None):
+        """The trusted-clock state the next write would persist (read-only view)."""
+        self._ensure_store()
+        moment = time.time() if now is None else now
+        with self._connection() as connection:
+            return clock_advance(clock_state(connection), moment, self.max_skew, self.settle)
 
     def reset_high_water(self, now=None):
-        """Operator recovery for a genuine clock correction. Returns the new mark.
+        """Operator recovery after a clock correction. Returns the new mark.
 
-        After a real forward correction (an NTP fix, a restored host) reclaim stays
-        refused while the persisted mark is more than ``max_skew`` behind the real
-        clock. This explicit action accepts the current clock as truthful. It removes
-        no identity by itself: a subsequent ``reclaim_expired`` still compacts a
-        closed window to a tombstone rather than dropping it.
+        Sets ``high_water`` to the current clock and clears suspicion, which both
+        accepts a corrected clock immediately and re-arms jump detection after a
+        corrected forward jump left ``high_water`` in the future. It removes no identity
+        by itself: a subsequent ``reclaim_expired`` still compacts a closed window to a
+        tombstone rather than dropping it.
         """
-        moment = time.time() if now is None else now
+        self._ensure_store()
+        moment = float(time.time() if now is None else now)
         with self._transaction() as connection:
-            connection.execute(
-                "INSERT OR REPLACE INTO meta (key, value) VALUES ('high_water', ?)",
-                (float(moment),))
+            clock_persist(connection, {'high_water': moment, 'suspect': False,
+                                       'anchor': None, 'suspect_since': None})
         return moment
 
     @staticmethod
@@ -1022,10 +1201,11 @@ class OperationJournal:
     def expired(self, entry, now=None):
         """Whether ``entry``'s idempotency receipt window has closed.
 
-        The decision uses the SAME trusted clock as a write (:meth:`trusted_now`), so a
-        forward jump that has not been accepted cannot expire a receipt that is still
-        inside its window: during a +8 day jump a 60-second-old committed receipt
-        replays and a live uncertain reservation still reports uncertainty (``124``).
+        The decision uses the trusted clock (:meth:`trusted_now`): while the store is
+        (or the next write would make it) suspect, the clock is capped at
+        ``anchor + max_skew``, so an unaccepted forward jump cannot expire a receipt
+        that is still inside its window: during a +8 day jump a 60-second-old committed
+        receipt replays and a live uncertain reservation still reports ``124``.
         """
         if not isinstance(entry, dict):
             return False
@@ -1033,46 +1213,24 @@ class OperationJournal:
             return True
         return entry.get('at', 0) + self.window(entry) <= self.trusted_now(now)
 
-    # -- trusted clock ---------------------------------------------------------
-    def _trusted_from(self, now, high):
-        """``min(now, high + max_skew)``, taken at the strict end.
+    def trusted_now(self, now=None, connection=None):
+        """The trusted clock for expiry and replay-window decisions.
 
-        While the clock is within :data:`JOURNAL_MAX_SKEW_SECONDS` of the persisted
-        non-decreasing high-water mark it is accepted as-is. Once it is implausibly
-        ahead the mark itself is used: the jump has not been accepted (reclaim refuses
-        too), so no live identity may be expired or stamped with it. ``high <= 0`` means
-        the mark is not established yet, so the clock is used unchanged.
-        """
-        if high is None or high <= 0:
-            return now
-        if now > high + self.max_skew:
-            return high
-        return now
-
-    def trusted_now(self, now=None, connection=None, high=None):
-        """The one clock used to stamp rows and to decide replay vs expired.
-
-        Reading the high-water mark opens a short connection when one is not supplied;
-        that is one indexed ``meta`` point read, not a table scan.
+        ``now`` when not suspect, ``min(now, anchor + max_skew)`` while suspect,
+        evaluated against the transition the next write would make (one ``meta`` read,
+        not a table scan). Rows are never stamped with it; they carry the raw clock.
         """
         moment = time.time() if now is None else now
-        if high is None:
-            if connection is not None:
-                high = self._high_water(connection)
-            else:
-                with self._connection() as opened:
-                    high = self._high_water(opened)
-        return self._trusted_from(moment, high)
-
-    def _clamp_at(self, connection, at):
-        """Stamp a stored ``at`` with the trusted clock (never a future timestamp)."""
-        moment = time.time() if at is None else float(at)
-        return self._trusted_from(moment, self._high_water(connection))
+        if connection is not None:
+            state = clock_state(connection)
+        else:
+            self._ensure_store()
+            with self._connection() as opened:
+                state = clock_state(opened)
+        return clock_trusted(clock_advance(state, moment, self.max_skew, self.settle),
+                             moment, self.max_skew)
 
     # -- compaction / bounds ---------------------------------------------------
-    def _skewed(self, high, now):
-        return high > 0 and now > high + self.max_skew
-
     def _over(self, connection):
         """Whether the store exceeds the one bound that can refuse a write.
 
@@ -1091,20 +1249,16 @@ class OperationJournal:
                 % (totals['entries'], self.limit, totals['tombstones'], totals['bytes']))
 
     def _tombstone(self, connection, operation_id, now):
-        """Compact one CLOSED-WINDOW record to a tombstone, unless a bound forbids it.
+        """Compact one CLOSED-WINDOW record to a tombstone stamped with raw ``now``.
 
         The caller only passes records whose own retention window has genuinely closed
-        (see :meth:`_reclaim`). Returns False, leaving the record in place, when the
-        tombstone count bound is reached: the record then stays a closed-window entry
-        that is still refused as expired, so no identity is lost and no write is
-        blocked by the tombstones already present.
+        (see :meth:`_reclaim`). There is no count gate: the tombstone count is reported
+        by :meth:`stats` but never stops compaction, so closed receipts never linger as
+        live identities that count toward :data:`JOURNAL_LIMIT`.
         """
         row = connection.execute('SELECT * FROM operations WHERE operation_id = ?',
                                  (operation_id,)).fetchone()
         if row is None or row['state'] == 'expired':
-            return False
-        totals = self._totals(connection)
-        if totals['tombstones'] + 1 > self.tombstone_limit:
             return False
         record = {'state': 'expired', 'request_hash': row['request_hash'],
                   'principal': row['principal'], 'at': row['at'], 'reclaimed_at': now,
@@ -1121,25 +1275,21 @@ class OperationJournal:
         self._adjust(connection, live=-1, tombstones=1, bytes_=delta)
         return True
 
-    def _reclaim(self, connection, now, high):
+    def _reclaim(self, connection, now, clock):
         """Compact every CLOSED-WINDOW identity to a tombstone. Returns the count.
 
+        Runs only while the store is not suspect, and then against the raw clock ``now``.
         A committed receipt is a candidate only once its own
-        :data:`JOURNAL_COMMITTED_RETENTION_SECONDS` window has genuinely closed against
-        the trusted clock; an in-window receipt is never a candidate, whatever the byte
-        or tombstone budget is. Returns 0 without touching anything while the clock is
-        implausibly far ahead of the high-water mark. Stops early when the tombstone
-        bound is reached and leaves the remaining closed-window records in place, where
-        an exact retry is still refused as expired, so no identity is lost.
+        :data:`JOURNAL_COMMITTED_RETENTION_SECONDS` window has closed; an in-window
+        receipt is never a candidate, whatever the byte or tombstone count is.
         """
-        if self._skewed(high, now):
+        if clock.get('suspect'):
             return 0
-        trusted = self._trusted_from(now, high)
         # Compare the bare indexed column against a precomputed threshold (``at <= ?``,
         # not ``at + ? <= ?``) so the (state, at) index is an index range scan rather
         # than a full-table scan on every write.
-        committed_before = trusted - self.committed_retention
-        active_before = trusted - self.retention
+        committed_before = now - self.committed_retention
+        active_before = now - self.retention
         compacted = 0
         while True:
             rows = connection.execute(
@@ -1151,26 +1301,23 @@ class OperationJournal:
                 (active_before,)).fetchall()
             if not rows:
                 break
-            progress = False
             for row in rows:
-                if not self._tombstone(connection, row['operation_id'], trusted):
-                    return compacted
-                compacted += 1
-                progress = True
-            if not progress:
-                break
+                if self._tombstone(connection, row['operation_id'], now):
+                    compacted += 1
         return compacted
 
-    def _drop_stale_tombstones(self, connection, now, high):
-        """Remove only tombstones genuinely outside their refusal window by age.
+    def _drop_stale_tombstones(self, connection, now, clock):
+        """Remove only tombstones outside their refusal window by age (raw clock).
 
         This is the *only* place an identity row is deleted by a budget-free policy. It
-        uses the trusted clock, so a forward jump cannot expire one, and it is never
-        used to satisfy the byte or count budget: a still-live tombstone stays.
+        runs only while the store is not suspect, so an unaccepted forward jump cannot
+        age one out, and it is never used to satisfy the byte or count budget.
         """
-        trusted = self._trusted_from(now, high)
-        # ``reclaimed_at <= ?`` keeps this an index range scan on operations_tombstone_age.
-        stale_before = trusted - self.tombstone_seconds
+        if clock.get('suspect'):
+            return 0
+        # ``state = 'expired' AND reclaimed_at <= ?`` is a range scan over the stale
+        # tombstones only, on the schema-5 (state, reclaimed_at) index.
+        stale_before = now - self.tombstone_seconds
         row = connection.execute(
             "SELECT COUNT(*), COALESCE(SUM(bytes), 0) FROM operations "
             "WHERE state = 'expired' AND reclaimed_at <= ?", (stale_before,)).fetchone()
@@ -1183,18 +1330,27 @@ class OperationJournal:
         self._adjust(connection, tombstones=-removed, bytes_=-size)
         return removed
 
-    def _fit(self, connection, now, high):
-        """Reclaim what time has genuinely closed; report whether a write may proceed.
+    def _admit(self, connection, now, clock, operation_id, record):
+        """Maintenance, then write one row unless the live-identity bound refuses it.
 
-        There is no eviction path for a live identity here. The only thing that can make
-        this return False is the live-identity count: the byte budget and the tombstone
-        count are reported by :meth:`stats`, never enforced by compacting an in-window
-        receipt or dropping a tombstone.
+        Reclaim and tombstone ageing (both no-ops while suspect) run first and stay
+        committed with the clock observation even when the row is refused, so a full
+        journal still makes progress toward settling and reclaiming. The row itself is
+        written under a savepoint: when the live identities would exceed ``limit`` it is
+        rolled back and the capacity message is returned (the caller raises
+        :class:`JournalFull` after the commit). There is no eviction path for a live
+        identity here.
         """
-        if not self._skewed(high, now):
-            self._reclaim(connection, now, high)
-            self._drop_stale_tombstones(connection, now, high)
-        return not self._over(connection)
+        self._reclaim(connection, now, clock)
+        self._drop_stale_tombstones(connection, now, clock)
+        connection.execute('SAVEPOINT admit')
+        self._upsert(connection, operation_id, record)
+        refused = None
+        if self._over(connection):
+            connection.execute('ROLLBACK TO admit')
+            refused = self._capacity_message(connection)
+        connection.execute('RELEASE admit')
+        return refused
 
     def lookup(self, operation_id):
         """One indexed point lookup: the live record or its tombstone, else ``None``."""
@@ -1206,46 +1362,43 @@ class OperationJournal:
 
     # -- mutations -------------------------------------------------------------
     def reserve(self, operation_id, request_hash, principal):
-        """Reserve a new identity, compacting terminal receipts under pressure.
+        """Reserve a new identity, compacting closed receipt windows first.
 
         Raises :class:`JournalFull` only when the live identities plus this new one
         genuinely exceed the live-identity bound. No live identity is ever evicted to
         make room, so the only thing that can refuse is a journal that is really full.
-        The transaction is rolled back, so the pre-existing store is left exactly as it
-        was and no effect has run.
+        The identity row is rolled back (only the clock observation and time-based
+        maintenance commit), so no pre-existing identity changes and no effect has run.
         """
         if not isinstance(operation_id, str) or not operation_id:
             raise ValueError('operation_id must be a non-empty string')
         self._ensure_store()
         with self._transaction() as connection:
             now = time.time()
-            high = self._high_water(connection)
-            trusted = self._trusted_from(now, high)
-            self._upsert(connection, operation_id, {
+            clock = self._observe(connection, now)
+            refused = self._admit(connection, now, clock, operation_id, {
                 'state': 'in_progress', 'request_hash': request_hash,
-                'principal': principal, 'at': trusted,
+                'principal': principal, 'at': now,
                 'actor': self._actor, 'route': self._route})
-            high = self._advance_high_water(connection, now)
-            if not self._fit(connection, now, high):
-                raise JournalFull(self._capacity_message(connection))
+        if refused:
+            raise JournalFull(refused)
 
     def complete(self, operation_id, envelope, request_hash, principal):
         """Record the committed response envelope for an identity (one transaction)."""
         self._ensure_store()
         with self._transaction() as connection:
             now = time.time()
-            trusted = self._trusted_from(now, self._high_water(connection))
+            clock = self._observe(connection, now)
             stored, digest, omitted = self._bounded(envelope)
             record = {'state': 'committed', 'request_hash': request_hash,
-                      'principal': principal, 'at': trusted, 'envelope': stored,
+                      'principal': principal, 'at': now, 'envelope': stored,
                       'envelope_sha256': digest,
                       'actor': self._actor, 'route': self._route}
             if omitted:
                 record['envelope_omitted'] = True
-            self._upsert(connection, operation_id, record)
-            high = self._advance_high_water(connection, now)
-            if not self._fit(connection, now, high):
-                raise JournalFull(self._capacity_message(connection))
+            refused = self._admit(connection, now, clock, operation_id, record)
+        if refused:
+            raise JournalFull(refused)
 
     #: The directed actor label and canonical route of the guarded mutation. The
     #: journal created by :func:`run_guarded` carries them so every row records which
@@ -1257,21 +1410,22 @@ class OperationJournal:
         """Keep a reservation whose outcome is not known to be pre-effect."""
         self._ensure_store()
         with self._transaction() as connection:
+            now = time.time()
+            self._observe(connection, now)
             row = connection.execute('SELECT * FROM operations WHERE operation_id = ?',
                                      (operation_id,)).fetchone()
             if row is None or row['state'] == 'expired':
                 return
-            now = time.time()
             record = self._row_record(row)
             record['state'] = 'unknown'
-            record['at'] = self._trusted_from(now, self._high_water(connection))
+            record['at'] = now
             self._upsert(connection, operation_id, record)
-            self._advance_high_water(connection, now)
 
     def discard(self, operation_id):
         """Release a reservation that is proven pre-effect."""
         self._ensure_store()
         with self._transaction() as connection:
+            self._observe(connection, time.time())
             row = connection.execute(
                 'SELECT state, bytes FROM operations WHERE operation_id = ?',
                 (operation_id,)).fetchone()
@@ -1282,26 +1436,23 @@ class OperationJournal:
                 self._adjust(connection, live=0 if tombstone else -1,
                              tombstones=-1 if tombstone else 0,
                              bytes_=-int(row['bytes']))
-            self._advance_high_water(connection, time.time())
 
     def reclaim_expired(self, now=None):
         """Compact every closed-window identity to a tombstone. Returns the count.
 
         This is the automatic maintenance step on every write and the operator action
         for a deployment that wants to compact the journal before the limit is reached.
-        Only a record whose OWN window has genuinely closed is a candidate: an in-window
-        committed receipt is never compacted, whatever the byte budget says. Unlike
-        :meth:`prune` it never lets an exact retry repeat: the tombstone keeps refusing
-        the reclaimed identity as expired. Compaction stops at the tombstone bound and
-        leaves the remaining closed-window records in place, where they are still
-        refused as expired, so no identity is lost.
+        It is a write transaction, so it observes the clock like any write, and it does
+        nothing while the store is suspect. Only a record whose OWN window has closed is
+        a candidate; unlike :meth:`prune` it never lets an exact retry repeat: the
+        tombstone keeps refusing the reclaimed identity as expired.
         """
         self._ensure_store()
         moment = time.time() if now is None else now
         with self._transaction() as connection:
-            high = self._high_water(connection)
-            removed = self._reclaim(connection, moment, high)
-            self._drop_stale_tombstones(connection, moment, high)
+            clock = self._observe(connection, moment)
+            removed = self._reclaim(connection, moment, clock)
+            self._drop_stale_tombstones(connection, moment, clock)
         return removed
 
     def prune(self, before):
@@ -1337,14 +1488,17 @@ class OperationJournal:
         table (this is an operator/admin call, not the write path), the running totals
         are cross-checked against a recount, and ``live_bytes``/``tombstone_bytes`` plus
         ``over_bytes``/``over_tombstones``/``over_limit`` show where the store stands
-        against the configured bounds. ``journal_mode`` reports the SQLite mode (``wal``)
-        and ``integrity`` the SQLite integrity check.
+        against the configured bounds. The persisted trusted-clock state is reported as
+        ``high_water``, ``suspect``, ``anchor`` and ``suspect_since``
+        (``clock_skewed`` = ``suspect``); ``trusted_now`` is the clock the next decision
+        would use. ``journal_mode`` reports the SQLite mode (``wal``).
         """
         self._ensure_store()
         moment = time.time() if now is None else now
         with self._connection() as connection:
-            high = self._high_water(connection)
-            trusted = self._trusted_from(moment, high)
+            clock = clock_state(connection)
+            view = clock_advance(clock, moment, self.max_skew, self.settle)
+            trusted = clock_trusted(view, moment, self.max_skew)
             states = {'in_progress': 0, 'committed': 0, 'unknown': 0}
             live_bytes = 0
             tombstone_bytes = 0
@@ -1359,7 +1513,7 @@ class OperationJournal:
                 if row['state'] in states:
                     states[row['state']] += 1
                 live_bytes += size
-                if self.expired({'state': row['state'], 'at': row['at']}, trusted):
+                if row['at'] + self.window({'state': row['state']}) <= trusted:
                     expired += 1
             live = states['in_progress'] + states['committed'] + states['unknown']
             self._ensure_totals(connection)
@@ -1368,29 +1522,33 @@ class OperationJournal:
             recount = {'total': live, 'entries': live, 'tombstones': tombstones,
                        'bytes': totals_bytes}
             mode = connection.execute('PRAGMA journal_mode').fetchone()[0]
-            skewed = self._skewed(high, moment)
-        totals_bytes = live_bytes + tombstone_bytes
-        return {'total': live, 'limit': self.limit,
-                'retention': self.retention,
-                'committed_retention': self.committed_retention,
-                'tombstone_seconds': self.tombstone_seconds,
-                'expired': expired, 'reclaimable': 0 if skewed else expired,
-                'states': states, 'tombstones': tombstones,
-                'tombstone_limit': self.tombstone_limit,
-                'high_water': high, 'clock_skewed': skewed,
-                'bytes': totals_bytes,
-                'live_bytes': live_bytes, 'tombstone_bytes': tombstone_bytes,
-                'limit_bytes': self.max_bytes,
-                'live': live,
-                'over_limit': live > self.limit,
-                'over_bytes': totals_bytes > self.max_bytes,
-                'over_tombstones': tombstones > self.tombstone_limit,
-                'running_totals': running,
-                'recount': recount,
-                'running_totals_match': running == recount,
-                'journal_mode': mode,
-                'file_bytes': self.path.stat().st_size if self.path.exists() else 0,
-                'schema': JOURNAL_SCHEMA}
+        report = {'total': live, 'limit': self.limit,
+                  'retention': self.retention,
+                  'committed_retention': self.committed_retention,
+                  'tombstone_seconds': self.tombstone_seconds,
+                  'expired': expired, 'reclaimable': 0 if view['suspect'] else expired,
+                  'states': states, 'tombstones': tombstones,
+                  'tombstone_limit': self.tombstone_limit,
+                  'max_skew': self.max_skew, 'settle_seconds': self.settle,
+                  'trusted_now': trusted,
+                  'bytes': totals_bytes,
+                  'live_bytes': live_bytes, 'tombstone_bytes': tombstone_bytes,
+                  'limit_bytes': self.max_bytes,
+                  'live': live,
+                  'over_limit': live > self.limit,
+                  'over_bytes': totals_bytes > self.max_bytes,
+                  'over_tombstones': tombstones > self.tombstone_limit,
+                  'running_totals': running,
+                  'recount': recount,
+                  'running_totals_match': running == recount,
+                  'journal_mode': mode,
+                  'file_bytes': self.path.stat().st_size if self.path.exists() else 0,
+                  'schema': JOURNAL_SCHEMA}
+        # The clock fields describe the state as of ``now`` (what the next write would
+        # persist and what ``trusted_now`` uses); ``clock_persisted`` is the stored row.
+        report.update(clock_report(view))
+        report['clock_persisted'] = clock_report(clock)
+        return report
 
 
 def _envelope(code, stderr='', **extra):

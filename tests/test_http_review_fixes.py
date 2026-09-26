@@ -1498,48 +1498,41 @@ class JournalBoundsCase(unittest.TestCase):
         self.assertEqual(stats['running_totals'], stats['recount'])
         self.assertEqual(stats['file_bytes'], journal.path.stat().st_size)
 
-    def test_tombstones_are_count_bounded_without_dropping_a_live_one(self):
+    def test_the_tombstone_count_is_reported_never_a_gate(self):
+        # Revision 9: the tombstone count no longer stops reclaim. At revision 8 reaching
+        # it left closed receipts live, counting toward JOURNAL_LIMIT, until writes were
+        # permanently refused (the reviewer's ~23.3k ops/week ceiling).
         path = self.tmp / 'tombstones.json'
         journal = OperationJournal(str(path), limit=1000, tombstone_limit=4,
-                                   committed_retention=10, max_skew=10 ** 9)
+                                   committed_retention=10)
         for index in range(20):
             key = 'op-%03d' % index
             journal.reserve(key, 'hash', 'actor:x')
             journal.complete(key, {'returncode': 0, 'stdout': 'x', 'stderr': ''},
                              'hash', 'actor:x')
-        # Reclaim stops at the tombstone budget and leaves the rest as expired entries,
-        # where they are still refused as expired. Before revision 7 it silently dropped
-        # the oldest tombstones, which is what let a retry re-execute.
-        self.assertEqual(4, journal.reclaim_expired(now=time.time() + 60))
+        self.assertEqual(20, journal.reclaim_expired(now=time.time() + 60))
         stats = journal.stats()
-        self.assertEqual(4, stats['tombstones'])
+        self.assertEqual(20, stats['tombstones'])
         self.assertEqual(4, stats['tombstone_limit'])
-        self.assertEqual(16, stats['total'])
+        self.assertTrue(stats['over_tombstones'])
+        self.assertEqual(0, stats['total'])
         identities = list(journal._load()) + list(journal._tombstones())
-        self.assertEqual(20, len(identities))
         self.assertEqual(20, len(set(identities)))
         records, effect = ledger()
+        options = {'limit': 15, 'tombstone_limit': 4, 'committed_retention': 10}
         for index in range(20):
             retry = run_guarded(dict(self.request, operation_id='op-%03d' % index), path,
-                                effect,
-                                journal_options={'limit': 1000, 'tombstone_limit': 4,
-                                                 'committed_retention': 10,
-                                                 'max_skew': 10 ** 9})
+                                effect, journal_options=options)
             self.assertEqual(2, retry['returncode'], retry)
         self.assertEqual([], records)
-        # A mutation that can only satisfy the entry budget by compacting a receipt to a
-        # tombstone - when the tombstone budget is full - fails closed, leaves the store
-        # intact and attempts no effect.
-        before = [journal.lookup('op-%03d' % index) for index in range(20)]
-        result = run_guarded(dict(self.request, operation_id='op-over-budget'), path, effect,
-                             journal_options={'limit': 15, 'tombstone_limit': 4,
-                                              'committed_retention': 10,
-                                              'max_skew': 10 ** 9})
-        self.assertEqual(124, result['returncode'], result)
-        self.assertEqual([], records)
-        self.assertIsNone(journal.lookup('op-over-budget'))
-        self.assertEqual(before, [journal.lookup('op-%03d' % index) for index in range(20)])
-        self.assertEqual(4, journal.stats()['tombstones'])
+        # Tombstones above the advisory size never block a write, even with a live
+        # bound (15) below the tombstone count (20).
+        for index in range(10):
+            result = run_guarded(dict(self.request, operation_id='op-new-%d' % index), path,
+                                 effect, journal_options=options)
+            self.assertEqual(0, result['returncode'], result)
+        self.assertEqual(10, len(records))
+        self.assertEqual(20, journal.stats()['tombstones'])
 
     def test_fail_closed_leaves_the_store_intact_and_attempts_no_effect(self):
         path = self.tmp / 'closed.json'
@@ -1987,11 +1980,10 @@ class JournalRetentionCase(unittest.TestCase):
         self.assertEqual('seeded', replay['stdout'])
         self.assertEqual([], records)
 
-    def test_repeated_saves_never_ratchet_the_high_water_mark(self):
-        # The P3 defect: _advance_high_water() ran on every save as
-        # max(high, min(now, high + max_skew)), so repeated writes ratcheted the mark
-        # up to a jumped-forward clock and reclaim then tombstoned a 60 s-old committed
-        # receipt and a live uncertain reservation.
+    def test_repeated_saves_during_a_jump_keep_the_original_anchor(self):
+        # Repeated writes during a +8 d jump keep the store suspect with the original
+        # anchor: nothing is reclaimed, the receipt stays committed and the uncertain
+        # reservation stays live.
         path = self.tmp / 'ratchet.json'
         request = dict(self.request)
         digest = http_authority.operation_hash(request)
@@ -2002,7 +1994,7 @@ class JournalRetentionCase(unittest.TestCase):
                          digest, principal)
         journal.reserve('op-u', digest, principal)
         journal.mark_unknown('op-u')
-        start = journal.stats()['high_water']
+        start = journal.stats()['clock_persisted']['high_water']
         real = time.time()
         clock = [real]
         real_time = time.time
@@ -2011,25 +2003,24 @@ class JournalRetentionCase(unittest.TestCase):
             time.time = lambda: clock[0]
             clock[0] = real + 8 * 24 * 3600
             for index in range(6):
+                clock[0] += 60
                 result = run_guarded(dict(request, operation_id='op-skew-%d' % index), path,
                                      effect)
                 self.assertEqual(0, result['returncode'], result)
                 stats = OperationJournal(str(path)).stats()
                 self.assertTrue(stats['clock_skewed'])
-                self.assertLessEqual(stats['high_water'], start + JOURNAL_MAX_SKEW_SECONDS + 1)
+                self.assertEqual(start, stats['anchor'])
                 self.assertEqual(0, stats['tombstones'])
                 self.assertEqual('committed',
                                  OperationJournal(str(path)).lookup('op-k')['state'])
                 self.assertEqual('unknown',
                                  OperationJournal(str(path)).lookup('op-u')['state'])
-            # Reclaim stays refused while the mark is implausibly behind the clock.
+            # Reclaim does nothing while suspect.
             self.assertEqual(0, OperationJournal(str(path)).reclaim_expired())
             self.assertEqual(0, OperationJournal(str(path)).stats()['tombstones'])
-            # The six skewed writes are six genuinely new operations: each ran once.
             self.assertEqual(6, len(records))
             baseline = len(records)
-            # Once the clock is corrected the committed receipt REPLAYS and the
-            # uncertain reservation reports uncertainty; nothing was ever tombstoned.
+            # Corrected: the committed receipt REPLAYS, the reservation reports 124.
             clock[0] = real + 60
             replay = run_guarded(dict(request, operation_id='op-k'), path, effect)
             self.assertEqual(0, replay['returncode'], replay)
@@ -2038,23 +2029,17 @@ class JournalRetentionCase(unittest.TestCase):
             self.assertEqual(124, uncertain['returncode'], uncertain)
             self.assertEqual(baseline, len(records))
             self.assertEqual(0, OperationJournal(str(path)).stats()['tombstones'])
-            # A genuine clock correction is accepted only by the explicit operator
-            # reset; reclaim then compacts closed windows to tombstones. The two
-            # original identities (at `real`) and the six skewed writes all expire: the
-            # skewed rows were stamped with the TRUSTED clock (the persisted mark), not
-            # with the jumped-forward wall clock, so they carry no future `at` and are
-            # inside their committed window only until the real window closes.
-            clock[0] = real + 8 * 24 * 3600
-            self.assertEqual(0, OperationJournal(str(path)).reclaim_expired())
-            self.assertEqual(clock[0], OperationJournal(str(path)).reset_high_water())
-            for index in range(6):
-                skewed = OperationJournal(str(path)).lookup('op-skew-%d' % index)
-                self.assertLessEqual(skewed['at'], real + JOURNAL_MAX_SKEW_SECONDS + 1)
-                self.assertLess(skewed['at'], clock[0])
-            self.assertEqual(8, OperationJournal(str(path)).reclaim_expired())
+            # A jump that persists past the settle hour is accepted: reclaim then
+            # compacts the closed windows to tombstones (refused, never re-run). The
+            # skewed rows carry the raw (+8 d) stamp, so they are still in-window.
+            clock[0] = real + 8 * 24 * 3600 + 2 * 3600
+            self.assertEqual(2, OperationJournal(str(path)).reclaim_expired())
             stats = OperationJournal(str(path)).stats()
             self.assertFalse(stats['clock_skewed'])
-            self.assertEqual(8, stats['tombstones'])
+            self.assertEqual(2, stats['tombstones'])
+            for index in range(6):
+                self.assertEqual('committed', OperationJournal(str(path)).lookup(
+                    'op-skew-%d' % index)['state'])
             refused = run_guarded(dict(request, operation_id='op-k'), path, effect)
             self.assertEqual(2, refused['returncode'], refused)
             self.assertEqual(baseline, len(records))
@@ -2062,9 +2047,11 @@ class JournalRetentionCase(unittest.TestCase):
             time.time = real_time
 
     def test_a_read_during_a_forward_jump_uses_the_trusted_clock(self):
-        # The reviewer's pinned +8 d read-path probe: a 60-second-old committed receipt
-        # REPLAYS (rc=0) and a live uncertain reservation reports 124, instead of both
-        # being refused as expired by the raw wall clock.
+        # Revision 9 trusted clock: during a +8 d jump the store is suspect and the
+        # trusted clock is capped at anchor + 24 h. A live uncertain reservation still
+        # reports 124; a committed receipt from before the jump is refused as expired
+        # at the capped clock (never re-executed). After the correction (inside the
+        # settle hour) the 60-second-old receipt replays again.
         path = self.tmp / 'read-skew.json'
         request = dict(self.request)
         digest = http_authority.operation_hash(request)
@@ -2081,35 +2068,39 @@ class JournalRetentionCase(unittest.TestCase):
         real_time = time.time
         try:
             time.time = lambda: clock[0]
+            self.assertLessEqual(journal.trusted_now(), real + JOURNAL_MAX_SKEW_SECONDS + 1)
             committed = run_guarded(dict(request, operation_id='op-k'), path, effect)
-            self.assertEqual(0, committed['returncode'], committed)
-            self.assertEqual('keeper', committed['stdout'])
+            self.assertEqual(2, committed['returncode'], committed)
             uncertain = run_guarded(dict(request, operation_id='op-ku'), path, effect)
             self.assertEqual(124, uncertain['returncode'], uncertain)
             self.assertIn('unknown', uncertain['stderr'])
             self.assertEqual([], records)
-            # A fresh write during the jump is stamped with the trusted clock, never
-            # the jumped-forward one.
+            # A fresh write during the jump is stamped with the RAW clock (a future
+            # stamp only lengthens retention) and makes the store suspect.
             run_guarded(dict(request, operation_id='op-during'), path, effect)
-            during = journal.lookup('op-during')
-            self.assertLessEqual(during['at'], real + JOURNAL_MAX_SKEW_SECONDS + 1)
-            self.assertLess(during['at'], clock[0])
-            # Corrected to 60 s after the real write: still a replay, still uncertain.
+            self.assertEqual(clock[0], journal.lookup('op-during')['at'])
+            stats = journal.stats()
+            self.assertTrue(stats['suspect'])
+            self.assertTrue(stats['clock_skewed'])
+            self.assertEqual(clock[0], stats['suspect_since'])
+            self.assertLessEqual(stats['anchor'], real + 1)
+            self.assertEqual(0, stats['tombstones'])
+            # Corrected to 60 s after the real write: replay and uncertainty again.
             clock[0] = real + 60
             again = run_guarded(dict(request, operation_id='op-k'), path, effect)
             self.assertEqual(0, again['returncode'], again)
+            self.assertEqual('keeper', again['stdout'])
+            self.assertEqual(124, run_guarded(dict(request, operation_id='op-ku'), path,
+                                              effect)['returncode'])
             self.assertEqual(1, len(records))
-            # A receipt genuinely past its window under an ACCEPTED clock is refused:
-            # advance the mark with ordinary writes inside the skew allowance first.
-            for step, operation in ((0.6, 'op-advance-1'), (1.3, 'op-advance-2')):
-                clock[0] = real + step * 24 * 3600
-                advanced = run_guarded(dict(request, operation_id=operation), path, effect)
-                self.assertEqual(0, advanced['returncode'], advanced)
-            clock[0] = real + 1.3 * 24 * 3600 + 60
+            # The operator reset re-arms detection; normal expiry then resumes.
+            OperationJournal(str(path)).reset_high_water()
+            self.assertFalse(journal.stats()['suspect'])
+            clock[0] = real + 1.3 * 24 * 3600
             stale = run_guarded(dict(request, operation_id='op-k'), path, effect)
             self.assertEqual(2, stale['returncode'], stale)
             self.assertIn('expired', stale['stderr'])
-            self.assertEqual(3, len(records))
+            self.assertEqual(1, len(records))
         finally:
             time.time = real_time
 
@@ -2591,9 +2582,14 @@ class ResultsBoundCase(EndpointCase):
         # Nothing is due yet: no record is dropped by count or size.
         self.assertEqual(0, records.purge())
         self.assertEqual(1, records.stats()['kinds']['result']['total'])
-        # Past the retention window the record really is removed.
+        # A step of more than 24 h is suspect: nothing is purged for the settle hour.
         future = time.time() + RESULT_RETENTION_SECONDS + 60
-        self.assertGreaterEqual(records.purge(now=future), 1)
+        self.assertEqual(0, records.purge(now=future))
+        self.assertTrue(records.stats(now=future)['suspect'])
+        self.assertEqual(1, records.stats()['kinds']['result']['total'])
+        # Once the clock has run for the settle hour the record really is removed.
+        self.assertGreaterEqual(records.purge(now=future + 3600), 1)
+        self.assertFalse(records.stats(now=future + 3600)['suspect'])
         self.assertEqual(0, records.stats()['kinds'].get('result', {}).get('total', 0))
 
     def test_a_legacy_state_document_migrates_its_keyed_records_once(self):
@@ -2733,6 +2729,389 @@ class JournalBackupCase(unittest.TestCase):
         with self.assertRaises(ValueError):
             admin.restore_journal(corrupt, self.tmp / 'target.sqlite3')
         self.assertFalse((self.tmp / 'target.sqlite3').exists())
+
+
+    def test_restore_new_with_a_corrupt_snapshot_creates_nothing(self):
+        import admin
+        import contextlib
+        import io
+        from unittest.mock import patch as _patch
+        self._seed('op-restored')
+        with self._patch.object(admin, 'run_bd', return_value='synced'):
+            admin.backup_project(self.root, 'source')
+        snapshot = admin.journal_snapshot_path(self.root, 'source')
+        data = bytearray(snapshot.read_bytes())
+        # Keep the header, corrupt every later page.
+        for offset in range(4096, len(data)):
+            data[offset] = 0xA5
+        snapshot.write_bytes(bytes(data))
+        calls = []
+
+        def fake_add(root, name):
+            calls.append(('add_project', name))
+            (root / 'projects' / name).mkdir(parents=True, exist_ok=True)
+
+        def fake_bd(*args, **kwargs):
+            calls.append(('run_bd', args))
+            return 'restored'
+
+        argv = ['admin.py', '--root', str(self.root), 'restore-new', 'source', 'destination']
+        with _patch.object(admin, 'add_project', side_effect=fake_add), \
+                _patch.object(admin, 'run_bd', side_effect=fake_bd), \
+                _patch.object(admin, 'restore_coordination',
+                              side_effect=lambda *a: calls.append(('coordination', a))), \
+                _patch.object(sys, 'argv', argv), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(ValueError):
+                admin.main()
+        self.assertEqual([], calls)
+        self.assertFalse((self.root / 'projects' / 'destination').exists())
+
+    def test_a_snapshot_without_the_journal_schema_is_refused(self):
+        import admin
+        import sqlite3
+        other = self.root / 'backups' / 'other.sqlite3'
+        connection = sqlite3.connect(str(other))
+        connection.execute('CREATE TABLE operations (operation_id TEXT)')
+        connection.commit()
+        connection.close()
+        with self.assertRaises(ValueError) as caught:
+            admin._check_journal_database(other)
+        self.assertIn('meta', str(caught.exception))
+
+
+class TrustedClockCase(unittest.TestCase):
+    """23. Revision 9 trusted clock: suspicion settles; idle gaps never freeze the journal."""
+
+    HOUR = 3600
+    DAY = 24 * 3600
+
+    def setUp(self):
+        from unittest.mock import patch
+        self.tmp = unique_dir('trustedclock9-')
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.path = self.tmp / 'projects' / 'p' / http_authority.JOURNAL_FILENAME
+        self.clock = [time.time()]
+        patcher = patch.object(http_authority.time, 'time', side_effect=lambda: self.clock[0])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.records, self.effect = ledger()
+
+    def request(self, operation_id, title='x'):
+        return {'project': 'p', 'actor': 'w', 'action': 'bd', 'args': ['create', title],
+                'operation_id': operation_id}
+
+    def run_op(self, operation_id, **options):
+        return run_guarded(self.request(operation_id), self.path, self.effect,
+                           journal_options=options or None)
+
+    def uncertain(self, operation_id):
+        def boom():
+            self.records.append('ran-uncertain')
+            raise OSError('lost after write')
+        return run_guarded(self.request(operation_id), self.path, boom)
+
+    def journal(self, **options):
+        return OperationJournal(str(self.path), **options)
+
+    def test_an_idle_gap_settles_without_an_operator(self):
+        for gap in (30 * self.HOUR, 2.6 * self.DAY):
+            with self.subTest(gap=gap):
+                self.path = self.tmp / ('gap-%d' % gap) / http_authority.JOURNAL_FILENAME
+                del self.records[:]
+                friday = self.clock[0]
+                self.assertEqual(0, self.run_op('op-fri')['returncode'])
+                self.clock[0] = friday + gap
+                monday = self.clock[0]
+                self.assertEqual(0, self.run_op('op-mon')['returncode'])
+                stats = self.journal().stats()
+                self.assertTrue(stats['suspect'])
+                self.assertEqual(friday, stats['anchor'])
+                self.assertEqual(monday, stats['suspect_since'])
+                # Rows carry the raw clock, never the mark.
+                self.assertEqual(monday, self.journal().lookup('op-mon')['at'])
+                # A receipt committed 60 s earlier replays; nothing was reclaimed yet.
+                self.clock[0] += 60
+                replay = self.run_op('op-mon')
+                self.assertEqual(0, replay['returncode'], replay)
+                self.assertEqual(2, len(self.records))
+                self.assertEqual('committed', self.journal().lookup('op-fri')['state'])
+                # After the settle hour the next write clears suspicion and reclaims.
+                self.clock[0] = monday + self.HOUR + 1
+                self.assertEqual(0, self.run_op('op-mon-2')['returncode'])
+                stats = self.journal().stats()
+                self.assertFalse(stats['suspect'])
+                self.assertFalse(stats['clock_skewed'])
+                self.assertEqual('expired', self.journal().lookup('op-fri')['state'])
+                # Daily operation afterwards: never refused, reclaim keeps running.
+                codes = {}
+                for day in range(1, 7):
+                    self.clock[0] = monday + day * self.DAY
+                    for index in range(4):
+                        self.clock[0] += 600
+                        rc = self.run_op('op-d%d-%d' % (day, index))['returncode']
+                        codes[rc] = codes.get(rc, 0) + 1
+                    self.clock[0] += 60
+                    replay = self.run_op('op-d%d-3' % day)
+                    self.assertEqual(0, replay['returncode'], replay)
+                    self.assertFalse(self.journal().stats()['suspect'])
+                self.assertEqual({0: 24}, codes)
+                # A receipt from five days ago is refused as expired, never re-run.
+                ran = len(self.records)
+                old = self.run_op('op-d1-0')
+                self.assertEqual(2, old['returncode'], old)
+                self.assertEqual(ran, len(self.records))
+                self.assertEqual('expired', self.journal().lookup('op-d1-0')['state'])
+                stats = self.journal().stats()
+                self.assertTrue(stats['running_totals_match'])
+                self.assertLessEqual(stats["live"], 8)
+                self.clock[0] += self.DAY
+
+    def test_a_long_idle_gap_does_not_refuse_writes_at_a_scaled_limit(self):
+        # The reviewer's full probe, scaled: limit 200, a 30 h gap, then one op every
+        # 10 minutes for three days. Revision 8 refused from day 1.4.
+        options = {'limit': 200}
+        self.assertEqual(0, self.run_op('op-start', **options)['returncode'])
+        self.clock[0] += 30 * self.HOUR
+        codes = {}
+        for index in range(432):
+            self.clock[0] += 600
+            rc = self.run_op('op-%d' % index, **options)['returncode']
+            codes[rc] = codes.get(rc, 0) + 1
+        self.assertEqual({0: 432}, codes)
+        stats = self.journal(**options).stats()
+        self.assertFalse(stats['clock_skewed'])
+        self.assertLessEqual(stats['live'], 150)
+
+    def test_a_corrected_forward_jump_replays_and_keeps_uncertainty(self):
+        real = self.clock[0]
+        self.assertEqual(0, self.run_op('op-k')['returncode'])
+        self.assertEqual(124, self.uncertain('op-ku')['returncode'])
+        ran = len(self.records)
+        self.clock[0] = real + 8 * self.DAY
+        self.assertEqual(124, self.run_op('op-ku')['returncode'])
+        self.assertEqual(0, self.run_op('op-j')['returncode'])
+        self.assertTrue(self.journal().stats()['suspect'])
+        # Corrected inside the hour: the committed receipt replays, the uncertain
+        # reservation reports 124, nothing is re-executed or reclaimed.
+        self.clock[0] = real + 120
+        replay = self.run_op('op-k')
+        self.assertEqual(0, replay['returncode'], replay)
+        self.assertEqual(124, self.run_op('op-ku')['returncode'])
+        self.assertEqual(ran + 1, len(self.records))
+        self.assertEqual(0, self.journal().stats()['tombstones'])
+        # Two real days later, still suspect (the jump left high_water in the future):
+        # expiry is capped at anchor + 24 h, so the old receipt is refused and the
+        # uncertain one still reports 124; nothing is re-executed.
+        self.clock[0] = real + 2 * self.DAY
+        self.assertEqual(2, self.run_op('op-k')['returncode'])
+        self.assertEqual(124, self.run_op('op-ku')['returncode'])
+        self.assertEqual(ran + 1, len(self.records))
+        # The operator reset re-arms detection and normal operation resumes.
+        self.journal().reset_high_water()
+        self.assertEqual(0, self.run_op('op-after')['returncode'])
+        stats = self.journal().stats()
+        self.assertFalse(stats['suspect'])
+        self.assertEqual('expired', self.journal().lookup('op-k')['state'])
+        self.assertEqual('unknown', self.journal().lookup('op-ku')['state'])
+
+    def test_a_jump_that_persists_past_the_settle_hour_is_accepted_without_reexecution(self):
+        real = self.clock[0]
+        self.assertEqual(0, self.run_op('op-a')['returncode'])
+        self.assertEqual(124, self.uncertain('op-u')['returncode'])
+        ran = len(self.records)
+        self.clock[0] = real + 8 * self.DAY
+        self.assertEqual(0, self.run_op('op-j1')['returncode'])
+        self.assertEqual('committed', self.journal().lookup('op-a')['state'])
+        self.clock[0] += self.HOUR + 1
+        self.assertEqual(0, self.run_op('op-j2')['returncode'])
+        stats = self.journal().stats()
+        self.assertFalse(stats['suspect'])
+        # Both pre-jump identities were compacted to tombstones: refused, never re-run.
+        self.assertEqual('expired', self.journal().lookup('op-a')['state'])
+        self.assertEqual('expired', self.journal().lookup('op-u')['state'])
+        self.assertEqual(2, self.run_op('op-a')['returncode'])
+        self.assertEqual(2, self.run_op('op-u')['returncode'])
+        self.assertEqual(ran + 2, len(self.records))
+
+    def test_a_backward_step_is_not_suspect(self):
+        real = self.clock[0]
+        self.assertEqual(0, self.run_op('op-1')['returncode'])
+        self.clock[0] = real - 3 * self.DAY
+        self.assertEqual(0, self.run_op('op-2')['returncode'])
+        stats = self.journal().stats()
+        self.assertFalse(stats['suspect'])
+        self.assertEqual(real, stats['clock_persisted']['high_water'])
+
+    def test_a_further_big_step_keeps_the_original_anchor(self):
+        real = self.clock[0]
+        self.run_op('op-1')
+        self.clock[0] = real + 2 * self.DAY
+        self.run_op('op-2')
+        self.clock[0] = real + 5 * self.DAY
+        self.run_op('op-3')
+        stats = self.journal().stats()
+        self.assertTrue(stats['suspect'])
+        self.assertEqual(real, stats['anchor'])
+        self.assertEqual(real + 5 * self.DAY, stats['suspect_since'])
+        self.assertEqual(real + self.DAY, self.journal().trusted_now())
+
+    def test_reset_high_water_clears_suspicion(self):
+        real = self.clock[0]
+        self.run_op('op-1')
+        self.clock[0] = real + 3 * self.DAY
+        self.run_op('op-2')
+        self.assertTrue(self.journal().stats()['suspect'])
+        self.assertEqual(self.clock[0], self.journal().reset_high_water())
+        stats = self.journal().stats()
+        self.assertFalse(stats['suspect'])
+        self.assertIsNone(stats['anchor'])
+        self.assertIsNone(stats['suspect_since'])
+        self.assertEqual(self.clock[0], stats['high_water'])
+        self.assertEqual(self.clock[0], self.journal().trusted_now())
+        self.assertEqual(1, self.journal().reclaim_expired())
+
+    def test_a_full_journal_still_settles_and_reclaims(self):
+        # A refused write still commits its clock observation, so a full journal after
+        # a gap settles and then reclaims instead of refusing forever.
+        options = {'limit': 3}
+        for index in range(3):
+            self.run_op('op-%d' % index, **options)
+        self.clock[0] += 3 * self.DAY
+        self.assertEqual(124, self.run_op('op-new', **options)['returncode'])
+        self.assertTrue(self.journal(**options).stats()['clock_persisted']['suspect'])
+        self.clock[0] += self.HOUR + 1
+        self.assertEqual(0, self.run_op('op-new', **options)['returncode'])
+        self.assertEqual(3, self.journal(**options).stats()['tombstones'])
+
+    def _rev8_store(self, high_water, rows=3):
+        """Build a schema-4 (revision 8) store: high_water only, no clock state."""
+        import sqlite3
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(str(self.path))
+        connection.execute('CREATE TABLE meta (key TEXT PRIMARY KEY, value)')
+        connection.execute('CREATE TABLE operations (%s)' % ', '.join(
+            '%s %s' % column for column in OperationJournal._COLUMNS))
+        connection.execute('CREATE INDEX operations_state_at ON operations (state, at)')
+        connection.execute('CREATE INDEX operations_tombstone_age ON operations (reclaimed_at)')
+        request = self.request('seed')
+        for index in range(rows):
+            connection.execute(
+                'INSERT INTO operations (operation_id, state, request_hash, principal, at, '
+                'envelope, bytes) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                ('op-old-%d' % index, 'committed', http_authority.operation_hash(request),
+                 principal_key(request), high_water - index,
+                 json.dumps({'returncode': 0, 'stdout': 'old', 'stderr': ''}), 10))
+        for key, value in (('schema', 4), ('high_water', high_water), ('live_count', rows),
+                           ('tombstone_count', 0), ('total_bytes', 10 * rows),
+                           ('legacy_migrated', 4)):
+            connection.execute('INSERT INTO meta (key, value) VALUES (?, ?)', (key, value))
+        connection.commit()
+        connection.close()
+
+    def _schema_view(self):
+        import sqlite3
+        connection = sqlite3.connect(str(self.path))
+        try:
+            meta = dict(connection.execute('SELECT key, value FROM meta'))
+            indexes = {row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'")}
+            nulls = connection.execute(
+                'SELECT COUNT(*) FROM operations WHERE replay_until IS NULL '
+                'OR expires_at IS NULL').fetchone()[0]
+        finally:
+            connection.close()
+        return meta, indexes, nulls
+
+    def test_a_rev8_store_far_in_the_past_upgrades_atomically(self):
+        from unittest.mock import patch
+        old = self.clock[0] - 10 * self.DAY
+        self._rev8_store(old)
+        # A crash inside the upgrade transaction leaves the schema-4 store untouched.
+        with patch.object(OperationJournal, '_upgrade_clock',
+                          side_effect=RuntimeError('crash during upgrade')):
+            with self.assertRaises(RuntimeError):
+                self.journal().lookup('op-old-0')
+        meta, indexes, nulls = self._schema_view()
+        self.assertEqual(4, int(meta['schema']))
+        self.assertNotIn('suspect', meta)
+        self.assertNotIn('operations_state_reclaimed', indexes)
+        self.assertEqual(3, nulls)
+        # A clean open upgrades everything in one transaction.
+        self.assertEqual('committed', self.journal().lookup('op-old-0')['state'])
+        meta, indexes, nulls = self._schema_view()
+        self.assertEqual(http_authority.JOURNAL_SCHEMA, int(meta['schema']))
+        self.assertEqual(1, int(meta['suspect']))
+        self.assertEqual(old, float(meta['anchor']))
+        self.assertEqual(self.clock[0], float(meta['suspect_since']))
+        self.assertIn('operations_state_reclaimed', indexes)
+        self.assertNotIn('operations_tombstone_age', indexes)
+        self.assertEqual(0, nulls)
+        # The upgraded store settles like any idle gap: no freeze.
+        self.assertEqual(0, self.run_op('op-new')['returncode'])
+        self.clock[0] += self.HOUR + 1
+        self.assertEqual(0, self.run_op('op-new-2')['returncode'])
+        stats = self.journal().stats()
+        self.assertFalse(stats['suspect'])
+        self.assertEqual(3, stats['tombstones'])
+        # An up-to-date store runs no DDL or backfill on open.
+        with patch.object(OperationJournal, '_ensure_columns',
+                          side_effect=AssertionError('backfill on open')), \
+                patch.object(OperationJournal, '_create_schema',
+                             side_effect=AssertionError('DDL on open')):
+            self.assertEqual('committed', self.journal().lookup('op-new-2')['state'])
+
+    def test_a_recent_rev8_store_upgrades_without_suspicion(self):
+        self._rev8_store(self.clock[0] - 60)
+        stats = self.journal().stats()
+        self.assertFalse(stats['clock_persisted']['suspect'])
+        self.assertEqual(self.clock[0] - 60, stats['clock_persisted']['high_water'])
+        self.assertEqual(0, self.run_op('op-old-0')['returncode'])
+        self.assertEqual([], self.records)
+
+    def test_stale_tombstone_ageing_is_an_index_range_scan(self):
+        import sqlite3
+        self.run_op('op-1')
+        connection = sqlite3.connect(str(self.path))
+        try:
+            plan = ' '.join(str(row) for row in connection.execute(
+                "EXPLAIN QUERY PLAN SELECT COUNT(*), COALESCE(SUM(bytes), 0) FROM operations "
+                "WHERE state = 'expired' AND reclaimed_at <= ?", (0,)))
+        finally:
+            connection.close()
+        self.assertIn('operations_state_reclaimed', plan)
+        self.assertIn('reclaimed_at<?', plan.replace(' ', ''))
+
+
+class RecordStoreClockCase(unittest.TestCase):
+    """24. The HTTP record store uses the same trusted clock as the journal."""
+
+    def setUp(self):
+        from http_auth import RecordStore
+        self.tmp = unique_dir('recordclock9-')
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.clock = [time.time()]
+        self.store = RecordStore(self.tmp / 'state.json.records.sqlite3',
+                                 clock=lambda: self.clock[0])
+
+    def test_a_jump_neither_expires_nor_purges_until_it_settles(self):
+        start = self.clock[0]
+        self.store.put('idempotency', 'k', {'v': 1}, ttl=3600)
+        self.clock[0] = start + 8 * 24 * 3600
+        # Read during the jump: the trusted clock is capped at anchor + 24 h, which is
+        # past this 1 h record's expiry, so it is reported expired.
+        self.assertIsNone(self.store.get('idempotency', 'k'))
+        self.store.put('idempotency', 'k2', {'v': 2}, ttl=48 * 3600)
+        stats = self.store.stats()
+        self.assertTrue(stats['suspect'])
+        self.assertEqual(start, stats['anchor'])
+        # A record written during the jump carries the raw clock and stays live; the
+        # store deletes nothing by age while suspect or after it settles early.
+        self.assertEqual({'v': 2}, self.store.get('idempotency', 'k2'))
+        self.assertEqual(0, self.store.purge())
+        self.clock[0] += 3600 + 1
+        self.assertEqual(0, self.store.purge())
+        self.assertFalse(self.store.stats()['suspect'])
+        self.assertEqual({'v': 2}, self.store.get('idempotency', 'k2'))
 
 
 if __name__ == '__main__':

@@ -40,7 +40,10 @@ from http_authority import (ALL_CAPABILITIES, CAP_ACCOUNTS_ADMIN, CAP_APPROVE,
                             CAP_PROJECT_CREATE, CAP_READ, CAP_REVIEWS, CAP_TASKS,
                             CREDENTIAL_FORBIDDEN_CAPABILITIES, CREDENTIAL_SCOPES, RANK,
                             ROLE_CAPABILITIES, ROLES, SCOPE_CAPABILITIES, SCHEMA_VERSION,
-                            AuthorityDenied, authority_request, decide, file_lock)
+                            JOURNAL_MAX_SKEW_SECONDS, JOURNAL_SUSPECT_SETTLE_SECONDS,
+                            AuthorityDenied, authority_request, clock_advance,
+                            clock_persist, clock_report, clock_state,
+                            clock_trusted, decide, file_lock)
 
 # Password verifier policy. n=2**14, r=8 needs ~16 MiB per hash; scrypt is the
 # memory-hard scheme available in the standard library without third-party wheels.
@@ -271,11 +274,21 @@ class RecordStore:
     * ``purge`` removes only records whose own ``expires_at`` has genuinely passed.
       There is deliberately no count or byte eviction: the durable endpoint operation
       journal is what makes a retry safe, so a record is dropped by *age* alone.
+    * The store uses the same **trusted clock** as the operation journal
+      (``http_authority`` module docstring): ``meta`` holds ``high_water``,
+      ``suspect``, ``anchor`` and ``suspect_since``; every write transaction observes
+      the raw clock; whether a record has expired is decided against the trusted clock
+      (``min(now, anchor + max_skew)`` while suspect); ``created_at`` is stamped with
+      the raw clock; and expired records are deleted only while the store is not
+      suspect, against the raw clock.
     """
 
-    def __init__(self, path, clock=time.time):
+    def __init__(self, path, clock=time.time, max_skew=JOURNAL_MAX_SKEW_SECONDS,
+                 settle=JOURNAL_SUSPECT_SETTLE_SECONDS):
         self.path = Path(path)
         self.clock = clock
+        self.max_skew = max_skew
+        self.settle = settle
         self._ensure()
 
     def _connection(self):
@@ -297,20 +310,41 @@ class RecordStore:
                 'PRIMARY KEY (kind, key))')
             connection.execute('CREATE INDEX IF NOT EXISTS records_expiry '
                                'ON records (kind, expires_at)')
+            connection.execute('CREATE TABLE IF NOT EXISTS meta '
+                               '(key TEXT PRIMARY KEY, value)')
             connection.execute('COMMIT')
 
     def _now(self):
         return self.clock()
 
+    def _observe(self, connection, now):
+        """Advance and persist the trusted-clock state inside a write transaction."""
+        state = clock_advance(clock_state(connection), now, self.max_skew, self.settle)
+        clock_persist(connection, state)
+        return state
+
+    def trusted_now(self, now=None, connection=None):
+        """The trusted clock the next write would see (expiry decisions only)."""
+        moment = self._now() if now is None else now
+        if connection is None:
+            with self._connection() as opened:
+                state = clock_state(opened)
+        else:
+            state = clock_state(connection)
+        return clock_trusted(clock_advance(state, moment, self.max_skew, self.settle),
+                             moment, self.max_skew)
+
     def get(self, kind, key):
         """The stored record, or ``None``. Never returns an expired record."""
+        moment = self._now()
         with self._connection() as connection:
             row = connection.execute(
                 'SELECT payload, expires_at FROM records WHERE kind = ? AND key = ?',
                 (kind, key)).fetchone()
+            trusted = self.trusted_now(moment, connection) if row is not None else None
         if row is None:
             return None
-        if row['expires_at'] is not None and row['expires_at'] <= self._now():
+        if row['expires_at'] is not None and row['expires_at'] <= trusted:
             self.delete(kind, key)
             return None
         try:
@@ -327,30 +361,47 @@ class RecordStore:
             expires = moment + float(ttl if ttl is not None else IDEMPOTENCY_TTL_SECONDS)
         with self._connection() as connection:
             connection.execute('BEGIN IMMEDIATE')
-            connection.execute(
-                'INSERT OR REPLACE INTO records (kind, key, payload, created_at, '
-                'expires_at) VALUES (?, ?, ?, ?, ?)',
-                (kind, key, json.dumps(record, ensure_ascii=False, sort_keys=True),
-                 moment, float(expires)))
-            # Time-only retention is enforced here, on the same transaction, so the
-            # table cannot grow without a matching expiry sweep.
-            connection.execute('DELETE FROM records WHERE kind = ? AND expires_at <= ?',
-                               (kind, moment))
+            try:
+                clock = self._observe(connection, moment)
+                connection.execute(
+                    'INSERT OR REPLACE INTO records (kind, key, payload, created_at, '
+                    'expires_at) VALUES (?, ?, ?, ?, ?)',
+                    (kind, key, json.dumps(record, ensure_ascii=False, sort_keys=True),
+                     moment, float(expires)))
+                # Time-only retention is enforced here, on the same transaction, so the
+                # table cannot grow without a matching expiry sweep. It is skipped while
+                # the clock is suspect, so an unaccepted jump cannot age records out.
+                if not clock['suspect']:
+                    connection.execute(
+                        'DELETE FROM records WHERE kind = ? AND expires_at <= ?',
+                        (kind, moment))
+            except BaseException:
+                connection.execute('ROLLBACK')
+                raise
             connection.execute('COMMIT')
         return record
 
     def delete(self, kind, key):
         with self._connection() as connection:
             connection.execute('BEGIN IMMEDIATE')
+            self._observe(connection, self._now())
             connection.execute('DELETE FROM records WHERE kind = ? AND key = ?',
                                (kind, key))
             connection.execute('COMMIT')
 
     def purge(self, kind=None, now=None):
-        """Delete only records past their own ``expires_at``. Returns the count."""
+        """Delete only records past their own ``expires_at``. Returns the count.
+
+        A write transaction: it observes the clock and deletes nothing while the store
+        is suspect.
+        """
         moment = self._now() if now is None else now
         with self._connection() as connection:
             connection.execute('BEGIN IMMEDIATE')
+            clock = self._observe(connection, moment)
+            if clock['suspect']:
+                connection.execute('COMMIT')
+                return 0
             if kind is None:
                 row = connection.execute(
                     'SELECT COUNT(*) FROM records WHERE expires_at <= ?', (moment,)).fetchone()
@@ -364,23 +415,40 @@ class RecordStore:
             connection.execute('COMMIT')
         return int(row[0])
 
+    def reset_high_water(self, now=None):
+        """Operator recovery after a clock correction (see ``OperationJournal``)."""
+        moment = float(self._now() if now is None else now)
+        with self._connection() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            clock_persist(connection, {'high_water': moment, 'suspect': False,
+                                       'anchor': None, 'suspect_since': None})
+            connection.execute('COMMIT')
+        return moment
+
     def stats(self, now=None):
-        """Operator-visible record counts and byte sizes, by kind and expiry."""
+        """Operator-visible record counts, byte sizes and trusted-clock state."""
         moment = self._now() if now is None else now
         with self._connection() as connection:
+            clock = clock_state(connection)
+            view = clock_advance(clock, moment, self.max_skew, self.settle)
+            trusted = clock_trusted(view, moment, self.max_skew)
             kinds = {}
             for row in connection.execute(
                     'SELECT kind, COUNT(*) AS total, '
                     'COALESCE(SUM(LENGTH(payload)), 0) AS bytes, '
                     'SUM(CASE WHEN expires_at <= ? THEN 1 ELSE 0 END) AS due '
-                    'FROM records GROUP BY kind', (moment,)):
+                    'FROM records GROUP BY kind', (trusted,)):
                 kinds[row['kind']] = {'total': int(row['total']),
                                       'bytes': int(row['bytes']),
                                       'expired': int(row['due'] or 0)}
             mode = connection.execute('PRAGMA journal_mode').fetchone()[0]
             total = connection.execute('SELECT COUNT(*) FROM records').fetchone()[0]
-        return {'records': int(total), 'kinds': kinds, 'journal_mode': mode,
-                'file_bytes': self.path.stat().st_size if self.path.exists() else 0}
+        report = {'records': int(total), 'kinds': kinds, 'journal_mode': mode,
+                  'trusted_now': trusted,
+                  'file_bytes': self.path.stat().st_size if self.path.exists() else 0}
+        report.update(clock_report(view))
+        report['clock_persisted'] = clock_report(clock)
+        return report
 
 
 class Store:
