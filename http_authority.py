@@ -88,14 +88,28 @@ extends retention by the jump length, and an idle gap of more than 24 h (a weeke
 extends it by the gap, which is safe. :meth:`OperationJournal.reset_high_water` never
 reduces the credit.
 
-**Client retry contract.** A step of 24 h or less is never suspect, so it is not
-credited. An exact retry must therefore be no older than
+**Client retry contract.** An exact retry sent no more than
 :data:`JOURNAL_RETRY_HORIZON_SECONDS` (``JOURNAL_TOMBSTONE_SECONDS -
-JOURNAL_MAX_SKEW_SECONDS``, 29 days) after the original attempt. Inside that horizon a
-retry replays, reports ``124`` or is refused as expired (``rc=2``) - it is never
-re-executed, whatever the clock did. An older retry is unsupported: its tombstone may
+JOURNAL_MAX_SKEW_SECONDS``, 29 days) after the original attempt replays, reports
+``124`` or is refused as expired (``rc=2``) - it is never re-executed - **as long as
+the total uncredited forward clock error stays below** ``JOURNAL_MAX_SKEW_SECONDS``
+(24 h). A forward step of 24 h or less is never suspect and never credited, and such
+steps compose: several false steps just under 24 h with no correction age tombstones
+early by their sum (three false +23 h steps re-execute retries about 28.4-29.1 days
+old). Keep the host clock disciplined (NTP); after finding and correcting a clock that
+ran ahead, run ``admin.py journal PROJECT --reset-high-water`` to re-arm detection.
+Tombstones already aged out during the error are not restored, so retries of those
+identities are outside the guarantee. An older retry is unsupported: its tombstone may
 have been aged out and the effect may run again. Use a fresh ``operation_id`` after
-reconciling instead.
+reconciling instead. The service-local HTTP routes (credential issue, account/project
+create, membership changes) have no canonical journal behind them: their guarantee is
+the HTTP idempotency record's window (``http_auth.IDEMPOTENCY_TTL_SECONDS``, 24 h),
+kept on the same confirmed timeline by ``http_auth.RecordStore``.
+
+**Sparse projects.** A project whose writes are always more than 24 h apart credits
+every gap, so its ``jump_credit`` grows at about real time and its (few) tombstones
+effectively never age out. That is safe - the retention cost is one small row per
+identity - and it ends as soon as writes fall within 24 h of each other.
 
 Effect: after an idle weekend the first write is suspect for one hour, with the
 trusted clock held near the anchor (receipts older than their window may still replay
@@ -163,9 +177,10 @@ JOURNAL_MAX_SKEW_SECONDS = 24 * 60 * 60
 #: How long the raw clock must keep running after a suspect step before the step is
 #: accepted and suspicion clears on the next write.
 JOURNAL_SUSPECT_SETTLE_SECONDS = 60 * 60
-#: The client retry contract: an exact retry must be no older than this after the
-#: original attempt (the tombstone horizon minus the largest uncredited clock step).
-#: Inside it a retry is never re-executed; an older retry is unsupported.
+#: The client retry contract: an exact retry no older than this after the original
+#: attempt is never re-executed, provided the total uncredited forward clock error
+#: (forward steps of 24 h or less that were not real elapsed time) stays below
+#: ``JOURNAL_MAX_SKEW_SECONDS``. An older retry is unsupported.
 JOURNAL_RETRY_HORIZON_SECONDS = JOURNAL_TOMBSTONE_SECONDS - JOURNAL_MAX_SKEW_SECONDS
 #: Largest serialized response envelope retained for replay. A larger envelope is
 #: recorded by digest only, so a retry reports uncertainty instead of a truncated
@@ -1404,7 +1419,8 @@ class OperationJournal:
         its age excluding every suspect forward step credited since it was reclaimed.
         An accepted forward jump therefore extends retention by the jump length rather
         than ageing tombstones out, so no identity inside the client retry horizon
-        (:data:`JOURNAL_RETRY_HORIZON_SECONDS`) is ever deleted by a clock jump. It also
+        (:data:`JOURNAL_RETRY_HORIZON_SECONDS`) is deleted by a credited jump; uncredited
+        steps of 24 h or less are bounded by the retry contract. It also
         runs only while the store is not suspect, and is never used to satisfy the byte
         or count budget. This is the *only* place an identity row is deleted by policy.
         """

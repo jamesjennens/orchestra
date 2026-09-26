@@ -349,7 +349,7 @@ binding is deferred with the job/artifact routes. A syntactically valid attachme
 therefore rejected with `501 not_implemented` rather than accepted and dropped. The
 service never returns `201` while discarding submitted evidence.
 
-An exact retry must be sent no more than 29 days after the original attempt (the journal's `JOURNAL_RETRY_HORIZON_SECONDS`); inside that horizon it is never re-executed, and an older retry is unsupported.
+An exact retry of a canonical mutation sent no more than 29 days after the original attempt (the journal's `JOURNAL_RETRY_HORIZON_SECONDS`) is never re-executed, as long as the total uncredited forward clock error (forward steps of 24 h or less that were not real elapsed time) stays below 24 h; recover with `--reset-high-water` after correcting the clock. An older retry is unsupported. A service-local route's exact-retry window is the 24 h HTTP idempotency record, kept on the same confirmed timeline.
 
 Every mutation that can be retried accepts an idempotency key scoped to
 authenticated principal, project and operation route. The key namespace does
@@ -567,12 +567,27 @@ the same boundary:
   reclaim still uses the raw clock once not suspect (worst case `rc=2`).
 * *Client retry contract.* A step of 24 h or less is not suspect and not credited, so an
   exact retry must be no older than `JOURNAL_RETRY_HORIZON_SECONDS` (29 days); inside it
-  a retry is never re-executed, an older one is unsupported.
+  a retry is never re-executed while the total uncredited forward clock error stays
+  below 24 h (rev11 wording), and an older one is unsupported.
 * *Trusted clock during a jump.* While suspect the trusted clock is
   `clamp(anchor + (now - suspect_since), anchor, anchor + 24 h)`, counting only time
   elapsed since the step, so a 60-second-old receipt replays during a jump.
 * *Snapshots* are converted to `journal_mode=DELETE`, leaving no `-wal`/`-shm` in
   `backups/`.
+
+**Current build status (rev11).** Revision 11 answers the round-10 review:
+
+* *HTTP idempotency records on the confirmed timeline.* `RecordStore` deleted records
+  with `expires_at <= raw now` once suspicion cleared, so after an accepted +8 day jump
+  and a correction an exact retry of `credentials.issue` 10 minutes after the original
+  issued a second credential. Each record now stores
+  `expires_confirmed = expires_at - jump_credit` (its own mirrored clock state and
+  credit, schema 2, upgraded atomically with credit 0) and is expired or deleted only
+  when `expires_confirmed < now - jump_credit`; rewriting a reservation keeps its
+  original confirmed expiry.
+* *Contract wording.* The retry guarantee holds while the total uncredited forward clock
+  error stays below 24 h; steps of 24 h or less compose (three false +23 h steps
+  re-execute retries about 28.4-29.1 days old). No dense-write crediting was added.
 
 
 Credential issuance is the deliberate exception to replaying a secret. The

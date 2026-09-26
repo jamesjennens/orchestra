@@ -173,11 +173,23 @@ Mutating calls accept an `Idempotency-Key`. On an uncertain `503` the client
 raises `UncertainOutcome` carrying the key: retry the identical request with that
 key to reconcile. Never retry an uncertain mutation with a new key.
 
-**Retry contract.** An exact retry must be sent no more than 29 days (`JOURNAL_RETRY_HORIZON_SECONDS`, the 30-day tombstone horizon minus the 24 h skew allowance) after the original attempt. Inside that horizon a
-retry replays the recorded result, reports uncertainty or is refused as expired; it
-is never re-executed, whatever the server clock did. An older retry is unsupported: its
-tombstone may have aged out and the effect may run again. Reconcile canonical state and
-use a new key instead.
+**Retry contract.** An exact retry sent no more than 29 days
+(`JOURNAL_RETRY_HORIZON_SECONDS`, the 30-day tombstone horizon minus the 24 h skew
+allowance) after the original attempt replays the recorded result, reports
+uncertainty or is refused as expired; it is never re-executed, **as long as the total
+uncredited forward clock error stays below 24 h** (`JOURNAL_MAX_SKEW_SECONDS`). A
+forward step of 24 h or less is not suspect and not credited, and such steps add up:
+three false +23 h steps with no correction re-execute retries about 28.4-29.1 days
+old. Keep the host clock NTP-disciplined; after correcting a clock that ran ahead, run
+`admin.py journal <PROJECT> --reset-high-water`. Tombstones already aged out during the
+error are not restored. An older retry is unsupported: its tombstone may have aged out
+and the effect may run again. Reconcile canonical state and use a new key instead.
+
+Service-local routes (credential issue, account and project create, membership
+changes) are not backed by the canonical journal: their exact-retry window is the HTTP
+idempotency record's (`IDEMPOTENCY_TTL_SECONDS`, 24 h). That record expires on the same
+confirmed timeline (see the record store in section 8), so a clock jump never shortens
+it; a retry after the window is treated as a new request.
 
 ## 7. Secrets, rotation and redaction
 
@@ -190,6 +202,24 @@ use a new key instead.
 - Audit events record time, request id, authenticated user id, project, action,
   outcome and a short redacted reason. They never contain request bodies,
   `Authorization` headers, cookies, passwords, reset values or attachment content.
+
+### Clock jumps and time-based expiry
+
+Every place that ages or deletes by time, and what an accepted clock jump does to it:
+
+| Item | Clock | Can a jump re-execute an effect? | Security direction |
+|---|---|---|---|
+| Journal tombstones (`http_authority`) | confirmed timeline (`aged_from`, `jump_credit`) | No (within the retry contract) | n/a |
+| Journal receipt reclaim, uncertain expiry | raw, only when not suspect | No: worst case `rc=2` refusal | n/a |
+| HTTP idempotency records and committed results (`RecordStore`) | confirmed timeline (`expires_confirmed`) | No: a retry replays or is refused | n/a |
+| Sessions (idle and absolute), worker credentials, reset tokens | raw absolute expiry | No | A forward jump expires existing ones **early** (safe). Anything issued or refreshed during a forward jump that is later corrected lives **late**, by the jump length; a clock set backwards extends every live one by the step |
+| Login throttle window (in memory) | raw | No | A forward jump clears it early (a few extra attempts); a backward step keeps it longer (safe) |
+| Audit log (`AUDIT_LIMIT`) | count-bounded; timestamps only | No | none |
+
+After correcting a clock that ran **ahead**, revoke the sessions, worker credentials and
+reset tokens issued during the error window (they carry `created_at` on the wrong
+clock), then run `--reset-high-water`. After correcting a clock that ran **behind**,
+nothing is extended.
 
 ## 8. Backup, restore and rollback
 
@@ -315,7 +345,12 @@ The store keeps the same three concepts:
   reclaim pauses), and a repeat of the same jump would not be detected again, until
   `--reset-high-water` (below). A clock step of 24 h or less is not suspect and not
   credited, which is why the client retry contract (section 6) is the horizon minus
-  24 h.
+  24 h and holds only while the total uncredited forward clock error stays below 24 h.
+
+  *Sparse projects.* A project whose writes are always more than 24 h apart credits
+  every gap, so its `jump_credit` grows at about real time and its few tombstones
+  effectively never age out. This is safe (one small row per identity) and ends as soon
+  as writes fall within 24 h of each other.
 
 An exact retry inside its window replays the committed response or reports `124`
 uncertainty; outside it (or after reclaim) it is refused as expired with `rc=2`. It is
@@ -345,7 +380,14 @@ timestamps.
 
 The HTTP service's own idempotency receipts and committed canonical results live in a
 second SQLite store beside the service state document (`<state>.records.sqlite3`,
-`http_auth.RecordStore`, WAL, time-only retention). They used to live inside the
+`http_auth.RecordStore`, WAL, time-only retention). It keeps its own trusted-clock state
+and `jump_credit` in its own `meta` table (the same rules as the journal, mirrored, not
+shared rows), stores each record's expiry on the confirmed timeline
+(`expires_confirmed = expires_at - jump_credit` at write time), and treats a record as
+expired, or deletes it, only when `expires_confirmed < now - jump_credit` (clamped
+trusted clock while suspect; no deletion while suspect). A clock jump therefore never
+ages an HTTP idempotency record or committed result out early. An older record store is
+upgraded atomically on open (`expires_confirmed = expires_at`, credit 0). They used to live inside the
 `http.json` state document, where the result map evicted by count/bytes and the
 idempotency map grew without bound; `http.json` no longer grows with the number of keyed
 operations and no keyed operation rewrites it. Back up the two files together: the
@@ -379,7 +421,9 @@ never reduces `jump_credit`, so tombstones keep ageing on the confirmed timeline
 operator action is needed after an idle gap (suspicion settles by itself after an
 hour). Use it after correcting a clock that had jumped forward: it re-arms jump
 detection and ends the capped-expiry period at once. It removes no identity by itself.
-Older stores are upgraded on first open in one transaction. A rev7/rev8 store whose
+Older stores are upgraded on first open in one transaction. The credit always
+starts at 0: schema 4 and 5 stores were never deployed, so no step before the upgrade
+is credited. A rev7/rev8 store whose
 `high_water` is more than 24 h old starts suspect (`anchor = high_water`) and settles an
 hour later like any idle gap. Schema 6 (this revision; from a rev9 schema-5 store or
 older) adds `jump_credit = 0`, the `aged_from` column (set to `reclaimed_at` for
