@@ -41,17 +41,38 @@ share them. Use no other actor's directory or another project's checkout:
 
 REPLACE_WITH_SSH_BOOTSTRAP_COMMAND
 
-Use the installed client/config printed in the returned project entry. Inspect
-task ownership and dependencies, then choose one unheld task from `ready --json`.
-Claim it atomically and register/verify your plan before implementation. Do not
-claim another task until this one is delivered. Follow the project's Delivery
-section; if absent or unclear, ask the coordinator rather than guessing.
+For first use, leave Actor and Client/config blank until start returns them; do not
+assume the checkout already exists. After successful start, save its actor,
+request ID and exact client configuration privately, then clone the repository
+into this worker's own checkout. If onboarding fails after registration, retain
+the actor and retry onboarding; do not run start again. Returning workers fill
+Actor, Client/config and Checkout from private saved state and skip registration.
 
-Only if the harness and project explicitly permit a loop, check every
-REPLACE_INTERVAL_MINUTES minutes for review feedback on your own tasks with
-`work --mine` first, then look for the next task with `ready --json`. Stop at
-REPLACE_DEADLINE or when you have no actionable open or pending-review task and
-`ready --json` has no unheld task. Do not wait on work held by other actors. In
+If the coordinator explicitly supplied a task, use that task. Otherwise inspect
+task ownership and dependencies, then select one unheld task from `ready --json`.
+A task is held by another actor if it is assigned to that actor or has an
+in-progress claim belonging to that actor; unheld means neither applies. Claim it
+atomically and register/verify your plan before implementation. Do not claim
+another task until this one is delivered. The Delivery section is supplied by the
+separate onboarding-template dependency (.36); if it is absent or unclear in the
+server-owned entry, ask the coordinator rather than guessing.
+
+Run ready/work through the installed client, not as bare shell commands. Example
+after replacing the client, config, project and actor with the printed values:
+
+```sh
+python orchestra-client.py --config client.local.json --project PROJECT --actor ACTOR -- ready --json
+python orchestra-client.py --config client.local.json --project PROJECT --actor ACTOR -- work --mine
+```
+
+Only if the harness and project explicitly permit a loop, after delivery check
+every REPLACE_INTERVAL_MINUTES minutes for review feedback on your own tasks first,
+then check `ready --json` for one next unheld task. Continue when a task is
+available; do not stop just because the previous task was delivered. Stop at
+REPLACE_DEADLINE or, after checking both sources, when you have no actionable open
+or pending-review task and `ready` has no unheld task. Use the full
+client-prefixed command examples above; do not run bare `work --mine` or
+`ready --json` as shell commands. Do not wait on work held by other actors. In
 office/person-started mode, do not poll or loop; end each turn with a one-line
 status for the person. Do not depend on another worker's checkout or start another
 coordination database.

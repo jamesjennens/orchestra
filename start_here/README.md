@@ -136,9 +136,20 @@ actor on later runs. Never use `start` to replace an interrupted worker.
    claims. Do not run `client.py` from the project clone unless that repository is
    the Orchestra kit itself.
 7. Read the task, dependencies, history and current owners. Recheck overlapping
-   files/interfaces. Choose one unheld task from `ready --json`, claim it atomically,
-   register the complete plan and pass any required acknowledgement or launch gate
-   before editing. Do not claim another task until this one has been delivered.
+   files/interfaces. Use an explicitly assigned task if one was supplied; otherwise
+   choose one unheld task from `ready --json`. A task is held by another actor if it
+   is assigned to that actor or has an in-progress claim belonging to that actor;
+   unheld means neither applies. Run task queries through the installed client, not
+   as bare shell commands; for example:
+
+   ```sh
+   python orchestra-client.py --config client.local.json --project PROJECT --actor ACTOR -- ready --json
+   python orchestra-client.py --config client.local.json --project PROJECT --actor ACTOR -- work --mine
+   ```
+
+   Claim the task atomically, register the complete plan and pass any required
+   acknowledgement or launch gate before editing. Do not claim another task until
+   this one has been delivered.
    Follow the linked
    [`worker guide`](../docs/WORKER_GUIDE.md) and
    [`review workflow`](../docs/REVIEWS.md).
@@ -155,12 +166,15 @@ otherwise.
 
 After delivery, a loop-capable harness may continue only when the project and
 harness explicitly permit it: at the configured interval, check review feedback on
-your own tasks with `work --mine` first, then check `ready --json` for one next
-claimable task. Stop at the deadline or when you have no actionable open or
-pending-review task and `ready --json` has no unheld task; do not wait on work held
-by other actors or keep polling an empty queue. In office/person-started mode, do
-not poll or loop: finish one bounded turn and end with a one-line status for the
-person.
+your own tasks with the installed client's `work --mine` action first, then check
+`ready --json` for one next unheld task. Continue when a task is available; do not
+stop just because the previous task was delivered. Stop at the deadline or, after
+checking both sources, when you have no actionable open or pending-review task and
+`ready` has no unheld task. Use the full client-prefixed example above with the
+installed client/config/project/actor; do not run bare `work --mine` or
+`ready --json` as shell commands. Do not wait on work held by other actors or keep
+polling an empty queue. In office/person-started mode, do not poll or loop: finish
+one bounded turn and end with a one-line status for the person.
 
 ## Machine-specific settings are examples, not defaults
 

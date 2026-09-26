@@ -131,6 +131,10 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(request.call_args_list[1].kwargs['action'],'onboard')
         self.assertIn(record['actor'],stdout.getvalue())
         self.assertIn('one working directory and checkout per actor',stdout.getvalue())
+        self.assertIn('assigned task',stdout.getvalue())
+        self.assertIn('held by another actor',stdout.getvalue())
+        self.assertIn('python orchestra-client.py --config client.local.json --project PROJECT --actor ACTOR -- ready --json',stdout.getvalue())
+        self.assertIn('python orchestra-client.py --config client.local.json --project PROJECT --actor ACTOR -- work --mine',stdout.getvalue())
         self.assertIn('ready --json',stdout.getvalue())
         self.assertIn('status for the person',stdout.getvalue())
 
@@ -140,6 +144,15 @@ class SessionTests(unittest.TestCase):
         stdout=io.StringIO();stderr=io.StringIO()
         with patch.object(sys,'argv',['worker.py','--root','/srv/runtime','--project','example','start','--name','worker']),patch('onboarding.execute'),patch('admin.root_path',return_value=self.path),patch('worker.request',side_effect=replies) as request,patch('sys.stdout',stdout),patch('sys.stderr',stderr):
             self.assertEqual(worker.main(),2)
+        self.assertEqual(request.call_args_list[1].args[2],record['actor'])
+        self.assertIn(record['actor'],stdout.getvalue())
+        self.assertIn('do not register another actor',stderr.getvalue())
+
+    def test_worker_start_onboarding_exception_keeps_registered_actor(self):
+        record={'actor':'session-'+str(uuid.uuid4()),'name':'worker','request_id':str(uuid.uuid4()),'created_at':'2026-09-16T00:00:00+00:00'}
+        stdout=io.StringIO();stderr=io.StringIO()
+        with patch.object(sys,'argv',['worker.py','--root','/srv/runtime','--project','example','start','--name','worker']),patch('onboarding.execute'),patch('admin.root_path',return_value=self.path),patch('worker.request',side_effect=[{'returncode':0,'stdout':json.dumps({'session':record}),'stderr':''},RuntimeError('onboarding unavailable')]) as request,patch('sys.stdout',stdout),patch('sys.stderr',stderr):
+            with self.assertRaisesRegex(RuntimeError,'onboarding unavailable'):worker.main()
         self.assertEqual(request.call_args_list[1].args[2],record['actor'])
         self.assertIn(record['actor'],stdout.getvalue())
         self.assertIn('do not register another actor',stderr.getvalue())

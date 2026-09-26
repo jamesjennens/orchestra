@@ -15,16 +15,26 @@ Worker setup:
   private, untracked file in that directory. Do not commit or share either value.
 - Use only the installed client and exact project configuration printed above.
   If onboarding fails, keep this actor and rerun onboard; do not register again.
-- Choose one task from `ready --json`, then claim it atomically. Do not work on a
-  task that is held or already assigned, and do not claim a second task before
-  delivering the first. Follow the project's Delivery section; if it is missing or
-  unclear, ask the coordinator instead of guessing.
-- Only when the harness explicitly permits a loop, check every N minutes for review
-  feedback on your tasks with `work --mine` first, then look for the next task with
-  `ready --json`. Stop at the deadline or when you have no actionable open or
-  pending-review task and `ready --json` has no unheld task. Do not wait on tasks
-  held by other actors. In office mode, do not poll or loop; end each turn with a
-  one-line status for the person.
+- Use an explicitly assigned task if one was supplied; otherwise choose one task
+  from `ready --json`, then claim it atomically. A task is held by another actor if
+  it is assigned to that actor or has an in-progress claim belonging to that actor;
+  unheld means neither condition applies. Do not replace an explicit assignment
+  with a ready task or take work held by another actor. These are client commands,
+  not bare shell commands; for example:
+  `python orchestra-client.py --config client.local.json --project PROJECT --actor ACTOR -- ready --json`
+  `python orchestra-client.py --config client.local.json --project PROJECT --actor ACTOR -- work --mine`
+- Follow the Delivery section supplied by the separate onboarding-template
+  dependency (.36); if it is missing or unclear, ask the coordinator instead of
+  guessing.
+- Only when the harness explicitly permits a loop, after delivery check every N
+  minutes for review feedback on your tasks with the client `work --mine` action
+  first, then check `ready --json` for one next unheld task. Continue if one is
+  available; do not stop just because the previous task was delivered. Stop at the
+  deadline or, after checking both sources, when you have no actionable open or
+  pending-review task and `ready` has no unheld task. Do not wait on tasks held by
+  other actors or poll an empty queue indefinitely. In office mode, do not poll or
+  loop; end each turn with a one-line status for the person. Use the full client
+  prefix and printed config, project and actor for each command.
 """
 
 def main():
