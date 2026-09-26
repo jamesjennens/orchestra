@@ -6,7 +6,6 @@ comment authors supply attribution; actor labels are not authentication.
 import json
 import re
 import recovery
-from lifecycle import project_facts
 from requirements import canonical_bytes
 
 PREFIX = 'Kind: contribution-review-v1\n'
@@ -436,48 +435,50 @@ def project(issue, operators=None):
     return projection(ordered, voids, invalid, refused, positions)
 
 
-def scoped_integration(fact, commit):
-    """Return the integration commit iff ``fact`` records a passed ``integrated``
-    lifecycle fact scoped to ``commit``'s source revision, else ``None``."""
-    scope = (fact or {}).get('scope') or {}
-    if not scope or (scope.get('source_commit') or '').lower() != commit.lower():
-        return None
-    if ((fact or {}).get('facts') or {}).get('integrated', {}).get('value') != 'passed':
-        return None
-    return scope.get('integration_commit') or None
+def require_integrated_follow_on(payload, state, rows, task):
+    """Refuse an additive follow-on whose prior revision is not genuinely approved.
 
+    ``follows`` asserts that the reviewer's base is already integrated, so the gate
+    requires two independent things, both read from the shared review-state
+    projection, before the sole native ``comments add``:
 
-def require_integrated_follow_on(payload, state, fact):
-    """Refuse an additive follow-on whose prior revision is not integrated.
+    * the raw append-only chain must show the prior revision **approved with no
+      unresolved requests** (``awaiting-integration``). Approval is a separate
+      reviewer operation, so a contributor cannot record it for itself, unlike a
+      ``integrated=passed`` lifecycle fact (the lifecycle action only requires
+      ``payload.actor == request actor``).
+    * the shared per-scope integration evidence (kittrial-5bb.24,
+      ``review_state.integration`` over ``review_state.scopes_for``) must record a
+      passed ``integrated`` fact for the prior contribution's FULL commit, and the
+      follow-on ``base_commit`` must equal that scope's ``integration_commit``.
+      Any scope order is accepted, so recording a newer scope for other work does
+      not make a genuinely integrated prior un-followable -- the older defect that
+      read only the task's single current ``lifecycle`` scope.
 
-    ``follows`` asserts the reviewer's base is already integrated, so the prior
-    contribution must carry a passed ``integrated`` fact scoped to its own
-    ``source_commit`` and the follow-on ``base_commit`` must equal that scope's
-    ``integration_commit``. This is a transition rule checked in the write path
-    before the sole native ``comments add``, so a refused follow-on writes nothing.
-    Append-only history is never re-litigated against later lifecycle evidence, so
-    read-only projections stay readable when facts move to a new scope. When no
-    scoped lifecycle evidence is available at all (``fact`` is ``None``) the
-    minimum rule applies: the prior must be approved with nothing pending, and
-    anything else fails closed.
+    There is deliberately no ``fact is None`` fallback: ``scopes_for`` returns an
+    empty list when no scoped evidence is trusted, and ``integration`` then reports
+    ``fact='unknown'``, which the check below refuses. A self-recorded
+    ``integrated=passed`` can therefore never open the gate on its own.
     """
     if payload.get('operation') != 'contribute' or payload.get('follows') is None:
         return
     prior = state.get('contribution') or {}
     if not prior:
         raise ValueError('Contribution must follow the current revision')
-    if fact is None:
-        if state.get('review_state') != 'awaiting-integration' or state.get('pending_requests'):
-            raise ValueError('Contribution follows a revision without scoped integration evidence; '
-                             'integrate the prior contribution and record its integration commit first')
-        return
-    integration = scoped_integration(fact, prior['commit'])
-    if integration is None:
-        raise ValueError('Contribution follows a revision that is not integrated; require a passed '
-                         'integrated lifecycle fact scoped to the prior contribution commit before an '
+    if state.get('review_state') != 'awaiting-integration' or state.get('pending_requests'):
+        raise ValueError('Contribution follows a revision that is not approved; a reviewer must '
+                         'approve the prior contribution with no unresolved requests before an '
                          'additive follow-on can use it as its base')
-    if payload['base_commit'].lower() != integration.lower():
-        raise ValueError('Contribution base_commit must equal the prior integration commit ' + integration)
+    from review_state import integration, scopes_for
+    evidence = integration(prior, scopes_for(rows, task))
+    if evidence['fact'] != 'passed' or not evidence['integration_commit']:
+        raise ValueError('Contribution follows a revision that is not integrated; require a passed '
+                         'integrated lifecycle fact scoped to the prior contribution commit, read from '
+                         'the shared review-state projection, before an additive follow-on can use it '
+                         'as its base')
+    if payload['base_commit'].lower() != evidence['integration_commit'].lower():
+        raise ValueError('Contribution base_commit must equal the prior integration commit '
+                         + evidence['integration_commit'])
 
 
 def execute(rows, task, actor, payload, run, operators=None):
@@ -514,12 +515,11 @@ def execute(rows, task, actor, payload, run, operators=None):
     preview_positions['pending-write'] = len(issue.get('comments') or [])
     preview = projection(ordered + [(payload, {'id': 'pending-write', 'author': actor, 'created_at': 'pending'})],
                          voids, invalid, refused, preview_positions)
-    # A follow-on may only base itself on an integrated prior revision. Resolve the
-    # scoped lifecycle evidence here, still before the sole native mutation, so the
-    # refusal happens with zero writes.
+    # A follow-on may only base itself on an approved, integrated prior revision.
+    # Resolve both from the shared review-state projection here, still before the
+    # sole native mutation, so the refusal happens with zero writes.
     if payload['operation'] == 'contribute' and payload.get('follows') is not None:
-        fact = next((r for r in project_facts(rows) if r.get('id') == task), None)
-        require_integrated_follow_on(payload, state, fact)
+        require_integrated_follow_on(payload, state, rows, task)
     result = json.loads(run(['comments', 'add', task, PREFIX + canonical_bytes(payload).decode(), '--json']))
     return dict(comment_id=str(result['id']), reconciled=False, **receipt(preview, rows, task))
 

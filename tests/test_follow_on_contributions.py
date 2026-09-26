@@ -4,9 +4,17 @@ An additive second change to a task whose contribution is already integrated use
 the optional ``follows`` relation instead of being forced to declare that it
 ``supersedes`` (retracts) the integrated revision. These tests pin:
 
-* the integration precondition for ``follows`` (refused with zero native writes
-  for an awaiting-review prior, an approved-but-unintegrated prior, and a prior
-  whose integration commit does not match the follow-on ``base_commit``);
+* the follow-on gate: the prior revision must be **approved by a reviewer** in the
+  append-only chain (``awaiting-integration``, nothing pending) **and** the shared
+  review-state projection must record a passed ``integrated`` fact for the prior
+  contribution's full commit, in any scope, with ``base_commit`` equal to that
+  scope's ``integration_commit``;
+* a self-recorded ``integrated=passed`` lifecycle fact by the contributor alone
+  does NOT open the gate, and neither does a changes-requested prior; all refusals
+  write nothing;
+* a newer lifecycle scope recorded for other work does not make a genuinely
+  integrated prior un-followable (the shared projection is per-scope);
+* no scoped evidence at all fails closed (there is no ``fact is None`` fallback);
 * the accepted additive follow-on on an integrated prior;
 * the bounded ``brief`` prior-contribution slice with a complete ``review TASK``;
 * what remains visible for a prior contribution after the follow-on records its
@@ -60,8 +68,13 @@ class FollowOnChainTests(unittest.TestCase):
     def send(self, p, actor='worker'):
         return w.execute(self.rows, 'task-1', actor, p, self.run_native)
 
-    def record_lifecycle(self, source_commit, integration_commit, scope_op='scope-1', integrated=True):
-        """Append scoped lifecycle evidence marking source_commit integrated."""
+    def record_lifecycle(self, source_commit, integration_commit, scope_op='scope-1', integrated=True,
+                         actor='worker'):
+        """Append scoped lifecycle evidence marking source_commit integrated.
+
+        ``actor`` is the recording actor. The lifecycle action only requires
+        ``payload.actor == request actor``, so the contributor can record it alone.
+        """
         def run(args):
             if args == ['export', '--all']:
                 return ''.join(json.dumps(r) + '\n' for r in self.rows)
@@ -77,7 +90,7 @@ class FollowOnChainTests(unittest.TestCase):
                            '\n\nReason: ' + reason)
             self.rows.append(dict(_type='issue', id=event_id, issue_type='event',
                                   title='State change: ' + dim + ' \u2192 ' + value,
-                                  description=description, status='closed', created_by='worker',
+                                  description=description, status='closed', created_by=actor,
                                   created_at='2026-09-16T00:00:00Z',
                                   dependencies=[dict(issue_id=event_id, depends_on_id='task-1',
                                                      type='parent-child')]))
@@ -86,12 +99,12 @@ class FollowOnChainTests(unittest.TestCase):
         scope = {'source_commit': source_commit, 'integration_commit': integration_commit,
                  'release_id': '', 'environment': ''}
         base = dict(schema_version=1, task='task-1', scope=scope, evidence=['commit:' + source_commit],
-                    provenance='performed', actor='worker')
+                    provenance='performed', actor=actor)
         lifecycle.apply_native(dict(base, operation_id=scope_op, dimension='lifecycle-scope',
-                                    value=content_hash(scope)), 'worker', run)
+                                    value=content_hash(scope)), actor, run)
         if integrated:
             lifecycle.apply_native(dict(base, operation_id=scope_op + '-int', dimension='integrated',
-                                        value='passed'), 'worker', run)
+                                        value='passed'), actor, run)
 
     def integration_case(self):
         """Contribution 1 approved and integrated at MERGE_1, base scope on COMMIT_1."""
@@ -118,7 +131,36 @@ class FollowOnChainTests(unittest.TestCase):
     def test_awaiting_review_prior_is_refused_without_write(self):
         first = self.send(self.contribution(COMMIT_1))['comment_id']
         before = len(self.issue['comments'])
-        with self.assertRaisesRegex(ValueError, 'not integrated'):
+        with self.assertRaisesRegex(ValueError, 'not approved'):
+            self.send(self.contribution(COMMIT_2, base=MERGE_1, supersedes=None, follows=first))
+        self.assertEqual(len(self.issue['comments']), before)
+
+    def test_self_recorded_integration_does_not_open_the_follow_on_gate(self):
+        """The contributor alone records scope + integrated=passed; the gate stays shut.
+
+        The lifecycle action only requires ``payload.actor == request actor``, so the
+        task owner can record a passed ``integrated`` fact by itself. Approval is a
+        separate reviewer operation, so the unstructured self-assertion must not be
+        enough to declare the prior revision integrated.
+        """
+        first = self.send(self.contribution(COMMIT_1))['comment_id']
+        self.record_lifecycle(COMMIT_1, MERGE_1, actor='worker')
+        facts = next(r for r in lifecycle.project_facts(self.rows) if r['id'] == 'task-1')
+        self.assertEqual(facts['facts']['integrated']['value'], 'passed')
+        self.assertEqual(w.project(self.issue)['review_state'], 'awaiting-review')
+        before = len(self.issue['comments'])
+        with self.assertRaisesRegex(ValueError, 'not approved'):
+            self.send(self.contribution(COMMIT_2, base=MERGE_1, supersedes=None, follows=first))
+        self.assertEqual(len(self.issue['comments']), before)
+
+    def test_changes_requested_prior_is_refused_even_when_self_integrated(self):
+        first = self.send(self.contribution(COMMIT_1))['comment_id']
+        self.send(self.payload('request-changes', contribution=first,
+                               items=[dict(id='fix-1', text='Correct the thing')]), 'reviewer')
+        self.record_lifecycle(COMMIT_1, MERGE_1, actor='worker')
+        self.assertEqual(w.project(self.issue)['review_state'], 'changes-requested')
+        before = len(self.issue['comments'])
+        with self.assertRaisesRegex(ValueError, 'not approved'):
             self.send(self.contribution(COMMIT_2, base=MERGE_1, supersedes=None, follows=first))
         self.assertEqual(len(self.issue['comments']), before)
 
@@ -141,17 +183,34 @@ class FollowOnChainTests(unittest.TestCase):
         self.send(self.contribution(COMMIT_2, base=MERGE_1, supersedes=None, follows=first))
         self.assertEqual(len(self.issue['comments']), before + 1)
 
-    def test_minimum_rule_when_scoped_evidence_is_unavailable(self):
+    def test_newer_scope_for_other_work_does_not_block_a_valid_follow_on(self):
+        """Item 2: the gate reads per-scope evidence, not the single current scope."""
+        first = self.integration_case()
+        # A newer scope for other work becomes the task's current lifecycle scope.
+        self.record_lifecycle(COMMIT_3, MERGE_2, scope_op='scope-2', actor='integrator')
+        current = next(r for r in lifecycle.project_facts(self.rows) if r['id'] == 'task-1')
+        self.assertEqual(current['scope']['source_commit'], COMMIT_3)
+        second = self.send(self.contribution(COMMIT_2, base=MERGE_1, supersedes=None,
+                                             follows=first))['comment_id']
+        state = w.project(self.issue)
+        self.assertEqual(state['contribution']['comment_id'], second)
+        self.assertEqual(state['contribution']['follows'], first)
+
+    def test_shared_projection_without_scoped_evidence_fails_closed(self):
+        """No ``fact is None`` fallback: an empty shared projection refuses the follow-on."""
         payload = dict(operation='contribute', follows='1', base_commit='b' * 40)
-        pending = dict(contribution={'commit': COMMIT_1}, review_state='awaiting-integration',
-                       pending_requests=[])
-        w.require_integrated_follow_on(payload, pending, None)
-        for state in (dict(pending, review_state='awaiting-review'),
-                      dict(pending, review_state='changes-requested'),
-                      dict(pending, review_state='awaiting-integration',
+        # The task row exists but records no trusted scope, so the shared projection
+        # reports fact='unknown' and the gate fails closed.
+        approved = dict(contribution={'commit': COMMIT_1}, review_state='awaiting-integration',
+                        pending_requests=[])
+        with self.assertRaisesRegex(ValueError, 'not integrated'):
+            w.require_integrated_follow_on(payload, approved, self.rows, 'task-1')
+        for state in (dict(approved, review_state='awaiting-review'),
+                      dict(approved, review_state='changes-requested'),
+                      dict(approved, review_state='awaiting-integration',
                            pending_requests=[{'item': 'fix'}])):
-            with self.assertRaisesRegex(ValueError, 'without scoped integration evidence'):
-                w.require_integrated_follow_on(payload, state, None)
+            with self.assertRaisesRegex(ValueError, 'not approved'):
+                w.require_integrated_follow_on(payload, state, self.rows, 'task-1')
 
     def test_legacy_supersede_chain_still_tags_the_replaced_revision(self):
         first = self.send(self.contribution(COMMIT_1))['comment_id']
