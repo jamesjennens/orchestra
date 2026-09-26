@@ -57,7 +57,10 @@ def queue(rows,actor,args,request_dir=None):
                       'pending_handoff_total':handoff_total,
                       'pending_handoff_next_offset':a.handoff_offset+a.handoff_limit if a.handoff_offset+a.handoff_limit<handoff_total else None,
                       'lifecycle':{k:v['value'] for k,v in fact.items()},'lifecycle_scope':scope,
-                      'lifecycle_matches_contribution':None if not contribution else review.get('integration',{}).get('matches_contribution'),
+                      # ORIGINAL meaning: the NEWEST scope shown in `lifecycle`/`lifecycle_scope`
+                      # names the current contribution. The ANY-scope answer is additive as
+                      # `integration.matches_contribution`.
+                      'lifecycle_matches_contribution':None if not contribution else scope.get('source_commit','').lower()==contribution['commit'].lower(),
                       'integration':review.get('integration'),'workflow_state':review.get('workflow_state'),'error':error})
     priority={'changes-requested':0,'error':1,'awaiting-review':2,'legacy-review-ready':2,'awaiting-integration':3}
     items.sort(key=lambda r:(priority.get(r['review_state'],4),r['task']))
@@ -78,8 +81,8 @@ def execute(path,actor,action,args,attachments,run):
         from briefing import task_row
         rows=[json.loads(line) for line in run(['export','--all']).splitlines() if line.strip()]
         issue=task_row(rows,task)
-        scopes=next((r['scopes'] for r in integration_evidence(rows) if r['id']==task),[])
-        return workflow(issue,scopes)
+        from review_state import scopes_for
+        return workflow(issue,scopes_for(rows,task))
     if len(args)!=2 or not args[1].startswith('@attachment:'):raise ValueError('A JSON file attachment is required')
     item=attachments.get(args[1].partition(':')[2],{})
     if not isinstance(item,dict) or item.get('flag') not in ('--file','-f') or not isinstance(item.get('text'),str):raise ValueError('Invalid attachment')

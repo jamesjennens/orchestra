@@ -116,11 +116,13 @@ def brief(rows,project,task,offset=0,limit=5):
     items=p['open_items'] if p else []
     if offset>len(items):raise ValueError('Unresolved-item offset exceeds total')
     deps=[d for d in (issue.get('dependencies') or []) if d.get('type')!='parent-child']
-    from lifecycle import integration_evidence
     from work import workflow
-    scopes=next((r['scopes'] for r in integration_evidence(rows) if r['id']==task),[])
-    review=workflow(issue,scopes)
-    matches_contribution=None if not review.get('contribution') else review['integration']['matches_contribution']
+    from review_state import scopes_for
+    review=workflow(issue,scopes_for(rows,task))
+    # ORIGINAL meaning: does the scope currently shown in `lifecycle`/`lifecycle_scope`
+    # (the newest recorded scope) belong to the current contribution? The ANY-scope
+    # answer is additive as `review.integration.matches_contribution`.
+    matches_contribution=None if not review.get('contribution') else (facts['scope'] or {}).get('source_commit','').lower()==review['contribution']['commit'].lower()
     pending=review.get('pending_requests',[])
     review_next={'changes-requested':'Address the outstanding review requests for the current contribution; read review '+task+'.',
                  'awaiting-review':'Reviewer: retrieve and verify the current contribution, then record review feedback or approval.',
