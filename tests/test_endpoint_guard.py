@@ -344,5 +344,133 @@ class NativeLabelResolutionTests(unittest.TestCase):
                     run.assert_not_called()
 
 
+class _EndpointRootMixin:
+    """A disposable root/project for driving endpoint.execute end to end."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix='endpoint-dispatch-')
+        self.root = Path(self._tmp.name)
+        (self.root / 'bin').mkdir()
+        (self.root / 'bin' / 'bd').write_text('', encoding='utf-8')
+        (self.root / 'deployment.private.json').write_text(
+            '{"password": "x", "unit": "none", "port": "1"}', encoding='utf-8')
+        (self.root / 'projects' / 'pp' / '.beads').mkdir(parents=True)
+        (self.root / 'projects' / 'pp' / '.beads' / 'metadata.json').write_text(
+            '{}', encoding='utf-8')
+        self.addCleanup(self._tmp.cleanup)
+
+    def execute(self, action, payload, actor='alice'):
+        return endpoint.execute(self.root, {
+            'project': 'pp', 'actor': actor, 'action': action,
+            'args': [json.dumps(payload)]})
+
+    def bd(self, args, actor='mallory'):
+        return endpoint.execute(self.root, {
+            'project': 'pp', 'actor': actor, 'action': 'bd', 'args': args})
+
+    def out(self, result):
+        return json.loads(result['stdout'])
+
+
+@unittest.skipIf(endpoint is None, 'endpoint imports fcntl (POSIX-only)')
+class EndpointSingleDispatchTests(_EndpointRootMixin, unittest.TestCase):
+    """kittrial-pth.26 rev3 P1 endpoint-double-dispatch.
+
+    endpoint.execute kept the lifecycle/coordinate block twice, so both actions
+    ran twice under the lock and the caller saw the second, reconciled result: a
+    fresh merge-release returned {released:false,available:true} and a fresh
+    lifecycle write returned reconciled:true. Each request must dispatch once.
+    """
+
+    def test_lifecycle_dispatches_exactly_once(self):
+        calls = []
+
+        def apply(payload, actor, run):
+            calls.append(payload)
+            return {'event_id': 'e1', 'reconciled': len(calls) > 1}
+
+        with mock.patch.object(endpoint, 'apply_native', apply):
+            result = self.execute('lifecycle',
+                                  {'schema_version': 1, 'operation_id': 'lc1'})
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(self.out(result)['reconciled'])
+
+    def test_coordinate_dispatches_exactly_once(self):
+        import coordination
+        counts = {}
+
+        def apply(payload, actor, run, path):
+            operation = payload.get('operation')
+            counts[operation] = counts.get(operation, 0) + 1
+            if operation == 'merge-release':
+                return {'released': counts[operation] == 1}
+            return {'reconciled': counts[operation] > 1}
+
+        with mock.patch.object(coordination, 'apply_native', apply):
+            release = self.out(self.execute('coordinate',
+                                            {'operation': 'merge-release'}))
+            acquire = self.out(self.execute('coordinate',
+                                            {'operation': 'merge-acquire'}))
+        self.assertEqual(counts, {'merge-release': 1, 'merge-acquire': 1})
+        self.assertTrue(release['released'])
+        self.assertFalse(acquire['reconciled'])
+
+    def test_requirement_dispatches_exactly_once_not_lifecycle(self):
+        import requirement_records
+        calls = []
+
+        def apply(payload, actor, run, path):
+            calls.append(payload)
+            return {'id': 'r1', 'reconciled': len(calls) > 1}
+
+        with mock.patch.object(requirement_records, 'apply_native', apply):
+            result = self.execute('requirement', {'operation_id': 'r1'})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.out(result)['id'], 'r1')
+
+
+@unittest.skipIf(endpoint is None, 'endpoint imports fcntl (POSIX-only)')
+class EndpointLabelAliasGuardTests(_EndpointRootMixin, unittest.TestCase):
+    """kittrial-pth.26 rev3 P1 hidden-label-alias at the endpoint seam."""
+
+    RESERVED = ('requirement', 'requirement:accepted', 'requirement:draft',
+                'brd-section', 'request:' + 'a' * 64,
+                'requirement,requirement:accepted')
+
+    def test_create_label_alias_is_refused_before_any_native_write(self):
+        with mock.patch.object(endpoint.subprocess, 'run') as run:
+            for value in self.RESERVED:
+                for args in (['create', 'x', '--label', value],
+                             ['create', 'x', '--label=' + value]):
+                    with self.subTest(args=str(args)):
+                        with self.assertRaisesRegex(
+                                ValueError, 'Reserved coordination/requirement labels'):
+                            self.bd(args)
+            run.assert_not_called()
+
+    def test_unrecognized_create_update_flag_is_refused(self):
+        with mock.patch.object(endpoint.subprocess, 'run') as run:
+            for args in (['create', 'x', '--labell', 'requirement'],
+                         ['update', 'x', '--set-label', 'requirement'],
+                         ['update', 'x', '--mystery']):
+                with self.subTest(args=str(args)):
+                    with self.assertRaisesRegex(ValueError, 'unrecognized flag'):
+                        self.bd(args)
+            run.assert_not_called()
+
+    def test_ordinary_labels_still_reach_the_native_client_once(self):
+        def proc(argv, **kwargs):
+            return _Proc(0, '{"id": "pp-1"}', '')
+
+        for args in (['create', 'x', '--label', 'frontend,bug', '--json'],
+                     ['create', 'x', '--labels', 'frontend', '--json'],
+                     ['create', 'x', '-l', 'frontend', '--json'],
+                     ['update', 'pp-1', '--add-label', 'reviewed', '--json']):
+            with self.subTest(args=str(args)):
+                with mock.patch.object(endpoint.subprocess, 'run', proc):
+                    result = self.bd(args)
+                self.assertEqual(result['returncode'], 0)
+
+
 if __name__ == '__main__':
     unittest.main()

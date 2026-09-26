@@ -32,6 +32,10 @@ class Native:
         self.create_outcome = 'ok'
         self.comment_outcome = 'ok'
         self.update_outcome = 'ok'
+        # Fail only on comments whose body starts with this prefix, so a test
+        # can drop one write (for example the acceptance evidence) while the
+        # others succeed.
+        self.fail_comment_prefix = None
 
     def seed(self, task, title='Seeded record', description='Seeded body', labels=None,
              comments=None, issue_type='task'):
@@ -76,6 +80,8 @@ class Native:
         if args[0] == 'comments':
             if args[1] == 'add':
                 task, body = args[2], args[3]
+                if self.fail_comment_prefix and body.startswith(self.fail_comment_prefix):
+                    raise ValueError('native comment failed')
                 if self.comment_outcome == 'fail':
                     raise ValueError('native comment failed')
                 if self.comment_outcome == 'not-written':
@@ -462,6 +468,38 @@ class RequirementRecordTests(unittest.TestCase):
         self.assertEqual(self.native.writes(), before)
         self.assertEqual(len(self.native.acceptances('req-1')), 1)
 
+    def test_acceptance_evidence_precedes_the_accepted_revision_and_label(self):
+        # kittrial-pth.26 rev3 item p3-ordering: the evidence must be written
+        # BEFORE both the accepted revision comment and the accepted state
+        # label, so a failed evidence write can never leave a record that reads
+        # as accepted with no acceptance-v1 record.
+        self.apply(self.draft())
+        self.native.fail_comment_prefix = ACCEPTANCE_PREFIX
+        with self.assertRaisesRegex(ValueError, 'acceptance evidence'):
+            self.apply(self.accept(), operator=True)
+        labels = set(self.native.row('req-1')['labels'])
+        self.assertIn('requirement:draft', labels)
+        self.assertNotIn('requirement:accepted', labels)
+        self.assertEqual(self.native.acceptances('req-1'), [])
+        revisions = [parse_json(c['text'][len(REVISION_PREFIX):])
+                     for c in self.native.comments('req-1')]
+        self.assertEqual([record['revision'] for record in revisions], [1])
+        # Retry heals: the evidence is written first, then the accepted revision
+        # comment, and only then the label.
+        self.native.fail_comment_prefix = None
+        result = self.apply(self.accept(), operator=True)
+        self.assertEqual(result['acceptance_state'], 'accepted')
+        kinds = []
+        for call in self.native.calls:
+            if call[:2] != ['comments', 'add']:
+                continue
+            body = call[3]
+            kinds.append('evidence' if body.startswith(ACCEPTANCE_PREFIX)
+                         else 'revision' if body.startswith(REVISION_PREFIX)
+                         else 'other')
+        self.assertEqual(kinds, ['revision', 'evidence', 'evidence', 'revision'])
+        self.assertEqual(len(self.native.acceptances('req-1')), 1)
+
     def test_acceptance_evidence_is_not_a_manifest_hash_and_rebinds_for_publication(self):
         self.apply(self.draft())
         result = self.apply(self.accept(), operator=True)
@@ -769,6 +807,32 @@ class RequirementRecordTests(unittest.TestCase):
                      evidence='e')]),
                 'operator', self.native, self.project)
         self.assertEqual(self.native.writes(), before)
+
+    def test_backfill_to_accepted_is_refused_when_latest_revision_is_draft(self):
+        # kittrial-pth.26 rev3 item p3-ordering: the revision ledger stays
+        # authoritative, so backfill must not relabel a draft-latest record
+        # accepted behind it.
+        self.apply(self.draft())
+        before = list(self.native.writes())
+        with self.assertRaisesRegex(ValueError, 'latest revision comment is'):
+            rr.backfill(dict(schema_version=1, operation_id='bf-draft-latest', records=[
+                dict(task='req-1', kind='requirement', acceptance_state='accepted',
+                     evidence='legacy-evidence')]),
+                'operator', self.native, self.project)
+        self.assertEqual(self.native.writes(), before)
+        self.assertEqual(self.native.acceptances('req-1'), [])
+        self.assertIn('requirement:draft', self.native.row('req-1')['labels'])
+        # Once the latest revision is accepted, an accepted backfill no longer
+        # contradicts the ledger and is allowed (it is a no-op here).
+        self.apply(self.accept(), operator=True)
+        result = rr.backfill(dict(schema_version=1, operation_id='bf-accepted-latest',
+                                  records=[dict(task='req-1', kind='requirement',
+                                                acceptance_state='accepted',
+                                                evidence='legacy-evidence')]),
+                             'operator', self.native, self.project)
+        self.assertEqual(result['records'][0]['added'], [])
+        # The stronger requirement-apply evidence for that revision is kept.
+        self.assertEqual(len(self.native.acceptances('req-1')), 1)
 
     # --- CLI and routing ------------------------------------------------
 

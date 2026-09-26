@@ -28,6 +28,7 @@ from reserved_comments import (
     raw_file_flag_in_args,
     reserved_label_in_args,
     reserved_match,
+    unresolved_bd_flags,
 )
 from briefing import PREFIX as CHECKPOINT_PREFIX
 from export_requirements import REVISION_PREFIX as REQUIREMENT_PREFIX
@@ -707,6 +708,126 @@ class ReservedLabelNamespaceTests(unittest.TestCase):
         self.assertEqual(calls, [])
         guarded(['create', '--title', 'x', '--labels', 'backend'], {})
         self.assertEqual(len(calls), 1)
+
+
+class HiddenLabelAliasTests(unittest.TestCase):
+    """kittrial-pth.26 rev3 P1 hidden-label-alias.
+
+    bd 1.2.2 accepts `create --label X` as an UNDOCUMENTED alias of `--labels`
+    (it is hidden from `bd create --help`), so a table built from --help let a
+    plain create mint `requirement,requirement:accepted`, `brd-section` and
+    `request:<64hex>`. The alias now joins the label-write table, and an
+    unresolvable create/update flag fails closed rather than being assumed
+    harmless.
+    """
+
+    RESERVED = ('requirement', 'requirement:accepted', 'requirement:draft',
+                'brd-section', 'request:' + 'a' * 64,
+                'request-content:' + 'b' * 64)
+
+    def test_create_label_alias_writes_are_recognised(self):
+        for value in self.RESERVED:
+            for args in (
+                ['create', 'x', '--label', value],
+                ['create', 'x', '--label=' + value],
+                ['create', 'x', '--label', 'plain,' + value],
+            ):
+                with self.subTest(args=str(args)):
+                    self.assertIsNotNone(reserved_label_in_args(args))
+
+    def test_create_label_alias_ordinary_labels_still_allowed(self):
+        self.assertIsNone(reserved_label_in_args(
+            ['create', 'x', '--label', 'frontend,bug']))
+        self.assertIsNone(reserved_label_in_args(
+            ['create', 'x', '--label=frontend']))
+        self.assertIsNone(reserved_label_in_args(
+            ['create', 'x', '-l', 'frontend']))
+        # `requirements`/`requirement-ish` are not the controlled names.
+        self.assertIsNone(reserved_label_in_args(
+            ['create', 'x', '--label', 'requirements,requirement-ish']))
+
+    def test_unresolved_create_update_flags_fail_closed(self):
+        for args in (
+            ['create', 'x', '--labell', 'requirement'],
+            ['create', 'x', '--labelz=requirement'],
+            ['create', 'x', '--parent', 'p', '--mystery', 'requirement'],
+            ['create', 'x', '-Z', 'requirement'],
+            ['update', 'x', '--add-labell', 'requirement'],
+            ['update', 'x', '--wat'],
+            ['update', 'x', '--set-label', 'requirement'],
+        ):
+            with self.subTest(args=str(args)):
+                self.assertTrue(unresolved_bd_flags(args))
+        # Verified spellings resolve and are not reported.
+        for args in (
+            ['create', 'x', '--label', 'a', '--labels', 'b', '-l', 'c', '--json'],
+            ['create', 'x', '--parent', 'p', '--no-inherit-labels'],
+            ['update', 'x', '--add-label', 'a', '--set-labels', 'b',
+             '--remove-label', 'c', '--json'],
+            ['list', '-l', 'x'],
+            ['show', 'x'],
+            ['create', 'x', '--help'],
+        ):
+            with self.subTest(args=str(args)):
+                self.assertEqual(unresolved_bd_flags(args), [])
+
+    def test_unknown_flag_keeps_the_guard_ambiguous(self):
+        # An unknown flag could be a hidden label or replacement alias, so it
+        # must not be discarded before the branch decision.
+        for args in (['update', 'x', '--set-labell', 'keep'],
+                     ['update', 'x', '--mystery'],
+                     ['create', 'x', '--mystery']):
+            with self.subTest(args=str(args)):
+                request = label_guard_request(args)
+                self.assertIsNotNone(request)
+                self.assertTrue(request['ambiguous'])
+
+    def test_known_flags_keep_their_previous_decisions(self):
+        self.assertIsNone(label_guard_request(['create', 'x', '--json']))
+        self.assertEqual(
+            label_guard_request(['create', 'x', '--parent', 'p', '--label', 'plain']),
+            {'kind': 'inherit', 'target': 'p', 'ambiguous': False})
+        self.assertIsNone(label_guard_request(['update', 'x', '--add-label', 'plain']))
+        self.assertEqual(
+            label_guard_request(['update', 'x', '--set-labels', 'plain']),
+            {'kind': 'replace', 'targets': ['x'], 'ambiguous': False})
+        self.assertIsNone(label_guard_request(['list', '-l', 'x']))
+
+
+class LookalikeReservedPrefixTests(unittest.TestCase):
+    """kittrial-pth.26 rev3 item p3-ordering-backfill-docs: BOM/CRLF lookalikes.
+
+    The strict parsers anchor their match at the first byte, so a BOM-prefixed
+    or CRLF acceptance/revision record is ignored (filed as ordinary prose)
+    while still looking like one. The raw path refuses such a body.
+    """
+
+    def _bodies(self, prefix):
+        return (
+            '\ufeff' + prefix + '{"forged": 1}',
+            prefix.replace('\n', '\r\n') + '{"forged": 1}',
+            '\ufeff' + prefix.replace('\n', '\r\n') + '{"forged": 1}',
+        )
+
+    def test_bom_and_crlf_lookalikes_are_refused(self):
+        from export_requirements import ACCEPTANCE_PREFIX
+        for prefix in (REQUIREMENT_PREFIX, ACCEPTANCE_PREFIX):
+            for body in self._bodies(prefix):
+                with self.subTest(prefix=prefix[:26], body=repr(body[:16])):
+                    self.assertIsNotNone(reserved_match(body))
+                    with self.assertRaisesRegex(ValueError, r'Refusing raw'):
+                        check_comment_body(body, 'positional')
+                    with self.assertRaisesRegex(ValueError, r'Refusing raw'):
+                        check_raw_request(
+                            ['comments', 'add', 'task-1', body, '--json'], {})
+
+    def test_ordinary_prose_with_bom_or_crlf_still_passes(self):
+        for body in ('\ufeffordinary prose', 'ordinary prose\r\n',
+                     '\ufeffKind: finding\r\n'):
+            with self.subTest(body=repr(body)):
+                self.assertIsNone(reserved_match(body))
+                check_comment_body(body, 'positional')
+                check_raw_request(['comments', 'add', 'task-1', body, '--json'], {})
 
 
 class DepSubcommandShorthandTests(unittest.TestCase):

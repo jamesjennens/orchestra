@@ -92,13 +92,22 @@ python requirement_records.py revise --config client.json --project example --ac
   caller-supplied `labels` field is refused, and unrelated labels are untouched.
   The contributor guard also refuses raw `update --add-label requirement...` and
   raw `comments add` of any `requirement-revision-v1` body, so this operation is
-  the only writer. The same reserved-label guard refuses a raw
-  `create --parent X` whose parent holds a controlled requirement label (a child
-  cannot inherit `requirement:accepted` without F3 evidence) and any raw
+  the only writer. It matches every label-writing spelling bd 1.2.2 accepts,
+  including the undocumented `create --label` alias of `--labels`, and it fails
+  closed on any unrecognized `create`/`update` flag rather than assuming the
+  flag cannot move the reserved namespace. The same reserved-label guard refuses
+  a raw `create --parent X` whose parent holds a controlled requirement label (a
+  child cannot inherit `requirement:accepted` without F3 evidence) and any raw
   `update X --set-labels/--remove-label` on a record that holds one, so a
   replacement cannot silently drop the operator's acceptance. Pass
   `--no-inherit-labels` when a raw child of a requirement record is genuinely
   wanted.
+- The raw-comment guard also refuses a BOM-prefixed or CRLF body that is a
+  reserved machine-record prefix once the BOM is dropped and CRLF folded to LF.
+  The strict parsers ignore such a lookalike, so without this it would be filed
+  as ordinary prose; refusing it keeps the reserved namespace unambiguous. A
+  legitimate writer emits exact canonical UTF-8 with `\n`, so nothing valid is
+  refused.
 - The contributor path must not carry an `acceptance` object at all: a draft is
   unaccepted by definition, so a contributor acceptance is refused before any
   native read or write.
@@ -107,7 +116,12 @@ python requirement_records.py revise --config client.json --project example --ac
   authenticated owner identity. `revise` is bound to the record's kind and key,
   not to the actor who first drafted it, so two contributors may co-edit one
   draft through successive revisions; the revision comment history records who
-  wrote what.
+  wrote what. This attribution model does not confine native edits: a
+  contributor can still change an accepted record's native title, description or
+  status, or reparent it, through ordinary bd operations. The
+  `requirement-revision-v1` and `requirement-acceptance-v1` comments remain
+  authoritative for the requirement's content, revision and acceptance, so those
+  native edits do not change what the kit exports or accepts.
 - Retrying the same `operation_id` with identical content reconciles without a
   second record, comment or label write; reusing it with different content is
   refused. A native `bd create --dry-run` preflight and the revision check run
@@ -126,8 +140,11 @@ caller-supplied: the command binds it to the exact revision it writes, and the
 stored field is `record_sha256` (the accepted revision's content hash). It is
 deliberately not called `manifest_sha256`, because no publication manifest exists
 when a single record is accepted; `publish_brd` keeps that name for the
-manifest-level object, and `requirement_records.publication_acceptance` rebinds a
-record decision to a manifest when a BRD is published.
+manifest-level object. `requirement_records.publication_acceptance` can rebind a
+record decision to a manifest, but it has **no production caller today**:
+`publish_brd` does not yet use it, and the bridge exists only for a future
+publisher integration. Until then a published manifest's acceptance continues to
+be supplied through `publish_brd`'s existing `--acceptance` path.
 
 ```json
 {"schema_version": 1, "operation_id": "session-1/req-1-r2", "kind": "requirement",
@@ -138,8 +155,8 @@ record decision to a manifest when a BRD is published.
 ```
 
 ```sh
-python admin.py --root /path/to/runtime requirement-apply \
-  --project example --actor operator --file record.json
+python admin.py --root /path/to/runtime requirement-apply example \
+  --actor operator --file record.json
 ```
 
 Acceptance without evidence, a contributor acceptance attempt, a contributor
@@ -148,7 +165,11 @@ native write.
 
 The operator acceptance is **durable on the record**: beside the
 `requirement-revision-v1` comment the command writes one
-`Kind: requirement-acceptance-v1` record bound to that revision:
+`Kind: requirement-acceptance-v1` record bound to that revision. The evidence
+comment is written **before** the accepted revision comment and the
+`requirement:accepted` label, so an uncertain evidence write leaves the record
+reading as draft (never accepted without evidence) and is healed by retry or
+`admin.py requirement-reconcile`:
 
 ```text
 Kind: requirement-acceptance-v1
@@ -178,8 +199,8 @@ comment:
 ```
 
 ```sh
-python admin.py --root /path/to/runtime requirement-backfill \
-  --project example --actor operator --file backfill.json
+python admin.py --root /path/to/runtime requirement-backfill example \
+  --actor operator --file backfill.json
 ```
 
 A record backfilled to `requirement:accepted` needs an `evidence` field
@@ -190,12 +211,16 @@ any native write. Accepting by backfill also writes the durable
 `Kind: requirement-acceptance-v1` evidence record (with `source`
 `requirement-backfill`), bound to the record's latest revision when it has one,
 so the evidence is visible on the record and not only in `.requirement-backfills/`.
+Backfill to `accepted` is refused when the record's latest revision comment says
+`draft`: the revision ledger stays authoritative, so accepting such a record goes
+through `admin.py requirement-apply` with F3 evidence, which writes a new
+accepted revision.
 
 ### Reconcile an uncertain requirement operation (operator)
 
 ```sh
-python admin.py --root /path/to/runtime requirement-reconcile \
-  --project example --operation-id session-1/req-1 --actor operator \
+python admin.py --root /path/to/runtime requirement-reconcile example \
+  --operation-id session-1/req-1 --actor operator \
   --disposition complete --issue-id sample-job.7 --reason "confirmed native record"
 ```
 

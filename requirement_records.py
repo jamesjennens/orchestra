@@ -46,7 +46,14 @@ records (for example records created through create-child that lack them) and
 never writes a revision comment. Backfilling a record to `requirement:accepted`
 requires an evidence field and also writes the durable
 `requirement-acceptance-v1` evidence record (bound to the latest revision when
-one exists).
+one exists). A record whose latest revision comment says `draft` is refused:
+relabelling it accepted behind that ledger would contradict the authoritative
+revision, so acceptance goes through `admin.py requirement-apply` instead.
+
+An operator acceptance writes the acceptance evidence comment BEFORE the
+accepted revision comment and the `requirement:accepted` label, so an uncertain
+evidence write can never leave a record that reads as accepted with no
+acceptance evidence.
 
 Payload schemas are closed. `schema_version` is the integer 1.
 """
@@ -649,7 +656,10 @@ def apply_native(payload, actor, run, project, operator=False):
     and must not carry an acceptance object. An operator acceptance writes a
     durable `Kind: requirement-acceptance-v1` record bound to the exact
     revision hash beside the revision comment, so the evidence survives a
-    restore and is visible to every other reader.
+    restore and is visible to every other reader. The evidence comment is
+    written before the accepted revision comment and the state label, so a
+    failed evidence write leaves the record reading as draft rather than
+    accepted without evidence.
     """
     validate_payload(payload)
     if not operator and payload['acceptance_state'] == 'accepted':
@@ -760,17 +770,26 @@ def apply_native(payload, actor, run, project, operator=False):
         # write, so every refusal above reserves nothing.
         atomic(receipt, {'sha256': digest, 'status': 'pending', 'actor': actor, 'id': task,
                          'created': created, 'operation': payload['operation'], 'revision': revision})
+    # Durable acceptance evidence is written BEFORE the accepted revision
+    # comment and the accepted state label (kittrial-pth.26 rev3 review
+    # p3-ordering-backfill-docs). Both the `requirement-accepted` state label and
+    # an accepted `requirement-revision-v1` comment make the kit read the record
+    # as accepted, so writing either first left a crash window in which the
+    # record read as accepted with no acceptance-v1 record. With the evidence
+    # first, an uncertain evidence write leaves the record reading as draft (the
+    # revision comment and label follow) and the pending receipt is completed by
+    # retry or admin.py requirement-reconcile.
+    if evidence_body is not None:
+        try:
+            run(['comments', 'add', task, evidence_body, '--json'])
+        except (ValueError, OSError) as refusal:
+            raise _uncertain(str(refusal), 'acceptance evidence') from None
     if revision not in existing:
         try:
             run(['comments', 'add', task, revision_comment(record), '--json'])
         except (ValueError, OSError) as refusal:
             raise _uncertain(str(refusal), 'revision comment') from None
     apply_controlled_labels(run, task, row.get('labels') or [], payload['kind'], payload['acceptance_state'])
-    if evidence_body is not None:
-        try:
-            run(['comments', 'add', task, evidence_body, '--json'])
-        except (ValueError, OSError) as refusal:
-            raise _uncertain(str(refusal), 'acceptance evidence') from None
     complete = {'sha256': digest, 'status': 'complete', 'actor': actor, 'id': task,
                 'operation': payload['operation'], 'revision': revision}
     if bound is not None:
@@ -820,6 +839,17 @@ def backfill(payload, actor, run, project):
         # malformed existing record fails closed with zero writes.
         if entry['acceptance_state'] == 'accepted':
             binding = latest_revision(existing_revisions(row))
+            # A record whose latest revision comment says draft must not be
+            # relabelled accepted behind that ledger (kittrial-pth.26 rev3 review
+            # backfill-latest-draft): the state label would then contradict the
+            # authoritative revision. Accept it through requirement-apply with F3
+            # evidence (which writes a new accepted revision), or backfill draft.
+            if binding is not None and binding.get('acceptance_state') != 'accepted':
+                raise ValueError(
+                    'Refusing to backfill %s to accepted: its latest revision comment is %r, and '
+                    'the revision ledger stays authoritative. Accept it with admin.py '
+                    'requirement-apply and F3 acceptance evidence (a new accepted revision), or '
+                    'backfill it as a draft.' % (entry['task'], binding.get('acceptance_state')))
             record, body = backfill_evidence(entry['task'], entry['evidence'], binding, actor, at)
             prior_evidence = existing_acceptances(row).get(record['revision'])
             if prior_evidence is not None:
