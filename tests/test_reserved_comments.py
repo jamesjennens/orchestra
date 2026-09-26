@@ -796,6 +796,55 @@ class ReservedLabelMutationGuardTests(unittest.TestCase):
             ['create', 'x', '--parent', 'H',
              '--no-inherit-labels=false', '--no-inherit-labels=1']))
 
+    def test_repeated_no_inherit_labels_uses_the_last_occurrence(self):
+        # kittrial-5bb.30 review request repeated-flag-last-wins: pflag applies
+        # the LAST occurrence, so `bare then =false` lets bd inherit and the
+        # guard must stay active; the reverse order really does disable it.
+        for args in (
+            ['create', 'x', '--parent', 'H',
+             '--no-inherit-labels', '--no-inherit-labels=false'],
+            ['create', 'x', '--parent', 'H',
+             '--no-inherit-labels=true', '--no-inherit-labels=F'],
+            ['create', 'x', '--parent', 'H',
+             '--no-inherit-labels=1', '--no-inherit-labels=f'],
+            ['create', 'x', '--parent', 'H',
+             '--no-inherit-labels=T', '--no-inherit-labels=0'],
+        ):
+            with self.subTest(args=str(args)):
+                request = label_guard_request(args)
+                self.assertIsNotNone(request)
+                self.assertEqual(request['kind'], 'inherit')
+                self.assertFalse(request['ambiguous'])
+                self.assertEqual(request['target'], 'H')
+        for args in (
+            ['create', 'x', '--parent', 'H',
+             '--no-inherit-labels=false', '--no-inherit-labels=true'],
+            ['create', 'x', '--parent', 'H',
+             '--no-inherit-labels=F', '--no-inherit-labels'],
+            ['create', 'x', '--parent', 'H',
+             '--no-inherit-labels=false', '--no-inherit-labels=t'],
+        ):
+            with self.subTest(args=str(args)):
+                self.assertIsNone(label_guard_request(args))
+        # Any unparseable occurrence makes pflag reject the command whichever
+        # value comes last, so the guard reports the request ambiguous.
+        for args in (
+            ['create', 'x', '--parent', 'H',
+             '--no-inherit-labels=false', '--no-inherit-labels=maybe'],
+            ['create', 'x', '--parent', 'H',
+             '--no-inherit-labels=maybe', '--no-inherit-labels=false'],
+            ['create', 'x', '--parent', 'H',
+             '--no-inherit-labels', '--no-inherit-labels=yes'],
+            ['create', 'x', '--parent', 'H',
+             '--no-inherit-labels=2', '--no-inherit-labels'],
+            ['create', 'x', '--parent', 'H',
+             '--no-inherit-labels=', '--no-inherit-labels=true'],
+        ):
+            with self.subTest(args=str(args)):
+                request = label_guard_request(args)
+                self.assertIsNotNone(request)
+                self.assertTrue(request['ambiguous'])
+
     def test_create_without_parent_needs_nothing(self):
         self.assertIsNone(label_guard_request(['create', 'x', '--json']))
         self.assertIsNone(label_guard_request(

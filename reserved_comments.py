@@ -833,11 +833,13 @@ def label_guard_request(args):
     ambiguous = bool(unknown)
     if command == 'create':
         parents = [value for name, value in flags if name == '--parent']
-        # Any `--no-inherit-labels` value bd cannot parse makes bd reject the
-        # whole command with an error, so the guard refuses too instead of
-        # guessing which spelling bd would have used. Otherwise an explicit
-        # truthy value disables the inheritance guard; `=f`/`=F`/`=0`/... mean
-        # inheritance, exactly as strconv.ParseBool reads them.
+        # pflag parses every occurrence with strconv.ParseBool and the LAST one
+        # wins, so a repeated flag is decided by its final value: an explicit
+        # truthy value disables the inheritance guard, while `=f`/`=F`/`=0`/...
+        # mean inheritance, exactly as strconv.ParseBool reads them. Any
+        # occurrence bd cannot parse makes bd reject the whole command with an
+        # error, so the guard refuses too instead of guessing which spelling bd
+        # would have used.
         no_inherit = False
         invalid_bool = False
         for name, value in flags:
@@ -846,8 +848,8 @@ def label_guard_request(args):
             parsed = _parse_go_bool(value)
             if parsed is None:
                 invalid_bool = True
-            elif parsed:
-                no_inherit = True
+            else:
+                no_inherit = parsed
         if invalid_bool:
             return {'kind': 'inherit',
                     'target': parents[0] if parents else None,

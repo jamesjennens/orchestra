@@ -187,6 +187,58 @@ class NativeLabelResolutionTests(unittest.TestCase):
                          '--no-inherit-labels=' + value], 'worker')
                     run.assert_not_called()
 
+    def test_repeated_flag_last_occurrence_decides_the_guard(self):
+        # kittrial-5bb.30 review request repeated-flag-last-wins: bd's pflag
+        # takes the LAST --no-inherit-labels occurrence, so a trailing false
+        # still inherits and must be refused before any native write.
+        rows = [{'id': 'pp-3q2', 'labels': ['request:B']}]
+        for args in (
+            ['create', 'x', '--parent', '3q2',
+             '--no-inherit-labels', '--no-inherit-labels=false'],
+            ['create', 'x', '--parent', '3q2',
+             '--no-inherit-labels=true', '--no-inherit-labels=F'],
+            ['create', 'x', '--parent', '3q2',
+             '--no-inherit-labels=1', '--no-inherit-labels=f'],
+        ):
+            with self.subTest(args=str(args)):
+                with mock.patch.object(endpoint.subprocess, 'run',
+                                       _rows_run(rows)):
+                    with self.assertRaises(ValueError):
+                        _guard_reserved_labels(self.root, self.path, args,
+                                               'worker')
+
+    def test_repeated_flag_true_last_disables_the_guard_without_a_read(self):
+        for args in (
+            ['create', 'x', '--parent', '3q2',
+             '--no-inherit-labels=false', '--no-inherit-labels=true'],
+            ['create', 'x', '--parent', '3q2',
+             '--no-inherit-labels=F', '--no-inherit-labels'],
+        ):
+            with self.subTest(args=str(args)):
+                with mock.patch.object(endpoint.subprocess, 'run') as run:
+                    _guard_reserved_labels(self.root, self.path, args, 'worker')
+                    run.assert_not_called()
+
+    def test_repeated_flag_with_an_invalid_occurrence_fails_closed(self):
+        # pflag rejects the command on the first unparseable occurrence, so the
+        # endpoint must refuse before running bd at all.
+        for args in (
+            ['create', 'x', '--parent', '3q2',
+             '--no-inherit-labels=false', '--no-inherit-labels=maybe'],
+            ['create', 'x', '--parent', '3q2',
+             '--no-inherit-labels=maybe', '--no-inherit-labels=false'],
+            ['create', 'x', '--parent', '3q2',
+             '--no-inherit-labels', '--no-inherit-labels=yes'],
+            ['create', 'x', '--parent', '3q2',
+             '--no-inherit-labels=2', '--no-inherit-labels'],
+        ):
+            with self.subTest(args=str(args)):
+                with mock.patch.object(endpoint.subprocess, 'run') as run:
+                    with self.assertRaises(ValueError):
+                        _guard_reserved_labels(self.root, self.path, args,
+                                               'worker')
+                    run.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()
