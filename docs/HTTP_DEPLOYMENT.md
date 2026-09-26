@@ -189,20 +189,53 @@ key to reconcile. Never retry an uncertain mutation with a new key.
 
 Back up, in one coordinated snapshot:
 
-1. the canonical coordination database and its sidecar,
-2. this service's `--state` document (accounts, membership, revocation state,
-   audit and idempotency records).
+1. the canonical coordination database and its sidecar, **and each project's
+   operation store** `<PROJECT>/.http-operations.sqlite3` — `admin.py backup PROJECT`
+   captures all three together (Dolt via `bd backup`, the coordination sidecar, and a
+   consistent `sqlite3` backup-API snapshot of the operation store in
+   `<RUNTIME_ROOT>/backups/<PROJECT>.http-operations.sqlite3`),
+2. this service's `--state` document (accounts, membership, revocation state and
+   audit) **and its record store** `<state>.records.sqlite3` (HTTP idempotency
+   receipts and committed results).
 
-Encrypt off-machine copies, restrict the key to the backup owner, and define
-retention before rollout. Restore drill on an **isolated** deployment:
+The two SQLite stores run in WAL mode, so never copy the bare `.sqlite3` file of a
+live store with `cp`: committed pages may still be in the `-wal` file. Take a
+consistent copy with the SQLite backup API instead — `admin.py backup` does this for
+the operation store; for the record store (or any store taken outside `admin.py`),
+stop the service or use:
+
+```sh
+sudo -u <SERVICE_USER> python3 -c "import sqlite3,sys; s=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True); d=sqlite3.connect(sys.argv[2]); s.backup(d); d.close(); s.close()" \
+    <RUNTIME_ROOT>/http-state.json.records.sqlite3 <BACKUP_DIR>/http-state.json.records.sqlite3
+```
+
+Take the state document and its record store in the same service stop (or back to
+back, state document first) so they describe the same moment. Encrypt off-machine
+copies, restrict the key to the backup owner, and define retention before rollout.
+Restore drill on an **isolated** deployment:
 
 ```sh
 sudo systemctl stop orchestra-http
 sudo -u <SERVICE_USER> install -m 0600 <RESTORED_STATE> <RUNTIME_ROOT>/http-state.json
+sudo -u <SERVICE_USER> install -m 0600 <RESTORED_STATE>.records.sqlite3 \
+    <RUNTIME_ROOT>/http-state.json.records.sqlite3
+sudo -u <SERVICE_USER> rm -f <RUNTIME_ROOT>/http-state.json.records.sqlite3-wal \
+    <RUNTIME_ROOT>/http-state.json.records.sqlite3-shm
 sudo -u <SERVICE_USER> python3 -m json.tool <RUNTIME_ROOT>/http-state.json > /dev/null
+sudo -u <SERVICE_USER> python3 -c "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute('PRAGMA quick_check').fetchone()[0])" \
+    <RUNTIME_ROOT>/http-state.json.records.sqlite3      # ok
+# a project, including its operation store, is restored into a NEW project name:
+sudo -u <SERVICE_USER> python3 admin.py --root <RUNTIME_ROOT> restore-new <PROJECT> <NEW_PROJECT>
 sudo systemctl start orchestra-http
 curl -fsS http://127.0.0.1:8443/healthz          # {"status":"ok"}
 ```
+
+`restore-new` validates the operation-store snapshot first (read-only open,
+`PRAGMA quick_check`, the `operations` and `meta` tables) and refuses a corrupt
+snapshot before it creates the destination project, runs the Dolt restore or writes
+any coordination file. The restored store replaces any stale `-wal`/`-shm` sidecars.
+Without the record store the service starts with an empty receipt set (a lost-response
+retry then falls through to the operation store, which still replays or refuses it).
 
 After restore, verify hashes, revocation state, memberships and audit continuity,
 then cut over explicitly. Rollback is the previous pinned kit revision plus its
@@ -237,14 +270,33 @@ The store keeps the same three concepts:
   expired. A tombstone is removed only when its age exceeds `JOURNAL_TOMBSTONE_SECONDS`
   (default 30 days) measured against the trusted clock; a still-live tombstone is never
   dropped to satisfy the byte or count budget.
-* **high_water** — a non-decreasing wall-clock mark. Reclaim, compaction and the
-  replay/expiry decision refuse to act while the clock is more than
-  `JOURNAL_MAX_SKEW_SECONDS` ahead of it, and the mark is never ratcheted toward a
-  jumped-forward clock, so a forward jump can neither reclaim nor expire an identity
-  whose receipt window is still open. `trusted_now()` (the same clock rows are stamped
-  with) is used on the read path too, so during a +8 day jump a 60-second-old committed
-  receipt replays and a live uncertain reservation reports `124` instead of both being
-  refused as expired.
+* **trusted clock** — `meta` holds `high_water` (the largest raw clock any write has
+  seen; it never decreases), `suspect`, `anchor` and `suspect_since`. Every write
+  observes the raw clock: a step of more than `JOURNAL_MAX_SKEW_SECONDS` (24 h) since
+  `high_water` makes the store *suspect* (the first such step records
+  `anchor = high_water`; a further big step restarts `suspect_since` but keeps the
+  anchor); once the raw clock has run for `JOURNAL_SUSPECT_SETTLE_SECONDS` (1 h) after
+  the step the next write clears it; a backward step is never suspect. The trusted
+  clock is `now`, or `min(now, anchor + 24 h)` while suspect, and decides every
+  replay/expiry question on the read and write paths (the HTTP record store uses the
+  same rule). Rows are stamped with the raw clock. Reclaim and tombstone deletion run
+  only while the store is not suspect, against the raw clock.
+
+  *Effect.* After an idle weekend the first write is suspect for one hour — expiry is
+  evaluated at `anchor + 24 h`, so a receipt older than that may still replay instead
+  of being refused, which is harmless — and then normal operation resumes without an
+  operator. A genuine forward jump (for example +8 days) is held for an hour: an
+  uncertain reservation keeps reporting `124`, a committed receipt from before the jump
+  is refused as expired at the capped clock (never re-executed), and a clock corrected
+  inside the hour replays it again.
+
+  *Residual risk.* A jump that persists for longer than the settle hour is accepted:
+  receipts still inside their real window can then be compacted to tombstones, so an
+  exact retry is refused as expired (reconcile and use a fresh `operation_id`); a retry
+  is never re-executed. A jump that is later corrected leaves `high_water` in the
+  future, so the store stays suspect (expiry capped, reclaim paused) until the raw
+  clock passes the jumped time plus an hour, and a repeat of the same jump would not be
+  detected again. After correcting a wrong clock, run `--reset-high-water` (below).
 
 An exact retry inside its window replays the committed response or reports `124`
 uncertainty; outside it (or after reclaim) it is refused as expired with `rc=2`. It is
@@ -252,17 +304,23 @@ never re-executed.
 
 **Retention is by time only.** A committed receipt is never compacted, deleted or
 otherwise evicted while its window is open, whatever the store's size; the byte budget
-(`MAX_JOURNAL_BYTES`) and the tombstone bound (`JOURNAL_TOMBSTONE_LIMIT`) are
-**reported**, never enforced by eviction, and accumulated tombstones never block a
-write. The one admission bound is the live-identity count (`JOURNAL_LIMIT`): when the
+(`MAX_JOURNAL_BYTES`) and the advisory tombstone size (`JOURNAL_TOMBSTONE_LIMIT`) are
+**reported**, never enforced by eviction; the tombstone count never stops reclaim and
+never blocks a write (tombstones age out by time only). The one admission bound is the live-identity count (`JOURNAL_LIMIT`): when the
 store genuinely cannot hold one more live identity the mutation fails closed with `124`,
 the transaction is rolled back so the pre-existing store is untouched, and no effect is
 attempted. `stats()` reports `live_bytes`, `tombstone_bytes`, `bytes`, `limit_bytes`
 (`MAX_JOURNAL_BYTES`), `over_bytes`/`over_tombstones`/`over_limit`, `journal_mode` and
-`running_totals_match`; `stats()['file_bytes']` is the database file's size on disk. The
+`running_totals_match`, plus the clock state `high_water`, `suspect`, `anchor`,
+`suspect_since`, `clock_skewed` (= `suspect`) and `trusted_now` as of the call
+(`clock_persisted` is the stored row); `stats()['file_bytes']` is the database file's
+size on disk. The
 store keeps `live_count`/`tombstone_count`/`total_bytes` running totals in `meta`,
 updated inside the same transaction as every row write, so a keyed operation never scans
-the table and latency does not grow with the store's size. Each row also carries the
+the table and latency does not grow with the store's size. Tombstone ageing is a
+range scan on the `(state, reclaimed_at)` index, and schema upgrades (columns,
+backfill, indexes, clock state; schema 5 in this revision) run once, atomically, on the
+first open by the new code, never on every open. Each row also carries the
 directed `actor`, the canonical `route` and the precomputed `replay_until`/`expires_at`
 timestamps.
 
@@ -289,7 +347,7 @@ sudo -u <SERVICE_USER> python3 admin.py --root <RUNTIME_ROOT> journal <PROJECT> 
 sudo -u <SERVICE_USER> python3 admin.py --root <RUNTIME_ROOT> journal <PROJECT> \
     --retention 604800 --committed-retention 86400 --reclaim-expired
 
-# accept the current clock as the high-water mark after a real clock correction
+# after correcting a wrong clock: high_water = now and clear suspicion
 sudo -u <SERVICE_USER> python3 admin.py --root <RUNTIME_ROOT> journal <PROJECT> --reset-high-water
 
 # explicit override after reconciling canonical state: remove a still-live identity
@@ -297,10 +355,13 @@ sudo -u <SERVICE_USER> python3 admin.py --root <RUNTIME_ROOT> journal <PROJECT> 
     --prune-before <EPOCH_SECONDS>
 ```
 
-`--reset-high-water` is the recovery for a genuine correction (an NTP fix, a restored
-host): while the persisted mark is more than `JOURNAL_MAX_SKEW_SECONDS` behind the real
-clock reclaim stays refused, so a forward jump cannot drop a live receipt, and this flag
-explicitly accepts the corrected clock. It removes no identity by itself.
+`--reset-high-water` sets `high_water` to the current clock and clears suspicion. No
+operator action is needed after an idle gap (suspicion settles by itself after an
+hour). Use it after correcting a clock that had jumped forward: it re-arms jump
+detection and ends the capped-expiry period at once. It removes no identity by itself.
+Rev7/rev8 stores are upgraded on first open in one transaction: a store whose
+`high_water` is more than 24 h old starts suspect (`anchor = high_water`) and settles an
+hour later like any idle gap.
 
 `--prune-before` is the only operation that removes a record without a tombstone, so it
 is the only one that can make an exact retry repeat its effect. Reconcile the canonical

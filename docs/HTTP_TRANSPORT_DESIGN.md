@@ -418,9 +418,8 @@ in server-side configuration rather than request data:
   `live_count`/`tombstone_count`/`total_bytes` running totals in `meta` (updated in the
   same transaction as every row write, so admission and the reported size never scan the
   table), and records the directed `actor`, the canonical `route` and the precomputed
-  `replay_until`/`expires_at` per row. `trusted_now()` is the single clock used to stamp
-  a row and to decide replay-versus-expired, so a forward jump that has not been accepted
-  can neither create a future `at` nor expire a live receipt.
+  `replay_until`/`expires_at` per row. Replay-versus-expired is decided with the
+  trusted clock (see rev9 below); rows are stamped with the raw clock.
 * *Service record store.* The HTTP service's idempotency receipts and committed
   canonical results live in `<state>.records.sqlite3` (`http_auth.RecordStore`, WAL,
   time-only retention) rather than inside `http.json`, so the state document no longer
@@ -522,7 +521,36 @@ the same boundary:
 * *Trusted clock on the read path.* `expired()` uses the same trusted clock as a write,
   so during a +8 day jump a 60 s-old committed receipt replays and a live uncertain
   reservation reports `124`; a skewed write is clamped so it can never store a future
-  `at`.
+  `at`. (Superseded by the rev9 trusted clock below.)
+
+**Current build status (rev9).** Revision 9 answers the round-8 review:
+
+* *Idle gaps no longer freeze the clock.* Rev8 advanced `high_water` only while the
+  clock was within 24 h of it, so an ordinary weekend froze the trusted clock for good
+  (no reclaim, rows stamped with the old mark, refusals from day 1.4 at a scaled limit).
+  Each store (journal and `RecordStore`) now persists `high_water` (largest raw clock
+  seen by a write), `suspect`, `anchor` and `suspect_since`. A step of more than
+  `JOURNAL_MAX_SKEW_SECONDS` (24 h) makes the store suspect (the first step records
+  `anchor = high_water`); once the raw clock has run for
+  `JOURNAL_SUSPECT_SETTLE_SECONDS` (1 h) after the step the next write clears it. While
+  suspect the trusted clock is `min(now, anchor + 24 h)` and reclaim/tombstone deletion
+  do not run; otherwise it is `now`. Rows are stamped with the raw clock. After a
+  weekend the first hour is suspect and then normal operation resumes with no
+  operator. A forward jump is held for an hour; a jump that persists longer is
+  accepted (in-window receipts may then become refused tombstones; never
+  re-executed). A refused (`JournalFull`) write still commits its clock observation
+  and time-based maintenance, so a full journal can settle and reclaim.
+* *Flat latency at 30-day steady state.* Schema 5 adds a `(state, reclaimed_at)` index
+  so tombstone ageing is a range scan over stale tombstones only, and the column
+  backfills run once in the schema-upgrade transaction instead of on every open.
+* *The tombstone count never gates reclaim.* `JOURNAL_TOMBSTONE_LIMIT` is advisory
+  (`over_tombstones`); closed receipts are always compacted, so they never count
+  toward `JOURNAL_LIMIT`.
+* *restore-new validates first.* The journal snapshot is opened read-only and checked
+  (`PRAGMA quick_check`, required tables) before any project, Dolt restore or
+  coordination file is created.
+* *Route on HTTP rows.* The HTTP service sends the route with a keyed mutation, so the
+  journal row records it (and the operation hash binds it).
 
 
 Credential issuance is the deliberate exception to replaying a secret. The
