@@ -17,6 +17,17 @@ session work (.19) and personal-agent work (.22) are considered only as
 interface and identity boundaries; this proposal does not assume either is
 accepted or complete.
 
+The existing endpoint serializes its handled mutations with a per-project
+`.coordination.lock` (`fcntl.flock`). Checking a lease while holding that lock
+is a candidate single-host enforcement point, not a multi-host guarantee.
+Direct operator commands through `bd` or `admin.py` do not pass through the
+contributor endpoint and would bypass that check unless separately guarded or
+paused during strict enforcement. The kit has no actor lease today.
+`sessions.py` records run start/heartbeat/end events with server UTC and
+allows several concurrent runs for one actor. Its random `run_id` and
+heartbeat format are useful precedent, but those activity records are not
+exclusive leases: they do not fence writes or prevent concurrent runs.
+
 ## Goals and non-goals
 
 The goal is to make a project's canonical coordination service the arbiter of
@@ -64,11 +75,40 @@ A lease record needs, at minimum:
 | --- | --- |
 | Project and actor key | Defines the exclusion scope |
 | Lease ID and fencing generation | Distinguishes grants and rejects stale holders |
-| Holder ID | Identifies one process/session, not just a reusable actor name |
+| Holder ID | Identifies one independently running work process, not just a reusable actor name |
 | Purpose | Human-readable reason for holding the lease |
 | Issued and expiry instants | Server-recorded lifetime and display |
 | Last operation ID | Supports exact retry reconciliation |
 | State | Active, expired, released, or superseded |
+
+The holder process mints a fresh, unpredictable run/holder ID at its own
+process start, using a cryptographically secure random source (a UUIDv4 is a
+possible representation). Separate scheduled and interactive processes mint
+different IDs even when they use the same actor, checkout, and working
+directory. A registered session's existing `run_id` may supply this identity
+when the same process already records a run; otherwise use a lease-specific
+ID. Do not treat a shared directory or cached handle file as process identity.
+
+The lease ID and the separate lease secret/handle are unguessable
+high-entropy values: possession of the secret authorizes the holder to present
+the lease, so it is credential material. Keep the secret only in the owning
+work process's memory (or an equivalent process-private secure facility),
+never in source, shared files, URLs, command-line arguments, logs, or brief
+and work output. Do not copy or share it between processes, including two
+processes for the same actor and checkout. On process restart, acquire a new
+lease; do not recover another process's secret from disk. If the holder exits,
+expiry and fencing recover safely.
+
+This has an important client boundary: the current `client.py` starts a new
+process for each invocation and sends one endpoint request. That shape cannot
+hold a private batch lease across commands without sharing the handle. A
+lease-aware long-running worker/client must own the lease in the same process
+that owns the work and issue its requests itself. Until that exists, a
+one-shot CLI may acquire/use/release a short command-scoped lease for one
+mutation, but that only serializes that command and must not be described as
+exclusive ownership of the surrounding multi-command work session. Strict
+workflow-wide enforcement must refuse to claim that a sequence of independent
+CLI invocations is protected.
 
 An append-only event trail should retain grants, renewals, releases, expiry
 observations, forced takeovers, and administrative policy changes. The current
@@ -85,29 +125,47 @@ must not claim to provide the exclusion guarantee.
 
 ## Acquire, renew, release
 
-1. **Acquire.** The caller supplies the actor, unique holder ID, purpose,
-   requested TTL, and an operation ID. The server validates the request and
-   any existing project authorization. In one atomic operation, it grants a
-   lease only if no unexpired lease exists for the key, or the previous lease
-   is expired according to canonical server time. Exactly one concurrent
-   contender wins. A grant assigns a fresh lease ID and strictly increasing
-   fencing generation.
-2. **Renew.** The caller supplies the exact lease ID, holder ID, generation,
-   and a new operation ID. Renewal succeeds only while that lease is still
-   active and current. It extends the server-calculated expiry within
-   server-enforced TTL bounds; it cannot revive an expired or superseded
-   lease. Renewal never changes the holder or purpose.
-3. **Release.** Release is conditional on the exact current lease ID, holder,
-   and generation. Releasing an already released lease is idempotent only for
-   the exact original operation. A different holder cannot clear it. A
-   missing response is resolved by reading the operation's canonical outcome,
-   not by issuing a new release with changed content.
+1. **Acquire.** The holder process supplies the actor, its newly minted holder
+   ID, purpose, requested TTL, and operation ID. The server validates the
+   request and any existing project authorization. In one atomic operation,
+   it grants a lease only if no unexpired lease exists for the key, or the
+   previous lease is expired according to canonical server time. Exactly one
+   concurrent contender wins. A grant assigns a fresh opaque, unguessable
+   lease ID, a separate unguessable secret handle, and a strictly increasing
+   fencing generation. The server response carries a nonzero command result
+   for conflict and explicit error text; the `client.py` CLI must exit with
+   that same nonzero status. The SSH endpoint's outer JSON transport may
+   complete normally while carrying that refusal, but it must not become a
+   success-shaped `acquired:false` result with client exit code zero. A piped
+   caller must be able to rely on normal failure propagation and inspect the
+   error.
+2. **Renew.** The same holder process supplies its secret handle, exact lease
+   reference, holder ID, generation, and a new operation ID. Renewal succeeds
+   only while that lease is still active and current. It extends the
+   server-calculated expiry within server-enforced TTL bounds; it cannot
+   revive an expired or superseded lease. Renewal never changes the holder or
+   purpose.
+3. **Release.** Release is conditional on the exact current lease reference,
+   secret handle, holder, and generation. Releasing an already released lease
+   is idempotent only for the exact original operation. A different holder
+   cannot clear it. A missing response is resolved by reading the operation's
+   canonical outcome, not by issuing a new release with changed content.
 
 The server chooses and validates the effective TTL; client-supplied time
 values are ignored. The allowed minimum, maximum, and default TTL remain
 owner/operator decisions. Reacquiring with the same holder does not silently
 extend an existing lease: clients use the explicit renew operation so a
 retry cannot mask a stale process or an accidental second execution.
+
+For an active manual work batch, renew on each accepted protected write using
+the same holder and handle, extending expiry by a bounded server-side
+sliding-TTL rule; a background renewer is not required. A long idle pause may
+let the lease expire. On resume, the process must reacquire and may proceed
+only if no other holder won; it cannot revive the old generation. A one-shot
+command-scoped lease is released after that one mutation and protects no
+subsequent command. Workers that need workflow-wide exclusion must use the
+long-running same-process client boundary above. Explicit release occurs
+when the batch yields or completes.
 
 Lease operations use idempotency keys. A retry with the same actor, operation
 ID, and canonical payload returns the recorded result. Reuse of an operation
@@ -120,19 +178,46 @@ mutation.
 Enforcement belongs at the shared server-side mutation boundary, after
 transport authentication/authorization and before effects. It must cover all
 commands that mutate project coordination state, regardless of whether they
-arrive over SSH, a local endpoint, or HTTP. Read-only commands remain
-available without holding a lease. Acquire, renew, release, and an explicitly
-authorized takeover are lease-control operations with their own validation
-and audit path.
+arrive over SSH, a local endpoint, or HTTP. The initial endpoint candidate is
+to validate while holding that project's existing `.coordination.lock` and
+retain the lock through the protected native mutation. That provides
+serialization only among endpoint requests on the same host/filesystem using
+that lock; it does not cover direct operator `bd`/`admin.py` writes or
+independent hosts. Strict multi-host use needs one shared transactional/fenced
+authority for both lease state and writes. Do not imply otherwise.
 
-In an enforcement-enabled project, every ordinary write made on behalf of an
-actor must present the current lease ID, holder, and fencing generation for
-that actor. The server rejects a missing, expired, released, or superseded
-lease with a clear conflict response that identifies the current holder and
-expiry where visible. A generic actor string is not a lease credential.
-Lease enforcement does not authenticate the actor; the existing access
-controls remain responsible for deciding who may use an actor or perform a
-takeover.
+Classification must occur in each action's parsed command/operation handler,
+not by grepping arbitrary argument text. Explicit read-only examples are
+`bd list`, `show`, `ready`, `search`, `count`, and `lint`; `comments ISSUE`
+(the current CLI has no `comments list` read subcommand); `dep list`, `cycles`,
+and `tree`; `brief`, `history`, `review TASK` without a payload, `work`,
+`session show`, and `session run status`. Explicit mutations include
+`bd create`, `update`, `close`, and `reopen`; `comments add`; dependency `add`,
+`remove`, `relate`, `unrelate`, and the `--blocks` shorthand; `checkpoint`;
+review contribution, request, response, and approval payloads; handoff
+dispositions; session register/resume and run start/heartbeat/end; lifecycle
+record; and coordination mutations. `view` is read-only. `refresh` writes
+derived views but not canonical coordination state and is outside this lease's
+write guarantee. A shared route does not imply a shared classification:
+`brief` is read-only while `checkpoint` writes, and `review TASK` reads while
+a review payload mutates. Comments and dependencies likewise require
+recognizing the specific operation. Unknown or malformed subcommands,
+ambiguous forms, and unclassified future mutations fail closed as writes; only
+an explicitly recognized read-only operation bypasses a lease check.
+
+Acquire, renew, release, and an explicitly authorized takeover are
+lease-control operations with their own validation and audit path; their
+effects are serialized with ordinary protected mutations.
+
+For each opted-in actor, every ordinary write must present the current lease
+reference, secret handle, holder ID, and fencing generation. The server
+rejects missing, expired, released, or superseded credentials with a clear
+conflict response that identifies the current holder and expiry where visible.
+The response and client process exit status must be nonzero; it must not be
+encoded as a successful result with a false acquisition flag. A generic actor
+string is not a lease credential. Lease enforcement does not authenticate the
+actor; existing access controls remain responsible for deciding who may use
+an actor or perform a takeover.
 
 The lease check cannot be a preliminary check followed by an unrelated write:
 a takeover could occur between those two operations. The lease validation and
@@ -147,13 +232,25 @@ returns a visible error; it must not silently proceed without checking or
 fall back to a local lock. Reads may report lease state as unavailable rather
 than presenting an unverified lease as active or absent.
 
-For migration, enforcement should be explicitly disabled until compatible
-clients and the server-side guard are ready. A project can first expose
-read-only lease status, then enable strict enforcement with a documented
-cutover. Once enabled, an old client that omits a lease is refused rather
-than bypassing the policy. The exact configuration mechanism, opt-in policy,
-and transition behavior require review. Turning enforcement off removes the
-guarantee and should itself be an authorized, audited policy change.
+The lease reference, holder ID, secret handle, and fencing generation must
+travel with every protected request. The existing SSH/local `client._wire`
+JSON envelope has no lease field; the proposal is to add a typed top-level
+lease context there and pass it unchanged to the endpoint guard. HTTP requests
+must carry the same context in dedicated authenticated headers or a typed
+request field over TLS; never place a secret in a URL, native `bd` argv,
+shell word, or log. Adapters normalize both transports to the same guard
+input, and actor identity still comes from the transport's existing
+authorization/binding rules. Missing or malformed lease context is a
+conflict in strict mode, not a fallback.
+
+Classify and enforce first in warn/audit-only mode, logging would-be refused
+operations and the selected actor without recording the secret. Then allow
+strict opt-in per actor (not by inventing a role) while non-opted-in actors
+retain existing behavior; only after compatibility evidence should an owner
+consider broader enforcement. Strict opt-in refuses old clients that omit
+the lease for that actor. Turning enforcement off removes the guarantee and
+must itself be authorized and audited. Direct operator writes remain a bypass
+unless the operator path is guarded or explicitly paused for opted-in actors.
 
 ## Expiry, crashes, clocks, and takeover
 
@@ -173,15 +270,19 @@ fences old writes.
 
 **Clock skew.** Clients do not calculate validity and their wall clocks do
 not affect the decision. The canonical server/storage authority supplies
-timestamps. Persisted expiry requires a wall-clock representation so it
-survives service restart; monotonic time is useful only within a running
-authority and cannot by itself recover a deadline after restart. The storage
-adapter should provide a single serialized time source and prevent its
-effective time from moving backwards. A detected material forward/backward
-clock discontinuity must suspend lease grants and protected writes until the
-authority is reconciled; it must not silently expire every holder or extend
-leases. The acceptable skew/discontinuity threshold and recovery procedure
-remain operational decisions.
+timestamps. Persist a canonical UTC high-water mark and the last monotonic
+clock sample observed by the running authority. During one uptime, compare
+wall-clock elapsed time with monotonic elapsed time; a forward or backward
+wall-clock step beyond an operator-selected tolerance marks lease time
+unhealthy. Reject timestamps below the persisted high-water mark. After
+restart, monotonic time has a new origin, so it cannot alone validate
+previous deadlines: if the wall clock is behind the persisted high-water
+mark, suspend grants and protected writes; if a forward jump exceeds the
+configured plausible downtime bound, require explicit reconciliation rather
+than expiring all holders. These checks cannot prove the cause of a long
+offline interval; the clock source, thresholds, and recovery procedure remain
+operational decisions. A detected discontinuity must never silently expire
+every holder or extend leases.
 
 **Forced takeover.** An active lease may be displaced only through a distinct,
 explicit takeover operation, never because an operator waited “long enough”
@@ -199,13 +300,15 @@ contributor endpoint.
 
 ## Visibility and user experience
 
-`brief` and `work` should show the relevant current actor lease state or state
-that no lease is held. When held, show holder ID, purpose, issued/expiry time,
-server-calculated time remaining, and whether the caller is the holder. Also
-show unavailable or stale-observation states explicitly. A listing should
-allow a coordinator to discover active leases without querying each task.
-Views reuse existing project read authorization and must not disclose a
-secret lease handle, local working-directory path, or new identity data.
+`brief TASK` should show the current lease for that task's currently assigned
+actor; `work` should show actor leases for the selected owner/actor scope, not
+imply that leases are keyed by task. Both show no-lease, unavailable, or
+stale-observation state explicitly. When held, show holder ID, purpose,
+issued/expiry time, server-calculated time remaining, and whether the current
+caller is the holder. A listing should allow a coordinator to discover active
+leases without querying each task. Views reuse existing project read
+authorization and must not disclose the secret lease handle, local
+working-directory path, or new identity data.
 
 Acquisition refusal should be actionable: identify the current holder and
 expiry, suggest a status read or coordination with that holder, and distinguish
@@ -220,29 +323,38 @@ The HTTP-session boundary (.19) and the lease boundary solve different
 problems. A valid HTTP session may authorize a request but does not prove that
 the caller is the only process using an actor. The HTTP adapter must derive the
 effective actor from its existing authenticated principal binding and invoke
-the same canonical lease guard as other transports. Session expiry/revocation
-must not silently release a lease; the lease expires or is explicitly
-released/taken over. Any backend that is only single-process must state that
-limit; multi-process or multi-host use requires transactional lease and write
-coordination rather than assuming an in-process lock is shared.
+the same canonical lease guard as other transports. The lease reference,
+holder ID, secret handle, and generation travel in a typed HTTP header/request
+context equivalent to the SSH/local JSON field; they do not replace the
+session credential. Session expiry/revocation must not silently release a
+lease; the lease expires or is explicitly released/taken over. An in-process
+HTTP backend and per-process file locks do not provide multi-process or
+multi-host safety; that scope requires a shared transactional lease-and-write
+authority.
 
 The personal-agent boundary (.22) proposes owner-bound agent identities whose
 access cannot exceed their owner's existing project authority. A registered
-agent may have a distinct actor ID and therefore a distinct actor lease. If
-the intended guarantee is one active process across all agents of an owner,
-that is a different owner-keyed policy and must be decided explicitly. A
-lease must not reveal a private working-directory hint or make an agent a
-project role. Disabling an owner/agent or revoking a credential should prevent
-future authorized writes under existing authorization rules; it does not
-rewrite the history of already granted leases.
+agent may have a distinct actor ID and therefore a distinct actor lease. A
+manual agent run mints and holds its own handle in the live work process; no
+background renewer is assumed. Each protected action renews the active batch
+lease. When the user stops to wait for feedback, the agent releases it or lets
+it expire; on manual resume, it reacquires and may be refused if another
+holder is current. If the intended guarantee is one active process across all
+agents of an owner, that is a different owner-keyed policy and must be decided
+explicitly. A lease must not reveal a private working-directory hint or make
+an agent a project role. Disabling an owner/agent or revoking a credential
+should prevent future authorized writes under existing authorization rules;
+it does not rewrite the history of already granted leases.
 
 SSH remains a supported transport. It must reach the same server-side command
-guard and keep its existing project/actor selection explicit. Lease enforcement
-cannot be HTTP-only, nor may old SSH clients bypass it after enforcement is
-enabled. During migration, unmodified clients continue to work only while
-enforcement is disabled; after cutover, clients must acquire and attach a
-lease for protected writes. Read access and transport choice remain separate
-from lease ownership.
+guard and keep its existing project/actor selection explicit. Its existing
+one-request JSON stdin envelope needs the lease context added by a
+lease-aware client; lease IDs/generation and secret handle must not be
+smuggled in native command arguments. Enforcement cannot be HTTP-only, nor
+may old SSH clients bypass it for an opted-in actor. During warn-only rollout,
+unmodified clients continue to work with audit warnings; strict opt-in actors
+must use the lease-aware path. Read access and transport choice remain
+separate from lease ownership.
 
 ## Durability, backup, and recovery
 
@@ -262,20 +374,33 @@ Implementation should use disposable fixtures and prove at least:
 
 - Concurrent acquisition for one key yields exactly one active holder; a
   different actor/project remains independent.
+- Separate processes for the same actor and checkout mint distinct holder IDs;
+  no test or supported flow writes a handle to a shared cache. A piped acquire
+  refusal yields nonzero status and actionable stderr.
 - Wrong holder, actor, lease ID, generation, or operation payload is refused;
   exact uncertain retries reconcile without duplicate events.
 - Expired/released/superseded holders cannot write, including a delayed write
   racing with acquisition or forced takeover.
 - Renewal cannot revive expiry; release cannot clear another holder; TTL
-  bounds are enforced server-side.
+  bounds are enforced server-side; manual work batches renew on protected
+  writes and resume only after reacquiring.
 - A crash/restart, unavailable store, malformed state, and simulated clock
   rollback/forward discontinuity fail safely and recover explicitly.
 - Forced takeover requires authorization and reason/evidence, increments the
   generation, and leaves a queryable audit event.
 - `brief`/`work` show active, absent, expired, and unavailable states without
   exposing lease credentials or private agent paths.
+- Parsed-operation classification distinguishes read-only `list`/`show` and
+  review/brief reads (including `comments ISSUE`, not nonexistent
+  `comments list`) from `create`/`update`, comment/dependency mutations,
+  checkpoint, and review/handoff writes; unknown forms fail closed. Exercise
+  every supported SSH/local and HTTP wire path with absent, malformed, and
+  valid lease context.
 - SSH, local, and HTTP mutation paths all enforce the same policy; HTTP
   principal binding and agent owner caps continue to apply.
+- The endpoint guard under `.coordination.lock` serializes same-host endpoint
+  writes, while tests/documentation demonstrate that direct `bd`/`admin.py`
+  and independent hosts are outside that guarantee unless separately guarded.
 - Backup/restore does not resurrect two active authorities, and rollback of
   enforcement is explicit and auditable.
 
@@ -307,6 +432,7 @@ have acted.
    visibility under existing authorization?
 
 **Proposed disposition:** review this design and resolve the decisions above
-before implementation. This note is not owner acceptance, authorization to
-change existing lease/merge behavior, or evidence of implementation,
-testing, review, integration, deployment, or live verification.
+before implementation. No actor lease exists in the kit today. This note is
+not owner acceptance or authorization to alter existing merge-slot behavior,
+and is not evidence of implementation, testing, review, integration,
+deployment, or live verification.
