@@ -144,7 +144,7 @@ def clip(value,limit):
     value=str(value or '')
     return {'text':value[:limit],'omitted_chars':max(0,len(value)-limit)}
 
-def brief(rows,project,task,offset=0,limit=5):
+def brief(rows,project,task,offset=0,limit=5,operators=None):
     if type(offset) is not int or offset<BRIEF_ITEM_OFFSET_MIN or type(limit) is not int or not BRIEF_ITEM_LIMIT_MIN<=limit<=BRIEF_ITEM_LIMIT_MAX:
         raise ValueError('Invalid unresolved-item page: --items-offset must be >= %d and --items-limit must be %d..%d' % (BRIEF_ITEM_OFFSET_MIN,BRIEF_ITEM_LIMIT_MIN,BRIEF_ITEM_LIMIT_MAX))
     issue=task_row(rows,task);current,invalid=checkpoints(issue)
@@ -156,7 +156,7 @@ def brief(rows,project,task,offset=0,limit=5):
     deps=[d for d in (issue.get('dependencies') or []) if d.get('type')!='parent-child']
     from work import workflow
     from review_state import scopes_for
-    review=workflow(issue,scopes_for(rows,task))
+    review=workflow(issue,scopes_for(rows,task),operators=operators)
     # ORIGINAL meaning: does the scope currently shown in `lifecycle`/`lifecycle_scope`
     # (the newest recorded scope) belong to the current contribution? The ANY-scope
     # answer is additive as `review.integration.matches_contribution`.
@@ -289,7 +289,7 @@ def help_notes(action):
             '--json is accepted in any position; the saved checkpoint is always returned as JSON on stdout.',
             'Every unresolved item must be carried forward unchanged or explicitly resolved with reason and evidence.']
 
-def execute(root,path,project,actor,action,args,attachments,run):
+def execute(root,path,project,actor,action,args,attachments,run,operators=None):
     """Endpoint holds project coordination lock. History caches are disposable."""
     from work import help_payload,help_requested
     if help_requested(args):
@@ -320,7 +320,7 @@ def execute(root,path,project,actor,action,args,attachments,run):
     else:
         rows=[json.loads(x) for x in run(['export','--all']).splitlines() if x.strip()]
         if action=='brief':
-            result=brief(rows,project,a.task,a.items_offset,a.items_limit)
+            result=brief(rows,project,a.task,a.items_offset,a.items_limit,operators=operators)
             return json.dumps(result,ensure_ascii=False,indent=2)+'\n' if a.json else format_brief(result)
         data=snapshot(rows,project,a.task);digest=content_hash(data);cache.mkdir(exist_ok=True)
         file=cache/(digest+'.json')

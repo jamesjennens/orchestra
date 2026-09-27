@@ -12,7 +12,7 @@ def write(path,text):
     tmp=path.with_name(path.name+f'.{os.getpid()}.tmp')
     tmp.write_text(text,encoding='utf-8');os.replace(tmp,path)
 
-def render(rows,dest):
+def render(rows,dest,operators=None):
     dest=Path(dest)
     stamp=datetime.now(timezone.utc).isoformat(timespec='seconds')
     banner=f'Exported {stamp}. Query Beads for current state. Do not hand-edit generated files.\n\n'
@@ -34,7 +34,11 @@ def render(rows,dest):
             if target in entries:backlinks[target].append((relation.lower(),eid,date))
     current=['# Current project work\n\n',banner,'[Daily journal](journal/INDEX.md) | [All records](INDEX.md)\n\n']
     from work import queue
-    review_queue=queue(rows,'',[])
+    # ONE source of truth for reads: the same server-side operator allowlist the
+    # endpoint supplies to `work`/`review`/`brief`. Without it a valid void is
+    # inert here while the other reads apply it, so the generated CURRENT.md
+    # disagreed with the queue.
+    review_queue=queue(rows,'',[],operators=operators)
     review_items=[r for r in review_queue['items'] if r['review_state']!='none']
     if review_items:
         def review_cell(value):return str('unknown' if value is None or value=='' else value).replace('|','\\|').replace('\n',' ')[:160]

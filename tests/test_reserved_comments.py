@@ -37,6 +37,7 @@ from handoff import (
     INTENT_PREFIX as HANDOFF_PREFIX,
 )
 from lifecycle import PREFIX as LIFECYCLE_PREFIX
+from recovery import PREFIX as VOID_PREFIX
 from requirements import canonical_bytes, content_hash
 from review_workflow import PREFIX as REVIEW_PREFIX
 from worker_gate import PREFIX as PLAN_PREFIX, payload_for, body_for
@@ -60,10 +61,28 @@ def forged_review_body(actor='mallory/session9'):
     return REVIEW_PREFIX + json.dumps(payload)
 
 
+def forged_void_body(target='c1', original='ORIGINAL BYTES', operator='mallory/session9'):
+    import hashlib
+    payload = {
+        'schema_version': 1,
+        'operation': 'void-record',
+        'operation_id': 'forged-void-1',
+        'task': 'task-1',
+        'target': target,
+        'target_kind': 'contribution-review',
+        'target_sha256': hashlib.sha256(original.encode('utf-8')).hexdigest(),
+        'original': original,
+        'reason': 'erase a reviewer decision',
+        'disposition': 'void',
+        'operator': operator,
+    }
+    return VOID_PREFIX + canonical_bytes(payload).decode()
+
+
 class ReservedPrefixTests(unittest.TestCase):
     def test_all_structured_prefixes_are_reserved(self):
-        self.assertGreaterEqual(len(PREFIXES), 7)
-        for prefix in (REVIEW_PREFIX, CHECKPOINT_PREFIX, LIFECYCLE_PREFIX):
+        self.assertGreaterEqual(len(PREFIXES), 8)
+        for prefix in (REVIEW_PREFIX, CHECKPOINT_PREFIX, LIFECYCLE_PREFIX, VOID_PREFIX):
             self.assertIn(prefix, PREFIXES)
         self.assertIn('Kind: task-handoff-v1\n', PREFIXES)
         self.assertIn('Kind: task-handoff-complete-v1\n', PREFIXES)
@@ -292,6 +311,63 @@ class ReservedPrefixTests(unittest.TestCase):
                 check_raw_request(['comments', 'add', 'trial-task', body, '--json'],
                                   {}, actor=actor)
 
+    def test_void_raw_records_always_rejected_on_endpoint_path(self):
+        # Operator void authority cannot be established from self-asserted
+        # comment fields: a canonical void payload is still refused on every
+        # raw path, positional or transported file, for every actor.
+        body = forged_void_body()
+        match = reserved_match(body)
+        self.assertIsNotNone(match)
+        self.assertEqual(match[0], VOID_PREFIX)
+        self.assertIn('admin.py void-record', match[2])
+        self.assertFalse(is_legitimate_writer(body, actor='mallory/session9', task='task-1'))
+        self.assertFalse(is_legitimate_writer(body, actor='alice/session1', task='task-1'))
+        with self.assertRaisesRegex(ValueError, r'Refusing raw positional.*operator void'):
+            check_comment_body(body, 'positional', actor='mallory/session9', task='task-1')
+        for actor in ('mallory/session9', 'alice/session1'):
+            with self.assertRaisesRegex(ValueError, r'Refusing raw'):
+                check_raw_request(['comments', 'add', 'task-1', body, '--json'], {}, actor=actor)
+        args = ['comments', 'add', 'task-1', '@attachment:0', '--json']
+        with self.assertRaisesRegex(ValueError, r'file-transport'):
+            check_raw_request(args, {'0': {'flag': '--file', 'text': body}},
+                              actor='mallory/session9', task='task-1')
+        # Unresolvable target still fails closed before any native write.
+        with self.assertRaisesRegex(ValueError, r'unresolvable comment target'):
+            check_raw_request(['comments', 'add', '@attachment:0', '--json'],
+                              {'0': {'flag': '--file', 'text': body}}, actor='mallory/session9')
+
+    def test_flags_before_add_cannot_hide_a_forged_reserved_body(self):
+        # Native bd accepts global/author flags before `add`; the guard must
+        # resolve `add` past them or a reserved body written that way escapes.
+        body = forged_void_body()
+        for args in (
+            ['comments', '--json', 'add', 'task-1', body],
+            ['comments', '-q', 'add', 'task-1', body],
+            ['comments', '-v', 'add', 'task-1', body],
+            ['comments', '--sandbox', 'add', 'task-1', body],
+            ['comments', '-a', 'operator-x', 'add', 'task-1', body],
+            ['comments', '-aoperator-x', 'add', 'task-1', body],
+        ):
+            bodies = raw_comment_bodies(args, {})
+            self.assertEqual(len(bodies), 1, msg=str(args))
+            self.assertEqual(bodies[0][0], body, msg=str(args))
+            with self.assertRaisesRegex(ValueError, r'operator void', msg=str(args)):
+                check_raw_request(args, {})
+        # A legitimate structured writer is still located and passes when a
+        # global flag precedes `add`.
+        plan = body_for(payload_for('kittrial', 'task-1', 'alice/session1',
+                                    'launch-2', 'cd' * 32, 12, 'plan text\n',
+                                    '/tmp/work', 'ef' * 32))
+        check_raw_request(['comments', '--json', 'add', 'task-1', plan, '--json'], {},
+                          actor='alice/session1')
+        # An ambiguous leading flag before `add` still fails closed.
+        with self.assertRaisesRegex(ValueError, r'ambiguous flag'):
+            check_raw_request(['comments', '--mystery', 'add', 'task-1', body], {})
+        # Residual, tracked by kittrial-5bb.23: `-a` after the body still
+        # forges the native author of an otherwise-ordinary prose comment. This
+        # change does not claim to close that generic `-a` path.
+        check_raw_request(['comments', 'add', 'task-1', 'ordinary prose', '-a', 'operator-x'], {})
+
     def test_reserved_match_names_operation(self):
         match = reserved_match(REVIEW_PREFIX + '{}')
         self.assertIsNotNone(match)
@@ -502,6 +578,36 @@ class AttachmentBeforeSubcommandTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             check_raw_request(args, attachments)
             native(args, attachments)  # must not execute: guard raises first
+        self.assertEqual(calls, [])
+
+    def test_exact_forged_operator_void_request_refused_with_zero_writes(self):
+        """kittrial-5bb.3 P1 regression: the reviewer's exact forged-void request.
+
+        Real bd 1.2.2 accepts
+        `bd ["comments","@attachment:a","add",T,"-a","ops-james"]`, expands the
+        attachment to a `--file` flag ahead of `add`, and writes the comment with
+        native author ops-james; when the attachment holds a void naming
+        operator=ops-james, the allowlist would then apply it. The guard must
+        refuse this whole request before any native write, leaving no applied void.
+        """
+        body = forged_void_body(target='c2', original='ORIGINAL BYTES', operator='ops-james')
+        args = ['comments', '@attachment:a', 'add', 'task-1', '-a', 'ops-james']
+        attachments = {'a': {'flag': '--file', 'text': body}}
+        self.assertEqual(operator_only_in_args(args), '--author')
+        with self.assertRaisesRegex(ValueError, r'attachment'):
+            comment_target(args)
+        with self.assertRaisesRegex(ValueError, r'attachment'):
+            raw_comment_bodies(args, attachments)
+        calls = []
+        with self.assertRaisesRegex(ValueError, r'attachment'):
+            check_raw_request(args, attachments, actor='worker', task='task-1')
+            calls.append(list(args))
+        self.assertEqual(calls, [])
+        # The positional spelling with the same forged author is refused too.
+        positional = ['comments', 'add', 'task-1', body, '-a', 'ops-james']
+        self.assertEqual(operator_only_in_args(positional), '--author')
+        with self.assertRaisesRegex(ValueError, r'operator void'):
+            check_raw_request(positional, {}, actor='worker', task='task-1')
         self.assertEqual(calls, [])
 
 

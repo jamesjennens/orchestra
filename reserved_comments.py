@@ -20,6 +20,7 @@ from handoff import (
 )
 from lifecycle import PREFIX as LIFECYCLE_PREFIX
 from requirements import ACCEPTANCE_FIELDS, SHA256_TEXT
+from recovery import PREFIX as VOID_PREFIX
 from review_workflow import PREFIX as REVIEW_PREFIX
 from worker_gate import PREFIX as PLAN_PREFIX, parse_body as parse_plan_body
 
@@ -169,6 +170,7 @@ RESERVED = (
     (HANDOFF_PREFIX, 'handoff intent', 'handoff TASK --file handoff.json'),
     (HANDOFF_COMPLETE_PREFIX, 'handoff completion', 'handoff TASK --file handoff.json'),
     (PLAN_PREFIX, 'worker plan registration', 'worker_gate.py register'),
+    (VOID_PREFIX, 'operator void record', 'admin.py void-record on the coordination host'),
 )
 
 PREFIXES = tuple(prefix for prefix, _, _ in RESERVED)
@@ -1099,6 +1101,14 @@ def is_legitimate_writer(body, actor=None, task=None):
         # Durable F3 acceptance evidence is written only by the operator
         # acceptance route (admin.py requirement-apply) bound to the exact
         # revision hash; a self-asserted acceptance comment must never pass.
+        return False
+    if body.startswith(VOID_PREFIX):
+        # Operator authority cannot be established from self-asserted comment
+        # fields: a void record carries only its own payload, and its native
+        # author is whatever `bd` was told at write time. Verified voids are
+        # written by the host-side structured operation (admin.py void-record,
+        # under the project lock); every raw path stays rejected, exactly like
+        # handoff records.
         return False
     return False
 

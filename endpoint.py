@@ -16,7 +16,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from admin import environment,project_dir,root_path
+from admin import environment,project_dir,root_path,operators as configured_operators
 import native
 from render import render
 from lifecycle import apply_native
@@ -122,7 +122,8 @@ def execute(root,request,authority_config=None,require_authority=False):
         # a validation refusal raised before any write is provably pre-effect.
         runner=NativeRunner(run)
         def work_effect():
-            return {'returncode':0,'stdout':json.dumps(work_execute(path,actor,action,args,request.get('attachments',{}),runner),ensure_ascii=False,indent=2)+'\n','stderr':''.join(run_warnings)}
+            return {'returncode':0,'stdout':json.dumps(work_execute(path,actor,action,args,request.get('attachments',{}),runner,
+                                                                    operators=configured_operators(root)),ensure_ascii=False,indent=2)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             return run_guarded(request,journal_path(path),work_effect,
@@ -142,7 +143,8 @@ def execute(root,request,authority_config=None,require_authority=False):
             return stdout
         runner=NativeRunner(run)
         def briefing_effect():
-            return {'returncode':0,'stdout':briefing_execute(root,path,name,actor,action,args,request.get('attachments',{}),runner),'stderr':''.join(run_warnings)}
+            return {'returncode':0,'stdout':briefing_execute(root,path,name,actor,action,args,request.get('attachments',{}),runner,
+                                                             operators=configured_operators(root)),'stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             return run_guarded(request,journal_path(path),briefing_effect,
@@ -192,7 +194,7 @@ def execute(root,request,authority_config=None,require_authority=False):
             p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','export','--all'],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
             if p.returncode:return {'returncode':p.returncode,'stdout':p.stdout,'stderr':p.stderr}
             rows=[json.loads(line) for line in p.stdout.splitlines() if line.strip()]
-            return {'returncode':0,'stdout':json.dumps(render(rows,path/'views'))+'\n','stderr':p.stderr}
+            return {'returncode':0,'stdout':json.dumps(render(rows,path/'views',configured_operators(root)))+'\n','stderr':p.stderr}
     if action!='bd':raise ValueError('Unknown action')
     args=request.get('args',[])
     if not isinstance(args,list) or not args or any(not isinstance(a,str) or '\0' in a for a in args):raise ValueError('Expected argument list')

@@ -141,11 +141,11 @@ class Parser(argparse.ArgumentParser):
         hint=next((text for flag,text in MISTAKEN_FLAGS.items() if flag in message),None)
         raise ValueError(message+('; hint: '+hint if hint else ''))
 
-def workflow(issue,scopes=None):
-    from review_state import project
-    return project(issue,scopes)
+def workflow(issue,scopes=None,operators=None):
+    from review_state import project as reviewed
+    return reviewed(issue,scopes,operators)
 
-def queue(rows,actor,args,request_dir=None):
+def queue(rows,actor,args,request_dir=None, operators=None):
     if help_requested(args):return help_payload('work')
     parser=Parser(add_help=False)
     group=parser.add_mutually_exclusive_group();group.add_argument('--mine',action='store_true');group.add_argument('--owner')
@@ -174,7 +174,7 @@ def queue(rows,actor,args,request_dir=None):
     for row in rows:
         if row.get('issue_type') in ('event','gate','merge-slot'):continue
         if owner is not None and row.get('assignee')!=owner:continue
-        try:review=workflow(row,evidence.get(row['id']));state=review['review_state'];error=None
+        try:review=workflow(row,evidence.get(row['id']),operators=operators);state=review['review_state'];error=None
         except ValueError as e:review={};state='error';error=str(e)[:300]
         fact=facts.get(row['id'],{}).get('facts',{})
         if row.get('status')=='closed' and state not in ('changes-requested','awaiting-review','awaiting-integration','legacy-review-ready','error'):continue
@@ -210,7 +210,7 @@ def queue(rows,actor,args,request_dir=None):
         result['coverage']=result['coverage']+' Journal validation completed before task filters; errors apply to this entire page.'
     return result
 
-def execute(path,actor,action,args,attachments,run):
+def execute(path,actor,action,args,attachments,run,operators=None):
     # Help is recognised anywhere it is a standalone token and never touches the
     # native export, the coordination lock or an attachment.
     if help_requested(args):
@@ -220,7 +220,7 @@ def execute(path,actor,action,args,attachments,run):
         args=[token for token in args if token!='--json']
     if action=='work':
         rows=[json.loads(line) for line in run(['export','--all']).splitlines() if line.strip()]
-        return queue(rows,actor,args,path/'.handoff-requests')
+        return queue(rows,actor,args,path/'.handoff-requests', operators=operators)
     if len(args) not in (1,2):raise ValueError('Use review TASK [--file payload.json] or handoff TASK --file payload.json')
     task=args[0]
     if action=='review' and len(args)==1:
@@ -228,7 +228,7 @@ def execute(path,actor,action,args,attachments,run):
         rows=[json.loads(line) for line in run(['export','--all']).splitlines() if line.strip()]
         issue=task_row(rows,task)
         from review_state import scopes_for
-        return workflow(issue,scopes_for(rows,task))
+        return workflow(issue,scopes_for(rows,task),operators=operators)
     if len(args)!=2 or not args[1].startswith('@attachment:'):raise ValueError('A JSON file attachment is required')
     item=attachments.get(args[1].partition(':')[2],{})
     if not isinstance(item,dict) or item.get('flag') not in ('--file','-f') or not isinstance(item.get('text'),str):raise ValueError('Invalid attachment')
@@ -245,7 +245,7 @@ def execute(path,actor,action,args,attachments,run):
         return handoff(path,actor,payload,run)
     from review_workflow import execute as review
     rows=[json.loads(line) for line in run(['export','--all']).splitlines() if line.strip()]
-    result=review(rows,task,actor,payload,run)
+    result=review(rows,task,actor,payload,run, operators=operators)
     if payload.get('operation')=='request-changes':
         # Retry repairs a label update interrupted after the durable review comment.
         run(['update',task,'--remove-label','review-ready','--json'])
