@@ -1,14 +1,18 @@
 """Timeout-safe native sync, the durable last-complete pair and the reference copy.
 
-kittrial-5bb.39 rev2. ``bd backup sync`` carries a fixed client read timeout of about
+kittrial-5bb.39 rev3. ``bd backup sync`` carries a fixed client read timeout of about
 ten seconds, which a large database cannot meet on a stalled server, and a failed run
 used to leave only a ``pending`` sidecar behind. These tests cover the Dolt SQL-client
-sync path, the last-complete copy that a failed or interrupted run cannot degrade, and
-the gated reference off-machine copy helper.
+sync path, the last-complete copy that a failed or interrupted run cannot degrade, the
+operation-journal snapshot that must stay in the same generation as that pair, and the
+gated reference off-machine copy helper (which stages, locks and replaces a destination
+instead of merging into it).
 """
 import contextlib
 import io
 import json
+import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -41,6 +45,33 @@ def write_pair(root, name, status='complete', files=None):
         encoding='utf-8')
 
 
+def write_live_journal(path, operation_ids):
+    """A minimal live operation journal (the schema ``_check_journal_database`` wants)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        path.unlink()
+    connection = sqlite3.connect(str(path))
+    try:
+        connection.execute(
+            'CREATE TABLE operations(operation_id TEXT PRIMARY KEY, state TEXT)')
+        connection.execute('CREATE TABLE meta(key TEXT)')
+        connection.executemany('INSERT INTO operations VALUES(?,?)',
+                               [(item, 'committed') for item in operation_ids])
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def journal_ids(path):
+    if not Path(path).is_file():
+        return None
+    connection = sqlite3.connect(str(path))
+    try:
+        return {row[0] for row in connection.execute('SELECT operation_id FROM operations')}
+    finally:
+        connection.close()
+
+
 class RuntimeCase(unittest.TestCase):
     """A disposable runtime root with the fake ``fcntl`` the POSIX lock code needs."""
 
@@ -54,6 +85,7 @@ class RuntimeCase(unittest.TestCase):
             {'port': 13317, 'unit': 'beads-example.service', 'password': 'test-only-password',
              'schema': 1}), encoding='utf-8')
         fake = types.SimpleNamespace(flock=Mock(), LOCK_EX=2)
+        self.fcntl = fake
         patcher = patch.dict(sys.modules, {'fcntl': fake})
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -180,6 +212,88 @@ class LastCompletePairCase(RuntimeCase):
             'pending')
         self.assertEqual(admin.backup_pair_state(self.root, 'alpha')[0], False)
 
+    def test_a_failed_run_keeps_the_journal_snapshot_of_the_last_complete_pair(self):
+        # P1(b): the journal snapshot must belong to the same generation as the native
+        # backup and the complete sidecar. A keyed write is acknowledged, the synced run
+        # fails, and restore-new must not see that un-synced operation in the journal it
+        # restores with the previous Dolt state.
+        live = self.root / 'projects' / 'alpha' / admin.JOURNAL_STORE_NAME
+        write_live_journal(live, ['op-old'])
+        with patch.object(admin, 'native_backup_sync', return_value='Backup synced'):
+            stdout, stderr, code = self.run_admin('backup', 'alpha')
+        self.assertEqual(code, 0, stderr)
+        snapshot = admin.journal_snapshot_path(self.root, 'alpha')
+        self.assertEqual(journal_ids(snapshot), {'op-old'})
+        # A keyed write lands in the live journal, then the native sync fails.
+        write_live_journal(live, ['op-old', 'op-unsynced'])
+        failure = subprocess.CalledProcessError(1, ['dolt', 'sql'], stderr='backup target is full')
+        with patch.object(admin, 'native_backup_sync', side_effect=failure):
+            stdout, stderr, code = self.run_admin('backup', 'alpha')
+        self.assertNotEqual(code, 0)
+        # The complete sidecar (and the durable last-complete copy) is restored...
+        self.assertEqual(admin.backup_pair_state(self.root, 'alpha'), (True, None))
+        aside = admin.last_complete_sidecar_path(self.root, 'alpha')
+        self.assertEqual(json.loads(aside.read_text(encoding='utf-8'))['status'], 'complete')
+        # ...and the journal snapshot restore-new uses is the one that pairs with it,
+        # with no un-synced operation and no staging file left behind.
+        self.assertEqual(journal_ids(snapshot), {'op-old'})
+        self.assertNotIn('op-unsynced', journal_ids(snapshot))
+        self.assertFalse(admin.staged_journal_snapshot_path(self.root, 'alpha').exists())
+        # A later successful run promotes the journal of the new generation.
+        with patch.object(admin, 'native_backup_sync', return_value='Backup synced'):
+            stdout, stderr, code = self.run_admin('backup', 'alpha')
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(journal_ids(snapshot), {'op-old', 'op-unsynced'})
+
+    def test_restore_reports_when_it_falls_back_to_the_last_complete_copy(self):
+        write_pair(self.root, 'alpha', status='pending')
+        aside = admin.last_complete_sidecar_path(self.root, 'alpha')
+        aside.write_text(json.dumps(
+            {'schema_version': 1, 'status': 'complete', 'files': {}, 'operators': []}),
+            encoding='utf-8')
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            admin.restore_coordination(self.root, 'alpha', 'beta')
+        # The operator is told the canonical sidecar was not complete and what the
+        # restore actually used, instead of the fallback happening silently.
+        self.assertIn('last-complete copy', output.getvalue())
+
+    def test_a_journal_snapshot_is_promoted_only_after_a_successful_sync(self):
+        live = self.root / 'projects' / 'alpha' / admin.JOURNAL_STORE_NAME
+        write_live_journal(live, ['op-one'])
+        with patch.object(admin, 'native_backup_sync', side_effect=RuntimeError('sync failed')):
+            with self.assertRaises(RuntimeError):
+                admin.backup_project(self.root, 'alpha')
+        # No previous snapshot existed, so a failed first run publishes none.
+        self.assertIsNone(journal_ids(admin.journal_snapshot_path(self.root, 'alpha')))
+        with patch.object(admin, 'native_backup_sync', return_value='Backup synced'):
+            admin.backup_project(self.root, 'alpha')
+        self.assertEqual(journal_ids(admin.journal_snapshot_path(self.root, 'alpha')), {'op-one'})
+
+    def test_a_failed_last_complete_refresh_does_not_roll_back_the_new_sidecar(self):
+        # P3 ordering: if refreshing the last-complete copy fails after a successful
+        # sync, the guard must NOT put the old sidecar back beside the new native
+        # directory and the newly promoted journal.
+        write_pair(self.root, 'alpha', files={'.merge-context.json': {'holder': 'prior'}})
+        real_copy = admin._atomic_copy
+        calls = []
+
+        def flaky(source, destination):
+            calls.append((Path(source).name, Path(destination).name))
+            if len(calls) == 2:  # guard save-aside first, post-sync refresh second
+                raise OSError('disk full')
+            return real_copy(source, destination)
+
+        with patch.object(admin, 'native_backup_sync', return_value='Backup synced'), \
+                patch.object(admin, '_atomic_copy', side_effect=flaky):
+            stdout, stderr, code = self.run_admin('backup', 'alpha')
+        self.assertNotEqual(code, 0)
+        canonical = json.loads(
+            (self.root / 'backups' / 'alpha.coordination.json').read_text(encoding='utf-8'))
+        self.assertEqual(canonical['status'], 'complete')
+        # The new generation's (empty) coordination files, not the prior holder.
+        self.assertEqual(canonical['files'], {})
+
 
 class BackupCopyCase(RuntimeCase):
     def setUp(self):
@@ -245,6 +359,78 @@ class BackupCopyCase(RuntimeCase):
         stdout, stderr, code = self.run_admin('backup-copy', 'relative-copy')
         self.assertNotEqual(code, 0)
         self.assertIn('absolute', stderr)
+
+    def test_the_copy_holds_each_project_lock_while_copying_its_pair(self):
+        self.record()
+        locked = []
+        real_lock = admin.backup_lock
+
+        @contextlib.contextmanager
+        def recording_lock(root, name):
+            locked.append(name)
+            with real_lock(root, name):
+                yield
+
+        with patch.object(admin, 'backup_lock', side_effect=recording_lock):
+            stdout, stderr, code = self.run_admin('backup-copy', str(self.destination))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(locked, ['alpha', 'beta'])
+        # The project coordination lock is taken too (the runtime `fcntl` is a mock).
+        self.assertGreaterEqual(self.fcntl.flock.call_count, 2)
+
+    def test_the_copy_replaces_a_stale_destination_instead_of_merging(self):
+        self.record()
+        (self.root / 'backups' / 'alpha' / 'chunk').write_text('native bytes', encoding='utf-8')
+        (self.destination / 'alpha').mkdir(parents=True)
+        (self.destination / 'alpha' / 'STALE-junk-file').write_text('x', encoding='utf-8')
+        stdout, stderr, code = self.run_admin('backup-copy', str(self.destination))
+        self.assertEqual(code, 0, stderr)
+        self.assertFalse((self.destination / 'alpha' / 'STALE-junk-file').exists())
+        self.assertEqual((self.destination / 'alpha' / 'chunk').read_text(encoding='utf-8'),
+                         'native bytes')
+        # The staging directory and the previous-generation swap name are cleaned up.
+        self.assertEqual(list(self.destination.glob('.backup-copy-staging-*')), [])
+        self.assertEqual(list(self.destination.glob('*.previous')), [])
+
+    def test_the_copy_includes_each_project_journal_snapshot(self):
+        self.record()
+        (self.root / 'backups' / 'alpha.http-operations.sqlite3').write_bytes(b'journal-bytes')
+        stdout, stderr, code = self.run_admin('backup-copy', str(self.destination))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(
+            (self.destination / 'alpha.http-operations.sqlite3').read_bytes(), b'journal-bytes')
+        # A project without a journal snapshot is copied without one.
+        self.assertFalse((self.destination / 'beta.http-operations.sqlite3').exists())
+        self.assertIn('1 operation-journal snapshot(s)', stdout)
+
+    def test_a_partial_failure_leaves_no_completeness_record_and_a_clear_error(self):
+        self.record()
+        (self.root / 'backups' / 'alpha' / 'chunk').write_text('native bytes', encoding='utf-8')
+        real_copytree = shutil.copytree
+
+        def flaky(source, target, **kwargs):
+            if Path(source).name == 'beta':
+                raise PermissionError('destination is not writable')
+            return real_copytree(source, target, **kwargs)
+
+        with patch('shutil.copytree', side_effect=flaky):
+            stdout, stderr, code = self.run_admin('backup-copy', str(self.destination))
+        self.assertNotEqual(code, 0)
+        self.assertIn('backup-copy failed', stderr)
+        self.assertIn('does not look complete', stderr)
+        self.assertNotIn('Traceback', stderr)
+        # The record that would make the destination look complete is not published.
+        self.assertFalse((self.destination / admin.BACKUP_STATUS_NAME).exists())
+        self.assertEqual(list(self.destination.glob('.backup-copy-staging-*')), [])
+
+    def test_the_copy_rechecks_the_pair_under_the_lock(self):
+        self.record()
+        (self.root / 'backups' / 'beta').rmdir()
+        with patch.object(admin, 'require_complete_problems', return_value=[]):
+            stdout, stderr, code = self.run_admin('backup-copy', str(self.destination))
+        self.assertNotEqual(code, 0)
+        self.assertIn('no longer a complete pair', stderr)
+        self.assertFalse((self.destination / admin.BACKUP_STATUS_NAME).exists())
 
 
 if __name__ == '__main__':

@@ -522,26 +522,67 @@ class ScheduledCoverageGuidanceCase(unittest.TestCase):
         self.assertTrue(covered)
         self.assertIn('beads-example-backup.service', message)
 
-    def test_a_longsync_wrapper_unit_for_this_runtime_is_safe_coverage(self):
-        # The live installations moved to a long-sync wrapper (see kittrial-5bb.28);
-        # it is the safe path and must be reported as coverage, never replaced with
-        # `backup --all`.
+    def test_a_longsync_wrapper_covers_only_the_projects_it_names(self):
+        # The live installations moved to a long-sync wrapper naming one project per
+        # line (see kittrial-5bb.28). The wrapper is the timeout-safe path and must not
+        # be replaced with `backup --all`, but it is NOT full coverage: a project added
+        # later needs another line, so it must never be reported as "no change needed".
         self.write_unit(self.wrapper_line(), name='beads-example-backup.service')
         covered, message = admin.scheduled_backup_coverage(self.root, 'second')
-        self.assertTrue(covered)
+        self.assertFalse(covered)
         self.assertIn('long-sync wrapper', message)
         self.assertIn('beads-example-backup.service', message)
-        self.assertIn('no change is needed', message)
+        self.assertIn('already include second', message)
+        self.assertIn('name projects individually', message)
+        self.assertNotIn('cover every project', message)
+        self.assertNotIn('no change is needed', message)
         self.assertNotIn('backup --all', message)
+
+    def test_a_wrapper_with_one_line_per_project_covers_only_those_projects(self):
+        self.write_unit(
+            'ExecStart=/usr/bin/python3 /opt/wrapper.py --root %s --project first\n'
+            'ExecStart=/usr/bin/python3 /opt/wrapper.py --root %s --project second'
+            % (self.root, self.root),
+            name='beads-example-backup.service')
+        covered, message = admin.scheduled_backup_coverage(self.root, 'second')
+        self.assertFalse(covered)
+        self.assertIn('first, second', message)
+        # A project added after the unit was installed is reported NOT covered.
+        covered, message = admin.scheduled_backup_coverage(self.root, 'third')
+        self.assertFalse(covered)
+        self.assertIn('cover only first, second', message)
+        self.assertIn('do not include third', message)
+        self.assertIn('long-sync wrapper', message)
+        self.assertNotIn('no change is needed', message)
+        self.assertNotIn('backup --all', message)
+
+    def test_a_wrapper_with_no_project_names_is_not_full_coverage(self):
+        self.write_unit('ExecStart=/usr/bin/python3 /opt/report.py --root %s' % self.root)
+        covered, message = admin.scheduled_backup_coverage(self.root, 'second')
+        self.assertFalse(covered)
+        self.assertIn('names no project', message)
+        self.assertIn('second', message)
+        self.assertNotIn('cover every project', message)
+        self.assertNotIn('no change is needed', message)
+        self.assertNotIn('backup --all', message)
+
+    def test_a_wrapper_project_equals_form_is_parsed(self):
+        self.write_unit(
+            'ExecStart=/usr/bin/python3 /opt/wrapper.py --root=%s --project=second' % self.root)
+        covered, message = admin.scheduled_backup_coverage(self.root, 'second')
+        self.assertFalse(covered)
+        self.assertIn('already include second', message)
+        self.assertNotIn('no change is needed', message)
 
     def test_a_wrapper_and_a_named_unit_together_never_steer_off_the_wrapper(self):
         self.write_unit(self.wrapper_line(), name='beads-example-backup.service')
         self.write_unit(self.line('first'), name='beads-backup.service')
         covered, message = admin.scheduled_backup_coverage(self.root, 'second')
-        self.assertTrue(covered)
+        self.assertFalse(covered)
         self.assertIn('long-sync wrapper', message)
-        self.assertIn('no change is needed', message)
+        self.assertNotIn('no change is needed', message)
         self.assertNotIn('Replace that project list', message)
+        self.assertNotIn('backup --all', message)
 
     def test_a_wrapper_for_another_runtime_is_not_coverage_of_this_one(self):
         self.write_unit(self.wrapper_line(root='/srv/other'))
@@ -592,8 +633,8 @@ class ScheduledCoverageGuidanceCase(unittest.TestCase):
             admin.add_project(self.root, 'newproject')
         text = output.getvalue()
         self.assertIn('long-sync wrapper', text)
-        self.assertIn('no change is needed', text)
-        self.assertNotIn('does not include newproject', text)
+        self.assertIn('do not include newproject', text)
+        self.assertNotIn('no change is needed', text)
         self.assertNotIn('backup --all', text)
 
 

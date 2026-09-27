@@ -2,6 +2,7 @@
 """Operator commands for an isolated, user-systemd Beads/Dolt deployment."""
 import argparse
 import base64
+import contextlib
 import csv
 import io
 import json
@@ -366,6 +367,20 @@ def _mentions_root(tokens,root):
         except OSError:pass
     return False
 
+def _project_arguments(tokens):
+    """The project names a command line names with ``--project``/``--project=``.
+
+    Used for a long-sync wrapper, whose own command line is the only statement of
+    which projects it backs up: the kit cannot know that a wrapper "covers every
+    project" merely because it names the runtime root, so coverage is read from the
+    project arguments it actually carries. A wrapper that names none covers none.
+    """
+    found=[]
+    for index,token in enumerate(tokens):
+        if token=='--project' and index+1<len(tokens):found.append(tokens[index+1])
+        elif token.startswith('--project='):found.append(token.split('=',1)[1])
+    return [name for name in found if name]
+
 def scheduled_backup_unit_report(text,root):
     """Classify one unit file's ``ExecStart`` lines against one runtime root.
 
@@ -373,12 +388,14 @@ def scheduled_backup_unit_report(text,root):
     ``all_line`` the durable ``backup --all`` form and ``named`` the projects a line of
     this runtime lists individually. ``wrapper`` is the command line of a recognised
     long-sync wrapper of this runtime (a line that runs a script other than
-    ``admin.py`` and names this runtime), and ``other_runtime`` any line that belongs
-    to a different runtime. A wrapper is the timeout-safe path an operator moved to, so
-    it is recognised as safe coverage rather than something to replace.
+    ``admin.py`` and names this runtime) and ``wrapper_projects`` the projects those
+    wrapper lines name with ``--project``; a wrapper is treated as covering only the
+    projects it names, never every project. ``other_runtime`` is any line that belongs
+    to a different runtime.
     """
     import shlex
-    report={'all_line':False,'named':[],'ours':False,'wrapper':None,'other_runtime':False}
+    report={'all_line':False,'named':[],'ours':False,'wrapper':None,'wrapper_projects':[],
+            'other_runtime':False}
     for value in _execstart_values(text):
         try:tokens=shlex.split(value)
         except ValueError:continue
@@ -395,6 +412,7 @@ def scheduled_backup_unit_report(text,root):
             continue
         if _mentions_root(tokens,root):
             if report['wrapper'] is None:report['wrapper']=value
+            report['wrapper_projects']+=_project_arguments(tokens)
         else:
             report['other_runtime']=True
     return report
@@ -403,18 +421,19 @@ def scheduled_backup_coverage(root,name):
     """(durably_covers_every_project, message) for the INSTALLED schedule.
 
     ``True`` only for a schedule that durably covers every project of this runtime: an
-    ``admin.py ... backup --all`` unit, or a recognised long-sync wrapper unit (one
-    that runs a script other than ``admin.py`` for this runtime). A schedule that
-    merely lists ``name`` inside its project list is reported as included but not
-    durable, because the next project added would need another edit.
+    ``admin.py ... backup --all`` unit. A unit that names projects individually —
+    whether through ``admin.py ... backup PROJECT`` or through a long-sync wrapper's
+    ``--project`` arguments — is reported as covering exactly those projects and no
+    others, because the next project added would need another edit; a wrapper is never
+    reported as something to replace with ``backup --all``, and a wrapper that names no
+    project is not full coverage either.
 
     Every ``beads-*backup*.service`` unit installed for the account is read, not only
     the historical ``beads-backup.service``, and the report names the units it read and
-    says that systemd drop-ins (``*.service.d/*.conf``) are not inspected. A recognized
-    wrapper is never reported as something to replace with ``backup --all``, and
-    ``--all`` is never suggested next to named project lines (naming projects and
-    ``--all`` in one command is refused). It is a report, not a gate: this never edits,
-    installs or enables a unit.
+    says that systemd drop-ins (``*.service.d/*.conf``) are not inspected. ``--all`` is
+    never suggested next to named project lines (naming projects and ``--all`` in one
+    command is refused). It is a report, not a gate: this never edits, installs or
+    enables a unit.
     """
     directory=scheduled_backup_unit_dir()
     line=scheduled_backup_execstart(root)
@@ -425,7 +444,7 @@ def scheduled_backup_coverage(root,name):
         return False,(f'No installed scheduled backup unit matching beads-*backup*.service was found in '
                       f'{directory}, so no project of this runtime is on a schedule. A schedule that covers '
                       f'every project, including {name}, is:\n  {line}')
-    read=[];unreadable=[];durable=[];wrappers=[];named={};foreign=[]
+    read=[];unreadable=[];durable=[];wrappers=[];named={};wrapper_projects={};foreign=[]
     for path in paths:
         try:text=path.read_text(encoding='utf-8')
         except OSError as error:
@@ -433,33 +452,54 @@ def scheduled_backup_coverage(root,name):
         read.append(str(path))
         report=scheduled_backup_unit_report(text,root)
         if report['all_line']:durable.append(str(path))
-        if report['wrapper']:wrappers.append(str(path))
+        if report['wrapper']:
+            wrappers.append(str(path))
+            wrapper_projects[str(path)]=sorted(set(report['wrapper_projects']))
         if report['ours'] and not report['all_line']:
             named[str(path)]=sorted(set(report['named']))
         if report['other_runtime']:foreign.append(str(path))
-    if durable or wrappers:
-        coverage=[]
-        if durable:coverage.append('durable backup --all: '+', '.join(durable))
-        if wrappers:coverage.append('long-sync wrapper: '+', '.join(wrappers))
+    if durable:
         note=(' Read: '+', '.join(read)+'.') if read else ''
         if unreadable:note+=' Not readable: '+'; '.join(unreadable)+'.'
         return True,(f'The installed scheduled backup unit(s) read for this runtime cover every project, '
-                      f'including {name}, so no change is needed ('+'; '.join(coverage)+').'+note+' '+dropins)
-    covered=sorted({item for names in named.values() for item in names})
-    if named:
+                      f'including {name}, so no change is needed (durable backup --all: '+', '.join(durable)+
+                      ').'+note+' '+dropins)
+    covered=sorted({item for names in named.values() for item in names} |
+                   {item for names in wrapper_projects.values() for item in names})
+    individual=list(named)+list(wrapper_projects)
+    if individual:
         note=' Read: '+', '.join(read)+'.'
         if foreign:note+=' Units for another runtime were also read and are not changed: '+', '.join(foreign)+'.'
         if unreadable:note+=' Not readable: '+'; '.join(unreadable)+'.'
+        units=', '.join(individual)
+        projectless=any(not projects for projects in wrapper_projects.values())
         if name in covered:
-            return False,(f'The installed scheduled backup unit(s) read for this runtime already include {name} '
-                          f'(projects: {", ".join(covered)}) at '+', '.join(named)+', but they name projects '
-                          f'individually, so the next project added needs the same edit. Replace that project '
-                          f'list with the durable form (do not combine named projects with --all in one '
-                          f'command):\n  {line}'+note+' '+dropins)
-        return False,(f'The installed scheduled backup unit(s) read for this runtime cover only '
-                      f'{", ".join(covered) if covered else "no project"}, so they do not include {name}. Add '
-                      f'{name} there, or replace the project list with the durable form (do not combine named '
-                      f'projects with --all in one command):\n  {line}'+note+' '+dropins)
+            message=(f'The installed scheduled backup unit(s) read for this runtime already include {name} '
+                     f'(projects: {", ".join(covered)}) at {units}, but they name projects individually, so the '
+                     f'next project added needs the same edit.')
+            if wrappers:
+                message+=(f' The long-sync wrapper is the timeout-safe path and is not replaced; add a line naming '
+                          f'the new project to the same wrapper schedule ({", ".join(wrappers)}). Do not combine '
+                          f'named projects with --all in one command.')
+            else:
+                message+=(f' Replace that project list with the durable form (do not combine named projects with '
+                          f'--all in one command):\n  {line}')
+            return False,message+note+' '+dropins
+        message=(f'The installed scheduled backup unit(s) read for this runtime cover only '
+                 f'{", ".join(covered) if covered else "no project"}, so they do not include {name}.')
+        if wrappers:
+            if projectless:
+                message+=(f' The long-sync wrapper names no project, so it is not coverage of {name}; add a line '
+                          f'naming each project, including {name}, to the same wrapper schedule '
+                          f'({", ".join(wrappers)}). Do not combine named projects with --all in one command.')
+            else:
+                message+=(f' The long-sync wrapper is the timeout-safe path and is not replaced; add a line naming '
+                          f'{name} to the same wrapper schedule ({", ".join(wrappers)}). Do not combine named '
+                          f'projects with --all in one command.')
+        else:
+            message+=(f' Add {name} there, or replace the project list with the durable form (do not combine named '
+                      f'projects with --all in one command):\n  {line}')
+        return False,message+note+' '+dropins
     details=[]
     if foreign:details.append('these units do not back up this runtime: '+', '.join(foreign))
     if unreadable:details.append('could not be read: '+'; '.join(unreadable))
@@ -537,6 +577,38 @@ def journal_snapshot_path(root,name):
     """Where ``backup_project`` stores the project's operation-journal snapshot."""
     validate_name(name)
     return root/'backups'/(name+JOURNAL_STORE_NAME)
+
+def staged_journal_snapshot_path(root,name):
+    """Where this run stages the journal snapshot before the native sync succeeds."""
+    validate_name(name)
+    return root/'backups'/(name+JOURNAL_STORE_NAME+'.staging')
+
+def stage_journal_snapshot(root,name):
+    """Snapshot the live journal to a staging path (or None when there is no journal).
+
+    The snapshot is NOT yet the one ``restore-new`` consumes: it is promoted to
+    ``journal_snapshot_path`` only after the native sync and the complete sidecar are
+    durable, so a failed or interrupted run cannot leave a newer journal beside the
+    previous complete pair (see ``promote_journal_snapshot``).
+    """
+    staging=staged_journal_snapshot_path(root,name)
+    if staging.is_symlink():raise ValueError('Journal snapshot path must not be a symlink')
+    return snapshot_journal(project_dir(root,name)/JOURNAL_STORE_NAME,staging)
+
+def promote_journal_snapshot(root,name,staging):
+    """Publish ``staging`` as the project's journal snapshot, atomically.
+
+    Only called after the native sync and the new complete sidecar are durable. A run
+    with no live journal removes any previous snapshot, so the published snapshot always
+    belongs to the same generation as the native backup and the complete sidecar.
+    """
+    final=journal_snapshot_path(root,name)
+    if final.is_symlink():raise ValueError('Journal snapshot path must not be a symlink')
+    if staging is None or not Path(staging).is_file():
+        if final.is_file():final.unlink()
+        return None
+    os.replace(staging,final)
+    return final
 
 def snapshot_journal(source,destination):
     """Consistent SQLite snapshot of ``source`` into ``destination`` (or None).
@@ -677,19 +749,27 @@ def last_complete_guard(root,name):
     complete pair leaves the honest ``pending`` marker in place: there is nothing to
     degrade. The caller's critical section still starts before the ``pending`` write;
     this guard only performs atomic file copies of an atomically-replaced file.
+
+    The yielded ``state`` carries one flag the caller raises once the NEW generation is
+    durable (native sync done, complete sidecar written, journal snapshot promoted):
+    after that point the old sidecar must NOT be put back, because doing so would pair
+    the previous sidecar with the new native directory if a later promotion step (for
+    example refreshing the last-complete copy) fails.
     """
     bundle=root/'backups'/(name+'.coordination.json')
     last_complete=last_complete_sidecar_path(root,name)
+    state={'promoted':False}
     if complete_sidecar(bundle) is not None:
         _atomic_copy(bundle,last_complete)
     try:
-        yield bundle,last_complete
+        yield bundle,last_complete,state
     except BaseException:
-        try:
-            if last_complete.is_file() and not last_complete.is_symlink():
-                _atomic_copy(last_complete,bundle)
-        except OSError:
-            pass
+        if not state['promoted']:
+            try:
+                if last_complete.is_file() and not last_complete.is_symlink():
+                    _atomic_copy(last_complete,bundle)
+            except OSError:
+                pass
         raise
 
 def backup_project(root,name):
@@ -697,7 +777,7 @@ def backup_project(root,name):
     from coordination import atomic
     path=project_dir(root,name)
     with (path/'.coordination.lock').open('a') as lock, backup_lock(root,name), \
-            last_complete_guard(root,name) as (bundle,last_complete):
+            last_complete_guard(root,name) as (bundle,last_complete,guard_state):
         fcntl.flock(lock,fcntl.LOCK_EX)
         atomic(bundle,{'schema_version':1,'status':'pending'})
         files={}
@@ -757,20 +837,38 @@ def backup_project(root,name):
         validate_coordination_files(files)
         # The idempotency journal is a second local store inside the project directory;
         # take its consistent snapshot in the same critical section as the coordination
-        # sidecar so a backup never pairs one store's state with the other's.
-        snapshot_journal(path/JOURNAL_STORE_NAME,journal_snapshot_path(root,name))
-        output=native_backup_sync(root,name)
-        # The deployment operator allowlist travels with the project sidecar so a
-        # restore can TELL the operator which recorded authority is missing on the
-        # destination host. It is not applied automatically: the allowlist is
-        # deployment-wide authority, so `restore-new` only re-grants it with an
-        # explicit --restore-operators. Native backup preserves the void comments
-        # and this preserves the record of the authority the reads would need.
-        atomic(bundle,{'schema_version':1,'status':'complete','files':files,
-                       'operators':sorted(operators(root))})
-        # Refresh the durable last-complete copy so the next run has a restorable pair
-        # to protect even if it is interrupted before it can write anything.
-        _atomic_copy(bundle,last_complete)
+        # sidecar so a backup never pairs one store's state with the other's. It is
+        # STAGED here and promoted only after the native sync and the new complete
+        # sidecar are durable, so a failed run leaves the previous snapshot (which
+        # belongs to the previous complete pair) in place for restore-new.
+        staged=None
+        try:
+            staged=stage_journal_snapshot(root,name)
+            output=native_backup_sync(root,name)
+            # The deployment operator allowlist travels with the project sidecar so a
+            # restore can TELL the operator which recorded authority is missing on the
+            # destination host. It is not applied automatically: the allowlist is
+            # deployment-wide authority, so `restore-new` only re-grants it with an
+            # explicit --restore-operators. Native backup preserves the void comments
+            # and this preserves the record of the authority the reads would need.
+            atomic(bundle,{'schema_version':1,'status':'complete','files':files,
+                           'operators':sorted(operators(root))})
+            # The new generation is now native + complete sidecar + promoted journal;
+            # from here the guard must not put the previous sidecar back.
+            promote_journal_snapshot(root,name,staged)
+            staged=None
+            guard_state['promoted']=True
+            # Refresh the durable last-complete copy so the next run has a restorable
+            # pair to protect even if it is interrupted before it can write anything.
+            # A failure here leaves the new complete generation in place (the guard no
+            # longer rolls it back), and the next run's guard refreshes this copy.
+            _atomic_copy(bundle,last_complete)
+        finally:
+            if staged is not None:
+                try:
+                    if Path(staged).exists():Path(staged).unlink()
+                except OSError:
+                    pass
         return output
 
 def utc_stamp():
@@ -981,20 +1079,63 @@ def copy_destination_path(value):
         raise ValueError('Destination path must not contain whitespace')
     return path
 
+def _replace_with(staged,target):
+    """Move ``staged`` onto ``target``, replacing it fully instead of merging.
+
+    A directory is swapped by moving the old one aside first and removing it only after
+    the new one is in place, so a failure cannot leave the destination as a mixture of
+    two generations; a file is replaced in one step. The temporary ``.previous`` name is
+    removed on success and put back if the swap of the new content fails.
+    """
+    import shutil
+    target=Path(target)
+    previous=None
+    if target.is_symlink() or target.exists():
+        previous=target.with_name(target.name+'.previous')
+        if previous.is_symlink():
+            previous.unlink()
+        elif previous.is_dir():
+            shutil.rmtree(previous)
+        elif previous.exists():
+            previous.unlink()
+        os.replace(target,previous)
+    try:
+        os.replace(staged,target)
+    except BaseException:
+        if previous is not None and not (target.exists() or target.is_symlink()):
+            os.replace(previous,target)
+        raise
+    if previous is not None:
+        if previous.is_dir() and not previous.is_symlink():
+            shutil.rmtree(previous,ignore_errors=True)
+        else:
+            try:previous.unlink()
+            except OSError:pass
+
 def backup_copy(root,destination):
     """Reference off-machine copy of every project's last complete backup pair.
 
     The gate is exactly ``backup-status --require-complete``: every initialized project
     must be in the last run record with a complete pair on disk, or this refuses and
     names what is missing, copying nothing. Each project is written as
-    ``<DEST>/<name>`` (its native backup directory) plus
-    ``<DEST>/<name>.coordination.json`` (its complete sidecar) — the same shape a
-    runtime's ``backups/`` directory has, so the copy can be copied back and restored —
-    and the record that gated the copy is copied too. The scheduled, encrypted
+    ``<DEST>/<name>`` (its native backup directory), ``<DEST>/<name>.coordination.json``
+    (its complete sidecar) and — when the project has one — its operation-journal
+    snapshot under the same file name the runtime's ``backups/`` directory uses
+    (``<name>`` plus the journal store name), the same shape a runtime's ``backups/``
+    directory has, so the copy can be copied back and restored; the operation journal is
+    what keeps an acknowledged retry from re-executing after an off-machine restore.
+    Each project's pair is copied while that project's backup lock and coordination lock
+    are held, into a per-run staging directory, and only then moved into place by
+    rename, so a concurrent ``--all`` cannot yield a mixed native directory beside a
+    complete sidecar, a stale destination file is replaced rather than merged, and a
+    failure cannot leave a half-refreshed generation. The completeness record that gated
+    the copy is published last; if anything fails, the destination is left without it
+    and the command exits non-zero with a clear error. The scheduled, encrypted
     off-machine system, its retention and its encryption stay the operator's: this is a
     generic, credential-free reference the operator can gate and schedule. It reads and
     copies files only; it never touches a unit, timer or schedule.
     """
+    import fcntl
     import shutil
     record=read_backup_status(root)
     problems=require_complete_problems(root,record)
@@ -1008,25 +1149,71 @@ def backup_copy(root,destination):
     if destination==root or root in destination.parents:
         raise SystemExit('backup-copy refused: destination %s is inside the runtime %s; use an off-machine '
                          'location'%(destination,root))
-    backups=root/'backups';copied=[]
-    for entry in sorted(record['projects'],key=lambda item:item['name']):
-        name=entry['name']
-        native=backups/name
-        sidecar=backups/(name+'.coordination.json')
-        if native.is_symlink() or sidecar.is_symlink():
-            raise ValueError('Backup pair paths must not be symlinks')
-        target_native=destination/name
-        shutil.copytree(native,target_native,dirs_exist_ok=True)
-        target_sidecar=destination/(name+'.coordination.json')
-        _atomic_copy(sidecar,target_sidecar)
-        copied.append(name)
-        print('Copied %s: %s -> %s'%(name,native,target_native))
-        print('Copied %s: %s -> %s'%(name,sidecar,target_sidecar))
+    backups=root/'backups'
+    destination.mkdir(parents=True,exist_ok=True)
     target_status=destination/BACKUP_STATUS_NAME
-    _atomic_copy(backups/BACKUP_STATUS_NAME,target_status)
-    print('Copied the completeness record: %s -> %s'%(backups/BACKUP_STATUS_NAME,target_status))
-    print('Copied %d complete project pair(s) of %d initialized to %s.'
-          %(len(copied),len(initialized_projects(root)),destination))
+    if target_status.is_symlink():
+        raise SystemExit('backup-copy refused: %s must not be a symlink'%target_status)
+    staging=destination/('.backup-copy-staging-'+secrets.token_hex(8))
+    if staging.exists():shutil.rmtree(staging)
+    staging.mkdir()
+    staged=[];journals=0;copied=[]
+    try:
+        # Stage every project first, each under its locks, so a copy error touches
+        # nothing in the destination.
+        for entry in sorted(record['projects'],key=lambda item:item['name']):
+            name=entry['name']
+            native=backups/name
+            sidecar=backups/(name+'.coordination.json')
+            journal=journal_snapshot_path(root,name)
+            if native.is_symlink() or sidecar.is_symlink() or journal.is_symlink():
+                raise ValueError('Backup pair paths must not be symlinks')
+            project=root/'projects'/name
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(backup_lock(root,name))
+                if project.is_dir():
+                    handle=stack.enter_context((project/'.coordination.lock').open('a'))
+                    fcntl.flock(handle,fcntl.LOCK_EX)
+                complete,reason=backup_pair_state(root,name)
+                if not complete:
+                    raise RuntimeError('%s is no longer a complete pair on disk: %s'%(name,reason))
+                shutil.copytree(native,staging/name)
+                _atomic_copy(sidecar,staging/(name+'.coordination.json'))
+                staged_journal=None
+                if journal.is_file():
+                    staged_journal=staging/journal.name
+                    _atomic_copy(journal,staged_journal)
+                    journals+=1
+            staged.append((name,staging/name,staging/(name+'.coordination.json'),staged_journal))
+        # Every project staged: move each pair into place, replacing (not merging) the
+        # destination, then publish the completeness record last.
+        for name,native_staged,sidecar_staged,journal_staged in staged:
+            _replace_with(native_staged,destination/name)
+            _replace_with(sidecar_staged,destination/(name+'.coordination.json'))
+            if journal_staged is not None:
+                _replace_with(journal_staged,destination/journal_staged.name)
+            copied.append(name)
+            print('Copied %s: %s -> %s'%(name,backups/name,destination/name))
+            print('Copied %s: %s -> %s'%(name,backups/(name+'.coordination.json'),
+                                         destination/(name+'.coordination.json')))
+            if journal_staged is not None:
+                print('Copied %s journal snapshot: %s -> %s'%(
+                    name,journal_snapshot_path(root,name),destination/journal_staged.name))
+        _atomic_copy(backups/BACKUP_STATUS_NAME,staging/BACKUP_STATUS_NAME)
+        _replace_with(staging/BACKUP_STATUS_NAME,target_status)
+        print('Copied the completeness record: %s -> %s'%(backups/BACKUP_STATUS_NAME,target_status))
+    except Exception as error:
+        # A copy that did not finish must not leave a destination that looks complete.
+        try:
+            if target_status.is_file() and not target_status.is_symlink():target_status.unlink()
+        except OSError:
+            pass
+        raise SystemExit('backup-copy failed: %s; no completeness record was published under %s, so the '
+                         'destination does not look complete. Re-run after fixing the cause.'%(error,destination))
+    finally:
+        shutil.rmtree(staging,ignore_errors=True)
+    print('Copied %d complete project pair(s) and %d operation-journal snapshot(s) of %d initialized to %s.'
+          %(len(copied),journals,len(initialized_projects(root)),destination))
     return copied
 
 def backup_projects(root,names,all_projects=False):
@@ -1093,23 +1280,34 @@ def validate_coordination_operators(value):
         except ValueError:raise ValueError('Invalid operator identity in coordination backup') from None
     return allowed
 
-def resolved_coordination_sidecar(root,source):
-    """The complete coordination sidecar for a project, or None when there is none.
+def coordination_sidecar_source(root,source):
+    """(path, record) of the complete coordination sidecar a restore should use.
 
     The canonical ``backups/<name>.coordination.json`` is preferred. A run that failed
     or was interrupted after writing its ``pending`` marker leaves that marker behind,
     so the durable last-complete copy is used instead: it is what keeps the previous
     restorable pair usable by ``restore-new``. Every path is refused if it is a
-    symlink, exactly like the canonical sidecar.
+    symlink, exactly like the canonical sidecar. Returns ``(None, None)`` when neither
+    is complete, so the caller can distinguish a legacy backup from an incomplete one.
     """
     validate_name(source)
     bundle=root/'backups'/(source+'.coordination.json')
     if bundle.is_symlink():raise ValueError('Coordination backup must not be a symlink')
     data=complete_sidecar(bundle)
-    if data is not None:return data
+    if data is not None:return bundle,data
     fallback=last_complete_sidecar_path(root,source)
     if fallback.is_symlink():raise ValueError('Coordination backup must not be a symlink')
-    return complete_sidecar(fallback)
+    data=complete_sidecar(fallback)
+    if data is not None:return fallback,data
+    return None,None
+
+def resolved_coordination_sidecar(root,source):
+    """The complete coordination sidecar for a project, or None when there is none.
+
+    The canonical ``backups/<name>.coordination.json`` is preferred; the durable
+    last-complete copy is the fallback (see ``coordination_sidecar_source``).
+    """
+    return coordination_sidecar_source(root,source)[1]
 
 def coordination_backup(root,source):
     data=resolved_coordination_sidecar(root,source)
@@ -1167,6 +1365,18 @@ def missing_operators(root,source):
     return [item for item in snapshot if item not in listed]
 
 
+def using_last_complete_sidecar(root,source):
+    """True when ``coordination_backup`` had to use the durable last-complete copy.
+
+    ``complete_sidecar`` treats a symlinked or unreadable path as unusable rather than
+    raising, so this is a pure report: it decides whether ``restore_coordination``
+    should tell the operator which generation it is restoring.
+    """
+    validate_name(source)
+    bundle=root/'backups'/(source+'.coordination.json')
+    fallback=last_complete_sidecar_path(root,source)
+    return complete_sidecar(bundle) is None and complete_sidecar(fallback) is not None
+
 def restore_coordination(root,source,destination,restore_operators=False):
     from coordination import atomic
     path=project_dir(root,destination)
@@ -1174,6 +1384,11 @@ def restore_coordination(root,source,destination,restore_operators=False):
     if files is None:
         print('Legacy backup has no coordination journal. Reconcile outstanding child requests and merge ownership before accepting writes.')
         return
+    if using_last_complete_sidecar(root,source):
+        print('The canonical coordination sidecar backups/%s.coordination.json is not complete, so this restore '
+              'uses the durable last-complete copy %s (the previous complete generation, restored with the '
+              'operation-journal snapshot that belongs to it).'
+              %(source,last_complete_sidecar_path(root,source)))
     for name in files:
         target=path/name
         if target.is_symlink() or target.parent.is_symlink() or target.with_suffix('.tmp').is_symlink():raise ValueError('Coordination restore paths must not be symlinks')
