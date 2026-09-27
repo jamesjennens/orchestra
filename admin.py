@@ -29,6 +29,16 @@ JOURNAL_STORE_NAME='.http-operations.sqlite3'
 #: off-machine copy can read which projects have a complete backup pair.
 BACKUP_STATUS_NAME='backup-status.json'
 
+#: Explicit ceiling for one project's native Dolt sync through the SQL client. Unlike
+#: ``bd backup sync``, the SQL client has no fixed ~10 s read timeout, so this only
+#: bounds a genuinely hung server; a large database legitimately needs minutes.
+BACKUP_SYNC_TIMEOUT=1800
+
+#: Suffix of the durable copy of a project's last COMPLETE coordination sidecar. A
+#: failed or interrupted run must never destroy the previous restorable pair, so the
+#: last complete sidecar is kept here and ``coordination_backup`` can fall back to it.
+LAST_COMPLETE_SUFFIX='.coordination.last-complete.json'
+
 def checked(cmd, **kwargs):
     return subprocess.run(list(map(str,cmd)),text=True,encoding='utf-8',capture_output=True,check=True,**kwargs)
 
@@ -134,6 +144,61 @@ def run_bd(root,name,args):
     path=project_dir(root,name)
     location=[] if args and args[0]=='init' else ['--directory',path]
     return checked([root/'bin/bd',*location,'--sandbox',*args],env=environment(root),cwd=path).stdout
+
+def project_server_metadata(root,name):
+    """(host,port,user,database) from the project's ``.beads/metadata.json``, or None.
+
+    ``bd init --server`` records the loopback Dolt server coordinates there. The
+    password is deliberately not part of this tuple: ``environment(root)`` supplies it
+    through ``DOLT_CLI_PASSWORD``, so a credential never reaches a command line or a
+    recorded failure reason. A project without those keys (an older or partial
+    project) has no SQL coordinates, and the caller keeps the pre-existing native path.
+    """
+    try:
+        data=json.loads((project_dir(root,name)/'.beads'/'metadata.json').read_text(encoding='utf-8'))
+    except (OSError,ValueError):
+        return None
+    if not isinstance(data,dict):return None
+    keys=('dolt_server_host','dolt_server_port','dolt_server_user','dolt_database')
+    if not all(data.get(key) for key in keys):return None
+    return tuple(data[key] for key in keys)
+
+def project_backup_name(root,name):
+    """The Dolt backup name recorded in the project's ``.beads/dolt-backup.json``."""
+    try:
+        data=json.loads((project_dir(root,name)/'.beads'/'dolt-backup.json').read_text(encoding='utf-8'))
+    except (OSError,ValueError):
+        return None
+    if not isinstance(data,dict):return None
+    value=data.get('backup_name')
+    return value if isinstance(value,str) and value else None
+
+def native_backup_sync(root,name):
+    """Synchronize one project's native Dolt backup without bd's fixed read timeout.
+
+    ``bd backup sync`` inherits a fixed client read timeout of about ten seconds, which
+    a large database cannot meet on a busy or stalled server (that timeout is what
+    forced the live installations onto a long-sync wrapper). Dolt's SQL client has no
+    such timeout, so the native step is ``CALL DOLT_BACKUP('sync', <backup_name>)``
+    over the same loopback connection ``sql()`` uses, bounded only by the explicit
+    ``BACKUP_SYNC_TIMEOUT``. It runs in the caller's critical section, so the
+    coordination sidecar and the native state still move as one pair.
+
+    The backup name is validated before it reaches the statement, and the password
+    travels in the environment, never in the command. A project that carries no server
+    metadata has no SQL coordinates to use, so it keeps the pre-existing
+    ``bd backup sync`` path.
+    """
+    metadata=project_server_metadata(root,name)
+    backup_name=project_backup_name(root,name)
+    if metadata is None or backup_name is None:
+        return run_bd(root,name,['backup','sync'])
+    if not re.fullmatch(r'[A-Za-z0-9_.-]{1,64}',backup_name):
+        raise ValueError('The project records an unusable Dolt backup name')
+    host,port,user,database=metadata
+    command=[root/'bin/dolt','--host',str(host),'--port',str(port),'--no-tls','--user',str(user),
+             '--use-db',str(database),'sql','-q',"CALL DOLT_BACKUP('sync', '%s')"%backup_name]
+    return checked(command,env=environment(root),cwd=root,timeout=BACKUP_SYNC_TIMEOUT).stdout
 
 def provision_merge_slot(root,name):
     """Create the project's merge slot once, tolerating an existing slot.
@@ -251,76 +316,160 @@ def worker_client_setup(root,name):
             f'Bootstrap command (replace ACTOR with the actor returned by worker.py start or session\n'
             f'register):\n  python client.py --config client.local.json --project {name} --actor ACTOR -- onboard')
 
-def scheduled_backup_unit_path():
-    """The installed user unit the scheduled-backup template is copied to."""
-    return Path.home()/'.config/systemd/user'/'beads-backup.service'
+def scheduled_backup_unit_dir():
+    """The user systemd unit directory an operator installs the schedule into."""
+    return Path.home()/'.config/systemd/user'
+
+def scheduled_backup_unit_paths():
+    """Every installed scheduled-backup candidate unit, sorted by path.
+
+    ``beads-backup.service`` (the template's name) is only ONE candidate: a deployment
+    may install the schedule under any ``beads-*backup*.service`` name, so every
+    matching unit file is read instead of assuming the historical one. Only the unit
+    files themselves are inspected; systemd drop-ins (``*.service.d/*.conf``) can
+    override them and are NOT read, which the coverage report states plainly.
+    """
+    directory=scheduled_backup_unit_dir()
+    try:
+        return sorted(path for path in directory.glob('beads-*backup*.service') if path.is_file())
+    except OSError:
+        return []
 
 def scheduled_backup_execstart(root):
     """The exact ``ExecStart`` line that covers every project of this runtime."""
     return (f'ExecStart={sys.executable} {Path(__file__).resolve()} '
             f'--root {root} backup --all')
 
-def scheduled_backup_coverage(root,name):
-    """(already_covers_every_project, message) for the INSTALLED schedule.
+def _execstart_values(text):
+    """The command of each ``ExecStart=`` line in a unit file, systemd prefix stripped.
 
-    ``True`` only for the durable ``backup --all`` form; a unit that merely lists
-    ``name`` inside its project list is reported as included but not durable
-    (the next project added would need another edit).
+    A oneshot service may carry several ``ExecStart`` lines (the template uses one) and
+    each may start with systemd's ``-``/``+``/``!``/``:`` prefix. Comments and every
+    other directive are ignored; drop-ins are not read here at all.
+    """
+    for raw in text.splitlines():
+        line=raw.strip()
+        if not line.startswith('ExecStart='):continue
+        value=line[len('ExecStart='):].strip()
+        while value[:1] in ('-','+','!',':'):value=value[1:].lstrip()
+        if value:yield value
 
-    The schedule is an operator-owned user systemd unit copied from
-    ``templates/beads-backup.service``; this reads the file that is actually
-    installed (not the template) and reports it factually. A unit that runs
-    another runtime, one that lists projects individually, one that already uses
-    ``backup --all`` and an absent unit are distinguished, and every message says
-    which project is not covered and, unless the durable ``--all`` form is already
-    installed, prints the exact ``ExecStart`` line to use. It is a report, not a
-    gate: this never edits, installs or enables a unit.
+def _mentions_root(tokens,root):
+    """True when a parsed command line names this runtime root."""
+    for index,token in enumerate(tokens):
+        if token=='--root' and index+1<len(tokens):candidate=tokens[index+1]
+        elif token.startswith('--root='):candidate=token.split('=',1)[1]
+        elif token==str(root):return True
+        else:continue
+        try:
+            if Path(candidate).expanduser().resolve()==root:return True
+        except OSError:pass
+    return False
+
+def scheduled_backup_unit_report(text,root):
+    """Classify one unit file's ``ExecStart`` lines against one runtime root.
+
+    ``ours`` is True when a line runs this kit's ``admin.py`` for THIS runtime, with
+    ``all_line`` the durable ``backup --all`` form and ``named`` the projects a line of
+    this runtime lists individually. ``wrapper`` is the command line of a recognised
+    long-sync wrapper of this runtime (a line that runs a script other than
+    ``admin.py`` and names this runtime), and ``other_runtime`` any line that belongs
+    to a different runtime. A wrapper is the timeout-safe path an operator moved to, so
+    it is recognised as safe coverage rather than something to replace.
     """
     import shlex
-    path=scheduled_backup_unit_path()
-    line=scheduled_backup_execstart(root)
-    if not path.is_file():
-        return False,(f'The installed scheduled backup unit {path} is missing, so no project is on a '
-                      f'schedule. A schedule that covers every project, including {name}, is:\n  {line}')
-    try:
-        text=path.read_text(encoding='utf-8')
-    except OSError as error:
-        return False,(f'The installed scheduled backup unit {path} could not be read ({error}), so schedule '
-                      f'coverage of {name} cannot be confirmed. Use a schedule that covers every project:\n  {line}')
-    ours=False;all_projects=False;covered=[]
-    for raw in text.splitlines():
-        raw=raw.strip()
-        if not raw.startswith('ExecStart='):continue
-        try:tokens=shlex.split(raw[len('ExecStart='):])
+    report={'all_line':False,'named':[],'ours':False,'wrapper':None,'other_runtime':False}
+    for value in _execstart_values(text):
+        try:tokens=shlex.split(value)
         except ValueError:continue
-        if not any(Path(token).name=='admin.py' for token in tokens):continue
-        unit_root=[tokens[i+1] for i,token in enumerate(tokens[:-1]) if token=='--root']
-        unit_root+= [token.split('=',1)[1] for token in tokens if token.startswith('--root=')]
-        if not unit_root:continue
-        try:
-            if Path(unit_root[0]).expanduser().resolve()!=root:continue
-        except OSError:continue
-        ours=True
-        try:index=tokens.index('backup',next(i for i,token in enumerate(tokens) if Path(token).name=='admin.py'))
-        except (StopIteration,ValueError):continue
-        tail=tokens[index+1:]
-        if '--all' in tail:all_projects=True
-        covered+=[token for token in tail if not token.startswith('-')]
-    if all_projects:
-        return True,(f'The installed scheduled backup unit {path} already backs up every project of this '
-                     f'runtime (backup --all), so {name} is covered; no change is needed.')
-    covered=sorted(set(covered))
-    if not ours:
-        return False,(f'The installed scheduled backup unit {path} does not back up this runtime ({root}), so '
-                      f'{name} is not covered. Replace it with a schedule that covers every project:\n  {line}')
-    if name in covered:
-        return False,(f'The installed scheduled backup unit {path} already includes {name} (projects: '
-                      f'{", ".join(covered)}), but it names projects individually, so the next project added '
-                      f'needs the same edit. Replace that project list with the durable form:\n  {line}')
-    return False,(f'The installed scheduled backup unit {path} covers only '
-                  f'{", ".join(covered) if covered else "no project"}, so it does not include {name}. Add this '
-                  f'exact line (a oneshot service may run several ExecStart lines), or replace the project '
-                  f'list with --all:\n  {line}')
+        if not tokens:continue
+        if any(Path(token).name=='admin.py' for token in tokens):
+            if not _mentions_root(tokens,root):
+                report['other_runtime']=True;continue
+            report['ours']=True
+            try:index=tokens.index('backup',next(i for i,token in enumerate(tokens) if Path(token).name=='admin.py'))
+            except (StopIteration,ValueError):continue
+            tail=tokens[index+1:]
+            if '--all' in tail:report['all_line']=True
+            else:report['named']+=[token for token in tail if not token.startswith('-')]
+            continue
+        if _mentions_root(tokens,root):
+            if report['wrapper'] is None:report['wrapper']=value
+        else:
+            report['other_runtime']=True
+    return report
+
+def scheduled_backup_coverage(root,name):
+    """(durably_covers_every_project, message) for the INSTALLED schedule.
+
+    ``True`` only for a schedule that durably covers every project of this runtime: an
+    ``admin.py ... backup --all`` unit, or a recognised long-sync wrapper unit (one
+    that runs a script other than ``admin.py`` for this runtime). A schedule that
+    merely lists ``name`` inside its project list is reported as included but not
+    durable, because the next project added would need another edit.
+
+    Every ``beads-*backup*.service`` unit installed for the account is read, not only
+    the historical ``beads-backup.service``, and the report names the units it read and
+    says that systemd drop-ins (``*.service.d/*.conf``) are not inspected. A recognized
+    wrapper is never reported as something to replace with ``backup --all``, and
+    ``--all`` is never suggested next to named project lines (naming projects and
+    ``--all`` in one command is refused). It is a report, not a gate: this never edits,
+    installs or enables a unit.
+    """
+    directory=scheduled_backup_unit_dir()
+    line=scheduled_backup_execstart(root)
+    dropins=(f'Systemd drop-ins ({directory}/*.service.d/*.conf) are not inspected, so this reports the unit '
+             f'files themselves.')
+    paths=scheduled_backup_unit_paths()
+    if not paths:
+        return False,(f'No installed scheduled backup unit matching beads-*backup*.service was found in '
+                      f'{directory}, so no project of this runtime is on a schedule. A schedule that covers '
+                      f'every project, including {name}, is:\n  {line}')
+    read=[];unreadable=[];durable=[];wrappers=[];named={};foreign=[]
+    for path in paths:
+        try:text=path.read_text(encoding='utf-8')
+        except OSError as error:
+            unreadable.append('%s (%s)'%(path,error));continue
+        read.append(str(path))
+        report=scheduled_backup_unit_report(text,root)
+        if report['all_line']:durable.append(str(path))
+        if report['wrapper']:wrappers.append(str(path))
+        if report['ours'] and not report['all_line']:
+            named[str(path)]=sorted(set(report['named']))
+        if report['other_runtime']:foreign.append(str(path))
+    if durable or wrappers:
+        coverage=[]
+        if durable:coverage.append('durable backup --all: '+', '.join(durable))
+        if wrappers:coverage.append('long-sync wrapper: '+', '.join(wrappers))
+        note=(' Read: '+', '.join(read)+'.') if read else ''
+        if unreadable:note+=' Not readable: '+'; '.join(unreadable)+'.'
+        return True,(f'The installed scheduled backup unit(s) read for this runtime cover every project, '
+                      f'including {name}, so no change is needed ('+'; '.join(coverage)+').'+note+' '+dropins)
+    covered=sorted({item for names in named.values() for item in names})
+    if named:
+        note=' Read: '+', '.join(read)+'.'
+        if foreign:note+=' Units for another runtime were also read and are not changed: '+', '.join(foreign)+'.'
+        if unreadable:note+=' Not readable: '+'; '.join(unreadable)+'.'
+        if name in covered:
+            return False,(f'The installed scheduled backup unit(s) read for this runtime already include {name} '
+                          f'(projects: {", ".join(covered)}) at '+', '.join(named)+', but they name projects '
+                          f'individually, so the next project added needs the same edit. Replace that project '
+                          f'list with the durable form (do not combine named projects with --all in one '
+                          f'command):\n  {line}'+note+' '+dropins)
+        return False,(f'The installed scheduled backup unit(s) read for this runtime cover only '
+                      f'{", ".join(covered) if covered else "no project"}, so they do not include {name}. Add '
+                      f'{name} there, or replace the project list with the durable form (do not combine named '
+                      f'projects with --all in one command):\n  {line}'+note+' '+dropins)
+    details=[]
+    if foreign:details.append('these units do not back up this runtime: '+', '.join(foreign))
+    if unreadable:details.append('could not be read: '+'; '.join(unreadable))
+    if not read:
+        return False,(f'The installed scheduled backup unit(s) found in {directory} could not be read ('
+                      +'; '.join(unreadable)+f'), so schedule coverage of {name} cannot be confirmed. Use a '
+                      f'schedule that covers every project:\n  {line}')
+    return False,(f'The installed scheduled backup unit(s) read ('+', '.join(read)+f') do not cover {name}'
+                  +(' ('+'; '.join(details)+')' if details else '')
+                  +f'. A schedule that covers every project is:\n  {line} '+dropins)
 
 def add_project(root,name):
     path=project_dir(root,name)
@@ -494,13 +643,62 @@ def _atomic_write_bytes(path,content):
     finally:
         if os.path.exists(temporary):os.unlink(temporary)
 
+def last_complete_sidecar_path(root,name):
+    """The durable copy of this project's last COMPLETE coordination sidecar."""
+    validate_name(name)
+    return root/'backups'/(name+LAST_COMPLETE_SUFFIX)
+
+def complete_sidecar(path):
+    """The complete coordination record at ``path``, or None.
+
+    Missing, symlinked, unreadable, wrong-schema and non-``complete`` sidecars all
+    return None: every caller treats "not proven complete" as unusable rather than
+    guessing, so a half-written or still-``pending`` marker is never restored from.
+    """
+    path=Path(path)
+    if path.is_symlink() or not path.is_file():return None
+    try:data=json.loads(path.read_text(encoding='utf-8'))
+    except (OSError,ValueError):return None
+    if not isinstance(data,dict) or data.get('schema_version')!=1 or data.get('status')!='complete':
+        return None
+    return data
+
+def _atomic_copy(source,destination):
+    """Replace ``destination`` with a byte-for-byte copy of ``source``, atomically."""
+    _atomic_write_bytes(Path(destination),Path(source).read_bytes())
+
+@contextmanager
+def last_complete_guard(root,name):
+    """Keep the previous complete sidecar restorable across one backup run.
+
+    The complete sidecar is saved aside (durably) before the caller replaces it with
+    the ``pending`` marker, and restored if the run fails or is interrupted, so a
+    failed run never destroys the pair ``restore-new`` needs. A run with no previous
+    complete pair leaves the honest ``pending`` marker in place: there is nothing to
+    degrade. The caller's critical section still starts before the ``pending`` write;
+    this guard only performs atomic file copies of an atomically-replaced file.
+    """
+    bundle=root/'backups'/(name+'.coordination.json')
+    last_complete=last_complete_sidecar_path(root,name)
+    if complete_sidecar(bundle) is not None:
+        _atomic_copy(bundle,last_complete)
+    try:
+        yield bundle,last_complete
+    except BaseException:
+        try:
+            if last_complete.is_file() and not last_complete.is_symlink():
+                _atomic_copy(last_complete,bundle)
+        except OSError:
+            pass
+        raise
+
 def backup_project(root,name):
     import fcntl
     from coordination import atomic
     path=project_dir(root,name)
-    with (path/'.coordination.lock').open('a') as lock, backup_lock(root,name):
+    with (path/'.coordination.lock').open('a') as lock, backup_lock(root,name), \
+            last_complete_guard(root,name) as (bundle,last_complete):
         fcntl.flock(lock,fcntl.LOCK_EX)
-        bundle=root/'backups'/(name+'.coordination.json')
         atomic(bundle,{'schema_version':1,'status':'pending'})
         files={}
         if (path/'.coordination-requests').is_symlink() or (path/'.merge-context.json').is_symlink():raise ValueError('Coordination paths must not be symlinks')
@@ -561,7 +759,7 @@ def backup_project(root,name):
         # take its consistent snapshot in the same critical section as the coordination
         # sidecar so a backup never pairs one store's state with the other's.
         snapshot_journal(path/JOURNAL_STORE_NAME,journal_snapshot_path(root,name))
-        output=run_bd(root,name,['backup','sync'])
+        output=native_backup_sync(root,name)
         # The deployment operator allowlist travels with the project sidecar so a
         # restore can TELL the operator which recorded authority is missing on the
         # destination host. It is not applied automatically: the allowlist is
@@ -570,6 +768,9 @@ def backup_project(root,name):
         # and this preserves the record of the authority the reads would need.
         atomic(bundle,{'schema_version':1,'status':'complete','files':files,
                        'operators':sorted(operators(root))})
+        # Refresh the durable last-complete copy so the next run has a restorable pair
+        # to protect even if it is interrupted before it can write anything.
+        _atomic_copy(bundle,last_complete)
         return output
 
 def utc_stamp():
@@ -688,6 +889,45 @@ def write_backup_status(root,record):
     validate_backup_status(record)
     atomic(root/'backups'/BACKUP_STATUS_NAME,record)
 
+def merged_backup_status(root,record):
+    """``record`` merged with the last known state of the projects it did not touch.
+
+    A named or single-project run must not erase the last known state of the other
+    projects, so their entries are carried forward from the previous file. `scope` and
+    `generated_at` always describe THIS run truthfully, and a carried-forward entry
+    keeps the completion time or failure reason from when it was last observed, so the
+    merge cannot dress a stale entry up as this run's result. ``--require-complete``
+    still refuses a record whose scope is not ``all`` and still re-checks every pair on
+    disk, so a merged record cannot pass the completeness gate on a stale entry alone.
+    """
+    try:
+        previous=read_backup_status(root)
+    except ValueError:
+        previous=None
+    if previous is None:return record
+    entries={entry['name']:entry for entry in previous['projects']}
+    for entry in record['projects']:entries[entry['name']]=entry
+    merged=dict(record)
+    merged['projects']=[entries[name] for name in sorted(entries)]
+    complete=sum(1 for entry in merged['projects'] if entry['status']=='complete')
+    merged['status']='complete' if complete==len(merged['projects']) else 'incomplete'
+    return merged
+
+def failure_reason(error):
+    """One-line, size-bounded reason for a failed project, with the native stderr.
+
+    The exception text alone (``Command '[...]' returned non-zero exit status 1.``)
+    hides the diagnostic that says WHY the native command refused, so the captured
+    stderr (or stdout) is appended when it adds anything. This is the native command's
+    own output, never the environment or a command line, so no credential is echoed.
+    """
+    parts=[' '.join(str(error).split()) or error.__class__.__name__]
+    extra=getattr(error,'stderr',None) or getattr(error,'stdout',None)
+    if isinstance(extra,bytes):extra=extra.decode('utf-8','replace')
+    extra=' '.join(str(extra or '').split())
+    if extra and extra not in parts[0]:parts.append(extra)
+    return ' '.join(parts)[:400]
+
 def read_backup_status(root):
     path=root/'backups'/BACKUP_STATUS_NAME
     if path.is_symlink():raise ValueError('Backup status file must not be a symlink')
@@ -696,6 +936,98 @@ def read_backup_status(root):
     except (OSError,ValueError):raise ValueError('Backup status file is not readable JSON') from None
     validate_backup_status(record)
     return record
+
+def require_complete_problems(root,record):
+    """Why the last run does not cover every initialized project with a complete pair.
+
+    This is the gate in front of both the operator's off-machine copy and the
+    ``backup-copy`` helper, so it is one implementation. Beyond the run having used
+    ``--all`` and every recorded pair still being complete on disk, the record is
+    compared with ``initialized_projects(root)``: a project added after the last run is
+    absent from the record and is reported by name instead of being silently ignored.
+    A project is named at most once (the most concrete reason wins).
+    """
+    problems=[];seen=set()
+    def add(key,text):
+        if key in seen:return
+        seen.add(key);problems.append(text)
+    if record.get('scope')!='all':
+        add('scope','the last run was a named run, so it does not cover every initialized project')
+    entries={entry['name']:entry for entry in record['projects']}
+    for entry in record['projects']:
+        complete,reason=backup_pair_state(root,entry['name'])
+        if not complete:add(entry['name'],'%s: %s'%(entry['name'],reason))
+    for name in initialized_projects(root):
+        entry=entries.get(name)
+        if entry is None:
+            add(name,'%s: initialized project is absent from the last run record (added after it, or not on '
+                    'the schedule); run backup --all'%name)
+        elif entry['status']!='complete':
+            add(name,'%s: the last run recorded %s, not complete'%(name,entry['status']))
+    return problems
+
+def copy_destination_path(value):
+    """Validate the operator's off-machine copy destination.
+
+    The copy is a plain mirror an operator can copy back into a runtime's ``backups/``
+    directory, so the destination must be an explicit, absolute, non-root path with no
+    whitespace: an ambiguous path is refused rather than guessed at.
+    """
+    path=Path(value).expanduser()
+    if not path.is_absolute():raise ValueError('Destination must be an absolute path')
+    path=path.resolve()
+    if path==Path(path.anchor):raise ValueError('Destination must not be the filesystem root')
+    if any(character.isspace() for character in str(path)):
+        raise ValueError('Destination path must not contain whitespace')
+    return path
+
+def backup_copy(root,destination):
+    """Reference off-machine copy of every project's last complete backup pair.
+
+    The gate is exactly ``backup-status --require-complete``: every initialized project
+    must be in the last run record with a complete pair on disk, or this refuses and
+    names what is missing, copying nothing. Each project is written as
+    ``<DEST>/<name>`` (its native backup directory) plus
+    ``<DEST>/<name>.coordination.json`` (its complete sidecar) — the same shape a
+    runtime's ``backups/`` directory has, so the copy can be copied back and restored —
+    and the record that gated the copy is copied too. The scheduled, encrypted
+    off-machine system, its retention and its encryption stay the operator's: this is a
+    generic, credential-free reference the operator can gate and schedule. It reads and
+    copies files only; it never touches a unit, timer or schedule.
+    """
+    import shutil
+    record=read_backup_status(root)
+    problems=require_complete_problems(root,record)
+    if problems:
+        raise SystemExit('backup-copy refused: not every initialized project has a complete backup pair '
+                         'on disk: '+'; '.join(problems))
+    try:
+        destination=copy_destination_path(destination)
+    except ValueError as error:
+        raise SystemExit('backup-copy refused: '+str(error)) from None
+    if destination==root or root in destination.parents:
+        raise SystemExit('backup-copy refused: destination %s is inside the runtime %s; use an off-machine '
+                         'location'%(destination,root))
+    backups=root/'backups';copied=[]
+    for entry in sorted(record['projects'],key=lambda item:item['name']):
+        name=entry['name']
+        native=backups/name
+        sidecar=backups/(name+'.coordination.json')
+        if native.is_symlink() or sidecar.is_symlink():
+            raise ValueError('Backup pair paths must not be symlinks')
+        target_native=destination/name
+        shutil.copytree(native,target_native,dirs_exist_ok=True)
+        target_sidecar=destination/(name+'.coordination.json')
+        _atomic_copy(sidecar,target_sidecar)
+        copied.append(name)
+        print('Copied %s: %s -> %s'%(name,native,target_native))
+        print('Copied %s: %s -> %s'%(name,sidecar,target_sidecar))
+    target_status=destination/BACKUP_STATUS_NAME
+    _atomic_copy(backups/BACKUP_STATUS_NAME,target_status)
+    print('Copied the completeness record: %s -> %s'%(backups/BACKUP_STATUS_NAME,target_status))
+    print('Copied %d complete project pair(s) of %d initialized to %s.'
+          %(len(copied),len(initialized_projects(root)),destination))
+    return copied
 
 def backup_projects(root,names,all_projects=False):
     """Back up one or more projects in one run and publish the run's status file.
@@ -729,8 +1061,7 @@ def backup_projects(root,names,all_projects=False):
         try:
             native=backup_project(root,name)
         except Exception as error:
-            reason=' '.join(str(error).split()) or error.__class__.__name__
-            results.append({'name':name,'status':'failed','reason':reason[:400]})
+            results.append({'name':name,'status':'failed','reason':failure_reason(error)})
             incomplete.append(name);continue
         complete,reason=backup_pair_state(root,name)
         if complete:
@@ -739,7 +1070,7 @@ def backup_projects(root,names,all_projects=False):
         else:
             results.append({'name':name,'status':'failed','reason':reason})
             incomplete.append(name)
-    write_backup_status(root,backup_status_record(results,scope,generated_at))
+    write_backup_status(root,merged_backup_status(root,backup_status_record(results,scope,generated_at)))
     for entry in results:
         if entry['status']!='complete':
             print('backup %s for %s: %s'%(entry['status'],entry['name'],entry['reason']),file=sys.stderr)
@@ -762,26 +1093,48 @@ def validate_coordination_operators(value):
         except ValueError:raise ValueError('Invalid operator identity in coordination backup') from None
     return allowed
 
-def coordination_backup(root,source):
+def resolved_coordination_sidecar(root,source):
+    """The complete coordination sidecar for a project, or None when there is none.
+
+    The canonical ``backups/<name>.coordination.json`` is preferred. A run that failed
+    or was interrupted after writing its ``pending`` marker leaves that marker behind,
+    so the durable last-complete copy is used instead: it is what keeps the previous
+    restorable pair usable by ``restore-new``. Every path is refused if it is a
+    symlink, exactly like the canonical sidecar.
+    """
     validate_name(source)
     bundle=root/'backups'/(source+'.coordination.json')
-    if not bundle.exists():
-        return None
     if bundle.is_symlink():raise ValueError('Coordination backup must not be a symlink')
-    data=json.loads(bundle.read_text(encoding='utf-8'))
-    if not isinstance(data,dict) or data.get('schema_version')!=1 or data.get('status')!='complete':raise ValueError('Incomplete coordination backup; recover/reconcile source first')
+    data=complete_sidecar(bundle)
+    if data is not None:return data
+    fallback=last_complete_sidecar_path(root,source)
+    if fallback.is_symlink():raise ValueError('Coordination backup must not be a symlink')
+    return complete_sidecar(fallback)
+
+def coordination_backup(root,source):
+    data=resolved_coordination_sidecar(root,source)
+    if data is None:
+        bundle=root/'backups'/(source+'.coordination.json')
+        if not bundle.exists():
+            return None
+        raise ValueError('Incomplete coordination backup; recover/reconcile source first')
     validate_coordination_files(data.get('files'))
     validate_coordination_operators(data.get('operators'))
     return data['files']
 
 def coordination_operators(root,source):
-    """Operator allowlist snapshot in a project sidecar, or [] when absent."""
+    """Operator allowlist snapshot in a project sidecar, or [] when absent.
+
+    Reads the same sidecar ``coordination_backup`` restores (the canonical one, else the
+    durable last-complete copy), so the "recorded but not listed here" report and the
+    restore itself cannot disagree.
+    """
     validate_name(source)
     bundle=root/'backups'/(source+'.coordination.json')
-    if not bundle.is_file() or bundle.is_symlink():return []
-    try:data=json.loads(bundle.read_text(encoding='utf-8'))
-    except ValueError:return []
-    if not isinstance(data,dict):return []
+    if bundle.is_symlink():return []
+    data=complete_sidecar(bundle)
+    if data is None:data=complete_sidecar(last_complete_sidecar_path(root,source))
+    if data is None:return []
     return validate_coordination_operators(data.get('operators'))
 
 def merge_operators(root,actors):
@@ -967,8 +1320,11 @@ def main():
                    help='back up every initialized project in this runtime in one run')
     a=sub.add_parser('backup-status')
     a.add_argument('--require-complete',action='store_true',dest='require_complete',
-                   help='exit non-zero unless the last run covered every project (--all) and every recorded '
-                        'pair is still complete on disk')
+                   help='exit non-zero unless the last run covered every project (--all) and every initialized '
+                        'project has a complete pair on disk')
+    a=sub.add_parser('backup-copy');a.add_argument('destination',metavar='DEST',
+                   help='copy every project\'s last complete backup pair under this off-machine directory; '
+                        'refuses unless backup-status --require-complete would pass')
     a=sub.add_parser('restore-new');a.add_argument('project');a.add_argument('destination')
     a.add_argument('--restore-operators',action='store_true',dest='restore_operators',
                    help='explicitly re-grant the operator allowlist entries the backup records that this '
@@ -1122,16 +1478,12 @@ def main():
         atomic_private_write(marker,json.dumps(cfg))
         print(json.dumps({'operators':current}))
     elif args.command=='backup':backup_projects(root,args.projects,args.all_projects)
+    elif args.command=='backup-copy':backup_copy(root,args.destination)
     elif args.command=='backup-status':
         record=read_backup_status(root)
         print(json.dumps(record,sort_keys=True))
         if args.require_complete:
-            problems=[]
-            if record['scope']!='all':
-                problems.append('the last run was a named run, so it does not cover every initialized project')
-            for entry in record['projects']:
-                complete,reason=backup_pair_state(root,entry['name'])
-                if not complete:problems.append('%s: %s'%(entry['name'],reason))
+            problems=require_complete_problems(root,record)
             if problems:
                 raise SystemExit('backup-status: not every project has a complete backup pair on disk: '
                                  +'; '.join(problems))

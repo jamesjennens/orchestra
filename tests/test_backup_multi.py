@@ -9,6 +9,7 @@ prints.
 import contextlib
 import io
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -189,6 +190,48 @@ class BackupCommandCase(unittest.TestCase):
             return
         self.assertEqual(admin.initialized_projects(self.root), ['alpha', 'beta'])
 
+    def test_a_named_run_keeps_the_last_known_state_of_untouched_projects(self):
+        with patch.object(admin, 'backup_project', side_effect=self.fake_backup()):
+            self.run_admin('backup', '--all')
+        first = {entry['name']: entry for entry in admin.read_backup_status(self.root)['projects']}
+        with patch.object(admin, 'backup_project', side_effect=self.fake_backup()):
+            stdout, stderr, code = self.run_admin('backup', 'alpha')
+        self.assertEqual(code, 0, stderr)
+        record = admin.read_backup_status(self.root)
+        # The run's own scope and stamp are truthful, and beta's entry survives intact.
+        self.assertEqual(record['scope'], 'named')
+        self.assertTrue(admin.utc_timestamp(record['generated_at']))
+        entries = {entry['name']: entry for entry in record['projects']}
+        self.assertEqual(sorted(entries), ['alpha', 'beta'])
+        self.assertEqual(entries['beta'], first['beta'])
+        self.assertEqual(entries['alpha']['status'], 'complete')
+
+    def test_a_merge_never_drops_a_failed_entry_or_claims_the_run_covered_it(self):
+        def failing(root, name):
+            raise RuntimeError('sync refused for ' + name)
+        with patch.object(admin, 'backup_project', side_effect=failing):
+            self.run_admin('backup', '--all')
+        failed = {entry['name']: entry for entry in admin.read_backup_status(self.root)['projects']}
+        self.assertEqual(failed['beta']['status'], 'failed')
+        with patch.object(admin, 'backup_project', side_effect=self.fake_backup()):
+            self.run_admin('backup', 'alpha')
+        record = admin.read_backup_status(self.root)
+        entries = {entry['name']: entry for entry in record['projects']}
+        self.assertEqual(entries['beta'], failed['beta'])
+        self.assertEqual(record['status'], 'incomplete')
+
+    def test_a_native_failure_reason_keeps_the_bd_stderr(self):
+        def failing(root, name):
+            raise subprocess.CalledProcessError(1, ['dolt', 'sql'], stderr='Error 1105: backup target is full')
+        with patch.object(admin, 'backup_project', side_effect=failing):
+            stdout, stderr, code = self.run_admin('backup', 'alpha')
+        self.assertNotEqual(code, 0)
+        entry = admin.read_backup_status(self.root)['projects'][0]
+        self.assertEqual(entry['status'], 'failed')
+        self.assertIn('backup target is full', entry['reason'])
+        self.assertIn('backup target is full', stderr)
+        self.assertNotIn('\n', entry['reason'])
+
 
 class BackupStatusReadCase(unittest.TestCase):
     def setUp(self):
@@ -262,6 +305,26 @@ class BackupStatusReadCase(unittest.TestCase):
         self.assertNotEqual(code, 0)
         self.assertIn('alpha', stderr)
         self.assertIn('not complete', stderr)
+
+    def test_require_complete_reports_a_project_initialized_after_the_run(self):
+        admin.write_backup_status(self.root, self.record)
+        make_project(self.root, 'gamma')
+        stdout, stderr, code = self.run_status('backup-status', '--require-complete')
+        self.assertNotEqual(code, 0)
+        self.assertIn('gamma', stderr)
+        self.assertIn('absent from the last run record', stderr)
+        # alpha and beta are complete and covered, so only gamma is a problem.
+        self.assertNotIn('alpha:', stderr)
+
+    def test_require_complete_reports_a_recorded_project_that_is_not_complete(self):
+        record = json.loads(json.dumps(self.record))
+        record['status'] = 'incomplete'
+        record['projects'][1] = {'name': 'beta', 'status': 'skipped', 'reason': 'not initialized'}
+        admin.write_backup_status(self.root, record)
+        stdout, stderr, code = self.run_status('backup-status', '--require-complete')
+        self.assertNotEqual(code, 0)
+        self.assertIn('beta', stderr)
+        self.assertIn('recorded skipped', stderr)
 
     def test_missing_or_malformed_status_file_is_refused(self):
         with self.assertRaisesRegex(ValueError, 'No backup status file'):
@@ -356,24 +419,37 @@ class ScheduledCoverageGuidanceCase(unittest.TestCase):
         (self.root / 'backups').mkdir(parents=True)
         (self.root / 'projects').mkdir()
         self.root = self.root.resolve()
-        self.unit = Path(self.temp.name) / 'beads-backup.service'
-        patcher = patch.object(admin, 'scheduled_backup_unit_path', return_value=self.unit)
+        # The report enumerates the account's unit DIRECTORY, so the tests point it at
+        # their own directory and install `beads-*backup*.service` files there.
+        self.units = Path(self.temp.name) / 'user-units'
+        self.units.mkdir()
+        patcher = patch.object(admin, 'scheduled_backup_unit_dir', return_value=self.units)
         patcher.start()
         self.addCleanup(patcher.stop)
+        self.unit = self.units / 'beads-backup.service'
 
-    def write_unit(self, *execstarts):
-        self.unit.write_text('\n'.join(
+    def write_unit(self, *execstarts, name='beads-backup.service'):
+        path = self.units / name
+        path.write_text('\n'.join(
             ['[Unit]', 'Description=Backup', '', '[Service]', 'Type=oneshot', *execstarts]) + '\n',
             encoding='utf-8')
+        return path
+
+    def admin_line(self, root, *projects):
+        return ('ExecStart=/usr/bin/python3 /opt/orchestra/admin.py --root %s backup %s'
+                % (root, ' '.join(projects)))
 
     def line(self, *projects):
-        return ('ExecStart=/usr/bin/python3 /opt/orchestra/admin.py --root %s backup %s'
-                % (self.root, ' '.join(projects)))
+        return self.admin_line(self.root, *projects)
 
-    def test_missing_unit_reports_no_coverage_and_the_exact_line(self):
+    def wrapper_line(self, root=None, script='/opt/orchestra/longsync-wrapper.py'):
+        return ('ExecStart=/usr/bin/python3 %s --root %s --project second'
+                % (script, root or self.root))
+
+    def test_no_unit_reports_no_coverage_and_the_exact_line(self):
         covered, message = admin.scheduled_backup_coverage(self.root, 'second')
         self.assertFalse(covered)
-        self.assertIn('is missing', message)
+        self.assertIn('was found', message)
         self.assertIn('second', message)
         self.assertIn('backup --all', message)
         self.assertIn('ExecStart=', message)
@@ -382,15 +458,15 @@ class ScheduledCoverageGuidanceCase(unittest.TestCase):
         self.write_unit(self.line('first'))
         covered, message = admin.scheduled_backup_coverage(self.root, 'second')
         self.assertFalse(covered)
-        self.assertIn('covers only first', message)
-        self.assertIn('does not include second', message)
-        self.assertIn('backup --all', message)
+        self.assertIn('cover only first', message)
+        self.assertIn('do not include second', message)
+        self.assertIn('durable form', message)
 
     def test_unit_listing_this_project_is_reported_as_needing_the_durable_form(self):
         self.write_unit(self.line('first', 'second'))
         covered, message = admin.scheduled_backup_coverage(self.root, 'second')
         self.assertFalse(covered)
-        self.assertIn('already includes second', message)
+        self.assertIn('already include second', message)
         self.assertIn('first, second', message)
         self.assertIn('backup --all', message)
 
@@ -398,22 +474,26 @@ class ScheduledCoverageGuidanceCase(unittest.TestCase):
         self.write_unit(self.line('first'), self.line('second'))
         covered, message = admin.scheduled_backup_coverage(self.root, 'second')
         self.assertFalse(covered)
-        self.assertIn('already includes second', message)
+        self.assertIn('already include second', message)
         self.assertIn('first, second', message)
 
     def test_unit_using_all_is_reported_as_already_covering_every_project(self):
         self.write_unit(self.line('--all'))
         covered, message = admin.scheduled_backup_coverage(self.root, 'second')
         self.assertTrue(covered)
-        self.assertIn('already backs up every project', message)
+        self.assertIn('cover every project', message)
         self.assertIn('no change is needed', message)
         self.assertIn('second', message)
+        # The answer is about the unit files: drop-ins are stated as not inspected.
+        self.assertIn('drop-ins', message)
+        self.assertIn('not inspected', message)
 
     def test_a_unit_for_another_runtime_is_not_coverage(self):
-        self.write_unit('ExecStart=/usr/bin/python3 /opt/orchestra/admin.py --root /srv/other backup --all')
+        self.write_unit(self.admin_line('/srv/other', '--all'))
         covered, message = admin.scheduled_backup_coverage(self.root, 'second')
         self.assertFalse(covered)
-        self.assertIn('does not back up this runtime', message)
+        self.assertIn('do not cover second', message)
+        self.assertIn('do not back up this runtime', message)
         self.assertIn('backup --all', message)
 
     def test_an_unreadable_unit_is_reported_unconfirmed_not_fine(self):
@@ -428,13 +508,55 @@ class ScheduledCoverageGuidanceCase(unittest.TestCase):
         self.write_unit('ExecStart=/usr/bin/python3 /opt/orchestra/admin.py --root %s backup' % self.root)
         covered, message = admin.scheduled_backup_coverage(self.root, 'second')
         self.assertFalse(covered)
-        self.assertIn('covers only no project', message)
-        self.assertIn('does not include second', message)
+        self.assertIn('cover only no project', message)
+        self.assertIn('do not include second', message)
 
     def test_execstart_line_names_this_runtime_and_the_durable_form(self):
         line = admin.scheduled_backup_execstart(self.root)
         self.assertTrue(line.startswith('ExecStart='))
         self.assertIn('--root %s backup --all' % self.root, line)
+
+    def test_a_differently_named_backup_unit_is_read(self):
+        self.write_unit(self.line('--all'), name='beads-example-backup.service')
+        covered, message = admin.scheduled_backup_coverage(self.root, 'second')
+        self.assertTrue(covered)
+        self.assertIn('beads-example-backup.service', message)
+
+    def test_a_longsync_wrapper_unit_for_this_runtime_is_safe_coverage(self):
+        # The live installations moved to a long-sync wrapper (see kittrial-5bb.28);
+        # it is the safe path and must be reported as coverage, never replaced with
+        # `backup --all`.
+        self.write_unit(self.wrapper_line(), name='beads-example-backup.service')
+        covered, message = admin.scheduled_backup_coverage(self.root, 'second')
+        self.assertTrue(covered)
+        self.assertIn('long-sync wrapper', message)
+        self.assertIn('beads-example-backup.service', message)
+        self.assertIn('no change is needed', message)
+        self.assertNotIn('backup --all', message)
+
+    def test_a_wrapper_and_a_named_unit_together_never_steer_off_the_wrapper(self):
+        self.write_unit(self.wrapper_line(), name='beads-example-backup.service')
+        self.write_unit(self.line('first'), name='beads-backup.service')
+        covered, message = admin.scheduled_backup_coverage(self.root, 'second')
+        self.assertTrue(covered)
+        self.assertIn('long-sync wrapper', message)
+        self.assertIn('no change is needed', message)
+        self.assertNotIn('Replace that project list', message)
+
+    def test_a_wrapper_for_another_runtime_is_not_coverage_of_this_one(self):
+        self.write_unit(self.wrapper_line(root='/srv/other'))
+        covered, message = admin.scheduled_backup_coverage(self.root, 'second')
+        self.assertFalse(covered)
+        self.assertIn('do not cover second', message)
+
+    def test_named_lines_never_suggest_combining_projects_with_all(self):
+        self.write_unit(self.line('first'))
+        covered, message = admin.scheduled_backup_coverage(self.root, 'second')
+        self.assertFalse(covered)
+        self.assertIn('do not combine named projects with --all in one command', message)
+        for candidate in message.splitlines():
+            if candidate.strip().startswith('ExecStart=') and '--all' in candidate:
+                self.assertNotIn('first', candidate)
 
     def test_add_project_prints_the_guidance_without_touching_the_unit(self):
         self.write_unit(self.line('first'))
@@ -446,7 +568,7 @@ class ScheduledCoverageGuidanceCase(unittest.TestCase):
             admin.add_project(self.root, 'newproject')
         text = output.getvalue()
         self.assertIn('Created project newproject', text)
-        self.assertIn('does not include newproject', text)
+        self.assertIn('do not include newproject', text)
         self.assertIn('backup --all', text)
         self.assertEqual(self.unit.read_text(encoding='utf-8'), before)
 
@@ -458,8 +580,21 @@ class ScheduledCoverageGuidanceCase(unittest.TestCase):
                 patch.object(admin, 'backup_project'), contextlib.redirect_stdout(output):
             admin.add_project(self.root, 'newproject')
         text = output.getvalue()
-        self.assertIn('already backs up every project', text)
+        self.assertIn('cover every project', text)
         self.assertIn('no change is needed', text)
+
+    def test_add_project_does_not_steer_off_a_longsync_wrapper(self):
+        self.write_unit(self.wrapper_line(), name='beads-example-backup.service')
+        output = io.StringIO()
+        with patch.object(admin, 'config', return_value={'port': 13317}), \
+                patch.object(admin, 'run_bd', return_value=''), \
+                patch.object(admin, 'backup_project'), contextlib.redirect_stdout(output):
+            admin.add_project(self.root, 'newproject')
+        text = output.getvalue()
+        self.assertIn('long-sync wrapper', text)
+        self.assertIn('no change is needed', text)
+        self.assertNotIn('does not include newproject', text)
+        self.assertNotIn('backup --all', text)
 
 
 if __name__ == '__main__':
