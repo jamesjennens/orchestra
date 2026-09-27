@@ -1606,13 +1606,87 @@ class Service:
             view['working_directory_hidden'] = True
         return view
 
+    def project_agent_view(self, agent):
+        """The *project-owner* view of an agent active in their project.
+
+        Deliberately narrower than :meth:`agent_view`. A project owner governs
+        whether an agent may work in their project, but is not that agent's owner, so
+        the response carries identity, attribution and liveness only. The
+        ``working_directory`` hint never appears - and neither does
+        ``working_directory_hidden``, which would still disclose that a path exists -
+        nor do the agent's other project grants, its machine/notes or its credentials.
+        """
+        return {
+            'id': agent['id'],
+            'name': agent['name'],
+            'owner': agent['owner'],
+            'owner_display_name': self._owner_name(agent['owner']),
+            'actor': self.agent_actor(agent),
+            'enabled': bool(agent.get('enabled')),
+            'last_seen_at': agent.get('last_seen_at'),
+        }
+
+    def list_project_agents(self, principal, project_id):
+        """Agents whose live grant names ``project_id`` (owner decision 4).
+
+        Authorization is the route's ``CAP_PROJECT_ADMIN`` check (project owner or
+        admin, never a worker/agent credential), so this method only assembles the
+        safe :meth:`project_agent_view`.
+        """
+        with self.store.lock:
+            self._refresh_authority(principal)
+            agents = [a for a in self.state['agents'].values()
+                      if project_id in (a.get('projects') or [])]
+            agents.sort(key=lambda a: a['id'])
+            return [self.project_agent_view(a) for a in agents]
+
+    def get_project_agent(self, principal, project_id, agent_id):
+        """One agent as its project's owner/admin sees it.
+
+        Like :meth:`list_project_agents`, the route holds the ``CAP_PROJECT_ADMIN``
+        boundary. An agent whose grant does not name this project is reported exactly
+        like a missing agent, so a project owner cannot probe the wider registry.
+        """
+        with self.store.lock:
+            self._refresh_authority(principal)
+            agent = self._agent(agent_id)
+            if project_id not in (agent.get('projects') or []):
+                raise not_found('Agent not found in this project')
+            return self.project_agent_view(agent)
+
+    def revoke_agent_project(self, principal, project_id, agent_id, request_id=None):
+        """Remove one project from an agent's grant (owner decision 4).
+
+        The project owner/admin boundary is the route's ``CAP_PROJECT_ADMIN`` check.
+        Only the grant changes: the agent keeps its other projects, its credentials,
+        its ``enabled`` state and every control its own owner holds. Because
+        :func:`http_authority.decide` reads the *live* grant on every request, the
+        agent credential is refused on this project on its next request and the
+        project drops out of ``/v1/agents/me/next``.
+        """
+        if principal is None or principal.via == 'credential':
+            raise forbidden('Session authority required to change an agent grant')
+        with self.store.lock:
+            self._refresh_authority(principal)
+            agent = self._agent(agent_id)
+            projects = list(agent.get('projects') or [])
+            if project_id not in projects:
+                # Exactly like a missing agent: a non-participant learns nothing.
+                raise not_found('Agent not found in this project')
+            agent['projects'] = [pid for pid in projects if pid != project_id]
+            self.store.save()
+            view = self.project_agent_view(agent)
+        return {'operation': 'agents.project.revoke', 'project': project_id, 'agent': view}
+
     def agent_setup(self, agent, secret, projects=None):
         """The one-time setup payload. It never contains the secret itself.
 
         The secret is returned once beside this payload; ``.orchestra/agent.json``
         holds only the server URL, the agent id and the project ids, so the directory
-        the agent runs in is safe to keep (the secret lives in an environment
-        variable, VS Code secret storage or the OS credential store).
+        the agent runs in is safe to keep. The snippet leads with VS Code secret
+        storage or the OS credential store (owner decision 9); an environment variable
+        is only a documented fallback, read from that store, and no command line ever
+        carries the literal secret (shell history, process list).
         """
         server_url = self.public_url
         config = {
@@ -1626,9 +1700,14 @@ class Service:
             "mkdir -p .orchestra\n"
             "cat > %s <<'JSON'\n%s\nJSON\n"
             "printf '\\n.orchestra/\\n' >> .gitignore\n"
-            "# Store the secret shown once in your OS credential store or VS Code secret\n"
-            "# storage - never in the file above and never in Git:\n"
-            "export %s='<paste the secret shown once>'\n"
+            "# Store the secret shown once in VS Code secret storage or your OS\n"
+            "# credential store and let your client read it from there. Never write it\n"
+            "# into the file above, into Git, or onto a command line: a literal export\n"
+            "# would persist in shell history and the process list.\n"
+            "#\n"
+            "# Fallback only, for a machine with no secret store: set the %s\n"
+            "# environment variable from that store and reference it as below - never\n"
+            "# paste the secret itself into a command.\n"
             "curl -fsS -H \"Authorization: Bearer $%s\" %s\n"
         ) % (AGENT_CONFIG_PATH, json.dumps(config, indent=2, sort_keys=True),
              AGENT_SECRET_ENV, AGENT_SECRET_ENV, endpoint)
@@ -1638,9 +1717,12 @@ class Service:
             'config_contains_secret': False,
             'secret_env_var': AGENT_SECRET_ENV,
             'setup_snippet': snippet,
-            'guidance': 'Keep .orchestra/ out of Git; the secret belongs in an '
-                        'environment variable, VS Code secret storage or the OS '
-                        'credential store, and is shown only once.',
+            'guidance': 'Keep .orchestra/ out of Git. Keep the secret shown once in '
+                        'VS Code secret storage or the OS credential store and have '
+                        'the client read it from there; the %s environment variable is '
+                        'only a documented fallback, set from that store, and the '
+                        'literal secret must never appear on a command line. It is '
+                        'shown only once.' % AGENT_SECRET_ENV,
         }
 
     def _issue_agent_credential_locked(self, principal, agent, scopes=None, label=None):

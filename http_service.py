@@ -46,13 +46,14 @@ MAX_FILENAME = 128
 MAX_PAGE = 100
 DEFAULT_PAGE = 50
 MAX_CURSOR = 512
-#: Bound on the read-time agent next-action list. Attention is computed from a bounded,
-#: cached, per-request read of every granted project's task pages; nothing is scheduled
-#: or polled.
+#: Bound on the read-time agent next-action list. Attention is computed from bounded,
+#: cached, per-request task reads (one full snapshot per granted project); nothing is
+#: scheduled or polled.
 AGENT_ACTION_LIMIT = 50
-#: How many task pages (of :data:`MAX_PAGE` each) agent attention walks per project per
-#: request, i.e. 20,000 tasks for one project. The walk exists so an agent's own task is
-#: never hidden behind the page boundary; a walk that stops here reports ``truncated``.
+#: Bound on agent attention, expressed as pages of :data:`MAX_PAGE` each, i.e. 20,000
+#: tasks for one project. The bound is applied in memory to the single full snapshot
+#: (:meth:`EndpointBackend.read_tasks`), not by re-reading the canonical store per
+#: page, so a bound that is reached reports ``truncated`` without extra reads.
 AGENT_MAX_PAGES = 200
 #: Cap on the *claimable* suggestions collected per read. Claimable work is a suggestion
 #: list, not the agent's own work, so it is the only list the page-sized cap applies to:
@@ -420,11 +421,22 @@ class InProcessBackend:
         return {'feedback': record}
 
     # -- reads (no canonical mutation) ----------------------------------------
-    def list_tasks(self, project_id, limit, offset):
+    def read_tasks(self, project_id):
+        """One full canonical snapshot of every in-project row.
+
+        This is the single-read seam (:data:`AGENT_MAX_PAGES` walks chunk it in
+        memory instead of re-reading the canonical store per page). ``list_tasks``
+        stays the paginated view over the *same* snapshot so the HTTP page route is
+        unchanged.
+        """
         tasks = [t for t in self.state['tasks'].values() if t['project_id'] == project_id]
         tasks.sort(key=lambda t: t['id'])
-        return {'items': [dict(t) for t in tasks[offset:offset + limit]],
-                'total': len(tasks)}
+        return {'items': [dict(t) for t in tasks], 'total': len(tasks)}
+
+    def list_tasks(self, project_id, limit, offset):
+        snapshot = self.read_tasks(project_id)
+        return {'items': snapshot['items'][offset:offset + limit],
+                'total': snapshot['total']}
 
     def get_task(self, project_id, task_id):
         return dict(self._task(project_id, task_id))
@@ -444,14 +456,16 @@ class InProcessBackend:
 class EndpointBackend:
     """Production seam: map authorized HTTP operations onto canonical ``endpoint.py``.
 
-    This is the runnable Linux binding, not deployment glue. Each of the six methods
-    the routes need is implemented:
+    This is the runnable Linux binding, not deployment glue. Every method the routes
+    need is implemented:
 
     * ``invoke`` maps task/checkpoint/review mutations onto the canonical client
       protocol (``bd create/update`` and the structured ``checkpoint``/``review``
       actions that already own claim, review and checkpoint semantics);
-    * ``list_tasks``/``get_task``/``task_history`` map onto ``bd list``/``show`` and
-      the canonical ``history`` action;
+    * ``read_tasks`` performs the one full canonical read of a project;
+      ``list_tasks`` slices that snapshot into the paginated HTTP view, and
+      ``get_task``/``task_history`` map onto ``bd show`` and the canonical
+      ``history`` action;
     * ``list_feedback`` fails closed with a clean 501 until the dedicated feedback
       stream (``kittrial-5bb.13``) is integrated into the canonical command set;
       the service never substitutes its own in-memory feedback for canonical data.
@@ -731,15 +745,26 @@ class EndpointBackend:
         return [row for row in rows
                 if not isinstance(row, dict) or row.get('project_id') in (None, project_id)]
 
-    def list_tasks(self, project_id, limit, offset):
-        # ``list --all --limit 0`` is the kit's own full-read form (see
-        # coordination.py); the HTTP page is sliced from that snapshot so the
-        # offset cursor stays exact.
+    def read_tasks(self, project_id):
+        """One full canonical read of a project: the single-read seam.
+
+        ``bd list --all --limit 0 --json`` is the kit's own full-read form (see
+        coordination.py) and costs exactly one ``endpoint.py`` subprocess. Attention
+        chunks this in-memory snapshot instead of paying one full read per page, and
+        the paginated HTTP route slices the same snapshot so both stay exact.
+        """
         rows = self._run('bd', project_id, self.actor_namespace + '/read',
                          ['list', '--all', '--limit', '0', '--json'])
         rows = rows if isinstance(rows, list) else rows.get('items', [])
         rows = self._in_project(rows, project_id)
-        return {'items': rows[offset:offset + limit], 'total': len(rows)}
+        return {'items': rows, 'total': len(rows)}
+
+    def list_tasks(self, project_id, limit, offset):
+        # The HTTP page is sliced from the one full snapshot so the offset cursor
+        # stays exact; the canonical read happens once per call, not once per page.
+        snapshot = self.read_tasks(project_id)
+        return {'items': snapshot['items'][offset:offset + limit],
+                'total': snapshot['total']}
 
     def get_task(self, project_id, task_id):
         row = self._run('bd', project_id, self.actor_namespace + '/read',
@@ -1064,7 +1089,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     # -- mutation helper -------------------------------------------------------
     def _mutate(self, ctx, route_name, project_id, fn, *, capability, allow_self_user=None,
                 status=200, idempotent=True, replay_status=None, serialize=True,
-                canonical=False):
+                canonical=False, reason=None):
         """Run one authorized, idempotent mutation.
 
         ``capability`` names the authority the route needs. The idempotency key is
@@ -1075,7 +1100,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         mutations. Canonical mutations pass ``serialize=False`` and ``canonical=True``:
         their durable operation identity lets a retry after an uncertain outcome
         reconcile the canonical result through the endpoint journal instead of
-        repeating the effect.
+        repeating the effect. ``reason`` is an optional short redacted clarification
+        (for example the target's identity) added to the route's audit events; it must
+        never carry a secret or request body.
         """
         ctx.authorize = (lambda: self.service.check_authority(
             ctx.principal, project_id, capability, allow_self_user=allow_self_user))
@@ -1104,7 +1131,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         except UncertainOutcome:
             self.service.idempotency_unknown(digest)
             self.service.audit(ctx.request_id, ctx.principal, route_name, 'unknown',
-                               project_id=project_id, reason='uncertain')
+                               project_id=project_id, reason=reason or 'uncertain')
             self.service.store.save()
             raise uncertain('The operation may have committed; reconcile with the same '
                             'idempotency key')
@@ -1120,7 +1147,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise
         self.service.idempotency_commit(digest, status, stored)
         self.service.audit(ctx.request_id, ctx.principal, route_name, 'committed',
-                           project_id=project_id)
+                           project_id=project_id, reason=reason)
         self.service.store.save()
         return status, public
 
@@ -1428,6 +1455,39 @@ class ApiHandler(BaseHTTPRequestHandler):
         return self._mutate(ctx, 'agents.credentials.revoke', None, revoke, status=204,
                             capability=CAP_AGENTS)
 
+    # -- project-scoped agent routes (owner decision 4) ------------------------
+    #
+    # The boundary is the project's own administration capability, NOT
+    # ``CAP_AGENTS``: a project owner/admin governs which agents may work in their
+    # project without gaining any control over an agent it does not own. Both routes
+    # return the deliberately narrow :meth:`Service.project_agent_view`, which never
+    # carries ``working_directory``.
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/agents')
+    def project_agents_list(self, ctx):
+        self._project(ctx, CAP_PROJECT_ADMIN)
+        items = self.service.list_project_agents(ctx.principal, ctx.params['pid'])
+        return 200, {'project': ctx.params['pid'], 'items': items, 'total': len(items),
+                     'generated_at': now_iso(self.service._now())}
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/agents/(?P<aid>' + ID + r')')
+    def project_agent_get(self, ctx):
+        self._project(ctx, CAP_PROJECT_ADMIN)
+        agent = self.service.get_project_agent(ctx.principal, ctx.params['pid'],
+                                               ctx.params['aid'])
+        return 200, {'project': ctx.params['pid'], 'agent': agent,
+                     'generated_at': now_iso(self.service._now())}
+
+    @route('DELETE', r'/v1/projects/(?P<pid>' + ID + r')/agents/(?P<aid>' + ID + r')')
+    def project_agent_revoke(self, ctx):
+        def revoke():
+            result = self.service.revoke_agent_project(
+                ctx.principal, ctx.params['pid'], ctx.params['aid'],
+                request_id=ctx.request_id)
+            return result, result
+        return self._mutate(ctx, 'agents.project.revoke', ctx.params['pid'], revoke,
+                            capability=CAP_PROJECT_ADMIN,
+                            reason='agent %s' % ctx.params['aid'])
+
     # -- read-time agent attention --------------------------------------------
     def _agent_blocked_tasks(self):
         """Task ids whose latest checkpoint still lists open items.
@@ -1478,37 +1538,26 @@ class ApiHandler(BaseHTTPRequestHandler):
         return True
 
     def _agent_project_tasks(self, project_id):
-        """Every task page of one project, read at most once per HTTP request.
+        """Every task row of one project from ONE canonical read per HTTP request.
 
-        The per-project read is cached for the whole request, so the owner's
-        ``GET /v1/agents`` with N agents over P projects performs P reads rather than
-        N*P (the endpoint binding spawns one ``endpoint.py``/``bd list`` per read). The
-        walk follows pages to the last one so an agent's own task is never hidden
-        behind the page boundary; the last page also reports completeness for the
-        ``truncated`` flag. Nothing is cached across requests - the next request
-        re-reads canonical state.
+        The backend's :meth:`read_tasks` snapshot is fetched at most once per project
+        per request (the endpoint binding spawns one ``endpoint.py`` / ``bd list
+        --all`` for it), so attention over a project of any size costs one read, not
+        one read per :data:`MAX_PAGE` page. The snapshot is chunked in memory to the
+        same :data:`AGENT_MAX_PAGES` bound the page walk used, so the ``complete``
+        flag - and therefore ``truncated`` - keeps exactly its rev2 meaning: a bound
+        that is not reached means every page was seen. Nothing is cached across
+        requests; the next request re-reads canonical state.
         """
         cache = getattr(self, '_agent_task_cache', None)
         if cache is None:
             cache = self._agent_task_cache = {}
         if project_id in cache:
             return cache[project_id]
-        tasks = []
-        offset = 0
-        complete = False
-        for _ in range(AGENT_MAX_PAGES):
-            page = self.backend.list_tasks(project_id, MAX_PAGE, offset)
-            rows = [task for task in (page.get('items') or []) if isinstance(task, dict)]
-            total = page.get('total')
-            tasks.extend(rows)
-            offset += len(rows)
-            if len(rows) < MAX_PAGE:
-                complete = True
-                break
-            if isinstance(total, int) and offset >= total:
-                complete = True
-                break
-        result = {'tasks': tasks, 'complete': complete}
+        snapshot = self.backend.read_tasks(project_id)
+        rows = [task for task in (snapshot.get('items') or []) if isinstance(task, dict)]
+        bound = AGENT_MAX_PAGES * MAX_PAGE
+        result = {'tasks': rows[:bound], 'complete': len(rows) <= bound}
         cache[project_id] = result
         return result
 
@@ -1626,7 +1675,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         else:
             what = 'There is nothing queued right now.'
         return ("Open your agent folder%s for agent '%s' (%s). %s\n"
-                "Set %s from your secret store, then run:\n"
+                "Read %s from VS Code secret storage or your OS credential store (an\n"
+                "environment variable is only a fallback), then run:\n"
                 "  curl -fsS -H \"Authorization: Bearer $%s\" %s/v1/agents/me/next"
                 % (where, agent['name'], agent['id'], what, AGENT_SECRET_ENV,
                    AGENT_SECRET_ENV, server))

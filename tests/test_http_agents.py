@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import http_service
-from http_auth import Service, Store
+from http_auth import AGENT_SECRET_ENV, Service, Store
 from http_service import MAX_BODY_BYTES, InProcessBackend, create_server
 
 TMP_ROOT = Path(os.environ.get('ORCHESTRA_TEST_TMP', str(ROOT / '.runtime' / 'test-tmp')))
@@ -192,6 +192,75 @@ class AgentRegistryTests(AgentHarness):
         # Both credentials authenticate independently.
         for token in (secret, second):
             self.assertEqual(200, self.request('GET', '/v1/agents/me', token=token).status)
+
+
+class AgentSecretGuidanceTests(AgentHarness):
+    """Owner decision 9: recommend a secret store; an env var is only a fallback.
+
+    The one-time secret must never be shown being assigned on a command line, and
+    ``.orchestra/agent.json`` must stay secretless while the secret itself is still
+    returned exactly once.
+    """
+
+    DOCS = ('docs/HTTP_DEPLOYMENT.md', 'docs/HTTP_TRANSPORT_DESIGN.md')
+
+    def setUp(self):
+        super().setUp()
+        admin = self.admin_token()
+        self.create_account(admin, 'alex', 'alex-password-1')
+        self.alex = self.login('alex', 'alex-password-1')[0]
+
+    def test_setup_snippet_leads_with_a_secret_store_and_no_literal_export(self):
+        created = self.create_agent(self.alex)
+        self.assertEqual(201, created.status, created.data)
+        setup = created.data['setup']
+        snippet = setup['setup_snippet']
+        secret = created.data['credential']['secret']
+        self.assertTrue(secret)
+        # No command ever carries the literal secret, and no shell export at all.
+        self.assertNotIn(secret, json.dumps(setup))
+        self.assertNotRegex(snippet, r'export\s+\w+=')
+        self.assertNotIn('%s=' % AGENT_SECRET_ENV, snippet)
+        # The store is named first; the environment variable is only the fallback.
+        self.assertIn('VS Code secret storage', snippet)
+        self.assertIn('credential store', snippet)
+        self.assertIn('environment variable', snippet)
+        self.assertLess(snippet.index('VS Code secret storage'),
+                        snippet.index(AGENT_SECRET_ENV))
+        self.assertIn('VS Code secret storage', setup['guidance'])
+        self.assertLess(setup['guidance'].index('VS Code secret storage'),
+                        setup['guidance'].index(AGENT_SECRET_ENV))
+        # The config file stays secretless and the secret is still shown once.
+        self.assertFalse(setup['config_contains_secret'])
+        self.assertNotIn('secret', setup['config'])
+        self.assertTrue(created.data['secret_available'])
+
+    def test_secret_is_returned_exactly_once(self):
+        body = {'name': 'Kestrel', 'working_directory': '/home/priya/kestrel'}
+        first = self.request('POST', '/v1/agents', body, token=self.alex,
+                             key='guidance-key-0001')
+        self.assertEqual(201, first.status, first.data)
+        secret = first.data['credential']['secret']
+        self.assertTrue(secret)
+        replay = self.request('POST', '/v1/agents', body, token=self.alex,
+                              key='guidance-key-0001')
+        self.assertEqual(200, replay.status, replay.data)
+        self.assertNotIn('secret', replay.data['credential'])
+        self.assertFalse(replay.data['credential']['secret_available'])
+        self.assertFalse(replay.data['setup']['config_contains_secret'])
+        self.assertNotIn(secret, json.dumps(replay.data))
+        listing = self.request('GET', '/v1/agents', token=self.alex)
+        self.assertEqual(200, listing.status, listing.data)
+        self.assertNotIn(secret, json.dumps(listing.data))
+
+    def test_docs_recommend_the_secret_store_before_the_environment_fallback(self):
+        phrase = ('VS Code secret storage or the OS credential store; an environment '
+                  'variable is only a documented fallback')
+        for name in self.DOCS:
+            flat = ' '.join((ROOT / name).read_text(encoding='utf-8').split())
+            self.assertIn(phrase, flat, name)
+            self.assertNotIn('export %s' % AGENT_SECRET_ENV, flat, name)
+            self.assertNotIn("setup snippet's export", flat, name)
 
 
 class AgentRestContractTests(AgentHarness):
@@ -440,6 +509,160 @@ class AgentPrivacyTests(AgentHarness):
         self.assertNotIn('secret"', json.dumps(superuser.data))
 
 
+class ProjectOwnerAgentTests(AgentHarness):
+    """Owner decision 4: a project owner/admin sees and revokes agents in it.
+
+    The boundary is the project's own administration capability, so a project owner
+    governs which agents may work in their project without gaining any control over
+    an agent they do not own - and never sees its ``working_directory``.
+    """
+
+    #: The only fields a project owner may receive about an agent in their project.
+    SAFE_FIELDS = {'id', 'name', 'owner', 'owner_display_name', 'actor', 'enabled',
+                   'last_seen_at'}
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.admin_token()
+        self.create_account(self.admin, 'alex', 'alex-password-1')
+        self.create_account(self.admin, 'blair', 'blair-password-1')
+        self.create_account(self.admin, 'carol', 'carol-password-1')
+        self.alex, self.alex_user = self.login('alex', 'alex-password-1')
+        self.blair, self.blair_user = self.login('blair', 'blair-password-1')
+        self.carol = self.login('carol', 'carol-password-1')[0]
+        self.alpha = self.create_project(self.alex, 'Alpha')
+        self.beta = self.create_project(self.alex, 'Beta')
+        # Blair is an ordinary contributor on Alpha: a member, but not its owner.
+        member = self.request('PUT', '/v1/projects/%s/members/%s'
+                              % (self.alpha, self.blair_user['id']),
+                              {'role': 'contributor'}, token=self.alex)
+        self.assertEqual(200, member.status, member.data)
+        self.agent_id, self.secret, _ = self.agent_secret(
+            self.alex, name='Kestrel', projects=[self.alpha, self.beta])
+        for project, title in ((self.alpha, 'ALPHA-WORK'), (self.beta, 'BETA-WORK')):
+            created = self.request('POST', '/v1/projects/%s/tasks' % project,
+                                   {'title': title}, token=self.alex)
+            self.assertEqual(201, created.status, created.data)
+
+    def assert_safe_view(self, agent):
+        self.assertEqual(self.SAFE_FIELDS, set(agent))
+        self.assertNotIn('working_directory', agent)
+        # "hidden" is still a disclosure that a path exists.
+        self.assertNotIn('working_directory_hidden', agent)
+
+    def test_project_owner_lists_agents_without_the_working_directory(self):
+        listed = self.request('GET', '/v1/projects/%s/agents' % self.alpha, token=self.alex)
+        self.assertEqual(200, listed.status, listed.data)
+        self.assertEqual(self.alpha, listed.data['project'])
+        self.assertEqual(1, listed.data['total'])
+        item = listed.data['items'][0]
+        self.assert_safe_view(item)
+        self.assertEqual(self.agent_id, item['id'])
+        self.assertEqual('Kestrel', item['name'])
+        self.assertEqual(self.alex_user['id'], item['owner'])
+        self.assertEqual('alex', item['owner_display_name'])
+        self.assertEqual(self.agent_id, item['actor'])
+        self.assertTrue(item['enabled'])
+        self.assertIn('last_seen_at', item)
+        self.assertNotIn('/home/priya', listed.body.decode('utf-8'))
+        self.assertNotIn('working_directory', listed.body.decode('utf-8'))
+        # A single-agent project view is just as narrow.
+        single = self.request('GET', '/v1/projects/%s/agents/%s'
+                              % (self.alpha, self.agent_id), token=self.alex)
+        self.assertEqual(200, single.status, single.data)
+        self.assert_safe_view(single.data['agent'])
+        self.assertNotIn('/home/priya', single.body.decode('utf-8'))
+        self.assertNotIn('working_directory', single.body.decode('utf-8'))
+        # A superuser holds the same project administration boundary.
+        as_admin = self.request('GET', '/v1/projects/%s/agents' % self.alpha, token=self.admin)
+        self.assertEqual(200, as_admin.status, as_admin.data)
+
+    def test_listing_is_scoped_to_the_project_grant(self):
+        other = self.create_agent(self.alex, name='Merlin', projects=[self.beta])
+        self.assertEqual(201, other.status, other.data)
+        alpha = self.request('GET', '/v1/projects/%s/agents' % self.alpha, token=self.alex)
+        self.assertEqual([self.agent_id], [a['id'] for a in alpha.data['items']])
+        beta = self.request('GET', '/v1/projects/%s/agents' % self.beta, token=self.alex)
+        self.assertEqual({self.agent_id, other.data['agent']['id']},
+                         {a['id'] for a in beta.data['items']})
+        # An agent that is not in the project is reported exactly like a missing one.
+        self.assertEqual(404, self.request('GET', '/v1/projects/%s/agents/%s'
+                                           % (self.alpha, other.data['agent']['id']),
+                                           token=self.alex).status)
+
+    def test_non_owner_member_cannot_list_or_revoke(self):
+        self.assertEqual(403, self.request('GET', '/v1/projects/%s/agents' % self.alpha,
+                                           token=self.blair).status)
+        self.assertEqual(403, self.request('GET', '/v1/projects/%s/agents/%s'
+                                           % (self.alpha, self.agent_id),
+                                           token=self.blair).status)
+        refused = self.request('DELETE', '/v1/projects/%s/agents/%s'
+                               % (self.alpha, self.agent_id), token=self.blair)
+        self.assertEqual(403, refused.status, refused.data)
+        # A non-member learns nothing at all (no existence probe).
+        self.assertEqual(404, self.request('GET', '/v1/projects/%s/agents' % self.alpha,
+                                           token=self.carol).status)
+        self.assertEqual(404, self.request('DELETE', '/v1/projects/%s/agents/%s'
+                                           % (self.alpha, self.agent_id),
+                                           token=self.carol).status)
+        # Nothing changed, and an agent credential never holds project admin.
+        detail = self.request('GET', '/v1/agents/%s' % self.agent_id, token=self.alex)
+        self.assertEqual([self.alpha, self.beta], detail.data['projects'])
+        self.assertEqual(403, self.request('GET', '/v1/projects/%s/agents' % self.alpha,
+                                           token=self.secret).status)
+        self.assertEqual(403, self.request('DELETE', '/v1/projects/%s/agents/%s'
+                                           % (self.alpha, self.agent_id),
+                                           token=self.secret).status)
+
+    def test_project_owner_revokes_one_project_live_with_audit(self):
+        revoked = self.request('DELETE', '/v1/projects/%s/agents/%s'
+                               % (self.alpha, self.agent_id), token=self.alex)
+        self.assertEqual(200, revoked.status, revoked.data)
+        self.assertEqual(self.alpha, revoked.data['project'])
+        self.assertEqual('agents.project.revoke', revoked.data['operation'])
+        self.assert_safe_view(revoked.data['agent'])
+        # Only the grant narrowed: Beta stays, the agent stays enabled, and its own
+        # owner keeps every other control.
+        detail = self.request('GET', '/v1/agents/%s' % self.agent_id, token=self.alex)
+        self.assertEqual([self.beta], detail.data['projects'])
+        self.assertTrue(detail.data['enabled'])
+        renamed = self.request('PATCH', '/v1/agents/%s' % self.agent_id,
+                               {'name': 'Kestrel-2'}, token=self.alex)
+        self.assertEqual(200, renamed.status, renamed.data)
+        self.assertEqual('Kestrel-2', renamed.data['name'])
+        # Live authorization: the next request on Alpha is refused...
+        self.assertEqual(404, self.request('GET', '/v1/projects/%s/tasks' % self.alpha,
+                                           token=self.secret).status)
+        self.assertEqual(404, self.request('POST', '/v1/projects/%s/tasks' % self.alpha,
+                                           {'title': 'nope'}, token=self.secret).status)
+        # ...Beta still works...
+        self.assertEqual(200, self.request('GET', '/v1/projects/%s/tasks' % self.beta,
+                                           token=self.secret).status)
+        # ...and /next drops Alpha from the grant, the projects list and attention.
+        nxt = self.request('GET', '/v1/agents/me/next', token=self.secret)
+        self.assertEqual(200, nxt.status, nxt.data)
+        self.assertEqual([self.beta], [p['id'] for p in nxt.data['projects']])
+        self.assertEqual([self.beta], nxt.data['agent']['projects'])
+        self.assertEqual(1, nxt.data['attention']['counts']['claimable'])
+        self.assertNotIn('ALPHA-WORK', nxt.body.decode('utf-8'))
+        self.assertNotIn(self.alpha, json.dumps(nxt.data['attention']))
+        # The project-scoped view drops it too.
+        self.assertEqual(404, self.request('GET', '/v1/projects/%s/agents/%s'
+                                           % (self.alpha, self.agent_id),
+                                           token=self.alex).status)
+        self.assertEqual(0, self.request('GET', '/v1/projects/%s/agents' % self.alpha,
+                                         token=self.alex).data['total'])
+        # The audit names the project and the acting user.
+        audit = self.request('GET', '/v1/projects/%s/audit' % self.alpha, token=self.alex)
+        self.assertEqual(200, audit.status, audit.data)
+        events = [e for e in audit.data['items']
+                  if e.get('action') == 'agents.project.revoke'
+                  and e.get('outcome') == 'committed']
+        self.assertEqual(1, len(events), audit.data)
+        self.assertEqual(self.alpha, events[0]['project_id'])
+        self.assertEqual(self.alex_user['id'], events[0]['user_id'])
+
+
 class AgentAttentionAuthorizationTests(AgentHarness):
     """Attention must apply the same authorization check as the task routes.
 
@@ -613,12 +836,20 @@ class AgentPaginationTests(AgentHarness):
 
 
 class CountingBackend(InProcessBackend):
-    """In-process backend that counts task reads, the cost proxy for the endpoint
-    binding (which spawns ``endpoint.py`` and ``bd list --all`` per read)."""
+    """In-process backend that counts canonical task reads, the cost proxy for the
+    endpoint binding (which spawns ``endpoint.py`` and ``bd list --all`` per read)."""
 
     def __init__(self, service):
         super().__init__(service)
+        #: Every canonical task read, paginated or full, in call order.
         self.list_calls = []
+        #: Only full-snapshot reads (``read_tasks``): what attention must use once.
+        self.read_calls = []
+
+    def read_tasks(self, project_id):
+        self.read_calls.append(project_id)
+        self.list_calls.append((project_id, None, 0))
+        return super().read_tasks(project_id)
 
     def list_tasks(self, project_id, limit, offset):
         self.list_calls.append((project_id, limit, offset))
@@ -661,6 +892,68 @@ class AgentReadCostTests(AgentHarness):
         nxt = self.request('GET', '/v1/agents/me/next', token=secret)
         self.assertEqual(200, nxt.status, nxt.data)
         self.assertEqual(5, len(self.backend.list_calls))
+
+    def test_a_project_bigger_than_one_page_still_costs_one_read(self):
+        # 130 tasks in one project: the page walk used to cost one full read per
+        # page (2 for this project, so 6 reads for the request). One snapshot now
+        # costs one read, and the exact count proves the whole snapshot was used.
+        big = self.projects[0]
+        seeded = http_service.MAX_PAGE + 30
+        for index in range(seeded):
+            created = self.request('POST', '/v1/projects/%s/tasks' % big,
+                                   {'title': 'big-%03d' % index}, token=self.alex)
+            self.assertEqual(201, created.status, created.data)
+        for label, path, token in (('owner list', '/v1/agents', self.alex),
+                                   ('agent next', None, None)):
+            if path is None:
+                agent_id, secret, _ = self.agent_secret(self.alex, projects=list(self.projects))
+                path, token = '/v1/agents/me/next', secret
+            self.backend.list_calls = []
+            self.backend.read_calls = []
+            response = self.request('GET', path, token=token)
+            self.assertEqual(200, response.status, response.data)
+            # Exactly one read per project, the big one included; never per page.
+            self.assertEqual(5, len(self.backend.read_calls), label)
+            self.assertEqual(5, len(self.backend.list_calls), label)
+            self.assertEqual(1, self.backend.read_calls.count(big), label)
+        # The page boundary is not a read boundary: the whole project was counted.
+        attention = self.request('GET', '/v1/agents/me/next', token=secret).data['attention']
+        self.assertEqual(seeded, attention['counts']['claimable'])
+
+
+class AgentReadBoundTests(AgentHarness):
+    """The in-memory page bound keeps rev2's ``truncated`` meaning at ONE read."""
+
+    backend_class = CountingBackend
+
+    def test_a_snapshot_beyond_the_page_bound_is_truncated_after_one_read(self):
+        admin = self.admin_token()
+        self.create_account(admin, 'alex', 'alex-password-1')
+        alex = self.login('alex', 'alex-password-1')[0]
+        project = self.create_project(alex, 'Alpha')
+        agent_id, secret, _ = self.agent_secret(alex, projects=[project])
+        self.assertTrue(agent_id)
+        bound = http_service.AGENT_MAX_PAGES * http_service.MAX_PAGE
+        # 20,001 HTTP creates is not viable; the canonical rows are the same shape the
+        # create route writes, so seed them directly and drive the real route below.
+        seeded = self.backend.state['tasks']
+        for index in range(bound + 1):
+            task_id = 'task_%08d' % index
+            seeded[task_id] = {'id': task_id, 'project_id': project,
+                               'title': 'bulk-%08d' % index, 'description': '',
+                               'status': 'open', 'assignee': None, 'version': 1,
+                               'created_by': 'usr_seed', 'created_at': 'seed',
+                               'attachments': []}
+        self.backend.list_calls = []
+        self.backend.read_calls = []
+        nxt = self.request('GET', '/v1/agents/me/next', token=secret)
+        self.assertEqual(200, nxt.status, nxt.data)
+        self.assertEqual(1, len(self.backend.read_calls))
+        attention = nxt.data['attention']
+        # Exactly the bound is considered - not bound+1 - and the flag still reports
+        # that the project was cut off, with no second read.
+        self.assertEqual(bound, attention['counts']['claimable'])
+        self.assertTrue(attention['truncated'])
 
 
 class NoScheduledWorkTests(AgentHarness):

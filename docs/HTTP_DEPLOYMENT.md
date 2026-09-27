@@ -201,8 +201,11 @@ the agent record, the setup payload and the credential secret **once**; an exact
 idempotent retry returns `200` with `secret_available:false` and never re-delivers it.
 
 The setup payload writes `.orchestra/agent.json` with the server URL, the agent id and
-the project ids and no secret. The secret goes in an environment variable, VS Code
-secret storage or the OS credential store, and `.orchestra/` stays out of Git. The
+the project ids and no secret. The secret belongs in VS Code secret storage or the OS
+credential store; an environment variable is only a documented fallback, set from that
+store, and `.orchestra/` stays out of Git. The setup snippet never shows the literal
+secret being assigned on a command line: a literal `export` would persist in shell
+history and the process list. The
 agent then calls `GET /v1/agents/me` and `GET /v1/agents/me/next` with
 `Authorization: Bearer $ORCHESTRA_AGENT_SECRET`; every other project route works as
 before, capped at the owner's live role and the agent's granted projects. A grant may
@@ -215,11 +218,23 @@ manually.
 Attention re-authorizes every granted project with the same live check the task routes
 use before it reads anything, so a project the caller can no longer open (the owner
 was removed, or the grant was narrowed) is skipped instead of leaked. Each project is
-read once per request and walked page by page, so an agent's own task is found however
-deep it sorts; only the *claimable* suggestions meet the page-sized cap, and
-`truncated` reports that suggestion list. On the endpoint binding a read costs one
-`endpoint.py` / `bd list --all` invocation per project per page, so a project with
-more than `MAX_PAGE` (100) tasks costs one extra invocation per page for that request.
+read once per request through one full task snapshot, so an agent's own task is found
+however deep it sorts and the request costs one `endpoint.py` / `bd list --all`
+invocation per project whatever the project's size (the page-sized cap is applied to
+the in-memory snapshot); only the *claimable* suggestions meet the page-sized cap, and
+`truncated` reports that suggestion list.
+
+A project owner or admin governs which agents may work in their project without
+holding `agents.manage` and without seeing anything the agent's own owner keeps
+private. `GET /v1/projects/{id}/agents` lists the agents whose grant names the project
+(id, name, owner, `last_seen_at`, `enabled` only, never `working_directory` or
+`working_directory_hidden`), `GET /v1/projects/{id}/agents/{agent}` returns one of
+them, and `DELETE /v1/projects/{id}/agents/{agent}` removes the project from that
+agent's grant with an audit record naming the project and the acting user. Removal
+takes effect on the agent's next request: the credential is refused (`403`/`404`) on
+that project's routes and the project drops out of `/v1/agents/me/next`. It revokes
+nothing else - the agent is not disabled, keeps its other projects and credentials,
+and its own owner keeps every other control.
 
 Revoke an agent credential, disable the agent, disable the owner or remove the
 owner's project membership and the agent stops on its next request. The
@@ -617,8 +632,11 @@ the pilot phase, not part of this service.
   for canonical feedback. Attachment uploads are validated and bounded but only
   their metadata and digest are retained, so **UI readiness is not claimed**.
 - The personal-agent registry, one-time agent credential and the agent REST
-  contract (`/v1/agents`, `/v1/agents/me`, `/v1/agents/me/next`) are implemented and
-  tested. The **browser screens** that render "Your agents", the working directory
+  contract (`/v1/agents`, `/v1/agents/me`, `/v1/agents/me/next`, and the
+  project-scoped `GET /v1/projects/{id}/agents`,
+  `GET /v1/projects/{id}/agents/{agent}` and
+  `DELETE /v1/projects/{id}/agents/{agent}`) are implemented and tested. The
+  **browser screens** that render "Your agents", the working directory
   and the copyable resume prompt are kittrial-5bb.20 and are not built here; this
   build exposes only the JSON contract they will consume.
 - **Known limitation `endpoint-blocked-signal`.** `blocked` attention for an agent is
@@ -651,16 +669,16 @@ the pilot phase, not part of this service.
 4. Retention period and recovery objectives for audit, state and backups.
 5. Whether to bind an external identity provider (SSO) or MFA, and when.
 6. Network exposure and any approved browser origin list.
-7. The personal-agent design decisions (checkpoint item `owner-decisions-pending`):
-   whether an agent credential may see its own `working_directory` and credential
-   list; superuser visibility of every agent and path; the default credential scopes
-   (read-only versus tasks/checkpoints/reviews/feedback); whether project owners may
-   see and revoke agents in their project; the `/next` priority order and claimable
-   filter; disable-revokes-all with no restore on enable; the registry limits (100
-   agents, 20 credentials, 64 projects, 30-day TTL); `actor = agent id`; and the
-   setup snippet's export of the secret. The implementation is a coordinator
-   proposal pending these decisions; the P1/P2 authorization and pagination fixes do
-   not depend on them.
+7. The personal-agent design decisions (checkpoint item `owner-decisions-pending`)
+   were settled by the owner on 2026-09-27 (comment
+   `01a0e2f2-569c-7d03-94ee-36b8dd61940a`): decisions 1, 2, 3, 5, 6, 7 and 8 keep
+   the coordinator proposal as implemented; decision 4 (project owners/admins list
+   and revoke agents in their project) and decision 9 (recommend VS Code secret
+   storage or the OS credential store first, environment variable only as a
+   documented fallback, never a literal `export` of the secret) are implemented in
+   this revision. The `owner-decisions-pending` checkpoint item is therefore
+   resolved; the disposable-build caveat below still stands until rollout decisions
+   1-6 in this list are recorded.
 
 Until these are recorded, this service is a disposable local validation build,
 not an office deployment.

@@ -164,10 +164,11 @@ own machine and pull work over the API without SSH or shared directories.
   same record, token-hash, expiry, revocation and idempotent-replay machinery as
   the project worker credential, extended with `agent_id` and a project grant.
   The secret is shown once; `.orchestra/agent.json` holds the server URL, the
-  agent id and the project ids and **no secret**. The secret belongs in an
-  environment variable, VS Code secret storage or the OS credential store, and
-  `.orchestra/` is kept out of Git. The setup snippet and the copyable resume
-  prompt never contain the secret.
+  agent id and the project ids and **no secret**. The secret belongs in VS Code
+  secret storage or the OS credential store; an environment variable is only a
+  documented fallback, set from that store, and `.orchestra/` is kept out of Git.
+  The setup snippet and the copyable resume prompt never contain the secret and
+  never show it being assigned on a command line (shell history).
 - **Authority.** Project access is granted like membership but is always capped at
   the owner's **current** role by the same `http_authority.decide` /
   `credential_capabilities` rule used by the .19 worker credentials, and the grant
@@ -184,9 +185,11 @@ own machine and pull work over the API without SSH or shared directories.
   routes use (`Service.check_authority` with `CAP_READ`), so a project the reader can
   no longer read - the owner left it, or the grant was narrowed - is skipped rather
   than read: a stored grant is a ceiling, never a licence. Each project's tasks are
-  read once per **request** (so `GET /v1/agents` with N agents over P projects
-  performs P reads, not N*P) and the read follows every page up to a bound, so an
-  agent's own task is counted however deep it sorts by id. The page-sized cap applies
+  read **once per request** through one full snapshot (`Backend.read_tasks`), so
+  `GET /v1/agents` with N agents over P projects performs P reads, not N*P, and a
+  project of any size costs one canonical read rather than one per `MAX_PAGE` page;
+  the snapshot is chunked in memory to the same bound, so an agent's own task is
+  counted however deep it sorts by id. The page-sized cap applies
   only to the **claimable** suggestions, and `truncated` reports that capped
   suggestion list rather than a blind first page. `GET /v1/agents/me` returns the
   agent record; `GET /v1/agents/me/next` returns the stable JSON
@@ -203,14 +206,28 @@ own machine and pull work over the API without SSH or shared directories.
   (and for a superuser). Ordinary users see only their own agents, so the path
   cannot leak. The `projects` field is the stored grant **ceiling**; the attention
   data beside it is always filtered through the reader's live authority.
-- **Open owner decisions.** This shape is a coordinator proposal: the owner has not
-  yet accepted whether the credential may see its own `working_directory` and
-  credential list, superuser visibility of every agent and path, the default
-  credential scopes, whether project owners may see or revoke agents in their
-  project, the `/next` priority order and claimable filter, disable-revokes-all with
-  no restore on enable, the registry limits, `actor = agent id`, and the setup
-  snippet's secret export. It is tracked as the checkpoint item
-  `owner-decisions-pending`; no product change is made for it in this revision.
+- **Project-scoped agent API (owner decision 4).** A project owner or admin - the
+  project's own `CAP_PROJECT_ADMIN` boundary, never `agents.manage` - may
+  `GET /v1/projects/{id}/agents` to list the agents whose grant names their project,
+  `GET /v1/projects/{id}/agents/{agent}` for one of them, and
+  `DELETE /v1/projects/{id}/agents/{agent}` to remove the project from that agent's
+  grant. The view is deliberately narrower than the owner view: `id`, `name`,
+  `owner`, `owner_display_name`, `actor`, `last_seen_at` and `enabled` only, never
+  `working_directory` (nor `working_directory_hidden`) and never the agent's other
+  project grants. The removal is recorded in the project audit and takes effect on
+  the agent's next request because `decide` re-reads the live grant: the credential
+  is refused (`403`/`404`) on that project's routes and the project drops out of
+  `/v1/agents/me/next`. Nothing else is revoked - the agent stays enabled, keeps its
+  other projects and credentials, and its own owner keeps every other control.
+- **Settled owner decisions.** The owner settled the personal-agent design choices
+  on 2026-09-27 (comment `01a0e2f2-569c-7d03-94ee-36b8dd61940a`): decisions 1, 2, 3,
+  5, 6, 7 and 8 keep the shape documented here (the credential may see its own
+  `working_directory` and credential list; superusers see every agent and path; the
+  default credential scopes are tasks/checkpoints/reviews/feedback; `/next` keeps
+  its priority order; disable revokes all credentials and enable restores none; the
+  registry limits and `actor = agent id` stand). Decision 4 and decision 9 (secret
+  store first, environment variable only as a documented fallback) are implemented
+  as described above; the checkpoint item `owner-decisions-pending` is resolved.
 - **Handoff.** This service owns the JSON contract only. The browser screens
   ("Your agents" on My work, directory display, copyable resume prompt) are
   kittrial-5bb.20 and consume these responses unchanged.
@@ -369,7 +386,8 @@ call; it does not authorize direct database access. Protected mutation rows requ
 | `PUT /v1/projects/{id}/members/{user}`, `DELETE .../members/{user}` | Owner or superuser | Assigner is current owner or superuser; only superuser may assign/remove owner role under default policy; cannot remove final active owner | Key scoped to principal + project + operation route + target; `200/204`, `403/409` | Membership add/remove and role transition |
 | `POST /v1/projects/{id}/worker-credentials`, `POST .../worker-credentials/{credential}/revoke` | Owner or superuser issues; owner of credential may revoke own | Project membership current; requested scope subset of issuer scope | Issue key scoped to principal + project + route; request hash detects payload conflicts; `201` secret once, exact uncertain retry `200` metadata only; revoke key scoped to principal + project + credential, `204`; `403/409` | Credential registry and revocation |
 | `POST /v1/agents`, `GET /v1/agents`, `GET /v1/agents/{agent}`, `PATCH /v1/agents/{agent}`, `POST /v1/agents/{agent}/disable`, `POST /v1/agents/{agent}/enable`, `POST /v1/agents/{agent}/credentials`, `POST .../credentials/{credential}/revoke` | Authenticated session; the owning user or a superuser per agent | Agent name/fields bounded; a project grant must name a project the **agent's owner** can open (a superuser may not grant a project outside the owner's membership); a disabled agent cannot receive a credential | Personal routes are session-only (an agent or worker credential gets `403`); create/issue key scoped to principal + route; `201` secret once or `200` metadata-only exact retry; `403/404/409`; `working_directory` is returned only to the owner/superuser; attention is filtered per project through `decide` with `CAP_READ` and each project is read once per request | Personal agent registry and credential records (no canonical mapping) |
-| `GET /v1/agents/me`, `GET /v1/agents/me/next` | Agent credential only | The credential is live, the agent is enabled and the owner is a current member; each granted project is re-checked with `decide` (`CAP_READ`) before its tasks are read | Read-only, no idempotency key; stable JSON attention/next-action computed at read time over every task page per project, with the page cap on the claimable suggestions only; `401/403/404` | Live registry plus bounded canonical task reads, capped by the owner's current role |
+| `GET /v1/agents/me`, `GET /v1/agents/me/next` | Agent credential only | The credential is live, the agent is enabled and the owner is a current member; each granted project is re-checked with `decide` (`CAP_READ`) before its tasks are read | Read-only, no idempotency key; stable JSON attention/next-action computed at read time over one full task snapshot per project, with the page cap on the claimable suggestions only; `401/403/404` | Live registry plus one canonical full task read per project, capped by the owner's current role |
+| `GET /v1/projects/{id}/agents`, `GET /v1/projects/{id}/agents/{agent}`, `DELETE /v1/projects/{id}/agents/{agent}` | Project owner/admin (the project's `CAP_PROJECT_ADMIN`), never `agents.manage`; a non-member gets `404` and an agent/worker credential `403` | A grant may only name a project the **agent's owner** can open; the delete requires the project to be in that agent's live grant | Reads are keyless; the delete is a project mutation keyed to principal + project + route + agent and records `agents.project.revoke` in the project audit; `200`, `403/404`; the response is the narrow safe view with no `working_directory` | Live agent registry (grant narrowing); no canonical mapping |
 | `POST /v1/projects/{id}/jobs`, `PATCH /v1/projects/{id}/jobs/{job}`, `POST /v1/projects/{id}/tasks`, `PATCH /v1/projects/{id}/tasks/{task}` | Owner/contributor for create/update according to project policy; viewer denied | Membership current; update carries resource version; task parent/job must be in same project | Key scoped to principal + project + route + client operation ID; `201/200`, `403/409` | Canonical job/task create/update |
 | `GET /v1/projects/{id}/tasks`, `GET .../tasks/{task}` | Project member; viewer may read | Membership checked before query and cursor validation | Opaque cursor bound to principal/project/query; `200`, `401/403/404` | Canonical task/list/show and history views |
 | `POST /v1/projects/{id}/tasks/{task}/claim` | Contributor/owner or bound worker credential | Task open/claimable and actor binding matches credential | Key scoped to principal + project + task + route; `200`, `403/409` | Existing atomic claim operation |
