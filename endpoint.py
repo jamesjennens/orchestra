@@ -131,7 +131,7 @@ def execute(root,request,authority_config=None,require_authority=False):
                                require_authority=require_authority,runner=runner)
     if action in ('onboard','docs'):
         from onboarding import execute as onboard
-        return {'returncode':0,'stdout':onboard(Path(__file__).resolve().parent,path,name,actor,action,request.get('args',[])),'stderr':''}
+        return {'returncode':0,'stdout':onboard(Path(__file__).resolve().parent,path,name,actor,action,request.get('args',[]),endpoint=Path(__file__).resolve()),'stderr':''}
     if action in ('brief','history','checkpoint'):
         from briefing import execute as briefing_execute
         args=request.get('args',[])

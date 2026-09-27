@@ -11,6 +11,7 @@ import secrets
 import socket
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -229,6 +230,22 @@ WantedBy=default.target
         raise RuntimeError('Initialization failed; service stopped. Preserve runtime and inspect journal; do not overwrite the deployment.') from None
     print(f'Installed {unit}, authenticated loopback port {port}')
 
+def worker_client_setup(root,name):
+    """Exact worker client configuration and bootstrap command for one project.
+
+    The endpoint is this kit's generic ``endpoint.py`` (the file beside this
+    module), which serves every project of the deployment. The host is a
+    placeholder because the kit is public and each worker supplies its own SSH
+    alias; never point a new project at a project-specific wrapper endpoint.
+    """
+    endpoint=Path(__file__).resolve().with_name('endpoint.py')
+    config=json.dumps({'host':'WORKER_SSH_HOST','endpoint':str(endpoint),'root':str(root)},indent=2)
+    return (f'Worker client configuration for {name} (save as client.local.json in the worker\'s own\n'
+            f'directory and replace WORKER_SSH_HOST with that worker\'s SSH alias; this kit endpoint serves\n'
+            f'every project, so do not point it at a project-specific wrapper):\n{config}\n'
+            f'Bootstrap command (replace ACTOR with the actor returned by worker.py start or session\n'
+            f'register):\n  python client.py --config client.local.json --project {name} --actor ACTOR -- onboard')
+
 def add_project(root,name):
     path=project_dir(root,name)
     if path.exists() and any(path.iterdir()): raise ValueError('Project already exists; use it rather than initializing again')
@@ -242,6 +259,7 @@ def add_project(root,name):
     provision_merge_slot(root,name)
     backup_project(root,name)
     print(f'Created project {name}')
+    print(worker_client_setup(root,name))
 
 @contextmanager
 def backup_lock(root,name):
@@ -730,12 +748,17 @@ def main():
     elif args.command=='add-project':add_project(root,args.project)
     elif args.command=='set-onboarding':
         import fcntl
-        from onboarding import write_project
+        from onboarding import probe_endpoints, write_project
         path=project_dir(root,args.project)
         if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            write_project(path/'ONBOARDING.md',Path(args.file).read_text(encoding='utf-8-sig'))
+            text=Path(args.file).read_text(encoding='utf-8-sig')
+            write_project(path/'ONBOARDING.md',text)
+        # Warn after the atomic write: an endpoint that refuses this project must never
+        # be installed silently, but a warning must not block the operator's update.
+        for warning in probe_endpoints(text,args.project,Path(__file__).resolve().parent):
+            print(warning,file=sys.stderr)
         print('Project onboarding installed; back up the project after changes.')
     elif args.command=='service':print(service(root,args.action))
     elif args.command=='record-store':

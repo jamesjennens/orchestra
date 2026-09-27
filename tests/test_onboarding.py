@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -56,3 +58,50 @@ class OnboardingTests(unittest.TestCase):
             with patch.object(sys,'argv',['client.py','--config',str(config),'--project','example','--actor','worker-1','--',*command]),patch.object(client,'request',return_value={'stdout':'','stderr':'','returncode':0}) as request:
                 self.assertEqual(client.main(),0)
                 self.assertEqual(request.call_args.args[3:5],(command[1:],command[0]))
+    def test_onboard_reports_the_endpoint_in_use(self):
+        result=self.call('onboard',[])
+        self.assertIn('Endpoint in use: '+str((self.kit/'endpoint.py').resolve()),result)
+        explicit=o.execute(self.kit,self.project,'example','worker-1','onboard',[],
+                           endpoint=self.root/'wrapper-endpoint.py')
+        self.assertIn('Endpoint in use: '+str((self.root/'wrapper-endpoint.py').resolve()),explicit)
+    def test_endpoint_probe_flags_only_a_project_restricted_script(self):
+        generic=self.kit/'endpoint.py';generic.write_text('# serves every project\n',encoding='utf-8')
+        wrapper=self.root/'wrapper-endpoint.py'
+        wrapper.write_text("if project != 'other':\n    raise SystemExit('This deployment serves only other')\n",encoding='utf-8')
+        document=f'Canonical service/endpoint: {generic}\nworker wrapper: {wrapper}\nabsent: /no/such/host/endpoint.py\n'
+        warnings=o.probe_endpoints(document,'example',self.kit)
+        self.assertEqual(len(warnings),1)
+        self.assertIn(str(wrapper.resolve()),warnings[0])
+        self.assertIn(str(generic.resolve()),warnings[0])
+        self.assertIn('serves only',warnings[0])
+        self.assertEqual(o.probe_endpoints('endpoint: /no/such/host/endpoint.py','example',self.kit),[])
+    @unittest.skipIf(sys.platform=='win32','set-onboarding takes the POSIX coordination lock')
+    def test_set_onboarding_warns_but_still_installs_a_restricted_endpoint(self):
+        project=self.root/'projects'/'example';(project/'.beads').mkdir(parents=True)
+        (project/'.beads/metadata.json').write_text('{}',encoding='utf-8')
+        wrapper=self.root/'wrapper-endpoint.py'
+        wrapper.write_text("raise SystemExit('This deployment serves only other')\n",encoding='utf-8')
+        document=self.root/'onboarding.md';text=f'Canonical service/endpoint: {wrapper}\n'
+        document.write_text(text,encoding='utf-8')
+        stdout,stderr=io.StringIO(),io.StringIO()
+        argv=['admin.py','--root',str(self.root),'set-onboarding','example','--file',str(document)]
+        with patch.object(sys,'argv',argv),contextlib.redirect_stdout(stdout),contextlib.redirect_stderr(stderr):
+            admin.main()
+        self.assertIn('WARNING',stderr.getvalue())
+        self.assertIn('serves only',stderr.getvalue())
+        self.assertIn(f'kit endpoint {Path(admin.__file__).resolve().with_name("endpoint.py")}',stderr.getvalue())
+        self.assertIn('installed',stdout.getvalue())
+        self.assertEqual((project/'ONBOARDING.md').read_text(encoding='utf-8'),text)
+    def test_add_project_prints_client_config_and_bootstrap(self):
+        (self.root/'projects').mkdir()
+        with patch.object(admin,'config',return_value={'port':13317}),patch.object(admin,'run_bd',return_value=''),\
+                patch.object(admin,'provision_merge_slot'),patch.object(admin,'backup_project'):
+            out=io.StringIO()
+            with contextlib.redirect_stdout(out):admin.add_project(self.root,'example')
+        text=out.getvalue();endpoint=str(Path(admin.__file__).resolve().with_name('endpoint.py'))
+        self.assertIn('Created project example',text)
+        self.assertIn('"host": "WORKER_SSH_HOST"',text)
+        self.assertIn('"endpoint": '+json.dumps(endpoint),text)
+        self.assertIn('"root": '+json.dumps(str(self.root)),text)
+        self.assertIn('--project example --actor ACTOR -- onboard',text)
+        self.assertNotIn('beads-team',text)
