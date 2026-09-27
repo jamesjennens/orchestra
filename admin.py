@@ -572,6 +572,30 @@ def restore_coordination(root,source,destination,restore_operators=False):
     if added:
         print('Re-granted operator allowlist entries from the backup (--restore-operators): ' + ', '.join(added))
 
+def record_store_path(state):
+    """The HTTP record store beside the service state document (``http_auth.Store``)."""
+    from http_auth import RECORD_STORE_SUFFIX
+    state=Path(state)
+    return state.with_name(state.name+RECORD_STORE_SUFFIX)
+
+def record_store_reset(state):
+    """Operator recovery for the service record store's monotone auth clock.
+
+    Auth expiry is ``max(raw now, high_water)``; after a forward jump that is later
+    corrected, ``high_water`` stays ahead until the raw clock passes it, so every
+    session, credential and reset value issued in that period is stamped on the pinned
+    timeline and lives late. This sets the floor to the corrected clock
+    (``http_auth.RecordStore.reset_high_water``) and keeps ``jump_credit``, so records
+    already ageing on the confirmed timeline keep their real expiry. The matching
+    operation-journal command is ``admin.py journal <PROJECT> --reset-high-water``.
+    """
+    from http_auth import RecordStore
+    store=RecordStore(record_store_path(state))
+    report={'state':str(Path(state)),'record_store':str(store.path),
+            'high_water':store.reset_high_water()}
+    report['stats']=store.stats()
+    return report
+
 def main():
     p=argparse.ArgumentParser();p.add_argument('--root',required=True)
     sub=p.add_subparsers(dest='command',required=True)
@@ -606,6 +630,12 @@ def main():
     a.add_argument('--any-actor',action='store_true',dest='any_actor',
                    help='with --disposition released (or failed on a receipt with no recorded actor), open the request ID to any actor')
     a=sub.add_parser('service');a.add_argument('action',choices=['start','stop','restart','status'])
+    a=sub.add_parser('record-store')
+    a.add_argument('--state',required=True,
+                   help='the HTTP service state document (its --state); the record store is <state>.records.sqlite3')
+    a.add_argument('--reset-high-water',action='store_true',dest='reset_high_water',
+                   help='set the record store high-water mark to the current clock and clear suspicion '
+                        '(keeps jump_credit); the auth-clock recovery after a corrected forward jump')
     a=sub.add_parser('journal');a.add_argument('project')
     a.add_argument('--retention',type=float,default=None,
                    help='uncertain-reservation window in seconds for this command (default 7 days)')
@@ -632,6 +662,15 @@ def main():
             write_project(path/'ONBOARDING.md',Path(args.file).read_text(encoding='utf-8-sig'))
         print('Project onboarding installed; back up the project after changes.')
     elif args.command=='service':print(service(root,args.action))
+    elif args.command=='record-store':
+        report=record_store_reset(args.state) if args.reset_high_water else {
+            'state':str(Path(args.state)),'record_store':str(record_store_path(args.state))}
+        print(json.dumps(report,sort_keys=True))
+        if not args.reset_high_water:
+            print('Inspection only: the record store monotone auth floor is unchanged. Use '
+                  '--reset-high-water after correcting a clock that ran ahead, so sessions, worker '
+                  'credentials and reset values issued while the floor was pinned stop being stamped '
+                  'on it; jump_credit is kept either way.',file=__import__('sys').stderr)
     elif args.command=='reconcile-request':
         import fcntl
         from coordination import reconcile_request
