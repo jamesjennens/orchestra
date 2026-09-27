@@ -1,4 +1,5 @@
 """Read-only, fixed-catalog onboarding from the installed kit and project."""
+import re
 from pathlib import Path
 from version import line, report
 
@@ -21,6 +22,8 @@ DOCUMENTS = {
     'decision-template': 'templates/DECISION.md',
 }
 PROJECT_LIMIT = 8000
+ENDPOINT_REFERENCE = re.compile(r'(?:[A-Za-z]:)?[\\/][A-Za-z0-9_.\\/-]*\.py')
+ENDPOINT_REFUSAL = 'serves only'
 
 def write_project(path, text):
     import os
@@ -54,7 +57,34 @@ def read_document(base, relative, limit=64000):
     if not result.strip():raise ValueError('Onboarding document is empty')
     return result
 
-def execute(kit, project_path, project, actor, action, args):
+def probe_endpoints(text, project, kit):
+    """Warn about an onboarding document that names a project-restricted endpoint.
+
+    The installed kit endpoint (``endpoint.py`` beside this module) serves every
+    project. A project-specific wrapper refuses the others, and that refusal is
+    visible in its own source, so this probe reads each Python path the document
+    names and reports the ones carrying the guard. It is deterministic and
+    offline: nothing is executed and no request is sent, so a server with no
+    network still gets the warning. The caller warns and still installs the
+    document; the probe never blocks or changes the write.
+    """
+    generic=(Path(kit).resolve()/'endpoint.py')
+    warnings=[]
+    for reference in dict.fromkeys(ENDPOINT_REFERENCE.findall(text)):
+        try:
+            path=Path(reference)
+            if path.resolve()==generic:continue
+            source=path.read_text(encoding='utf-8-sig')
+        except (OSError,UnicodeError,RuntimeError):
+            continue  # not on this host, or not text: nothing deterministic to probe
+        if ENDPOINT_REFUSAL in source.lower():
+            warnings.append(f'WARNING: the onboarding document for {project} names endpoint {reference}, '
+                            f'which refuses projects other than its own ("{ENDPOINT_REFUSAL}"); workers must '
+                            f'use the kit endpoint {generic} instead. The document was still installed; '
+                            f'correct the endpoint and reinstall it.')
+    return warnings
+
+def execute(kit, project_path, project, actor, action, args, endpoint=None):
     if not isinstance(args, list) or any(not isinstance(a, str) for a in args):
         raise ValueError('Expected argument list')
     catalog = '\n'.join('  docs '+key for key in ['project', *DOCUMENTS])
@@ -69,7 +99,9 @@ def execute(kit, project_path, project, actor, action, args):
     entry = read_document(project_path, 'ONBOARDING.md', PROJECT_LIMIT)
     start = read_document(kit, DOCUMENTS['start'], 8000)
     metadata = report(kit)
+    in_use = Path(endpoint).resolve() if endpoint is not None else Path(kit).resolve()/'endpoint.py'
     return (f'# Orchestra onboarding\n\nProject: {project}\nSession actor: {actor}\n'
+            f'Endpoint in use: {in_use}\n'
             f'{line(metadata)}\n\n'
             + start+'\n\n# Project entry point\n\n'+entry
             +'\n\n# Supporting documents\n\n'+catalog+'\n')
