@@ -86,6 +86,13 @@ Round 7 (revision 13, kittrial-5bb.42 rev2) closes the two review items on that 
 30. ``RecordStoreOperatorResetCase`` -> the record store's pinned monotone floor has an
                                        operator reset (``admin.py record-store
                                        --reset-high-water``) that keeps ``jump_credit``
+
+Round 8 (revision 14, kittrial-5bb.45) closes the operator-CLI finding on that revision:
+
+31. ``RecordStoreMissingPathCase`` -> ``admin.py record-store`` refuses a missing state
+                                       document or record store instead of fabricating an
+                                       empty sidecar and reporting success, creates nothing,
+                                       and its inspection path reports the clock state
 """
 import argparse
 import http.client
@@ -3925,10 +3932,14 @@ class AuthExpiryMonotonicClockCase(unittest.TestCase):
 def pinned_record_store(tmp):
     """A record store whose ``high_water`` is 40 d ahead with 40 d of jump credit.
 
+    Writes the service state document too: the operator command requires both it and the
+    sidecar to exist before it will touch either (revision 14).
+
     Returns ``(state_path, record_store_path, real, clock)``.
     """
     state = tmp / 'http-state.json'
     path = tmp / ('http-state.json' + RECORD_STORE_SUFFIX)
+    state.write_text('{}', encoding='utf-8')
     real = time.time()
     clock = [real]
     store = RecordStore(path, clock=lambda: clock[0])
@@ -3977,18 +3988,94 @@ class RecordStoreOperatorCommandCase(unittest.TestCase):
         self.assertEqual(0, completed.returncode, completed.stderr)
         report = json.loads(completed.stdout)
         self.assertAlmostEqual(time.time(), report['high_water'], delta=30)
+        self.assertIn('clock_persisted', report['stats'])
         after = RecordStore(path).stats()['clock_persisted']
         self.assertAlmostEqual(40 * 86400, after['jump_credit'], delta=5)
         self.assertFalse(after['suspect'])
-        # Inspection without the flag changes nothing.
+        # Inspection without the flag changes nothing, and reports the clock state.
         before = after['high_water']
         completed = subprocess.run(
             [sys.executable, str(ROOT / 'admin.py'), '--root', str(root),
              'record-store', '--state', str(state)],
             text=True, encoding='utf-8', capture_output=True, timeout=60)
         self.assertEqual(0, completed.returncode, completed.stderr)
+        inspected_report = json.loads(completed.stdout)
+        self.assertIn('clock_persisted', inspected_report['stats'])
+        self.assertEqual(str(path), inspected_report['record_store'])
         inspected = RecordStore(path, clock=lambda: clock[0]).stats()['clock_persisted']
         self.assertAlmostEqual(before, inspected['high_water'], delta=5)
+
+    def test_a_typo_state_path_is_refused_and_creates_nothing(self):
+        # The reviewer's probe: this used to create <typo>/http-state.json.records.sqlite3
+        # and exit 0 while the real store stayed pinned.
+        tmp = unique_dir('recbad14-')
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        root = tmp / 'root'
+        root.mkdir()
+        typo = tmp / 'nope' / 'http-state.json'
+        completed = subprocess.run(
+            [sys.executable, str(ROOT / 'admin.py'), '--root', str(root),
+             'record-store', '--state', str(typo), '--reset-high-water'],
+            text=True, encoding='utf-8', capture_output=True, timeout=60)
+        self.assertNotEqual(0, completed.returncode, completed.stdout)
+        self.assertIn('refused', completed.stderr)
+        self.assertIn(str(typo), completed.stderr)
+        self.assertFalse((tmp / 'nope').exists())
+        self.assertFalse(typo.with_name(typo.name + RECORD_STORE_SUFFIX).exists())
+
+
+class RecordStoreMissingPathCase(unittest.TestCase):
+    """31. Revision 14: a missing state document or record store is refused, never created."""
+
+    def test_a_typo_state_path_is_refused_without_creating_a_directory(self):
+        tmp = unique_dir('recmiss14-')
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        typo = tmp / 'nope' / 'http-state.json'
+        with self.assertRaises(ValueError) as refusal:
+            admin.record_store_reset(typo)
+        self.assertIn(str(typo), str(refusal.exception))
+        self.assertFalse((tmp / 'nope').exists())
+        self.assertFalse(typo.with_name(typo.name + RECORD_STORE_SUFFIX).exists())
+
+    def test_an_existing_state_document_without_a_record_store_is_refused(self):
+        tmp = unique_dir('recmiss14-')
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        state = tmp / 'http-state.json'
+        state.write_text('{}', encoding='utf-8')
+        with self.assertRaises(ValueError):
+            admin.record_store_stats(state)
+        with self.assertRaises(ValueError):
+            admin.record_store_reset(state)
+        self.assertFalse(state.with_name(state.name + RECORD_STORE_SUFFIX).exists())
+
+    def test_a_state_document_that_is_not_a_record_store_is_refused(self):
+        tmp = unique_dir('recmiss14-')
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        state = tmp / 'http-state.json'
+        state.write_text('{}', encoding='utf-8')
+        path = state.with_name(state.name + RECORD_STORE_SUFFIX)
+        for content in (b'', b'not a record store'):
+            path.write_bytes(content)
+            with self.assertRaises(ValueError):
+                admin.record_store_stats(state)
+            self.assertEqual(content, path.read_bytes())   # never filled in
+
+    def test_inspection_reports_stats_and_does_not_move_the_clock(self):
+        tmp = unique_dir('recstats14-')
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        state, path, real, clock = pinned_record_store(tmp)
+        clock[0] = real
+        before = RecordStore(path, clock=lambda: clock[0]).stats()['clock_persisted']
+        report = admin.record_store_stats(state)
+        self.assertEqual({'state', 'record_store', 'stats'}, set(report))
+        self.assertEqual(str(state), report['state'])
+        self.assertEqual(str(path), report['record_store'])
+        self.assertAlmostEqual(before['high_water'],
+                               report['stats']['clock_persisted']['high_water'], delta=5)
+        after = RecordStore(path, clock=lambda: clock[0]).stats()['clock_persisted']
+        self.assertAlmostEqual(before['high_water'], after['high_water'], delta=5)
+        self.assertAlmostEqual(40 * 86400, after['jump_credit'], delta=5)
+        self.assertTrue(after['suspect'])
 
 
 if __name__ == '__main__':

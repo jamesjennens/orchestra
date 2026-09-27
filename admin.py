@@ -578,6 +578,46 @@ def record_store_path(state):
     state=Path(state)
     return state.with_name(state.name+RECORD_STORE_SUFFIX)
 
+def existing_record_store(state):
+    """Open the EXISTING record store beside the EXISTING service state document.
+
+    ``http_auth.RecordStore`` is the running service's write path: its constructor runs
+    ``_ensure()``, which creates the parent directory and the SQLite file. That is exactly
+    the wrong failure mode for an operator command - a typo in ``--state`` fabricates an
+    empty store beside it, reports a successful reset (rc=0) and leaves the real store
+    pinned, so the operator sees success and no effect. This guard therefore requires the
+    state document AND its sidecar to already exist, and proves the sidecar really is a
+    record store by opening it read-only (``mode=ro`` cannot create a missing file) before
+    the service's own open path runs. Nothing is created here; ``ValueError`` names the
+    missing path.
+    """
+    import sqlite3
+    from http_auth import RecordStore
+    document=Path(state)
+    path=record_store_path(document)
+    if not document.is_file():
+        raise ValueError('No HTTP service state document at '+str(document)+': refusing to '
+                         'create one. Point --state at the running service\'s real --state path.')
+    if not path.is_file():
+        raise ValueError('No record store at '+str(path)+': refusing to create one. The store '
+                         'is created by the HTTP service itself; check --state.')
+    try:
+        probe=sqlite3.connect(path.resolve().as_uri()+'?mode=ro',uri=True)
+    except sqlite3.Error as error:
+        raise ValueError('Cannot read the record store at '+str(path)+' (not a SQLite store): '
+                         +str(error))
+    try:
+        tables={row[0] for row in probe.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+    except sqlite3.Error as error:
+        raise ValueError('Cannot read the record store at '+str(path)+': '+str(error))
+    finally:
+        probe.close()
+    if 'records' not in tables:
+        raise ValueError('The file at '+str(path)+' is not an HTTP record store (no records '
+                         'table): refusing to create one over it.')
+    return RecordStore(path),document,path
+
 def record_store_reset(state):
     """Operator recovery for the service record store's monotone auth clock.
 
@@ -588,13 +628,22 @@ def record_store_reset(state):
     (``http_auth.RecordStore.reset_high_water``) and keeps ``jump_credit``, so records
     already ageing on the confirmed timeline keep their real expiry. The matching
     operation-journal command is ``admin.py journal <PROJECT> --reset-high-water``.
+    The state document and its record store must already exist; a missing path is
+    refused instead of being created (``existing_record_store``).
     """
-    from http_auth import RecordStore
-    store=RecordStore(record_store_path(state))
-    report={'state':str(Path(state)),'record_store':str(store.path),
+    store,document,path=existing_record_store(state)
+    report={'state':str(document),'record_store':str(path),
             'high_water':store.reset_high_water()}
     report['stats']=store.stats()
     return report
+
+def record_store_stats(state):
+    """Inspection: the EXISTING store's clock state and record counts, no clock change.
+
+    The same guard as the reset path, so an inspection cannot create a store either.
+    """
+    store,document,path=existing_record_store(state)
+    return {'state':str(document),'record_store':str(path),'stats':store.stats()}
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('--root',required=True)
@@ -632,7 +681,9 @@ def main():
     a=sub.add_parser('service');a.add_argument('action',choices=['start','stop','restart','status'])
     a=sub.add_parser('record-store')
     a.add_argument('--state',required=True,
-                   help='the HTTP service state document (its --state); the record store is <state>.records.sqlite3')
+                   help='the HTTP service state document (its --state); the record store is '
+                        '<state>.records.sqlite3. Both must already exist: a missing path is '
+                        'refused, never created')
     a.add_argument('--reset-high-water',action='store_true',dest='reset_high_water',
                    help='set the record store high-water mark to the current clock and clear suspicion '
                         '(keeps jump_credit); the auth-clock recovery after a corrected forward jump')
@@ -663,8 +714,13 @@ def main():
         print('Project onboarding installed; back up the project after changes.')
     elif args.command=='service':print(service(root,args.action))
     elif args.command=='record-store':
-        report=record_store_reset(args.state) if args.reset_high_water else {
-            'state':str(Path(args.state)),'record_store':str(record_store_path(args.state))}
+        try:
+            report=record_store_reset(args.state) if args.reset_high_water \
+                else record_store_stats(args.state)
+        except ValueError as error:
+            # A typo in --state must never fabricate an empty store beside the real one and
+            # report success; refuse before anything is opened or created.
+            raise SystemExit('record-store refused: '+str(error))
         print(json.dumps(report,sort_keys=True))
         if not args.reset_high_water:
             print('Inspection only: the record store monotone auth floor is unchanged. Use '
