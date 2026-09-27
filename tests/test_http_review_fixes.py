@@ -64,6 +64,15 @@ HTTP result map, with a class per round-5 request:
 22. ``JournalBackupCase``            -> the journal is captured by a consistent sqlite
                                        snapshot under the backup lock and restored by
                                        ``restore-new``
+
+Round 6 (revision 12, kittrial-5bb.42) adds the monotone auth-expiry case class:
+
+28. ``AuthExpiryMonotonicClockCase`` -> every auth expiry (session idle and absolute,
+                                       worker credentials, reset values) is evaluated on
+                                       ``max(now, persisted high_water)``: a forward jump
+                                       expires early (fail closed) and a following
+                                       backward step never revives an expired item,
+                                       while normal expiry is unchanged
 """
 import argparse
 import http.client
@@ -84,7 +93,7 @@ sys.path.insert(0, str(ROOT))
 import http_authority
 import http_service
 from http_auth import (IDEMPOTENCY_TTL_SECONDS, RESULT_RETENTION_SECONDS, HttpError,
-                       Service, Store, now_iso)
+                       Service, Store, now_iso, token_hash)
 from http_authority import (AuthorityConfig, JOURNAL_COMMITTED_RETENTION_SECONDS,
                             JOURNAL_MAX_SKEW_SECONDS, JOURNAL_RETENTION_SECONDS,
                             JOURNAL_TOMBSTONE_LIMIT, LEGACY_JOURNAL_FILENAME,
@@ -3577,6 +3586,215 @@ class RecordStoreConfirmedTimelineCase(unittest.TestCase):
         labelled = [credential for credential in service.state['credentials'].values()
                     if credential.get('label') == 'ci worker']
         self.assertEqual(1, len(labelled))
+
+
+class AuthExpiryMonotonicClockCase(unittest.TestCase):
+    """28. Revision 12: auth expiry uses a monotone clock (kittrial-5bb.42).
+
+    Base behaviour (``ea07999`` and earlier): a forward jump of more than the item's TTL
+    makes the session, worker credential and reset value 401, and stepping the raw clock
+    back to a moment before their expiry makes all three work again. Every expiry is now
+    evaluated against ``max(raw now, RecordStore high_water)``, so the decision clock
+    never goes backwards: the items stay refused, while a forward step still fails closed
+    (early expiry, re-issue) and normal expiry is unchanged.
+    """
+
+    DAY = 86400
+    USER_PASSWORD = 'alex-password-1'
+
+    def setUp(self):
+        self.tmp = unique_dir('authmono12-')
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.clock = [time.time()]
+        self.store = Store(self.tmp / 'state.json', clock=lambda: self.clock[0])
+        Service.bootstrap_superuser(self.store, ADMIN, ADMIN_PASSWORD)
+        self.service = Service(self.store)
+        self.admin = self.service.authenticate(
+            self.service.login(ADMIN, ADMIN_PASSWORD)['session_token'])
+        self.project = self.service.create_project(self.admin, 'Monotone')['id']
+
+    # -- helpers ---------------------------------------------------------------
+    def make_user(self, username='alex'):
+        created = self.service.create_user(self.admin, username)
+        self.service.change_password(self.admin, created['id'], None, self.USER_PASSWORD)
+        token = self.service.login(username, self.USER_PASSWORD)['session_token']
+        return created, token
+
+    def fresh_admin(self):
+        return self.service.authenticate(
+            self.service.login(ADMIN, ADMIN_PASSWORD)['session_token'])
+
+    def jump_forward(self):
+        real = self.clock[0]
+        self.clock[0] = real + 40 * self.DAY
+        return real
+
+    # -- the reported defect: a backward step ----------------------------------
+    def test_a_backward_step_does_not_revive_an_expired_session(self):
+        created, token = self.make_user()
+        self.assertEqual(created['id'], self.service.authenticate(token).user_id)
+        real = self.jump_forward()
+        with self.assertRaises(HttpError) as caught:
+            self.service.authenticate(token)
+        self.assertEqual(401, caught.exception.status)
+        # The host booted before NTP: the raw clock returns to a moment the session was
+        # live, but the decision clock does not go back with it.
+        self.clock[0] = real + 600
+        with self.assertRaises(HttpError) as caught:
+            self.service.authenticate(token)
+        self.assertEqual(401, caught.exception.status)
+        # The step is durable even though every decision above was a rejection, so a
+        # restart cannot lose the floor.
+        self.assertEqual(real + 40 * self.DAY,
+                         self.store.records.stats()['clock_persisted']['high_water'])
+
+    def test_a_backward_step_does_not_revive_an_expired_credential(self):
+        secret = self.service.issue_credential(self.admin, self.project)['secret']
+        self.assertEqual(self.admin.user_id, self.service.authenticate(secret).user_id)
+        real = self.jump_forward()
+        with self.assertRaises(HttpError) as caught:
+            self.service.authenticate(secret)
+        self.assertEqual(401, caught.exception.status)
+        self.clock[0] = real + 600
+        with self.assertRaises(HttpError) as caught:
+            self.service.authenticate(secret)
+        self.assertEqual(401, caught.exception.status)
+        # A forward jump still fails closed: a credential re-issued after it works at
+        # once, and the correction does not revive the old one.
+        fresh = self.service.issue_credential(self.fresh_admin(), self.project)['secret']
+        self.assertEqual(self.admin.user_id, self.service.authenticate(fresh).user_id)
+
+    def test_a_backward_step_does_not_revive_an_expired_reset_value(self):
+        created, _ = self.make_user()
+        issued = self.service.issue_reset(self.admin, created['id'])
+        digest = token_hash(issued['reset_value'])
+        real = self.jump_forward()
+        with self.assertRaises(HttpError) as caught:
+            self.service.redeem_reset(created['id'], issued['reset_value'],
+                                      'another-password-9')
+        self.assertEqual(401, caught.exception.status)
+        self.clock[0] = real + 600
+        with self.assertRaises(HttpError) as caught:
+            self.service.redeem_reset(created['id'], issued['reset_value'],
+                                      'another-password-9')
+        self.assertEqual(401, caught.exception.status)
+        # A rejected attempt never spends the value, so the refusal was the clock.
+        self.assertFalse(self.service.state['reset_tokens'][digest]['used'])
+
+    def test_a_backward_step_does_not_revive_an_absolute_session_expiry(self):
+        # Idle is long and absolute is short, so only the absolute deadline has passed
+        # and the revival cannot be explained by the idle refresh.
+        service = Service(self.store, session_idle=10 * self.DAY, session_absolute=3600)
+        created = self.service.create_user(self.admin, 'alex')
+        self.service.change_password(self.admin, created['id'], None, self.USER_PASSWORD)
+        token = service.login('alex', self.USER_PASSWORD)['session_token']
+        real = self.clock[0]
+        self.clock[0] = real + 2 * 3600
+        with self.assertRaises(HttpError):
+            service.authenticate(token)
+        self.clock[0] = real + 1800
+        with self.assertRaises(HttpError) as caught:
+            service.authenticate(token)
+        self.assertEqual(401, caught.exception.status)
+
+    # -- normal expiry is unchanged --------------------------------------------
+    def test_normal_session_idle_expiry_is_unchanged(self):
+        _, token = self.make_user()
+        self.clock[0] += self.service.session_idle + 1
+        with self.assertRaises(HttpError) as caught:
+            self.service.authenticate(token)
+        self.assertEqual(401, caught.exception.status)
+
+    def test_normal_credential_expiry_is_unchanged(self):
+        secret = self.service.issue_credential(self.admin, self.project)['secret']
+        self.clock[0] += self.service.credential_ttl + 1
+        with self.assertRaises(HttpError) as caught:
+            self.service.authenticate(secret)
+        self.assertEqual(401, caught.exception.status)
+
+    def test_normal_reset_expiry_is_unchanged(self):
+        created, _ = self.make_user()
+        issued = self.service.issue_reset(self.admin, created['id'])
+        self.clock[0] += self.service.reset_ttl + 1
+        with self.assertRaises(HttpError) as caught:
+            self.service.redeem_reset(created['id'], issued['reset_value'],
+                                      'another-password-9')
+        self.assertEqual(401, caught.exception.status)
+
+    def test_expiry_just_inside_every_window_still_works(self):
+        created, token = self.make_user()
+        issued = self.service.issue_reset(self.admin, created['id'])
+        secret = self.service.issue_credential(self.admin, self.project)['secret']
+        self.clock[0] += self.service.session_idle - 1
+        self.assertEqual(created['id'], self.service.authenticate(token).user_id)
+        self.assertEqual(self.admin.user_id, self.service.authenticate(secret).user_id)
+        self.service.redeem_reset(created['id'], issued['reset_value'],
+                                  'another-password-9')
+
+    # -- items issued after a corrected jump -----------------------------------
+    def test_an_item_issued_after_a_corrected_jump_is_not_dead_on_arrival(self):
+        created, _ = self.make_user()
+        real = self.jump_forward()
+        # Any observation pins the monotone clock, including a rejected one.
+        with self.assertRaises(HttpError):
+            self.service.authenticate('not-a-real-token')
+        issued = self.service.issue_reset(self.fresh_admin(), created['id'])
+        # The raw host is corrected behind the jump while high_water stays ahead: an item
+        # stamped on the monotone clock is still usable and expires on that clock.
+        self.clock[0] = real + 600
+        self.service.redeem_reset(created['id'], issued['reset_value'],
+                                  'another-password-9')
+        self.assertTrue(self.service.login('alex', 'another-password-9')['session_token'])
+
+    def test_the_reviewers_credential_backward_step_over_http_stays_refused(self):
+        # The reviewer's probe-auth-backward-step through the real HTTP service: issue a
+        # credential, jump +40 d (401), step back (base: 200).
+        import urllib.error
+        import urllib.request
+        clock = self.clock
+        state = self.tmp / 'http-backward.json'
+        service = Service(Store(str(state), clock=lambda: clock[0]))
+        Service.bootstrap_superuser(service.store, ADMIN, ADMIN_PASSWORD)
+
+        class Args:
+            backend = 'inprocess'
+
+        httpd = create_server(service, build_backend(service, Args()), host='127.0.0.1',
+                              port=0)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        base = 'http://127.0.0.1:%d' % httpd.server_address[1]
+
+        def call(method, path, body=None, token=None):
+            headers = {'Content-Type': 'application/json'}
+            if token:
+                headers['Authorization'] = 'Bearer ' + token
+            request = urllib.request.Request(
+                base + path, data=json.dumps(body).encode() if body is not None else None,
+                method=method, headers=headers)
+            try:
+                with urllib.request.urlopen(request) as reply:
+                    return reply.status, json.loads(reply.read() or b'null')
+            except urllib.error.HTTPError as error:
+                return error.code, json.loads(error.read() or b'null')
+
+        status, body = call('POST', '/v1/sessions',
+                            {'username': ADMIN, 'password': ADMIN_PASSWORD})
+        self.assertEqual(201, status, body)
+        session = body['session']['token']
+        self.assertEqual(201, call('POST', '/v1/projects',
+                                   {'name': 'probe', 'project_id': 'p1'}, session)[0])
+        status, issued = call('POST', '/v1/projects/p1/worker-credentials',
+                              {'label': 'probe', 'scopes': ['read']}, session)
+        self.assertEqual(201, status, issued)
+        secret = issued['credential']['secret']
+        self.assertEqual(200, call('GET', '/v1/projects/p1', token=secret)[0])
+        real = clock[0]
+        clock[0] = real + 40 * self.DAY
+        self.assertEqual(401, call('GET', '/v1/projects/p1', token=secret)[0])
+        clock[0] = real + 600
+        self.assertEqual(401, call('GET', '/v1/projects/p1', token=secret)[0])
 
 
 if __name__ == '__main__':

@@ -571,9 +571,11 @@ class EndpointBackend:
         authority = None
         if capability is not None:
             # Principal descriptor only: the store/lock locations are endpoint launch
-            # configuration (``self.authority_store``), not request data.
+            # configuration (``self.authority_store``), not request data. The decision
+            # time is the service's monotone expiry clock, so the canonical endpoint
+            # re-check cannot revive an item expired by a backward step.
             authority = authority_request(principal, project_id, capability,
-                                          now=self.service._now())
+                                          now=self.service._expiry_now())
         try:
             result = self._run(action, project, payload.get('actor') or self._actor(principal),
                                args, attachments, operation_id=operation_id,

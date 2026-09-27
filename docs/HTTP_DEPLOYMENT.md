@@ -212,14 +212,36 @@ Every place that ages or deletes by time, and what an accepted clock jump does t
 | Journal tombstones (`http_authority`) | confirmed timeline (`aged_from`, `jump_credit`) | No (within the retry contract) | n/a |
 | Journal receipt reclaim, uncertain expiry | raw, only when not suspect | No: worst case `rc=2` refusal | n/a |
 | HTTP idempotency records and committed results (`RecordStore`) | confirmed timeline (`expires_confirmed`) | No: a retry replays or is refused | n/a |
-| Sessions (idle and absolute), worker credentials, reset tokens | raw absolute expiry | No | A forward jump expires existing ones **early** (safe). Anything issued or refreshed during a forward jump that is later corrected lives **late**, by the jump length; a clock set backwards extends every live one by the step |
+| Sessions (idle and absolute), worker credentials, reset tokens (`http_auth`) | monotone: `max(raw now, RecordStore high_water)` | No | A forward jump expires existing ones **early** (safe; log in again or re-issue). A backward step, including one that corrects a forward jump, can never revive an item that has already expired: `high_water` never decreases and every auth observation persists it, even a rejection. Items issued during a jump are stamped on the same clock, so a re-issued item works while the raw host catches up |
 | Login throttle window (in memory) | raw | No | A forward jump clears it early (a few extra attempts); a backward step keeps it longer (safe) |
 | Audit log (`AUDIT_LIMIT`) | count-bounded; timestamps only | No | none |
 
-After correcting a clock that ran **ahead**, revoke the sessions, worker credentials and
-reset tokens issued during the error window (they carry `created_at` on the wrong
-clock), then run `--reset-high-water`. After correcting a clock that ran **behind**,
-nothing is extended.
+**Auth expiry uses a monotone clock.** Every auth decision (login, session/credential
+authentication, idle refresh, credential issue, reset issue/redeem, capability checks and
+the canonical endpoint's authority descriptor) compares against
+`max(now, high_water)` from the service's record store. `high_water` is the largest raw
+clock any observation has seen; it never decreases, and the observation is persisted even
+when the decision rejects the request, so a restart cannot lose the floor. `trusted_now`
+is deliberately **not** used for auth expiry: while the clock is suspect it is held near
+the anchor so a record inside its real window can still replay, which would keep an
+expired auth item alive.
+
+Because the decision clock is pinned at `high_water` until the raw clock passes it, a
+forward jump that is later corrected leaves auth items **issued** during the pinned period
+usable on that pinned timeline until the raw host catches up. This is fail-closed for
+items that existed before the jump (they stay expired) and keeps re-issue possible, but it
+is a residual retention effect to know about. After correcting a clock that ran ahead,
+still revoke the sessions, worker credentials and reset tokens issued during the error
+window, then run `python3 admin.py --root <RUNTIME_ROOT> journal <PROJECT>
+--reset-high-water` for each project. That command re-arms the **operation journal** only:
+the service record store's own floor is not yet exposed through an operator command
+(`RecordStore.reset_high_water` exists in code), so it clears itself once the raw clock
+passes the jump.
+
+After correcting a clock that ran **behind**, nothing is extended. The login throttle
+window (in memory) is a rate limit, not an item expiry, so it stays on the raw clock: a
+backward step only lengthens it, and a forward step clears it early while also expiring
+every session and credential.
 
 ## 8. Backup, restore and rollback
 
