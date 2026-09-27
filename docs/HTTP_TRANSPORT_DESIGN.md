@@ -146,6 +146,54 @@ cannot impersonate another user, authorize a role change, or escape the
 credential's project/scope. Run IDs remain distinct from stable human
 ownership and are not leases.
 
+### Personal agents (kittrial-5bb.22)
+
+An **agent** is a personal identity owned by exactly one user ("Kestrel, agent of
+Priya"), not a user account and not a project role. It exists so a person can run
+a local assistant (for example GitHub Copilot in VS Code) in one folder of their
+own machine and pull work over the API without SSH or shared directories.
+
+- **Registry.** `state['agents'][agent_id]` holds `id`, `name`, `owner` (user id),
+  `tool` (free text), `working_directory`, optional `machine` and `notes`,
+  `last_seen_at`, `enabled` and the granted `projects`.
+  `working_directory` is a free-text hint for the owner's own machine; the server
+  stores it, never reads or resolves it, and only the owner or a superuser
+  receives it in a response. For anyone else the field is omitted and
+  `working_directory_hidden` is set instead.
+- **Credential.** Creating an agent returns a one-time credential built from the
+  same record, token-hash, expiry, revocation and idempotent-replay machinery as
+  the project worker credential, extended with `agent_id` and a project grant.
+  The secret is shown once; `.orchestra/agent.json` holds the server URL, the
+  agent id and the project ids and **no secret**. The secret belongs in an
+  environment variable, VS Code secret storage or the OS credential store, and
+  `.orchestra/` is kept out of Git. The setup snippet and the copyable resume
+  prompt never contain the secret.
+- **Authority.** Project access is granted like membership but is always capped at
+  the owner's **current** role by the same `http_authority.decide` /
+  `credential_capabilities` rule used by the .19 worker credentials, and the grant
+  list itself is read live, so narrowing it takes effect on the next request. A
+  disabled agent, a revoked credential, a disabled owner and a removed owner
+  membership all stop the agent on its next request (`401`/`403`/`404`). An agent
+  credential can never manage agents, accounts or projects.
+- **Attention.** Attention and the next-action list are computed at **read time**
+  from one bounded task page per granted project. `GET /v1/agents/me` returns the
+  agent record; `GET /v1/agents/me/next` returns the stable JSON
+  `attention`/`next_actions` contract with task/brief (task-detail) links,
+  prioritised as changes-requested, blocked, claimable task, then awaiting review.
+  There is no scheduler, background job, poller or timer: the owner resumes the
+  agent manually and re-reads the route.
+- **Owner API.** Session routes `POST /v1/agents`, `GET /v1/agents`,
+  `GET /v1/agents/{id}`, `PATCH /v1/agents/{id}`,
+  `POST /v1/agents/{id}/disable|enable`,
+  `POST /v1/agents/{id}/credentials` and
+  `POST /v1/agents/{id}/credentials/{cid}/revoke` return the registry plus
+  per-agent attention, the working directory and the resume prompt for the owner
+  (and for a superuser). Ordinary users see only their own agents, so the path
+  cannot leak.
+- **Handoff.** This service owns the JSON contract only. The browser screens
+  ("Your agents" on My work, directory display, copyable resume prompt) are
+  kittrial-5bb.20 and consume these responses unchanged.
+
 ### Future external authentication
 
 Keep a provider-neutral identity binding table: local user ID, provider name,
@@ -299,6 +347,8 @@ call; it does not authorize direct database access. Protected mutation rows requ
 | `POST /v1/projects`, `GET /v1/projects`, `POST /v1/projects/{id}/archive` | Authenticated user; create default enabled; list members only; archive owner/superuser | Create validates unique metadata; archive requires active owner or superuser and confirmation | Create/archive key scoped to principal + project (when present) + route; `201/200`, `403/409` | Project create/list and archive state transition |
 | `PUT /v1/projects/{id}/members/{user}`, `DELETE .../members/{user}` | Owner or superuser | Assigner is current owner or superuser; only superuser may assign/remove owner role under default policy; cannot remove final active owner | Key scoped to principal + project + operation route + target; `200/204`, `403/409` | Membership add/remove and role transition |
 | `POST /v1/projects/{id}/worker-credentials`, `POST .../worker-credentials/{credential}/revoke` | Owner or superuser issues; owner of credential may revoke own | Project membership current; requested scope subset of issuer scope | Issue key scoped to principal + project + route; request hash detects payload conflicts; `201` secret once, exact uncertain retry `200` metadata only; revoke key scoped to principal + project + credential, `204`; `403/409` | Credential registry and revocation |
+| `POST /v1/agents`, `GET /v1/agents`, `GET /v1/agents/{agent}`, `PATCH /v1/agents/{agent}`, `POST /v1/agents/{agent}/disable`, `POST /v1/agents/{agent}/enable`, `POST /v1/agents/{agent}/credentials`, `POST .../credentials/{credential}/revoke` | Authenticated session; the owning user or a superuser per agent | Agent name/fields bounded; a project grant must name a project the owner can open; a disabled agent cannot receive a credential | Personal routes are session-only (an agent or worker credential gets `403`); create/issue key scoped to principal + route; `201` secret once or `200` metadata-only exact retry; `403/404/409`; `working_directory` is returned only to the owner/superuser | Personal agent registry and credential records (no canonical mapping) |
+| `GET /v1/agents/me`, `GET /v1/agents/me/next` | Agent credential only | The credential is live, the agent is enabled and the owner is a current member | Read-only, no idempotency key; stable JSON attention/next-action computed at read time; `401/403/404` | Live registry plus bounded canonical task reads, capped by the owner's current role |
 | `POST /v1/projects/{id}/jobs`, `PATCH /v1/projects/{id}/jobs/{job}`, `POST /v1/projects/{id}/tasks`, `PATCH /v1/projects/{id}/tasks/{task}` | Owner/contributor for create/update according to project policy; viewer denied | Membership current; update carries resource version; task parent/job must be in same project | Key scoped to principal + project + route + client operation ID; `201/200`, `403/409` | Canonical job/task create/update |
 | `GET /v1/projects/{id}/tasks`, `GET .../tasks/{task}` | Project member; viewer may read | Membership checked before query and cursor validation | Opaque cursor bound to principal/project/query; `200`, `401/403/404` | Canonical task/list/show and history views |
 | `POST /v1/projects/{id}/tasks/{task}/claim` | Contributor/owner or bound worker credential | Task open/claimable and actor binding matches credential | Key scoped to principal + project + task + route; `200`, `403/409` | Existing atomic claim operation |
@@ -718,6 +768,12 @@ Tests should be disposable and synthetic:
   cookies, cache controls, body limits and request-ID propagation.
 - Browser acceptance tests, in the later UI task, for create/join, membership,
   task/review/checkpoint flows, keyboard navigation and no data leakage.
+- Personal-agent contract tests (implemented in `tests/test_http_agents.py`) for
+  one-time credential setup with a secretless `.orchestra/agent.json`, the
+  `me`/`next` REST contract, read-time attention after a changes-requested
+  review, working-directory privacy, role/scope caps, cross-project denial,
+  revocation, agent disable, owner disable and owner-membership removal, and the
+  absence of any scheduler or poller.
 - Operational review of secret provisioning, log redaction, restore cutover,
   rollback and incident credential rotation. No live office service is a
   valid test fixture.

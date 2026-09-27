@@ -191,6 +191,32 @@ idempotency record's (`IDEMPOTENCY_TTL_SECONDS`, 24 h). That record expires on t
 confirmed timeline (see the record store in section 8), so a clock jump never shortens
 it; a retry after the window is treated as a new request.
 
+### Personal agents
+
+An agent is a personal identity owned by one user; it pulls work over the same REST
+API instead of reading HTML. Create one with `POST /v1/agents` (session authority),
+giving `name`, an optional free-text `working_directory` hint for the owner's own
+machine, `tool`, `machine`, `notes` and the `projects` to grant. The response carries
+the agent record, the setup payload and the credential secret **once**; an exact
+idempotent retry returns `200` with `secret_available:false` and never re-delivers it.
+
+The setup payload writes `.orchestra/agent.json` with the server URL, the agent id and
+the project ids and no secret. The secret goes in an environment variable, VS Code
+secret storage or the OS credential store, and `.orchestra/` stays out of Git. The
+agent then calls `GET /v1/agents/me` and `GET /v1/agents/me/next` with
+`Authorization: Bearer $ORCHESTRA_AGENT_SECRET`; every other project route works as
+before, capped at the owner's live role and the agent's granted projects. Set
+`--public-url https://<HOSTNAME>` so the setup and resume snippets carry the real
+address. Attention is computed at read time only: the service runs no scheduled job,
+poller or timer, and the owner resumes the agent manually.
+
+Revoke an agent credential, disable the agent, disable the owner or remove the
+owner's project membership and the agent stops on its next request. The
+`working_directory` hint is returned only to the owner or a superuser. The browser
+screens that display the directory and the copyable resume prompt are
+kittrial-5bb.20 and consume these JSON responses; they are not part of this service
+build.
+
 ## 7. Secrets, rotation and redaction
 
 - Password verifiers are stored with memory-hard `scrypt`; plaintext passwords,
@@ -579,6 +605,14 @@ the pilot phase, not part of this service.
   stream ships with `kittrial-5bb.13`; the service never substitutes its own store
   for canonical feedback. Attachment uploads are validated and bounded but only
   their metadata and digest are retained, so **UI readiness is not claimed**.
+- The personal-agent registry, one-time agent credential and the agent REST
+  contract (`/v1/agents`, `/v1/agents/me`, `/v1/agents/me/next`) are implemented and
+  tested. The **browser screens** that render "Your agents", the working directory
+  and the copyable resume prompt are kittrial-5bb.20 and are not built here; this
+  build exposes only the JSON contract they will consume. `blocked` attention for an
+  agent is derived from the in-process canonical checkpoint view, which the
+  canonical endpoint binding does not mirror, so over `--backend endpoint` that one
+  signal is absent rather than wrong.
 - Administrative audit coverage is partial: login outcomes, authorization
   denials and every successful idempotent mutation are recorded; a per-field
   before/after administrative trail is not implemented.
