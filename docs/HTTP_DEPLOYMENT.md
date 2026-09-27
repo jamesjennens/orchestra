@@ -253,7 +253,8 @@ sudo -u <SERVICE_USER> python3 admin.py --root <RUNTIME_ROOT> \
 That sets `high_water` to the corrected clock and clears suspicion while keeping
 `jump_credit`, so sessions, worker credentials and reset values issued while the floor was
 pinned stop being stamped on it (the same command without `--reset-high-water` only
-reports). **Revoking items issued during the error window is not enough**: it does not
+reports, and prints the record store's clock state — `stats()`, the same shape as
+`journal`). **Revoking items issued during the error window is not enough**: it does not
 cover items issued *after* the correction (a new login, worker credential or reset), which
 are the ones stamped on the pinned floor and stretched by the jump - the clock must be
 reset. For completeness also revoke the sessions, worker credentials and reset tokens
@@ -261,10 +262,36 @@ issued *during* the error window, and run the operation-journal equivalent
 `python3 admin.py --root <RUNTIME_ROOT> journal <PROJECT> --reset-high-water` for each
 project.
 
-After correcting a clock that ran **behind**, nothing is extended. The login throttle
-window (in memory) is a rate limit, not an item expiry, so it stays on the raw clock: a
-backward step only lengthens it, and a forward step clears it early while also expiring
-every session and credential.
+`record-store` requires both the state document and its record store to exist and opens
+them without creating anything: a mistyped `--state` path is refused with a non-zero exit
+and a message naming the missing path, and it never creates the directory or an empty
+`<state>.records.sqlite3`. (It used to create both and report success, leaving the real
+store pinned.) The record store is created by the HTTP service itself.
+
+A **backward** clock step is not symmetric, and the bound below is what the monotone floor
+can and cannot promise. Because `high_water` never decreases, an item that is still live
+when the host clock steps back by `B` is not revoked — but its remaining lifetime is
+extended by up to `B`. The monotone clock stays frozen at the pre-step floor until the raw
+clock catches up, and the item's raw issue/last-use stamp makes its real age look `B`
+smaller, so both halves of the expiry check move later by the same `B`. Measured on the
+monotone-clock review probe: a 12 h session used every 20 min died at real +18 h after a 6 h
+backward step, i.e. 6 h after its 12 h absolute lifetime. A clock that keeps stepping
+backward — a bad time source, a VM snapshot restore, or an operator correcting in the wrong
+direction — can therefore keep a still-live session, worker credential or reset value alive
+for as long as each step stays ahead of its idle or absolute deadline, and a use during the
+backward window restarts the idle window from an earlier raw stamp. Two things bound the
+exposure: a backward step never *revives* an item that has already expired on either clock,
+and once the raw clock is correct and stable every item expires at its real lifetime. With
+no trustworthy monotonic time source the kit cannot beat that step-sized bound; if the host
+clock is known to be unstable, revoke sessions and worker credentials and re-issue them once
+it is stable. `--reset-high-water` is the remedy for a corrected **forward** jump, not for a
+backward step.
+
+Correcting a clock that ran **behind** (a forward step) extends nothing: it clears the
+login throttle window early and expires sessions and credentials that were already past
+their lifetime. The login throttle window (in memory) is a rate limit, not an item expiry,
+so it stays on the raw clock — a backward step only lengthens it, and a forward step clears
+it early.
 
 **Cost note (accepted at office scale).** Persisting the monotone floor means every auth
 observation that advances `high_water` is a record-store write transaction, and one
@@ -464,7 +491,8 @@ sudo -u <SERVICE_USER> python3 admin.py --root <RUNTIME_ROOT> journal <PROJECT> 
 sudo -u <SERVICE_USER> python3 admin.py --root <RUNTIME_ROOT> journal <PROJECT> --reset-high-water
 
 # the same recovery for the service record store's monotone auth floor (keeps jump_credit);
-# without the flag it only reports the floor and the state/record-store paths
+# without the flag it only reports the clock state and the state/record-store paths. Both
+# paths must already exist: a typo is refused non-zero and creates nothing
 sudo -u <SERVICE_USER> python3 admin.py --root <RUNTIME_ROOT> record-store \
     --state <RUNTIME_ROOT>/http-state.json --reset-high-water
 
@@ -478,7 +506,12 @@ never reduces `jump_credit`, so tombstones keep ageing on the confirmed timeline
 `record-store --reset-high-water` command applies exactly the same rule to the HTTP
 record store's monotone auth clock (`<state>.records.sqlite3`), keeping its own
 `jump_credit`, and is the remedy that stops auth items issued after a corrected forward
-jump from being stamped on the pinned floor. No
+jump from being stamped on the pinned floor. It refuses a state document or record store
+that does not already exist (non-zero, creating nothing), so a mistyped path cannot
+silently reset a fabricated store instead of the real one. A backward step needs no
+reset: it extends a still-live item by up to the step size (the bound in the auth-clock
+section above), and shortening that window means revoking the affected sessions or
+credentials, not resetting the floor. No
 operator action is needed after an idle gap (suspicion settles by itself after an
 hour). Use it after correcting a clock that had jumped forward: it re-arms jump
 detection and ends the capped-expiry period at once. It removes no identity by itself.
