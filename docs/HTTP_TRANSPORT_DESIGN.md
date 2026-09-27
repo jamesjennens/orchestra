@@ -172,11 +172,23 @@ own machine and pull work over the API without SSH or shared directories.
   the owner's **current** role by the same `http_authority.decide` /
   `credential_capabilities` rule used by the .19 worker credentials, and the grant
   list itself is read live, so narrowing it takes effect on the next request. A
-  disabled agent, a revoked credential, a disabled owner and a removed owner
-  membership all stop the agent on its next request (`401`/`403`/`404`). An agent
-  credential can never manage agents, accounts or projects.
-- **Attention.** Attention and the next-action list are computed at **read time**
-  from one bounded task page per granted project. `GET /v1/agents/me` returns the
+  grant may only name a project the **owner** can read: a non-owner request is
+  refused with `404`, and a superuser editing somebody else's agent may not store a
+  project outside that owner's membership either, because such a grant could only
+  ever be a leak waiting to be read. A disabled agent, a revoked credential, a
+  disabled owner and a removed owner membership all stop the agent on its next
+  request (`401`/`403`/`404`). An agent credential can never manage agents,
+  accounts or projects.
+- **Attention.** Attention and the next-action list are computed at **read time**.
+  Every granted project is re-authorized with the same live-authority check the task
+  routes use (`Service.check_authority` with `CAP_READ`), so a project the reader can
+  no longer read - the owner left it, or the grant was narrowed - is skipped rather
+  than read: a stored grant is a ceiling, never a licence. Each project's tasks are
+  read once per **request** (so `GET /v1/agents` with N agents over P projects
+  performs P reads, not N*P) and the read follows every page up to a bound, so an
+  agent's own task is counted however deep it sorts by id. The page-sized cap applies
+  only to the **claimable** suggestions, and `truncated` reports that capped
+  suggestion list rather than a blind first page. `GET /v1/agents/me` returns the
   agent record; `GET /v1/agents/me/next` returns the stable JSON
   `attention`/`next_actions` contract with task/brief (task-detail) links,
   prioritised as changes-requested, blocked, claimable task, then awaiting review.
@@ -189,7 +201,16 @@ own machine and pull work over the API without SSH or shared directories.
   `POST /v1/agents/{id}/credentials/{cid}/revoke` return the registry plus
   per-agent attention, the working directory and the resume prompt for the owner
   (and for a superuser). Ordinary users see only their own agents, so the path
-  cannot leak.
+  cannot leak. The `projects` field is the stored grant **ceiling**; the attention
+  data beside it is always filtered through the reader's live authority.
+- **Open owner decisions.** This shape is a coordinator proposal: the owner has not
+  yet accepted whether the credential may see its own `working_directory` and
+  credential list, superuser visibility of every agent and path, the default
+  credential scopes, whether project owners may see or revoke agents in their
+  project, the `/next` priority order and claimable filter, disable-revokes-all with
+  no restore on enable, the registry limits, `actor = agent id`, and the setup
+  snippet's secret export. It is tracked as the checkpoint item
+  `owner-decisions-pending`; no product change is made for it in this revision.
 - **Handoff.** This service owns the JSON contract only. The browser screens
   ("Your agents" on My work, directory display, copyable resume prompt) are
   kittrial-5bb.20 and consume these responses unchanged.
@@ -347,8 +368,8 @@ call; it does not authorize direct database access. Protected mutation rows requ
 | `POST /v1/projects`, `GET /v1/projects`, `POST /v1/projects/{id}/archive` | Authenticated user; create default enabled; list members only; archive owner/superuser | Create validates unique metadata; archive requires active owner or superuser and confirmation | Create/archive key scoped to principal + project (when present) + route; `201/200`, `403/409` | Project create/list and archive state transition |
 | `PUT /v1/projects/{id}/members/{user}`, `DELETE .../members/{user}` | Owner or superuser | Assigner is current owner or superuser; only superuser may assign/remove owner role under default policy; cannot remove final active owner | Key scoped to principal + project + operation route + target; `200/204`, `403/409` | Membership add/remove and role transition |
 | `POST /v1/projects/{id}/worker-credentials`, `POST .../worker-credentials/{credential}/revoke` | Owner or superuser issues; owner of credential may revoke own | Project membership current; requested scope subset of issuer scope | Issue key scoped to principal + project + route; request hash detects payload conflicts; `201` secret once, exact uncertain retry `200` metadata only; revoke key scoped to principal + project + credential, `204`; `403/409` | Credential registry and revocation |
-| `POST /v1/agents`, `GET /v1/agents`, `GET /v1/agents/{agent}`, `PATCH /v1/agents/{agent}`, `POST /v1/agents/{agent}/disable`, `POST /v1/agents/{agent}/enable`, `POST /v1/agents/{agent}/credentials`, `POST .../credentials/{credential}/revoke` | Authenticated session; the owning user or a superuser per agent | Agent name/fields bounded; a project grant must name a project the owner can open; a disabled agent cannot receive a credential | Personal routes are session-only (an agent or worker credential gets `403`); create/issue key scoped to principal + route; `201` secret once or `200` metadata-only exact retry; `403/404/409`; `working_directory` is returned only to the owner/superuser | Personal agent registry and credential records (no canonical mapping) |
-| `GET /v1/agents/me`, `GET /v1/agents/me/next` | Agent credential only | The credential is live, the agent is enabled and the owner is a current member | Read-only, no idempotency key; stable JSON attention/next-action computed at read time; `401/403/404` | Live registry plus bounded canonical task reads, capped by the owner's current role |
+| `POST /v1/agents`, `GET /v1/agents`, `GET /v1/agents/{agent}`, `PATCH /v1/agents/{agent}`, `POST /v1/agents/{agent}/disable`, `POST /v1/agents/{agent}/enable`, `POST /v1/agents/{agent}/credentials`, `POST .../credentials/{credential}/revoke` | Authenticated session; the owning user or a superuser per agent | Agent name/fields bounded; a project grant must name a project the **agent's owner** can open (a superuser may not grant a project outside the owner's membership); a disabled agent cannot receive a credential | Personal routes are session-only (an agent or worker credential gets `403`); create/issue key scoped to principal + route; `201` secret once or `200` metadata-only exact retry; `403/404/409`; `working_directory` is returned only to the owner/superuser; attention is filtered per project through `decide` with `CAP_READ` and each project is read once per request | Personal agent registry and credential records (no canonical mapping) |
+| `GET /v1/agents/me`, `GET /v1/agents/me/next` | Agent credential only | The credential is live, the agent is enabled and the owner is a current member; each granted project is re-checked with `decide` (`CAP_READ`) before its tasks are read | Read-only, no idempotency key; stable JSON attention/next-action computed at read time over every task page per project, with the page cap on the claimable suggestions only; `401/403/404` | Live registry plus bounded canonical task reads, capped by the owner's current role |
 | `POST /v1/projects/{id}/jobs`, `PATCH /v1/projects/{id}/jobs/{job}`, `POST /v1/projects/{id}/tasks`, `PATCH /v1/projects/{id}/tasks/{task}` | Owner/contributor for create/update according to project policy; viewer denied | Membership current; update carries resource version; task parent/job must be in same project | Key scoped to principal + project + route + client operation ID; `201/200`, `403/409` | Canonical job/task create/update |
 | `GET /v1/projects/{id}/tasks`, `GET .../tasks/{task}` | Project member; viewer may read | Membership checked before query and cursor validation | Opaque cursor bound to principal/project/query; `200`, `401/403/404` | Canonical task/list/show and history views |
 | `POST /v1/projects/{id}/tasks/{task}/claim` | Contributor/owner or bound worker credential | Task open/claimable and actor binding matches credential | Key scoped to principal + project + task + route; `200`, `403/409` | Existing atomic claim operation |

@@ -59,6 +59,8 @@ class Response:
 
 class AgentHarness(unittest.TestCase):
     max_body = MAX_BODY_BYTES
+    #: Some suites count backend reads; the default is the untraced in-process backend.
+    backend_class = InProcessBackend
 
     def setUp(self):
         self.tmp_path = unique_dir('agent-')
@@ -66,7 +68,7 @@ class AgentHarness(unittest.TestCase):
         self.store = Store(self.tmp_path / 'state.json')
         self.admin_user = Service.bootstrap_superuser(self.store, ADMIN, ADMIN_PASSWORD)
         self.service = Service(self.store, public_url='https://office.example.invalid')
-        self.backend = InProcessBackend(self.service)
+        self.backend = self.backend_class(self.service)
         self.httpd = create_server(self.service, self.backend, host='127.0.0.1', port=0,
                                    max_body=self.max_body)
         self.port = self.httpd.server_address[1]
@@ -436,6 +438,229 @@ class AgentPrivacyTests(AgentHarness):
                          superuser.data['items'][0]['working_directory'])
         # No agent response body ever carries the secret.
         self.assertNotIn('secret"', json.dumps(superuser.data))
+
+
+class AgentAttentionAuthorizationTests(AgentHarness):
+    """Attention must apply the same authorization check as the task routes.
+
+    A stored project grant is a ceiling, not a licence to read: the owner leaving the
+    project, or a superuser storing a project outside the owner's membership, must
+    never put that project's tasks into an attention or next-action response.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.admin_token()
+        self.create_account(self.admin, 'alex', 'alex-password-1')
+        self.create_account(self.admin, 'blair', 'blair-password-1')
+        self.alex = self.login('alex', 'alex-password-1')[0]
+        _, self.alex_user = self.login('alex', 'alex-password-1')
+        self.blair, self.blair_user = self.login('blair', 'blair-password-1')
+        self.alpha = self.create_project(self.alex, 'Alpha')
+        # Blair must be an owner before Alex can be removed from Alpha.
+        promoted = self.request('PUT', '/v1/projects/%s/members/%s'
+                                % (self.alpha, self.blair_user['id']), {'role': 'owner'},
+                                token=self.admin)
+        self.assertEqual(200, promoted.status, promoted.data)
+        self.agent_id, self.secret, _ = self.agent_secret(self.alex, projects=[self.alpha])
+
+    def test_attention_hides_a_project_the_owner_was_removed_from(self):
+        removed = self.request('DELETE', '/v1/projects/%s/members/%s'
+                               % (self.alpha, self.alex_user['id']), token=self.admin)
+        self.assertEqual(200, removed.status, removed.data)
+        task = self.request('POST', '/v1/projects/%s/tasks' % self.alpha,
+                            {'title': 'CONFIDENTIAL-after-removal'}, token=self.blair)
+        self.assertEqual(201, task.status, task.data)
+        # The direct task route refuses the agent credential...
+        self.assertEqual(403, self.request('GET', '/v1/projects/%s/tasks' % self.alpha,
+                                           token=self.secret).status)
+        # ...and the agent's own next-action read must not disclose that project.
+        nxt = self.request('GET', '/v1/agents/me/next', token=self.secret)
+        self.assertEqual(200, nxt.status, nxt.data)
+        self.assertEqual([], nxt.data['projects'])
+        self.assertEqual('idle', nxt.data['attention']['state'])
+        self.assertEqual(0, nxt.data['attention']['counts']['claimable'])
+        self.assertIsNone(nxt.data['next_action'])
+        self.assertNotIn('CONFIDENTIAL-after-removal', nxt.body.decode('utf-8'))
+        self.assertNotIn(task.data['id'], nxt.body.decode('utf-8'))
+        self.assertNotIn(self.alpha, json.dumps(nxt.data['attention']))
+        # The owner's own "Your agents" view is filtered the same way.
+        owner = self.request('GET', '/v1/agents', token=self.alex)
+        self.assertEqual(200, owner.status, owner.data)
+        item = owner.data['items'][0]
+        self.assertEqual('idle', item['attention']['state'])
+        self.assertEqual(0, item['attention']['counts']['claimable'])
+        self.assertNotIn('CONFIDENTIAL-after-removal', owner.body.decode('utf-8'))
+        self.assertNotIn(' in project %s.' % self.alpha, item['resume_prompt'])
+        detail = self.request('GET', '/v1/agents/%s' % self.agent_id, token=self.alex)
+        self.assertEqual(200, detail.status, detail.data)
+        self.assertEqual('idle', detail.data['attention']['state'])
+        self.assertNotIn('CONFIDENTIAL-after-removal', detail.body.decode('utf-8'))
+
+    def test_superuser_cannot_grant_a_project_outside_the_owners_membership(self):
+        gamma = self.create_project(self.blair, 'Gamma')
+        seeded = self.request('POST', '/v1/projects/%s/tasks' % gamma,
+                              {'title': 'GAMMA-PRIVATE'}, token=self.blair)
+        self.assertEqual(201, seeded.status, seeded.data)
+        # A superuser may not store a project the agent's owner cannot open.
+        refused = self.request('PATCH', '/v1/agents/%s' % self.agent_id,
+                               {'projects': [self.alpha, gamma]}, token=self.admin)
+        self.assertEqual(404, refused.status, refused.data)
+        detail = self.request('GET', '/v1/agents/%s' % self.agent_id, token=self.alex)
+        self.assertEqual([self.alpha], detail.data['projects'])
+        nxt = self.request('GET', '/v1/agents/me/next', token=self.secret)
+        self.assertEqual(200, nxt.status, nxt.data)
+        self.assertNotIn('GAMMA-PRIVATE', nxt.body.decode('utf-8'))
+        self.assertEqual([self.alpha], [p['id'] for p in nxt.data['projects']])
+        self.assertEqual(0, nxt.data['attention']['counts']['claimable'])
+        # The superuser path still works where the owner *is* a member: rename and
+        # re-grant Alpha, and administer an agent whose owner belongs to Gamma.
+        allowed = self.request('PATCH', '/v1/agents/%s' % self.agent_id,
+                               {'projects': [self.alpha], 'notes': 'reviewed'},
+                               token=self.admin)
+        self.assertEqual(200, allowed.status, allowed.data)
+        self.assertEqual('reviewed', allowed.data['notes'])
+        blair_agent = self.create_agent(self.blair, name='Blair-agent', projects=[gamma])
+        self.assertEqual(201, blair_agent.status, blair_agent.data)
+        blair_grant = self.request('PATCH', '/v1/agents/%s' % blair_agent.data['agent']['id'],
+                                   {'projects': [gamma]}, token=self.admin)
+        self.assertEqual(200, blair_grant.status, blair_grant.data)
+
+    def test_attention_follows_a_narrowed_grant(self):
+        beta = self.create_project(self.alex, 'Beta')
+        widened = self.request('PATCH', '/v1/agents/%s' % self.agent_id,
+                               {'projects': [self.alpha, beta]}, token=self.alex)
+        self.assertEqual(200, widened.status, widened.data)
+        seeded = self.request('POST', '/v1/projects/%s/tasks' % beta, {'title': 'BETA-WORK'},
+                              token=self.alex)
+        self.assertEqual(201, seeded.status, seeded.data)
+        before = self.request('GET', '/v1/agents/me/next', token=self.secret)
+        self.assertEqual(1, before.data['attention']['counts']['claimable'])
+        narrowed = self.request('PATCH', '/v1/agents/%s' % self.agent_id,
+                                {'projects': [self.alpha]}, token=self.alex)
+        self.assertEqual(200, narrowed.status, narrowed.data)
+        after = self.request('GET', '/v1/agents/me/next', token=self.secret)
+        self.assertEqual(0, after.data['attention']['counts']['claimable'])
+        self.assertNotIn('BETA-WORK', after.body.decode('utf-8'))
+
+
+class AgentPaginationTests(AgentHarness):
+    """Attention reads every page; only the claimable suggestions are capped."""
+
+    def setUp(self):
+        super().setUp()
+        admin = self.admin_token()
+        self.create_account(admin, 'alex', 'alex-password-1')
+        self.alex = self.login('alex', 'alex-password-1')[0]
+        self.project = self.create_project(self.alex, 'Alpha')
+        self.agent_id, self.secret, _ = self.agent_secret(self.alex, projects=[self.project])
+
+    def create_task(self, title):
+        response = self.request('POST', '/v1/projects/%s/tasks' % self.project,
+                                {'title': title}, token=self.alex)
+        self.assertEqual(201, response.status, response.data)
+        return response.data['id']
+
+    def review(self, task, operation, token, **extra):
+        payload = {'operation': operation, **extra}
+        response = self.request('POST', '/v1/projects/%s/tasks/%s/reviews'
+                                % (self.project, task), payload, token=token)
+        self.assertEqual(201, response.status, response.data)
+        return response.data
+
+    def test_own_changes_requested_task_beyond_the_first_page_is_found(self):
+        ids = [self.create_task('t%03d' % index) for index in range(130)]
+        own = max(ids)
+        # The agent's own task is deliberately the one that sorts last by id, i.e.
+        # beyond the first MAX_PAGE page of the project read.
+        self.assertEqual(130, sorted(ids).index(own) + 1)
+        claim = self.request('POST', '/v1/projects/%s/tasks/%s/claim'
+                             % (self.project, own), token=self.secret)
+        self.assertEqual(200, claim.status, claim.data)
+        self.review(own, 'contribute', self.secret, commit=COMMIT, base_commit=BASE,
+                    bundle_sha256=BUNDLE, summary='agent slice')
+        self.review(own, 'request-changes', self.alex, summary='please revise')
+        nxt = self.request('GET', '/v1/agents/me/next', token=self.secret)
+        self.assertEqual(200, nxt.status, nxt.data)
+        attention = nxt.data['attention']
+        counts = attention['counts']
+        self.assertEqual('changes-requested', attention['state'])
+        self.assertEqual(1, counts['changes_requested'])
+        self.assertEqual(1, counts['claimed'])
+        self.assertEqual(129, counts['claimable'])
+        self.assertEqual('changes-requested', nxt.data['next_action']['kind'])
+        self.assertIn(own, [action['task'] for action in nxt.data['next_actions']])
+        # ``truncated`` now describes the capped *claimable suggestion* list only: the
+        # agent's own feedback is still first and complete.
+        self.assertTrue(attention['truncated'])
+        self.assertEqual(own, nxt.data['next_actions'][0]['task'])
+        self.assertEqual('changes-requested', nxt.data['next_actions'][0]['kind'])
+        owner = self.request('GET', '/v1/agents', token=self.alex)
+        self.assertEqual('changes-requested', owner.data['items'][0]['attention']['state'])
+        self.assertIn(own, owner.data['items'][0]['resume_prompt'])
+
+    def test_every_page_is_read_not_just_the_first(self):
+        # 130 open, unclaimed tasks: the exact count proves the whole project was read
+        # even though only AGENT_CLAIMABLE_LIMIT suggestions are collected.
+        for index in range(130):
+            self.create_task('open-%03d' % index)
+        nxt = self.request('GET', '/v1/agents/me/next', token=self.secret)
+        self.assertEqual(130, nxt.data['attention']['counts']['claimable'])
+        self.assertTrue(nxt.data['attention']['truncated'])
+        self.assertEqual(http_service.AGENT_ACTION_LIMIT,
+                         len([action for action in nxt.data['next_actions']
+                              if action['kind'] == 'claimable-task']))
+
+
+class CountingBackend(InProcessBackend):
+    """In-process backend that counts task reads, the cost proxy for the endpoint
+    binding (which spawns ``endpoint.py`` and ``bd list --all`` per read)."""
+
+    def __init__(self, service):
+        super().__init__(service)
+        self.list_calls = []
+
+    def list_tasks(self, project_id, limit, offset):
+        self.list_calls.append((project_id, limit, offset))
+        return super().list_tasks(project_id, limit, offset)
+
+
+class AgentReadCostTests(AgentHarness):
+    """One project read per project per request, never per agent or across requests."""
+
+    backend_class = CountingBackend
+
+    def setUp(self):
+        super().setUp()
+        admin = self.admin_token()
+        self.create_account(admin, 'alex', 'alex-password-1')
+        self.alex = self.login('alex', 'alex-password-1')[0]
+        self.projects = [self.create_project(self.alex, 'P%d' % index) for index in range(5)]
+        for index in range(10):
+            created = self.create_agent(self.alex, name='A%d' % index,
+                                        projects=list(self.projects))
+            self.assertEqual(201, created.status, created.data)
+
+    def test_owner_list_reads_each_project_once_per_request(self):
+        self.backend.list_calls = []
+        listing = self.request('GET', '/v1/agents', token=self.alex)
+        self.assertEqual(200, listing.status, listing.data)
+        self.assertEqual(10, listing.data['total'])
+        # 10 agents x 5 projects would be 50 reads; the request performs 5.
+        self.assertEqual(5, len(self.backend.list_calls))
+        self.assertEqual(set(self.projects), {call[0] for call in self.backend.list_calls})
+        # The cache never outlives the request: the next read re-reads every project.
+        self.backend.list_calls = []
+        self.request('GET', '/v1/agents', token=self.alex)
+        self.assertEqual(5, len(self.backend.list_calls))
+
+    def test_agent_next_reads_every_granted_project_once(self):
+        agent_id, secret, _ = self.agent_secret(self.alex, projects=list(self.projects))
+        self.assertTrue(agent_id)
+        self.backend.list_calls = []
+        nxt = self.request('GET', '/v1/agents/me/next', token=secret)
+        self.assertEqual(200, nxt.status, nxt.data)
+        self.assertEqual(5, len(self.backend.list_calls))
 
 
 class NoScheduledWorkTests(AgentHarness):

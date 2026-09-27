@@ -205,10 +205,21 @@ the project ids and no secret. The secret goes in an environment variable, VS Co
 secret storage or the OS credential store, and `.orchestra/` stays out of Git. The
 agent then calls `GET /v1/agents/me` and `GET /v1/agents/me/next` with
 `Authorization: Bearer $ORCHESTRA_AGENT_SECRET`; every other project route works as
-before, capped at the owner's live role and the agent's granted projects. Set
-`--public-url https://<HOSTNAME>` so the setup and resume snippets carry the real
-address. Attention is computed at read time only: the service runs no scheduled job,
-poller or timer, and the owner resumes the agent manually.
+before, capped at the owner's live role and the agent's granted projects. A grant may
+only name a project the owner can open, including when a superuser edits somebody
+else's agent (`404` otherwise). Set `--public-url https://<HOSTNAME>` so the setup and
+resume snippets carry the real address. Attention is computed at read time only: the
+service runs no scheduled job, poller or timer, and the owner resumes the agent
+manually.
+
+Attention re-authorizes every granted project with the same live check the task routes
+use before it reads anything, so a project the caller can no longer open (the owner
+was removed, or the grant was narrowed) is skipped instead of leaked. Each project is
+read once per request and walked page by page, so an agent's own task is found however
+deep it sorts; only the *claimable* suggestions meet the page-sized cap, and
+`truncated` reports that suggestion list. On the endpoint binding a read costs one
+`endpoint.py` / `bd list --all` invocation per project per page, so a project with
+more than `MAX_PAGE` (100) tasks costs one extra invocation per page for that request.
 
 Revoke an agent credential, disable the agent, disable the owner or remove the
 owner's project membership and the agent stops on its next request. The
@@ -609,10 +620,14 @@ the pilot phase, not part of this service.
   contract (`/v1/agents`, `/v1/agents/me`, `/v1/agents/me/next`) are implemented and
   tested. The **browser screens** that render "Your agents", the working directory
   and the copyable resume prompt are kittrial-5bb.20 and are not built here; this
-  build exposes only the JSON contract they will consume. `blocked` attention for an
-  agent is derived from the in-process canonical checkpoint view, which the
-  canonical endpoint binding does not mirror, so over `--backend endpoint` that one
-  signal is absent rather than wrong.
+  build exposes only the JSON contract they will consume.
+- **Known limitation `endpoint-blocked-signal`.** `blocked` attention for an agent is
+  derived from the in-process canonical checkpoint view (`backend.state['checkpoints']`).
+  The canonical endpoint binding does not mirror checkpoints into service state, so
+  over `--backend endpoint` that one signal is **absent rather than wrong** while
+  changes-requested, claimable and awaiting-review are unaffected. Mirroring
+  checkpoints into the endpoint backend is deliberately not attempted in this
+  revision (it is the open checkpoint item `endpoint-blocked-signal`).
 - Administrative audit coverage is partial: login outcomes, authorization
   denials and every successful idempotent mutation are recorded; a per-field
   before/after administrative trail is not implemented.
@@ -636,6 +651,16 @@ the pilot phase, not part of this service.
 4. Retention period and recovery objectives for audit, state and backups.
 5. Whether to bind an external identity provider (SSO) or MFA, and when.
 6. Network exposure and any approved browser origin list.
+7. The personal-agent design decisions (checkpoint item `owner-decisions-pending`):
+   whether an agent credential may see its own `working_directory` and credential
+   list; superuser visibility of every agent and path; the default credential scopes
+   (read-only versus tasks/checkpoints/reviews/feedback); whether project owners may
+   see and revoke agents in their project; the `/next` priority order and claimable
+   filter; disable-revokes-all with no restore on enable; the registry limits (100
+   agents, 20 credentials, 64 projects, 30-day TTL); `actor = agent id`; and the
+   setup snippet's export of the secret. The implementation is a coordinator
+   proposal pending these decisions; the P1/P2 authorization and pagination fixes do
+   not depend on them.
 
 Until these are recorded, this service is a disposable local validation build,
 not an office deployment.

@@ -1522,12 +1522,16 @@ class Service:
             raise invalid('%s must be at most %d printable characters' % (field, limit))
         return text
 
-    def _agent_projects(self, principal, projects):
-        """Validate a requested agent grant against the owner's live membership.
+    def _agent_projects(self, principal, projects, owner_id=None):
+        """Validate a requested agent grant against the *owner's* live membership.
 
-        A grant may only name projects the owner can already open; a superuser may
-        grant any existing project. The stored list is a *ceiling*: the live role cap
-        in :func:`http_authority.decide` is still applied on every request.
+        A grant may only name projects the agent's owner can already read. For the
+        owner's own request that is the pre-existing rule; for a superuser changing
+        somebody else's agent it means a superuser may **not** store a project outside
+        the owner's membership, because such a grant can only ever be a leak waiting to
+        be read. The stored list is a *ceiling*: the live role cap in
+        :func:`http_authority.decide` is still applied on every request, and attention
+        re-authorizes each project at read time.
         """
         if projects is None:
             return []
@@ -1540,11 +1544,14 @@ class Service:
                 raise invalid('Invalid project id in agent grant')
             if pid not in granted:
                 granted.append(pid)
+        owner_id = owner_id or principal.user_id
+        owner = self.state['users'].get(owner_id) or {}
+        owner_is_superuser = bool(owner.get('superuser'))
         for pid in granted:
             if pid not in self.state['projects']:
                 raise not_found('Project not found')
-            if not principal.superuser and \
-                    principal.user_id not in self.state['memberships'].get(pid, {}):
+            if not owner_is_superuser and \
+                    owner_id not in self.state['memberships'].get(pid, {}):
                 raise not_found('Project not found')
         return granted
 
@@ -1746,7 +1753,8 @@ class Service:
                 if field in payload:
                     agent[field] = self._agent_text(payload.get(field), field, limit)
             if 'projects' in payload:
-                agent['projects'] = self._agent_projects(principal, payload.get('projects'))
+                agent['projects'] = self._agent_projects(principal, payload.get('projects'),
+                                                         owner_id=agent['owner'])
             if 'enabled' in payload and payload.get('enabled') is not None:
                 enabled = bool(payload.get('enabled'))
                 agent['enabled'] = enabled

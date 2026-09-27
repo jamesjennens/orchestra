@@ -46,9 +46,19 @@ MAX_FILENAME = 128
 MAX_PAGE = 100
 DEFAULT_PAGE = 50
 MAX_CURSOR = 512
-#: Bound on the read-time agent next-action list. Attention is computed from a single
-#: bounded task page per granted project; nothing is scheduled or polled.
+#: Bound on the read-time agent next-action list. Attention is computed from a bounded,
+#: cached, per-request read of every granted project's task pages; nothing is scheduled
+#: or polled.
 AGENT_ACTION_LIMIT = 50
+#: How many task pages (of :data:`MAX_PAGE` each) agent attention walks per project per
+#: request, i.e. 20,000 tasks for one project. The walk exists so an agent's own task is
+#: never hidden behind the page boundary; a walk that stops here reports ``truncated``.
+AGENT_MAX_PAGES = 200
+#: Cap on the *claimable* suggestions collected per read. Claimable work is a suggestion
+#: list, not the agent's own work, so it is the only list the page-sized cap applies to:
+#: an agent's own changes-requested, blocked or awaiting-review task is always collected
+#: however many claimable tasks sit beside it.
+AGENT_CLAIMABLE_LIMIT = MAX_PAGE
 IDEMPOTENCY_HEADER = 'Idempotency-Key'
 ATTACHMENT_MEDIA_TYPES = ('text/plain', 'text/markdown')
 # One identifier pattern for every route parameter. Canonical Orchestra ids contain
@@ -850,6 +860,9 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _dispatch(self, method):
         request_id = self._request_id()
         self._current_request_id = request_id
+        # Per-request agent read cache. An HTTP/1.1 keep-alive connection reuses this
+        # handler instance, so the cache is reset for every request and never outlives it.
+        self._agent_task_cache = {}
         try:
             parsed = urlsplit(self.path)
             path = parsed.path
@@ -1319,7 +1332,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('GET', r'/v1/agents/me/next')
     def agents_me_next(self, ctx):
         agent = self.service.agent_for_credential(ctx.principal)
-        attention = self._agent_attention(agent)
+        attention = self._agent_attention(ctx.principal, agent)
         projects = [{'id': p['id'], 'name': p['name']}
                     for p in self.service.list_projects(ctx.principal)]
         return 200, {
@@ -1354,7 +1367,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.require(ctx, CAP_AGENTS)
         items = []
         for agent in self.service.list_agents(ctx.principal):
-            attention = self._agent_attention(agent)
+            attention = self._agent_attention(ctx.principal, agent)
             items.append(dict(agent, attention=self._agent_attention_view(agent, attention),
                               resume_prompt=self._agent_resume_prompt(agent, attention)))
         return 200, {'items': items, 'total': len(items),
@@ -1364,7 +1377,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     def agents_get(self, ctx):
         self.require(ctx, CAP_AGENTS)
         agent = self.service.get_agent(ctx.principal, ctx.params['aid'])
-        attention = self._agent_attention(agent)
+        attention = self._agent_attention(ctx.principal, agent)
         return 200, dict(agent, attention=self._agent_attention_view(agent, attention),
                          resume_prompt=self._agent_resume_prompt(agent, attention),
                          generated_at=now_iso(self.service._now()))
@@ -1447,48 +1460,117 @@ class ApiHandler(BaseHTTPRequestHandler):
                 'links': {'task': base, 'brief': base, 'history': base + '/history',
                           'project': '/v1/projects/%s' % project_id}}
 
-    def _agent_attention(self, agent):
-        """Owner/agent-visible attention, computed at read time from bounded reads."""
+    def _agent_may_read(self, principal, project_id):
+        """The task-route authority check for one project, reused by attention.
+
+        ``Service.check_authority`` is the single boundary every task route uses and it
+        delegates to ``http_authority.decide``, so attention can never read a project
+        that the same principal would be refused on ``GET /v1/projects/{id}/tasks``:
+        for an agent credential that is the live credential, the live enable state and
+        the owner's *current* role; for the owner view it is the owner's current
+        membership. Anything else (including a stored grant the owner has since lost)
+        is skipped rather than read.
+        """
+        try:
+            self.service.check_authority(principal, project_id, CAP_READ)
+        except HttpError:
+            return False
+        return True
+
+    def _agent_project_tasks(self, project_id):
+        """Every task page of one project, read at most once per HTTP request.
+
+        The per-project read is cached for the whole request, so the owner's
+        ``GET /v1/agents`` with N agents over P projects performs P reads rather than
+        N*P (the endpoint binding spawns one ``endpoint.py``/``bd list`` per read). The
+        walk follows pages to the last one so an agent's own task is never hidden
+        behind the page boundary; the last page also reports completeness for the
+        ``truncated`` flag. Nothing is cached across requests - the next request
+        re-reads canonical state.
+        """
+        cache = getattr(self, '_agent_task_cache', None)
+        if cache is None:
+            cache = self._agent_task_cache = {}
+        if project_id in cache:
+            return cache[project_id]
+        tasks = []
+        offset = 0
+        complete = False
+        for _ in range(AGENT_MAX_PAGES):
+            page = self.backend.list_tasks(project_id, MAX_PAGE, offset)
+            rows = [task for task in (page.get('items') or []) if isinstance(task, dict)]
+            total = page.get('total')
+            tasks.extend(rows)
+            offset += len(rows)
+            if len(rows) < MAX_PAGE:
+                complete = True
+                break
+            if isinstance(total, int) and offset >= total:
+                complete = True
+                break
+        result = {'tasks': tasks, 'complete': complete}
+        cache[project_id] = result
+        return result
+
+    def _agent_attention(self, principal, agent):
+        """Owner/agent-visible attention, computed at read time from bounded reads.
+
+        Each granted project is re-authorized with the same live-authority check the
+        task routes apply (:meth:`_agent_may_read`), so a project the principal can no
+        longer read drops out of attention instead of leaking its tasks. Each project
+        is read once per request (:meth:`_agent_project_tasks`) and walked to its last
+        page, so an agent's own task is counted however deep it sorts; the page-sized
+        cap applies only to the claimable suggestions.
+        """
         actor = agent.get('actor') or agent.get('id')
         blocked = self._agent_blocked_tasks()
         counts = {'claimable': 0, 'claimed': 0, 'changes_requested': 0,
                   'awaiting_review': 0, 'blocked': 0}
-        actions = []
+        own_actions = []
+        claimable_actions = []
         truncated = False
         for project_id in agent.get('projects') or []:
-            try:
-                page = self.backend.list_tasks(project_id, MAX_PAGE, 0)
-            except HttpError:
-                # A project the owner can no longer open simply drops out of attention.
+            if not self._agent_may_read(principal, project_id):
                 continue
-            if (page.get('total') or 0) > MAX_PAGE:
+            try:
+                read = self._agent_project_tasks(project_id)
+            except HttpError:
+                # A project the principal can no longer open simply drops out.
+                continue
+            if not read['complete']:
                 truncated = True
-            for task in page.get('items') or []:
+            for task in read['tasks']:
                 assigned = task.get('assignee') == actor
                 review = task.get('review_state')
                 if assigned and review == 'changes-requested':
                     counts['changes_requested'] += 1
-                    actions.append(self._agent_action(
+                    own_actions.append(self._agent_action(
                         1, 'changes-requested', project_id, task,
                         'A reviewer requested changes on this contribution.'))
                 elif assigned and review == 'awaiting-review':
                     counts['awaiting_review'] += 1
-                    actions.append(self._agent_action(
+                    own_actions.append(self._agent_action(
                         4, 'awaiting-review', project_id, task,
                         'Waiting for a human review decision.'))
                 elif assigned and task.get('status') != 'closed' and \
                         task.get('id') in blocked:
                     counts['blocked'] += 1
-                    actions.append(self._agent_action(
+                    own_actions.append(self._agent_action(
                         2, 'blocked', project_id, task,
                         'The latest checkpoint left unresolved items.'))
                 if assigned:
                     counts['claimed'] += 1
                 elif task.get('status') == 'open' and task.get('assignee') is None:
                     counts['claimable'] += 1
-                    actions.append(self._agent_action(
-                        3, 'claimable-task', project_id, task,
-                        'Open, unclaimed work the agent may take.'))
+                    if len(claimable_actions) < AGENT_CLAIMABLE_LIMIT:
+                        claimable_actions.append(self._agent_action(
+                            3, 'claimable-task', project_id, task,
+                            'Open, unclaimed work the agent may take.'))
+        # The count is exact over every page; only the collected suggestions are capped,
+        # so a long claimable list can never hide the agent's own feedback.
+        if counts['claimable'] > len(claimable_actions):
+            truncated = True
+        actions = own_actions + claimable_actions
         actions.sort(key=lambda a: (a['priority'], a['project'], a['task']))
         if len(actions) > AGENT_ACTION_LIMIT:
             actions = actions[:AGENT_ACTION_LIMIT]
