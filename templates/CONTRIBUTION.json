@@ -5,6 +5,7 @@
   "task": "example-task",
   "previous": null,
   "supersedes": null,
+  "follows": null,
   "repository": "REPOSITORY_URL",
   "commit": "REPLACE_WITH_FULL_COMMIT",
   "base_commit": "REPLACE_WITH_FULL_BASE_COMMIT",

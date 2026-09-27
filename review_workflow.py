@@ -36,7 +36,14 @@ def fields(value, expected):
 def validate(p, task):
     if not isinstance(p, dict) or not isinstance(p.get('operation'), str) or p['operation'] not in EXTRA:
         raise ValueError('Invalid review workflow operation')
-    fields(p, COMMON | EXTRA[p['operation']])
+    if p['operation'] == 'contribute':
+        # `follows` is optional on purpose: payloads and chains written before the
+        # additive follow-on relation existed must keep validating unchanged.
+        expected = COMMON | EXTRA['contribute']
+        if set(p) not in (expected, expected | {'follows'}):
+            raise ValueError('Invalid review workflow fields')
+    else:
+        fields(p, COMMON | EXTRA[p['operation']])
     if type(p['schema_version']) is not int or p['schema_version'] != 1 or p['task'] != task:
         raise ValueError('Invalid review workflow version/task')
     identity(task); identity(p['operation_id'])
@@ -50,6 +57,11 @@ def validate(p, task):
                 raise ValueError(f'{key}: require exact 40/64 hexadecimal commit')
         if p['supersedes'] is not None:
             identity(p['supersedes'])
+        follows = p.get('follows')
+        if follows is not None:
+            identity(follows)
+        if p['supersedes'] is not None and follows is not None:
+            raise ValueError('Contribution may supersede or follow the current revision, not both')
         d = p['delivery']
         if not isinstance(d, dict):
             raise ValueError('Invalid delivery')
@@ -321,14 +333,32 @@ def receipt(state, rows, task):
 
 
 def projection(ordered, voids=None, invalid=None, refused=None, positions=None):
-    contribution = None; pending = {}; approved = False; approved_id = None; latest = None
+    """Project the chain. ``prior_contributions`` keeps every revision the current
+    one replaced visible, tagged with its ``relation`` (``follows`` additive or
+    ``supersedes``), so a follow-on never removes the prior revision's record from
+    the chain. The prior revision's scoped lifecycle facts are not re-scoped: they
+    stay recorded in lifecycle history under their own scope."""
+    contribution = None; prior = []; pending = {}; approved = False; approved_id = None; latest = None
     for p, c in ordered:
         cid = str(c['id']); op = p['operation']
         metadata = {'comment_id': cid, 'author': c['author'], 'timestamp': c['created_at']}
         current = contribution['comment_id'] if contribution else None
         if op == 'contribute':
-            if p['supersedes'] != current:
-                raise ValueError('Contribution must explicitly supersede the current revision')
+            follows = p.get('follows')
+            if follows is not None:
+                if follows != current:
+                    raise ValueError('Contribution must follow the current revision')
+                relation = 'follows'
+            elif p['supersedes'] is not None:
+                if p['supersedes'] != current:
+                    raise ValueError('Contribution must explicitly supersede or follow the current revision')
+                relation = 'supersedes'
+            elif current is not None:
+                raise ValueError('Contribution must explicitly supersede or follow the current revision')
+            else:
+                relation = None
+            if contribution is not None:
+                prior.append(dict(contribution, relation=relation))
             contribution = dict(p, **metadata); approved = False; approved_id = None
         else:
             if not current or p['contribution'] != current:
@@ -395,7 +425,7 @@ def projection(ordered, voids=None, invalid=None, refused=None, positions=None):
     invalid = list(invalid or [])
     if invalid:
         warnings.append('Malformed or stale operator void comments ignored: ' + ', '.join(invalid[:5]))
-    return dict(contribution=contribution, review_state=state,
+    return dict(contribution=contribution, prior_contributions=prior, review_state=state,
                 pending_requests=list(pending.values()), latest_comment_id=latest,
                 recoveries=recoveries, warnings=warnings)
 
@@ -403,6 +433,86 @@ def projection(ordered, voids=None, invalid=None, refused=None, positions=None):
 def project(issue, operators=None):
     ordered, voids, invalid, refused, positions = history(issue, operators)
     return projection(ordered, voids, invalid, refused, positions)
+
+
+def approving_record(ordered, contribution_id):
+    """The native ``approve`` comment the shared projection counted for a revision.
+
+    A later contribution resets the approval and the projection refuses to approve
+    while requests are unresolved, so the LAST ``approve`` naming this contribution
+    is the record the projection used. The native author on that comment is the
+    attribution the follow-on gate checks; it is the transport's record of who
+    actually wrote the approval.
+    """
+    found = None
+    for p, c in ordered:
+        if p['operation'] == 'approve' and p['contribution'] == contribution_id:
+            found = c
+    return found
+
+
+def require_integrated_follow_on(payload, state, ordered, rows, task, assignee=None):
+    """Refuse an additive follow-on whose prior revision is not genuinely approved.
+
+    ``follows`` asserts that the reviewer's base is already integrated, so the gate
+    requires three independent things before the sole native ``comments add``:
+
+    * the raw append-only chain must show the prior revision **approved with no
+      unresolved requests** (``awaiting-integration``);
+    * that approving record's **native author** must differ from both the prior
+      contribution's author and the current task assignee. Native comment authors
+      supply *attribution, not authentication*, on the SSH/endpoint path: a caller
+      can label itself anything, so this check refuses the contributor's own
+      approval (and the assignee's) without pretending to be an identity system.
+      The HTTP ``CAP_APPROVE`` capability is the real approval authority: there the
+      native author is bound to the authenticated principal, so a worker credential
+      cannot approve at all;
+    * the shared per-scope integration evidence (kittrial-5bb.24,
+      ``review_state.integration`` over ``review_state.scopes_for``) must record a
+      passed ``integrated`` fact for the prior contribution's FULL commit, and the
+      follow-on ``base_commit`` must equal that scope's ``integration_commit``.
+      Any scope order is accepted, so recording a newer scope for other work does
+      not make a genuinely integrated prior un-followable -- the older defect that
+      read only the task's single current ``lifecycle`` scope.
+
+    There is deliberately no ``fact is None`` fallback: ``scopes_for`` returns an
+    empty list when no scoped evidence is trusted, and ``integration`` then reports
+    ``fact='unknown'``, which the check below refuses. A self-recorded
+    ``integrated=passed`` can therefore never open the gate on its own.
+    """
+    if payload.get('operation') != 'contribute' or payload.get('follows') is None:
+        return
+    prior = state.get('contribution') or {}
+    if not prior:
+        raise ValueError('Contribution must follow the current revision')
+    if state.get('review_state') != 'awaiting-integration' or state.get('pending_requests'):
+        raise ValueError('Contribution follows a revision that is not approved; a reviewer must '
+                         'approve the prior contribution with no unresolved requests before an '
+                         'additive follow-on can use it as its base')
+    approval = approving_record(ordered, prior['comment_id'])
+    if approval is None:
+        raise ValueError('Contribution follows a revision that is not approved; a reviewer must '
+                         'approve the prior contribution with no unresolved requests before an '
+                         'additive follow-on can use it as its base')
+    author = approval.get('author')
+    if author == prior.get('author'):
+        raise ValueError('Contribution follows a revision approved by its own author; an additive '
+                         'follow-on requires an approving record whose native author is neither the '
+                         'prior contribution author nor the task assignee')
+    if assignee and author == assignee:
+        raise ValueError('Contribution follows a revision approved by the task assignee; an additive '
+                         'follow-on requires an approving record whose native author is neither the '
+                         'prior contribution author nor the task assignee')
+    from review_state import integration, scopes_for
+    evidence = integration(prior, scopes_for(rows, task))
+    if evidence['fact'] != 'passed' or not evidence['integration_commit']:
+        raise ValueError('Contribution follows a revision that is not integrated; require a passed '
+                         'integrated lifecycle fact scoped to the prior contribution commit, read from '
+                         'the shared review-state projection, before an additive follow-on can use it '
+                         'as its base')
+    if payload['base_commit'].lower() != evidence['integration_commit'].lower():
+        raise ValueError('Contribution base_commit must equal the prior integration commit '
+                         + evidence['integration_commit'])
 
 
 def execute(rows, task, actor, payload, run, operators=None):
@@ -439,6 +549,12 @@ def execute(rows, task, actor, payload, run, operators=None):
     preview_positions['pending-write'] = len(issue.get('comments') or [])
     preview = projection(ordered + [(payload, {'id': 'pending-write', 'author': actor, 'created_at': 'pending'})],
                          voids, invalid, refused, preview_positions)
+    # A follow-on may only base itself on a prior revision approved by a distinct
+    # native author and genuinely integrated. Resolve the approving record from the
+    # chain and the integration evidence from the shared review-state projection
+    # here, still before the sole native mutation, so the refusal writes nothing.
+    if payload['operation'] == 'contribute' and payload.get('follows') is not None:
+        require_integrated_follow_on(payload, state, ordered, rows, task, issue.get('assignee'))
     result = json.loads(run(['comments', 'add', task, PREFIX + canonical_bytes(payload).decode(), '--json']))
     return dict(comment_id=str(result['id']), reconciled=False, **receipt(preview, rows, task))
 

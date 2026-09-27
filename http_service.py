@@ -610,6 +610,13 @@ class EndpointBackend:
         'respond': ('contribution', 'resolutions'),
         'approve': ('contribution', 'summary'),
     }
+    #: Optional canonical review fields: forwarded only when the caller supplied them,
+    #: so old payloads keep the exact legacy field set (no operation-inappropriate
+    #: nulls) and a follow-on's additive ``follows`` relation is not silently dropped
+    #: into a first contribution or a supersede.
+    REVIEW_OPTIONAL_FIELDS = {
+        'contribute': ('follows',),
+    }
     CHECKPOINT_FIELDS = ('schema_version', 'previous', 'activity_cursor', 'source_commit',
                          'branch', 'intent', 'acceptance', 'summary', 'next_action',
                          'open_items', 'resolved')
@@ -668,6 +675,9 @@ class EndpointBackend:
                 raise invalid('Canonical review payload is missing fields: %s'
                               % ', '.join(missing))
             body = {field: payload.get(field) for field in fields}
+            for field in self.REVIEW_OPTIONAL_FIELDS.get(operation, ()):
+                if field in payload:
+                    body[field] = payload.get(field)
             body['schema_version'] = payload.get('schema_version', 1)
             body['operation_id'] = payload.get('operation_id') or operation_id
             if not body['operation_id']:

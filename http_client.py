@@ -272,18 +272,21 @@ class Client:
     def add_review(self, project, task, operation, *, operation_id=None, previous=None,
                    schema_version=1, commit=None, base_commit=None, bundle_sha256=None,
                    summary=None, actor=None, key=None, repository=None, delivery=None,
-                   supersedes=None, contribution=None, items=None, resolutions=None):
+                   supersedes=None, follows=None, contribution=None, items=None, resolutions=None):
         """Record one contribution/review operation.
 
         The canonical backend forwards exactly the fields the operation needs, so the
         caller supplies the canonical payload (``previous``/``operation_id`` and the
-        operation-specific evidence) rather than a fixed union with nulls.
+        operation-specific evidence) rather than a fixed union with nulls. ``follows``
+        is the optional additive follow-on relation (mutually exclusive with
+        ``supersedes``); it must survive the HTTP hop or a follow-on silently becomes a
+        first contribution or a supersede.
         """
         body = {'schema_version': schema_version, 'operation': operation,
                 'operation_id': operation_id, 'previous': previous, 'actor': actor,
                 'commit': commit, 'base_commit': base_commit, 'bundle_sha256': bundle_sha256,
                 'summary': summary, 'repository': repository, 'delivery': delivery,
-                'supersedes': supersedes, 'contribution': contribution,
+                'supersedes': supersedes, 'follows': follows, 'contribution': contribution,
                 'items': items, 'resolutions': resolutions}
         return self.request('POST', '/v1/projects/%s/tasks/%s/reviews'
                             % (quote(project, safe=''), quote(task, safe='')), body, key=key)
