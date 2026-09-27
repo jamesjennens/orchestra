@@ -3,6 +3,7 @@ import base64
 import contextlib
 import io
 import json
+import subprocess
 import sys
 import tempfile
 import types
@@ -285,11 +286,81 @@ class BackupTests(unittest.TestCase):
 
     def test_new_project_initializes_and_performs_backup(self):
         target = self.root / 'projects' / 'newproject'
-        with patch.object(admin, 'config', return_value={'port': 13317}), patch.object(admin, 'run_bd', return_value='') as native, patch.object(admin, 'backup_project') as backup, contextlib.redirect_stdout(io.StringIO()):
+
+        def native(root, name, args):
+            if args[:2] == ['merge-slot', 'check']:
+                # EXACT real bd 1.2.2 missing-slot JSON: `available` IS present
+                # (false) alongside `error`, and the command exits 0.
+                return json.dumps({'available': False, 'error': 'not found',
+                                   'id': 'newproject-merge-slot'})
+            return ''
+
+        with patch.object(admin, 'config', return_value={'port': 13317}), patch.object(admin, 'run_bd', side_effect=native) as run_bd, patch.object(admin, 'backup_project') as backup, contextlib.redirect_stdout(io.StringIO()):
             admin.add_project(self.root, 'newproject')
         self.assertTrue(target.is_dir())
-        self.assertIn((self.root, 'newproject', ['backup', 'init', str(self.root / 'backups' / 'newproject')]), [c.args for c in native.call_args_list])
+        calls = [c.args for c in run_bd.call_args_list]
+        self.assertIn((self.root, 'newproject', ['backup', 'init', str(self.root / 'backups' / 'newproject')]), calls)
+        self.assertIn((self.root, 'newproject', ['merge-slot', 'check', '--json']), calls)
+        # The real missing shape must still cause add-project to create the slot.
+        self.assertIn((self.root, 'newproject', ['merge-slot', 'create', '--json']), calls)
         backup.assert_called_once_with(self.root, 'newproject')
+
+    def test_add_project_does_not_recreate_an_existing_merge_slot(self):
+        target = self.root / 'projects' / 'newproject'
+
+        def native(root, name, args):
+            if args[:2] == ['merge-slot', 'check']:
+                # Real bd 1.2.2 existing-slot JSON carries holder AND waiters.
+                return json.dumps({'available': True, 'holder': None,
+                                   'id': 'newproject-merge-slot', 'waiters': None})
+            return ''
+
+        with patch.object(admin, 'config', return_value={'port': 13317}), patch.object(admin, 'run_bd', side_effect=native) as run_bd, patch.object(admin, 'backup_project'), contextlib.redirect_stdout(io.StringIO()):
+            admin.add_project(self.root, 'newproject')
+        self.assertTrue(target.is_dir())
+        calls = [c.args[2] for c in run_bd.call_args_list]
+        self.assertIn(['merge-slot', 'check', '--json'], calls)
+        self.assertNotIn(['merge-slot', 'create', '--json'], calls)
+
+    def test_add_project_does_not_recreate_a_held_merge_slot(self):
+        def native(root, name, args):
+            if args[:2] == ['merge-slot', 'check']:
+                # A held slot is available:false WITH a holder - not missing.
+                return json.dumps({'available': False, 'holder': 'someone',
+                                   'id': 'newproject-merge-slot', 'waiters': None})
+            return ''
+
+        with patch.object(admin, 'config', return_value={'port': 13317}), patch.object(admin, 'run_bd', side_effect=native) as run_bd, patch.object(admin, 'backup_project'), contextlib.redirect_stdout(io.StringIO()):
+            admin.add_project(self.root, 'newproject')
+        calls = [c.args[2] for c in run_bd.call_args_list]
+        self.assertIn(['merge-slot', 'check', '--json'], calls)
+        self.assertNotIn(['merge-slot', 'create', '--json'], calls)
+
+    def test_provision_merge_slot_tolerates_an_existing_slot_refusal(self):
+        def native(root, name, args):
+            if args[:2] == ['merge-slot', 'check']:
+                return json.dumps({'available': False, 'error': 'not found',
+                                   'id': 'newproject-merge-slot'})
+            if args[:2] == ['merge-slot', 'create']:
+                raise subprocess.CalledProcessError(1, args, stderr='merge slot already exists')
+            return ''
+
+        with patch.object(admin, 'run_bd', side_effect=native) as run_bd:
+            admin.provision_merge_slot(self.root, 'newproject')
+        calls = [c.args[2] for c in run_bd.call_args_list]
+        self.assertIn(['merge-slot', 'check', '--json'], calls)
+        self.assertIn(['merge-slot', 'create', '--json'], calls)
+
+    def test_provision_merge_slot_reraises_a_real_create_failure(self):
+        def native(root, name, args):
+            if args[:2] == ['merge-slot', 'check']:
+                return json.dumps({'available': False, 'error': 'not found',
+                                   'id': 'newproject-merge-slot'})
+            raise subprocess.CalledProcessError(1, args, stderr='connection refused')
+
+        with patch.object(admin, 'run_bd', side_effect=native):
+            with self.assertRaises(subprocess.CalledProcessError):
+                admin.provision_merge_slot(self.root, 'newproject')
 
     def test_reconcile_request_command_releases_under_lock_and_prints_audit(self):
         (self.source / '.beads').mkdir()

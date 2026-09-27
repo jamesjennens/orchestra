@@ -129,6 +129,30 @@ def run_bd(root,name,args):
     location=[] if args and args[0]=='init' else ['--directory',path]
     return checked([root/'bin/bd',*location,'--sandbox',*args],env=environment(root),cwd=path).stdout
 
+def provision_merge_slot(root,name):
+    """Create the project's merge slot once, tolerating an existing slot.
+
+    bd 1.2.2 reports a missing slot as ``{"available": false, "error": "not
+    found", "id": "<project>-merge-slot"}`` with exit code 0, so a missing slot
+    is detected with ``coordination.merge_slot_missing`` instead of by an absent
+    ``available`` key (which is always present). A missing, unparseable or empty
+    check result means there is nothing usable, so create: ``bd merge-slot
+    create`` is idempotent (an existing slot returns ``status: open`` with no
+    refusal). A create refusal naming an existing slot is still tolerated
+    defensively, so an operator retry stays idempotent without depending on the
+    exact native error text.
+    """
+    from coordination import merge_slot_missing
+    try:
+        state=json.loads(run_bd(root,name,['merge-slot','check','--json']))
+    except (TypeError,ValueError):
+        state=None
+    if not merge_slot_missing(state):return
+    try:
+        run_bd(root,name,['merge-slot','create','--json'])
+    except subprocess.CalledProcessError as refusal:
+        if 'exist' not in (refusal.stderr or '').lower():raise
+
 def service(root,action):
     cfg=config(root)
     return checked(['systemctl','--user',action,cfg['unit']]).stdout
@@ -215,6 +239,7 @@ def add_project(root,name):
     for key,value in [('no-git-ops','true'),('dolt.auto-push','false'),('dolt.auto-commit','on'),('backup.git-push','false')]:
         run_bd(root,name,['config','set',key,value])
     run_bd(root,name,['backup','init',str(root/'backups'/name)])
+    provision_merge_slot(root,name)
     backup_project(root,name)
     print(f'Created project {name}')
 
