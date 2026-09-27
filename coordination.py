@@ -219,6 +219,24 @@ def reconcile_request(project, request_id, actor, reason, disposition, run, at=N
     return {'request_id':request_id,'status':disposition,'reconciled':True,'reconciliation':audit}
 
 
+def merge_slot_missing(state):
+    """True when a native merge-slot check reports no slot for this project.
+
+    bd 1.2.2 answers a missing slot with ``{"available": false, "error": "not
+    found", "id": "<project>-merge-slot"}`` and exit code 0, so key absence is
+    NOT a signal: ``available`` is present. A real state always carries
+    ``holder`` and ``waiters`` (either may be null), including a held slot,
+    which is ``available: false`` WITH a holder. A state is therefore missing
+    when native reports an error, when it is an unavailable dict without those
+    keys, or when it is not a recognizable check result at all (empty or
+    unparseable), so callers can safely treat it as missing.
+    """
+    if not isinstance(state,dict):return True
+    if state.get('error'):return True
+    if 'available' not in state:return True
+    return state.get('available') is False and 'holder' not in state and 'waiters' not in state
+
+
 def apply_native(p, actor, run, project):
     """Caller holds canonical project lock. Journals belong to runtime, never Git."""
     if not isinstance(p,dict):raise ValueError('Expected object')
@@ -286,7 +304,7 @@ def apply_native(p, actor, run, project):
     context_path=project/'.merge-context.json'
     if op=='merge-create':return json.loads(run(['merge-slot','create','--json']))
     state=json.loads(run(['merge-slot','check','--json']))
-    if not isinstance(state,dict) or 'available' not in state:
+    if merge_slot_missing(state):
         detail=''
         if isinstance(state,dict) and state.get('error'):detail=' (%s)' % state['error']
         raise ValueError('Merge slot does not exist for this project%s; run the merge-create operation to create it before checking, acquiring or releasing' % detail)

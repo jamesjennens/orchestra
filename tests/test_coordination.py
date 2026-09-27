@@ -97,14 +97,20 @@ class Native:
                 raise RuntimeError('task missing')
             return json.dumps([self.details.get(args[1], {'id': args[1]})])
         if args[:2] == ['merge-slot', 'create']:
-            if self.slot_exists:
-                raise ValueError('merge slot already exists')
+            # bd 1.2.2 create is idempotent: an existing slot returns
+            # {"id": ..., "status": "open"} with rc 0, never a refusal.
             self.slot_exists = True
             return json.dumps({'created': True})
         if args[:2] == ['merge-slot', 'check']:
             if not self.slot_exists:
-                return json.dumps({'error': 'not found'})
-            return json.dumps({'available': self.holder is None, 'holder': self.holder})
+                # EXACT real bd 1.2.2 missing-slot JSON: `available` IS present
+                # (false) alongside `error`, and the command exits 0.
+                return json.dumps({'available': False, 'error': 'not found',
+                                   'id': 'pp-merge-slot'})
+            # A real state always carries holder and waiters, including a held
+            # slot (available false with a holder).
+            return json.dumps({'available': self.holder is None,
+                               'holder': self.holder, 'waiters': None})
         if args[:2] == ['merge-slot', 'acquire']:
             if self.acquire_outcome == 'not-written':
                 raise RuntimeError('acquire response uncertain')
@@ -405,23 +411,53 @@ class CoordinationTests(unittest.TestCase):
                          {'released': False, 'available': True})
         self.assertEqual(self.native.count('merge-slot', 'release'), 1)
 
-    def test_missing_slot_refuses_check_and_acquire_naming_create(self):
+    def test_merge_slot_missing_predicate_matches_real_bd_shapes(self):
+        # True for the exact real bd 1.2.2 missing-slot JSON (note `available`
+        # is present), for a non-dict, for an error-only or unavailable dict
+        # with no holder/waiters, and for an empty/unrecognized check result.
+        for state in (None, 'not JSON',
+                      {'available': False, 'error': 'not found', 'id': 'pp-merge-slot'},
+                      {'error': 'not found'},
+                      {'available': False},
+                      {},
+                      {'unexpected': 'shape'}):
+            with self.subTest(state=state):
+                self.assertTrue(coordination.merge_slot_missing(state))
+        # False for a real state: holder and waiters are always present, even
+        # for a held slot (available false WITH a holder).
+        for state in ({'available': True, 'holder': None, 'id': 'pp-merge-slot', 'waiters': None},
+                      {'available': False, 'holder': 'alice', 'id': 'pp-merge-slot', 'waiters': None},
+                      {'available': False, 'holder': None, 'id': 'pp-merge-slot', 'waiters': ['bob']}):
+            with self.subTest(state=state):
+                self.assertFalse(coordination.merge_slot_missing(state))
+
+    def test_missing_slot_refuses_check_acquire_and_release_naming_create(self):
         self.native.slot_exists = False
-        with self.assertRaisesRegex(ValueError, 'merge-create'):
-            self.apply({'operation': 'merge-check'})
-        with self.assertRaisesRegex(ValueError, 'merge-create'):
-            self.apply(MERGE)
+        for payload in ({'operation': 'merge-check'}, MERGE, {'operation': 'merge-release'}):
+            with self.subTest(operation=payload['operation']):
+                with self.assertRaisesRegex(ValueError, 'merge-create') as caught:
+                    self.apply(payload)
+                # The native detail is preserved in the refusal.
+                self.assertIn('not found', str(caught.exception))
         self.assertEqual(self.native.count('merge-slot', 'acquire'), 0)
+        self.assertEqual(self.native.count('merge-slot', 'release'), 0)
         self.assertFalse((self.project / '.merge-context.json').exists())
 
-    def test_missing_slot_refuses_release_too(self):
-        self.native.slot_exists = False
-        with self.assertRaisesRegex(ValueError, 'merge-create'):
-            self.apply({'operation': 'merge-release'})
-        self.assertEqual(self.native.count('merge-slot', 'release'), 0)
+    def test_held_slot_is_not_missing_and_its_holder_releases(self):
+        # available false WITH a holder is a valid held slot, not a missing one.
+        self.assertTrue(self.apply(MERGE)['acquired'])
+        self.assertEqual(self.native.holder, 'alice')
+        self.assertEqual(self.apply({'operation': 'merge-check'})['holder'], 'alice')
+        self.assertTrue(self.apply({'operation': 'merge-release'})['released'])
+        self.assertIsNone(self.native.holder)
 
     def test_fresh_project_create_then_acquire_and_release(self):
         self.native.slot_exists = False
+        # The real missing shape is refused before the slot exists...
+        with self.assertRaisesRegex(ValueError, 'merge-create'):
+            self.apply(MERGE)
+        self.assertFalse((self.project / '.merge-context.json').exists())
+        # ...creating it (what add-project's provision does) makes it usable.
         self.assertTrue(self.apply({'operation': 'merge-create'})['created'])
         self.assertTrue(self.apply({'operation': 'merge-check'})['available'])
         self.assertTrue(self.apply(MERGE)['acquired'])

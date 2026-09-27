@@ -132,18 +132,22 @@ def run_bd(root,name,args):
 def provision_merge_slot(root,name):
     """Create the project's merge slot once, tolerating an existing slot.
 
-    ``bd merge-slot create`` refuses a slot that already exists, so read the
-    slot first: a check that reports a slot state (``available`` present) means
-    there is nothing to do. Any other check result - including an empty result
-    from a test seam or a native error - falls through to create, and a create
-    refusal that reports an existing slot is also success. That keeps an
-    operator retry idempotent without depending on the exact native error text.
+    bd 1.2.2 reports a missing slot as ``{"available": false, "error": "not
+    found", "id": "<project>-merge-slot"}`` with exit code 0, so a missing slot
+    is detected with ``coordination.merge_slot_missing`` instead of by an absent
+    ``available`` key (which is always present). A missing, unparseable or empty
+    check result means there is nothing usable, so create: ``bd merge-slot
+    create`` is idempotent (an existing slot returns ``status: open`` with no
+    refusal). A create refusal naming an existing slot is still tolerated
+    defensively, so an operator retry stays idempotent without depending on the
+    exact native error text.
     """
+    from coordination import merge_slot_missing
     try:
         state=json.loads(run_bd(root,name,['merge-slot','check','--json']))
     except (TypeError,ValueError):
         state=None
-    if isinstance(state,dict) and 'available' in state:return
+    if not merge_slot_missing(state):return
     try:
         run_bd(root,name,['merge-slot','create','--json'])
     except subprocess.CalledProcessError as refusal:
