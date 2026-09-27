@@ -10,7 +10,9 @@ security boundary described in ``docs/HTTP_TRANSPORT_DESIGN.md``:
 * single-use password-reset values,
 * auth expiry (session idle and absolute, worker credentials, reset values) evaluated on
   a monotone clock, ``max(raw now, RecordStore high_water)``, so a backward clock step
-  can never revive an expired item while a forward step still fails closed,
+  can never revive an expired item while a forward step still fails closed, *and* on the
+  raw clock as a real-lifetime bound, so a floor pinned ahead by a corrected forward jump
+  cannot stretch an item's real lifetime either,
 * project membership and the owner/contributor/viewer action matrix,
 * server-derived principals with actor labels treated as attribution only,
 * idempotency records bound to principal + project + route with a separate request
@@ -302,6 +304,14 @@ class RecordStore:
       This is deliberately *not* :meth:`trusted_now`: while suspect that clock is held
       near the anchor so an idempotency record inside its real window can still replay,
       which would keep an expired auth item alive.
+
+      The monotone clock is only one half of an auth expiry. After a forward jump that is
+      later corrected, ``high_water`` stays ahead of the raw host clock and any item
+      issued in the meantime is stamped on that pinned floor, so its monotone deadline is
+      stretched by the jump. An item therefore also carries its raw issuance (and, for an
+      idle refresh, raw last-use) stamp, and expires when either its monotone deadline is
+      reached OR its real age reaches its lifetime (``Service._expired``). The raw half
+      only adds refusals; it never replaces the monotone one.
     """
 
     def __init__(self, path, clock=time.time, max_skew=JOURNAL_MAX_SKEW_SECONDS,
@@ -710,8 +720,66 @@ class Service:
         revive an expired session, worker credential or reset value, and a forward step
         expires one at once (fail closed; re-issue). Timestamps that are only
         informational (audit events, ``created_at``) stay on the raw clock.
+
+        This is the *monotone half* of an auth expiry; :meth:`_expired` adds the item's
+        real age on the raw host clock as the other half, so a floor pinned ahead by a
+        corrected forward jump cannot stretch a lifetime.
         """
         return self.store.records.monotonic_now()
+
+    def _raw_now(self):
+        """The raw host clock (:meth:`Store.now`).
+
+        It is *not* a decision clock on its own: only :meth:`_expired` may use it, as the
+        real-lifetime half of an expiry comparison.
+        """
+        return self.store.now()
+
+    def _expired(self, moment, *, expires_at=None, issued_raw=None, lifetime=None):
+        """Whether one auth item is expired on EITHER clock.
+
+        ``moment`` is :meth:`_expiry_now`, the monotone decision clock: reaching
+        ``expires_at`` expires the item, which is the guarantee that a backward step can
+        never revive something already expired. ``issued_raw``/``lifetime`` add the item's
+        real lifetime on the raw host clock: ``_raw_now() - issued_raw >= lifetime`` also
+        expires it, so a monotone floor left ahead by a corrected forward jump (which is
+        where a new item's stamp comes from while the raw clock catches up) can no longer
+        stretch a session idle/absolute, worker credential or reset lifetime.
+
+        The monotone comparison is never dropped; the raw one only adds refusals. A
+        record that predates the raw stamp (``issued_raw is None``) keeps the monotone
+        rule alone rather than failing open.
+        """
+        if expires_at is not None and moment >= expires_at:
+            return True
+        if issued_raw is None or lifetime is None:
+            return False
+        return self._raw_now() - float(issued_raw) >= float(lifetime)
+
+    def _live_item_expired(self, moment, principal):
+        """Whether the live session/credential behind ``principal`` is expired on either
+        clock.
+
+        The read-only companion of :meth:`_refresh_authority` for decisions that do not
+        take ``store.lock`` (a capability listing). Revocation is included so the two
+        paths agree.
+        """
+        if principal is None:
+            return True
+        if principal.via == 'session':
+            session = self.state['sessions'].get(principal.session_hash)
+            return session is None or session.get('revoked') or self._expired(
+                moment, expires_at=session.get('absolute_expires'),
+                issued_raw=session.get('issued_raw'), lifetime=self.session_absolute) or \
+                self._expired(moment, expires_at=session.get('idle_expires'),
+                              issued_raw=session.get('last_used_raw'),
+                              lifetime=self.session_idle)
+        if principal.via == 'credential':
+            credential = self.state['credentials'].get(principal.credential_id)
+            return credential is None or credential.get('revoked') or self._expired(
+                moment, expires_at=credential.get('expires_at'),
+                issued_raw=credential.get('issued_raw'), lifetime=self.credential_ttl)
+        return True
 
     def audit(self, request_id, principal, action, outcome, *, project_id=None, reason=None,
               actor=None):
@@ -826,8 +894,11 @@ class Service:
             user = self._user(user_id)
             token = new_token()
             # Issued on the monotone clock, so a value issued during a forward jump that
-            # is later corrected never lives past its TTL on that same clock.
+            # is later corrected never lives past its TTL on that same clock. The raw
+            # issuance is stored too, so the real TTL still bounds it while the monotone
+            # floor is pinned ahead of the corrected host clock.
             moment = self._expiry_now()
+            raw = self._raw_now()
             # Reissuing invalidates any previous pending reset for the account.
             for existing, record in list(self.state['reset_tokens'].items()):
                 if record['user_id'] == user_id and not record['used']:
@@ -835,6 +906,7 @@ class Service:
             self.state['reset_tokens'][token_hash(token)] = {
                 'user_id': user_id,
                 'issued_at': moment,
+                'issued_raw': raw,
                 'expires_at': moment + self.reset_ttl,
                 'used': False,
                 'issued_by': principal.user_id,
@@ -850,7 +922,9 @@ class Service:
         with self.store.lock:
             record = self.state['reset_tokens'].get(digest)
             if record is None or record['user_id'] != user_id or record['used'] or \
-                    record['expires_at'] <= self._expiry_now():
+                    self._expired(self._expiry_now(), expires_at=record['expires_at'],
+                                  issued_raw=record.get('issued_raw'),
+                                  lifetime=self.reset_ttl):
                 raise unauthenticated('Invalid or expired reset value')
             user = self._user(user_id)
             record['used'] = True
@@ -948,11 +1022,16 @@ class Service:
             token, csrf = new_token(), new_token()
             # The session's lifecycle is stamped on the monotone clock, so a session
             # issued during a forward jump that is later corrected does not live late.
+            # The raw issuance/last-use stamps preserve the real idle and absolute
+            # lifetimes while that monotone floor is still pinned ahead.
             moment = self._expiry_now()
+            raw = self._raw_now()
             self.state['sessions'][token_hash(token)] = {
                 'user_id': user['id'],
                 'issued_at': moment,
+                'issued_raw': raw,
                 'last_used': moment,
+                'last_used_raw': raw,
                 'idle_expires': moment + self.session_idle,
                 'absolute_expires': moment + self.session_absolute,
                 'revoked': False,
@@ -972,21 +1051,29 @@ class Service:
         """Resolve a bearer session/credential value to a principal, or raise 401.
 
         Session and credential expiry are evaluated on the monotone clock
-        (:meth:`_expiry_now`), never on the raw clock, so a backward step cannot revive
-        an expired item. An idle refresh stamps the new idle deadline on that same clock.
+        (:meth:`_expiry_now`), never on the raw clock alone, so a backward step cannot
+        revive an expired item; the item's raw issuance/last-use stamp adds its real
+        lifetime as a second, independent expiry (:meth:`_expired`). An idle refresh
+        stamps the new idle deadline on the monotone clock and the new raw last-use.
         """
         digest = token_hash(token)
         moment = self._expiry_now()
         with self.store.lock:
             session = self.state['sessions'].get(digest)
             if session is not None:
-                if session['revoked'] or session['absolute_expires'] <= moment or \
-                        session['idle_expires'] <= moment:
+                if session['revoked'] or self._expired(
+                        moment, expires_at=session['absolute_expires'],
+                        issued_raw=session.get('issued_raw'),
+                        lifetime=self.session_absolute) or self._expired(
+                        moment, expires_at=session['idle_expires'],
+                        issued_raw=session.get('last_used_raw'),
+                        lifetime=self.session_idle):
                     raise unauthenticated('Session expired or revoked')
                 user = self.state['users'].get(session['user_id'])
                 if user is None or user['disabled']:
                     raise unauthenticated('Session expired or revoked')
                 session['last_used'] = moment
+                session['last_used_raw'] = self._raw_now()
                 session['idle_expires'] = moment + self.session_idle
                 self.store.save()
                 return Principal(user['id'], user['display_name'], user['superuser'],
@@ -995,7 +1082,10 @@ class Service:
             credential_id = self.state['credential_tokens'].get(digest)
             credential = self.state['credentials'].get(credential_id) if credential_id else None
             if credential is not None:
-                if credential['revoked'] or credential['expires_at'] <= moment:
+                if credential['revoked'] or self._expired(
+                        moment, expires_at=credential['expires_at'],
+                        issued_raw=credential.get('issued_raw'),
+                        lifetime=self.credential_ttl):
                     raise unauthenticated('Credential expired or revoked')
                 user = self.state['users'].get(credential['user_id'])
                 if user is None or user['disabled']:
@@ -1030,8 +1120,13 @@ class Service:
         moment = self._expiry_now()
         if principal.via == 'session':
             session = self.state['sessions'].get(principal.session_hash)
-            if session is None or session['revoked'] or \
-                    session['absolute_expires'] <= moment or session['idle_expires'] <= moment:
+            if session is None or session['revoked'] or self._expired(
+                    moment, expires_at=session['absolute_expires'],
+                    issued_raw=session.get('issued_raw'),
+                    lifetime=self.session_absolute) or self._expired(
+                    moment, expires_at=session['idle_expires'],
+                    issued_raw=session.get('last_used_raw'),
+                    lifetime=self.session_idle):
                 raise unauthenticated('Session expired or revoked')
             user = self.state['users'].get(session['user_id'])
             if user is None or user['disabled']:
@@ -1041,7 +1136,10 @@ class Service:
             return user
         if principal.via == 'credential':
             credential = self.state['credentials'].get(principal.credential_id)
-            if credential is None or credential['revoked'] or credential['expires_at'] <= moment:
+            if credential is None or credential['revoked'] or self._expired(
+                    moment, expires_at=credential['expires_at'],
+                    issued_raw=credential.get('issued_raw'),
+                    lifetime=self.credential_ttl):
                 raise unauthenticated('Credential expired or revoked')
             user = self.state['users'].get(credential['user_id'])
             if user is None or user['disabled']:
@@ -1059,9 +1157,13 @@ class Service:
         This routes through the same :func:`http_authority.decide` rule used by the
         route boundary and the canonical endpoint, so a credential can never exceed
         its issuer's current project role. The decision's ``now`` is the monotone clock,
-        so a capability listing cannot outlive an item that has already expired.
+        so a capability listing cannot outlive an item that has already expired, and the
+        live item's raw real lifetime is applied first (:meth:`_live_item_expired`), so a
+        pinned monotone floor does not list capabilities for a genuinely expired item.
         """
         moment = self._expiry_now()
+        if self._live_item_expired(moment, principal):
+            return frozenset()
         try:
             decide(self.state, authority_request(principal, project_id, CAP_READ),
                    now=moment)
@@ -1278,7 +1380,9 @@ class Service:
             secret = new_token()
             # ``created_at`` is informational and stays on the raw clock; the credential's
             # expiry is stamped on the monotone clock, so a credential issued during a
-            # forward jump that is later corrected does not live late.
+            # forward jump that is later corrected does not live late. ``issued_raw`` keeps
+            # the real issuance instant, so the TTL still bounds it while the monotone floor
+            # is pinned ahead of the corrected host clock.
             moment = self._expiry_now()
             credential = {
                 'id': 'cred_' + secrets.token_hex(8),
@@ -1289,6 +1393,7 @@ class Service:
                 'actor': actor,
                 'token_hash': token_hash(secret),
                 'created_at': now_iso(self._now()),
+                'issued_raw': self._raw_now(),
                 'last_used': None,
                 'expires_at': moment + self.credential_ttl,
                 'revoked': False,

@@ -73,6 +73,19 @@ Round 6 (revision 12, kittrial-5bb.42) adds the monotone auth-expiry case class:
                                        expires early (fail closed) and a following
                                        backward step never revives an expired item,
                                        while normal expiry is unchanged
+
+Round 7 (revision 13, kittrial-5bb.42 rev2) closes the two review items on that revision:
+
+29. ``AuthExpiryMonotonicClockCase`` (extended) -> an item issued after a corrected
+                                       forward jump still expires on its REAL lifetime:
+                                       the raw issuance/last-use stamp is a second,
+                                       independent expiry, so a pinned monotone floor no
+                                       longer stretches a session idle/absolute,
+                                       credential or reset lifetime (J = 8 d and 365 d),
+                                       and the rev1 backward-step guarantee still holds
+30. ``RecordStoreOperatorResetCase`` -> the record store's pinned monotone floor has an
+                                       operator reset (``admin.py record-store
+                                       --reset-high-water``) that keeps ``jump_credit``
 """
 import argparse
 import http.client
@@ -90,10 +103,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import admin
 import http_authority
 import http_service
-from http_auth import (IDEMPOTENCY_TTL_SECONDS, RESULT_RETENTION_SECONDS, HttpError,
-                       Service, Store, now_iso, token_hash)
+from http_auth import (IDEMPOTENCY_TTL_SECONDS, RECORD_STORE_SUFFIX,
+                       RESULT_RETENTION_SECONDS, HttpError, RecordStore, Service, Store,
+                       now_iso, token_hash)
 from http_authority import (AuthorityConfig, JOURNAL_COMMITTED_RETENTION_SECONDS,
                             JOURNAL_MAX_SKEW_SECONDS, JOURNAL_RETENTION_SECONDS,
                             JOURNAL_TOMBSTONE_LIMIT, LEGACY_JOURNAL_FILENAME,
@@ -3746,6 +3761,116 @@ class AuthExpiryMonotonicClockCase(unittest.TestCase):
                                   'another-password-9')
         self.assertTrue(self.service.login('alex', 'another-password-9')['session_token'])
 
+    # -- a pinned floor must not stretch a real lifetime (rev2 review item 1) ---
+    def corrected_jump_stack(self, jump, **service_kwargs):
+        """A service after a forward jump of ``jump`` seconds that was then corrected.
+
+        The jump pins ``high_water`` at ``real + jump`` and the correction leaves it
+        there, so a session minted *after* the correction is stamped on the pinned floor -
+        the reviewer's reproducer. Returns ``(tmp, clock, service, admin, project, real)``.
+        """
+        tmp = unique_dir('authpin12-')
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        clock = [time.time()]
+        real = clock[0]
+        store = Store(tmp / 'state.json', clock=lambda: clock[0])
+        Service.bootstrap_superuser(store, ADMIN, ADMIN_PASSWORD)
+        service = Service(store, **service_kwargs)
+        clock[0] = real + jump
+        with self.assertRaises(HttpError):
+            service.authenticate('not-a-real-token')      # any observation pins it
+        clock[0] = real                                   # the host clock is corrected
+        admin = service.authenticate(
+            service.login(ADMIN, ADMIN_PASSWORD)['session_token'])
+        project = service.create_project(admin, 'Pinned')['id']
+        return tmp, clock, service, admin, project, real
+
+    def test_a_session_issued_after_a_corrected_jump_keeps_its_real_idle_limit(self):
+        # The reviewer measured a session left unused for 6 h real with a 30 min idle
+        # limit still authenticating, because its monotone idle deadline was stretched by
+        # the pinned floor. The raw last-use stamp must expire it on the real window.
+        for jump in (8 * self.DAY, 365 * self.DAY):
+            with self.subTest(jump=jump):
+                tmp, clock, service, admin, project, real = self.corrected_jump_stack(jump)
+                created = service.create_user(admin, 'alex')
+                service.change_password(admin, created['id'], None, self.USER_PASSWORD)
+                token = service.login('alex', self.USER_PASSWORD)['session_token']
+                session = service.state['sessions'][token_hash(token)]
+                self.assertGreaterEqual(session['issued_at'], real + jump)
+                self.assertAlmostEqual(real, session['issued_raw'], delta=1)
+                self.assertEqual(created['id'], service.authenticate(token).user_id)
+                clock[0] = real + 6 * 3600              # unused for 6 h of REAL time
+                with self.assertRaises(HttpError) as caught:
+                    service.authenticate(token)
+                self.assertEqual(401, caught.exception.status)
+                # The raw stamp is durable, so a restart cannot lose it either.
+                reloaded = Service(Store(tmp / 'state.json', clock=lambda: clock[0]))
+                with self.assertRaises(HttpError) as caught:
+                    reloaded.authenticate(token)
+                self.assertEqual(401, caught.exception.status)
+
+    def test_a_session_issued_after_a_corrected_jump_keeps_its_real_absolute_limit(self):
+        for jump in (8 * self.DAY, 365 * self.DAY):
+            with self.subTest(jump=jump):
+                _, clock, service, admin, project, real = self.corrected_jump_stack(
+                    jump, session_idle=10 * self.DAY, session_absolute=3600)
+                created = service.create_user(admin, 'alex')
+                service.change_password(admin, created['id'], None, self.USER_PASSWORD)
+                token = service.login('alex', self.USER_PASSWORD)['session_token']
+                clock[0] = real + 3601                  # idle window is 10 d; only the
+                with self.assertRaises(HttpError) as caught:   # absolute one has passed
+                    service.authenticate(token)
+                self.assertEqual(401, caught.exception.status)
+
+    def test_a_credential_issued_after_a_corrected_jump_keeps_its_real_ttl(self):
+        # The reviewer measured 38.0 d real for a 30 d credential at J = 8 d and 395 d at
+        # J = 365 d. The raw issuance stamp must cut every one of them back to the TTL.
+        for jump in (8 * self.DAY, 365 * self.DAY):
+            with self.subTest(jump=jump):
+                _, clock, service, admin, project, real = self.corrected_jump_stack(jump)
+                issued = service.issue_credential(admin, project)
+                record = service.state['credentials'][issued['id']]
+                self.assertGreaterEqual(record['expires_at'] - service.credential_ttl,
+                                        real + jump)
+                self.assertAlmostEqual(real, record['issued_raw'], delta=1)
+                self.assertEqual(admin.user_id,
+                                 service.authenticate(issued['secret']).user_id)
+                clock[0] = real + service.credential_ttl - 1
+                self.assertEqual(admin.user_id,
+                                 service.authenticate(issued['secret']).user_id)
+                clock[0] = real + service.credential_ttl + 1
+                with self.assertRaises(HttpError) as caught:
+                    service.authenticate(issued['secret'])
+                self.assertEqual(401, caught.exception.status)
+
+    def test_a_reset_issued_after_a_corrected_jump_keeps_its_real_ttl(self):
+        for jump in (8 * self.DAY, 365 * self.DAY):
+            with self.subTest(jump=jump):
+                _, clock, service, admin, project, real = self.corrected_jump_stack(jump)
+                created = service.create_user(admin, 'alex')
+                issued = service.issue_reset(admin, created['id'])
+                record = service.state['reset_tokens'][token_hash(issued['reset_value'])]
+                self.assertGreaterEqual(record['issued_at'], real + jump)
+                self.assertAlmostEqual(real, record['issued_raw'], delta=1)
+                clock[0] = real + service.reset_ttl + 1
+                with self.assertRaises(HttpError) as caught:
+                    service.redeem_reset(created['id'], issued['reset_value'],
+                                         'another-password-9')
+                self.assertEqual(401, caught.exception.status)
+
+    def test_the_rev1_backward_step_guarantee_survives_the_raw_bound(self):
+        # The raw real-lifetime bound only adds refusals; the monotone half still stops a
+        # backward step from reviving an item that a forward jump already expired.
+        secret = self.service.issue_credential(self.admin, self.project)['secret']
+        real = self.jump_forward()                       # past the TTL: 401 now
+        with self.assertRaises(HttpError) as caught:
+            self.service.authenticate(secret)
+        self.assertEqual(401, caught.exception.status)
+        self.clock[0] = real + 600                       # correction *behind* issuance
+        with self.assertRaises(HttpError) as caught:
+            self.service.authenticate(secret)
+        self.assertEqual(401, caught.exception.status)
+
     def test_the_reviewers_credential_backward_step_over_http_stays_refused(self):
         # The reviewer's probe-auth-backward-step through the real HTTP service: issue a
         # credential, jump +40 d (401), step back (base: 200).
@@ -3795,6 +3920,75 @@ class AuthExpiryMonotonicClockCase(unittest.TestCase):
         self.assertEqual(401, call('GET', '/v1/projects/p1', token=secret)[0])
         clock[0] = real + 600
         self.assertEqual(401, call('GET', '/v1/projects/p1', token=secret)[0])
+
+
+def pinned_record_store(tmp):
+    """A record store whose ``high_water`` is 40 d ahead with 40 d of jump credit.
+
+    Returns ``(state_path, record_store_path, real, clock)``.
+    """
+    state = tmp / 'http-state.json'
+    path = tmp / ('http-state.json' + RECORD_STORE_SUFFIX)
+    real = time.time()
+    clock = [real]
+    store = RecordStore(path, clock=lambda: clock[0])
+    store.monotonic_now()                                # high_water = real
+    clock[0] = real + 40 * 86400
+    store.monotonic_now()                                # pinned ahead, credit 40 d
+    return state, path, real, clock
+
+
+class RecordStoreOperatorResetCase(unittest.TestCase):
+    """30. Revision 13: the record store's pinned monotone floor has an operator reset."""
+
+    def test_the_operator_reset_moves_a_pinned_floor_and_keeps_jump_credit(self):
+        tmp = unique_dir('recreset12-')
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        state, path, real, clock = pinned_record_store(tmp)
+        before = RecordStore(path, clock=lambda: clock[0]).stats()['clock_persisted']
+        self.assertAlmostEqual(real + 40 * 86400, before['high_water'], delta=5)
+        self.assertAlmostEqual(40 * 86400, before['jump_credit'], delta=5)
+        self.assertTrue(before['suspect'])
+
+        clock[0] = real                                  # the host clock is corrected
+        report = admin.record_store_reset(state)
+        self.assertAlmostEqual(real, report['high_water'], delta=5)
+        after = RecordStore(path).stats()['clock_persisted']
+        self.assertAlmostEqual(real, after['high_water'], delta=5)
+        self.assertAlmostEqual(40 * 86400, after['jump_credit'], delta=5)   # kept
+        self.assertFalse(after['suspect'])
+
+
+@unittest.skipUnless(os.name == 'posix', 'admin.py operator commands are POSIX only')
+class RecordStoreOperatorCommandCase(unittest.TestCase):
+    """30b. The documented operator command reaches the record-store reset."""
+
+    def test_record_store_reset_high_water_command(self):
+        tmp = unique_dir('reccmd12-')
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        root = tmp / 'root'
+        root.mkdir()
+        state, path, real, clock = pinned_record_store(tmp)
+        clock[0] = real
+        completed = subprocess.run(
+            [sys.executable, str(ROOT / 'admin.py'), '--root', str(root),
+             'record-store', '--state', str(state), '--reset-high-water'],
+            text=True, encoding='utf-8', capture_output=True, timeout=60)
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        report = json.loads(completed.stdout)
+        self.assertAlmostEqual(time.time(), report['high_water'], delta=30)
+        after = RecordStore(path).stats()['clock_persisted']
+        self.assertAlmostEqual(40 * 86400, after['jump_credit'], delta=5)
+        self.assertFalse(after['suspect'])
+        # Inspection without the flag changes nothing.
+        before = after['high_water']
+        completed = subprocess.run(
+            [sys.executable, str(ROOT / 'admin.py'), '--root', str(root),
+             'record-store', '--state', str(state)],
+            text=True, encoding='utf-8', capture_output=True, timeout=60)
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        inspected = RecordStore(path, clock=lambda: clock[0]).stats()['clock_persisted']
+        self.assertAlmostEqual(before, inspected['high_water'], delta=5)
 
 
 if __name__ == '__main__':

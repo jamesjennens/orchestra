@@ -212,36 +212,66 @@ Every place that ages or deletes by time, and what an accepted clock jump does t
 | Journal tombstones (`http_authority`) | confirmed timeline (`aged_from`, `jump_credit`) | No (within the retry contract) | n/a |
 | Journal receipt reclaim, uncertain expiry | raw, only when not suspect | No: worst case `rc=2` refusal | n/a |
 | HTTP idempotency records and committed results (`RecordStore`) | confirmed timeline (`expires_confirmed`) | No: a retry replays or is refused | n/a |
-| Sessions (idle and absolute), worker credentials, reset tokens (`http_auth`) | monotone: `max(raw now, RecordStore high_water)` | No | A forward jump expires existing ones **early** (safe; log in again or re-issue). A backward step, including one that corrects a forward jump, can never revive an item that has already expired: `high_water` never decreases and every auth observation persists it, even a rejection. Items issued during a jump are stamped on the same clock, so a re-issued item works while the raw host catches up |
+| Sessions (idle and absolute), worker credentials, reset tokens (`http_auth`) | monotone `max(raw now, RecordStore high_water)` **and** raw real lifetime (`issued_raw` / `last_used_raw`) | No | A forward jump expires existing ones **early** (safe; log in again or re-issue). A backward step, including one that corrects a forward jump, can never revive an item that has already expired: `high_water` never decreases and every auth observation persists it, even a rejection. Because the floor stays ahead until the raw clock passes it, each item also carries its raw issuance (and raw last use) stamp and expires when **either** clock reaches its lifetime, so a pinned floor cannot stretch a real session idle/absolute, credential or reset lifetime |
+| Auth clock observation (`RecordStore.monotonic_now`) | raw, persisted as `high_water` | No | Not an expiry by itself. Every observation that advances `high_water` is one record-store write transaction, so each authenticated request performs at least one (accepted at office scale; see the cost note) |
 | Login throttle window (in memory) | raw | No | A forward jump clears it early (a few extra attempts); a backward step keeps it longer (safe) |
 | Audit log (`AUDIT_LIMIT`) | count-bounded; timestamps only | No | none |
 
-**Auth expiry uses a monotone clock.** Every auth decision (login, session/credential
+**Auth expiry uses two clocks.** Every auth decision (login, session/credential
 authentication, idle refresh, credential issue, reset issue/redeem, capability checks and
-the canonical endpoint's authority descriptor) compares against
-`max(now, high_water)` from the service's record store. `high_water` is the largest raw
-clock any observation has seen; it never decreases, and the observation is persisted even
-when the decision rejects the request, so a restart cannot lose the floor. `trusted_now`
-is deliberately **not** used for auth expiry: while the clock is suspect it is held near
-the anchor so a record inside its real window can still replay, which would keep an
-expired auth item alive.
+the canonical endpoint's authority descriptor) compares against `max(now, high_water)`
+from the service's record store **and** against the item's real age on the raw host clock.
+`high_water` is the largest raw clock any observation has seen; it never decreases, and
+the observation is persisted even when the decision rejects the request, so a restart
+cannot lose the floor. `trusted_now` is deliberately **not** used for auth expiry: while
+the clock is suspect it is held near the anchor so a record inside its real window can
+still replay, which would keep an expired auth item alive.
 
-Because the decision clock is pinned at `high_water` until the raw clock passes it, a
-forward jump that is later corrected leaves auth items **issued** during the pinned period
-usable on that pinned timeline until the raw host catches up. This is fail-closed for
-items that existed before the jump (they stay expired) and keeps re-issue possible, but it
-is a residual retention effect to know about. After correcting a clock that ran ahead,
-still revoke the sessions, worker credentials and reset tokens issued during the error
-window, then run `python3 admin.py --root <RUNTIME_ROOT> journal <PROJECT>
---reset-high-water` for each project. That command re-arms the **operation journal** only:
-the service record store's own floor is not yet exposed through an operator command
-(`RecordStore.reset_high_water` exists in code), so it clears itself once the raw clock
-passes the jump.
+An item is expired when **either** clock says so:
+
+* the monotone deadline (`expires_at`, `idle_expires`, `absolute_expires`) is reached.
+  This is what stops a backward step from reviving an item, and it is never dropped; or
+* its real lifetime has elapsed: `raw - issued_raw >= lifetime`, and for session idle
+  `raw - last_used_raw >= session_idle`. `issued_raw` and `last_used_raw` are stored
+  beside the monotone stamps for exactly this second comparison.
+
+The raw half is what stops a **forward** jump that is later corrected from stretching a
+lifetime. While `high_water` is pinned ahead of the corrected clock every newly issued
+session, worker credential and reset value is stamped on that floor, so its monotone
+deadline is late by the jump; its real TTL/idle window still expires it on time. An item
+issued *during* the error window (when the raw clock itself was wrong) carries that wrong
+raw stamp, so its raw age is understated by the jump as well: those items must be revoked
+or the floor reset, which is why the operator remedy below covers both.
+
+After correcting a clock that ran ahead, reset the service record store's own floor:
+
+```sh
+sudo -u <SERVICE_USER> python3 admin.py --root <RUNTIME_ROOT> \
+    record-store --state <RUNTIME_ROOT>/http-state.json --reset-high-water
+```
+
+That sets `high_water` to the corrected clock and clears suspicion while keeping
+`jump_credit`, so sessions, worker credentials and reset values issued while the floor was
+pinned stop being stamped on it (the same command without `--reset-high-water` only
+reports). **Revoking items issued during the error window is not enough**: it does not
+cover items issued *after* the correction (a new login, worker credential or reset), which
+are the ones stamped on the pinned floor and stretched by the jump - the clock must be
+reset. For completeness also revoke the sessions, worker credentials and reset tokens
+issued *during* the error window, and run the operation-journal equivalent
+`python3 admin.py --root <RUNTIME_ROOT> journal <PROJECT> --reset-high-water` for each
+project.
 
 After correcting a clock that ran **behind**, nothing is extended. The login throttle
 window (in memory) is a rate limit, not an item expiry, so it stays on the raw clock: a
 backward step only lengthens it, and a forward step clears it early while also expiring
 every session and credential.
+
+**Cost note (accepted at office scale).** Persisting the monotone floor means every auth
+observation that advances `high_water` is a record-store write transaction, and one
+authenticated request observes at least once (a session/credential authenticate plus the
+authority check). That is acceptable for a single office service with a per-process lock;
+a materially higher request rate would need the floor held in memory under the same
+single-writer discipline, with the same persisted-on-rejection rule.
 
 ## 8. Backup, restore and rollback
 
@@ -433,13 +463,22 @@ sudo -u <SERVICE_USER> python3 admin.py --root <RUNTIME_ROOT> journal <PROJECT> 
 # after correcting a wrong clock: high_water = now and clear suspicion
 sudo -u <SERVICE_USER> python3 admin.py --root <RUNTIME_ROOT> journal <PROJECT> --reset-high-water
 
+# the same recovery for the service record store's monotone auth floor (keeps jump_credit);
+# without the flag it only reports the floor and the state/record-store paths
+sudo -u <SERVICE_USER> python3 admin.py --root <RUNTIME_ROOT> record-store \
+    --state <RUNTIME_ROOT>/http-state.json --reset-high-water
+
 # explicit override after reconciling canonical state: remove a still-live identity
 sudo -u <SERVICE_USER> python3 admin.py --root <RUNTIME_ROOT> journal <PROJECT> \
     --prune-before <EPOCH_SECONDS>
 ```
 
 `--reset-high-water` sets `high_water` to the current clock and clears suspicion; it
-never reduces `jump_credit`, so tombstones keep ageing on the confirmed timeline. No
+never reduces `jump_credit`, so tombstones keep ageing on the confirmed timeline. The
+`record-store --reset-high-water` command applies exactly the same rule to the HTTP
+record store's monotone auth clock (`<state>.records.sqlite3`), keeping its own
+`jump_credit`, and is the remedy that stops auth items issued after a corrected forward
+jump from being stamped on the pinned floor. No
 operator action is needed after an idle gap (suspicion settles by itself after an
 hour). Use it after correcting a clock that had jumped forward: it re-arms jump
 detection and ends the capped-expiry period at once. It removes no identity by itself.
