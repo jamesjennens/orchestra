@@ -435,18 +435,38 @@ def project(issue, operators=None):
     return projection(ordered, voids, invalid, refused, positions)
 
 
-def require_integrated_follow_on(payload, state, rows, task):
+def approving_record(ordered, contribution_id):
+    """The native ``approve`` comment the shared projection counted for a revision.
+
+    A later contribution resets the approval and the projection refuses to approve
+    while requests are unresolved, so the LAST ``approve`` naming this contribution
+    is the record the projection used. The native author on that comment is the
+    attribution the follow-on gate checks; it is the transport's record of who
+    actually wrote the approval.
+    """
+    found = None
+    for p, c in ordered:
+        if p['operation'] == 'approve' and p['contribution'] == contribution_id:
+            found = c
+    return found
+
+
+def require_integrated_follow_on(payload, state, ordered, rows, task, assignee=None):
     """Refuse an additive follow-on whose prior revision is not genuinely approved.
 
     ``follows`` asserts that the reviewer's base is already integrated, so the gate
-    requires two independent things, both read from the shared review-state
-    projection, before the sole native ``comments add``:
+    requires three independent things before the sole native ``comments add``:
 
     * the raw append-only chain must show the prior revision **approved with no
-      unresolved requests** (``awaiting-integration``). Approval is a separate
-      reviewer operation, so a contributor cannot record it for itself, unlike a
-      ``integrated=passed`` lifecycle fact (the lifecycle action only requires
-      ``payload.actor == request actor``).
+      unresolved requests** (``awaiting-integration``);
+    * that approving record's **native author** must differ from both the prior
+      contribution's author and the current task assignee. Native comment authors
+      supply *attribution, not authentication*, on the SSH/endpoint path: a caller
+      can label itself anything, so this check refuses the contributor's own
+      approval (and the assignee's) without pretending to be an identity system.
+      The HTTP ``CAP_APPROVE`` capability is the real approval authority: there the
+      native author is bound to the authenticated principal, so a worker credential
+      cannot approve at all;
     * the shared per-scope integration evidence (kittrial-5bb.24,
       ``review_state.integration`` over ``review_state.scopes_for``) must record a
       passed ``integrated`` fact for the prior contribution's FULL commit, and the
@@ -469,6 +489,20 @@ def require_integrated_follow_on(payload, state, rows, task):
         raise ValueError('Contribution follows a revision that is not approved; a reviewer must '
                          'approve the prior contribution with no unresolved requests before an '
                          'additive follow-on can use it as its base')
+    approval = approving_record(ordered, prior['comment_id'])
+    if approval is None:
+        raise ValueError('Contribution follows a revision that is not approved; a reviewer must '
+                         'approve the prior contribution with no unresolved requests before an '
+                         'additive follow-on can use it as its base')
+    author = approval.get('author')
+    if author == prior.get('author'):
+        raise ValueError('Contribution follows a revision approved by its own author; an additive '
+                         'follow-on requires an approving record whose native author is neither the '
+                         'prior contribution author nor the task assignee')
+    if assignee and author == assignee:
+        raise ValueError('Contribution follows a revision approved by the task assignee; an additive '
+                         'follow-on requires an approving record whose native author is neither the '
+                         'prior contribution author nor the task assignee')
     from review_state import integration, scopes_for
     evidence = integration(prior, scopes_for(rows, task))
     if evidence['fact'] != 'passed' or not evidence['integration_commit']:
@@ -515,11 +549,12 @@ def execute(rows, task, actor, payload, run, operators=None):
     preview_positions['pending-write'] = len(issue.get('comments') or [])
     preview = projection(ordered + [(payload, {'id': 'pending-write', 'author': actor, 'created_at': 'pending'})],
                          voids, invalid, refused, preview_positions)
-    # A follow-on may only base itself on an approved, integrated prior revision.
-    # Resolve both from the shared review-state projection here, still before the
-    # sole native mutation, so the refusal happens with zero writes.
+    # A follow-on may only base itself on a prior revision approved by a distinct
+    # native author and genuinely integrated. Resolve the approving record from the
+    # chain and the integration evidence from the shared review-state projection
+    # here, still before the sole native mutation, so the refusal writes nothing.
     if payload['operation'] == 'contribute' and payload.get('follows') is not None:
-        require_integrated_follow_on(payload, state, rows, task)
+        require_integrated_follow_on(payload, state, ordered, rows, task, issue.get('assignee'))
     result = json.loads(run(['comments', 'add', task, PREFIX + canonical_bytes(payload).decode(), '--json']))
     return dict(comment_id=str(result['id']), reconciled=False, **receipt(preview, rows, task))
 

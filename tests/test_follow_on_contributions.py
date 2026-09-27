@@ -4,18 +4,21 @@ An additive second change to a task whose contribution is already integrated use
 the optional ``follows`` relation instead of being forced to declare that it
 ``supersedes`` (retracts) the integrated revision. These tests pin:
 
-* the follow-on gate: the prior revision must be **approved by a reviewer** in the
-  append-only chain (``awaiting-integration``, nothing pending) **and** the shared
-  review-state projection must record a passed ``integrated`` fact for the prior
-  contribution's full commit, in any scope, with ``base_commit`` equal to that
-  scope's ``integration_commit``;
-* a self-recorded ``integrated=passed`` lifecycle fact by the contributor alone
-  does NOT open the gate, and neither does a changes-requested prior; all refusals
-  write nothing;
+* the follow-on gate: the prior revision must be **approved by a record whose
+  native author is neither the prior contribution's author nor the task assignee**
+  in the append-only chain (``awaiting-integration``, nothing pending) **and** the
+  shared review-state projection must record a passed ``integrated`` fact for the
+  prior contribution's full commit, in any scope, with ``base_commit`` equal to
+  that scope's ``integration_commit``;
+* a self-approval, an assignee approval, a self-recorded ``integrated=passed``
+  lifecycle fact by the contributor alone and a changes-requested prior do NOT open
+  the gate; all refusals write nothing;
 * a newer lifecycle scope recorded for other work does not make a genuinely
   integrated prior un-followable (the shared projection is per-scope);
 * no scoped evidence at all fails closed (there is no ``fact is None`` fallback);
 * the accepted additive follow-on on an integrated prior;
+* the HTTP review binding forwards the optional ``follows`` relation intact, so a
+  follow-on over HTTP never silently becomes a first contribution or a supersede;
 * the bounded ``brief`` prior-contribution slice with a complete ``review TASK``;
 * what remains visible for a prior contribution after the follow-on records its
   own lifecycle scope (record/commit/relation, not re-scoped lifecycle facts).
@@ -44,6 +47,7 @@ class FollowOnChainTests(unittest.TestCase):
                           status='in_progress', labels=[], comments=[])
         self.rows = [self.issue]
         self.count = 0
+        self.actor = 'worker'
 
     def payload(self, op, **extra):
         self.count += 1
@@ -61,11 +65,14 @@ class FollowOnChainTests(unittest.TestCase):
 
     def run_native(self, args):
         cid = str(len(self.issue['comments']) + 1)
-        self.issue['comments'].append(dict(id=cid, text=args[3], author='worker',
+        self.issue['comments'].append(dict(id=cid, text=args[3], author=self.actor,
                                            created_at='2026-09-16T00:00:00Z'))
         return json.dumps({'id': cid})
 
     def send(self, p, actor='worker'):
+        # The native comment author is the acting actor, as a real endpoint records
+        # attribution; the follow-on gate reads that author, not the actor label.
+        self.actor = actor
         return w.execute(self.rows, 'task-1', actor, p, self.run_native)
 
     def record_lifecycle(self, source_commit, integration_commit, scope_op='scope-1', integrated=True,
@@ -153,6 +160,36 @@ class FollowOnChainTests(unittest.TestCase):
             self.send(self.contribution(COMMIT_2, base=MERGE_1, supersedes=None, follows=first))
         self.assertEqual(len(self.issue['comments']), before)
 
+    def test_self_approval_does_not_open_the_follow_on_gate(self):
+        """Item 1: the contributor approves its own revision and fabricates the
+        scoped integration fact; the gate stays shut and writes nothing.
+
+        Native comment authors are attribution, not authentication, on the SSH
+        path, so the gate refuses an approval whose native author is the prior
+        contribution's own author instead of pretending to verify an identity.
+        """
+        first = self.send(self.contribution(COMMIT_1))['comment_id']
+        self.send(self.payload('approve', contribution=first, summary='Self approved'), 'worker')
+        self.record_lifecycle(COMMIT_1, MERGE_1, actor='worker')
+        self.assertEqual(w.project(self.issue)['review_state'], 'awaiting-integration')
+        before = len(self.issue['comments'])
+        with self.assertRaisesRegex(ValueError, 'approved by its own author'):
+            self.send(self.contribution(COMMIT_2, base=MERGE_1, supersedes=None, follows=first))
+        self.assertEqual(len(self.issue['comments']), before)
+
+    def test_assignee_approval_does_not_open_the_follow_on_gate(self):
+        """Item 1: a handoff leaves the new assignee approving the prior revision."""
+        first = self.send(self.contribution(COMMIT_1))['comment_id']
+        self.issue['assignee'] = 'owner'   # the task is handed off after contributing
+        self.send(self.payload('approve', contribution=first, summary='Approved as owner'), 'owner')
+        self.record_lifecycle(COMMIT_1, MERGE_1, actor='owner')
+        self.assertEqual(w.project(self.issue)['review_state'], 'awaiting-integration')
+        before = len(self.issue['comments'])
+        with self.assertRaisesRegex(ValueError, 'approved by the task assignee'):
+            self.send(self.contribution(COMMIT_2, base=MERGE_1, supersedes=None, follows=first),
+                      'owner')
+        self.assertEqual(len(self.issue['comments']), before)
+
     def test_changes_requested_prior_is_refused_even_when_self_integrated(self):
         first = self.send(self.contribution(COMMIT_1))['comment_id']
         self.send(self.payload('request-changes', contribution=first,
@@ -198,19 +235,74 @@ class FollowOnChainTests(unittest.TestCase):
 
     def test_shared_projection_without_scoped_evidence_fails_closed(self):
         """No ``fact is None`` fallback: an empty shared projection refuses the follow-on."""
-        payload = dict(operation='contribute', follows='1', base_commit='b' * 40)
+        first = self.send(self.contribution(COMMIT_1))['comment_id']
+        self.send(self.payload('approve', contribution=first, summary='Reviewed'), 'reviewer')
+        ordered = w.records(self.issue)
+        state = w.projection(ordered)
+        self.assertEqual(state['review_state'], 'awaiting-integration')
+        payload = dict(operation='contribute', follows=first, base_commit=MERGE_1)
         # The task row exists but records no trusted scope, so the shared projection
         # reports fact='unknown' and the gate fails closed.
-        approved = dict(contribution={'commit': COMMIT_1}, review_state='awaiting-integration',
-                        pending_requests=[])
         with self.assertRaisesRegex(ValueError, 'not integrated'):
-            w.require_integrated_follow_on(payload, approved, self.rows, 'task-1')
-        for state in (dict(approved, review_state='awaiting-review'),
-                      dict(approved, review_state='changes-requested'),
-                      dict(approved, review_state='awaiting-integration',
-                           pending_requests=[{'item': 'fix'}])):
+            w.require_integrated_follow_on(payload, state, ordered, self.rows, 'task-1', 'worker')
+        for altered in (dict(state, review_state='awaiting-review'),
+                        dict(state, review_state='changes-requested'),
+                        dict(state, review_state='awaiting-integration',
+                             pending_requests=[{'item': 'fix'}])):
             with self.assertRaisesRegex(ValueError, 'not approved'):
-                w.require_integrated_follow_on(payload, state, self.rows, 'task-1')
+                w.require_integrated_follow_on(payload, altered, ordered, self.rows,
+                                               'task-1', 'worker')
+
+    def test_http_binding_forwards_follows_and_keeps_legacy_bodies_exact(self):
+        """Item 2: the HTTP review binding must not silently drop ``follows``.
+
+        kittrial-5bb.19 forwarded only the required canonical field list, so an
+        HTTP follow-on either failed closed or became a first contribution or a
+        supersede. The forwarded body must carry the optional relation, and a
+        legacy payload without it must keep the exact legacy field set.
+        """
+        import http_service
+        backend = http_service.EndpointBackend.__new__(http_service.EndpointBackend)
+        first = '1'
+        base = {'task_id': 'task-1', 'operation': 'contribute', 'schema_version': 1,
+                'previous': first, 'operation_id': 'op-http', 'repository': 'ssh://git.example/p',
+                'commit': COMMIT_2, 'base_commit': MERGE_1, 'supersedes': None,
+                'delivery': dict(kind='bundle', path='koopa:/y.bundle', sha256='c' * 64),
+                'summary': 'follow-on over http'}
+        _, _, args, attachments = backend._command('reviews.add', None, 'proj',
+                                                   dict(base, follows=first), 'f' * 64)
+        self.assertEqual(['task-1', '@attachment:0'], args)
+        body = json.loads(attachments['0']['text'])
+        self.assertEqual(first, body['follows'])
+        w.validate(body, 'task-1')
+        # A legacy payload without the optional field keeps the exact legacy set.
+        _, _, _, plain_attachments = backend._command('reviews.add', None, 'proj',
+                                                      dict(base), 'f' * 64)
+        plain = json.loads(plain_attachments['0']['text'])
+        self.assertNotIn('follows', plain)
+        w.validate(plain, 'task-1')
+
+    def test_http_forwarded_body_stays_a_follow_on(self):
+        """The forwarded HTTP body records a ``follows`` relation, not a first/supersede."""
+        import http_service
+        first = self.integration_case()
+        payload = {'task_id': 'task-1', 'operation': 'contribute', 'schema_version': 1,
+                   'previous': w.project(self.issue)['latest_comment_id'],
+                   'operation_id': 'op-http-follow', 'repository': 'ssh://git.example/p',
+                   'commit': COMMIT_2, 'base_commit': MERGE_1, 'supersedes': None,
+                   'follows': first,
+                   'delivery': dict(kind='bundle', path='koopa:/y.bundle', sha256='c' * 64),
+                   'summary': 'follow-on over http'}
+        backend = http_service.EndpointBackend.__new__(http_service.EndpointBackend)
+        _, _, _, attachments = backend._command('reviews.add', None, 'proj', payload, 'f' * 64)
+        body = json.loads(attachments['0']['text'])
+        self.assertEqual(first, body['follows'])
+        second = self.send(body)['comment_id']
+        state = w.project(self.issue)
+        self.assertEqual(state['contribution']['comment_id'], second)
+        self.assertEqual(state['contribution']['follows'], first)
+        self.assertIsNone(state['contribution']['supersedes'])
+        self.assertEqual([c['relation'] for c in state['prior_contributions']], ['follows'])
 
     def test_legacy_supersede_chain_still_tags_the_replaced_revision(self):
         first = self.send(self.contribution(COMMIT_1))['comment_id']

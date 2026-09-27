@@ -769,6 +769,57 @@ class CanonicalProtocolCase(EndpointCase):
             self.assertEqual('task-1', body['task'])
 
 
+class HttpFollowsForwardingCase(EndpointCase):
+    """http-drops-follows: the optional additive ``follows`` relation survives HTTP.
+
+    kittrial-5bb.19 forwarded only the required canonical field list
+    (``REVIEW_FIELDS['contribute']``), so a follow-on over HTTP either failed closed
+    ("must explicitly supersede or follow") or was silently recorded as a first
+    contribution or a supersede. These pin the optional field at both HTTP seams:
+    the service body binding and the client request body.
+    """
+
+    def review_body(self, payload):
+        _, _, args, attachments = self.backend._command('reviews.add', None, 'pp-1',
+                                                       payload, 'f' * 64)
+        self.assertEqual(['t-1', '@attachment:0'], args)
+        return json.loads(attachments['0']['text'])
+
+    def payload(self, **extra):
+        body = {'task_id': 't-1', 'operation': 'contribute', 'schema_version': 1,
+                'previous': None, 'operation_id': 'op-http-follows',
+                'repository': 'https://example.invalid/repo.git', 'commit': COMMIT,
+                'base_commit': BASE, 'supersedes': None,
+                'delivery': {'kind': 'bundle', 'path': 'koopa:/tmp/x.bundle',
+                             'sha256': BUNDLE},
+                'summary': 'delivered'}
+        body.update(extra)
+        return body
+
+    def test_service_body_carries_follows_and_legacy_bodies_stay_exact(self):
+        from review_workflow import validate
+        prior = 'prior-contribution-1'
+        body = self.review_body(self.payload(follows=prior))
+        self.assertEqual(prior, body['follows'])
+        validate(body, 't-1')  # raises if the field set or values are wrong
+        # A legacy payload without the optional field keeps the exact legacy set.
+        legacy = self.review_body(self.payload())
+        self.assertNotIn('follows', legacy)
+        validate(legacy, 't-1')
+
+    def test_client_sends_follows_in_the_review_body(self):
+        from http_client import Client
+        sent = {}
+        client = Client('http://127.0.0.1:1')
+        client.request = lambda method, path, body=None, **kw: (
+            sent.update(body), {'ok': True})[1]
+        client.add_review('pp-1', 't-1', 'contribute', operation_id='op-client',
+                          previous=None, commit=COMMIT, base_commit=BASE,
+                          bundle_sha256=BUNDLE, summary='delivered', supersedes=None,
+                          follows='prior-contribution-1')
+        self.assertEqual('prior-contribution-1', sent['follows'])
+
+
 class CanonicalLostResultCase(EndpointCase):
     """2. canonical-lost-result: response loss before the local receipt."""
 
