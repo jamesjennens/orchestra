@@ -1,0 +1,466 @@
+"""Multi-project scheduled backup: status file, coverage guidance and compatibility.
+
+kittrial-5bb.39: a project added after installation silently fell outside the
+installation's single-project schedule. These tests cover the multi-project /
+``--all`` invocation, the honest per-project status file, the read/verify path,
+the unchanged single-project form and the exact schedule guidance ``add-project``
+prints.
+"""
+import contextlib
+import io
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import admin
+
+
+def make_project(root, name):
+    """Create the native marker a project must carry to be an initialized target."""
+    path = root / 'projects' / name
+    (path / '.beads').mkdir(parents=True, exist_ok=True)
+    (path / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+    return path
+
+
+def write_pair(root, name, status='complete'):
+    (root / 'backups' / name).mkdir(parents=True, exist_ok=True)
+    (root / 'backups' / (name + '.coordination.json')).write_text(
+        json.dumps({'schema_version': 1, 'status': status}), encoding='utf-8')
+
+
+class BackupCommandCase(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / 'backups').mkdir()
+        for name in ('alpha', 'beta'):
+            make_project(self.root, name)
+        self.calls = []
+
+    def fake_backup(self, fail=(), pending=(), no_native=()):
+        def backup(root, name):
+            self.calls.append(name)
+            if name in fail:
+                raise RuntimeError('sync refused for ' + name)
+            if name not in no_native:
+                (root / 'backups' / name).mkdir(parents=True, exist_ok=True)
+            (root / 'backups' / (name + '.coordination.json')).write_text(
+                json.dumps({'schema_version': 1, 'status': 'pending' if name in pending else 'complete'}),
+                encoding='utf-8')
+            return 'native output for ' + name
+        return backup
+
+    def run_admin(self, *argv):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        code = 0
+        with patch.object(sys, 'argv', ['admin.py', '--root', str(self.root), *argv]), \
+                patch.object(admin, 'root_path', return_value=self.root), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                admin.main()
+            except SystemExit as exit:
+                code = exit.code if isinstance(exit.code, int) else 1
+                if exit.code is not None and not isinstance(exit.code, int):
+                    stderr.write(str(exit.code))
+        return stdout.getvalue(), stderr.getvalue(), code
+
+    def status_text(self):
+        return (self.root / 'backups' / admin.BACKUP_STATUS_NAME).read_text(encoding='utf-8')
+
+    def test_all_projects_backs_up_every_initialized_project(self):
+        with patch.object(admin, 'backup_project', side_effect=self.fake_backup()):
+            stdout, stderr, code = self.run_admin('backup', '--all')
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(self.calls, ['alpha', 'beta'])
+        self.assertIn('native output for alpha', stdout)
+        self.assertIn('native output for beta', stdout)
+        self.assertIn('Backed up 2 of 2 project(s)', stdout)
+        record = admin.read_backup_status(self.root)
+        self.assertEqual(record['schema_version'], 1)
+        self.assertEqual(record['scope'], 'all')
+        self.assertEqual(record['status'], 'complete')
+        self.assertEqual([entry['name'] for entry in record['projects']], ['alpha', 'beta'])
+        for entry in record['projects']:
+            self.assertEqual(entry['status'], 'complete')
+            self.assertTrue(admin.utc_timestamp(entry['completed_at']))
+            self.assertEqual(entry['pair'], {'native': 'backups/' + entry['name'],
+                                             'coordination': 'backups/' + entry['name'] + '.coordination.json'})
+        self.assertTrue(admin.utc_timestamp(record['generated_at']))
+        # Deterministic JSON: the file is exactly the sorted-key dump of its record.
+        self.assertEqual(self.status_text(), json.dumps(record, ensure_ascii=False, sort_keys=True))
+
+    def test_several_named_projects_run_in_one_invocation(self):
+        with patch.object(admin, 'backup_project', side_effect=self.fake_backup()):
+            stdout, stderr, code = self.run_admin('backup', 'beta', 'alpha')
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(self.calls, ['alpha', 'beta'])
+        record = admin.read_backup_status(self.root)
+        self.assertEqual(record['scope'], 'named')
+        self.assertEqual(record['status'], 'complete')
+
+    def test_single_project_form_keeps_its_stdout_and_exit(self):
+        with patch.object(admin, 'backup_project', side_effect=self.fake_backup()) as backup:
+            stdout, stderr, code = self.run_admin('backup', 'alpha')
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(stdout, 'native output for alpha\n')
+        self.assertEqual(stderr, '')
+        backup.assert_called_once_with(self.root, 'alpha')
+        record = admin.read_backup_status(self.root)
+        self.assertEqual(record['scope'], 'named')
+        self.assertEqual([entry['name'] for entry in record['projects']], ['alpha'])
+
+    def test_one_failed_project_does_not_stop_the_others_and_is_recorded(self):
+        with patch.object(admin, 'backup_project', side_effect=self.fake_backup(fail=('alpha',))):
+            stdout, stderr, code = self.run_admin('backup', '--all')
+        self.assertNotEqual(code, 0)
+        self.assertEqual(self.calls, ['alpha', 'beta'])
+        self.assertIn('native output for beta', stdout)
+        self.assertIn('backup failed for alpha', stderr)
+        self.assertIn('sync refused for alpha', stderr)
+        record = admin.read_backup_status(self.root)
+        self.assertEqual(record['status'], 'incomplete')
+        entries = {entry['name']: entry for entry in record['projects']}
+        self.assertEqual(entries['alpha']['status'], 'failed')
+        self.assertIn('sync refused for alpha', entries['alpha']['reason'])
+        self.assertNotIn('completed_at', entries['alpha'])
+        self.assertEqual(entries['beta']['status'], 'complete')
+
+    def test_a_pending_sidecar_is_never_recorded_complete(self):
+        with patch.object(admin, 'backup_project', side_effect=self.fake_backup(pending=('beta',))):
+            stdout, stderr, code = self.run_admin('backup', '--all')
+        self.assertNotEqual(code, 0)
+        entries = {entry['name']: entry for entry in admin.read_backup_status(self.root)['projects']}
+        self.assertEqual(entries['beta']['status'], 'failed')
+        self.assertIn('not complete', entries['beta']['reason'])
+        self.assertEqual(entries['alpha']['status'], 'complete')
+
+    def test_a_missing_native_directory_is_never_recorded_complete(self):
+        with patch.object(admin, 'backup_project', side_effect=self.fake_backup(no_native=('beta',))):
+            stdout, stderr, code = self.run_admin('backup', '--all')
+        self.assertNotEqual(code, 0)
+        entries = {entry['name']: entry for entry in admin.read_backup_status(self.root)['projects']}
+        self.assertEqual(entries['beta']['reason'], 'native backup directory is missing')
+
+    def test_uninitialized_named_project_is_skipped_and_names_its_reason(self):
+        with patch.object(admin, 'backup_project', side_effect=self.fake_backup()) as backup:
+            stdout, stderr, code = self.run_admin('backup', 'gamma')
+        self.assertNotEqual(code, 0)
+        backup.assert_not_called()
+        self.assertEqual(stderr.count('backup skipped for gamma'), 1)
+        record = admin.read_backup_status(self.root)
+        self.assertEqual(record['status'], 'incomplete')
+        self.assertEqual(record['projects'],
+                         [{'name': 'gamma', 'status': 'skipped',
+                           'reason': 'not an initialized project in this runtime'}])
+
+    def test_a_run_without_targets_is_refused_rather_than_recorded_empty(self):
+        with self.assertRaises(ValueError):
+            admin.backup_projects(self.root, [], False)
+        empty = Path(self.temp.name) / 'emptyruntime'
+        (empty / 'backups').mkdir(parents=True)
+        with patch.object(admin, 'backup_project') as backup:
+            with self.assertRaises(ValueError):
+                admin.backup_projects(empty, [], True)
+        backup.assert_not_called()
+        self.assertFalse((empty / 'backups' / admin.BACKUP_STATUS_NAME).exists())
+
+    def test_all_with_named_projects_is_refused_rather_than_ignored(self):
+        with self.assertRaisesRegex(ValueError, 'do not also name projects'):
+            admin.backup_projects(self.root, ['alpha'], True)
+        self.assertFalse((self.root / 'backups' / admin.BACKUP_STATUS_NAME).exists())
+
+    def test_initialized_projects_ignores_stray_and_unusable_directories(self):
+        (self.root / 'projects' / 'stray').mkdir()
+        (self.root / 'projects' / 'bad_name').mkdir()
+        (self.root / 'projects' / 'bad_name' / '.beads').mkdir()
+        (self.root / 'projects' / 'bad_name' / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+        self.assertEqual(admin.initialized_projects(self.root), ['alpha', 'beta'])
+        try:
+            (self.root / 'projects' / 'linked').symlink_to(self.root / 'projects' / 'alpha',
+                                                           target_is_directory=True)
+        except OSError:
+            return
+        self.assertEqual(admin.initialized_projects(self.root), ['alpha', 'beta'])
+
+
+class BackupStatusReadCase(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / 'backups').mkdir()
+        for name in ('alpha', 'beta'):
+            make_project(self.root, name)
+            write_pair(self.root, name)
+        self.record = {'schema_version': 1, 'scope': 'all', 'generated_at': '2026-09-27T16:00:00Z',
+                       'status': 'complete',
+                       'projects': [{'name': name, 'status': 'complete',
+                                     'completed_at': '2026-09-27T16:00:00Z',
+                                     'pair': {'native': 'backups/' + name,
+                                              'coordination': 'backups/' + name + '.coordination.json'}}
+                                    for name in ('alpha', 'beta')]}
+
+    def run_status(self, *argv):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        code = 0
+        with patch.object(sys, 'argv', ['admin.py', '--root', str(self.root), *argv]), \
+                patch.object(admin, 'root_path', return_value=self.root), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                admin.main()
+            except SystemExit as exit:
+                code = exit.code if isinstance(exit.code, int) else 1
+                if exit.code is not None and not isinstance(exit.code, int):
+                    stderr.write(str(exit.code))
+        return stdout.getvalue(), stderr.getvalue(), code
+
+    def test_status_file_is_published_only_after_validation(self):
+        admin.write_backup_status(self.root, self.record)
+        self.assertEqual(admin.read_backup_status(self.root), self.record)
+        bad = json.loads(json.dumps(self.record))
+        bad['projects'][0]['status'] = 'failed'
+        bad['projects'][0]['reason'] = 'sync failed'
+        with self.assertRaises(ValueError):
+            admin.write_backup_status(self.root, bad)
+        # The refused record did not replace the valid one.
+        self.assertEqual(admin.read_backup_status(self.root), self.record)
+
+    def test_require_complete_accepts_a_complete_all_run(self):
+        admin.write_backup_status(self.root, self.record)
+        stdout, stderr, code = self.run_status('backup-status', '--require-complete')
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout), self.record)
+
+    def test_require_complete_refuses_a_named_run_that_cannot_cover_every_project(self):
+        named = json.loads(json.dumps(self.record))
+        named['scope'] = 'named'
+        named['projects'] = named['projects'][:1]
+        admin.write_backup_status(self.root, named)
+        stdout, stderr, code = self.run_status('backup-status', '--require-complete')
+        self.assertNotEqual(code, 0)
+        self.assertIn('named run', stderr)
+
+    def test_require_complete_detects_a_pair_removed_after_the_run(self):
+        admin.write_backup_status(self.root, self.record)
+        (self.root / 'backups' / 'beta').rmdir()
+        stdout, stderr, code = self.run_status('backup-status', '--require-complete')
+        self.assertNotEqual(code, 0)
+        self.assertIn('beta: native backup directory is missing', stderr)
+
+    def test_require_complete_detects_a_sidecar_that_became_pending(self):
+        admin.write_backup_status(self.root, self.record)
+        write_pair(self.root, 'alpha', 'pending')
+        stdout, stderr, code = self.run_status('backup-status', '--require-complete')
+        self.assertNotEqual(code, 0)
+        self.assertIn('alpha', stderr)
+        self.assertIn('not complete', stderr)
+
+    def test_missing_or_malformed_status_file_is_refused(self):
+        with self.assertRaisesRegex(ValueError, 'No backup status file'):
+            admin.read_backup_status(self.root)
+        path = self.root / 'backups' / admin.BACKUP_STATUS_NAME
+        path.write_text('{bad', encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'not readable JSON'):
+            admin.read_backup_status(self.root)
+
+    def test_status_file_symlink_is_refused(self):
+        path = self.root / 'backups' / admin.BACKUP_STATUS_NAME
+        try:
+            path.symlink_to(self.root / 'backups' / 'alpha.coordination.json')
+        except OSError as exc:
+            self.skipTest('Symlink privilege unavailable: ' + str(exc))
+        with self.assertRaisesRegex(ValueError, 'must not be a symlink'):
+            admin.read_backup_status(self.root)
+
+
+class ValidateBackupStatusCase(unittest.TestCase):
+    def record(self, **overrides):
+        data = {'schema_version': 1, 'scope': 'all', 'generated_at': '2026-09-27T16:00:00Z',
+                'status': 'complete',
+                'projects': [{'name': 'alpha', 'status': 'complete',
+                              'completed_at': '2026-09-27T16:00:00Z',
+                              'pair': {'native': 'backups/alpha',
+                                       'coordination': 'backups/alpha.coordination.json'}}]}
+        data.update(overrides)
+        return data
+
+    def test_a_supported_record_validates(self):
+        self.assertIsNone(admin.validate_backup_status(self.record()))
+        self.assertIsNone(admin.validate_backup_status(self.record(
+            status='incomplete',
+            projects=[{'name': 'alpha', 'status': 'failed', 'reason': 'sync failed'},
+                      {'name': 'beta', 'status': 'skipped', 'reason': 'not initialized'}])))
+
+    def test_records_that_could_overclaim_completeness_are_refused(self):
+        cases = {
+            'not an object': [],
+            'schema': self.record(schema_version=2),
+            'scope': self.record(scope='partial'),
+            'generated_at': self.record(generated_at='yesterday'),
+            'empty projects': self.record(projects=[]),
+            'run status disagrees': self.record(
+                status='complete',
+                projects=[{'name': 'alpha', 'status': 'failed', 'reason': 'sync failed'}]),
+            'unknown status': self.record(
+                status='incomplete',
+                projects=[{'name': 'alpha', 'status': 'ok'}]),
+            'complete without timestamp': self.record(
+                projects=[{'name': 'alpha', 'status': 'complete',
+                           'pair': {'native': 'backups/alpha',
+                                    'coordination': 'backups/alpha.coordination.json'}}]),
+            'complete with reason': self.record(
+                projects=[{'name': 'alpha', 'status': 'complete',
+                           'completed_at': '2026-09-27T16:00:00Z', 'reason': 'maybe',
+                           'pair': {'native': 'backups/alpha',
+                                    'coordination': 'backups/alpha.coordination.json'}}]),
+            'complete with another project pair': self.record(
+                projects=[{'name': 'alpha', 'status': 'complete',
+                           'completed_at': '2026-09-27T16:00:00Z',
+                           'pair': {'native': 'backups/beta',
+                                    'coordination': 'backups/beta.coordination.json'}}]),
+            'incomplete without reason': self.record(
+                status='incomplete', projects=[{'name': 'alpha', 'status': 'failed'}]),
+            'incomplete with completion fields': self.record(
+                status='incomplete',
+                projects=[{'name': 'alpha', 'status': 'failed', 'reason': 'sync failed',
+                           'completed_at': '2026-09-27T16:00:00Z'}]),
+            'invalid name': self.record(
+                projects=[{'name': 'Alpha', 'status': 'failed', 'reason': 'x'}]),
+            'missing name': self.record(
+                projects=[{'status': 'failed', 'reason': 'x'}]),
+            'entry not an object': self.record(status='incomplete', projects=[[]]),
+            'repeated project': self.record(
+                status='incomplete',
+                projects=[{'name': 'alpha', 'status': 'failed', 'reason': 'x'},
+                          {'name': 'alpha', 'status': 'failed', 'reason': 'y'}]),
+        }
+        for label, record in cases.items():
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    admin.validate_backup_status(record)
+
+
+class ScheduledCoverageGuidanceCase(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / 'runtime'
+        (self.root / 'backups').mkdir(parents=True)
+        (self.root / 'projects').mkdir()
+        self.root = self.root.resolve()
+        self.unit = Path(self.temp.name) / 'beads-backup.service'
+        patcher = patch.object(admin, 'scheduled_backup_unit_path', return_value=self.unit)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write_unit(self, *execstarts):
+        self.unit.write_text('\n'.join(
+            ['[Unit]', 'Description=Backup', '', '[Service]', 'Type=oneshot', *execstarts]) + '\n',
+            encoding='utf-8')
+
+    def line(self, *projects):
+        return ('ExecStart=/usr/bin/python3 /opt/orchestra/admin.py --root %s backup %s'
+                % (self.root, ' '.join(projects)))
+
+    def test_missing_unit_reports_no_coverage_and_the_exact_line(self):
+        covered, message = admin.scheduled_backup_coverage(self.root, 'second')
+        self.assertFalse(covered)
+        self.assertIn('is missing', message)
+        self.assertIn('second', message)
+        self.assertIn('backup --all', message)
+        self.assertIn('ExecStart=', message)
+
+    def test_unit_listing_only_other_projects_reports_this_project_missing(self):
+        self.write_unit(self.line('first'))
+        covered, message = admin.scheduled_backup_coverage(self.root, 'second')
+        self.assertFalse(covered)
+        self.assertIn('covers only first', message)
+        self.assertIn('does not include second', message)
+        self.assertIn('backup --all', message)
+
+    def test_unit_listing_this_project_is_reported_as_needing_the_durable_form(self):
+        self.write_unit(self.line('first', 'second'))
+        covered, message = admin.scheduled_backup_coverage(self.root, 'second')
+        self.assertFalse(covered)
+        self.assertIn('already includes second', message)
+        self.assertIn('first, second', message)
+        self.assertIn('backup --all', message)
+
+    def test_several_execstart_lines_are_all_considered(self):
+        self.write_unit(self.line('first'), self.line('second'))
+        covered, message = admin.scheduled_backup_coverage(self.root, 'second')
+        self.assertFalse(covered)
+        self.assertIn('already includes second', message)
+        self.assertIn('first, second', message)
+
+    def test_unit_using_all_is_reported_as_already_covering_every_project(self):
+        self.write_unit(self.line('--all'))
+        covered, message = admin.scheduled_backup_coverage(self.root, 'second')
+        self.assertTrue(covered)
+        self.assertIn('already backs up every project', message)
+        self.assertIn('no change is needed', message)
+        self.assertIn('second', message)
+
+    def test_a_unit_for_another_runtime_is_not_coverage(self):
+        self.write_unit('ExecStart=/usr/bin/python3 /opt/orchestra/admin.py --root /srv/other backup --all')
+        covered, message = admin.scheduled_backup_coverage(self.root, 'second')
+        self.assertFalse(covered)
+        self.assertIn('does not back up this runtime', message)
+        self.assertIn('backup --all', message)
+
+    def test_an_unreadable_unit_is_reported_unconfirmed_not_fine(self):
+        self.unit.write_text('[Service]\n', encoding='utf-8')
+        with patch.object(admin.Path, 'read_text', side_effect=OSError('permission denied')):
+            covered, message = admin.scheduled_backup_coverage(self.root, 'second')
+        self.assertFalse(covered)
+        self.assertIn('could not be read', message)
+        self.assertIn('second', message)
+
+    def test_bare_backup_with_no_project_is_reported_as_no_coverage(self):
+        self.write_unit('ExecStart=/usr/bin/python3 /opt/orchestra/admin.py --root %s backup' % self.root)
+        covered, message = admin.scheduled_backup_coverage(self.root, 'second')
+        self.assertFalse(covered)
+        self.assertIn('covers only no project', message)
+        self.assertIn('does not include second', message)
+
+    def test_execstart_line_names_this_runtime_and_the_durable_form(self):
+        line = admin.scheduled_backup_execstart(self.root)
+        self.assertTrue(line.startswith('ExecStart='))
+        self.assertIn('--root %s backup --all' % self.root, line)
+
+    def test_add_project_prints_the_guidance_without_touching_the_unit(self):
+        self.write_unit(self.line('first'))
+        before = self.unit.read_text(encoding='utf-8')
+        output = io.StringIO()
+        with patch.object(admin, 'config', return_value={'port': 13317}), \
+                patch.object(admin, 'run_bd', return_value=''), \
+                patch.object(admin, 'backup_project'), contextlib.redirect_stdout(output):
+            admin.add_project(self.root, 'newproject')
+        text = output.getvalue()
+        self.assertIn('Created project newproject', text)
+        self.assertIn('does not include newproject', text)
+        self.assertIn('backup --all', text)
+        self.assertEqual(self.unit.read_text(encoding='utf-8'), before)
+
+    def test_add_project_states_when_the_schedule_already_covers_every_project(self):
+        self.write_unit(self.line('--all'))
+        output = io.StringIO()
+        with patch.object(admin, 'config', return_value={'port': 13317}), \
+                patch.object(admin, 'run_bd', return_value=''), \
+                patch.object(admin, 'backup_project'), contextlib.redirect_stdout(output):
+            admin.add_project(self.root, 'newproject')
+        text = output.getvalue()
+        self.assertIn('already backs up every project', text)
+        self.assertIn('no change is needed', text)
+
+
+if __name__ == '__main__':
+    unittest.main()

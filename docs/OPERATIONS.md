@@ -47,9 +47,11 @@ Run after meaningful work and before maintenance:
 
 ```sh
 python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime backup example
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime backup example second
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime backup --all
 ```
 
-This invokes Beads' native Dolt backup into `runtime/backups/example`. Same-host backups protect against some mistakes, not loss of the server. Arrange an ordinary scheduled, encrypted off-machine copy of completed backups using your existing backup system. The kit does not install a backup timer. Preserve the kit/version pins and a protected copy of deployment configuration separately; JSONL views are useful exports but are not a substitute for the native backup.
+This invokes Beads' native Dolt backup into `runtime/backups/example`. One or more project names, or `--all` for every initialized project of the runtime, run in a single invocation; each project is backed up exactly as the single-project form does, one failing project does not stop the others, and the command exits non-zero when any targeted project's backup pair is not complete. Same-host backups protect against some mistakes, not loss of the server. Arrange an ordinary scheduled, encrypted off-machine copy of completed backups using your existing backup system. The kit does not install a backup timer. Preserve the kit/version pins and a protected copy of deployment configuration separately; JSONL views are useful exports but are not a substitute for the native backup.
 
 Restore drills deliberately create a new project:
 
@@ -66,6 +68,17 @@ Session registrations in `.sessions.json` are included in the coordination sidec
 `add-project` initializes the project, provisions its merge slot (idempotently) and performs an initial backup, so a freshly provisioned project can run `merge-create`/`merge-check`/`merge-acquire` without a manual slot setup. A project whose slot is missing refuses `merge-check`/`merge-acquire`/`merge-release` with an error naming the `merge-create` operation, which is the manual repair. `backup` captures both the native backup directory and `backups/PROJECT.coordination.json`. The sidecar preserves pending child-request reservations and merge context outside Dolt. Keep this pair together. A pending marker is written before synchronization and becomes complete only after native sync succeeds; restore refuses an incomplete sidecar. Backup and restore serialize access to the pair, and backup excludes contributor writes through the endpoint. Direct operator/native writes bypass these locks and must be paused for backup. The completed sidecar also records the deployment operator allowlist, so a restore can report recorded authority the destination host does not list. `restore-new` does **not** apply it: re-granting an operator is deployment-wide authority and stays an explicit decision (`--restore-operators`, or `operators add OPERATOR`), so a stale backup cannot silently reverse a revocation. See [Operator removal and restore policy](#operator-removal-and-restore-policy).
 
 Copy a completed, quiescent backup pair off-machine using your normal encrypted backup system. Do not copy it during the next sync. This is not an atomic transaction across arbitrary filesystem copies; take a filesystem snapshot or hold the project's `backups/PROJECT.lock` while copying. Legacy backups without a sidecar warn that outstanding requests/merge context require reconciliation.
+
+Every run of `backup` also writes `runtime/backups/backup-status.json`: a schema-versioned, sorted-key record of the run with one entry per project, naming whether that project's pair (its `backups/PROJECT` native directory plus its `complete` `backups/PROJECT.coordination.json` sidecar) is complete, the UTC time it completed, and the reason when it is not. The per-project pair state is re-read from the files, so a run that fails or is skipped — and even a "successful" call whose sidecar is still `pending` — is recorded as **not** complete rather than assumed complete. Record scope is explicit: `"scope":"all"` means the run covered every project initialized at that moment, `"named"` means it covered only the projects listed.
+
+Read that record on the host:
+
+```sh
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime backup-status
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime backup-status --require-complete
+```
+
+`--require-complete` exits non-zero unless the last run used `--all` and every project it lists still has a complete pair on disk, naming each project that does not. Use it as the gate in front of the off-machine copy, so a project that is absent from the schedule or whose pair is half written is noticed instead of being silently omitted. The copy itself remains the operator's: the kit has no off-machine copy script, cannot see the operator's backup system, and makes no copy for you. What the kit provides is the machine-readable statement of every project's last complete pair, so the operator's schedule or script can cover all of them and stop when one is not complete.
 
 If restore is interrupted, the new destination may exist with only part of the restore completed. Preserve it for inspection; retry recovery into another unused destination. Do not delete the source or force reuse of the partially restored target. Verify pending reservations, comments, lifecycle events, baselines and slot context before switching clients.
 
@@ -117,7 +130,9 @@ python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime res
 
 ### Optional scheduled backup
 
-Edit `templates/beads-backup.service` for the installation paths/project, then copy it and `templates/beads-backup.timer` into the service account's `~/.config/systemd/user/`. Enable with `systemctl --user daemon-reload` and `systemctl --user enable --now beads-backup.timer`. Check `systemctl --user list-timers` and the service journal; lingering must already be enabled for unattended operation. The timer performs same-host backup only. Configure off-machine copying and retention separately. These templates do not replace an existing team's backup schedule.
+Edit `templates/beads-backup.service` for the installation paths, then copy it and `templates/beads-backup.timer` into the service account's `~/.config/systemd/user/`. Its `ExecStart` uses `backup --all`, so the one timer covers every project initialized in that runtime, including projects added later, and every run writes the `backup-status.json` record described above. Enable with `systemctl --user daemon-reload` and `systemctl --user enable --now beads-backup.timer`. Check `systemctl --user list-timers`, the service journal, and `backup-status --require-complete`; lingering must already be enabled for unattended operation. The timer performs same-host backup only. Configure off-machine copying, its completeness gate and retention separately; the timer does not copy anything off the host. These templates do not replace an existing team's backup schedule.
+
+`add-project` checks the installed `~/.config/systemd/user/beads-backup.service` and prints the exact `ExecStart` line to add when that schedule does not already cover every project, or states that it already does. It reads the unit file only — it never edits, installs or enables a unit — and a schedule that names projects individually is reported as covering this one but needing an edit for the next, with the `backup --all` form as the durable fix. An absent or unreadable unit is reported as no coverage rather than assumed fine.
 
 ### Local and Windows clients
 
