@@ -10,6 +10,7 @@ cross-project denial, and the absence of polling/scheduled work.
 import http.client
 import json
 import os
+import re
 import secrets
 import shutil
 import sys
@@ -234,6 +235,45 @@ class AgentSecretGuidanceTests(AgentHarness):
         self.assertFalse(setup['config_contains_secret'])
         self.assertNotIn('secret', setup['config'])
         self.assertTrue(created.data['secret_available'])
+        # The fallback hands curl a config file (-K), never a command line that a
+        # shell would expand into curl's argv and the process list.
+        self.assertNotRegex(snippet, r'-H\s+["\']?Authorization:\s*Bearer')
+        self.assertNotRegex(snippet, r'Authorization:\s*Bearer\s+\$')
+        self.assertRegex(snippet, r'curl -fsS -K \S+')
+        self.assertRegex(snippet, r'header = "Authorization: Bearer <[^>]+>"')
+        self.assertIn('mode 600', snippet)
+
+    def test_no_command_line_puts_the_agent_secret_in_argv(self):
+        """Item 3: the flagged shape is a bearer header on a curl command line.
+
+        ``curl -H "Authorization: Bearer ..."`` puts the value in curl's argv; with a
+        shell variable the expanded *secret* lands there and in the process list, and a
+        literal token is worse. The setup snippet must hand curl a config file instead,
+        and neither the snippet nor the resume prompt may carry the issued secret or a
+        bearer value that is not a shell variable.
+        """
+        created = self.create_agent(self.alex)
+        self.assertEqual(201, created.status, created.data)
+        secret = created.data['credential']['secret']
+        snippet = created.data['setup']['setup_snippet']
+        listed = self.request('GET', '/v1/agents', token=self.alex)
+        self.assertEqual(200, listed.status, listed.data)
+        prompt = listed.data['items'][0]['resume_prompt']
+        literal_bearer = re.compile(
+            r'(?:-H|--header)\s+["\']?Authorization:\s*Bearer\s+(?!\$)')
+        for text in (snippet, prompt):
+            self.assertNotIn(secret, text)
+            self.assertNotRegex(text, literal_bearer)
+            self.assertNotIn('export %s=' % AGENT_SECRET_ENV, text)
+        # The setup fallback expands nothing at all.
+        self.assertNotRegex(snippet, r'-H\s+["\']?Authorization:\s*Bearer')
+        self.assertNotIn('$' + AGENT_SECRET_ENV, snippet)
+        self.assertRegex(snippet, r'curl -fsS -K \S+')
+        # The documented example matches the snippet.
+        flat = ' '.join((ROOT / 'docs/HTTP_DEPLOYMENT.md').read_text(
+            encoding='utf-8').split())
+        self.assertIn('curl reads the header from it with `-K`', flat)
+        self.assertNotIn('-H "Authorization: Bearer', flat)
 
     def test_secret_is_returned_exactly_once(self):
         body = {'name': 'Kestrel', 'working_directory': '/home/priya/kestrel'}
@@ -661,6 +701,90 @@ class ProjectOwnerAgentTests(AgentHarness):
         self.assertEqual(1, len(events), audit.data)
         self.assertEqual(self.alpha, events[0]['project_id'])
         self.assertEqual(self.alex_user['id'], events[0]['user_id'])
+
+    @staticmethod
+    def _without_request_id(body):
+        return {key: value for key, value in body.items() if key != 'request_id'}
+
+    def test_not_granted_agent_is_indistinguishable_from_a_missing_id(self):
+        """Item 1: one 404 message for both project-scoped agent routes.
+
+        An agent that exists but is granted only to Beta, probed through Alpha, must
+        answer exactly like an id that does not exist - same status, same error object,
+        same body apart from the per-request id - while the granted case still works.
+        """
+        other = self.create_agent(self.alex, name='Merlin', projects=[self.beta])
+        self.assertEqual(201, other.status, other.data)
+        elsewhere = other.data['agent']['id']
+        missing = 'agent_no_such_agent_at_all'
+        for method in ('GET', 'DELETE'):
+            path = '/v1/projects/%s/agents/%%s' % self.alpha
+            not_granted = self.request(method, path % elsewhere, token=self.alex)
+            unknown = self.request(method, path % missing, token=self.alex)
+            self.assertEqual(404, unknown.status, unknown.data)
+            self.assertEqual(404, not_granted.status, not_granted.data)
+            self.assertEqual(unknown.data['error'], not_granted.data['error'])
+            self.assertEqual('not_found', not_granted.data['error']['code'])
+            self.assertEqual('Agent not found', not_granted.data['error']['message'])
+            # Nothing but the unavoidable per-request id may differ.
+            self.assertEqual(self._without_request_id(unknown.data),
+                             self._without_request_id(not_granted.data))
+            self.assertEqual(['error', 'request_id'], sorted(not_granted.data))
+        # The refused DELETE changed neither agent's grant.
+        detail = self.request('GET', '/v1/agents/%s' % elsewhere, token=self.alex)
+        self.assertEqual([self.beta], detail.data['projects'])
+        kept = self.request('GET', '/v1/agents/%s' % self.agent_id, token=self.alex)
+        self.assertEqual([self.alpha, self.beta], kept.data['projects'])
+        # A granted project owner still reads and revokes normally.
+        read = self.request('GET', '/v1/projects/%s/agents/%s'
+                            % (self.alpha, self.agent_id), token=self.alex)
+        self.assertEqual(200, read.status, read.data)
+        self.assertEqual(self.agent_id, read.data['agent']['id'])
+        revoked = self.request('DELETE', '/v1/projects/%s/agents/%s'
+                               % (self.alpha, self.agent_id), token=self.alex)
+        self.assertEqual(200, revoked.status, revoked.data)
+        self.assertEqual(self.alpha, revoked.data['project'])
+        self.assertEqual(self.agent_id, revoked.data['agent']['id'])
+
+    def test_a_project_revoke_is_not_sticky_and_its_owner_can_regrant(self):
+        """Item 2: pin today's behaviour - a project revoke narrows one grant only.
+
+        Blair owns the agent and is an ordinary contributor member of Alpha; Alex owns
+        Alpha. Alex's revoke takes effect live, yet Blair can add Alpha straight back
+        because the agent's own owner still administers the agent. Whether a project
+        owner may block that re-grant is an owner decision that is still pending, so
+        this test pins the existing behaviour only.
+        """
+        created = self.create_agent(self.blair, name='Sparrow', projects=[self.alpha])
+        self.assertEqual(201, created.status, created.data)
+        agent_id = created.data['agent']['id']
+        secret = created.data['credential']['secret']
+        self.assertEqual(200, self.request('GET', '/v1/projects/%s/tasks' % self.alpha,
+                                           token=secret).status)
+        # The project's owner revokes: live, and only for this project.
+        revoked = self.request('DELETE', '/v1/projects/%s/agents/%s'
+                               % (self.alpha, agent_id), token=self.alex)
+        self.assertEqual(200, revoked.status, revoked.data)
+        self.assertEqual(self.alpha, revoked.data['project'])
+        self.assertEqual(404, self.request('GET', '/v1/projects/%s/tasks' % self.alpha,
+                                           token=secret).status)
+        detail = self.request('GET', '/v1/agents/%s' % agent_id, token=self.blair)
+        self.assertEqual([], detail.data['projects'])
+        self.assertTrue(detail.data['enabled'])
+        # The agent's own owner adds the project straight back: the revoke is not
+        # sticky, and nothing marks the agent as barred.
+        regranted = self.request('PATCH', '/v1/agents/%s' % agent_id,
+                                 {'projects': [self.alpha]}, token=self.blair)
+        self.assertEqual(200, regranted.status, regranted.data)
+        self.assertEqual([self.alpha], regranted.data['projects'])
+        self.assertEqual(200, self.request('GET', '/v1/projects/%s/tasks' % self.alpha,
+                                           token=secret).status)
+        # The project owner sees the grant back and can revoke again.
+        listed = self.request('GET', '/v1/projects/%s/agents' % self.alpha, token=self.alex)
+        self.assertIn(agent_id, [a['id'] for a in listed.data['items']])
+        again = self.request('DELETE', '/v1/projects/%s/agents/%s'
+                             % (self.alpha, agent_id), token=self.alex)
+        self.assertEqual(200, again.status, again.data)
 
 
 class AgentAttentionAuthorizationTests(AgentHarness):

@@ -1645,13 +1645,17 @@ class Service:
 
         Like :meth:`list_project_agents`, the route holds the ``CAP_PROJECT_ADMIN``
         boundary. An agent whose grant does not name this project is reported exactly
-        like a missing agent, so a project owner cannot probe the wider registry.
+        like a missing agent, so a project owner cannot probe the wider registry: the
+        not-granted case raises the *same* ``Agent not found`` message a nonexistent id
+        gets from :meth:`_agent`, and the response body is byte-identical.
         """
         with self.store.lock:
             self._refresh_authority(principal)
             agent = self._agent(agent_id)
             if project_id not in (agent.get('projects') or []):
-                raise not_found('Agent not found in this project')
+                # One message for every agent 404 on this route: "exists but is not
+                # granted here" must be indistinguishable from "no such id".
+                raise not_found('Agent not found')
             return self.project_agent_view(agent)
 
     def revoke_agent_project(self, principal, project_id, agent_id, request_id=None):
@@ -1663,6 +1667,17 @@ class Service:
         :func:`http_authority.decide` reads the *live* grant on every request, the
         agent credential is refused on this project on its next request and the
         project drops out of ``/v1/agents/me/next``.
+
+        An agent whose grant does not name this project is reported exactly like a
+        missing agent - both raise the same ``Agent not found`` message, so a project
+        owner cannot tell the two apart.
+
+        This revoke is deliberately **not sticky**: it removes one project from the
+        agent's grant and nothing more. The agent's own owner still administers it and
+        can immediately add this project back (while the owner is still a member of
+        it), just as they could grant it directly. Whether a project owner should be
+        able to block an agent from being re-granted is an OWNER DECISION that is
+        still pending; this method implements no such block.
         """
         if principal is None or principal.via == 'credential':
             raise forbidden('Session authority required to change an agent grant')
@@ -1671,8 +1686,9 @@ class Service:
             agent = self._agent(agent_id)
             projects = list(agent.get('projects') or [])
             if project_id not in projects:
-                # Exactly like a missing agent: a non-participant learns nothing.
-                raise not_found('Agent not found in this project')
+                # Exactly like a missing agent: one message, so a non-participant
+                # learns nothing and a project owner cannot probe for the id.
+                raise not_found('Agent not found')
             agent['projects'] = [pid for pid in projects if pid != project_id]
             self.store.save()
             view = self.project_agent_view(agent)
@@ -1686,7 +1702,9 @@ class Service:
         the agent runs in is safe to keep. The snippet leads with VS Code secret
         storage or the OS credential store (owner decision 9); an environment variable
         is only a documented fallback, read from that store, and no command line ever
-        carries the literal secret (shell history, process list).
+        carries the literal secret (shell history, process list). The fallback hands
+        curl a **config file** (``-K``) that holds the header line, so the shell never
+        expands a secret into curl's argv.
         """
         server_url = self.public_url
         config = {
@@ -1705,12 +1723,17 @@ class Service:
             "# into the file above, into Git, or onto a command line: a literal export\n"
             "# would persist in shell history and the process list.\n"
             "#\n"
-            "# Fallback only, for a machine with no secret store: set the %s\n"
-            "# environment variable from that store and reference it as below - never\n"
-            "# paste the secret itself into a command.\n"
-            "curl -fsS -H \"Authorization: Bearer $%s\" %s\n"
+            "# Fallback only, for a machine with no secret store: keep the secret in a\n"
+            "# curl config file that only you can read (created mode 600), for example\n"
+            "# ~/.orchestra-agent-curlrc holding one line\n"
+            "#   header = \"Authorization: Bearer <YOUR_AGENT_SECRET>\"\n"
+            "# with the secret copied from your credential store - the %s\n"
+            "# environment variable may hold it on such a machine. curl reads the header\n"
+            "# from that file, so the secret never reaches the command line, shell history\n"
+            "# or the process list; never paste it into a command yourself. Then run:\n"
+            "curl -fsS -K ~/.orchestra-agent-curlrc %s\n"
         ) % (AGENT_CONFIG_PATH, json.dumps(config, indent=2, sort_keys=True),
-             AGENT_SECRET_ENV, AGENT_SECRET_ENV, endpoint)
+             AGENT_SECRET_ENV, endpoint)
         return {
             'config_path': AGENT_CONFIG_PATH,
             'config': config,
@@ -1721,7 +1744,9 @@ class Service:
                         'VS Code secret storage or the OS credential store and have '
                         'the client read it from there; the %s environment variable is '
                         'only a documented fallback, set from that store, and the '
-                        'literal secret must never appear on a command line. It is '
+                        'literal secret must never appear on a command line. In the '
+                        'documented fallback curl reads the header from a mode-600 '
+                        'config file (-K), so the secret stays out of argv. It is '
                         'shown only once.' % AGENT_SECRET_ENV,
         }
 
