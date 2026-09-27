@@ -29,7 +29,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from http_auth import (CAP_ACCOUNTS_ADMIN, CAP_APPROVE, CAP_CHECKPOINTS, CAP_FEEDBACK,
+from http_auth import (AGENT_SECRET_ENV, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CAP_APPROVE,
+                       CAP_CHECKPOINTS, CAP_FEEDBACK,
                        CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_READ, CAP_REVIEWS,
                        CAP_TASKS, RESULT_RETENTION_SECONDS, HttpError, Service, Store,
                        authority_request, conflict, forbidden, invalid, not_found,
@@ -45,6 +46,20 @@ MAX_FILENAME = 128
 MAX_PAGE = 100
 DEFAULT_PAGE = 50
 MAX_CURSOR = 512
+#: Bound on the read-time agent next-action list. Attention is computed from bounded,
+#: cached, per-request task reads (one full snapshot per granted project); nothing is
+#: scheduled or polled.
+AGENT_ACTION_LIMIT = 50
+#: Bound on agent attention, expressed as pages of :data:`MAX_PAGE` each, i.e. 20,000
+#: tasks for one project. The bound is applied in memory to the single full snapshot
+#: (:meth:`EndpointBackend.read_tasks`), not by re-reading the canonical store per
+#: page, so a bound that is reached reports ``truncated`` without extra reads.
+AGENT_MAX_PAGES = 200
+#: Cap on the *claimable* suggestions collected per read. Claimable work is a suggestion
+#: list, not the agent's own work, so it is the only list the page-sized cap applies to:
+#: an agent's own changes-requested, blocked or awaiting-review task is always collected
+#: however many claimable tasks sit beside it.
+AGENT_CLAIMABLE_LIMIT = MAX_PAGE
 IDEMPOTENCY_HEADER = 'Idempotency-Key'
 ATTACHMENT_MEDIA_TYPES = ('text/plain', 'text/markdown')
 # One identifier pattern for every route parameter. Canonical Orchestra ids contain
@@ -168,6 +183,22 @@ def result_is_stored(service, key):
     with the number of keyed operations nor is rewritten by one.
     """
     return service.has_result(key)
+
+
+def _redact_agent_secret(result):
+    """The stored/replayable copy of an agent create/issue result: never the secret.
+
+    A one-time agent secret is returned exactly once. An exact idempotent retry replays
+    this redacted copy with ``200`` and ``secret_available: false``, so a retry can
+    never re-deliver a credential.
+    """
+    stored = dict(result)
+    credential = dict(stored.get('credential') or {})
+    credential.pop('secret', None)
+    credential['secret_available'] = False
+    stored['credential'] = credential
+    stored['secret_available'] = False
+    return stored
 
 
 # ------------------------------------------------------------------ backend seam
@@ -390,11 +421,22 @@ class InProcessBackend:
         return {'feedback': record}
 
     # -- reads (no canonical mutation) ----------------------------------------
-    def list_tasks(self, project_id, limit, offset):
+    def read_tasks(self, project_id):
+        """One full canonical snapshot of every in-project row.
+
+        This is the single-read seam (:data:`AGENT_MAX_PAGES` walks chunk it in
+        memory instead of re-reading the canonical store per page). ``list_tasks``
+        stays the paginated view over the *same* snapshot so the HTTP page route is
+        unchanged.
+        """
         tasks = [t for t in self.state['tasks'].values() if t['project_id'] == project_id]
         tasks.sort(key=lambda t: t['id'])
-        return {'items': [dict(t) for t in tasks[offset:offset + limit]],
-                'total': len(tasks)}
+        return {'items': [dict(t) for t in tasks], 'total': len(tasks)}
+
+    def list_tasks(self, project_id, limit, offset):
+        snapshot = self.read_tasks(project_id)
+        return {'items': snapshot['items'][offset:offset + limit],
+                'total': snapshot['total']}
 
     def get_task(self, project_id, task_id):
         return dict(self._task(project_id, task_id))
@@ -414,14 +456,16 @@ class InProcessBackend:
 class EndpointBackend:
     """Production seam: map authorized HTTP operations onto canonical ``endpoint.py``.
 
-    This is the runnable Linux binding, not deployment glue. Each of the six methods
-    the routes need is implemented:
+    This is the runnable Linux binding, not deployment glue. Every method the routes
+    need is implemented:
 
     * ``invoke`` maps task/checkpoint/review mutations onto the canonical client
       protocol (``bd create/update`` and the structured ``checkpoint``/``review``
       actions that already own claim, review and checkpoint semantics);
-    * ``list_tasks``/``get_task``/``task_history`` map onto ``bd list``/``show`` and
-      the canonical ``history`` action;
+    * ``read_tasks`` performs the one full canonical read of a project;
+      ``list_tasks`` slices that snapshot into the paginated HTTP view, and
+      ``get_task``/``task_history`` map onto ``bd show`` and the canonical
+      ``history`` action;
     * ``list_feedback`` fails closed with a clean 501 until the dedicated feedback
       stream (``kittrial-5bb.13``) is integrated into the canonical command set;
       the service never substitutes its own in-memory feedback for canonical data.
@@ -701,15 +745,26 @@ class EndpointBackend:
         return [row for row in rows
                 if not isinstance(row, dict) or row.get('project_id') in (None, project_id)]
 
-    def list_tasks(self, project_id, limit, offset):
-        # ``list --all --limit 0`` is the kit's own full-read form (see
-        # coordination.py); the HTTP page is sliced from that snapshot so the
-        # offset cursor stays exact.
+    def read_tasks(self, project_id):
+        """One full canonical read of a project: the single-read seam.
+
+        ``bd list --all --limit 0 --json`` is the kit's own full-read form (see
+        coordination.py) and costs exactly one ``endpoint.py`` subprocess. Attention
+        chunks this in-memory snapshot instead of paying one full read per page, and
+        the paginated HTTP route slices the same snapshot so both stay exact.
+        """
         rows = self._run('bd', project_id, self.actor_namespace + '/read',
                          ['list', '--all', '--limit', '0', '--json'])
         rows = rows if isinstance(rows, list) else rows.get('items', [])
         rows = self._in_project(rows, project_id)
-        return {'items': rows[offset:offset + limit], 'total': len(rows)}
+        return {'items': rows, 'total': len(rows)}
+
+    def list_tasks(self, project_id, limit, offset):
+        # The HTTP page is sliced from the one full snapshot so the offset cursor
+        # stays exact; the canonical read happens once per call, not once per page.
+        snapshot = self.read_tasks(project_id)
+        return {'items': snapshot['items'][offset:offset + limit],
+                'total': snapshot['total']}
 
     def get_task(self, project_id, task_id):
         row = self._run('bd', project_id, self.actor_namespace + '/read',
@@ -830,6 +885,9 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _dispatch(self, method):
         request_id = self._request_id()
         self._current_request_id = request_id
+        # Per-request agent read cache. An HTTP/1.1 keep-alive connection reuses this
+        # handler instance, so the cache is reset for every request and never outlives it.
+        self._agent_task_cache = {}
         try:
             parsed = urlsplit(self.path)
             path = parsed.path
@@ -1031,7 +1089,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     # -- mutation helper -------------------------------------------------------
     def _mutate(self, ctx, route_name, project_id, fn, *, capability, allow_self_user=None,
                 status=200, idempotent=True, replay_status=None, serialize=True,
-                canonical=False):
+                canonical=False, reason=None):
         """Run one authorized, idempotent mutation.
 
         ``capability`` names the authority the route needs. The idempotency key is
@@ -1042,7 +1100,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         mutations. Canonical mutations pass ``serialize=False`` and ``canonical=True``:
         their durable operation identity lets a retry after an uncertain outcome
         reconcile the canonical result through the endpoint journal instead of
-        repeating the effect.
+        repeating the effect. ``reason`` is an optional short redacted clarification
+        (for example the target's identity) added to the route's audit events; it must
+        never carry a secret or request body.
         """
         ctx.authorize = (lambda: self.service.check_authority(
             ctx.principal, project_id, capability, allow_self_user=allow_self_user))
@@ -1071,7 +1131,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         except UncertainOutcome:
             self.service.idempotency_unknown(digest)
             self.service.audit(ctx.request_id, ctx.principal, route_name, 'unknown',
-                               project_id=project_id, reason='uncertain')
+                               project_id=project_id, reason=reason or 'uncertain')
             self.service.store.save()
             raise uncertain('The operation may have committed; reconcile with the same '
                             'idempotency key')
@@ -1087,7 +1147,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise
         self.service.idempotency_commit(digest, status, stored)
         self.service.audit(ctx.request_id, ctx.principal, route_name, 'committed',
-                           project_id=project_id)
+                           project_id=project_id, reason=reason)
         self.service.store.save()
         return status, public
 
@@ -1284,6 +1344,342 @@ class ApiHandler(BaseHTTPRequestHandler):
             return result, result
         return self._mutate(ctx, 'credentials.revoke', ctx.params['pid'], revoke, status=204,
                             capability=CAP_PROJECT_ADMIN)
+
+    # -- personal agent routes -------------------------------------------------
+    #
+    # The agent's own API is registered before ``/v1/agents/{aid}`` so the literal
+    # ``me`` path always wins. Every route here returns stable JSON; the browser
+    # screens are the separate task kittrial-5bb.20 and are not built here.
+    @route('GET', r'/v1/agents/me')
+    def agents_me(self, ctx):
+        agent = self.service.agent_for_credential(ctx.principal)
+        return 200, {'agent': agent, 'attention': self._agent_attention_view(agent),
+                     'generated_at': now_iso(self.service._now())}
+
+    @route('GET', r'/v1/agents/me/next')
+    def agents_me_next(self, ctx):
+        agent = self.service.agent_for_credential(ctx.principal)
+        attention = self._agent_attention(ctx.principal, agent)
+        projects = [{'id': p['id'], 'name': p['name']}
+                    for p in self.service.list_projects(ctx.principal)]
+        return 200, {
+            'agent': agent,
+            'attention': self._agent_attention_view(agent, attention),
+            'next_action': attention['actions'][0] if attention['actions'] else None,
+            'next_actions': attention['actions'],
+            'projects': projects,
+            'links': {'self': '/v1/agents/me', 'next': '/v1/agents/me/next'},
+            'manual_cadence': 'Computed at read time; no polling or scheduled work. '
+                              'Re-read this route when the owner resumes the agent.',
+            'generated_at': now_iso(self.service._now()),
+        }
+
+    @route('POST', r'/v1/agents')
+    def agents_create(self, ctx):
+        payload = dict(ctx.payload or {})
+
+        def create():
+            result = self.service.create_agent(
+                ctx.principal, name=payload.get('name'), tool=payload.get('tool'),
+                working_directory=payload.get('working_directory'),
+                machine=payload.get('machine'), notes=payload.get('notes'),
+                projects=payload.get('projects'), scopes=payload.get('scopes'),
+                request_id=ctx.request_id)
+            return result, _redact_agent_secret(result)
+        return self._mutate(ctx, 'agents.create', None, create, status=201,
+                            capability=CAP_AGENTS, replay_status=200)
+
+    @route('GET', r'/v1/agents')
+    def agents_list(self, ctx):
+        self.require(ctx, CAP_AGENTS)
+        items = []
+        for agent in self.service.list_agents(ctx.principal):
+            attention = self._agent_attention(ctx.principal, agent)
+            items.append(dict(agent, attention=self._agent_attention_view(agent, attention),
+                              resume_prompt=self._agent_resume_prompt(agent, attention)))
+        return 200, {'items': items, 'total': len(items),
+                     'generated_at': now_iso(self.service._now())}
+
+    @route('GET', r'/v1/agents/(?P<aid>' + ID + r')')
+    def agents_get(self, ctx):
+        self.require(ctx, CAP_AGENTS)
+        agent = self.service.get_agent(ctx.principal, ctx.params['aid'])
+        attention = self._agent_attention(ctx.principal, agent)
+        return 200, dict(agent, attention=self._agent_attention_view(agent, attention),
+                         resume_prompt=self._agent_resume_prompt(agent, attention),
+                         generated_at=now_iso(self.service._now()))
+
+    @route('PATCH', r'/v1/agents/(?P<aid>' + ID + r')')
+    def agents_update(self, ctx):
+        payload = dict(ctx.payload or {})
+
+        def update():
+            result = self.service.update_agent(ctx.principal, ctx.params['aid'], payload)
+            return result, result
+        return self._mutate(ctx, 'agents.update', None, update, capability=CAP_AGENTS)
+
+    @route('POST', r'/v1/agents/(?P<aid>' + ID + r')/disable')
+    def agents_disable(self, ctx):
+        def disable():
+            result = self.service.disable_agent(ctx.principal, ctx.params['aid'])
+            return result, result
+        return self._mutate(ctx, 'agents.disable', None, disable, capability=CAP_AGENTS)
+
+    @route('POST', r'/v1/agents/(?P<aid>' + ID + r')/enable')
+    def agents_enable(self, ctx):
+        def enable():
+            result = self.service.enable_agent(ctx.principal, ctx.params['aid'])
+            return result, result
+        return self._mutate(ctx, 'agents.enable', None, enable, capability=CAP_AGENTS)
+
+    @route('POST', r'/v1/agents/(?P<aid>' + ID + r')/credentials')
+    def agents_credential_issue(self, ctx):
+        payload = dict(ctx.payload or {})
+
+        def issue():
+            result = self.service.issue_agent_credential(
+                ctx.principal, ctx.params['aid'], scopes=payload.get('scopes'),
+                label=payload.get('label'), request_id=ctx.request_id)
+            return result, _redact_agent_secret(result)
+        return self._mutate(ctx, 'agents.credentials.issue', None, issue, status=201,
+                            capability=CAP_AGENTS, replay_status=200)
+
+    @route('POST', r'/v1/agents/(?P<aid>' + ID + r')/credentials/'
+                  r'(?P<cid>' + ID + r')/revoke')
+    def agents_credential_revoke(self, ctx):
+        def revoke():
+            result = self.service.revoke_agent_credential(
+                ctx.principal, ctx.params['aid'], ctx.params['cid'],
+                request_id=ctx.request_id)
+            return result, result
+        return self._mutate(ctx, 'agents.credentials.revoke', None, revoke, status=204,
+                            capability=CAP_AGENTS)
+
+    # -- project-scoped agent routes (owner decision 4) ------------------------
+    #
+    # The boundary is the project's own administration capability, NOT
+    # ``CAP_AGENTS``: a project owner/admin governs which agents may work in their
+    # project without gaining any control over an agent it does not own. Both routes
+    # return the deliberately narrow :meth:`Service.project_agent_view`, which never
+    # carries ``working_directory``.
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/agents')
+    def project_agents_list(self, ctx):
+        self._project(ctx, CAP_PROJECT_ADMIN)
+        items = self.service.list_project_agents(ctx.principal, ctx.params['pid'])
+        return 200, {'project': ctx.params['pid'], 'items': items, 'total': len(items),
+                     'generated_at': now_iso(self.service._now())}
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/agents/(?P<aid>' + ID + r')')
+    def project_agent_get(self, ctx):
+        self._project(ctx, CAP_PROJECT_ADMIN)
+        agent = self.service.get_project_agent(ctx.principal, ctx.params['pid'],
+                                               ctx.params['aid'])
+        return 200, {'project': ctx.params['pid'], 'agent': agent,
+                     'generated_at': now_iso(self.service._now())}
+
+    @route('DELETE', r'/v1/projects/(?P<pid>' + ID + r')/agents/(?P<aid>' + ID + r')')
+    def project_agent_revoke(self, ctx):
+        def revoke():
+            result = self.service.revoke_agent_project(
+                ctx.principal, ctx.params['pid'], ctx.params['aid'],
+                request_id=ctx.request_id)
+            return result, result
+        return self._mutate(ctx, 'agents.project.revoke', ctx.params['pid'], revoke,
+                            capability=CAP_PROJECT_ADMIN,
+                            reason='agent %s' % ctx.params['aid'])
+
+    # -- read-time agent attention --------------------------------------------
+    def _agent_blocked_tasks(self):
+        """Task ids whose latest checkpoint still lists open items.
+
+        This reads the in-process canonical view when it is present; the canonical
+        endpoint binding does not mirror checkpoints into it, so a missing view simply
+        yields no ``blocked`` signal rather than a wrong one.
+        """
+        state = getattr(self.backend, 'state', None)
+        if not isinstance(state, dict):
+            return set()
+        checkpoints = state.get('checkpoints')
+        if not isinstance(checkpoints, dict):
+            return set()
+        blocked = set()
+        for task_id, items in checkpoints.items():
+            if isinstance(items, list) and items:
+                last = items[-1]
+                if isinstance(last, dict) and last.get('open_items'):
+                    blocked.add(task_id)
+        return blocked
+
+    def _agent_action(self, priority, kind, project_id, task, reason):
+        task_id = task.get('id')
+        base = '/v1/projects/%s/tasks/%s' % (project_id, task_id)
+        return {'priority': priority, 'kind': kind, 'project': project_id,
+                'task': task_id, 'title': task.get('title'),
+                'status': task.get('status'), 'review_state': task.get('review_state'),
+                'assignee': task.get('assignee'), 'reason': reason,
+                'links': {'task': base, 'brief': base, 'history': base + '/history',
+                          'project': '/v1/projects/%s' % project_id}}
+
+    def _agent_may_read(self, principal, project_id):
+        """The task-route authority check for one project, reused by attention.
+
+        ``Service.check_authority`` is the single boundary every task route uses and it
+        delegates to ``http_authority.decide``, so attention can never read a project
+        that the same principal would be refused on ``GET /v1/projects/{id}/tasks``:
+        for an agent credential that is the live credential, the live enable state and
+        the owner's *current* role; for the owner view it is the owner's current
+        membership. Anything else (including a stored grant the owner has since lost)
+        is skipped rather than read.
+        """
+        try:
+            self.service.check_authority(principal, project_id, CAP_READ)
+        except HttpError:
+            return False
+        return True
+
+    def _agent_project_tasks(self, project_id):
+        """Every task row of one project from ONE canonical read per HTTP request.
+
+        The backend's :meth:`read_tasks` snapshot is fetched at most once per project
+        per request (the endpoint binding spawns one ``endpoint.py`` / ``bd list
+        --all`` for it), so attention over a project of any size costs one read, not
+        one read per :data:`MAX_PAGE` page. The snapshot is chunked in memory to the
+        same :data:`AGENT_MAX_PAGES` bound the page walk used, so the ``complete``
+        flag - and therefore ``truncated`` - keeps exactly its rev2 meaning: a bound
+        that is not reached means every page was seen. Nothing is cached across
+        requests; the next request re-reads canonical state.
+        """
+        cache = getattr(self, '_agent_task_cache', None)
+        if cache is None:
+            cache = self._agent_task_cache = {}
+        if project_id in cache:
+            return cache[project_id]
+        snapshot = self.backend.read_tasks(project_id)
+        rows = [task for task in (snapshot.get('items') or []) if isinstance(task, dict)]
+        bound = AGENT_MAX_PAGES * MAX_PAGE
+        result = {'tasks': rows[:bound], 'complete': len(rows) <= bound}
+        cache[project_id] = result
+        return result
+
+    def _agent_attention(self, principal, agent):
+        """Owner/agent-visible attention, computed at read time from bounded reads.
+
+        Each granted project is re-authorized with the same live-authority check the
+        task routes apply (:meth:`_agent_may_read`), so a project the principal can no
+        longer read drops out of attention instead of leaking its tasks. Each project
+        is read once per request (:meth:`_agent_project_tasks`) and walked to its last
+        page, so an agent's own task is counted however deep it sorts; the page-sized
+        cap applies only to the claimable suggestions.
+        """
+        actor = agent.get('actor') or agent.get('id')
+        blocked = self._agent_blocked_tasks()
+        counts = {'claimable': 0, 'claimed': 0, 'changes_requested': 0,
+                  'awaiting_review': 0, 'blocked': 0}
+        own_actions = []
+        claimable_actions = []
+        truncated = False
+        for project_id in agent.get('projects') or []:
+            if not self._agent_may_read(principal, project_id):
+                continue
+            try:
+                read = self._agent_project_tasks(project_id)
+            except HttpError:
+                # A project the principal can no longer open simply drops out.
+                continue
+            if not read['complete']:
+                truncated = True
+            for task in read['tasks']:
+                assigned = task.get('assignee') == actor
+                review = task.get('review_state')
+                if assigned and review == 'changes-requested':
+                    counts['changes_requested'] += 1
+                    own_actions.append(self._agent_action(
+                        1, 'changes-requested', project_id, task,
+                        'A reviewer requested changes on this contribution.'))
+                elif assigned and review == 'awaiting-review':
+                    counts['awaiting_review'] += 1
+                    own_actions.append(self._agent_action(
+                        4, 'awaiting-review', project_id, task,
+                        'Waiting for a human review decision.'))
+                elif assigned and task.get('status') != 'closed' and \
+                        task.get('id') in blocked:
+                    counts['blocked'] += 1
+                    own_actions.append(self._agent_action(
+                        2, 'blocked', project_id, task,
+                        'The latest checkpoint left unresolved items.'))
+                if assigned:
+                    counts['claimed'] += 1
+                elif task.get('status') == 'open' and task.get('assignee') is None:
+                    counts['claimable'] += 1
+                    if len(claimable_actions) < AGENT_CLAIMABLE_LIMIT:
+                        claimable_actions.append(self._agent_action(
+                            3, 'claimable-task', project_id, task,
+                            'Open, unclaimed work the agent may take.'))
+        # The count is exact over every page; only the collected suggestions are capped,
+        # so a long claimable list can never hide the agent's own feedback.
+        if counts['claimable'] > len(claimable_actions):
+            truncated = True
+        actions = own_actions + claimable_actions
+        actions.sort(key=lambda a: (a['priority'], a['project'], a['task']))
+        if len(actions) > AGENT_ACTION_LIMIT:
+            actions = actions[:AGENT_ACTION_LIMIT]
+            truncated = True
+        if counts['changes_requested']:
+            state = 'changes-requested'
+        elif counts['blocked']:
+            state = 'blocked'
+        elif counts['awaiting_review']:
+            state = 'waiting-review'
+        elif counts['claimed']:
+            state = 'working'
+        else:
+            state = 'idle'
+        return {'state': state, 'summary': self._agent_summary(state, counts),
+                'counts': counts, 'actions': actions, 'truncated': truncated,
+                'computed_at': now_iso(self.service._now())}
+
+    @staticmethod
+    def _agent_summary(state, counts):
+        if state == 'changes-requested':
+            return ('%d contribution(s) have changes requested; act on them first.'
+                    % counts['changes_requested'])
+        if state == 'blocked':
+            return ('%d task(s) have unresolved checkpoint items.'
+                    % counts['blocked'])
+        if state == 'working':
+            return ('%d claimed task(s) in flight; %d claimable.'
+                    % (counts['claimed'], counts['claimable']))
+        if state == 'waiting-review':
+            return ('%d contribution(s) waiting for a human review decision.'
+                    % counts['awaiting_review'])
+        return ('Idle: %d claimable task(s), nothing in flight.' % counts['claimable'])
+
+    @staticmethod
+    def _agent_attention_view(agent, attention=None):
+        if attention is None:
+            attention = {'state': 'unknown', 'summary': 'Not computed.',
+                         'counts': {}, 'actions': [], 'truncated': False,
+                         'computed_at': None}
+        return {key: attention[key] for key in
+                ('state', 'summary', 'counts', 'truncated', 'computed_at')}
+
+    def _agent_resume_prompt(self, agent, attention):
+        """A copyable prompt for the owner's local assistant. No secret is included."""
+        server = self.service.public_url or '<ORCHESTRA_SERVER_URL>'
+        directory = agent.get('working_directory')
+        where = (' in %s' % directory) if directory else ''
+        first = attention['actions'][0] if attention['actions'] else None
+        if first:
+            what = ('Next: %s on %s in project %s.'
+                    % (first['kind'], first['task'], first['project']))
+        else:
+            what = 'There is nothing queued right now.'
+        return ("Open your agent folder%s for agent '%s' (%s). %s\n"
+                "Read %s from VS Code secret storage or your OS credential store (an\n"
+                "environment variable is only a fallback), then run:\n"
+                "  curl -fsS -H \"Authorization: Bearer $%s\" %s/v1/agents/me/next"
+                % (where, agent['name'], agent['id'], what, AGENT_SECRET_ENV,
+                   AGENT_SECRET_ENV, server))
 
     # -- task routes -----------------------------------------------------------
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks')
@@ -1512,6 +1908,9 @@ def main(argv=None):
                         help='actor namespace attributed to session principals')
     parser.add_argument('--endpoint-timeout', type=int, default=150)
     parser.add_argument('--max-body', type=int, default=MAX_BODY_BYTES)
+    parser.add_argument('--public-url',
+                        help='canonical base URL of this service, used only to render '
+                             'copyable agent setup/resume snippets (e.g. https://host)')
     parser.add_argument('--bootstrap-user', help='one-time operator bootstrap superuser')
     args = parser.parse_args(argv)
 
@@ -1528,7 +1927,7 @@ def main(argv=None):
     trusted = list(args.trusted_proxy)
     if args.trust_proxy and 'localhost' not in trusted:
         trusted.append('localhost')
-    service = Service(store)
+    service = Service(store, public_url=args.public_url)
     backend = build_backend(service, args)
     httpd = create_server(service, backend, host=args.host, port=args.port,
                           trusted_proxies=trusted, max_body=args.max_body,

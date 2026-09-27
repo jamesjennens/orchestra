@@ -191,6 +191,58 @@ idempotency record's (`IDEMPOTENCY_TTL_SECONDS`, 24 h). That record expires on t
 confirmed timeline (see the record store in section 8), so a clock jump never shortens
 it; a retry after the window is treated as a new request.
 
+### Personal agents
+
+An agent is a personal identity owned by one user; it pulls work over the same REST
+API instead of reading HTML. Create one with `POST /v1/agents` (session authority),
+giving `name`, an optional free-text `working_directory` hint for the owner's own
+machine, `tool`, `machine`, `notes` and the `projects` to grant. The response carries
+the agent record, the setup payload and the credential secret **once**; an exact
+idempotent retry returns `200` with `secret_available:false` and never re-delivers it.
+
+The setup payload writes `.orchestra/agent.json` with the server URL, the agent id and
+the project ids and no secret. The secret belongs in VS Code secret storage or the OS
+credential store; an environment variable is only a documented fallback, set from that
+store, and `.orchestra/` stays out of Git. The setup snippet never shows the literal
+secret being assigned on a command line: a literal `export` would persist in shell
+history and the process list. The
+agent then calls `GET /v1/agents/me` and `GET /v1/agents/me/next` with
+`Authorization: Bearer $ORCHESTRA_AGENT_SECRET`; every other project route works as
+before, capped at the owner's live role and the agent's granted projects. A grant may
+only name a project the owner can open, including when a superuser edits somebody
+else's agent (`404` otherwise). Set `--public-url https://<HOSTNAME>` so the setup and
+resume snippets carry the real address. Attention is computed at read time only: the
+service runs no scheduled job, poller or timer, and the owner resumes the agent
+manually.
+
+Attention re-authorizes every granted project with the same live check the task routes
+use before it reads anything, so a project the caller can no longer open (the owner
+was removed, or the grant was narrowed) is skipped instead of leaked. Each project is
+read once per request through one full task snapshot, so an agent's own task is found
+however deep it sorts and the request costs one `endpoint.py` / `bd list --all`
+invocation per project whatever the project's size (the page-sized cap is applied to
+the in-memory snapshot); only the *claimable* suggestions meet the page-sized cap, and
+`truncated` reports that suggestion list.
+
+A project owner or admin governs which agents may work in their project without
+holding `agents.manage` and without seeing anything the agent's own owner keeps
+private. `GET /v1/projects/{id}/agents` lists the agents whose grant names the project
+(id, name, owner, `last_seen_at`, `enabled` only, never `working_directory` or
+`working_directory_hidden`), `GET /v1/projects/{id}/agents/{agent}` returns one of
+them, and `DELETE /v1/projects/{id}/agents/{agent}` removes the project from that
+agent's grant with an audit record naming the project and the acting user. Removal
+takes effect on the agent's next request: the credential is refused (`403`/`404`) on
+that project's routes and the project drops out of `/v1/agents/me/next`. It revokes
+nothing else - the agent is not disabled, keeps its other projects and credentials,
+and its own owner keeps every other control.
+
+Revoke an agent credential, disable the agent, disable the owner or remove the
+owner's project membership and the agent stops on its next request. The
+`working_directory` hint is returned only to the owner or a superuser. The browser
+screens that display the directory and the copyable resume prompt are
+kittrial-5bb.20 and consume these JSON responses; they are not part of this service
+build.
+
 ## 7. Secrets, rotation and redaction
 
 - Password verifiers are stored with memory-hard `scrypt`; plaintext passwords,
@@ -579,6 +631,21 @@ the pilot phase, not part of this service.
   stream ships with `kittrial-5bb.13`; the service never substitutes its own store
   for canonical feedback. Attachment uploads are validated and bounded but only
   their metadata and digest are retained, so **UI readiness is not claimed**.
+- The personal-agent registry, one-time agent credential and the agent REST
+  contract (`/v1/agents`, `/v1/agents/me`, `/v1/agents/me/next`, and the
+  project-scoped `GET /v1/projects/{id}/agents`,
+  `GET /v1/projects/{id}/agents/{agent}` and
+  `DELETE /v1/projects/{id}/agents/{agent}`) are implemented and tested. The
+  **browser screens** that render "Your agents", the working directory
+  and the copyable resume prompt are kittrial-5bb.20 and are not built here; this
+  build exposes only the JSON contract they will consume.
+- **Known limitation `endpoint-blocked-signal`.** `blocked` attention for an agent is
+  derived from the in-process canonical checkpoint view (`backend.state['checkpoints']`).
+  The canonical endpoint binding does not mirror checkpoints into service state, so
+  over `--backend endpoint` that one signal is **absent rather than wrong** while
+  changes-requested, claimable and awaiting-review are unaffected. Mirroring
+  checkpoints into the endpoint backend is deliberately not attempted in this
+  revision (it is the open checkpoint item `endpoint-blocked-signal`).
 - Administrative audit coverage is partial: login outcomes, authorization
   denials and every successful idempotent mutation are recorded; a per-field
   before/after administrative trail is not implemented.
@@ -602,6 +669,16 @@ the pilot phase, not part of this service.
 4. Retention period and recovery objectives for audit, state and backups.
 5. Whether to bind an external identity provider (SSO) or MFA, and when.
 6. Network exposure and any approved browser origin list.
+7. The personal-agent design decisions (checkpoint item `owner-decisions-pending`)
+   were settled by the owner on 2026-09-27 (comment
+   `01a0e2f2-569c-7d03-94ee-36b8dd61940a`): decisions 1, 2, 3, 5, 6, 7 and 8 keep
+   the coordinator proposal as implemented; decision 4 (project owners/admins list
+   and revoke agents in their project) and decision 9 (recommend VS Code secret
+   storage or the OS credential store first, environment variable only as a
+   documented fallback, never a literal `export` of the secret) are implemented in
+   this revision. The `owner-decisions-pending` checkpoint item is therefore
+   resolved; the disposable-build caveat below still stands until rollout decisions
+   1-6 in this list are recorded.
 
 Until these are recorded, this service is a disposable local validation build,
 not an office deployment.

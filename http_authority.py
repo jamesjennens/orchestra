@@ -320,6 +320,10 @@ CAP_APPROVE = 'reviews.approve'
 CAP_PROJECT_ADMIN = 'project.admin'
 CAP_PROJECT_CREATE = 'project.create'
 CAP_ACCOUNTS_ADMIN = 'accounts.admin'
+#: Personal agent management. It is deliberately NOT project-scoped: every
+#: authenticated session may manage the agents it owns, while no worker/agent
+#: credential ever holds it (an agent cannot create or widen another identity).
+CAP_AGENTS = 'agents.manage'
 
 ROLES = ('viewer', 'contributor', 'owner')
 RANK = {'viewer': 0, 'contributor': 1, 'owner': 2}
@@ -340,9 +344,11 @@ ROLE_CAPABILITIES = {
                         CAP_APPROVE, CAP_PROJECT_ADMIN}),
 }
 CREDENTIAL_FORBIDDEN_CAPABILITIES = frozenset({CAP_APPROVE, CAP_PROJECT_ADMIN,
-                                               CAP_PROJECT_CREATE, CAP_ACCOUNTS_ADMIN})
+                                               CAP_PROJECT_CREATE, CAP_ACCOUNTS_ADMIN,
+                                               CAP_AGENTS})
 ALL_CAPABILITIES = frozenset(ROLE_CAPABILITIES['owner'] | {CAP_PROJECT_CREATE,
-                                                           CAP_ACCOUNTS_ADMIN})
+                                                           CAP_ACCOUNTS_ADMIN,
+                                                           CAP_AGENTS})
 
 
 class AuthorityDenied(Exception):
@@ -416,10 +422,20 @@ def decide(state, request, *, now=None, allow_self_user=None):
         issuer = state.get('users', {}).get(credential.get('user_id'))
         if not isinstance(issuer, dict) or issuer.get('disabled'):
             raise deny(401, 'unauthenticated', 'Authentication is no longer valid')
-        if capability in (CAP_ACCOUNTS_ADMIN, CAP_PROJECT_CREATE):
+        if capability in (CAP_ACCOUNTS_ADMIN, CAP_PROJECT_CREATE, CAP_AGENTS):
             raise deny(403, 'forbidden',
                        'A worker credential cannot perform administrative operations')
-        if credential.get('project_id') != project_id:
+        if credential.get('agent_id'):
+            # An agent credential is a personal identity: it is refused the moment the
+            # agent record is gone or disabled, and its project reach is the agent's
+            # LIVE grant list (not a snapshot taken at issue time), so narrowing the
+            # grant takes effect on the next request.
+            agent = state.get('agents', {}).get(credential.get('agent_id'))
+            if not isinstance(agent, dict) or not agent.get('enabled'):
+                raise deny(401, 'unauthenticated', 'Agent is disabled')
+            if project_id not in (agent.get('projects') or []):
+                raise deny(404, 'not_found', 'Project not found')
+        elif credential.get('project_id') != project_id:
             raise deny(404, 'not_found', 'Project not found')
         if project_id not in state.get('projects', {}):
             raise deny(404, 'not_found', 'Project not found')
@@ -446,6 +462,11 @@ def decide(state, request, *, now=None, allow_self_user=None):
             raise deny(403, 'forbidden', 'Superuser authority required')
         return {'role': 'superuser'}
     if capability == CAP_PROJECT_CREATE:
+        return {'role': 'session'}
+    if capability == CAP_AGENTS:
+        # Personal identity management, not a project operation: every authenticated
+        # session may manage the agents it owns, and the service checks ownership of
+        # the specific agent separately.
         return {'role': 'session'}
     if project_id not in state.get('projects', {}):
         raise deny(404, 'not_found', 'Project not found')

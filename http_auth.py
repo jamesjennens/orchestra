@@ -40,7 +40,7 @@ import threading
 import time
 from pathlib import Path
 
-from http_authority import (ALL_CAPABILITIES, CAP_ACCOUNTS_ADMIN, CAP_APPROVE,
+from http_authority import (ALL_CAPABILITIES, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CAP_APPROVE,
                             CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROJECT_ADMIN,
                             CAP_PROJECT_CREATE, CAP_READ, CAP_REVIEWS, CAP_TASKS,
                             CREDENTIAL_FORBIDDEN_CAPABILITIES, CREDENTIAL_SCOPES, RANK,
@@ -75,6 +75,22 @@ RESULT_RETENTION_SECONDS = 24 * 60 * 60
 #: service state document. Both used to live inside the JSON document with a count/byte
 #: eviction (results) or unbounded growth (idempotency).
 RECORD_STORE_SUFFIX = '.records.sqlite3'
+
+# Personal-agent bounds and defaults (kittrial-5bb.22). An agent is a personal
+# identity owned by one user, not a project role; every field is a bounded,
+# free-text hint the server stores and never executes.
+AGENT_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9 _.-]{0,63}')
+AGENT_PROJECT_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}')
+AGENT_TOOL_MAX = 120
+AGENT_MACHINE_MAX = 120
+AGENT_NOTES_MAX = 1000
+AGENT_DIRECTORY_MAX = 512
+AGENT_PROJECTS_MAX = 64
+AGENT_MAX_PER_OWNER = 100
+AGENT_MAX_CREDENTIALS = 20
+AGENT_DEFAULT_SCOPES = ('tasks', 'checkpoints', 'reviews', 'feedback')
+AGENT_CONFIG_PATH = '.orchestra/agent.json'
+AGENT_SECRET_ENV = 'ORCHESTRA_AGENT_SECRET'
 
 # Capabilities are the single authority vocabulary for every route. A route names
 # the capability it needs; the Service decides whether the live principal holds it.
@@ -223,10 +239,12 @@ class Principal:
     """A server-derived authenticated identity. Submitted actor labels never grant authority."""
 
     __slots__ = ('user_id', 'display_name', 'superuser', 'via', 'credential_id',
-                 'credential_project', 'scopes', 'actor', 'csrf', 'session_hash')
+                 'credential_project', 'scopes', 'actor', 'csrf', 'session_hash',
+                 'agent_id')
 
     def __init__(self, user_id, display_name, superuser, via, actor, *, credential_id=None,
-                 credential_project=None, scopes=(), csrf=None, session_hash=None):
+                 credential_project=None, scopes=(), csrf=None, session_hash=None,
+                 agent_id=None):
         self.user_id = user_id
         self.display_name = display_name
         self.superuser = superuser
@@ -237,6 +255,7 @@ class Principal:
         self.actor = actor
         self.csrf = csrf
         self.session_hash = session_hash
+        self.agent_id = agent_id
 
     def __repr__(self):
         return 'Principal(user_id=%r, via=%r, credential_id=%r)' % (
@@ -255,6 +274,7 @@ def _blank_state():
         'reset_tokens': {},
         'projects': {},
         'memberships': {},
+        'agents': {},
         'audit': [],
         'canonical': {'tasks': {}, 'checkpoints': {}, 'contributions': {}, 'feedback': {}},
     }
@@ -692,7 +712,7 @@ class Service:
                  credential_ttl=CREDENTIAL_TTL_SECONDS, reset_ttl=RESET_TTL_SECONDS,
                  idempotency_ttl=IDEMPOTENCY_TTL_SECONDS,
                  result_retention=RESULT_RETENTION_SECONDS,
-                 login_max_attempts=LOGIN_MAX_ATTEMPTS):
+                 login_max_attempts=LOGIN_MAX_ATTEMPTS, public_url=None):
         self.store = store
         self.session_idle = session_idle
         self.session_absolute = session_absolute
@@ -701,6 +721,9 @@ class Service:
         self.idempotency_ttl = idempotency_ttl
         self.result_retention = result_retention
         self.login_max_attempts = login_max_attempts
+        #: Canonical base URL of this service, used only to render the copyable agent
+        #: setup/resume snippets. It is deployment configuration, never request data.
+        self.public_url = (public_url or '').rstrip('/') or None
         self._failures = {}
 
     # -- helpers ---------------------------------------------------------------
@@ -776,9 +799,14 @@ class Service:
                               lifetime=self.session_idle)
         if principal.via == 'credential':
             credential = self.state['credentials'].get(principal.credential_id)
-            return credential is None or credential.get('revoked') or self._expired(
-                moment, expires_at=credential.get('expires_at'),
-                issued_raw=credential.get('issued_raw'), lifetime=self.credential_ttl)
+            if credential is None or credential.get('revoked') or self._expired(
+                    moment, expires_at=credential.get('expires_at'),
+                    issued_raw=credential.get('issued_raw'), lifetime=self.credential_ttl):
+                return True
+            if credential.get('agent_id'):
+                agent = self.state['agents'].get(credential['agent_id'])
+                return not isinstance(agent, dict) or not agent.get('enabled')
+            return False
         return True
 
     def audit(self, request_id, principal, action, outcome, *, project_id=None, reason=None,
@@ -1094,6 +1122,17 @@ class Service:
                     raise forbidden('Credential scope does not permit this operation')
                 credential['last_used'] = moment
                 actor = credential.get('actor') or user['id']
+                # An agent credential resolves to its agent record on every request: a
+                # missing or disabled agent stops it even when the token itself was never
+                # individually revoked, and a successful use stamps ``last_seen_at`` (the
+                # manual-cadence signal the owner's web view shows). No background job or
+                # poller exists; this is only written when the agent actually calls in.
+                agent_id = credential.get('agent_id')
+                if agent_id:
+                    agent = self.state['agents'].get(agent_id)
+                    if not isinstance(agent, dict) or not agent.get('enabled'):
+                        raise unauthenticated('Agent is disabled')
+                    agent['last_seen_at'] = now_iso(self._now())
                 self.store.save()
                 # A credential carries ONLY the authority granted by its type, project
                 # and scopes. It never inherits the issuing account's global superuser
@@ -1102,7 +1141,7 @@ class Service:
                 return Principal(user['id'], user['display_name'], False,
                                  'credential', actor, credential_id=credential['id'],
                                  credential_project=credential['project_id'],
-                                 scopes=credential['scopes'])
+                                 scopes=credential['scopes'], agent_id=agent_id)
         raise unauthenticated('Authentication required')
 
     # -- live authority --------------------------------------------------------
@@ -1144,10 +1183,16 @@ class Service:
             user = self.state['users'].get(credential['user_id'])
             if user is None or user['disabled']:
                 raise unauthenticated('Authentication is no longer valid')
+            agent_id = credential.get('agent_id')
+            if agent_id:
+                agent = self.state['agents'].get(agent_id)
+                if not isinstance(agent, dict) or not agent.get('enabled'):
+                    raise unauthenticated('Agent is disabled')
             principal.superuser = False
             principal.scopes = tuple(credential['scopes'])
             principal.credential_project = credential['project_id']
             principal.actor = credential.get('actor') or principal.actor
+            principal.agent_id = agent_id
             return user
         raise unauthenticated()
 
@@ -1205,7 +1250,7 @@ class Service:
             raise HttpError(denied.status, denied.code, denied.message, denied.detail)
         if allow_self_user is not None and principal.user_id == allow_self_user:
             return None, decision['role']
-        if capability in (CAP_ACCOUNTS_ADMIN, CAP_PROJECT_CREATE):
+        if capability in (CAP_ACCOUNTS_ADMIN, CAP_PROJECT_CREATE, CAP_AGENTS):
             return None, decision['role']
         return self.state.get('projects', {}).get(project_id), decision['role']
 
@@ -1280,6 +1325,18 @@ class Service:
         with self.store.lock:
             self._refresh_authority(principal)
             if principal.via == 'credential':
+                if principal.agent_id:
+                    # An agent credential reads exactly its live grant list, and only the
+                    # projects its owner can still open: a narrowed grant or a lost
+                    # membership drops a project from this list immediately.
+                    agent = self.state['agents'].get(principal.agent_id)
+                    visible = []
+                    for pid in (agent.get('projects') if agent else []) or []:
+                        try:
+                            visible.append(self.project_view(principal, pid))
+                        except HttpError:
+                            continue
+                    return visible
                 pid = principal.credential_project
                 if pid not in self.state['projects']:
                     return []
@@ -1407,9 +1464,10 @@ class Service:
 
     def credential_view(self, credential):
         return {'id': credential['id'], 'project': credential['project_id'],
+                'agent': credential.get('agent_id'),
                 'label': credential['label'], 'scopes': list(credential['scopes']),
                 'actor': credential.get('actor'), 'revoked': credential['revoked'],
-                'created_at': credential['created_at'],
+                'created_at': credential['created_at'], 'last_used': credential.get('last_used'),
                 'expires_at': now_iso(credential['expires_at'])}
 
     def revoke_credential(self, principal, project_id, credential_id, request_id=None):
@@ -1429,6 +1487,422 @@ class Service:
             credential['revoked'] = True
             self.store.save()
         return {'id': credential_id, 'revoked': True}
+
+    # -- personal agents -------------------------------------------------------
+    #
+    # An agent is a personal identity owned by exactly one user: "Kestrel, agent of
+    # Priya". It is NOT a project role and NOT a user account. It may be granted access
+    # to projects its owner belongs to, and every grant is capped at the owner's LIVE
+    # role on that project by the same ``http_authority.decide`` rule the .19 worker
+    # credentials use, so a demotion, removal or account disable narrows or stops the
+    # agent on its next request. ``working_directory`` is a free-text hint for the
+    # owner's own machine; the server stores it and never reads it, and only the owner
+    # (or a superuser) ever receives it in a response.
+    def agent_actor(self, agent):
+        """The stable attribution label an agent's API writes carry."""
+        return agent['id']
+
+    @staticmethod
+    def _agent_name(name):
+        if not isinstance(name, str) or not AGENT_NAME.fullmatch(name.strip()):
+            raise invalid('Agent name must be 1-64 characters of letters, digits, '
+                          'space, . _ -')
+        return name.strip()
+
+    @staticmethod
+    def _agent_text(value, field, limit):
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise invalid('%s must be text' % field)
+        text = value.strip()
+        if not text:
+            return None
+        if len(text) > limit or any(ord(c) < 32 for c in text):
+            raise invalid('%s must be at most %d printable characters' % (field, limit))
+        return text
+
+    def _agent_projects(self, principal, projects, owner_id=None):
+        """Validate a requested agent grant against the *owner's* live membership.
+
+        A grant may only name projects the agent's owner can already read. For the
+        owner's own request that is the pre-existing rule; for a superuser changing
+        somebody else's agent it means a superuser may **not** store a project outside
+        the owner's membership, because such a grant can only ever be a leak waiting to
+        be read. The stored list is a *ceiling*: the live role cap in
+        :func:`http_authority.decide` is still applied on every request, and attention
+        re-authorizes each project at read time.
+        """
+        if projects is None:
+            return []
+        if not isinstance(projects, list) or len(projects) > AGENT_PROJECTS_MAX:
+            raise invalid('projects must be a list of at most %d project ids'
+                          % AGENT_PROJECTS_MAX)
+        granted = []
+        for pid in projects:
+            if not isinstance(pid, str) or not AGENT_PROJECT_ID.fullmatch(pid):
+                raise invalid('Invalid project id in agent grant')
+            if pid not in granted:
+                granted.append(pid)
+        owner_id = owner_id or principal.user_id
+        owner = self.state['users'].get(owner_id) or {}
+        owner_is_superuser = bool(owner.get('superuser'))
+        for pid in granted:
+            if pid not in self.state['projects']:
+                raise not_found('Project not found')
+            if not owner_is_superuser and \
+                    owner_id not in self.state['memberships'].get(pid, {}):
+                raise not_found('Project not found')
+        return granted
+
+    def _agent(self, agent_id):
+        agent = self.state['agents'].get(agent_id)
+        if not isinstance(agent, dict):
+            raise not_found('Agent not found')
+        return agent
+
+    def _agent_owned(self, principal, agent_id):
+        """Return the agent when ``principal`` may administer it, else 404.
+
+        A non-owner must not learn whether the id exists, so an unauthorized read is
+        reported exactly like a missing agent.
+        """
+        agent = self._agent(agent_id)
+        if not (principal.superuser or agent['owner'] == principal.user_id):
+            raise not_found('Agent not found')
+        return agent
+
+    def _owner_name(self, user_id):
+        user = self.state['users'].get(user_id) or {}
+        return user.get('display_name') or user_id
+
+    def _agent_credentials(self, agent):
+        return [c for c in self.state['credentials'].values()
+                if c.get('agent_id') == agent['id']]
+
+    def _revoke_agent_credentials(self, agent):
+        for credential in self._agent_credentials(agent):
+            credential['revoked'] = True
+
+    def agent_view(self, agent, principal):
+        """The owner-visible agent record. The path never leaks to anyone else."""
+        owner_sees_path = bool(principal.superuser or
+                               principal.user_id == agent['owner'])
+        view = {
+            'id': agent['id'], 'name': agent['name'], 'owner': agent['owner'],
+            'owner_display_name': self._owner_name(agent['owner']),
+            'tool': agent.get('tool'), 'machine': agent.get('machine'),
+            'notes': agent.get('notes'), 'enabled': bool(agent.get('enabled')),
+            'actor': self.agent_actor(agent),
+            'projects': list(agent.get('projects') or []),
+            'created_at': agent.get('created_at'),
+            'last_seen_at': agent.get('last_seen_at'),
+            'credentials': [self.credential_view(c) for c in self._agent_credentials(agent)],
+        }
+        if owner_sees_path:
+            view['working_directory'] = agent.get('working_directory')
+        else:
+            # Explicit, so a client can tell "hidden from you" from "not set".
+            view['working_directory_hidden'] = True
+        return view
+
+    def project_agent_view(self, agent):
+        """The *project-owner* view of an agent active in their project.
+
+        Deliberately narrower than :meth:`agent_view`. A project owner governs
+        whether an agent may work in their project, but is not that agent's owner, so
+        the response carries identity, attribution and liveness only. The
+        ``working_directory`` hint never appears - and neither does
+        ``working_directory_hidden``, which would still disclose that a path exists -
+        nor do the agent's other project grants, its machine/notes or its credentials.
+        """
+        return {
+            'id': agent['id'],
+            'name': agent['name'],
+            'owner': agent['owner'],
+            'owner_display_name': self._owner_name(agent['owner']),
+            'actor': self.agent_actor(agent),
+            'enabled': bool(agent.get('enabled')),
+            'last_seen_at': agent.get('last_seen_at'),
+        }
+
+    def list_project_agents(self, principal, project_id):
+        """Agents whose live grant names ``project_id`` (owner decision 4).
+
+        Authorization is the route's ``CAP_PROJECT_ADMIN`` check (project owner or
+        admin, never a worker/agent credential), so this method only assembles the
+        safe :meth:`project_agent_view`.
+        """
+        with self.store.lock:
+            self._refresh_authority(principal)
+            agents = [a for a in self.state['agents'].values()
+                      if project_id in (a.get('projects') or [])]
+            agents.sort(key=lambda a: a['id'])
+            return [self.project_agent_view(a) for a in agents]
+
+    def get_project_agent(self, principal, project_id, agent_id):
+        """One agent as its project's owner/admin sees it.
+
+        Like :meth:`list_project_agents`, the route holds the ``CAP_PROJECT_ADMIN``
+        boundary. An agent whose grant does not name this project is reported exactly
+        like a missing agent, so a project owner cannot probe the wider registry.
+        """
+        with self.store.lock:
+            self._refresh_authority(principal)
+            agent = self._agent(agent_id)
+            if project_id not in (agent.get('projects') or []):
+                raise not_found('Agent not found in this project')
+            return self.project_agent_view(agent)
+
+    def revoke_agent_project(self, principal, project_id, agent_id, request_id=None):
+        """Remove one project from an agent's grant (owner decision 4).
+
+        The project owner/admin boundary is the route's ``CAP_PROJECT_ADMIN`` check.
+        Only the grant changes: the agent keeps its other projects, its credentials,
+        its ``enabled`` state and every control its own owner holds. Because
+        :func:`http_authority.decide` reads the *live* grant on every request, the
+        agent credential is refused on this project on its next request and the
+        project drops out of ``/v1/agents/me/next``.
+        """
+        if principal is None or principal.via == 'credential':
+            raise forbidden('Session authority required to change an agent grant')
+        with self.store.lock:
+            self._refresh_authority(principal)
+            agent = self._agent(agent_id)
+            projects = list(agent.get('projects') or [])
+            if project_id not in projects:
+                # Exactly like a missing agent: a non-participant learns nothing.
+                raise not_found('Agent not found in this project')
+            agent['projects'] = [pid for pid in projects if pid != project_id]
+            self.store.save()
+            view = self.project_agent_view(agent)
+        return {'operation': 'agents.project.revoke', 'project': project_id, 'agent': view}
+
+    def agent_setup(self, agent, secret, projects=None):
+        """The one-time setup payload. It never contains the secret itself.
+
+        The secret is returned once beside this payload; ``.orchestra/agent.json``
+        holds only the server URL, the agent id and the project ids, so the directory
+        the agent runs in is safe to keep. The snippet leads with VS Code secret
+        storage or the OS credential store (owner decision 9); an environment variable
+        is only a documented fallback, read from that store, and no command line ever
+        carries the literal secret (shell history, process list).
+        """
+        server_url = self.public_url
+        config = {
+            'server_url': server_url,
+            'agent_id': agent['id'],
+            'projects': list(projects if projects is not None else agent.get('projects') or []),
+            'name': agent['name'],
+        }
+        endpoint = (server_url or '<ORCHESTRA_SERVER_URL>') + '/v1/agents/me/next'
+        snippet = (
+            "mkdir -p .orchestra\n"
+            "cat > %s <<'JSON'\n%s\nJSON\n"
+            "printf '\\n.orchestra/\\n' >> .gitignore\n"
+            "# Store the secret shown once in VS Code secret storage or your OS\n"
+            "# credential store and let your client read it from there. Never write it\n"
+            "# into the file above, into Git, or onto a command line: a literal export\n"
+            "# would persist in shell history and the process list.\n"
+            "#\n"
+            "# Fallback only, for a machine with no secret store: set the %s\n"
+            "# environment variable from that store and reference it as below - never\n"
+            "# paste the secret itself into a command.\n"
+            "curl -fsS -H \"Authorization: Bearer $%s\" %s\n"
+        ) % (AGENT_CONFIG_PATH, json.dumps(config, indent=2, sort_keys=True),
+             AGENT_SECRET_ENV, AGENT_SECRET_ENV, endpoint)
+        return {
+            'config_path': AGENT_CONFIG_PATH,
+            'config': config,
+            'config_contains_secret': False,
+            'secret_env_var': AGENT_SECRET_ENV,
+            'setup_snippet': snippet,
+            'guidance': 'Keep .orchestra/ out of Git. Keep the secret shown once in '
+                        'VS Code secret storage or the OS credential store and have '
+                        'the client read it from there; the %s environment variable is '
+                        'only a documented fallback, set from that store, and the '
+                        'literal secret must never appear on a command line. It is '
+                        'shown only once.' % AGENT_SECRET_ENV,
+        }
+
+    def _issue_agent_credential_locked(self, principal, agent, scopes=None, label=None):
+        """Create one agent credential. Caller holds ``store.lock`` and has authorized."""
+        requested = tuple(scopes or AGENT_DEFAULT_SCOPES)
+        for scope in requested:
+            if scope not in CREDENTIAL_SCOPES:
+                raise invalid('Unknown credential scope %r' % (scope,))
+        if len(self._agent_credentials(agent)) >= AGENT_MAX_CREDENTIALS:
+            raise conflict('An agent may hold at most %d credentials'
+                           % AGENT_MAX_CREDENTIALS)
+        secret = new_token()
+        moment = self._expiry_now()
+        credential = {
+            'id': 'cred_' + secrets.token_hex(8),
+            'user_id': agent['owner'],
+            'project_id': None,
+            'agent_id': agent['id'],
+            'label': label or ('agent:%s' % agent['name'])[:64],
+            'scopes': list(requested),
+            'actor': self.agent_actor(agent),
+            'token_hash': token_hash(secret),
+            'created_at': now_iso(self._now()),
+            'issued_raw': self._raw_now(),
+            'last_used': None,
+            'expires_at': moment + self.credential_ttl,
+            'revoked': False,
+        }
+        self.state['credentials'][credential['id']] = credential
+        self.state['credential_tokens'][token_hash(secret)] = credential['id']
+        return credential, secret
+
+    def create_agent(self, principal, *, name, tool=None, working_directory=None,
+                     machine=None, notes=None, projects=None, scopes=None,
+                     request_id=None):
+        """Create an owner-bound agent and its first (one-time) credential."""
+        if principal is None or principal.via == 'credential':
+            raise forbidden('Session authority required to create an agent')
+        clean_name = self._agent_name(name)
+        tool = self._agent_text(tool, 'tool', AGENT_TOOL_MAX)
+        working_directory = self._agent_text(working_directory, 'working_directory',
+                                             AGENT_DIRECTORY_MAX)
+        machine = self._agent_text(machine, 'machine', AGENT_MACHINE_MAX)
+        notes = self._agent_text(notes, 'notes', AGENT_NOTES_MAX)
+        with self.store.lock:
+            self._refresh_authority(principal)
+            owned = [a for a in self.state['agents'].values()
+                     if a['owner'] == principal.user_id]
+            if len(owned) >= AGENT_MAX_PER_OWNER:
+                raise conflict('At most %d agents per account' % AGENT_MAX_PER_OWNER)
+            granted = self._agent_projects(principal, projects)
+            agent_id = 'agent_' + secrets.token_hex(8)
+            agent = {
+                'id': agent_id, 'name': clean_name, 'owner': principal.user_id,
+                'tool': tool, 'working_directory': working_directory,
+                'machine': machine, 'notes': notes, 'enabled': True,
+                'projects': granted, 'created_at': now_iso(self._now()),
+                'last_seen_at': None,
+            }
+            self.state['agents'][agent_id] = agent
+            credential, secret = self._issue_agent_credential_locked(principal, agent,
+                                                                     scopes=scopes)
+            self.store.save()
+            # The one-time secret travels only in this response.
+            public = {
+                'operation': 'agents.create',
+                'agent': self.agent_view(agent, principal),
+                'credential': dict(self.credential_view(credential), secret=secret,
+                                   secret_available=True),
+                'setup': self.agent_setup(agent, secret),
+                'secret_available': True,
+            }
+        return public
+
+    def list_agents(self, principal):
+        """Agents the principal may administer: its own, or every agent for a superuser."""
+        with self.store.lock:
+            self._refresh_authority(principal)
+            agents = [a for a in self.state['agents'].values()
+                      if principal.superuser or a['owner'] == principal.user_id]
+            agents.sort(key=lambda a: a['id'])
+            return [self.agent_view(a, principal) for a in agents]
+
+    def get_agent(self, principal, agent_id):
+        with self.store.lock:
+            self._refresh_authority(principal)
+            agent = self._agent_owned(principal, agent_id)
+            return self.agent_view(agent, principal)
+
+    def agent_for_credential(self, principal):
+        """The agent behind an agent credential, for ``GET /v1/agents/me``."""
+        if principal is None or principal.via != 'credential' or not principal.agent_id:
+            raise forbidden('An agent credential is required')
+        with self.store.lock:
+            self._refresh_authority(principal)
+            agent = self._agent(principal.agent_id)
+            return self.agent_view(agent, principal)
+
+    def update_agent(self, principal, agent_id, payload):
+        if principal is None or principal.via == 'credential':
+            raise forbidden('Session authority required to change an agent')
+        with self.store.lock:
+            self._refresh_authority(principal)
+            agent = self._agent_owned(principal, agent_id)
+            if 'name' in payload and payload.get('name') is not None:
+                agent['name'] = self._agent_name(payload.get('name'))
+            for field, limit in (('tool', AGENT_TOOL_MAX), ('machine', AGENT_MACHINE_MAX),
+                                 ('notes', AGENT_NOTES_MAX),
+                                 ('working_directory', AGENT_DIRECTORY_MAX)):
+                if field in payload:
+                    agent[field] = self._agent_text(payload.get(field), field, limit)
+            if 'projects' in payload:
+                agent['projects'] = self._agent_projects(principal, payload.get('projects'),
+                                                         owner_id=agent['owner'])
+            if 'enabled' in payload and payload.get('enabled') is not None:
+                enabled = bool(payload.get('enabled'))
+                agent['enabled'] = enabled
+                if not enabled:
+                    self._revoke_agent_credentials(agent)
+            self.store.save()
+            return self.agent_view(agent, principal)
+
+    def disable_agent(self, principal, agent_id):
+        """Disable an agent and revoke every credential it holds, immediately."""
+        if principal is None or principal.via == 'credential':
+            raise forbidden('Session authority required to disable an agent')
+        with self.store.lock:
+            self._refresh_authority(principal)
+            agent = self._agent_owned(principal, agent_id)
+            agent['enabled'] = False
+            self._revoke_agent_credentials(agent)
+            self.store.save()
+            return self.agent_view(agent, principal)
+
+    def enable_agent(self, principal, agent_id):
+        """Re-enable an agent. Previously revoked credentials stay revoked."""
+        if principal is None or principal.via == 'credential':
+            raise forbidden('Session authority required to enable an agent')
+        with self.store.lock:
+            self._refresh_authority(principal)
+            agent = self._agent_owned(principal, agent_id)
+            agent['enabled'] = True
+            self.store.save()
+            return self.agent_view(agent, principal)
+
+    def issue_agent_credential(self, principal, agent_id, *, scopes=None, label=None,
+                               request_id=None):
+        if principal is None or principal.via == 'credential':
+            raise forbidden('Session authority required to issue an agent credential')
+        with self.store.lock:
+            self._refresh_authority(principal)
+            agent = self._agent_owned(principal, agent_id)
+            if not agent.get('enabled'):
+                raise conflict('A disabled agent cannot receive a credential')
+            credential, secret = self._issue_agent_credential_locked(
+                principal, agent, scopes=scopes, label=label)
+            self.store.save()
+            return {
+                'operation': 'agents.credentials.issue',
+                'agent': agent['id'],
+                'credential': dict(self.credential_view(credential), secret=secret,
+                                   secret_available=True),
+                'setup': self.agent_setup(agent, secret),
+                'secret_available': True,
+            }
+
+    def revoke_agent_credential(self, principal, agent_id, credential_id,
+                                request_id=None):
+        if principal is None or principal.via == 'credential':
+            raise forbidden('Session authority required to revoke an agent credential')
+        with self.store.lock:
+            self._refresh_authority(principal)
+            agent = self._agent_owned(principal, agent_id)
+            credential = self.state['credentials'].get(credential_id)
+            if not isinstance(credential, dict) or \
+                    credential.get('agent_id') != agent['id']:
+                raise not_found('Credential not found')
+            credential['revoked'] = True
+            self.store.save()
+        return {'id': credential_id, 'agent': agent['id'], 'revoked': True}
 
     # -- idempotency -----------------------------------------------------------
     def _idempotency_key(self, principal, project_id, route, key):
