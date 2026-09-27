@@ -259,7 +259,7 @@ class BackupTests(unittest.TestCase):
         def native(*args):
             locked('restore-native')
             return 'restored'
-        def restore(*args): locked('restore-sidecar')
+        def restore(*args, **kwargs): locked('restore-sidecar')
         argv = ['admin.py', '--root', str(self.root), 'restore-new', 'source', 'destination']
         with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', return_value=self.root), patch.object(admin, 'coordination_backup', side_effect=read), patch.object(admin, 'add_project', side_effect=create), patch.object(admin, 'run_bd', side_effect=native), patch.object(admin, 'restore_coordination', side_effect=restore), contextlib.redirect_stdout(io.StringIO()):
             admin.main()

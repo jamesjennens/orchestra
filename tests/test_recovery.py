@@ -514,7 +514,7 @@ class AdminVoidRecordTests(unittest.TestCase):
         # Re-adding the operator restores the disposition: nothing was deleted.
         self.assertEqual(w.project(issue, ('ops',))['review_state'], 'awaiting-review')
 
-    def test_project_backup_carries_the_allowlist_and_restore_reestablishes_it(self):
+    def test_project_backup_carries_the_allowlist_and_restore_reports_it_without_regranting(self):
         marker = self.root / 'deployment.private.json'
         marker.write_text(json.dumps({'password': 'x', 'unit': 'none', 'operators': ['operator', 'ops']}),
                           encoding='utf-8')
@@ -525,16 +525,97 @@ class AdminVoidRecordTests(unittest.TestCase):
         bundle = json.loads((self.root / 'backups' / 'trial.coordination.json').read_text(encoding='utf-8'))
         self.assertEqual(bundle['operators'], ['operator', 'ops'])
         self.assertEqual(admin.coordination_operators(self.root, 'trial'), ['operator', 'ops'])
-        # A host that does not list `ops` would treat the preserved void as
-        # inert; restore re-establishes the recorded authority and reports it.
+        self.assertEqual(admin.missing_operators(self.root, 'trial'), [])
+        # A host that does not list `ops` treats the void `ops` authored as
+        # inert. Restoring the backup reports that difference; it must not
+        # change the deployment allowlist by itself.
         marker.write_text(json.dumps({'password': 'x', 'unit': 'none', 'operators': ['operator']}),
                           encoding='utf-8')
+        self.assertEqual(admin.missing_operators(self.root, 'trial'), ['ops'])
         with contextlib.redirect_stdout(io.StringIO()) as out:
             admin.restore_coordination(self.root, 'trial', 'other')
+        self.assertEqual(json.loads(marker.read_text(encoding='utf-8'))['operators'], ['operator'])
+        self.assertIn('NOT restored', out.getvalue())
+        self.assertIn('ops', out.getvalue())
+        # The explicit flag is the only way a restore re-grants recorded authority.
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            admin.restore_coordination(self.root, 'trial', 'other', restore_operators=True)
         self.assertEqual(json.loads(marker.read_text(encoding='utf-8'))['operators'], ['operator', 'ops'])
         self.assertIn('ops', out.getvalue())
         if os.name == 'posix':
             self.assertEqual(stat.S_IMODE(marker.stat().st_mode), 0o600)
+
+    def test_restore_does_not_regrant_an_operator_revoked_after_the_backup(self):
+        """Review item restore-regrants-operator (F6).
+
+        Repro: `operators remove ops-james --confirm-revoke`, then restore an
+        older project backup. The allowlist is deployment-wide, so re-adding the
+        entry would restore authority for every project from a stale backup with
+        only a printed line. It must stay revoked until an operator says
+        otherwise, and the void must stay inert on the restored project.
+        """
+        marker = self.root / 'deployment.private.json'
+        marker.write_text(json.dumps({'password': 'x', 'unit': 'none',
+                                      'operators': ['operator', 'ops-james']}), encoding='utf-8')
+        (self.root / 'backups').mkdir()
+        (self.root / 'backups' / 'trial').mkdir()
+        (self.root / 'projects' / 'other').mkdir()
+
+        def cli(*argv):
+            with patch.object(sys, 'argv', ['admin.py', '--root', str(self.root), *argv]), \
+                    patch.object(admin, 'root_path', return_value=self.root), \
+                    patch.object(admin, 'add_project'), \
+                    patch.object(admin, 'run_bd', return_value='restored'), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                admin.main()
+            return out.getvalue()
+
+        # 1. A backup taken while ops-james is an operator.
+        with patch.object(admin, 'run_bd', return_value='synced'):
+            admin.backup_project(self.root, 'trial')
+        self.assertEqual(admin.coordination_operators(self.root, 'trial'), ['operator', 'ops-james'])
+        # 2. Revoke ops-james from the deployment allowlist.
+        cli('operators', 'remove', 'ops-james', '--confirm-revoke')
+        self.assertEqual(admin.operators(self.root), frozenset({'operator'}))
+        # 3. Restore the older backup: the native records come back, the revoked
+        #    authority does not.
+        out = cli('restore-new', 'trial', 'other')
+        self.assertEqual(json.loads(marker.read_text(encoding='utf-8'))['operators'], ['operator'])
+        self.assertIn('ops-james', out)
+        self.assertIn('--restore-operators', out)
+        # 4. The preserved void by the revoked operator stays inert on the
+        #    restored project: authority is the deployment allowlist, not the
+        #    backup sidecar.
+        bad = broken_review()
+        issue = native([review_comment('c1', contribute()), bad,
+                        void_comment('v1', void('c2', bad['text'], operator='ops-james'), author='ops-james')])
+        with self.assertRaisesRegex(ValueError, 'operator reconciliation'):
+            w.project(issue, admin.operators(self.root))
+        self.assertEqual(w.project(issue, ('ops-james',))['review_state'], 'awaiting-review')
+        # 5. An operator can still re-grant deliberately.
+        cli('operators', 'add', 'ops-james')
+        self.assertEqual(json.loads(marker.read_text(encoding='utf-8'))['operators'], ['operator', 'ops-james'])
+
+    def test_restore_operators_flag_regrants_the_recorded_allowlist(self):
+        marker = self.root / 'deployment.private.json'
+        marker.write_text(json.dumps({'password': 'x', 'unit': 'none',
+                                      'operators': ['operator', 'ops-james']}), encoding='utf-8')
+        (self.root / 'backups').mkdir()
+        (self.root / 'backups' / 'trial').mkdir()
+        (self.root / 'projects' / 'other').mkdir()
+        with patch.object(admin, 'run_bd', return_value='synced'):
+            admin.backup_project(self.root, 'trial')
+        marker.write_text(json.dumps({'password': 'x', 'unit': 'none', 'operators': ['operator']}),
+                          encoding='utf-8')
+        argv = ['admin.py', '--root', str(self.root), 'restore-new', 'trial', 'other', '--restore-operators']
+        with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', return_value=self.root), \
+                patch.object(admin, 'add_project'), \
+                patch.object(admin, 'run_bd', return_value='restored'), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            admin.main()
+        self.assertEqual(json.loads(marker.read_text(encoding='utf-8'))['operators'], ['operator', 'ops-james'])
+        self.assertIn('ops-james', out.getvalue())
+        self.assertIn('--restore-operators', out.getvalue())
 
     def test_coordination_backup_refuses_a_malformed_operator_snapshot(self):
         (self.root / 'backups').mkdir()

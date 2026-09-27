@@ -61,7 +61,7 @@ It refuses a populated destination, restores status and comments, and retains or
 
 Session registrations in `.sessions.json` are included in the coordination sidecar, alongside the private project onboarding entry point. Restore with a kit version supporting these records. Preserve original actor IDs for resumed workers; do not create a second live authority from a restored registry.
 
-`add-project` initializes and performs an initial backup. `backup` captures both the native backup directory and `backups/PROJECT.coordination.json`. The sidecar preserves pending child-request reservations and merge context outside Dolt. Keep this pair together. A pending marker is written before synchronization and becomes complete only after native sync succeeds; restore refuses an incomplete sidecar. Backup and restore serialize access to the pair, and backup excludes contributor writes through the endpoint. Direct operator/native writes bypass these locks and must be paused for backup. The completed sidecar also records the deployment operator allowlist, and `restore-new` adds any recorded entry the destination does not already list, so a restore preserves void dispositions even onto a host that does not configure them.
+`add-project` initializes and performs an initial backup. `backup` captures both the native backup directory and `backups/PROJECT.coordination.json`. The sidecar preserves pending child-request reservations and merge context outside Dolt. Keep this pair together. A pending marker is written before synchronization and becomes complete only after native sync succeeds; restore refuses an incomplete sidecar. Backup and restore serialize access to the pair, and backup excludes contributor writes through the endpoint. Direct operator/native writes bypass these locks and must be paused for backup. The completed sidecar also records the deployment operator allowlist, so a restore can report recorded authority the destination host does not list. `restore-new` does **not** apply it: re-granting an operator is deployment-wide authority and stays an explicit decision (`--restore-operators`, or `operators add OPERATOR`), so a stale backup cannot silently reverse a revocation. See [Operator removal and restore policy](#operator-removal-and-restore-policy).
 
 Copy a completed, quiescent backup pair off-machine using your normal encrypted backup system. Do not copy it during the next sync. This is not an atomic transaction across arbitrary filesystem copies; take a filesystem snapshot or hold the project's `backups/PROJECT.lock` while copying. Legacy backups without a sidecar warn that outstanding requests/merge context require reconciliation.
 
@@ -94,7 +94,24 @@ A void may not target a record that is part of the contribution history the surv
 
 #### Operator removal and restore policy
 
-`admin.py operators remove OPERATOR` is a revocation, not a cleanup: voids that operator authored stop applying on read, the incident is reported as unreconciled again, and re-adding the operator restores those dispositions. Because that destroys recorded dispositions, `remove` refuses unless `--confirm-revoke` acknowledges the consequence. The allowlist is deployment configuration rather than a native Beads object, so it is captured in each project's complete coordination sidecar, and `restore-new` re-establishes recorded entries the destination does not already list (additive only, and it prints the names). The native backup preserves the original comment and the void comment; the sidecar preserves the authority reads need to apply it, so a restore preserves both the original and its disposition.
+`admin.py operators remove OPERATOR` is a revocation, not a cleanup: voids that operator authored stop applying on read, the incident is reported as unreconciled again, and re-adding the operator restores those dispositions. Because that destroys recorded dispositions, `remove` refuses unless `--confirm-revoke` acknowledges the consequence.
+
+The allowlist is deployment configuration rather than a native Beads object, so each project's complete coordination sidecar records the allowlist in force at backup time. **A restore does not re-grant it by default.** The allowlist is authority for *every* project on the deployment, so a backup taken before `operators remove ACTOR --confirm-revoke` would otherwise silently restore that actor's authority deployment-wide — including for projects the backup has nothing to do with. `restore-new` therefore restores the native records, the coordination sidecar and the operation journal, but leaves the deployment allowlist untouched. When the backup records operators this host does not list, the command prints them by name, states that they were **NOT** restored, and explains that void records they authored stay inert on the restored project until authority is granted again. Nothing is deleted: the void comments and their `original` bytes are intact, and they apply again as soon as the actor is deliberately re-added.
+
+To re-establish the recorded authority, re-grant it explicitly, one actor at a time:
+
+```
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime operators add OPERATOR
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime operators list
+```
+
+Or re-run the whole restore with `--restore-operators` when the entire allowlist recorded in the backup is intended to be in force again, for example on a replacement host:
+
+```
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime restore-new example examplerestore --restore-operators
+```
+
+`--restore-operators` is additive only (it never removes an entry) and prints exactly which entries it re-granted. It is an explicit authorization decision: after a revocation, do not pass it "to make the restore look complete" — a revoked operator stays revoked until an operator re-adds them by name. The native backup preserves the original comment and the void comment; the sidecar preserves the authority reads would need to apply it, so a restore still preserves both the original and its disposition, with the authority decision left where it belongs: with the deployment operator.
 
 ### Optional scheduled backup
 

@@ -442,11 +442,12 @@ def backup_project(root,name):
         # sidecar so a backup never pairs one store's state with the other's.
         snapshot_journal(path/JOURNAL_STORE_NAME,journal_snapshot_path(root,name))
         output=run_bd(root,name,['backup','sync'])
-        # The deployment operator allowlist travels with the project sidecar so
-        # a restore onto a host that does not list these operators still
-        # preserves the dispositions the backup recorded (`restore_coordination`
-        # re-establishes them). Native backup preserves the void comments; this
-        # preserves the authority the reads need to apply them.
+        # The deployment operator allowlist travels with the project sidecar so a
+        # restore can TELL the operator which recorded authority is missing on the
+        # destination host. It is not applied automatically: the allowlist is
+        # deployment-wide authority, so `restore-new` only re-grants it with an
+        # explicit --restore-operators. Native backup preserves the void comments
+        # and this preserves the record of the authority the reads would need.
         atomic(bundle,{'schema_version':1,'status':'complete','files':files,
                        'operators':sorted(operators(root))})
         return output
@@ -487,11 +488,12 @@ def coordination_operators(root,source):
 def merge_operators(root,actors):
     """Add missing operators to the deployment allowlist; return the added names.
 
-    Restore uses this to re-establish authority recorded in the backup so the
-    restored void dispositions still apply. It is additive only: an operator
-    that the destination deliberately removed is never silently re-granted
-    unless the backup that recorded it is the one being restored, and the added
-    names are reported by the caller.
+    Additive only, and only ever called by `restore_coordination` when the
+    operator explicitly passed `--restore-operators`. The deployment allowlist is
+    authority for EVERY project, so re-adding an entry from a backup is a
+    deployment-wide grant: a backup taken before `operators remove ACTOR
+    --confirm-revoke` must not silently undo that revocation. The added names are
+    returned so the caller can report exactly what was re-granted.
     """
     marker=root/'deployment.private.json'
     if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
@@ -506,7 +508,14 @@ def merge_operators(root,actors):
     return added
 
 
-def restore_coordination(root,source,destination):
+def missing_operators(root,source):
+    """Operators recorded in a project backup sidecar that this host does not list."""
+    snapshot=coordination_operators(root,source)
+    listed=operators(root)
+    return [item for item in snapshot if item not in listed]
+
+
+def restore_coordination(root,source,destination,restore_operators=False):
     from coordination import atomic
     path=project_dir(root,destination)
     files=coordination_backup(root,source)
@@ -543,12 +552,25 @@ def restore_coordination(root,source,destination):
             from feedback import validate_quarantine_record
             _atomic_write_bytes(target,validate_quarantine_record(name,record))
         else:atomic(target,record)
-    # Re-establish the operator authority the backup recorded so the restored
-    # void dispositions still apply on a host that does not already list them.
-    snapshot=coordination_operators(root,source)
-    added=merge_operators(root,snapshot) if snapshot else []
+    # The native and coordination records (original comment plus its void
+    # disposition) are restored by the writes above. Operator AUTHORITY is not:
+    # the deployment allowlist is authority for every project, so a stale backup
+    # must never silently re-grant an operator the deployment has since revoked.
+    # Re-adding entries recorded in the backup is an explicit operator decision
+    # (`--restore-operators`), and what it re-grants is reported either way.
+    missing=missing_operators(root,source)
+    if not missing:
+        return
+    if not restore_operators:
+        print('NOT restored: the backup records operator allowlist entries this host does not list: '
+              + ', '.join(missing) + '. Restoring them would re-grant deployment-wide authority for every project, '
+              'so they stay revoked here and void records they authored stay inert. Re-grant one deliberately with '
+              '`admin.py --root ROOT operators add ACTOR`, or re-run this restore with --restore-operators to '
+              're-establish the whole recorded allowlist.')
+        return
+    added=merge_operators(root,missing)
     if added:
-        print('Restored operator allowlist entries that were missing on this host: ' + ', '.join(added))
+        print('Re-granted operator allowlist entries from the backup (--restore-operators): ' + ', '.join(added))
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('--root',required=True)
@@ -570,7 +592,12 @@ def main():
                    help='with remove: acknowledge that this operator\'s earlier operator voids stop applying')
     for command in ('backup','restore-new'):
         a=sub.add_parser(command);a.add_argument('project')
-        if command=='restore-new':a.add_argument('destination')
+        if command=='restore-new':
+            a.add_argument('destination')
+            a.add_argument('--restore-operators',action='store_true',dest='restore_operators',
+                           help='explicitly re-grant the operator allowlist entries the backup records that this '
+                                'host no longer lists; off by default because the allowlist is deployment-wide '
+                                'authority for every project and a stale backup must not undo a revocation')
     a=sub.add_parser('reconcile-request');a.add_argument('project');a.add_argument('--request-id',required=True)
     a.add_argument('--actor',required=True);a.add_argument('--reason',required=True)
     a.add_argument('--disposition',choices=['failed','released','complete'],default='released')
@@ -741,7 +768,8 @@ def main():
             if snapshot.is_file():_check_journal_database(snapshot)
             add_project(root,args.destination)
             print(run_bd(root,args.destination,['backup','restore',str(backup),'--force']))
-            restore_coordination(root,args.project,args.destination)
+            restore_coordination(root,args.project,args.destination,
+                                 restore_operators=args.restore_operators)
             restored=restore_journal(snapshot,
                                      project_dir(root,args.destination)/JOURNAL_STORE_NAME)
             if restored is None:
