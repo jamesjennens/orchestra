@@ -286,6 +286,10 @@ def apply_native(p, actor, run, project):
     context_path=project/'.merge-context.json'
     if op=='merge-create':return json.loads(run(['merge-slot','create','--json']))
     state=json.loads(run(['merge-slot','check','--json']))
+    if not isinstance(state,dict) or 'available' not in state:
+        detail=''
+        if isinstance(state,dict) and state.get('error'):detail=' (%s)' % state['error']
+        raise ValueError('Merge slot does not exist for this project%s; run the merge-create operation to create it before checking, acquiring or releasing' % detail)
     context=load_json(context_path) if context_path.exists() else None
     if op=='merge-check':
         state['context']=context if context and context['holder']==state.get('holder') else None

@@ -129,6 +129,26 @@ def run_bd(root,name,args):
     location=[] if args and args[0]=='init' else ['--directory',path]
     return checked([root/'bin/bd',*location,'--sandbox',*args],env=environment(root),cwd=path).stdout
 
+def provision_merge_slot(root,name):
+    """Create the project's merge slot once, tolerating an existing slot.
+
+    ``bd merge-slot create`` refuses a slot that already exists, so read the
+    slot first: a check that reports a slot state (``available`` present) means
+    there is nothing to do. Any other check result - including an empty result
+    from a test seam or a native error - falls through to create, and a create
+    refusal that reports an existing slot is also success. That keeps an
+    operator retry idempotent without depending on the exact native error text.
+    """
+    try:
+        state=json.loads(run_bd(root,name,['merge-slot','check','--json']))
+    except (TypeError,ValueError):
+        state=None
+    if isinstance(state,dict) and 'available' in state:return
+    try:
+        run_bd(root,name,['merge-slot','create','--json'])
+    except subprocess.CalledProcessError as refusal:
+        if 'exist' not in (refusal.stderr or '').lower():raise
+
 def service(root,action):
     cfg=config(root)
     return checked(['systemctl','--user',action,cfg['unit']]).stdout
@@ -215,6 +235,7 @@ def add_project(root,name):
     for key,value in [('no-git-ops','true'),('dolt.auto-push','false'),('dolt.auto-commit','on'),('backup.git-push','false')]:
         run_bd(root,name,['config','set',key,value])
     run_bd(root,name,['backup','init',str(root/'backups'/name)])
+    provision_merge_slot(root,name)
     backup_project(root,name)
     print(f'Created project {name}')
 

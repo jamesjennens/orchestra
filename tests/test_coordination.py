@@ -33,6 +33,7 @@ class Native:
         self.issues = []
         self.details = {}
         self.holder = None
+        self.slot_exists = True
         self.create_outcome = 'ok'
         self.acquire_outcome = 'ok'
         self.show_fails = False
@@ -95,7 +96,14 @@ class Native:
             if self.show_fails:
                 raise RuntimeError('task missing')
             return json.dumps([self.details.get(args[1], {'id': args[1]})])
+        if args[:2] == ['merge-slot', 'create']:
+            if self.slot_exists:
+                raise ValueError('merge slot already exists')
+            self.slot_exists = True
+            return json.dumps({'created': True})
         if args[:2] == ['merge-slot', 'check']:
+            if not self.slot_exists:
+                return json.dumps({'error': 'not found'})
             return json.dumps({'available': self.holder is None, 'holder': self.holder})
         if args[:2] == ['merge-slot', 'acquire']:
             if self.acquire_outcome == 'not-written':
@@ -395,6 +403,33 @@ class CoordinationTests(unittest.TestCase):
         self.assertIsNone(self.apply({'operation': 'merge-check'})['context'])
         self.assertEqual(self.apply({'operation': 'merge-release'}),
                          {'released': False, 'available': True})
+        self.assertEqual(self.native.count('merge-slot', 'release'), 1)
+
+    def test_missing_slot_refuses_check_and_acquire_naming_create(self):
+        self.native.slot_exists = False
+        with self.assertRaisesRegex(ValueError, 'merge-create'):
+            self.apply({'operation': 'merge-check'})
+        with self.assertRaisesRegex(ValueError, 'merge-create'):
+            self.apply(MERGE)
+        self.assertEqual(self.native.count('merge-slot', 'acquire'), 0)
+        self.assertFalse((self.project / '.merge-context.json').exists())
+
+    def test_missing_slot_refuses_release_too(self):
+        self.native.slot_exists = False
+        with self.assertRaisesRegex(ValueError, 'merge-create'):
+            self.apply({'operation': 'merge-release'})
+        self.assertEqual(self.native.count('merge-slot', 'release'), 0)
+
+    def test_fresh_project_create_then_acquire_and_release(self):
+        self.native.slot_exists = False
+        self.assertTrue(self.apply({'operation': 'merge-create'})['created'])
+        self.assertTrue(self.apply({'operation': 'merge-check'})['available'])
+        self.assertTrue(self.apply(MERGE)['acquired'])
+        self.assertEqual(self.native.holder, 'alice')
+        self.assertTrue(self.apply({'operation': 'merge-release'})['released'])
+        self.assertIsNone(self.native.holder)
+        self.assertEqual(self.native.count('merge-slot', 'create'), 1)
+        self.assertEqual(self.native.count('merge-slot', 'acquire'), 1)
         self.assertEqual(self.native.count('merge-slot', 'release'), 1)
 
 

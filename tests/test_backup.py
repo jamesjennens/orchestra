@@ -289,7 +289,23 @@ class BackupTests(unittest.TestCase):
             admin.add_project(self.root, 'newproject')
         self.assertTrue(target.is_dir())
         self.assertIn((self.root, 'newproject', ['backup', 'init', str(self.root / 'backups' / 'newproject')]), [c.args for c in native.call_args_list])
+        self.assertIn((self.root, 'newproject', ['merge-slot', 'create', '--json']), [c.args for c in native.call_args_list])
         backup.assert_called_once_with(self.root, 'newproject')
+
+    def test_add_project_does_not_recreate_an_existing_merge_slot(self):
+        target = self.root / 'projects' / 'newproject'
+
+        def native(root, name, args):
+            if args[:2] == ['merge-slot', 'check']:
+                return json.dumps({'available': True, 'holder': None})
+            return ''
+
+        with patch.object(admin, 'config', return_value={'port': 13317}), patch.object(admin, 'run_bd', side_effect=native) as run_bd, patch.object(admin, 'backup_project'), contextlib.redirect_stdout(io.StringIO()):
+            admin.add_project(self.root, 'newproject')
+        self.assertTrue(target.is_dir())
+        calls = [c.args[2] for c in run_bd.call_args_list]
+        self.assertIn(['merge-slot', 'check', '--json'], calls)
+        self.assertNotIn(['merge-slot', 'create', '--json'], calls)
 
     def test_reconcile_request_command_releases_under_lock_and_prints_audit(self):
         (self.source / '.beads').mkdir()
