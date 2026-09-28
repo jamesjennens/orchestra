@@ -243,6 +243,48 @@ class BackupTests(unittest.TestCase):
                 create.assert_not_called()
                 native.assert_not_called()
 
+    def test_restore_new_refuses_corrupt_operator_allowlist_before_any_write(self):
+        self.save_bundle()
+        (self.root / 'deployment.private.json').write_text(
+            json.dumps({'password': 'x', 'operators': {'bad': 1}}), encoding='utf-8')
+        fresh = self.root / 'projects' / 'fresh'
+        argv = ['admin.py', '--root', str(self.root), 'restore-new', 'source', 'fresh']
+        with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', return_value=self.root), \
+                patch.object(admin, 'add_project') as create, patch.object(admin, 'run_bd') as native:
+            with self.assertRaisesRegex(ValueError, 'operators must be a list'):
+                admin.main()
+        create.assert_not_called()
+        native.assert_not_called()
+        self.assertFalse(fresh.exists())
+
+    def test_restore_operators_requires_the_deployment_config_before_any_write(self):
+        self.save_bundle()
+        self.assertFalse((self.root / 'deployment.private.json').exists())
+        fresh = self.root / 'projects' / 'fresh'
+        argv = ['admin.py', '--root', str(self.root), 'restore-new', 'source', 'fresh', '--restore-operators']
+        with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', return_value=self.root), \
+                patch.object(admin, 'add_project') as create, patch.object(admin, 'run_bd') as native:
+            with self.assertRaisesRegex(ValueError, 'Deployment is not installed; run install first'):
+                admin.main()
+        create.assert_not_called()
+        native.assert_not_called()
+        self.assertFalse(fresh.exists())
+
+    def test_restore_new_with_a_valid_allowlist_still_restores(self):
+        (self.root / 'deployment.private.json').write_text(
+            json.dumps({'password': 'x', 'operators': ['operator']}), encoding='utf-8')
+        self.save_bundle()
+        argv = ['admin.py', '--root', str(self.root), 'restore-new', 'source', 'destination']
+        with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', return_value=self.root), \
+                patch.object(admin, 'add_project') as create, \
+                patch.object(admin, 'run_bd', return_value='restored') as native, \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            admin.main()
+        create.assert_called_once_with(self.root, 'destination')
+        native.assert_called_once()
+        self.assertIn('Restored only into the newly created project', out.getvalue())
+        self.assertEqual(json.loads((self.destination / self.request_name).read_text()), self.receipt)
+
     def test_restore_holds_source_backup_lock_across_entire_pair(self):
         self.save_bundle()
         phases = []

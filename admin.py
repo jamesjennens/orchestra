@@ -909,6 +909,16 @@ def main():
             # coordination files left behind.
             snapshot=journal_snapshot_path(root,args.project)
             if snapshot.is_file():_check_journal_database(snapshot)
+            # Validate the deployment operator allowlist BEFORE creating anything too.
+            # `restore_coordination` only consults it at its very end (inside
+            # missing_operators/merge_operators), which is after the destination project
+            # and its native data exist; a corrupt `operators` value or a missing
+            # deployment config with --restore-operators would then leave a partial
+            # destination behind. `operators(root)` raises for a corrupt value, and
+            # --restore-operators needs the config file that merge_operators reads.
+            operators(root)
+            if args.restore_operators and not (root/'deployment.private.json').is_file():
+                raise ValueError('Deployment is not installed; run install first')
             add_project(root,args.destination)
             print(run_bd(root,args.destination,['backup','restore',str(backup),'--force']))
             restore_coordination(root,args.project,args.destination,
