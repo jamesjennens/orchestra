@@ -73,6 +73,16 @@ The assigned owner submits `b review example-task --file contribution.json`:
 
 For remote branches, use `delivery: {"kind":"remote","remote":"git@example.org:team/repository.git","branch":"worker/task"}`. Replace synthetic hashes with exact full commit/base IDs and the actual bundle SHA-256. Remote access and bundle contents are not verified automatically: the reviewer must retrieve, verify and test them. The protocol rejects incomplete delivery fields, not false assertions.
 
+Evidence is part of the delivery, not decoration. The `summary` and any linked evidence notes must state the platform the suite ran on and the exact commit tested, give the real pass/fail/skip counts, and enumerate every skipped test with the reason it skipped. A platform-specific behaviour whose test was skipped is unverified: `N passed, 1 skipped` is not evidence that the skipped behaviour works, so the contribution must say so rather than implying a full pass. If the suite could not be run on the deployment/target platform, state that explicitly and state why.
+
+**Evidence checklist for a reviewable contribution:**
+
+- Which platform (name and version/architecture) and which exact commit the suite ran on; if it was not the deployment/target platform, why not.
+- The real pass/fail/skip counts from that run, not a summarized "all tests passed".
+- Every skipped test, with the reason it was skipped (platform-specific, missing optional dependency, unavailable service, and so on).
+- Whether any claimed behaviour rests on a skipped test; if it does, the claim is unverified until the test runs on the platform that exercises it.
+- The exact commands and environment a reviewer needs to reproduce the run on the target platform.
+
 For a revision that replaces a rejected or unintegrated contribution, set `previous` to the latest workflow comment and `supersedes` to the current contribution's `comment_id`.
 
 For an **additive follow-on** to work that is already integrated, set `previous` to the latest workflow comment and `follows` to the current contribution's `comment_id`, with `supersedes: null` and `base_commit` set to the prior integration commit. Before any native write, the protocol reads the **shared review-state projection** (the same projection `review TASK`, `brief` and `work` use; see below) and requires three independent things of the prior revision:
