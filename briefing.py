@@ -167,7 +167,10 @@ def brief(rows,project,task,offset=0,limit=5,operators=None):
     matches_contribution=None if not review.get('contribution') else (facts['scope'] or {}).get('source_commit','').lower()==review['contribution']['commit'].lower()
     pending=review.get('pending_requests',[])
     priors=review.get('prior_contributions') or []
-    bounded_priors=[{key:c[key] for key in ('comment_id','commit','relation','timestamp')}
+    # The bounded slice keeps its PRIOR_BRIEF_LIMIT bound and adds the per-prior
+    # `integration` block the shared projection now carries, so the compact read
+    # says whether a replaced revision is integrated without re-reading review TASK.
+    bounded_priors=[{key:c[key] for key in ('comment_id','commit','relation','timestamp','integration')}
                     for c in priors[-PRIOR_BRIEF_LIMIT:]]
     review_next={'changes-requested':'Address the outstanding review requests for the current contribution; read review '+task+'.',
                  'awaiting-review':'Reviewer: retrieve and verify the current contribution, then record review feedback or approval.',

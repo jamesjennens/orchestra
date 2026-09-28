@@ -21,7 +21,13 @@ the optional ``follows`` relation instead of being forced to declare that it
   follow-on over HTTP never silently becomes a first contribution or a supersede;
 * the bounded ``brief`` prior-contribution slice with a complete ``review TASK``;
 * what remains visible for a prior contribution after the follow-on records its
-  own lifecycle scope (record/commit/relation, not re-scoped lifecycle facts).
+  own lifecycle scope (record/commit/relation, not re-scoped lifecycle facts);
+* the per-prior ``integration`` block the shared projection and the ``brief``
+  slice now carry: an integrated prior reports ``passed`` with its scope's
+  integration commit, a prior whose commit matches no scope reports ``unknown``,
+  and a newer FAILED scoped fact for the same commit still leaves the older pass
+  reported (the unchanged any-pass-wins rule) with ``newest_fact`` exposing the
+  failure.
 """
 import json
 import sys
@@ -76,11 +82,12 @@ class FollowOnChainTests(unittest.TestCase):
         return w.execute(self.rows, 'task-1', actor, p, self.run_native)
 
     def record_lifecycle(self, source_commit, integration_commit, scope_op='scope-1', integrated=True,
-                         actor='worker'):
+                         actor='worker', value='passed'):
         """Append scoped lifecycle evidence marking source_commit integrated.
 
         ``actor`` is the recording actor. The lifecycle action only requires
         ``payload.actor == request actor``, so the contributor can record it alone.
+        ``value`` is the scoped ``integrated`` value (``passed`` or ``failed``).
         """
         def run(args):
             if args == ['export', '--all']:
@@ -111,7 +118,13 @@ class FollowOnChainTests(unittest.TestCase):
                                     value=content_hash(scope)), actor, run)
         if integrated:
             lifecycle.apply_native(dict(base, operation_id=scope_op + '-int', dimension='integrated',
-                                        value='passed'), actor, run)
+                                        value=value), actor, run)
+
+    def shared(self):
+        """`review TASK`'s projection: the shared review-state overlay with scopes."""
+        from review_state import project as reviewed, scopes_for
+        return reviewed(self.issue, scopes_for(self.rows, 'task-1'))
+
 
     def integration_case(self):
         """Contribution 1 approved and integrated at MERGE_1, base scope on COMMIT_1."""
@@ -344,7 +357,9 @@ class FollowOnChainTests(unittest.TestCase):
         self.assertEqual(len(review['prior_contributions']), briefing.PRIOR_BRIEF_LIMIT)
         self.assertEqual(review['prior_contributions_more'], 'review task-1')
         for entry in review['prior_contributions']:
-            self.assertEqual(set(entry), {'comment_id', 'commit', 'relation', 'timestamp'})
+            self.assertEqual(set(entry),
+                             {'comment_id', 'commit', 'relation', 'timestamp', 'integration'})
+            self.assertIn(entry['integration']['fact'], ('unknown', 'passed', 'failed'))
         # The recent slice preserves order and matches the complete projection.
         self.assertEqual([c['comment_id'] for c in review['prior_contributions']],
                          [c['comment_id'] for c in complete['prior_contributions'][-briefing.PRIOR_BRIEF_LIMIT:]])
@@ -384,6 +399,84 @@ class FollowOnChainTests(unittest.TestCase):
         self.assertEqual(item['lifecycle_scope']['source_commit'], COMMIT_2)
         self.assertEqual(item['lifecycle']['integrated'], 'passed')
         self.assertNotIn('prior_contributions', item)
+
+    def test_prior_contribution_reports_its_integration_answer(self):
+        """The follow-on read says whether the replaced revision is integrated.
+
+        The independent review of kittrial-5bb.24 rev2 found that after a follow-on
+        the read correctly showed awaiting-review for the new commit, but the
+        ``prior_contributions`` entry carried no integration block, so nothing said
+        the earlier change was integrated. The block is computed from the prior's
+        own FULL commit over the same scopes, and existing entry keys are unchanged.
+        """
+        first = self.integration_case()
+        second = self.send(self.contribution(COMMIT_2, base=MERGE_1, supersedes=None,
+                                             follows=first))['comment_id']
+        state = self.shared()
+        self.assertEqual(state['review_state'], 'awaiting-review')
+        self.assertEqual(state['contribution']['comment_id'], second)
+        prior = state['prior_contributions'][0]
+        # The pre-existing keys keep their values and no key is renamed ...
+        self.assertEqual((prior['comment_id'], prior['commit'], prior['relation']),
+                         (first, COMMIT_1, 'follows'))
+        # ... and the additive block answers the prior's integration question.
+        self.assertEqual(prior['integration']['fact'], 'passed')
+        self.assertEqual(prior['integration']['source_commit'], COMMIT_1)
+        self.assertEqual(prior['integration']['integration_commit'], MERGE_1)
+        self.assertTrue(prior['integration']['matches_contribution'])
+        self.assertEqual(prior['integration']['newest_fact'], 'passed')
+        self.assertFalse({'lifecycle', 'integrated', 'review_state', 'facts', 'scope'} & set(prior))
+        # The CURRENT contribution has no scope of its own yet, so its own block
+        # and the prior's block are genuinely separate answers.
+        self.assertFalse(state['integration']['matches_contribution'])
+        self.assertEqual(state['integration']['fact'], 'unknown')
+        # The compact brief slice carries the same block for the prior entry.
+        review = briefing.brief(self.rows, 'proj', 'task-1')['review']
+        slice_prior = review['prior_contributions'][0]
+        self.assertEqual(slice_prior['comment_id'], first)
+        self.assertEqual(slice_prior['integration']['fact'], 'passed')
+        self.assertEqual(slice_prior['integration']['integration_commit'], MERGE_1)
+
+    def test_prior_without_a_matching_scope_reports_unknown(self):
+        """A scope for other work does not mark an unrelated prior integrated."""
+        first = self.send(self.contribution(COMMIT_1))['comment_id']
+        self.record_lifecycle(COMMIT_3, MERGE_2)
+        self.send(self.contribution(COMMIT_2))
+        prior = self.shared()['prior_contributions'][0]
+        self.assertEqual((prior['comment_id'], prior['relation']), (first, 'supersedes'))
+        self.assertEqual(prior['integration']['fact'], 'unknown')
+        self.assertEqual(prior['integration']['newest_fact'], 'unknown')
+        self.assertFalse(prior['integration']['matches_contribution'])
+        self.assertIsNone(prior['integration']['scope'])
+        self.assertIsNone(prior['integration']['source_commit'])
+        self.assertFalse({'lifecycle', 'integrated', 'review_state', 'facts', 'scope'} & set(prior))
+
+    def test_prior_any_pass_wins_is_visible_with_the_newer_failure(self):
+        """A newer FAILED scoped fact still reports the older pass for a prior.
+
+        Same rule as for the current contribution: the added facts make the
+        existing any-pass-wins answer visible for a prior entry instead of
+        introducing a new rule. ``newest_fact`` exposes the newer failure, and the
+        follow-on gate still accepts the older passing scope's integration commit
+        as the base (a newest-wins reading would have demanded MERGE_2).
+        """
+        first = self.integration_case()
+        self.record_lifecycle(COMMIT_1, MERGE_2, scope_op='scope-fail', actor='integrator',
+                              value='failed')
+        second = self.send(self.contribution(COMMIT_2, base=MERGE_1, supersedes=None,
+                                             follows=first))['comment_id']
+        state = self.shared()
+        self.assertEqual(state['contribution']['comment_id'], second)
+        prior = state['prior_contributions'][0]
+        self.assertEqual(prior['commit'], COMMIT_1)
+        self.assertEqual(prior['integration']['fact'], 'passed')
+        self.assertEqual(prior['integration']['scope']['integration_commit'], MERGE_1)
+        self.assertEqual(prior['integration']['integration_commit'], MERGE_1)
+        self.assertEqual(prior['integration']['newest_fact'], 'failed')
+        self.assertNotEqual(prior['integration']['newest_scope_token'],
+                            prior['integration']['scope_token'])
+        # A newest-wins reading is not what the projection now does or did before.
+        self.assertTrue(prior['integration']['matches_contribution'])
 
 
 if __name__ == '__main__':
