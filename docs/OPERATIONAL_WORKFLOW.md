@@ -162,6 +162,10 @@ Save `child.json`:
 python coordination.py --config client.local.json --project example --actor alex/session1 --file child.json
 ```
 
+When children will run in parallel, include the task template's `Owns / must not
+change` declaration in `description`, so each child states the files or areas it may
+change and the files or areas it must not change before it is authorized.
+
 Use the returned native child ID in all references. The request is bound to its actor and content, reserved durably, and marked on the native issue so a retry can reconcile instead of creating a duplicate. Inspect uncertain outcomes and retry only the same request. A reserved request with **no visible native issue** stops for operator reconciliation; do not bypass it with a new request ID or delete its reservation. Duplicate native matches also require reconciliation.
 
 Before anything is reserved, `create-child` runs the **identical create with `--dry-run`** (plus `--validate` for a `decision`). bd is the single source of truth for validation: the preflight writes nothing, so a refused description or a missing parent leaves the request ID free for corrected content instead of stranding it. The kit never re-implements bd's section matching.

@@ -9,10 +9,13 @@ Coordinator: REPLACE_SAVED_COORDINATOR_ACTOR
 Authorized task list: REPLACE_TASK_IDS
 
 Read the current project policy and coordinator instructions. Register a genuinely
-new worker once, then reuse its saved actor on resume; never share actors. Give each
-authorized task an isolated checkout,
-explicit file/interface scope, exact base, own environment and plan/acknowledgement
-gate. Check overlaps before dispatch and limit new work when review backlog grows.
+new worker once, then reuse its saved actor on resume; never share actors. Require
+every authorized task to declare, in its description's "Owns / must not change"
+section, the files or areas it may change and the files or areas it must not change.
+Give each authorized task an isolated checkout, explicit file/interface scope taken
+from that declaration, exact base, own environment and plan/acknowledgement gate.
+Check the declarations for overlaps before dispatch and limit new work when review
+backlog grows.
 
 For returning workers, check requested revisions and newer history first. Stop a
 worker cleanly when no revision or authorized existing claim is actionable; do not
