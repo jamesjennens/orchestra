@@ -288,9 +288,35 @@ class BackupTests(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()) as out:
             admin.main()
         create.assert_called_once_with(self.root, 'destination')
-        native.assert_called_once()
+        # `bd backup restore` and then the kittrial-5bb.49 re-point of the clone's own
+        # native backup target (a restored clone otherwise keeps the source's target).
+        self.assertEqual([item.args[2] for item in native.call_args_list],
+                         [['backup', 'restore', str(self.root / 'backups' / 'source'), '--force'],
+                          ['backup', 'init', str(self.root / 'backups' / 'destination')]])
         self.assertIn('Restored only into the newly created project', out.getvalue())
         self.assertEqual(json.loads((self.destination / self.request_name).read_text()), self.receipt)
+
+    def test_restore_new_repoints_the_clone_at_its_own_native_backup_target(self):
+        # kittrial-5bb.49: `bd backup restore` carries the SOURCE project's backup target
+        # into the clone, so without re-pointing, `backup destination` syncs the clone into
+        # backups/source and backups/destination goes stale.
+        self.save_bundle()
+        calls = []
+
+        def native(root, name, args):
+            calls.append((name, list(args)))
+            return 'restored'
+
+        argv = ['admin.py', '--root', str(self.root), 'restore-new', 'source', 'destination']
+        with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', return_value=self.root), \
+                patch.object(admin, 'add_project'), patch.object(admin, 'run_bd', side_effect=native), \
+                contextlib.redirect_stdout(io.StringIO()):
+            admin.main()
+        self.assertEqual([name for name, _ in calls], ['destination', 'destination'])
+        self.assertEqual(calls[0][1],
+                         ['backup', 'restore', str(self.root / 'backups' / 'source'), '--force'])
+        self.assertEqual(calls[1][1],
+                         ['backup', 'init', str(self.root / 'backups' / 'destination')])
 
     def test_restore_holds_source_backup_lock_across_entire_pair(self):
         self.save_bundle()
@@ -307,13 +333,15 @@ class BackupTests(unittest.TestCase):
             return real_read(root, source)
         def create(*args): locked('create-destination')
         def native(*args):
-            locked('restore-native')
+            # The native restore, then the kittrial-5bb.49 re-point of the clone's target.
+            locked('repoint-native' if args[2][:2] == ['backup', 'init'] else 'restore-native')
             return 'restored'
         def restore(*args, **kwargs): locked('restore-sidecar')
         argv = ['admin.py', '--root', str(self.root), 'restore-new', 'source', 'destination']
         with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', return_value=self.root), patch.object(admin, 'coordination_backup', side_effect=read), patch.object(admin, 'add_project', side_effect=create), patch.object(admin, 'run_bd', side_effect=native), patch.object(admin, 'restore_coordination', side_effect=restore), contextlib.redirect_stdout(io.StringIO()):
             admin.main()
-        self.assertEqual(phases, ['validate-sidecar', 'create-destination', 'restore-native', 'restore-sidecar'])
+        self.assertEqual(phases, ['validate-sidecar', 'create-destination', 'restore-native',
+                                  'repoint-native', 'restore-sidecar'])
         self.assertTrue(self.flock.call_args.args[0].closed)
 
     def test_backup_rejects_symlink_journal_directory(self):
