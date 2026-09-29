@@ -12,6 +12,7 @@ Read the prospective task first, then verify:
 4. Interpreter: locate an approved interpreter matching the repository's version requirement. Create an environment in your own workspace; never refer to another checkout's `.venv`.
 5. Dependencies: install from the repository's documented lockfile or package configuration. Verify the imports and lightweight checks required for the task using that environment's interpreter in the same execution boundary where implementation/tests will run.
 6. Overlap: recheck current claims, task dependencies and file/interface impacts immediately before claiming. A successful preflight does not reserve the task; confirm `update TASK --claim --json`, then register and acknowledge the plan.
+7. Target platform: identify the platform the change actually runs on - the deployment platform the task targets, or the platform whose behaviour the change claims - and plan to run the relevant suite there. If it cannot be run there, decide before implementation how that limitation will be recorded. A run on a different platform does not verify platform-specific behaviour: a test that was skipped is not a passing test.
 
 Environment provisioning may occur before the implementation claim in your isolated directory. It does not authorize application edits, deployment or taking another claim. If provisioning itself needs substantial shared changes, coordinate a separate setup task first.
 
@@ -35,6 +36,8 @@ Before a handoff, preserve the actual implementation as either:
 Push permission for a contribution branch is separate from permission to merge, update a shared branch or deploy. If project instructions do not establish push authority, ask for that narrow decision or agree a bundle transfer. Do not infer broad Git permissions from a claimed task.
 
 A local commit alone is insufficient. Uncommitted files and local-only evidence must be listed as outstanding work, not as a transferable completed implementation. Do not put credentials or private runtime data into a branch/bundle.
+
+Handoff evidence must be reproducible and honest about the platform it came from. Run the relevant suite on the deployment/target platform before handing off, or record why that was not possible. The evidence must state the platform the suite ran on and the exact commit tested, give the real pass/fail/skip counts, and list every skipped test with the reason it was skipped. Never report a platform-specific behaviour as verified when its test was skipped: `N passed, 1 skipped` is not evidence that the skipped behaviour works. Include the exact commands so the recipient can reproduce the run.
 
 ## Reserved machine-record comments
 
