@@ -89,10 +89,12 @@ else:
         except OSError:
             return False
 
-    def start(self, script=None, env=None, ready=True):
+    def start(self, script=None, python=None, env=None, ready=True):
         command = self.command('run', '--config', str(self.config), '--logs', str(self.logs))
         if script is not None:
             command[1] = str(script)
+        if python is not None:
+            command[0] = str(python)
         proc = subprocess.Popen(command,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, start_new_session=True, env=env)
@@ -159,13 +161,17 @@ else:
     def test_children_use_pinned_release_paths(self):
         alias = self.base/'current'
         alias.symlink_to(self.script.parent, target_is_directory=True)
-        proc = self.start(script=alias/'office_service.py')
+        python_alias = self.base/'python-current'
+        python_alias.symlink_to(Path(sys.executable).resolve())
+        proc = self.start(script=alias/'office_service.py', python=python_alias)
         children = self.children(proc)
         web = [args for _, args in children if 'http_service.py' in args]
         self.assertEqual(len(web), 1, children)
         self.assertIn(str(self.script.parent/'http_service.py'), web[0])
         self.assertIn(str(self.script.parent/'endpoint.py'), web[0])
+        self.assertIn(os.path.realpath(sys.executable), web[0])
         self.assertNotIn(str(alias/'http_service.py'), web[0])
+        self.assertNotIn(str(python_alias), web[0])
 
     def test_slow_web_child_gets_bounded_grace_and_nonzero_exit(self):
         proc = self.start()
