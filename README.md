@@ -11,6 +11,7 @@ The kit pins Beads 1.2.2 and Dolt 2.2.0, verifies release checksums, installs an
 **Developing the Orchestra kit:** start with the [draft BRD](docs/BRD.md), its [exact requirement manifest](docs/requirements-baseline.json), the [proposed system design](docs/SYSTEM_DESIGN.md) and [first implementation sequence](docs/IMPLEMENTATION_PLAN.md). The workflow direction is accepted; the detailed baseline remains a review candidate. The offline validator and BRD publisher are implemented: see [usage](docs/REQUIREMENTS.md). [Native export adaptation, revision impact views and an acknowledged-plan launch gate](docs/REQUIREMENTS_INTEGRATION.md) are also available through ordinary CLI commands.
 
 - Operators: [installation and recovery](docs/OPERATIONS.md).
+- Office operators: [foreground service, offline release and UAT verification](docs/OFFICE_SERVICE.md).
 - Project direction and remaining work: [implementation plan](docs/PLAN.md).
 - Operational feedback and next priorities: [pilot follow-up](docs/PILOT_FEEDBACK.md).
 - Lifecycle evidence, activity cursors, safe child creation and merge slots: [operational commands](docs/OPERATIONAL_WORKFLOW.md).
