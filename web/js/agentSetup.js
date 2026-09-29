@@ -13,6 +13,43 @@ export const GITIGNORE_LINE = '.orchestra/';
 
 const plain = (name) => String(name || '').replace(/\s*\(agent[^)]*\)$/, '');
 
+// File-name-safe slug of the agent name: lowercase [a-z0-9-], at most 40 characters.
+// Must stay identical to agent_slug() in http_auth.py (tests compare them).
+export function slug(name) {
+  const value = String(name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+    .slice(0, 40).replace(/-+$/g, '');
+  return value || 'agent';
+}
+
+// Where the owner keeps this agent's secret: a per-agent curl config file in the user
+// profile, outside the agent folder (owner's practical update, 2026-09-29).
+export function secretFile(name) {
+  const file = `.orchestra-agent-${slug(name)}.curlrc`;
+  return Object.freeze({
+    name: file,
+    windows: `%USERPROFILE%\\${file}`,
+    powershell: `$env:USERPROFILE\\${file}`,
+    posix: `~/${file}`,
+  });
+}
+
+// The one line that file holds. The real secret is passed ONLY by the dialog that is
+// showing a freshly issued secret; every other caller gets the placeholder.
+export const SECRET_PLACEHOLDER = '<your secret>';
+export function headerLine(secretValue = SECRET_PLACEHOLDER) {
+  return `header = "Authorization: Bearer ${secretValue}"`;
+}
+
+// Commands that prove the stored secret works (they never contain it).
+export function testCommands(payload) {
+  const file = payload.secretFile;
+  return Object.freeze({
+    powershell: `curl.exe -fsS -K "${file.powershell}" ${payload.server}/v1/agents/me`,
+    posixChmod: `chmod 600 ${file.posix}`,
+    posix: `curl -fsS -K ${file.posix} ${payload.server}/v1/agents/me`,
+  });
+}
+
 // The create response minus anything secret. Works for the real service
 // ({agent, setup, ...}) and the prototype's mock ({agent, server, owner_name, ...}).
 export function secretlessPayload(created, fallbackServer) {
@@ -20,10 +57,12 @@ export function secretlessPayload(created, fallbackServer) {
   const setup = created.setup || {};
   const config = setup.config || {};
   const projects = (config.projects || agent.projects || []).map((p) => (typeof p === 'string' ? p : p.id));
+  const name = plain(config.name || agent.name || agent.display_name);
   return Object.freeze({
     agentId: config.agent_id || agent.id,
-    name: plain(config.name || agent.name || agent.display_name),
-    owner: agent.owner_display_name || created.owner_name || 'your owner',
+    name,
+    secretFile: secretFile(name),
+    owner: agent.owner_display_name || created.owner_name || agent.owner_name || 'your owner',
     server: config.server_url || created.server || fallbackServer || '<ORCHESTRA_SERVER_URL>',
     projects: Object.freeze(projects.slice()),
     secretEnv: setup.secret_env_var || 'ORCHESTRA_AGENT_SECRET',
@@ -36,15 +75,28 @@ export function agentJson(payload) {
 }
 
 export function agentGuide(payload) {
+  const file = payload.secretFile;
+  const server = payload.server;
   return [
     `# ${payload.name}`,
     '',
     `You are ${payload.name}, an Orchestra agent owned by ${payload.owner}. Your settings are in ${CONFIG_PATH} (server_url, agent_id, projects). That file holds no secret.`,
     '',
-    `1. Your secret is kept by your owner in VS Code secret storage or the operating system's credential store. Read it from there when you call Orchestra. Never write it to a file, a commit or a command line. (Only on a machine with no credential store: the ${payload.secretEnv} environment variable, set from that store.)`,
-    `2. Ask for your next action: GET ${payload.server}/v1/agents/me/next with the header "Authorization: Bearer <your secret>". From a shell, let curl read that header from a config file only you can read (curl -K ~/.orchestra-agent-curlrc), never from the command line.`,
-    '3. The reply says what to do next: feedback to address, work to continue, or tasks you could claim. Before coding, read the task brief it links to.',
-    '4. Record a checkpoint when you stop, and deliver work for review through the API.',
+    '## Your secret',
+    '',
+    `Your owner keeps your secret in a curl config file in their user profile: ${file.windows} on Windows, ${file.posix} on macOS/Linux. It holds one line, ${headerLine()}. Hand that file to curl with -K on every call. Never open, print or copy that file, and never put the secret on a command line, in this folder, in a commit or in any other file.`,
+    '',
+    '## Every call',
+    '',
+    `- Windows (PowerShell): curl.exe -fsS -K "${file.powershell}" ${server}/v1/...`,
+    `- macOS/Linux: curl -fsS -K ${file.posix} ${server}/v1/...`,
+    '',
+    '## Steps',
+    '',
+    `1. Ask for your next action: GET ${server}/v1/agents/me/next, for example curl.exe -fsS -K "${file.powershell}" ${server}/v1/agents/me/next`,
+    '2. The reply says what to do next: feedback to address, work to continue, or tasks you could claim. Before coding, read the task brief it links to.',
+    '3. Record a checkpoint when you stop, and deliver work for review through the API, always with curl -K as above.',
+    `4. If a call returns 401, the secret file is missing or wrong: stop and ask your owner to check ${file.windows}.`,
     '5. Stop and ask your owner if anything is unclear.',
     '',
   ].join('\n');
@@ -70,7 +122,7 @@ export function setupPrompt(payload) {
     agentGuide(payload).trimEnd(),
     '~~~',
     `4. If this folder is a git repository and its .gitignore does not already list ${GITIGNORE_LINE}, add the line ${GITIGNORE_LINE} to .gitignore. Do not change any other file.`,
-    '5. Your secret is not in this message and must never be written to a file, a commit or a command line. I keep it in my credential store (VS Code secret storage or the operating system credential store) and provide it the way AGENT.md describes.',
+    `5. Your secret is not in this message. I keep it in ${payload.secretFile.windows} (on macOS/Linux ${payload.secretFile.posix}); you hand that file to curl with -K, as AGENT.md says. Never open, print or copy that file, and never write the secret to a file, a commit or a command line.`,
     '',
     `Then continue: ${resumePrompt(payload.name)}`,
     '',

@@ -449,6 +449,19 @@ export function createMock(options = {}) {
     log(projectsWanted[0] || null, 'agents.create', null, title);
     return ok({ agent: agentView(db.users[id], me()), owner_name: me().display_name, server: 'https://orchestra.example.invalid', credential: { id: 'cred_' + (db.seq += 1), secret: 'orc_' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2) } }, 201);
   });
+  const ownAgent = (aid) => { const a = db.users[aid]; return a && a.agent_of && (a.agent_of === db.session || me().superuser) ? a : null; };
+  on('GET', '/v1/agents/(?<aid>[\\w-]+)', (b, p) => { const a = ownAgent(p.aid); return a ? ok({ ...agentView(a, me()), credentials: a.credentials || [] }) : err(404, 'not_found', 'Agent not found'); });
+  on('POST', '/v1/agents/(?<aid>[\\w-]+)/credentials', (b, p) => {
+    const a = ownAgent(p.aid); if (!a) return err(404, 'not_found', 'Agent not found');
+    const cred = { id: 'cred_' + (db.seq += 1), label: b.label || 'agent', created_at: new Date().toISOString(), revoked: false };
+    a.credentials = (a.credentials || []).concat([cred]);
+    return ok({ agent: a.id, credential: { ...cred, secret: 'orc_' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2), secret_available: true } }, 201);
+  });
+  on('POST', '/v1/agents/(?<aid>[\\w-]+)/credentials/(?<cid>[\\w-]+)/revoke', (b, p) => {
+    const a = ownAgent(p.aid); const c = a && (a.credentials || []).find((x) => x.id === p.cid);
+    if (!c) return err(404, 'not_found', 'Credential not found');
+    c.revoked = true; return { status: 204, data: null };
+  });
   on('PATCH', '/v1/agents/(?<aid>[\\w-]+)', (b, p) => {
     const a = db.users[p.aid];
     if (!a || !a.agent_of || (a.agent_of !== db.session && !me().superuser)) return err(404, 'not_found', 'Agent not found');

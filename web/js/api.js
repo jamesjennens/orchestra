@@ -112,6 +112,10 @@ export function createApi(transport) {
     agents: () => call('GET', '/v1/agents'),
     createAgent: (body) => mutate('POST', '/v1/agents', body),
     updateAgent: (aid, body) => mutate('PATCH', `/v1/agents/${aid}`, body),
+    agent: (aid) => call('GET', `/v1/agents/${aid}`),
+    // A NEW credential for the agent; its secret is in this one response only.
+    issueAgentCredential: (aid) => mutate('POST', `/v1/agents/${aid}/credentials`, { label: 'web: new secret' }),
+    revokeAgentCredential: (aid, cid) => mutate('POST', `/v1/agents/${aid}/credentials/${cid}/revoke`, {}),
     feedback: (pid, params) => call('GET', `/v1/projects/${pid}/feedback`, { params }),
     addFeedback: (pid, body) => mutate('POST', `/v1/projects/${pid}/feedback`, body),
     requirements: (pid) => call('GET', `/v1/projects/${pid}/requirements`),

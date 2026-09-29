@@ -888,6 +888,56 @@ class LookupDigestCase(TeamHarness):
             self.assertNotIn(key.encode(), self.request('GET', path, token=self.olive).body)
 
 
+class AgentSecretReissueCase(TeamHarness):
+    """'Issue a new secret' in the reopened setup dialog uses the real routes."""
+
+    def test_reopen_reads_no_secret_and_reissue_is_owner_only(self):
+        created = self.request('POST', '/v1/agents', {'name': 'Kestrel', 'projects': [self.project],
+                                                      'working_directory': 'C:\\Users\\olive\\k'},
+                               token=self.olive)
+        self.assertEqual(201, created.status, created.data)
+        aid = created.data['agent']['id']
+        first = created.data['credential']
+        # The reopened dialog's source: the current record, which never holds a secret.
+        record = self.request('GET', '/v1/agents/%s' % aid, token=self.olive)
+        self.assertEqual(200, record.status, record.data)
+        self.assertNotIn(first['secret'].encode(), record.body)
+        self.assertNotIn(b'"secret"', record.body)
+        self.assertEqual('C:\\Users\\olive\\k', record.data['working_directory'])
+        # A non-owner (even a project owner of the agent's project) cannot read or reissue.
+        for token in (self.carl, self.otto):
+            self.assertEqual(404, self.request('GET', '/v1/agents/%s' % aid, token=token).status)
+            refused = self.request('POST', '/v1/agents/%s/credentials' % aid,
+                                   {'label': 'web: new secret'}, token=token)
+            self.assertEqual(404, refused.status, refused.data)
+        agent_secret = first['secret']
+        self.assertEqual(403, self.request('POST', '/v1/agents/%s/credentials' % aid,
+                                           {'label': 'x'}, token=agent_secret).status)
+        # The owner gets a NEW secret once; the old one keeps working until revoked.
+        issued = self.request('POST', '/v1/agents/%s/credentials' % aid,
+                              {'label': 'web: new secret'}, token=self.olive, key='reissue-0001')
+        self.assertEqual(201, issued.status, issued.data)
+        second = issued.data['credential']
+        self.assertNotEqual(first['secret'], second['secret'])
+        self.assertEqual(200, self.request('GET', '/v1/agents/me', token=first['secret']).status)
+        self.assertEqual(200, self.request('GET', '/v1/agents/me', token=second['secret']).status)
+        replay = self.request('POST', '/v1/agents/%s/credentials' % aid,
+                              {'label': 'web: new secret'}, token=self.olive, key='reissue-0001')
+        self.assertEqual(200, replay.status)
+        self.assertNotIn(second['secret'].encode(), replay.body)  # never re-shown
+        listed = self.request('GET', '/v1/agents/%s' % aid, token=self.olive).data['credentials']
+        self.assertEqual({first['id'], second['id']}, {c['id'] for c in listed})
+        revoked = self.request('POST', '/v1/agents/%s/credentials/%s/revoke' % (aid, first['id']),
+                               token=self.olive)
+        self.assertEqual(204, revoked.status, revoked.body)
+        self.assertEqual(401, self.request('GET', '/v1/agents/me', token=first['secret']).status)
+        self.assertEqual(200, self.request('GET', '/v1/agents/me', token=second['secret']).status)
+        self.assertEqual(404, self.request('POST', '/v1/agents/%s/credentials/%s/revoke'
+                                           % (aid, second['id']), token=self.carl).status)
+        # A superuser may manage it too (the card shows the button to superusers).
+        self.assertEqual(200, self.request('GET', '/v1/agents/%s' % aid, token=self.admin).status)
+
+
 class NextActionCase(unittest.TestCase):
     def test_unknown_review_state_matches_no_review_filter(self):
         from http_service import task_matches
@@ -1000,7 +1050,14 @@ class AgentSetupDialogCase(unittest.TestCase):
     @staticmethod
     def function_body(text, name):
         start = text.index('function ' + name + '(')
-        depth, index = 0, text.index('{', start)
+        # Skip the parameter list (it may hold destructuring braces) to the body's '{'.
+        depth, position = 0, text.index('(', start)
+        while True:
+            depth += {'(': 1, ')': -1}.get(text[position], 0)
+            if depth == 0:
+                break
+            position += 1
+        depth, index = 0, text.index('{', position)
         for position in range(index, len(text)):
             depth += {'{': 1, '}': -1}.get(text[position], 0)
             if depth == 0:
@@ -1027,14 +1084,112 @@ class AgentSetupDialogCase(unittest.TestCase):
             self.assertNotIn('secret', built)
             self.assertNotIn('created', built)
             self.assertIn('payload', built)
-        # The secret variable is used only for its own box and its own copy button.
-        def unquoted(line):
-            return re.sub(r"'[^']*'|`[^`]*`", "''", line)
+        # In the dialog the secret is only handed to secretSection(), the single place
+        # that renders one; everything else is built from the secretless payload.
         uses = [line.strip() for line in dialog.splitlines()
-                if re.search(r'\bsecret\b', unquoted(line))]
-        self.assertEqual(3, len(uses), uses)
-        self.assertTrue(any("copyButton('Copy', secret" in line for line in uses), uses)
-        self.assertTrue(any("h('div', { class: 'secret' }, secret)" in line for line in uses), uses)
+                if re.search(r'\bsecret\b', self.unquoted(line))]
+        self.assertIn('function setupDialog(ctx, source, { secret = null } = {}) {', code)
+        self.assertEqual(["secret ? secretSection(secret, 'Secret (shown once)', payload) : "
+                          "reissueSection(ctx, source.agent || {}, payload)),"], uses)
+        section = self.function_body(code, 'secretSection')
+        self.assertIn("copyButton('Copy', secret", section)
+        self.assertIn("h('div', { class: 'secret' }, secret)", section)
+        # Step 1's line is the only other thing built from the secret, and only here.
+        self.assertIn('secretSteps(payload, setupText.headerLine(secret), { withSecret: true })', section)
+        self.assertEqual(1, code.count('setupText.headerLine(secret)'))
+        steps = self.function_body(code, 'secretSteps')
+        self.assertIsNone(re.search(r'\bsecret\b|credential', self.unquoted(steps)))
+
+    @staticmethod
+    def unquoted(line):
+        return re.sub(r"'[^']*'|`[^`]*`", "''", line)
+
+    def test_reopened_dialog_never_shows_an_old_secret(self):
+        code = self.code(self.AGENTS_JS)
+        reopen = self.function_body(code, 'reopenSetup')
+        # Built from the agent's current secretless record, with no secret at all.
+        self.assertIn('ctx.api.agent(agentId)', reopen)
+        self.assertIn('setupDialog(ctx, { agent }, { secret: null })', reopen)
+        self.assertIsNone(re.search(r'credential|\.secret\b', reopen))
+        # Losing the secret means issuing a NEW credential; only its fresh secret is shown.
+        reissue = self.function_body(code, 'reissueSection')
+        self.assertIn('ctx.api.issueAgentCredential(agent.id)', reissue)
+        uses = [line.strip() for line in reissue.splitlines()
+                if re.search(r'\bsecret\b', self.unquoted(line))]
+        self.assertEqual(['if (!credential.secret) {',
+                          "section.replaceChildren(secretSection(credential.secret, "
+                          "'New secret (shown once)', payload), olderCredentials(ctx, agent, credential.id));"],
+                         uses)
+        # Without a fresh secret the steps show the placeholder line only.
+        self.assertIn('secretSteps(payload, setupText.headerLine(), { withSecret: false })', reissue)
+        older = self.function_body(code, 'olderCredentials')
+        self.assertIsNone(re.search(r'\bsecret\b', self.unquoted(older)))
+        self.assertIn('ctx.api.revokeAgentCredential(agent.id, c.id)', older)
+        # The API calls map onto the real routes.
+        api = (WEB / 'js' / 'api.js').read_text(encoding='utf-8')
+        self.assertIn("agent: (aid) => call('GET', `/v1/agents/${aid}`)", api)
+        self.assertIn("mutate('POST', `/v1/agents/${aid}/credentials`", api)
+        self.assertIn("mutate('POST', `/v1/agents/${aid}/credentials/${cid}/revoke`", api)
+        # The card button is for the agent's owner or a superuser only.
+        manages = self.function_body(code, 'manages')
+        self.assertIn('ctx.me.superuser || owner === ctx.me.id', manages)
+        card = self.function_body(code, 'agentCard')
+        self.assertIn("manages(ctx, raw) ? h('div'", card)
+        self.assertIn('reopenSetup(ctx, raw.id', card)
+
+    def test_dialog_is_three_numbered_steps(self):
+        dialog = self.function_body(self.code(self.AGENTS_JS), 'setupDialog')
+        order = [dialog.index("step(1, 'Store the secret'"), dialog.index("step(2, 'Set up the folder'"),
+                 dialog.index("step(3, 'Start the agent'")]
+        self.assertEqual(sorted(order), order)
+        step3 = dialog[order[2]:]
+        self.assertIn("copyLine('Resume prompt:', resume", step3)
+        steps = self.function_body(self.code(self.AGENTS_JS), 'secretSteps')
+        for text in ('Open Notepad', 'Save as type', 'All files (*.*)', 'file.windows', 'file.posix',
+                     'test.posixChmod', 'test.powershell', 'test.posix', 'error: 401',
+                     'cannot read config from', 'exit code 26', '.txt'):
+            self.assertIn(text, steps)
+
+    def test_secret_file_slug_matches_the_server(self):
+        from http_auth import agent_secret_file, agent_slug
+        names = ['Kestrel', 'Kestrel (agent of Olive)', 'wren 2', '../..\\x', '', '  --  ',
+                 'A' * 60, 'Ünïcode name', 'a.b_c-d']
+        for name in names:
+            slug = agent_slug(name)
+            self.assertRegex(slug, r'^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$', name)
+            self.assertNotIn('/', agent_secret_file(name)['name'])
+            self.assertNotIn('\\', agent_secret_file(name)['name'])
+        self.assertEqual('agent', agent_slug('../'))
+        self.assertEqual('.orchestra-agent-kestrel-agent-of-olive.curlrc',
+                         agent_secret_file('Kestrel (agent of Olive)')['name'])
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node is not installed; the JS slug is compared where it is')
+        import subprocess
+        script = ("const m = await import(process.argv[1]);"
+                  "console.log(JSON.stringify(JSON.parse(process.argv[2]).map((n) => "
+                  "[m.slug(n), m.secretFile(n)])))")
+        out = subprocess.run([node, '--input-type=module', '-e', script, self.SETUP_JS.as_uri(),
+                              json.dumps(names)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(0, out.returncode, out.stderr)
+        for name, (slug, file) in zip(names, json.loads(out.stdout)):
+            server = agent_secret_file(name)
+            self.assertEqual(agent_slug(name), slug, name)
+            self.assertEqual({'name': server['name'], 'windows': server['windows'],
+                              'powershell': server['windows_powershell'], 'posix': server['posix']},
+                             file, name)
+
+    def test_owner_facing_labels(self):
+        agents = self.AGENTS_JS.read_text(encoding='utf-8')
+        self.assertIn("export const SETUP_PROMPT_LABEL = 'Copy setup prompt (creates the files)';", agents)
+        self.assertIn('Set up the agent’s folder in one of two ways: Save to agent folder, or paste '
+                      'the setup prompt into the agent’s chat. Copy path is only for saving the '
+                      'files by hand.', agents)
+        self.assertIn("'Resume prompt (after setup)'", agents)
+        self.assertIn("'Needs .orchestra/agent.json in the folder; use Set up folder first.'", agents)
+        self.assertIn("}, 'Set up folder')", agents)
+        self.assertIn("}, 'Issue a new secret')", agents)
+        self.assertNotIn("'Copy agent prompt'", agents)
 
     def test_resume_prompt_names_the_file_the_dialog_writes(self):
         setup = self.SETUP_JS.read_text(encoding='utf-8')
@@ -1075,6 +1230,9 @@ const mock = { agent: { id: 'usr_9', display_name: 'Wren (agent)', working_direc
     projects: [{ id: 'proj_a', name: 'A', role: 'contributor' }] }, owner_name: 'Tomasz',
   server: 'https://orchestra.example.invalid', credential: { id: 'c', secret: 'MOCK-SECRET-777' } };
 const p = m.secretlessPayload(created, 'http://fallback');
+const reopened = m.secretlessPayload({ agent: { id: 'agent_1', name: 'Kestrel', owner: 'u1',
+    owner_display_name: 'Olive', working_directory: 'C:\\k', projects: ['p1'],
+    credentials: [{ id: 'c1', label: 'x', revoked: false }] } }, 'http://127.0.0.1:9');
 const q = m.secretlessPayload(mock, 'http://fallback');
 const texts = [m.agentJson(p), m.agentGuide(p), m.setupPrompt(p), JSON.stringify(p),
                m.agentJson(q), m.agentGuide(q), m.setupPrompt(q), JSON.stringify(q)];
@@ -1084,6 +1242,13 @@ console.log(JSON.stringify({
   promptHasJson: m.setupPrompt(p).includes(m.agentJson(p).trimEnd()),
   promptHasGuide: m.setupPrompt(p).includes(m.agentGuide(p).trimEnd()),
   promptResumes: m.setupPrompt(p).includes('Read .orchestra/AGENT.md in this folder'),
+  reopenedJson: JSON.parse(m.agentJson(reopened)),
+  guideNamesFile: m.agentGuide(p).includes('%USERPROFILE%\\.orchestra-agent-kestrel.curlrc')
+    && m.agentGuide(p).includes('curl.exe -fsS -K "$env:USERPROFILE\\.orchestra-agent-kestrel.curlrc" http://127.0.0.1:1/v1/')
+    && m.agentGuide(p).includes('curl -fsS -K ~/.orchestra-agent-kestrel.curlrc http://127.0.0.1:1/v1/'),
+  promptNamesFile: m.setupPrompt(p).includes('%USERPROFILE%\\.orchestra-agent-kestrel.curlrc'),
+  placeholder: m.headerLine(), real: m.headerLine('S3'),
+  tests: m.testCommands(p),
   paths: [m.destinationPath(p.workingDirectory, m.CONFIG_PATH), m.destinationPath('/home/j/x/', m.GUIDE_PATH),
           m.destinationPath('D:', m.CONFIG_PATH), m.destinationPath('', m.CONFIG_PATH)],
   ignore: [m.gitignoreAppend('node_modules'), m.gitignoreAppend('a\r\n'), m.gitignoreAppend('/.orchestra\n'),
@@ -1100,6 +1265,18 @@ console.log(JSON.stringify({
         self.assertEqual({'server_url': 'https://orchestra.example.invalid', 'agent_id': 'usr_9',
                           'projects': ['proj_a'], 'name': 'Wren'}, result['mockJson'])
         self.assertTrue(result['promptHasJson'] and result['promptHasGuide'] and result['promptResumes'])
+        self.assertEqual({'server_url': 'http://127.0.0.1:9', 'agent_id': 'agent_1',
+                          'projects': ['p1'], 'name': 'Kestrel'}, result['reopenedJson'])
+        self.assertTrue(result['guideNamesFile'])
+        self.assertTrue(result['promptNamesFile'])
+        self.assertEqual('header = "Authorization: Bearer <your secret>"', result['placeholder'])
+        self.assertEqual('header = "Authorization: Bearer S3"', result['real'])
+        self.assertEqual({
+            'powershell': 'curl.exe -fsS -K "$env:USERPROFILE\\.orchestra-agent-kestrel.curlrc" '
+                          'http://127.0.0.1:1/v1/agents/me',
+            'posixChmod': 'chmod 600 ~/.orchestra-agent-kestrel.curlrc',
+            'posix': 'curl -fsS -K ~/.orchestra-agent-kestrel.curlrc http://127.0.0.1:1/v1/agents/me'},
+            result['tests'])
         self.assertEqual([
             {'path': 'C:\\Users\\james\\zcode-x\\.orchestra\\agent.json', 'relative': False},
             {'path': '/home/j/x/.orchestra/AGENT.md', 'relative': False},

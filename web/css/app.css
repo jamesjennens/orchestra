@@ -312,6 +312,13 @@ dialog.dialog-wide { width: min(760px, calc(100vw - 32px)); }
 .copy-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .copy-row h3 { margin: 0; margin-right: auto; }
 .error-text { color: var(--crit); }
+.setup-steps { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 18px; }
+.setup-step { display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--line); padding-top: 12px; }
+.setup-step > h3 { margin: 0; }
+.setup-substeps { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 10px; }
+.setup-line { display: flex; flex-direction: column; gap: 4px; }
+.setup-line code { overflow-wrap: anywhere; }
+.setup-block h4 { margin: 0; margin-right: auto; }
 
 /* ---------- responsive ---------- */
 @media (max-width: 960px) {
