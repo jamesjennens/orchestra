@@ -30,6 +30,59 @@ prompt are current interim or home-use options, not the recommended office setup
 a project. Register once, save the returned actor privately, and resume that same
 actor on later runs. Never use `start` to replace an interrupted worker.
 
+## Operator commands (coordinator and host operator)
+
+A few coordination actions are **host shell commands**, not contributor-client
+actions: they run `admin.py` on the coordination host as the service account. A
+coordinator whose session settings deny `admin.py` prepares the payload file and
+hands the exact command to the project owner or the host operator. Do not ask a
+worker or agent lane to run them, and do not put another person's actor in
+`--actor`.
+
+| Command | Purpose | Authority it needs |
+| --- | --- | --- |
+| `requirement-apply PROJECT --actor ACTOR --file record.json` | write an accepted requirement revision, or move an accepted record back to draft | the payload's `acceptance` object (named owners/approvers, policy, decision id, evidence) |
+| `requirement-backfill PROJECT --actor ACTOR --file backfill.json` | add the controlled requirement type/state labels to records created before this route | an `evidence` pointer for an entry that becomes `accepted` |
+| `requirement-reconcile PROJECT --operation-id ID --actor ACTOR --disposition ...` | finish a requirement operation whose real write was uncertain | confirmation of the native record state |
+| `void-record PROJECT --actor OPERATOR --file void.json` | void a malformed or stale contribution-review record | the deployment operator allowlist (`operators` in `deployment.private.json`) |
+| `handoff PROJECT --actor ACTOR --file handoff.json` | transfer a claim when the current owner cannot act | an owner decision/evidence pointer in the payload's `approval` |
+
+All five are shell-trusted: access to the service account's shell is the
+boundary. Only `void-record` also checks the deployment operator allowlist, and a
+deployment that configures no operators authorizes nobody. Use the identity of
+the person actually running the command as `--actor`; the owner decision is named
+in the payload, never by reusing the owner's actor.
+
+Validate a payload before writing. The commands are fail-closed and refuse before
+any native write, but the same validator can be run with no native read or write
+from the kit directory:
+
+```sh
+python3 -c "import json,sys,requirement_records as r; r.validate_payload(json.load(open(sys.argv[1])), operator=True)" record.json
+python3 -c "import json,sys,requirement_records as r; r.validate_backfill(json.load(open(sys.argv[1])))" backfill.json
+python3 -c "import json,sys,recovery as r; p=json.load(open(sys.argv[1])); r.validate(p,p['task'])" void.json
+python3 -c "import json,sys,handoff as h; h.validate(json.load(open(sys.argv[1])))" handoff.json
+```
+
+The validators check payload shape only; each command rechecks native state
+(record existence, revision ledger, key uniqueness, the allowlist) and refuses
+before writing. There is no `--validate-only` flag today. The `requirement-apply`
+line uses the operator form because the contributor form (default
+`operator=False`) refuses an operator payload that accepts a first revision
+(`operation: "draft"` with `acceptance_state: "accepted"`), while `operator=True`
+additionally runs the F3 acceptance check. Payload schemas and
+full semantics are in [native requirement commands](../docs/REQUIREMENTS_INTEGRATION.md)
+and [installation and recovery](../docs/OPERATIONS.md).
+
+Records created before this route (for example by `create-child`) can be untyped,
+or typed draft although accepted; label them with `requirement-backfill`. A
+backfill to `accepted` needs an `evidence` pointer and is refused when the newest
+revision comment says `draft` - accept those with `requirement-apply` and F3
+evidence, which writes a new accepted revision. A record with no revision comments
+at all can instead get an accepted revision 1 via `operation: "draft"` with
+`acceptance_state: "accepted"` and an `acceptance` object (operator only), so the
+revision number can match a published manifest.
+
 ## From an empty directory
 
 1. Obtain service access and the owner/operator-provided bootstrap command before
