@@ -27,8 +27,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from http_service import (CONTENT_SECURITY_POLICY, DEFAULT_WEB_ROOT, InProcessBackend,
                           create_server, static_file)
-from test_http_service import (ADMIN, BASE, BUNDLE, COMMIT, Response, ServerHarness,
-                               unique_dir)
+from test_http_review_fixes import EndpointCase
+from test_http_service import (BASE, BUNDLE, COMMIT, Response, ServerHarness, unique_dir)
 
 WEB = DEFAULT_WEB_ROOT
 
@@ -213,6 +213,452 @@ class StaticConfigurationCase(StaticHarness):
         from http_service import main
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             main(['--state', str(self.tmp_path / 's.json'), '--no-web', '--web-root', 'x'])
+
+
+# ---------------------------------------------------------------- read routes
+def without_request_id(body):
+    return {key: value for key, value in (body or {}).items() if key != 'request_id'}
+
+
+class TeamHarness(ServerHarness):
+    """An owner, a contributor, a viewer, an outsider and a project with one task."""
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.admin_token()
+        self.ids = {}
+        for name in ('olive', 'carl', 'vera', 'otto'):
+            self.ids[name] = self.create_account(self.admin, name, name + '-password-1')
+        self.olive = self.login('olive', 'olive-password-1')[0]
+        self.carl = self.login('carl', 'carl-password-1')[0]
+        self.vera = self.login('vera', 'vera-password-1')[0]
+        self.otto = self.login('otto', 'otto-password-1')[0]
+        self.project = self.create_project(self.olive, 'Alpha')
+        self.other = self.create_project(self.otto, 'Elsewhere')
+        for name, role in (('carl', 'contributor'), ('vera', 'viewer')):
+            response = self.request('PUT', '/v1/projects/%s/members/%s'
+                                    % (self.project, self.ids[name]), {'role': role},
+                                    token=self.olive)
+            self.assertEqual(200, response.status, response.data)
+        self.task = self.create_task(self.olive, self.project, 'Paginate history').data['id']
+
+    def path(self, suffix='', project=None):
+        return '/v1/projects/%s%s' % (project or self.project, suffix)
+
+    def claim(self, token, task=None):
+        response = self.request('POST', self.path('/tasks/%s/claim' % (task or self.task)), {},
+                                token=token)
+        self.assertEqual(200, response.status, response.data)
+        return response.data
+
+    def contribute(self, token, task=None, commit=COMMIT, **extra):
+        body = {'operation': 'contribute', 'commit': commit, 'base_commit': BASE,
+                'bundle_sha256': BUNDLE, 'summary': 'delivered'}
+        body.update(extra)
+        return self.request('POST', self.path('/tasks/%s/reviews' % (task or self.task)), body,
+                            token=token)
+
+    def review(self, token, operation, task=None, **extra):
+        body = {'operation': operation}
+        body.update(extra)
+        return self.request('POST', self.path('/tasks/%s/reviews' % (task or self.task)), body,
+                            token=token)
+
+    def assert_uniform_not_found(self, suffix, token=None):
+        """A non-member sees exactly what a caller asking for a missing project sees."""
+        token = token or self.otto
+        hidden = self.request('GET', self.path(suffix), token=token)
+        missing = self.request('GET', self.path(suffix, project='proj_missing0000'), token=token)
+        self.assertEqual(404, hidden.status, hidden.data)
+        self.assertEqual(404, missing.status, missing.data)
+        self.assertEqual(without_request_id(hidden.data), without_request_id(missing.data))
+        self.assertEqual(401, self.request('GET', self.path(suffix)).status)
+
+
+class MembersRouteCase(TeamHarness):
+    def test_every_member_reads_the_member_list(self):
+        for token in (self.olive, self.carl, self.vera, self.admin):
+            response = self.request('GET', self.path('/members'), token=token)
+            self.assertEqual(200, response.status, response.data)
+            roles = {m['username']: m['role'] for m in response.data['items']}
+            self.assertEqual({'olive': 'owner', 'carl': 'contributor', 'vera': 'viewer'}, roles)
+            self.assertEqual(3, response.data['total'])
+            self.assertIsNone(response.data['next_cursor'])
+        member = response.data['items'][0]
+        self.assertEqual({'user_id', 'username', 'display_name', 'role', 'disabled',
+                          'superuser'}, set(member))
+
+    def test_non_member_and_missing_project_are_uniform_404(self):
+        self.assert_uniform_not_found('/members')
+
+    def test_member_list_pages_with_a_bound_cursor(self):
+        first = self.request('GET', self.path('/members?limit=2'), token=self.olive).data
+        self.assertEqual(2, len(first['items']))
+        second = self.request('GET', self.path('/members?limit=2&cursor=%s'
+                                               % first['next_cursor']), token=self.olive).data
+        self.assertEqual(1, len(second['items']))
+        seen = [m['user_id'] for m in first['items'] + second['items']]
+        self.assertEqual(3, len(set(seen)))
+        stolen = self.request('GET', self.path('/members?limit=2&cursor=%s'
+                                               % first['next_cursor']), token=self.carl)
+        self.assertEqual(409, stolen.status)
+        self.assertEqual(422, self.request('GET', self.path('/members?limit=101'),
+                                           token=self.olive).status)
+
+    def test_worker_credential_reads_members_of_its_own_project_only(self):
+        secret = self.request('POST', self.path('/worker-credentials'), {'label': 'w'},
+                              token=self.olive).data['credential']['secret']
+        self.assertEqual(200, self.request('GET', self.path('/members'), token=secret).status)
+        self.assertEqual(404, self.request('GET', self.path('/members', project=self.other),
+                                           token=secret).status)
+
+
+class WorkerCredentialListCase(TeamHarness):
+    def test_owner_sees_metadata_and_never_a_secret(self):
+        issued = self.request('POST', self.path('/worker-credentials'),
+                              {'label': 'build runner', 'scopes': ['tasks', 'reviews']},
+                              token=self.olive)
+        self.assertEqual(201, issued.status, issued.data)
+        secret = issued.data['credential']['secret']
+        response = self.request('GET', self.path('/worker-credentials'), token=self.olive)
+        self.assertEqual(200, response.status, response.data)
+        self.assertEqual(1, response.data['total'])
+        item = response.data['items'][0]
+        self.assertEqual('build runner', item['label'])
+        self.assertEqual(['tasks', 'reviews'], item['scopes'])
+        self.assertEqual(self.ids['olive'], item['user_id'])
+        self.assertEqual('olive', item['user_name'])
+        self.assertFalse(item['revoked'])
+        self.assertNotIn(secret.encode(), response.body)
+        for forbidden_key in (b'"secret"', b'token_hash', b'"hash"'):
+            self.assertNotIn(forbidden_key, response.body)
+        # Revocation shows as metadata, and the superuser sees it too.
+        self.request('POST', self.path('/worker-credentials/%s/revoke' % item['id']),
+                     token=self.olive)
+        again = self.request('GET', self.path('/worker-credentials'), token=self.admin).data
+        self.assertTrue(again['items'][0]['revoked'])
+
+    def test_contributors_viewers_and_credentials_are_refused(self):
+        secret = self.request('POST', self.path('/worker-credentials'), {'label': 'w'},
+                              token=self.olive).data['credential']['secret']
+        for token in (self.carl, self.vera, secret):
+            response = self.request('GET', self.path('/worker-credentials'), token=token)
+            self.assertEqual(403, response.status, response.data)
+
+    def test_non_member_and_missing_project_are_uniform_404(self):
+        self.assert_uniform_not_found('/worker-credentials')
+
+    def test_other_projects_and_agent_credentials_are_not_listed(self):
+        self.request('POST', self.path('/worker-credentials', project=self.other),
+                     {'label': 'elsewhere'}, token=self.otto)
+        agent = self.request('POST', '/v1/agents', {'name': 'Kestrel', 'projects': [self.project]},
+                             token=self.olive)
+        self.assertEqual(201, agent.status, agent.data)
+        listed = self.request('GET', self.path('/worker-credentials'), token=self.olive).data
+        self.assertEqual([], listed['items'])
+
+
+class BriefRouteCase(TeamHarness):
+    def test_brief_follows_claim_contribution_request_changes_and_revision(self):
+        brief = self.request('GET', self.path('/tasks/%s/brief' % self.task), token=self.vera)
+        self.assertEqual(200, brief.status, brief.data)
+        self.assertEqual('none', brief.data['review']['state'])
+        self.assertIsNone(brief.data['review']['contribution'])
+        self.assertEqual({'who': 'anyone', 'text': 'Claim this task'},
+                         brief.data['task']['next_action'])
+        self.claim(self.carl)
+        first = self.contribute(self.carl)
+        self.assertEqual(201, first.status, first.data)
+        brief = self.request('GET', self.path('/tasks/%s/brief' % self.task), token=self.olive).data
+        self.assertEqual('awaiting-review', brief['review']['state'])
+        contribution = brief['review']['contribution']
+        self.assertEqual(1, contribution['revision'])
+        self.assertEqual(COMMIT, contribution['commit'])
+        self.assertEqual('carl', contribution['author_name'])
+        self.assertEqual('carl', brief['task']['assignee_name'])
+        self.assertEqual('owner', brief['task']['next_action']['who'])
+        self.assertEqual(contribution['id'], brief['review']['latest_id'])
+
+        asked = self.review(self.olive, 'request-changes', contribution=contribution['id'],
+                            previous=brief['review']['latest_id'],
+                            items=[{'id': 'item-1', 'text': 'Handle an empty page'}, 'Add a test'])
+        self.assertEqual(201, asked.status, asked.data)
+        brief = self.request('GET', self.path('/tasks/%s/brief' % self.task), token=self.carl).data
+        self.assertEqual('changes-requested', brief['review']['state'])
+        self.assertEqual(['Handle an empty page', 'Add a test'],
+                         [r['text'] for r in brief['review']['requests']])
+        self.assertEqual({'open'}, {r['status'] for r in brief['review']['requests']})
+        self.assertEqual(2, brief['review']['open_requests'])
+        self.assertEqual('assignee', brief['task']['next_action']['who'])
+
+        revised = self.contribute(self.carl, commit='d' * 40,
+                                  delivery={'kind': 'remote', 'remote': 'origin',
+                                            'branch': 'contrib/paginate'},
+                                  bundle_sha256=None)
+        self.assertEqual(201, revised.status, revised.data)
+        brief = self.request('GET', self.path('/tasks/%s/brief' % self.task), token=self.olive).data
+        self.assertEqual('awaiting-review', brief['review']['state'])
+        self.assertEqual(2, brief['review']['contribution']['revision'])
+        self.assertEqual('contrib/paginate', brief['review']['contribution']['branch'])
+        self.assertEqual({'resolved'}, {r['status'] for r in brief['review']['requests']})
+        self.assertEqual(0, brief['review']['open_requests'])
+
+        # A reviewer holding the first revision is refused, not silently applied.
+        stale = self.review(self.olive, 'approve', contribution=contribution['id'])
+        self.assertEqual(409, stale.status, stale.data)
+        fresh = self.review(self.olive, 'approve',
+                            contribution=brief['review']['contribution']['id'])
+        self.assertEqual(201, fresh.status, fresh.data)
+
+    def test_checkpoint_appears_in_the_brief(self):
+        self.claim(self.carl)
+        added = self.request('POST', self.path('/tasks/%s/checkpoints' % self.task),
+                             {'previous': None, 'summary': 'Half done',
+                              'open_items': [{'text': 'Decide page size'}]}, token=self.carl)
+        self.assertEqual(201, added.status, added.data)
+        brief = self.request('GET', self.path('/tasks/%s/brief' % self.task), token=self.vera).data
+        self.assertEqual('Half done', brief['checkpoint']['summary'])
+        self.assertEqual('carl', brief['checkpoint']['author_name'])
+        self.assertEqual(['Decide page size'],
+                         [item['text'] for item in brief['checkpoint']['open_items']])
+
+    def test_not_found_is_uniform(self):
+        self.assert_uniform_not_found('/tasks/%s/brief' % self.task)
+        missing = self.request('GET', self.path('/tasks/task_missing/brief'), token=self.olive)
+        self.assertEqual(404, missing.status)
+        other_task = self.create_task(self.otto, self.other, 'hidden').data['id']
+        crossed = self.request('GET', self.path('/tasks/%s/brief' % other_task), token=self.olive)
+        self.assertEqual(404, crossed.status)
+        self.assertEqual(without_request_id(missing.data), without_request_id(crossed.data))
+
+    def test_viewer_reads_but_cannot_review(self):
+        self.claim(self.carl)
+        self.contribute(self.carl)
+        self.assertEqual(200, self.request('GET', self.path('/tasks/%s/brief' % self.task),
+                                           token=self.vera).status)
+        self.assertEqual(403, self.review(self.vera, 'request-changes', items=['x']).status)
+        self.assertEqual(403, self.review(self.carl, 'approve').status)
+
+
+class QueueRouteCase(TeamHarness):
+    def setUp(self):
+        super().setUp()
+        self.second = self.create_task(self.olive, self.project, 'Second').data['id']
+        self.third = self.create_task(self.olive, self.project, 'Third').data['id']
+        self.claim(self.carl)
+        self.claim(self.carl, self.second)
+        self.contribute(self.carl)
+        self.contribute(self.carl, task=self.second)
+        self.review(self.olive, 'request-changes', task=self.second, items=['Rename it'])
+
+    def test_queue_lists_work_in_flight_by_attention(self):
+        response = self.request('GET', self.path('/queue'), token=self.vera)
+        self.assertEqual(200, response.status, response.data)
+        states = [(item['id'], item['review_state']) for item in response.data['items']]
+        self.assertEqual([(self.second, 'changes-requested'), (self.task, 'awaiting-review')],
+                         states)
+        first = response.data['items'][0]
+        self.assertEqual(1, first['open_requests'])
+        self.assertEqual(COMMIT, first['contribution']['commit'])
+        self.assertEqual('carl', first['assignee_name'])
+        self.assertTrue(response.data['complete'])
+
+    def test_state_filter_and_pagination(self):
+        only = self.request('GET', self.path('/queue?state=awaiting-review'), token=self.olive)
+        self.assertEqual([self.task], [item['id'] for item in only.data['items']])
+        self.assertEqual(422, self.request('GET', self.path('/queue?state=none'),
+                                           token=self.olive).status)
+        page = self.request('GET', self.path('/queue?limit=1'), token=self.olive).data
+        self.assertEqual(2, page['total'])
+        rest = self.request('GET', self.path('/queue?limit=1&cursor=' + page['next_cursor']),
+                            token=self.olive).data
+        self.assertEqual(self.task, rest['items'][0]['id'])
+
+    def test_non_member_and_missing_project_are_uniform_404(self):
+        self.assert_uniform_not_found('/queue')
+
+
+class MyWorkRouteCase(TeamHarness):
+    def test_assigned_and_review_attention(self):
+        self.claim(self.carl)
+        self.contribute(self.carl)
+        second = self.create_task(self.olive, self.project, 'Second').data['id']
+        self.claim(self.carl, second)
+        carl = self.request('GET', '/v1/me/work', token=self.carl)
+        self.assertEqual(200, carl.status, carl.data)
+        self.assertEqual({self.task, second}, {t['id'] for t in carl.data['assigned']})
+        self.assertEqual([], carl.data['to_review'])
+        self.assertEqual('Alpha', carl.data['assigned'][0]['project_name'])
+        olive = self.request('GET', '/v1/me/work', token=self.olive).data
+        self.assertEqual([self.task], [t['id'] for t in olive['to_review']])
+        self.assertEqual([], olive['assigned'])
+        self.assertFalse(olive['truncated'])
+        vera = self.request('GET', '/v1/me/work', token=self.vera).data
+        self.assertEqual(([], []), (vera['assigned'], vera['to_review']))
+
+    def test_other_projects_do_not_leak(self):
+        other_task = self.create_task(self.otto, self.other, 'hidden').data['id']
+        claimed = self.request('POST', self.path('/tasks/%s/claim' % other_task,
+                                                 project=self.other), {}, token=self.otto)
+        self.assertEqual(200, claimed.status)
+        self.request('POST', self.path('/tasks/%s/reviews' % other_task, project=self.other),
+                     {'operation': 'contribute', 'commit': COMMIT, 'base_commit': BASE,
+                      'bundle_sha256': BUNDLE, 'summary': 'x'}, token=self.otto)
+        for token in (self.olive, self.carl, self.admin):
+            body = self.request('GET', '/v1/me/work', token=token).body
+            self.assertNotIn(other_task.encode(), body)
+            self.assertNotIn(b'Elsewhere', body)
+
+    def test_membership_removal_drops_the_project(self):
+        self.claim(self.carl)
+        self.assertTrue(self.request('GET', '/v1/me/work', token=self.carl).data['assigned'])
+        self.request('DELETE', self.path('/members/%s' % self.ids['carl']), token=self.olive)
+        self.assertEqual([], self.request('GET', '/v1/me/work', token=self.carl).data['assigned'])
+
+    def test_credentials_and_anonymous_are_refused(self):
+        secret = self.request('POST', self.path('/worker-credentials'), {'label': 'w'},
+                              token=self.olive).data['credential']['secret']
+        self.assertEqual(403, self.request('GET', '/v1/me/work', token=secret).status)
+        self.assertEqual(401, self.request('GET', '/v1/me/work').status)
+
+
+class AccountLookupCase(TeamHarness):
+    def lookup(self, token, username, project=None):
+        return self.request('GET', '/v1/accounts/lookup?username=%s&project=%s'
+                            % (username, project or self.project), token=token)
+
+    def test_owner_finds_an_exact_active_username(self):
+        found = self.lookup(self.olive, 'otto')
+        self.assertEqual(200, found.status, found.data)
+        self.assertEqual({'id': self.ids['otto'], 'username': 'otto', 'display_name': 'otto'},
+                         found.data)
+        self.assertEqual(self.ids['otto'], self.lookup(self.olive, 'OTTO').data['id'])
+        self.assertEqual(200, self.lookup(self.admin, 'otto').status)
+
+    def test_missing_partial_and_disabled_are_the_same_404(self):
+        self.request('POST', '/v1/accounts/%s/disable' % self.ids['vera'], token=self.admin)
+        missing = self.lookup(self.olive, 'nobody')
+        partial = self.lookup(self.olive, 'ott')
+        disabled = self.lookup(self.olive, 'vera')
+        for response in (missing, partial, disabled):
+            self.assertEqual(404, response.status, response.data)
+        self.assertEqual(without_request_id(missing.data), without_request_id(partial.data))
+        self.assertEqual(without_request_id(missing.data), without_request_id(disabled.data))
+
+    def test_only_project_administrators_may_look_up(self):
+        self.assertEqual(403, self.lookup(self.carl, 'otto').status)
+        self.assertEqual(403, self.lookup(self.vera, 'otto').status)
+        self.assertEqual(404, self.lookup(self.otto, 'olive').status)  # not otto's project
+        self.assertEqual(404, self.lookup(self.olive, 'otto', project='proj_missing0000').status)
+        secret = self.request('POST', self.path('/worker-credentials'), {'label': 'w'},
+                              token=self.olive).data['credential']['secret']
+        self.assertEqual(403, self.lookup(secret, 'otto').status)
+        self.assertEqual(401, self.request('GET', '/v1/accounts/lookup?username=otto&project=%s'
+                                           % self.project).status)
+
+    def test_malformed_requests(self):
+        self.assertEqual(422, self.request('GET', '/v1/accounts/lookup?username=otto',
+                                           token=self.olive).status)
+        self.assertEqual(422, self.lookup(self.olive, 'a%20b').status)
+
+
+class SessionAndTaskListCase(TeamHarness):
+    def test_current_session_returns_username_and_csrf_to_the_cookie_only(self):
+        login = self.request('POST', '/v1/sessions',
+                             {'username': 'carl', 'password': 'carl-password-1'})
+        cookie = login.set_cookies()[0].split(';')[0]
+        csrf = login.data['session']['csrf_token']
+        current = self.request('GET', '/v1/sessions/current', cookie=cookie).data
+        self.assertEqual('carl', current['user']['username'])
+        self.assertEqual(csrf, current['csrf_token'])
+        bearer = self.request('GET', '/v1/sessions/current', token=self.carl).data
+        self.assertNotIn('csrf_token', bearer)
+        # The returned token is the one the cookie session accepts.
+        created = self.request('POST', self.path('/tasks'), {'title': 'from the page'},
+                               cookie=cookie, csrf=current['csrf_token'])
+        self.assertEqual(201, created.status, created.data)
+
+    def test_task_list_filters_and_presentation_fields(self):
+        second = self.create_task(self.olive, self.project, 'Close me').data['id']
+        version = self.request('GET', self.path('/tasks/%s' % second), token=self.olive).data
+        self.request('PATCH', self.path('/tasks/%s' % second),
+                     {'status': 'closed', 'version': version['version']}, token=self.olive)
+        self.claim(self.carl)
+        active = self.request('GET', self.path('/tasks?status=active'), token=self.vera).data
+        self.assertEqual([self.task], [t['id'] for t in active['items']])
+        self.assertEqual('carl', active['items'][0]['assignee_name'])
+        self.assertEqual('assignee', active['items'][0]['next_action']['who'])
+        closed = self.request('GET', self.path('/tasks?status=closed'), token=self.vera).data
+        self.assertEqual([second], [t['id'] for t in closed['items']])
+        self.assertIsNone(closed['items'][0]['next_action'])
+        text = self.request('GET', self.path('/tasks?q=PAGINATE'), token=self.vera).data
+        self.assertEqual([self.task], [t['id'] for t in text['items']])
+        mine = self.request('GET', self.path('/tasks?assignee=%s' % self.ids['carl']),
+                            token=self.vera).data
+        self.assertEqual(1, mine['total'])
+        self.assertEqual(422, self.request('GET', self.path('/tasks?status=bogus'),
+                                           token=self.vera).status)
+        everything = self.request('GET', self.path('/tasks'), token=self.vera).data
+        self.assertEqual(2, everything['total'])
+
+
+class CanonicalBindingReadCase(EndpointCase):
+    """The same reads over ``EndpointBackend`` and the strict canonical stub."""
+
+    def test_brief_and_queue_follow_the_canonical_review_chain(self):
+        alex, project = self.setup_project()
+        task = self.create_task(alex, project, 'canonical task').data['id']
+        self.assertEqual(200, self.request('POST', '/v1/projects/%s/tasks/%s/claim'
+                                           % (project, task), {}, token=alex).status)
+        brief = self.request('GET', '/v1/projects/%s/tasks/%s/brief' % (project, task),
+                             token=alex)
+        self.assertEqual(200, brief.status, brief.data)
+        self.assertEqual('none', brief.data['review']['state'])
+        self.assertIsNone(brief.data['review']['latest_id'])
+        self.assertEqual('canonical task', brief.data['task']['title'])
+        delivered = self.contribute(alex, project, task)
+        self.assertEqual(201, delivered.status, delivered.data)
+        brief = self.request('GET', '/v1/projects/%s/tasks/%s/brief' % (project, task),
+                             token=alex).data
+        review = brief['review']
+        self.assertEqual('awaiting-review', review['state'])
+        self.assertEqual(1, review['contribution']['revision'])
+        self.assertEqual(COMMIT, review['contribution']['commit'])
+        self.assertEqual(review['contribution']['id'], review['latest_id'])
+        self.assertEqual(set(brief['lifecycle']), {'implemented', 'tested', 'reviewed',
+                                                   'integrated', 'deployed', 'live-verified'})
+        queue = self.request('GET', '/v1/projects/%s/queue' % project, token=alex)
+        self.assertEqual(200, queue.status, queue.data)
+        self.assertEqual([(task, 'awaiting-review')],
+                         [(i['id'], i['review_state']) for i in queue.data['items']])
+        self.assertTrue(queue.data['complete'])
+        asked = self.request(
+            'POST', '/v1/projects/%s/tasks/%s/reviews' % (project, task),
+            {'operation': 'request-changes', 'schema_version': 1,
+             'contribution': review['contribution']['id'], 'previous': review['latest_id'],
+             'items': [{'id': 'item-1', 'text': 'Handle an empty page'}]}, token=alex,
+            key='web-review-0001')
+        self.assertEqual(201, asked.status, asked.data)
+        brief = self.request('GET', '/v1/projects/%s/tasks/%s/brief' % (project, task),
+                             token=alex).data
+        self.assertEqual('changes-requested', brief['review']['state'])
+        self.assertEqual(['Handle an empty page'],
+                         [r['text'] for r in brief['review']['requests']])
+        self.assertEqual(1, brief['review']['open_requests'])
+        mine = self.request('GET', '/v1/me/work', token=alex).data
+        self.assertEqual([task], [t['id'] for t in mine['assigned']])
+        self.assertEqual('changes-requested', mine['assigned'][0]['review_state'])
+
+    def test_brief_of_a_hidden_project_is_404_before_any_canonical_read(self):
+        alex, project = self.setup_project()
+        admin = self.admin_token()
+        self.create_account(admin, 'blair', 'blair-password-1')
+        blair = self.login('blair', 'blair-password-1')[0]
+        for suffix in ('/tasks/x-1/brief', '/queue', '/members'):
+            self.assertEqual(404, self.request('GET', '/v1/projects/%s%s' % (project, suffix),
+                                               token=blair).status)
+        self.assertFalse((self.canonical_root / 'canonical.json').exists() and
+                         self.canonical_rows())
 
 
 if __name__ == '__main__':

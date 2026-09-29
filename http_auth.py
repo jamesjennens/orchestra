@@ -1488,6 +1488,93 @@ class Service:
             self.store.save()
         return {'id': credential_id, 'revoked': True}
 
+    # -- web interface reads (kittrial-5bb.20) ----------------------------------
+    #
+    # Each read re-checks live authority itself (the route checks it too), so a
+    # caller that reaches these methods some other way still meets the boundary.
+    def list_members(self, principal, project_id):
+        """The project's members with their display identity and role.
+
+        Readable by anyone who may read the project (``CAP_READ``): the same
+        principals already see the member ids in :meth:`project_view`. Only public
+        account fields are returned; never a verifier, session or credential.
+        """
+        with self.store.lock:
+            self.check_authority(principal, project_id, CAP_READ)
+            members = self.state['memberships'].get(project_id, {})
+            items = []
+            for user_id, role in members.items():
+                user = self.state['users'].get(user_id) or {}
+                items.append({'user_id': user_id, 'username': user.get('username'),
+                              'display_name': user.get('display_name') or user_id,
+                              'role': role, 'disabled': bool(user.get('disabled')),
+                              'superuser': bool(user.get('superuser'))})
+        items.sort(key=lambda m: ((m['display_name'] or '').lower(), m['user_id']))
+        return items
+
+    def list_worker_credentials(self, principal, project_id):
+        """Metadata of the project's worker credentials: never a secret or its hash.
+
+        Project administration (owner/superuser) only, the same authority that may
+        issue them. Personal-agent credentials are governed on the agent routes and
+        are not listed here.
+        """
+        with self.store.lock:
+            self.check_authority(principal, project_id, CAP_PROJECT_ADMIN)
+            items = []
+            for credential in self.state['credentials'].values():
+                if not isinstance(credential, dict) or credential.get('agent_id') or \
+                        credential.get('project_id') != project_id:
+                    continue
+                view = self.credential_view(credential)
+                view['user_id'] = credential.get('user_id')
+                view['user_name'] = self._owner_name(credential.get('user_id'))
+                items.append(view)
+        items.sort(key=lambda c: (c['created_at'] or '', c['id']))
+        return items
+
+    def lookup_account(self, principal, project_id, username):
+        """Exact username lookup for adding a member to ``project_id``.
+
+        Only a principal that may administer that project's membership can ask, so
+        the lookup never discloses more than the membership form already can. The
+        match is exact (case-insensitive, as usernames are unique that way); a
+        missing, disabled or malformed-but-valid name all give the same 404.
+        """
+        if principal is None or principal.via == 'credential':
+            raise forbidden('Session authority required to look up accounts')
+        if not isinstance(username, str) or not re.fullmatch(
+                r'[A-Za-z0-9][A-Za-z0-9_.@-]{1,63}', username):
+            raise invalid('username must be 2-64 characters of letters, digits, . _ @ -')
+        with self.store.lock:
+            self.check_authority(principal, project_id, CAP_PROJECT_ADMIN)
+            user_id = self.state['usernames'].get(username.lower())
+            user = self.state['users'].get(user_id) if user_id else None
+            if not user or user.get('disabled'):
+                raise not_found('No active account with that username')
+            return {'id': user['id'], 'username': user['username'],
+                    'display_name': user['display_name']}
+
+    def actor_names(self, actors):
+        """Display names for task actors (account ids and agent ids), best effort.
+
+        Anything that is neither a known account nor a known agent keeps its label.
+        """
+        names = {}
+        for actor in actors:
+            if not isinstance(actor, str) or actor in names:
+                continue
+            user = self.state['users'].get(actor)
+            agent = self.state['agents'].get(actor)
+            if isinstance(user, dict):
+                names[actor] = user.get('display_name') or actor
+            elif isinstance(agent, dict):
+                names[actor] = '%s (agent of %s)' % (agent.get('name') or actor,
+                                                     self._owner_name(agent.get('owner')))
+            else:
+                names[actor] = actor
+        return names
+
     # -- personal agents -------------------------------------------------------
     #
     # An agent is a personal identity owned by exactly one user: "Kestrel, agent of

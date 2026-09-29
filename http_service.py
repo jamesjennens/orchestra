@@ -61,6 +61,13 @@ AGENT_MAX_PAGES = 200
 #: an agent's own changes-requested, blocked or awaiting-review task is always collected
 #: however many claimable tasks sit beside it.
 AGENT_CLAIMABLE_LIMIT = MAX_PAGE
+#: Bound on the projects one ``GET /v1/me/work`` read walks (the caller's own
+#: memberships, each read once). Reaching it reports ``truncated``.
+ME_WORK_MAX_PROJECTS = 50
+#: Task-list filters the browser sends. Filtering reads the project's one full
+#: snapshot and pages the filtered rows, so the cursor stays exact.
+TASK_STATUS_FILTERS = ('active', 'open', 'in_progress', 'blocked', 'closed')
+TASK_FILTER_TEXT_MAX = 200
 IDEMPOTENCY_HEADER = 'Idempotency-Key'
 ATTACHMENT_MEDIA_TYPES = ('text/plain', 'text/markdown')
 # One identifier pattern for every route parameter. Canonical Orchestra ids contain
@@ -355,9 +362,13 @@ class InProcessBackend:
 
     def _event(self, project_id, task_id, action, principal, actor=None):
         events = self.state.setdefault('events', [])
-        events.append({'time': now_iso(self.service._now()), 'project': project_id,
+        moment = now_iso(self.service._now())
+        events.append({'time': moment, 'project': project_id,
                        'task': task_id, 'action': action, 'user_id': principal.user_id,
                        'actor': actor or principal.actor})
+        task = self.state['tasks'].get(task_id) if task_id else None
+        if isinstance(task, dict):
+            task['updated_at'] = moment
         if len(events) > 5000:
             del events[:len(events) - 5000]
 
@@ -374,8 +385,12 @@ class InProcessBackend:
         description = payload.get('description') or ''
         if not isinstance(description, str) or len(description) > 20000:
             raise invalid('Task description is too long')
+        priority = payload.get('priority', 2)
+        if type(priority) is not int or not 0 <= priority <= 4:
+            raise invalid('Task priority must be an integer 0-4')
         task_id = 'task_' + secrets.token_hex(6)
         task = {'id': task_id, 'project_id': project_id, 'title': title.strip(),
+                'priority': priority,
                 'description': description, 'status': 'open', 'assignee': None,
                 'version': 1, 'created_by': principal.user_id,
                 'created_at': now_iso(self.service._now()),
@@ -459,13 +474,29 @@ class InProcessBackend:
                 raise invalid('commit must be a full 40-character lowercase SHA')
             if not isinstance(base_commit, str) or not re.fullmatch(r'[0-9a-f]{40}', base_commit):
                 raise invalid('base_commit must be a full 40-character lowercase SHA')
-            if not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest):
+            delivery = payload.get('delivery')
+            branch = None
+            if digest is None and isinstance(delivery, dict):
+                # The canonical review protocol's delivery object (review_workflow):
+                # a remote branch or a bundle with its digest.
+                if delivery.get('kind') == 'remote':
+                    branch = delivery.get('branch')
+                    if not isinstance(branch, str) or not branch.strip() or len(branch) > 300 or \
+                            not isinstance(delivery.get('remote'), str) or \
+                            not delivery['remote'].strip() or len(delivery['remote']) > 1000:
+                        raise invalid('A remote delivery needs a remote and a branch')
+                elif delivery.get('kind') == 'bundle':
+                    digest = delivery.get('sha256')
+                else:
+                    raise invalid('Delivery must be remote or bundle')
+            if branch is None and (not isinstance(digest, str) or
+                                   not re.fullmatch(r'[0-9a-f]{64}', digest)):
                 raise invalid('bundle_sha256 must be a 64-character lowercase hex digest')
             if not isinstance(summary, str) or not summary.strip() or len(summary) > 1200:
                 raise invalid('Contribution summary must be 1-1200 characters')
             record = {'id': 'con_' + secrets.token_hex(6), 'task_id': task['id'],
                       'kind': 'contribution', 'commit': commit, 'base_commit': base_commit,
-                      'bundle_sha256': digest, 'summary': summary.strip(),
+                      'bundle_sha256': digest, 'branch': branch, 'summary': summary.strip(),
                       'actor': payload.get('actor') or principal.actor,
                       'created_at': now_iso(self.service._now())}
             contributions.append(record)
@@ -473,11 +504,21 @@ class InProcessBackend:
             task['version'] += 1
             self._event(project_id, task['id'], 'contribution', principal, record['actor'])
             return {'contribution': record, 'task_version': task['version']}
-        if not contributions:
+        current = [r for r in contributions if r['kind'] == 'contribution']
+        if not current:
             raise conflict('There is no contribution to review')
+        # A review names the revision it judges (canonical ``contribution``); a stale
+        # reviewer who read an older revision is refused instead of judging new work.
+        named = payload.get('contribution')
+        if named is not None and named != current[-1]['id']:
+            raise conflict('A newer contribution arrived; reread the task before reviewing',
+                           {'current_contribution': current[-1]['id']})
+        items = self._review_items(payload.get('items')) if operation == 'request-changes' \
+            else []
         record = {'id': 'rev_' + secrets.token_hex(6), 'task_id': task['id'], 'kind': operation,
-                  'contribution_id': contributions[-1]['id'],
+                  'contribution_id': current[-1]['id'],
                   'summary': (payload.get('summary') or '')[:1200],
+                  'items': items,
                   'actor': payload.get('actor') or principal.actor,
                   'created_at': now_iso(self.service._now())}
         contributions.append(record)
@@ -485,6 +526,24 @@ class InProcessBackend:
         task['version'] += 1
         self._event(project_id, task['id'], operation, principal, record['actor'])
         return {'review': record, 'task_version': task['version']}
+
+    @staticmethod
+    def _review_items(raw):
+        """Normalize requested-change items: plain strings or canonical ``{id, text}``."""
+        if raw is None:
+            return []
+        if not isinstance(raw, list) or len(raw) > 20:
+            raise invalid('Review items must be a list of at most 20 entries')
+        items = []
+        for index, item in enumerate(raw):
+            if isinstance(item, str):
+                item = {'id': 'item-%d' % (index + 1), 'text': item}
+            if not isinstance(item, dict) or not isinstance(item.get('text'), str) or \
+                    not item['text'].strip() or len(item['text']) > 1000 or \
+                    not isinstance(item.get('id'), str) or not SAFE_ID.fullmatch(item['id']):
+                raise invalid('Each review item needs an id and 1-1000 characters of text')
+            items.append({'id': item['id'], 'text': item['text'].strip()})
+        return items
 
     def _feedback_add(self, principal, project_id, payload):
         text = payload.get('text')
@@ -531,6 +590,98 @@ class InProcessBackend:
     def list_feedback(self, project_id, limit, offset):
         items = self.state.get('feedback', {}).get(project_id, [])
         return {'items': items[offset:offset + limit], 'total': len(items)}
+
+    def _review_view(self, task):
+        """The task's review chain, projected like ``review_workflow.projection``.
+
+        A requested change is open until a later revision arrives (the disposable
+        backend has no separate ``respond`` record).
+        """
+        records = self.state.get('contributions', {}).get(task['id'], [])
+        contributions = [r for r in records if r['kind'] == 'contribution']
+        requests = []
+        for position, record in enumerate(records):
+            if record['kind'] != 'request-changes':
+                continue
+            later = [r for r in records[position + 1:] if r['kind'] == 'contribution']
+            items = record.get('items') or (
+                [{'id': 'item-1', 'text': record['summary']}] if record.get('summary') else [])
+            for item in items:
+                resolved = later[0] if later else None
+                requests.append({
+                    'id': item['id'], 'request': record['id'], 'text': item['text'],
+                    'contribution': record['contribution_id'], 'author': record['actor'],
+                    'at': record['created_at'], 'status': 'resolved' if resolved else 'open',
+                    'resolution': ('Addressed in revision %d' % (contributions.index(resolved) + 1))
+                    if resolved else None})
+        contribution = None
+        if contributions:
+            current = contributions[-1]
+            contribution = {'id': current['id'], 'revision': len(contributions),
+                            'commit': current['commit'], 'base_commit': current['base_commit'],
+                            'branch': current.get('branch'), 'summary': current['summary'],
+                            'author': current['actor'], 'at': current['created_at']}
+        return {'state': task.get('review_state') or 'none', 'contribution': contribution,
+                'requests': requests,
+                'open_requests': sum(1 for r in requests if r['status'] == 'open'),
+                'latest_id': records[-1]['id'] if records else None,
+                'revisions': len(contributions)}
+
+    def task_brief(self, project_id, task_id):
+        """Everything the task page shows, from one read of the in-process state."""
+        task = self._task(project_id, task_id)
+        checkpoints = self.state.get('checkpoints', {}).get(task_id) or []
+        checkpoint = None
+        if checkpoints:
+            last = checkpoints[-1]
+            checkpoint = {'id': last['id'], 'at': last['created_at'], 'author': last['actor'],
+                          'summary': last['summary'], 'next_action': last.get('next_action'),
+                          'open_items': [{'id': item.get('id'),
+                                          'kind': item.get('kind') or 'item',
+                                          'text': item.get('text')}
+                                         for item in last.get('open_items') or []]}
+        return {'task': dict(task), 'checkpoint': checkpoint, 'review': self._review_view(task),
+                # The disposable backend records no lifecycle evidence, so every fact is
+                # honestly unknown rather than inferred from the review state.
+                'lifecycle': {}, 'depends_on': []}
+
+    def review_queue(self, project_id):
+        """Every task with current work, highest-attention review states first.
+
+        Mirrors ``work.queue``: a closed task stays listed only while its review is
+        still active. The project is read once; the route pages the result.
+        """
+        items = []
+        for task in self.read_tasks(project_id)['items']:
+            review = self._review_view(task)
+            if task.get('status') == 'closed' and review['state'] not in ACTIVE_REVIEW_STATES:
+                continue
+            items.append(queue_item(project_id, task, review['state'],
+                                    review['contribution'], review['open_requests']))
+        items.sort(key=queue_order)
+        return {'items': items, 'complete': True}
+
+
+#: Review states that still need someone to act (``work.queue`` keeps these even on a
+#: closed task). ``approved`` is the in-process name for ``awaiting-integration``.
+ACTIVE_REVIEW_STATES = ('changes-requested', 'error', 'awaiting-review', 'legacy-review-ready',
+                        'awaiting-integration', 'approved')
+QUEUE_PRIORITY = {'changes-requested': 0, 'error': 1, 'awaiting-review': 2,
+                  'legacy-review-ready': 2, 'awaiting-integration': 3, 'approved': 3}
+
+
+def queue_order(item):
+    return (QUEUE_PRIORITY.get(item['review_state'], 4), str(item['id']))
+
+
+def queue_item(project_id, task, review_state, contribution, open_requests):
+    """One review-queue row, in the shape both backends return."""
+    return {'id': task.get('id'), 'project_id': project_id, 'title': task.get('title'),
+            'status': task.get('status'), 'assignee': task.get('assignee'),
+            'priority': task.get('priority'), 'created_at': task.get('created_at'),
+            'updated_at': task.get('updated_at'),
+            'review_state': review_state or 'none', 'contribution': contribution,
+            'open_requests': open_requests}
 
 
 class EndpointBackend:
@@ -895,6 +1046,109 @@ class EndpointBackend:
         raise not_implemented('Canonical backend has no feedback read yet: %s'
                               % self.READ_UNRESOLVED['list_feedback'])
 
+    #: Unresolved checkpoint items and pending review requests shown per brief. The
+    #: canonical ``brief`` bounds these itself (``--items-limit`` 1..10, five pending
+    #: requests with a count); the page links to ``history`` for the rest.
+    BRIEF_ITEMS = 10
+
+    def task_brief(self, project_id, task_id):
+        """Map the canonical ``brief --json`` read onto the task page's shape.
+
+        Two canonical reads: ``bd show`` for the editable task row (title,
+        description, version) and ``brief`` for checkpoint, review projection,
+        lifecycle facts and dependencies. Nothing is inferred beyond what they say.
+        """
+        task = self.get_task(project_id, task_id)
+        data = self._run('brief', project_id, self.actor_namespace + '/read',
+                         [str(task_id), '--json', '--items-limit', str(self.BRIEF_ITEMS)])
+        if not isinstance(data, dict):
+            raise uncertain('Canonical brief returned an unexpected shape')
+        checkpoint = None
+        if data.get('checkpoint'):
+            point = data['checkpoint']
+            unresolved = data.get('unresolved') or {}
+            checkpoint = {'id': point.get('comment_id'), 'at': point.get('timestamp'),
+                          'author': point.get('author'), 'summary': data.get('current_position'),
+                          'next_action': data.get('next_action'),
+                          'branch': point.get('branch'), 'source_commit': point.get('source_commit'),
+                          'newer_activity': point.get('newer_activity'),
+                          'open_items': [{'id': item.get('id'), 'kind': item.get('kind'),
+                                          'text': item.get('text')}
+                                         for item in unresolved.get('items') or []
+                                         if isinstance(item, dict)],
+                          'open_items_total': unresolved.get('total')}
+        review = data.get('review') or {}
+        current = review.get('contribution')
+        priors = review.get('prior_contributions_total') or 0
+        contribution = None
+        if isinstance(current, dict):
+            delivery = current.get('delivery') or {}
+            contribution = {'id': current.get('comment_id'), 'revision': priors + 1,
+                            'commit': current.get('commit'),
+                            'base_commit': current.get('base_commit'),
+                            'branch': delivery.get('branch') if isinstance(delivery, dict) else None,
+                            'repository': current.get('repository'),
+                            'summary': current.get('summary'), 'author': current.get('author'),
+                            'at': current.get('timestamp')}
+        requests = [{'id': item.get('item'), 'request': item.get('request'),
+                     'text': item.get('text'), 'contribution': item.get('contribution'),
+                     'author': item.get('author'), 'at': item.get('timestamp'),
+                     'status': 'open', 'resolution': None}
+                    for item in review.get('pending_requests') or [] if isinstance(item, dict)]
+        lifecycle = {dimension: {'value': fact.get('value'), 'note': None}
+                     for dimension, fact in (data.get('lifecycle') or {}).items()
+                     if isinstance(fact, dict)}
+        dependencies = (data.get('dependencies') or {}).get('items') or []
+        return {'task': task, 'checkpoint': checkpoint,
+                'review': {'state': review.get('review_state') or 'none',
+                           'contribution': contribution, 'requests': requests,
+                           'open_requests': review.get('pending_total', len(requests)),
+                           'latest_id': review.get('latest_comment_id'),
+                           'revisions': priors + 1 if contribution else 0,
+                           'warnings': review.get('warnings') or []},
+                'lifecycle': lifecycle,
+                'depends_on': [{'id': d.get('depends_on_id'), 'title': d.get('depends_on_id'),
+                                'status': 'unknown', 'type': d.get('type')}
+                               for d in dependencies if isinstance(d, dict)],
+                'warnings': data.get('warnings') or []}
+
+    #: Bound on the canonical ``work`` pages one queue read walks (``work`` allows at
+    #: most 100 rows per call and re-exports the project each call). Reaching it
+    #: reports ``complete: false`` rather than reading on.
+    QUEUE_MAX_PAGES = 10
+
+    def review_queue(self, project_id):
+        """The canonical ``work`` queue (review projection per task), fully paged.
+
+        ``work`` already applies the kit's own rules: structured review wins over
+        legacy labels, a closed task stays listed only while its review is active,
+        and rows come highest-attention first.
+        """
+        items = []
+        offset = 0
+        complete = False
+        for _ in range(self.QUEUE_MAX_PAGES):
+            page = self._run('work', project_id, self.actor_namespace + '/read',
+                             ['--limit', str(MAX_PAGE), '--offset', str(offset), '--json'])
+            if not isinstance(page, dict):
+                raise uncertain('Canonical work queue returned an unexpected shape')
+            for row in page.get('items') or []:
+                if not isinstance(row, dict):
+                    continue
+                contribution = ({'id': row.get('contribution_id'), 'commit': row.get('commit'),
+                                 'revision': None, 'at': None}
+                                if row.get('contribution_id') else None)
+                task = {'id': row.get('task'), 'title': row.get('title'),
+                        'status': row.get('status'), 'assignee': row.get('owner')}
+                items.append(queue_item(project_id, task, row.get('review_state'),
+                                        contribution, row.get('pending_review_items') or 0))
+            offset = page.get('next_offset')
+            if offset is None:
+                complete = True
+                break
+        items.sort(key=queue_order)
+        return {'items': items, 'complete': complete}
+
 
 def _canonical_payload(stdout):
     """Parse the JSON body a canonical command returned, tolerating NDJSON."""
@@ -912,6 +1166,45 @@ def _canonical_payload(stdout):
                 except ValueError:
                     continue
     raise uncertain('Canonical command returned unparsable data; outcome may be unknown')
+
+
+def next_action(task):
+    """Who acts next on a task, derived only from its status, assignee and review state."""
+    state = task.get('review_state')
+    if task.get('status') == 'closed' and state not in ACTIVE_REVIEW_STATES:
+        return None
+    if state in ('awaiting-review', 'legacy-review-ready'):
+        return {'who': 'owner', 'text': 'Review the delivered contribution'}
+    if state == 'changes-requested':
+        return {'who': 'assignee', 'text': 'Address the requested changes'}
+    if state in ('approved', 'awaiting-integration'):
+        return {'who': 'owner', 'text': 'Integrate the approved contribution'}
+    if state == 'error':
+        return {'who': 'owner', 'text': 'Needs operator attention'}
+    if task.get('assignee'):
+        return {'who': 'assignee', 'text': 'Deliver a contribution'}
+    return {'who': 'anyone', 'text': 'Claim this task'}
+
+
+def task_matches(task, filters):
+    """Apply the browser's task-list filters to one canonical row."""
+    status = filters.get('status')
+    if status == 'active' and task.get('status') == 'closed':
+        return False
+    if status and status != 'active' and task.get('status') != status:
+        return False
+    review = filters.get('review_state')
+    if review and (task.get('review_state') or 'none') != review:
+        return False
+    assignee = filters.get('assignee')
+    if assignee and task.get('assignee') != assignee:
+        return False
+    text = filters.get('q')
+    if text:
+        haystack = ' '.join(str(task.get(key) or '') for key in ('id', 'title', 'description'))
+        if text.lower() not in haystack.lower():
+            return False
+    return True
 
 
 # ------------------------------------------------------------------ HTTP adapter
@@ -1286,6 +1579,28 @@ class ApiHandler(BaseHTTPRequestHandler):
         payload['task_id'] = ctx.params['tid']
         return payload
 
+    def _paged(self, ctx, items, limit, state, **extra):
+        """One bounded page of an in-memory list, with a cursor bound to this query."""
+        offset = state['o']
+        body = {'items': items[offset:offset + limit], 'total': len(items)}
+        body['next_cursor'] = (make_cursor(ctx.principal, ctx.params.get('pid'), ctx.query,
+                                           offset + limit)
+                               if offset + limit < len(items) else None)
+        body.update(extra)
+        return body
+
+    def _task_view(self, task, names):
+        """A task row plus presentation fields (assignee name, next action). Additive."""
+        view = dict(task)
+        assignee = view.get('assignee')
+        view['assignee_name'] = names.get(assignee, assignee) if assignee else None
+        view['next_action'] = next_action(view)
+        return view
+
+    def _task_views(self, tasks):
+        names = self.service.actor_names([t.get('assignee') for t in tasks])
+        return [self._task_view(t, names) for t in tasks]
+
     # -- session and account routes -------------------------------------------
     @route('POST', r'/v1/sessions', anonymous=True, csrf=False)
     def sessions_create(self, ctx):
@@ -1303,11 +1618,19 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('GET', r'/v1/sessions/current')
     def sessions_whoami(self, ctx):
         principal = ctx.principal
-        return 200, {'user': {'id': principal.user_id, 'display_name': principal.display_name,
-                              'superuser': principal.superuser},
-                     'via': principal.via,
-                     'credential': principal.credential_id,
-                     'project': principal.credential_project}
+        user = self.service.state['users'].get(principal.user_id) or {}
+        body = {'user': {'id': principal.user_id, 'username': user.get('username'),
+                         'display_name': principal.display_name,
+                         'superuser': principal.superuser},
+                'via': principal.via,
+                'credential': principal.credential_id,
+                'project': principal.credential_project}
+        # A browser keeps its CSRF token in memory only, so a reload re-reads it here.
+        # It is returned only to the cookie session it belongs to; a cross-origin page
+        # cannot read this same-origin response.
+        if ctx.auth_source == 'cookie' and principal.csrf:
+            body['csrf_token'] = principal.csrf
+        return 200, body
 
     @route('DELETE', r'/v1/sessions/current')
     def sessions_delete(self, ctx):
@@ -1330,6 +1653,15 @@ class ApiHandler(BaseHTTPRequestHandler):
     def accounts_list(self, ctx):
         self.require(ctx, CAP_ACCOUNTS_ADMIN)
         return 200, {'items': self.service.list_users(ctx.principal)}
+
+    @route('GET', r'/v1/accounts/lookup')
+    def accounts_lookup(self, ctx):
+        """Exact username -> account, for a project administrator adding a member."""
+        project = ctx.query.get('project')
+        if not isinstance(project, str) or not SAFE_ID.fullmatch(project):
+            raise invalid('project is required: the project the member is being added to')
+        return 200, self.service.lookup_account(ctx.principal, project,
+                                                ctx.query.get('username'))
 
     @route('POST', r'/v1/accounts/(?P<uid>' + ID + r')/password')
     def account_password(self, ctx):
@@ -1439,6 +1771,20 @@ class ApiHandler(BaseHTTPRequestHandler):
         return self._mutate(ctx, 'members.remove', ctx.params['pid'], remove,
                             capability=CAP_PROJECT_ADMIN)
 
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/members')
+    def members_list(self, ctx):
+        self._project(ctx, CAP_READ)
+        limit, state = self._page(ctx, ctx.query)
+        items = self.service.list_members(ctx.principal, ctx.params['pid'])
+        return 200, self._paged(ctx, items, limit, state)
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/worker-credentials')
+    def credentials_list(self, ctx):
+        self._project(ctx, CAP_PROJECT_ADMIN)
+        limit, state = self._page(ctx, ctx.query)
+        items = self.service.list_worker_credentials(ctx.principal, ctx.params['pid'])
+        return 200, self._paged(ctx, items, limit, state)
+
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/worker-credentials')
     def credential_issue(self, ctx):
         payload = ctx.payload or {}
@@ -1512,14 +1858,18 @@ class ApiHandler(BaseHTTPRequestHandler):
         return self._mutate(ctx, 'agents.create', None, create, status=201,
                             capability=CAP_AGENTS, replay_status=200)
 
+    def _agent_items(self, principal):
+        items = []
+        for agent in self.service.list_agents(principal):
+            attention = self._agent_attention(principal, agent)
+            items.append(dict(agent, attention=self._agent_attention_view(agent, attention),
+                              resume_prompt=self._agent_resume_prompt(agent, attention)))
+        return items
+
     @route('GET', r'/v1/agents')
     def agents_list(self, ctx):
         self.require(ctx, CAP_AGENTS)
-        items = []
-        for agent in self.service.list_agents(ctx.principal):
-            attention = self._agent_attention(ctx.principal, agent)
-            items.append(dict(agent, attention=self._agent_attention_view(agent, attention),
-                              resume_prompt=self._agent_resume_prompt(agent, attention)))
+        items = self._agent_items(ctx.principal)
         return 200, {'items': items, 'total': len(items),
                      'generated_at': now_iso(self.service._now())}
 
@@ -1838,16 +2188,72 @@ class ApiHandler(BaseHTTPRequestHandler):
     def tasks_list(self, ctx):
         self._project(ctx, CAP_READ)
         limit, state = self._page(ctx, ctx.query)
-        result = self.backend.list_tasks(ctx.params['pid'], limit, state['o'])
+        filters = self._task_filters(ctx.query)
+        if filters:
+            rows = [t for t in self.backend.read_tasks(ctx.params['pid']).get('items') or []
+                    if isinstance(t, dict) and task_matches(t, filters)]
+            result = {'items': rows[state['o']:state['o'] + limit], 'total': len(rows)}
+        else:
+            result = self.backend.list_tasks(ctx.params['pid'], limit, state['o'])
+        result['items'] = self._task_views(result['items'])
         result['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query,
                                              state['o'] + limit)
                                  if state['o'] + limit < result['total'] else None)
         return 200, result
 
+    @staticmethod
+    def _task_filters(query):
+        filters = {key: query[key] for key in ('status', 'review_state', 'assignee', 'q')
+                   if query.get(key)}
+        if 'status' in filters and filters['status'] not in TASK_STATUS_FILTERS:
+            raise invalid('status must be one of %s' % ', '.join(TASK_STATUS_FILTERS))
+        if 'review_state' in filters and not re.fullmatch(r'[a-z][a-z-]{0,39}',
+                                                          filters['review_state']):
+            raise invalid('review_state is not a review state')
+        if 'assignee' in filters and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}',
+                                                      filters['assignee']):
+            raise invalid('assignee is not an actor label')
+        if len(filters.get('q', '')) > TASK_FILTER_TEXT_MAX:
+            raise invalid('q must be at most %d characters' % TASK_FILTER_TEXT_MAX)
+        return filters
+
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')')
     def tasks_get(self, ctx):
         self._project(ctx, CAP_READ)
-        return 200, self.backend.get_task(ctx.params['pid'], ctx.params['tid'])
+        return 200, self._task_views([self.backend.get_task(ctx.params['pid'],
+                                                             ctx.params['tid'])])[0]
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/brief')
+    def tasks_brief(self, ctx):
+        """The task page in one read: row, current checkpoint, review chain, facts.
+
+        Readable by any project member (``CAP_READ``), exactly like the task and its
+        history. Reading never acknowledges anything.
+        """
+        self._project(ctx, CAP_READ)
+        pid, tid = ctx.params['pid'], ctx.params['tid']
+        brief = self.backend.task_brief(pid, tid)
+        review = brief['review']
+        checkpoint = brief.get('checkpoint')
+        contribution = review.get('contribution')
+        actors = [brief['task'].get('assignee')]
+        actors += [checkpoint.get('author')] if checkpoint else []
+        actors += [contribution.get('author')] if contribution else []
+        actors += [r.get('author') for r in review.get('requests') or []]
+        names = self.service.actor_names(actors)
+        task = dict(brief['task'], review_state=review.get('state') or 'none')
+        brief['task'] = self._task_view(task, names)
+        if checkpoint:
+            checkpoint['author_name'] = names.get(checkpoint.get('author'))
+        if contribution:
+            contribution['author_name'] = names.get(contribution.get('author'))
+        for request in review.get('requests') or []:
+            request['author_name'] = names.get(request.get('author'))
+        base = '/v1/projects/%s/tasks/%s' % (pid, tid)
+        brief['links'] = {'task': base, 'history': base + '/history',
+                          'reviews': base + '/reviews', 'checkpoints': base + '/checkpoints'}
+        brief['generated_at'] = now_iso(self.service._now())
+        return 200, brief
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/claim')
     def tasks_claim(self, ctx):
@@ -1919,6 +2325,76 @@ class ApiHandler(BaseHTTPRequestHandler):
             if continuation else None)
         return 200, body
 
+    # -- review queue and personal work ---------------------------------------
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/queue')
+    def project_queue(self, ctx):
+        """Contributions in flight, grouped by who acts next (the Reviews page).
+
+        Readable by any project member (``CAP_READ``): every row is already visible
+        in the task list; the queue only orders and projects it. ``state`` narrows to
+        one review state.
+        """
+        self._project(ctx, CAP_READ)
+        limit, state = self._page(ctx, ctx.query)
+        wanted = ctx.query.get('state')
+        if wanted is not None and wanted not in ACTIVE_REVIEW_STATES:
+            raise invalid('state must be one of %s' % ', '.join(ACTIVE_REVIEW_STATES))
+        read = self.backend.review_queue(ctx.params['pid'])
+        items = [item for item in read['items']
+                 if (item['review_state'] == wanted if wanted else
+                     item['review_state'] in ACTIVE_REVIEW_STATES)]
+        body = self._paged(ctx, items, limit, state, complete=bool(read.get('complete')),
+                           generated_at=now_iso(self.service._now()))
+        body['items'] = self._task_views(body['items'])
+        return 200, body
+
+    @route('GET', r'/v1/me/work')
+    def me_work(self, ctx):
+        """The signed-in person's own work and review attention across their projects.
+
+        Session only (an agent reads ``/v1/agents/me/next``). Walks the caller's own
+        memberships, re-authorizing each project with the live ``CAP_READ`` check,
+        one queue read per project and at most :data:`ME_WORK_MAX_PROJECTS` projects.
+        ``to_review`` lists contributions only in projects where the caller holds the
+        approval capability. Computed at read time; nothing is scheduled or marked.
+        """
+        principal = ctx.principal
+        if principal.via == 'credential':
+            raise forbidden('Session authority required; an agent reads /v1/agents/me/next')
+        actor = principal.actor or principal.user_id
+        projects = [p for p in self.service.list_projects(principal)
+                    if not p.get('archived') and principal.user_id in (p.get('members') or [])]
+        truncated = len(projects) > ME_WORK_MAX_PROJECTS
+        assigned, to_review, unavailable = [], [], []
+        for project in projects[:ME_WORK_MAX_PROJECTS]:
+            capabilities = self.service.capabilities_for(principal, project['id'])
+            if CAP_READ not in capabilities:
+                continue
+            try:
+                read = self.backend.review_queue(project['id'])
+            except HttpError as error:
+                unavailable.append({'project': project['id'], 'reason': error.code})
+                continue
+            truncated = truncated or not read.get('complete')
+            for item in read['items']:
+                row = dict(item, project_name=project['name'])
+                if item.get('assignee') == actor and item.get('status') != 'closed':
+                    assigned.append(row)
+                if CAP_APPROVE in capabilities and item['review_state'] in (
+                        'awaiting-review', 'legacy-review-ready', 'awaiting-integration',
+                        'approved'):
+                    to_review.append(row)
+        if len(assigned) > MAX_PAGE or len(to_review) > MAX_PAGE:
+            truncated = True
+        try:
+            agents = self._agent_items(principal)
+        except HttpError:
+            agents = []
+        return 200, {'assigned': self._task_views(assigned[:MAX_PAGE]),
+                     'to_review': self._task_views(to_review[:MAX_PAGE]),
+                     'agents': agents, 'truncated': truncated, 'unavailable': unavailable,
+                     'generated_at': now_iso(self.service._now())}
+
     # -- feedback and audit ----------------------------------------------------
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/feedback')
     def feedback_add(self, ctx):
@@ -1941,6 +2417,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._project(ctx, CAP_READ)
         limit, state = self._page(ctx, ctx.query)
         result = self.backend.list_feedback(ctx.params['pid'], limit, state['o'])
+        names = self.service.actor_names([f.get('user_id') for f in result['items']])
+        result['items'] = [dict(f, author_name=names.get(f.get('user_id'), f.get('actor')),
+                                at=f.get('created_at')) for f in result['items']]
         result['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query,
                                              state['o'] + limit)
                                  if state['o'] + limit < result['total'] else None)
@@ -1951,7 +2430,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._project(ctx, CAP_PROJECT_ADMIN)
         limit, state = self._page(ctx, ctx.query)
         events = [e for e in self.service.state['audit'] if e.get('project_id') == ctx.params['pid']]
-        body = {'items': events[state['o']:state['o'] + limit], 'total': len(events)}
+        page = events[state['o']:state['o'] + limit]
+        names = self.service.actor_names([e.get('user_id') for e in page])
+        body = {'items': [dict(e, user_name=names.get(e.get('user_id')), detail=e.get('reason'))
+                          for e in page], 'total': len(events)}
         body['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query,
                                            state['o'] + limit)
                                if state['o'] + limit < len(events) else None)
