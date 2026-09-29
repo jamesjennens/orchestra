@@ -1,21 +1,27 @@
 """Timeout-safe native sync, the durable last-complete pair and the reference copy.
 
-kittrial-5bb.39 rev3. ``bd backup sync`` carries a fixed client read timeout of about
+kittrial-5bb.39 rev3/rev4. ``bd backup sync`` carries a fixed client read timeout of about
 ten seconds, which a large database cannot meet on a stalled server, and a failed run
 used to leave only a ``pending`` sidecar behind. These tests cover the Dolt SQL-client
-sync path, the last-complete copy that a failed or interrupted run cannot degrade, the
-operation-journal snapshot that must stay in the same generation as that pair, and the
-gated reference off-machine copy helper (which stages, locks and replaces a destination
-instead of merging into it).
+sync path, the own-session process group that lets an interrupted run stop the client,
+the native-backup manifest a restore checks before pairing a previous generation, the
+last-complete copy a failed or interrupted run cannot degrade, the operation-journal
+snapshot that must stay in the same generation as that pair, and the gated reference
+off-machine copy helper (which stages, locks and replaces a destination instead of
+merging into it).
 """
 import contextlib
 import io
 import json
+import os
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -111,21 +117,42 @@ class NativeSyncCase(RuntimeCase):
         make_project(self.root, 'alpha')
         seen = {}
 
-        def fake_checked(command, **kwargs):
+        class FakeProcess:
+            pid = 4242
+            returncode = 0
+            stdout = None
+            stderr = None
+
+            def communicate(self, timeout=None):
+                seen['timeout'] = timeout
+                return 'Backup synced\n', ''
+
+            def wait(self, timeout=None):
+                return 0
+
+        def fake_popen(command, **kwargs):
             seen['command'] = [str(item) for item in command]
             seen['kwargs'] = kwargs
-            return subprocess.CompletedProcess(command, 0, stdout='Backup synced\n', stderr='')
+            return FakeProcess()
 
-        with patch.object(admin, 'checked', side_effect=fake_checked):
-            output = admin.native_backup_sync(self.root, 'alpha')
+        handle = admin.SyncClientHandle()
+        with patch.object(admin.subprocess, 'Popen', side_effect=fake_popen):
+            output = admin.native_backup_sync(self.root, 'alpha', client=handle)
         self.assertEqual(output, 'Backup synced\n')
         self.assertIn("CALL DOLT_BACKUP('sync', 'default')", seen['command'])
         self.assertIn('--use-db', seen['command'])
         self.assertIn('alpha', seen['command'])
-        self.assertEqual(seen['kwargs']['timeout'], admin.BACKUP_SYNC_TIMEOUT)
+        # The ceiling is the checked()-style communicate() timeout, not a Popen kwarg.
+        self.assertEqual(seen['timeout'], admin.BACKUP_SYNC_TIMEOUT)
+        self.assertNotIn('timeout', seen['kwargs'])
         # The credential is supplied through the environment, never the command line.
         self.assertNotIn('test-only-password', ' '.join(seen['command']))
         self.assertEqual(seen['kwargs']['env']['DOLT_CLI_PASSWORD'], 'test-only-password')
+        # The client owns its own session and its pid is recorded for the caller, which is
+        # what lets an interrupted run kill the whole group instead of only one process.
+        self.assertIs(seen['kwargs']['start_new_session'], True)
+        self.assertEqual(handle.pid, 4242)
+        self.assertTrue(handle.finished)
 
     def test_a_project_without_server_metadata_keeps_the_existing_native_path(self):
         make_project(self.root, 'alpha', server=False)
@@ -137,10 +164,10 @@ class NativeSyncCase(RuntimeCase):
         make_project(self.root, 'alpha')
         (self.root / 'projects' / 'alpha' / '.beads' / 'dolt-backup.json').write_text(
             json.dumps({'backup_name': "x'; DROP TABLE issues; --"}), encoding='utf-8')
-        with patch.object(admin, 'checked') as checked:
+        with patch.object(admin, 'spawn_sync_client') as spawn:
             with self.assertRaises(ValueError):
                 admin.native_backup_sync(self.root, 'alpha')
-        checked.assert_not_called()
+        spawn.assert_not_called()
 
     def test_the_native_command_records_its_own_stderr_in_the_failure_reason(self):
         failure = subprocess.CalledProcessError(1, ['dolt', 'sql'],
@@ -150,6 +177,124 @@ class NativeSyncCase(RuntimeCase):
         self.assertNotIn('\n', reason)
         self.assertLessEqual(len(reason), 400)
         self.assertEqual(admin.failure_reason(RuntimeError('refused')), 'refused')
+
+    def test_the_client_is_not_killed_again_once_it_has_exited(self):
+        # A successful run must not signal a pid the OS may have recycled: the handle is
+        # marked finished by spawn_sync_client once the child has been waited for.
+        handle = admin.SyncClientHandle()
+        handle.pid = os.getpid()
+        handle.finished = True
+        admin.terminate_process_group(handle)
+        self.assertEqual(handle.pid, os.getpid())
+
+    @unittest.skipUnless(hasattr(os, 'getpgrp') and hasattr(os, 'getpgid'),
+                         'POSIX process groups are required')
+    def test_a_client_still_in_our_own_group_is_never_signalled(self):
+        # Fail-safe: if the own-session start had not taken effect, killing "the group"
+        # would kill the kit itself, so the helper refuses a group it shares.
+        handle = admin.SyncClientHandle()
+        handle.pid = os.getpid()
+        handle.finished = False
+        admin.terminate_process_group(handle)
+        self.assertIsNone(handle.pid)
+
+
+class SyncClientHandleCase(RuntimeCase):
+    def test_spawn_records_the_pid_and_returns_the_captured_stdout(self):
+        handle = admin.SyncClientHandle()
+        output = admin.spawn_sync_client(
+            [sys.executable, '-c', 'print("sync output")'], handle)
+        self.assertIn('sync output', output)
+        self.assertIsNotNone(handle.pid)
+        self.assertTrue(handle.finished)
+        self.assertEqual(handle.process.returncode, 0)
+
+    def test_a_nonzero_client_is_reported_like_checked_would(self):
+        handle = admin.SyncClientHandle()
+        with self.assertRaises(subprocess.CalledProcessError) as caught:
+            admin.spawn_sync_client(
+                [sys.executable, '-c', 'import sys; sys.stderr.write("nope"); sys.exit(3)'], handle)
+        self.assertEqual(caught.exception.returncode, 3)
+        self.assertIn('nope', caught.exception.stderr)
+        self.assertTrue(handle.finished)
+
+    @unittest.skipUnless(hasattr(signal, 'SIGTERM'), 'SIGTERM is required')
+    def test_sigterm_raises_inside_the_guard_and_the_previous_handler_is_restored(self):
+        previous = signal.getsignal(signal.SIGTERM)
+        with self.assertRaises(admin.TerminatedBySignal) as caught:
+            with admin.signal_termination_guard():
+                os.kill(os.getpid(), signal.SIGTERM)
+        self.assertEqual(caught.exception.signum, signal.SIGTERM)
+        self.assertIs(signal.getsignal(signal.SIGTERM), previous)
+
+    @unittest.skipUnless(hasattr(os, 'killpg'), 'POSIX process groups are required')
+    def test_a_sigterm_during_the_native_sync_kills_the_client_group_and_runs_the_guard(self):
+        # P2: the reviewer reproduced SIGTERM of `admin.py backup` leaving the `dolt ...
+        # CALL DOLT_BACKUP` client writing the native backup after the backup lock was
+        # released. The kit must stop the client's whole process group and still run the
+        # guard that keeps the previous complete pair.
+        make_project(self.root, 'alpha')
+        (self.root / 'backups' / 'alpha').mkdir(parents=True, exist_ok=True)
+        (self.root / 'backups' / 'alpha' / 'older-chunk').write_text('older generation',
+                                                                    encoding='utf-8')
+        write_pair(self.root, 'alpha', files={'.merge-context.json': {'holder': 'prior'}})
+        canonical = self.root / 'backups' / 'alpha.coordination.json'
+        self.assertEqual(admin.complete_sidecar(canonical)['files'],
+                         {'.merge-context.json': {'holder': 'prior'}})
+        # This run's native step is a fake client that spawns a child and waits, so the
+        # whole process group can be observed.
+        pids = self.root / 'sync.pids'
+        script = self.root / 'bin' / 'dolt'
+        script.parent.mkdir()
+        script.write_text('#!/bin/sh\nsleep 30 &\necho "$$ $!" > %s\nwait\n' % pids,
+                          encoding='utf-8')
+        script.chmod(0o755)
+
+        def terminate_when_running():
+            for _ in range(200):
+                if pids.is_file():
+                    break
+                time.sleep(0.05)
+            else:
+                return
+            time.sleep(0.3)
+            os.kill(os.getpid(), signal.SIGTERM)
+
+        previous = signal.getsignal(signal.SIGTERM)
+        killer = threading.Thread(target=terminate_when_running)
+        killer.start()
+        try:
+            with self.assertRaises(admin.TerminatedBySignal):
+                admin.backup_project(self.root, 'alpha')
+        finally:
+            killer.join(15)
+        self.assertTrue(pids.is_file(), 'the fake sync client never started')
+        client_pid, child_pid = (int(value) for value in pids.read_text().split())
+        self.assertNotEqual(client_pid, os.getpid())
+
+        def alive(pid):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True
+            return True
+
+        for _ in range(100):
+            if not alive(client_pid) and not alive(child_pid):
+                break
+            time.sleep(0.05)
+        self.assertFalse(alive(client_pid), 'the sync client outlived the backup lock')
+        self.assertFalse(alive(child_pid), 'a child of the sync client outlived the backup lock')
+        # The guard restored the previous complete sidecar...
+        restored = json.loads(canonical.read_text(encoding='utf-8'))
+        self.assertEqual(restored['status'], 'complete')
+        self.assertEqual(restored['files'], {'.merge-context.json': {'holder': 'prior'}})
+        self.assertEqual(admin.backup_pair_state(self.root, 'alpha'), (True, None))
+        # ...the staged snapshot did not survive, and the handler was restored.
+        self.assertFalse(admin.staged_journal_snapshot_path(self.root, 'alpha').exists())
+        self.assertIs(signal.getsignal(signal.SIGTERM), previous)
 
 
 class LastCompletePairCase(RuntimeCase):
@@ -293,6 +438,110 @@ class LastCompletePairCase(RuntimeCase):
         self.assertEqual(canonical['status'], 'complete')
         # The new generation's (empty) coordination files, not the prior holder.
         self.assertEqual(canonical['files'], {})
+
+
+class NativeBackupManifestCase(RuntimeCase):
+    """P2: a restore must notice a native directory that changed after its generation."""
+
+    def setUp(self):
+        super().setUp()
+        for name in ('alpha', 'beta'):
+            make_project(self.root, name)
+            write_pair(self.root, name, files={'.merge-context.json': {'holder': 'prior'}})
+
+    def complete_run(self, name='alpha'):
+        with patch.object(admin, 'native_backup_sync', return_value='Backup synced'):
+            admin.backup_project(self.root, name)
+
+    def restore_output(self, source='alpha', destination='beta'):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            admin.restore_coordination(self.root, source, destination)
+        return output.getvalue()
+
+    def test_the_complete_sidecar_records_a_manifest_of_the_native_directory(self):
+        self.complete_run()
+        record = json.loads(
+            (self.root / 'backups' / 'alpha.coordination.json').read_text(encoding='utf-8'))
+        # Additive on schema 1: the readers keep accepting the record.
+        self.assertEqual(record['schema_version'], 1)
+        self.assertEqual(admin.complete_sidecar(
+            self.root / 'backups' / 'alpha.coordination.json')['status'], 'complete')
+        self.assertEqual(admin.backup_pair_state(self.root, 'alpha'), (True, None))
+        self.assertEqual(admin.coordination_backup(self.root, 'alpha'), record['files'])
+        manifest = record[admin.NATIVE_MANIFEST_KEY]
+        self.assertEqual(manifest['schema_version'], 1)
+        self.assertEqual(len(manifest['digest']), 64)
+        current, problem = admin.native_backup_manifest(self.root / 'backups' / 'alpha')
+        self.assertIsNone(problem)
+        self.assertEqual(current['digest'], manifest['digest'])
+        self.assertEqual(admin.native_backup_change(self.root, 'alpha', record)[0], 'unchanged')
+        self.assertEqual(admin.coordination_operators(self.root, 'alpha'), [])
+
+    def test_an_unchanged_pair_restores_without_a_warning(self):
+        self.complete_run()
+        text = self.restore_output()
+        self.assertNotIn('WARNING', text)
+        self.assertNotIn('could not be checked', text)
+
+    def test_restore_warns_when_the_native_directory_changed_after_the_complete_run(self):
+        self.complete_run()
+        # A run that was interrupted (or killed) can leave the native directory partly
+        # rewritten while the canonical sidecar is the restored previous generation.
+        (self.root / 'backups' / 'alpha' / 'half-written-chunk').write_text(
+            'a newer, partial sync', encoding='utf-8')
+        text = self.restore_output()
+        self.assertIn('WARNING', text)
+        self.assertIn('NO receipt in the restored journal', text)
+        self.assertIn('backups/alpha', text)
+
+    def test_the_last_complete_fallback_and_the_change_warning_are_both_reported(self):
+        # A kill -9 leaves the canonical marker `pending`; the durable copy is complete.
+        self.complete_run()
+        (self.root / 'backups' / 'alpha.coordination.json').write_text(
+            json.dumps({'schema_version': 1, 'status': 'pending'}), encoding='utf-8')
+        self.assertTrue(admin.using_last_complete_sidecar(self.root, 'alpha'))
+        (self.root / 'backups' / 'alpha' / 'orphan-client-chunk').write_text(
+            'written after the lock was released', encoding='utf-8')
+        text = self.restore_output()
+        self.assertIn('last-complete copy', text)
+        self.assertIn('WARNING', text)
+        self.assertIn('NO receipt in the restored journal', text)
+
+    def test_a_sidecar_without_a_manifest_is_reported_as_not_checked(self):
+        # A sidecar written before the manifest existed must not be called clean.
+        text = self.restore_output()
+        self.assertIn('could not be checked', text)
+        self.assertNotIn('WARNING', text)
+
+    def test_a_missing_or_odd_directory_is_reported_and_never_raises(self):
+        manifest, problem = admin.native_backup_manifest(self.root / 'backups' / 'absent')
+        self.assertIsNone(manifest)
+        self.assertIn('missing', problem)
+        state, detail = admin.native_backup_change(
+            self.root, 'absent', {admin.NATIVE_MANIFEST_KEY: {'digest': '0' * 64}})
+        self.assertEqual(state, 'unknown')
+        self.assertIn('missing', detail)
+
+    def test_a_rewritten_or_added_file_changes_the_digest(self):
+        chunk = self.root / 'backups' / 'alpha' / 'chunk'
+        chunk.write_text('one', encoding='utf-8')
+        first, _ = admin.native_backup_manifest(self.root / 'backups' / 'alpha')
+        chunk.write_text('two-longer', encoding='utf-8')
+        second, _ = admin.native_backup_manifest(self.root / 'backups' / 'alpha')
+        self.assertNotEqual(first['digest'], second['digest'])
+        # A pure timestamp change is visible too (the stat walk records mtime_ns), which is
+        # what catches a same-size rewrite on a filesystem with a fine-grained clock.
+        info = chunk.stat()
+        os.utime(chunk, ns=(info.st_atime_ns, info.st_mtime_ns + 10 ** 9))
+        third, _ = admin.native_backup_manifest(self.root / 'backups' / 'alpha')
+        self.assertNotEqual(second['digest'], third['digest'])
+        (self.root / 'backups' / 'alpha' / 'added').write_text('more', encoding='utf-8')
+        fourth, _ = admin.native_backup_manifest(self.root / 'backups' / 'alpha')
+        self.assertNotEqual(third['digest'], fourth['digest'])
+        # Reading the same directory twice is deterministic.
+        again, _ = admin.native_backup_manifest(self.root / 'backups' / 'alpha')
+        self.assertEqual(fourth['digest'], again['digest'])
 
 
 class BackupCopyCase(RuntimeCase):

@@ -3,18 +3,21 @@
 kittrial-5bb.39: a project added after installation silently fell outside the
 installation's single-project schedule. These tests cover the multi-project /
 ``--all`` invocation, the honest per-project status file, the read/verify path,
-the unchanged single-project form and the exact schedule guidance ``add-project``
-prints.
+the unchanged single-project form, the exact schedule guidance ``add-project``
+prints, the stale staged-journal cleanup an interrupted run needs and the lock
+scope of the reference off-machine copy.
 """
 import contextlib
 import io
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import admin
@@ -636,6 +639,119 @@ class ScheduledCoverageGuidanceCase(unittest.TestCase):
         self.assertIn('do not include newproject', text)
         self.assertNotIn('no change is needed', text)
         self.assertNotIn('backup --all', text)
+
+
+class InterruptedRunAndCopyLockCase(unittest.TestCase):
+    """P3: the stale staged snapshot, and the coordination-lock scope of backup-copy."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / 'runtime'
+        (self.root / 'backups').mkdir(parents=True)
+        (self.root / 'projects').mkdir()
+        (self.root / 'deployment.private.json').write_text(json.dumps(
+            {'port': 13317, 'unit': 'beads-example.service', 'password': 'test-only-password',
+             'schema': 1}), encoding='utf-8')
+        for name in ('alpha', 'beta'):
+            make_project(self.root, name)
+        self.flock = Mock()
+        patcher = patch.dict(sys.modules, {
+            'fcntl': types.SimpleNamespace(flock=self.flock, LOCK_EX=2)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.destination = Path(self.temp.name) / 'off-machine'
+
+    def run_admin(self, *argv):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        code = 0
+        with patch.object(sys, 'argv', ['admin.py', '--root', str(self.root), *argv]), \
+                patch.object(admin, 'root_path', return_value=self.root), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                admin.main()
+            except SystemExit as exit:
+                code = exit.code if isinstance(exit.code, int) else 1
+                if exit.code is not None and not isinstance(exit.code, int):
+                    stderr.write(str(exit.code))
+        return stdout.getvalue(), stderr.getvalue(), code
+
+    def record(self):
+        for name in ('alpha', 'beta'):
+            write_pair(self.root, name)
+        admin.write_backup_status(self.root, {
+            'schema_version': 1, 'scope': 'all', 'generated_at': '2026-09-27T16:00:00Z',
+            'status': 'complete',
+            'projects': [{'name': name, 'status': 'complete',
+                          'completed_at': '2026-09-27T16:00:00Z',
+                          'pair': {'native': 'backups/' + name,
+                                   'coordination': 'backups/' + name + '.coordination.json'}}
+                         for name in ('alpha', 'beta')]})
+
+    def test_a_stale_staging_snapshot_from_a_hard_kill_is_removed_at_the_start_of_a_run(self):
+        write_pair(self.root, 'alpha')
+        staging = admin.staged_journal_snapshot_path(self.root, 'alpha')
+        staging.write_bytes(b'left behind by kill -9')
+        Path(str(staging) + '.tmp').write_bytes(b'left behind by kill -9')
+        keep = self.root / 'backups' / 'alpha' / 'chunk'
+        keep.write_text('native bytes', encoding='utf-8')
+        with patch.object(admin, 'native_backup_sync', return_value='Backup synced'):
+            admin.backup_project(self.root, 'alpha')
+        self.assertFalse(staging.exists())
+        self.assertFalse(Path(str(staging) + '.tmp').exists())
+        self.assertEqual(keep.read_text(encoding='utf-8'), 'native bytes')
+
+    def test_a_stale_staging_snapshot_is_removed_even_when_the_run_fails(self):
+        write_pair(self.root, 'alpha')
+        staging = admin.staged_journal_snapshot_path(self.root, 'alpha')
+        staging.write_bytes(b'left behind by kill -9')
+        with patch.object(admin, 'native_backup_sync', side_effect=RuntimeError('sync failed')):
+            with self.assertRaises(RuntimeError):
+                admin.backup_project(self.root, 'alpha')
+        self.assertFalse(staging.exists())
+
+    def coordination_handle_recorder(self, handles):
+        def fake_flock(handle, operation):
+            if str(getattr(handle, 'name', '')).endswith('.coordination.lock'):
+                handles.append(handle)
+        return types.SimpleNamespace(flock=fake_flock, LOCK_EX=2)
+
+    def test_the_pair_is_rechecked_and_the_sidecar_copied_under_the_coordination_lock(self):
+        self.record()
+        handles = []
+        copied_under_lock = []
+        real_copy = admin._atomic_copy
+
+        def recording_copy(source, destination):
+            if str(destination).endswith('.coordination.json'):
+                copied_under_lock.append(any(not handle.closed for handle in handles))
+            return real_copy(source, destination)
+
+        with patch.dict(sys.modules, {'fcntl': self.coordination_handle_recorder(handles)}), \
+                patch.object(admin, '_atomic_copy', side_effect=recording_copy):
+            stdout, stderr, code = self.run_admin('backup-copy', str(self.destination))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(copied_under_lock, [True, True])
+
+    def test_the_coordination_lock_is_released_before_the_native_copy(self):
+        self.record()
+        (self.root / 'backups' / 'alpha' / 'chunk').write_text('native bytes', encoding='utf-8')
+        handles = []
+        held_during_copy = []
+        real_copytree = shutil.copytree
+
+        def slow_copytree(source, target, **kwargs):
+            held_during_copy.append(any(not handle.closed for handle in handles))
+            return real_copytree(source, target, **kwargs)
+
+        with patch.dict(sys.modules, {'fcntl': self.coordination_handle_recorder(handles)}), \
+                patch('shutil.copytree', side_effect=slow_copytree):
+            stdout, stderr, code = self.run_admin('backup-copy', str(self.destination))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(len(held_during_copy), 2)
+        self.assertFalse(any(held_during_copy),
+                         'the coordination lock was still held during the native copy')
 
 
 if __name__ == '__main__':

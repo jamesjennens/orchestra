@@ -4,16 +4,19 @@ import argparse
 import base64
 import contextlib
 import csv
+import hashlib
 import io
 import json
 import os
 import re
 import secrets
+import signal
 import socket
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from contextlib import contextmanager
@@ -40,8 +43,156 @@ BACKUP_SYNC_TIMEOUT=1800
 #: last complete sidecar is kept here and ``coordination_backup`` can fall back to it.
 LAST_COMPLETE_SUFFIX='.coordination.last-complete.json'
 
+#: Additive key in a COMPLETE coordination sidecar that records a manifest of the native
+#: backup directory at the moment that generation completed. ``restore-new`` recomputes it
+#: and warns when the directory no longer matches it, because a run that is killed outright
+#: (or an interrupted sync) can leave the native directory partly rewritten while the
+#: restore serves the previous complete sidecar and its operation-journal snapshot. The
+#: sidecar schema stays 1: the manifest is additive and readers ignore keys they do not know.
+NATIVE_MANIFEST_KEY='native_backup'
+
 def checked(cmd, **kwargs):
     return subprocess.run(list(map(str,cmd)),text=True,encoding='utf-8',capture_output=True,check=True,**kwargs)
+
+class TerminatedBySignal(BaseException):
+    """The guarded section was stopped by ``SIGTERM`` (see ``signal_termination_guard``).
+
+    ``BaseException`` on purpose: ``backup_project``'s ``last_complete_guard`` catches
+    ``BaseException`` and its ``finally`` must run, exactly as they do for a
+    ``KeyboardInterrupt``. An ordinary ``except Exception`` on the way out must not be able
+    to swallow an operator's stop request.
+    """
+
+    def __init__(self,signum):
+        super().__init__('terminated by signal %d'%signum)
+        self.signum=signum
+
+def raise_termination(signum,frame):
+    """Signal handler that turns a stop into an exception so the cleanup path runs."""
+    raise TerminatedBySignal(signum)
+
+@contextmanager
+def signal_termination_guard():
+    """Turn ``SIGTERM`` into a ``TerminatedBySignal`` exception for the duration of the block.
+
+    ``backup_project``'s ``last_complete_guard`` (which catches ``BaseException``) and its
+    ``finally`` are what restore the previous complete sidecar, drop the staged journal
+    snapshot and stop the native sync client. A ``SIGINT`` (Ctrl-C) already raises
+    ``KeyboardInterrupt``, but a ``SIGTERM`` terminates the interpreter outright, so that
+    cleanup never ran and the ``dolt`` client kept writing ``backups/<name>`` after the
+    backup lock was released. A handler that raises puts a normal stop back on the cleanup
+    path; the previous handlers are restored in a ``finally``.
+
+    A handler can only be installed in the main thread (``signal.signal`` raises
+    ``ValueError`` elsewhere), an embedded host may have its own handlers and a platform
+    may refuse the signal, so an install that is not possible is skipped instead of
+    failing the backup for a reason unrelated to it: the caller keeps the previous
+    behaviour, which is the honest limitation this cannot remove.
+    """
+    previous={}
+    if threading.current_thread() is threading.main_thread():
+        try:
+            for signum in (signal.SIGTERM,):
+                previous[signum]=signal.getsignal(signum)
+                signal.signal(signum,raise_termination)
+        except (ValueError,OSError,RuntimeError,AttributeError):
+            previous={}
+    try:
+        yield
+    finally:
+        for signum,handler in previous.items():
+            try: signal.signal(signum,handler)
+            except (ValueError,OSError,RuntimeError,AttributeError): pass
+
+class SyncClientHandle:
+    """Bookkeeping for a native sync client started in its own session.
+
+    ``checked()`` runs children through ``subprocess.run`` and hides the pid, so a caller
+    that has to be able to stop a child (and anything that child spawned) cannot use it.
+    ``spawn_sync_client`` fills this in: ``pid``/``process`` name the client before the wait
+    starts and ``finished`` becomes True only once the child has actually been waited for.
+    ``backup_project`` terminates the group from its ``finally`` while the handle is
+    unfinished, so a signal or an exception cannot leave the client writing
+    ``backups/<name>`` after the backup lock is released, and a run in which the client
+    exited normally never signals a pid the OS may have recycled by then.
+    """
+
+    def __init__(self):
+        self.pid=None
+        self.process=None
+        self.finished=False
+
+def terminate_process_group(handle):
+    """Kill and reap a sync client's whole process group when it is still running.
+
+    Called from ``backup_project``'s ``finally`` on every exit path. It is a no-op when
+    nothing was started or the client already exited and was waited for. A client still
+    running when the run unwinds (SIGTERM/SIGINT, an exception, the explicit ceiling) is
+    killed as a GROUP - ``os.killpg(os.getpgid(pid), SIGKILL)`` - so a ``dolt`` helper it
+    spawned cannot keep writing ``backups/<name>`` once the backup lock is released. A group
+    that is already gone (``ProcessLookupError``) or one this process may not signal
+    (``PermissionError``) is tolerated, so the run's real failure is reported instead of
+    being replaced by a secondary one. The group is never this process's own group: that
+    would only be possible if the child had not become a session leader, and killing it
+    would kill the kit itself.
+    """
+    if handle is None or handle.pid is None or handle.finished:
+        return
+    process=handle.process
+    pid=handle.pid
+    handle.pid=None
+    if hasattr(os,'killpg') and hasattr(os,'getpgid') and hasattr(os,'getpgrp'):
+        group=None
+        try: group=os.getpgid(pid)
+        except OSError: group=None
+        if group is not None and group!=os.getpgrp():
+            try: os.killpg(group,signal.SIGKILL)
+            except OSError: pass
+    elif process is not None:
+        try: process.kill()
+        except OSError: pass
+    if process is not None:
+        try: process.wait()
+        except OSError: pass
+        for stream in (process.stdout,process.stderr):
+            if stream is None:continue
+            try: stream.close()
+            except OSError: pass
+
+def spawn_sync_client(command,handle,**kwargs):
+    """Run the native sync client in its OWN session; return its captured stdout.
+
+    The contract mirrors ``checked`` (UTF-8 text, captured stdout/stderr, ``check=True``,
+    an optional ``timeout``), with the two differences the long native sync needs:
+
+    * ``start_new_session=True`` - the client leads its own session and process group, so
+      ``terminate_process_group`` reaches the ``dolt`` client AND whatever it spawned, not
+      only the one process.
+    * ``handle`` - a ``SyncClientHandle`` given the pid before the wait starts and marked
+      finished only after the child has been waited for, so the caller can stop exactly the
+      client that is still running and never a pid that has already been reaped.
+
+    ``checked()`` keeps its exact behaviour for every other caller in this file: this is the
+    one subprocess that runs in its own session.
+    """
+    args=list(map(str,command))
+    timeout=kwargs.pop('timeout',None)
+    process=subprocess.Popen(args,text=True,encoding='utf-8',stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE,start_new_session=True,**kwargs)
+    handle.pid=process.pid
+    handle.process=process
+    handle.finished=False
+    try:
+        stdout,stderr=process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # The explicit ceiling was reached. ``subprocess.run`` kills only the direct child
+        # on its own timeout path; this stops the whole group and reaps it before reporting.
+        terminate_process_group(handle)
+        raise
+    handle.finished=True
+    if process.returncode:
+        raise subprocess.CalledProcessError(process.returncode,args,output=stdout,stderr=stderr)
+    return stdout
 
 def validate_name(name):
     if not re.fullmatch(r'[a-z][a-z0-9]{1,23}',name): raise ValueError('Project: 2-24 lowercase letters/digits, beginning with a letter')
@@ -174,7 +325,7 @@ def project_backup_name(root,name):
     value=data.get('backup_name')
     return value if isinstance(value,str) and value else None
 
-def native_backup_sync(root,name):
+def native_backup_sync(root,name,client=None):
     """Synchronize one project's native Dolt backup without bd's fixed read timeout.
 
     ``bd backup sync`` inherits a fixed client read timeout of about ten seconds, which
@@ -185,10 +336,14 @@ def native_backup_sync(root,name):
     ``BACKUP_SYNC_TIMEOUT``. It runs in the caller's critical section, so the
     coordination sidecar and the native state still move as one pair.
 
-    The backup name is validated before it reaches the statement, and the password
-    travels in the environment, never in the command. A project that carries no server
-    metadata has no SQL coordinates to use, so it keeps the pre-existing
-    ``bd backup sync`` path.
+    The SQL client is started in its own session through ``spawn_sync_client`` and its pid
+    is recorded in the optional ``client`` handle, so the caller can stop the whole process
+    group when the run is interrupted instead of leaving a ``dolt`` client writing the
+    native backup after the lock is released. The backup name is validated before it
+    reaches the statement, and the password travels in the environment, never in the
+    command. A project that carries no server metadata has no SQL coordinates to use, so
+    it keeps the pre-existing ``bd backup sync`` path and is not part of that session
+    handling.
     """
     metadata=project_server_metadata(root,name)
     backup_name=project_backup_name(root,name)
@@ -199,7 +354,8 @@ def native_backup_sync(root,name):
     host,port,user,database=metadata
     command=[root/'bin/dolt','--host',str(host),'--port',str(port),'--no-tls','--user',str(user),
              '--use-db',str(database),'sql','-q',"CALL DOLT_BACKUP('sync', '%s')"%backup_name]
-    return checked(command,env=environment(root),cwd=root,timeout=BACKUP_SYNC_TIMEOUT).stdout
+    handle=client if client is not None else SyncClientHandle()
+    return spawn_sync_client(command,handle,env=environment(root),cwd=root,timeout=BACKUP_SYNC_TIMEOUT)
 
 def provision_merge_slot(root,name):
     """Create the project's merge slot once, tolerating an existing slot.
@@ -512,6 +668,18 @@ def scheduled_backup_coverage(root,name):
                   +f'. A schedule that covers every project is:\n  {line} '+dropins)
 
 def add_project(root,name):
+    """Initialize one project, provision its merge slot and back it up once.
+
+    The schedule guidance this prints (``scheduled_backup_coverage``) is deliberately
+    CONSERVATIVE about a unit whose ``ExecStart`` runs the backup through ``sh -c``: such a
+    line is reported as not backing up this runtime, because only a recognised ``admin.py``
+    or long-sync-wrapper command line can be attributed to this runtime with certainty. A
+    ``sh -c`` line may well run our ``admin.py backup --all``, but proving that means
+    parsing a shell command inside a shell command, and a wrong "already covered" answer
+    would leave a project silently off the schedule. Reporting it as uncovered is the safe
+    direction: it can only prompt an operator to double-check, never hide a gap. This is a
+    deliberate choice, not a missed case, and it never edits, installs or enables a unit.
+    """
     path=project_dir(root,name)
     if path.exists() and any(path.iterdir()): raise ValueError('Project already exists; use it rather than initializing again')
     path.mkdir(exist_ok=True)
@@ -594,6 +762,25 @@ def stage_journal_snapshot(root,name):
     staging=staged_journal_snapshot_path(root,name)
     if staging.is_symlink():raise ValueError('Journal snapshot path must not be a symlink')
     return snapshot_journal(project_dir(root,name)/JOURNAL_STORE_NAME,staging)
+
+def discard_stale_journal_staging(root,name):
+    """Remove a staged or temporary journal snapshot an earlier hard kill left behind.
+
+    ``stage_journal_snapshot`` writes ``backups/<name>.http-operations.sqlite3.staging`` and
+    ``snapshot_journal`` writes a ``.tmp`` sibling; a ``kill -9`` during the native sync can
+    run no cleanup, so without this the file survives until the next successful run (the
+    reviewer observed exactly that). The caller holds the project's backup lock for its whole
+    critical section, which is what makes cleaning here safe: a concurrent ``backup`` of the
+    same project is excluded by that lock, and ``backup-copy`` only ever reads the promoted
+    snapshot, never a staging path, so no in-flight run can lose the file it is using. A
+    symlink is removed as a link and never followed.
+    """
+    staging=staged_journal_snapshot_path(root,name)
+    for path in (staging,Path(str(staging)+'.tmp')):
+        try:
+            if path.exists() or path.is_symlink():path.unlink()
+        except OSError:
+            pass
 
 def promote_journal_snapshot(root,name,staging):
     """Publish ``staging`` as the project's journal snapshot, atomically.
@@ -735,6 +922,99 @@ def complete_sidecar(path):
         return None
     return data
 
+def native_backup_manifest(directory):
+    """``(manifest, None)`` for a native backup directory, or ``(None, reason)``.
+
+    The manifest is a stat-only walk - sorted relative path, size and ``mtime_ns`` for
+    every regular file, plus the name of every directory and symlink target - hashed with
+    SHA-256. No file contents are read, so the cost is one ``stat`` per entry and it is
+    safe on a large backup; any rewrite of a chunk changes the digest, and so does an added
+    or removed entry. A same-size rewrite that also lands on the same timestamp tick (a
+    coarse-grained filesystem) is the one change this cannot see, which is the deliberate
+    price of never reading the backup's contents. A missing, symlinked or unreadable
+    directory is REPORTED rather than raising: the caller decides what to tell the
+    operator, and this never turns a reporting step into a failure.
+    """
+    directory=Path(directory)
+    if directory.is_symlink():return None,'the native backup directory is a symlink'
+    if not directory.is_dir():return None,'the native backup directory is missing'
+    digest=hashlib.sha256();files=0
+    def add(kind,entry,extra=''):
+        digest.update(('%s\0%s\0%s\0'%(kind,entry,extra)).encode('utf-8','surrogateescape'))
+    try:
+        for base,dirnames,filenames in os.walk(directory):
+            dirnames.sort();filenames.sort()
+            relative=Path(base).relative_to(directory).as_posix()
+            relative='' if relative=='.' else relative
+            for name in list(dirnames):
+                path=Path(base)/name
+                entry=(relative+'/'+name) if relative else name
+                if path.is_symlink():
+                    add('link',entry,os.readlink(path));dirnames.remove(name)
+                else:
+                    add('dir',entry)
+            for name in filenames:
+                path=Path(base)/name
+                entry=(relative+'/'+name) if relative else name
+                if path.is_symlink():
+                    add('link',entry,os.readlink(path));continue
+                info=path.stat()
+                add('file',entry,'%d/%d'%(info.st_size,info.st_mtime_ns))
+                files+=1
+    except OSError as error:
+        return None,'the native backup directory could not be read: %s'%error
+    return {'schema_version':1,'algorithm':'sha256-path-size-mtime_ns','files':files,
+            'digest':digest.hexdigest()},None
+
+def native_backup_change(root,source,record):
+    """``(state, detail)`` for the native directory against a sidecar's recorded manifest.
+
+    ``state`` is ``'unchanged'`` when the directory still matches the manifest recorded
+    with ``record``, ``'changed'`` when it does not, and ``'unknown'`` when the check
+    cannot be performed at all: a sidecar written by an older revision records no manifest,
+    and a missing or unreadable directory cannot be walked. ``unknown`` is reported as
+    unknown rather than as clean, so an operator is never told a pair was verified when it
+    was not.
+    """
+    recorded=(record or {}).get(NATIVE_MANIFEST_KEY) if isinstance(record,dict) else None
+    if not isinstance(recorded,dict) or not isinstance(recorded.get('digest'),str):
+        return 'unknown',('the coordination sidecar records no native-backup manifest, so the check could not '
+                          'be performed')
+    manifest,problem=native_backup_manifest(root/'backups'/source)
+    if manifest is None:
+        return 'unknown',problem
+    if manifest['digest']==recorded['digest']:
+        return 'unchanged','the native backup directory matches the manifest recorded with this generation'
+    return 'changed',('the native backup directory no longer matches the manifest recorded with this '
+                      'generation')
+
+def report_native_backup_change(root,source):
+    """Print the truth about the native directory the restore is about to pair up.
+
+    A restore serves a complete sidecar (the canonical one, or the durable last-complete
+    copy when the canonical sidecar is still ``pending`` after a run that could not clean
+    up) together with the operation-journal snapshot of that same generation. The native
+    directory, however, is written by the ``dolt`` client outside that pair, so a run that
+    was killed outright or interrupted can leave it partly rewritten: the restored Dolt
+    could then hold an effect whose receipt the restored journal does not have, and an
+    exact retry could repeat it. Recomputing the recorded manifest is how that is detected;
+    a sidecar with no manifest is reported as unverifiable rather than clean.
+    """
+    record=resolved_coordination_sidecar(root,source)
+    state,detail=native_backup_change(root,source,record)
+    if state=='changed':
+        print('WARNING: %s. The restore uses the previous complete coordination sidecar and its '
+              'operation-journal snapshot, but the native backup under backups/%s changed after that '
+              'generation completed (an interrupted or killed backup run can leave the native directory '
+              'partly rewritten). Effects present in the restored Dolt may therefore have NO receipt in the '
+              'restored journal, and an exact retry of one could repeat it. Inspect the restored project '
+              'before accepting writes, and take a fresh complete backup (admin.py backup %s) from the '
+              'original runtime before relying on this pair.'%(detail,source,source))
+    elif state=='unknown':
+        print('Note: the native backup under backups/%s could not be checked against the coordination '
+              'sidecar being restored (%s), so this restore cannot claim the native directory is the one '
+              'that belongs to it.'%(source,detail))
+
 def _atomic_copy(source,destination):
     """Replace ``destination`` with a byte-for-byte copy of ``source``, atomically."""
     _atomic_write_bytes(Path(destination),Path(source).read_bytes())
@@ -842,28 +1122,51 @@ def backup_project(root,name):
         # sidecar are durable, so a failed run leaves the previous snapshot (which
         # belongs to the previous complete pair) in place for restore-new.
         staged=None
+        client=SyncClientHandle()
         try:
-            staged=stage_journal_snapshot(root,name)
-            output=native_backup_sync(root,name)
-            # The deployment operator allowlist travels with the project sidecar so a
-            # restore can TELL the operator which recorded authority is missing on the
-            # destination host. It is not applied automatically: the allowlist is
-            # deployment-wide authority, so `restore-new` only re-grants it with an
-            # explicit --restore-operators. Native backup preserves the void comments
-            # and this preserves the record of the authority the reads would need.
-            atomic(bundle,{'schema_version':1,'status':'complete','files':files,
-                           'operators':sorted(operators(root))})
-            # The new generation is now native + complete sidecar + promoted journal;
-            # from here the guard must not put the previous sidecar back.
-            promote_journal_snapshot(root,name,staged)
-            staged=None
-            guard_state['promoted']=True
-            # Refresh the durable last-complete copy so the next run has a restorable
-            # pair to protect even if it is interrupted before it can write anything.
-            # A failure here leaves the new complete generation in place (the guard no
-            # longer rolls it back), and the next run's guard refreshes this copy.
-            _atomic_copy(bundle,last_complete)
+            # SIGTERM is turned into an exception for exactly this section (SIGINT already
+            # raises KeyboardInterrupt), so the guard and the `finally` below still run on a
+            # normal operator stop instead of the interpreter dying with the dolt client
+            # still writing.
+            with signal_termination_guard():
+                # A staging file from an earlier hard kill is cleaned at the start of the run,
+                # under the backup lock (see discard_stale_journal_staging).
+                discard_stale_journal_staging(root,name)
+                staged=stage_journal_snapshot(root,name)
+                output=native_backup_sync(root,name,client=client)
+                # The deployment operator allowlist travels with the project sidecar so a
+                # restore can TELL the operator which recorded authority is missing on the
+                # destination host. It is not applied automatically: the allowlist is
+                # deployment-wide authority, so `restore-new` only re-grants it with an
+                # explicit --restore-operators. Native backup preserves the void comments
+                # and this preserves the record of the authority the reads would need.
+                record={'schema_version':1,'status':'complete','files':files,
+                        'operators':sorted(operators(root))}
+                # A manifest of the native directory as this generation completed it. A
+                # restore recomputes it and warns when the directory no longer matches, so
+                # a partly rewritten native backup is never paired silently with the
+                # previous complete sidecar and its journal snapshot (see
+                # report_native_backup_change). It is additive: the schema stays 1.
+                manifest,problem=native_backup_manifest(root/'backups'/name)
+                if manifest is not None:record[NATIVE_MANIFEST_KEY]=manifest
+                atomic(bundle,record)
+                # The new generation is now native + complete sidecar + promoted journal;
+                # from here the guard must not put the previous sidecar back.
+                promote_journal_snapshot(root,name,staged)
+                staged=None
+                guard_state['promoted']=True
+                # Refresh the durable last-complete copy so the next run has a restorable
+                # pair to protect even if it is interrupted before it can write anything.
+                # A failure here leaves the new complete generation in place (the guard no
+                # longer rolls it back), and the next run's guard refreshes this copy.
+                _atomic_copy(bundle,last_complete)
         finally:
+            # On ANY path that is not a normally-finished client - SIGTERM/SIGINT, the
+            # explicit ceiling, an exception - stop the whole process group here, while the
+            # backup lock is still held, so the dolt client and anything it spawned cannot
+            # keep writing backups/<name> past the lock (the reviewer reproduced that after
+            # SIGTERM). A successful run is a no-op: the client already exited.
+            terminate_process_group(client)
             if staged is not None:
                 try:
                     if Path(staged).exists():Path(staged).unlink()
@@ -1124,11 +1427,15 @@ def backup_copy(root,destination):
     (``<name>`` plus the journal store name), the same shape a runtime's ``backups/``
     directory has, so the copy can be copied back and restored; the operation journal is
     what keeps an acknowledged retry from re-executing after an off-machine restore.
-    Each project's pair is copied while that project's backup lock and coordination lock
-    are held, into a per-run staging directory, and only then moved into place by
-    rename, so a concurrent ``--all`` cannot yield a mixed native directory beside a
-    complete sidecar, a stale destination file is replaced rather than merged, and a
-    failure cannot leave a half-refreshed generation. The completeness record that gated
+    Each project's pair is copied into a per-run staging directory and only then moved into
+    place by rename, so a concurrent ``--all`` cannot yield a mixed native directory beside
+    a complete sidecar, a stale destination file is replaced rather than merged, and a
+    failure cannot leave a half-refreshed generation. That project's backup lock is held for
+    its whole staging (the same lock ``backup`` takes), while the project coordination lock
+    is held only long enough to re-check the pair and copy the sidecar plus the journal
+    snapshot: the long native ``copytree`` runs after the coordination lock is released, so
+    copying a large database cannot block endpoint writes on it. Both commands take the two
+    locks in the same order, so no deadlock is possible. The completeness record that gated
     the copy is published last; if anything fails, the destination is left without it
     and the command exits non-zero with a clear error. The scheduled, encrypted
     off-machine system, its retention and its encryption stay the operator's: this is a
@@ -1169,21 +1476,34 @@ def backup_copy(root,destination):
             if native.is_symlink() or sidecar.is_symlink() or journal.is_symlink():
                 raise ValueError('Backup pair paths must not be symlinks')
             project=root/'projects'/name
-            with contextlib.ExitStack() as stack:
-                stack.enter_context(backup_lock(root,name))
-                if project.is_dir():
-                    handle=stack.enter_context((project/'.coordination.lock').open('a'))
-                    fcntl.flock(handle,fcntl.LOCK_EX)
-                complete,reason=backup_pair_state(root,name)
-                if not complete:
-                    raise RuntimeError('%s is no longer a complete pair on disk: %s'%(name,reason))
+            # This project's backup lock is held for its whole staging; it is the same lock
+            # ``backup_project`` takes, so no concurrent backup can rewrite the native
+            # directory or the sidecar underneath us. The project's coordination lock is
+            # taken only long enough to re-check the pair and copy the two small
+            # coordination files - it is what keeps an endpoint keyed write from landing
+            # between the sidecar and the journal snapshot that must belong to it - and the
+            # long native ``copytree`` then runs AFTER it is released, so copying a large
+            # database cannot pin the coordination lock and delay endpoint writes.
+            # Lock ORDER is the same in both commands: ``backups/<name>.lock`` is acquired
+            # first and the project coordination lock second. ``backup_project`` merely
+            # OPENS the coordination lock file first (in its ``with`` header); its ``flock``
+            # runs in the body, after ``backup_lock`` is already held. A single consistent
+            # order means no deadlock is possible between a backup and a copy.
+            staged_journal=None
+            with backup_lock(root,name):
+                with contextlib.ExitStack() as stack:
+                    if project.is_dir():
+                        handle=stack.enter_context((project/'.coordination.lock').open('a'))
+                        fcntl.flock(handle,fcntl.LOCK_EX)
+                    complete,reason=backup_pair_state(root,name)
+                    if not complete:
+                        raise RuntimeError('%s is no longer a complete pair on disk: %s'%(name,reason))
+                    _atomic_copy(sidecar,staging/(name+'.coordination.json'))
+                    if journal.is_file():
+                        staged_journal=staging/journal.name
+                        _atomic_copy(journal,staged_journal)
+                        journals+=1
                 shutil.copytree(native,staging/name)
-                _atomic_copy(sidecar,staging/(name+'.coordination.json'))
-                staged_journal=None
-                if journal.is_file():
-                    staged_journal=staging/journal.name
-                    _atomic_copy(journal,staged_journal)
-                    journals+=1
             staged.append((name,staging/name,staging/(name+'.coordination.json'),staged_journal))
         # Every project staged: move each pair into place, replacing (not merging) the
         # destination, then publish the completeness record last.
@@ -1389,6 +1709,10 @@ def restore_coordination(root,source,destination,restore_operators=False):
               'uses the durable last-complete copy %s (the previous complete generation, restored with the '
               'operation-journal snapshot that belongs to it).'
               %(source,last_complete_sidecar_path(root,source)))
+    # The sidecar and journal snapshot are one generation by construction; the native
+    # directory is not. Report it before any coordination or journal write, so the operator
+    # learns here whether the restored Dolt really is the generation the journal describes.
+    report_native_backup_change(root,source)
     for name in files:
         target=path/name
         if target.is_symlink() or target.parent.is_symlink() or target.with_suffix('.tmp').is_symlink():raise ValueError('Coordination restore paths must not be symlinks')
@@ -1774,3 +2098,7 @@ if __name__=='__main__':
     except subprocess.CalledProcessError as e:
         # Never echo credential-bearing command input or the environment.
         raise SystemExit(f'Command failed ({e.returncode}): {e.stderr[:2000]}')
+    except TerminatedBySignal as e:
+        # The guarded cleanup ran (previous pair kept, sync client's group stopped); exit
+        # with the conventional 128+signal status instead of a traceback.
+        raise SystemExit(128+e.signum)
