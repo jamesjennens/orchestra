@@ -1234,6 +1234,10 @@ def task_matches(task, filters):
         return False
     review = filters.get('review_state')
     if review:
+        # An unknown state (``None``: the canonical projection did not cover the row)
+        # matches no review filter, not even ``none``.
+        if task.get('review_state') is None:
+            return False
         # ``approved`` (disposable backend) and ``awaiting-integration`` (canonical
         # projection) are the same state; either filter finds both.
         approved = ('approved', 'awaiting-integration')
@@ -1609,6 +1613,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             self.service.idempotency_release(digest)
             raise
         self.service.idempotency_commit(digest, status, stored)
+        self._forget_cached_reads(ctx.principal, project_id)
         self.service.audit(ctx.request_id, ctx.principal, route_name, 'committed',
                            project_id=project_id, reason=reason)
         self.service.store.save()
@@ -1678,6 +1683,21 @@ class ApiHandler(BaseHTTPRequestHandler):
                         self.read_cache.pop(stale, None)
                 self.read_cache[key] = (now + ttl, result)
         return result
+
+    def _forget_cached_reads(self, principal, project_id):
+        """Drop the principal's cached ``/v1/me/work`` reads after its own write.
+
+        The project's entry goes (all of them when the write had no project), so the
+        author sees their own claim, delivery or review at once; other principals'
+        entries still expire on their short TTL.
+        """
+        cache = getattr(self, 'read_cache', None)
+        if cache is None or principal is None:
+            return
+        with self.read_cache_lock:
+            for key in [k for k in cache if k[0] == principal.user_id and
+                        (project_id is None or k[1] == project_id)]:
+                cache.pop(key, None)
 
     def _with_review_states(self, project_id, rows):
         """Give every row its review state (``None`` when unknown). Returns completeness."""

@@ -1571,17 +1571,17 @@ class Service:
         determined account holder can still test usernames one at a time. Each
         principal is therefore held to :data:`LOOKUP_MAX_PER_WINDOW` lookups per
         :data:`LOOKUP_WINDOW_SECONDS` (429 beyond it), and every authorized lookup is
-        audited on the project with a digest of the queried name, never the name.
+        audited on the project with a keyed digest of the queried name (see
+        :meth:`_lookup_digest`), never the name.
         """
         if principal is None or principal.via == 'credential':
             raise forbidden('Session authority required to look up accounts')
         if not isinstance(username, str) or not re.fullmatch(
                 r'[A-Za-z0-9][A-Za-z0-9_.@-]{1,63}', username):
             raise invalid('username must be 2-64 characters of letters, digits, . _ @ -')
-        digest = 'username_sha256=' + hashlib.sha256(
-            username.lower().encode('utf-8')).hexdigest()[:16]
         with self.store.lock:
             self.check_authority(principal, project_id, CAP_PROJECT_ADMIN)
+            digest = 'username_hmac=' + self._lookup_digest(username)
             cutoff = self._now() - self.lookup_window
             recent = [t for t in self._lookups.get(principal.user_id, []) if t >= cutoff]
             if len(recent) >= self.lookup_max:
@@ -1602,6 +1602,22 @@ class Service:
                 raise not_found('No active account with that username')
             return {'id': user['id'], 'username': user['username'],
                     'display_name': user['display_name']}
+
+    def _lookup_digest(self, username):
+        """HMAC-SHA256 (first 16 hex) of the lower-cased username under a deployment key.
+
+        The key is 32 random bytes generated once and kept only in the private service
+        state (``lookup_audit_key``); it is never logged, audited or returned. A reader
+        of the audit can see that the same name was probed repeatedly but cannot
+        reverse a digest by hashing a dictionary of likely usernames. Call with
+        ``store.lock`` held.
+        """
+        key = self.state.get('lookup_audit_key')
+        if not isinstance(key, str) or len(key) < 32:
+            key = self.state['lookup_audit_key'] = secrets.token_hex(32)
+            self.store.save()
+        return hmac.new(bytes.fromhex(key), username.lower().encode('utf-8'),
+                        hashlib.sha256).hexdigest()[:16]
 
     def actor_names(self, actors):
         """Display names for task actors (account ids and agent ids), best effort.

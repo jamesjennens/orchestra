@@ -692,7 +692,9 @@ the pilot phase, not part of this service.
   `work` walk (up to 10 subprocess reads of 100 rows), for at most 50 of the caller's
   projects. The same principal's read of a project is reused for 20 seconds
   (`EndpointBackend.READ_CACHE_SECONDS`, in memory, bounded to 2048 entries), so
-  repeated page loads do not re-export every project. Authority is never cached:
+  repeated page loads do not re-export every project. A principal's own successful
+  write drops their cached reads of that project, so their action shows at once.
+  Authority is never cached:
   each project is re-authorized on every request, so a removed member loses it at
   once; only the task data may be up to 20 seconds old on My work. The queue, brief
   and task list always read fresh.
@@ -709,8 +711,11 @@ the pilot phase, not part of this service.
   partial and disabled accounts, at most 20 lookups per principal per 10 minutes
   (`429 rate_limited` beyond that; in memory, reset on restart) and an audit event
   per authorized lookup on that project (`accounts.lookup`, outcome
-  `found`/`not_found`/`throttled`, reason `username_sha256=<16 hex>` of the
-  lower-cased name, never the name itself). Operators who need stronger guarantees
+  `found`/`not_found`/`throttled`, reason `username_hmac=<16 hex>`: HMAC-SHA256 of
+  the lower-cased name under a per-deployment key, never the name itself). The key
+  (`lookup_audit_key`) is generated once into the private service state and is never
+  logged or returned; it is backed up and restored with that state, and deleting it
+  only makes earlier digests incomparable with later ones. Operators who need stronger guarantees
   should disable self-service project creation (section 12 of the design) so only
   real project owners can look names up.
 - **Known limitation `endpoint-blocked-signal`.** `blocked` attention for an agent is

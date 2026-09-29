@@ -722,6 +722,10 @@ class CanonicalBindingReadCase(EndpointCase):
         active = self.request('GET', '/v1/projects/%s/tasks?status=active' % project,
                               token=alex).data
         self.assertTrue(active['review_states_complete'])
+        # "No contribution" lists only rows known to have none, never the unknown ones.
+        none = self.request('GET', '/v1/projects/%s/tasks?review_state=none' % project,
+                            token=alex).data
+        self.assertEqual([idle], [t['id'] for t in none['items']])
 
     def test_brief_of_a_hidden_project_is_404_before_any_canonical_read(self):
         alex, project = self.setup_project()
@@ -840,7 +844,7 @@ class LookupThrottleCase(TeamHarness):
             self.assertEqual(self.project, event['project_id'])
             self.assertEqual(self.ids['olive'], event['user_id'])
             self.assertTrue(event['request_id'])
-            self.assertRegex(event['reason'], r'^username_sha256=[0-9a-f]{16}$')
+            self.assertRegex(event['reason'], r'^username_hmac=[0-9a-f]{16}$')
         self.assertNotIn('otto', json.dumps(events))
         self.assertNotIn('nobody', json.dumps(events).lower())
         # Same name in any case gives the same digest, so repeated probing is visible.
@@ -854,7 +858,46 @@ class LookupThrottleCase(TeamHarness):
         self.assertEqual(4, len([e for e in audit['items'] if e['action'] == 'accounts.lookup']))
 
 
+class LookupDigestCase(TeamHarness):
+    def lookup(self, token, username):
+        return self.request('GET', '/v1/accounts/lookup?username=%s&project=%s'
+                            % (username, self.project), token=token)
+
+    def test_audit_digest_is_keyed_and_the_key_never_leaves_the_state(self):
+        import hashlib
+        import hmac as hmac_module
+        self.assertEqual(403, self.lookup(self.carl, 'otto').status)
+        self.assertNotIn('lookup_audit_key', self.store.state)  # not minted for a refusal
+        self.lookup(self.olive, 'otto')
+        key = self.store.state['lookup_audit_key']
+        self.assertEqual(64, len(key))
+        event = [e for e in self.store.state['audit'] if e['action'] == 'accounts.lookup'][-1]
+        # Not the plain (dictionary-reversible) hash of the name ...
+        self.assertNotIn(hashlib.sha256(b'otto').hexdigest()[:16], event['reason'])
+        # ... but the HMAC under the deployment key.
+        expected = hmac_module.new(bytes.fromhex(key), b'otto', hashlib.sha256).hexdigest()[:16]
+        self.assertEqual('username_hmac=' + expected, event['reason'])
+        # The key is stable across lookups and restarts, and never reaches a response.
+        self.lookup(self.olive, 'OTTO')
+        self.assertEqual(key, self.store.state['lookup_audit_key'])
+        from http_auth import Store
+        self.assertEqual(key, Store(self.store.path).state['lookup_audit_key'])
+        audit = self.request('GET', self.path('/audit?limit=100'), token=self.olive)
+        self.assertNotIn(key.encode(), audit.body)
+        for path in ('/v1/sessions/current', '/v1/me/work', self.path('/members')):
+            self.assertNotIn(key.encode(), self.request('GET', path, token=self.olive).body)
+
+
 class NextActionCase(unittest.TestCase):
+    def test_unknown_review_state_matches_no_review_filter(self):
+        from http_service import task_matches
+        unknown = {'id': 't', 'status': 'closed', 'review_state': None}
+        for state in ('none', 'awaiting-review', 'approved', 'awaiting-integration'):
+            self.assertFalse(task_matches(unknown, {'review_state': state}), state)
+        self.assertTrue(task_matches(unknown, {'status': 'closed'}))
+        self.assertTrue(task_matches({'id': 'u', 'review_state': 'none'},
+                                     {'review_state': 'none'}))
+
     def test_unknown_review_state_invites_nothing(self):
         from http_service import next_action
         self.assertIsNone(next_action({'status': 'open', 'assignee': 'u1', 'review_state': None}))
@@ -906,11 +949,32 @@ class MyWorkCacheCase(TeamHarness):
         self.request('DELETE', self.path('/members/%s' % self.ids['carl']), token=self.olive)
         self.assertEqual([], self.request('GET', '/v1/me/work', token=self.carl).data['assigned'])
         # Once the entry expires the next read is fresh.
+        # (checked below, after the own-write case)
+        # Olive's removal of carl above was her own write, so her entry is gone: the
+        # next read refetches, the one after is cached.
+        self.request('GET', '/v1/me/work', token=self.olive)
+        reads = self.backend.queue_reads
+        # Olive's own write drops her cached read of that project at once.
+        cached = self.request('GET', '/v1/me/work', token=self.olive).data
+        self.assertEqual(reads, self.backend.queue_reads)
+        second = self.create_task(self.olive, self.project, 'Second').data['id']
+        self.request('POST', self.path('/tasks/%s/claim' % second), {}, token=self.olive)
+        fresh = self.request('GET', '/v1/me/work', token=self.olive).data
+        self.assertEqual(reads + 1, self.backend.queue_reads)
+        self.assertEqual([], cached['assigned'])
+        self.assertEqual([second], [t['id'] for t in fresh['assigned']])
+        # Someone else's write does not evict olive's entry (it expires on its TTL).
+        self.request('GET', '/v1/me/work', token=self.olive)
+        self.assertEqual(reads + 1, self.backend.queue_reads)
+        self.request('PUT', self.path('/members/%s' % self.ids['carl']), {'role': 'viewer'},
+                     token=self.admin)
+        self.request('GET', '/v1/me/work', token=self.olive)
+        self.assertEqual(reads + 1, self.backend.queue_reads)
         cache = self.httpd.RequestHandlerClass.read_cache
         for key in list(cache):
             cache[key] = (0, cache[key][1])
         self.request('GET', '/v1/me/work', token=self.olive)
-        self.assertEqual(reads + 3, self.backend.queue_reads)
+        self.assertEqual(reads + 2, self.backend.queue_reads)
 
 
 if __name__ == '__main__':
