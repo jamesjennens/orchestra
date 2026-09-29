@@ -169,6 +169,62 @@ class NativeSyncCase(RuntimeCase):
                 admin.native_backup_sync(self.root, 'alpha')
         spawn.assert_not_called()
 
+    def test_a_clone_recording_another_projects_backup_target_is_refused(self):
+        # kittrial-5bb.49: `restore-new source clone` leaves the clone's
+        # .beads/dolt-backup.json naming backups/source, so a backup of the clone would
+        # sync it into the SOURCE project's directory. Refuse before any native command.
+        make_project(self.root, 'alphan')
+        (self.root / 'projects' / 'alphan' / '.beads' / 'dolt-backup.json').write_text(
+            json.dumps({'backup_name': 'default',
+                        'backup_url': (self.root / 'backups' / 'alpha').resolve().as_uri()}),
+            encoding='utf-8')
+        with patch.object(admin, 'spawn_sync_client') as spawn, \
+                patch.object(admin, 'run_bd') as native:
+            with self.assertRaisesRegex(ValueError, 'backups/alphan'):
+                admin.native_backup_sync(self.root, 'alphan')
+        spawn.assert_not_called()
+        native.assert_not_called()
+
+    def test_a_remote_or_malformed_backup_url_is_refused_too(self):
+        make_project(self.root, 'alpha')
+        for url in ('https://doltremoteapi.dolthub.com/user/repo',
+                    'file://elsewhere/backups/alpha',
+                    'backups/not-alpha'):
+            with self.subTest(url=url):
+                (self.root / 'projects' / 'alpha' / '.beads' / 'dolt-backup.json').write_text(
+                    json.dumps({'backup_name': 'default', 'backup_url': url}), encoding='utf-8')
+                with self.assertRaisesRegex(ValueError, 'backups/alpha'):
+                    admin.native_backup_sync(self.root, 'alpha')
+
+    def test_backup_refuses_a_foreign_target_before_the_pending_marker(self):
+        make_project(self.root, 'alphan')
+        (self.root / 'projects' / 'alphan' / '.beads' / 'dolt-backup.json').write_text(
+            json.dumps({'backup_name': 'default',
+                        'backup_url': (self.root / 'backups' / 'alpha').resolve().as_uri()}),
+            encoding='utf-8')
+        with patch.object(admin, 'native_backup_sync') as sync:
+            with self.assertRaisesRegex(ValueError, 'backups/alphan'):
+                admin.backup_project(self.root, 'alphan')
+        sync.assert_not_called()
+        self.assertFalse((self.root / 'backups' / 'alphan.coordination.json').exists())
+
+    def test_a_project_recording_its_own_target_still_backs_up(self):
+        make_project(self.root, 'alpha')
+        (self.root / 'projects' / 'alpha' / '.beads' / 'dolt-backup.json').write_text(
+            json.dumps({'backup_name': 'default',
+                        'backup_url': (self.root / 'backups' / 'alpha').resolve().as_uri()}),
+            encoding='utf-8')
+        with patch.object(admin, 'native_backup_sync', return_value='synced') as sync:
+            self.assertEqual(admin.backup_project(self.root, 'alpha'), 'synced')
+        sync.assert_called_once()
+
+    def test_a_project_with_no_recorded_target_keeps_the_pre_existing_path(self):
+        # A project that records no backup_url (legacy, or the make_project fixture every
+        # other test uses) is not refused: the guard only refuses a recorded mismatch.
+        make_project(self.root, 'alpha')
+        self.assertIsNone(admin.project_backup_record(self.root, 'alpha').get('backup_url'))
+        admin.validate_backup_target(self.root, 'alpha')
+
     def test_the_native_command_records_its_own_stderr_in_the_failure_reason(self):
         failure = subprocess.CalledProcessError(1, ['dolt', 'sql'],
                                                 stderr='Error 1105: backup target is full')

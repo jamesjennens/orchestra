@@ -22,6 +22,8 @@ from pathlib import Path
 from contextlib import contextmanager
 from bootstrap import install as install_binaries
 from requirements import content_hash
+from urllib.parse import unquote, urlsplit
+from urllib.request import url2pathname
 
 #: The live operation-journal store inside one project directory. It is included in a
 #: native project backup through ``snapshot_journal``/``restore_journal`` below (`bd
@@ -333,15 +335,69 @@ def project_server_metadata(root,name):
     if not all(data.get(key) for key in keys):return None
     return tuple(data[key] for key in keys)
 
-def project_backup_name(root,name):
-    """The Dolt backup name recorded in the project's ``.beads/dolt-backup.json``."""
+def project_backup_record(root,name):
+    """The parsed ``.beads/dolt-backup.json`` a project records, or None.
+
+    ``bd backup init`` writes ``backup_name`` (the Dolt backup entry a sync names) and
+    ``backup_url`` (the destination that entry pushes to), so this file is the kit's local
+    view of a project's native backup target. An absent, unreadable or non-object file
+    reads as None, which keeps a project with no recorded target on its pre-existing path.
+    """
     try:
         data=json.loads((project_dir(root,name)/'.beads'/'dolt-backup.json').read_text(encoding='utf-8'))
     except (OSError,ValueError):
         return None
-    if not isinstance(data,dict):return None
-    value=data.get('backup_name')
+    return data if isinstance(data,dict) else None
+
+def project_backup_name(root,name):
+    """The Dolt backup name recorded in the project's ``.beads/dolt-backup.json``."""
+    record=project_backup_record(root,name)
+    if record is None:return None
+    value=record.get('backup_name')
     return value if isinstance(value,str) and value else None
+
+def local_backup_path(url):
+    """The local path a recorded ``backup_url`` names, or None when it names no local path.
+
+    ``bd backup init`` records a filesystem destination as a ``file://`` URL (a bare path is
+    accepted too). A DoltHub remote, a malformed URL, or a ``file:`` URL carrying a host is
+    not this runtime's ``backups/<name>`` directory, so it resolves to None and a caller
+    comparing targets refuses it.
+    """
+    if not isinstance(url,str) or not url:return None
+    if url.startswith('file:'):
+        parts=urlsplit(url)
+        if parts.scheme!='file' or parts.netloc not in ('','localhost'):return None
+        return Path(url2pathname(unquote(parts.path))).resolve()
+    if '://' in url:return None
+    return Path(url).expanduser().resolve()
+
+def expected_backup_target(root,name):
+    """The native backup directory a project named ``name`` must record: ``backups/<name>``."""
+    return (root/'backups'/name).resolve()
+
+def validate_backup_target(root,name):
+    """Refuse a project whose recorded native backup target is not its own ``backups/<name>``.
+
+    ``restore-new`` creates a clone with ``bd backup restore``, which brings the SOURCE
+    project's ``.beads/dolt-backup.json`` and restored ``dolt_backups`` row along with the
+    database: both still name ``backups/<source>``. Backing up the clone would then sync it
+    into the SOURCE's directory - rewriting a generation whose complete sidecar and journal
+    snapshot still describe the source - and leave the clone's own directory stale, so the
+    kit refuses before any native command instead. A project that records no target at all
+    keeps its pre-existing path.
+    """
+    record=project_backup_record(root,name)
+    if record is None:return
+    url=record.get('backup_url')
+    if url is None:return
+    expected=expected_backup_target(root,name)
+    if local_backup_path(url)!=expected:
+        raise ValueError(
+            'Project %s records native backup target %s, not %s; refusing to sync, because a '
+            'restored clone inherits the source project\'s target and would overwrite that '
+            'project\'s backup. Re-point it with `bd backup init %s` or re-run `restore-new`.'
+            %(name,url,expected,expected))
 
 def native_backup_sync(root,name,client=None):
     """Synchronize one project's native Dolt backup without bd's fixed read timeout.
@@ -363,6 +419,10 @@ def native_backup_sync(root,name,client=None):
     it keeps the pre-existing ``bd backup sync`` path and is not part of that session
     handling.
     """
+    # A clone restored from another project records THAT project's target until it is
+    # re-pointed (see validate_backup_target), and syncing into it would overwrite the
+    # source project's backup directory.
+    validate_backup_target(root,name)
     metadata=project_server_metadata(root,name)
     backup_name=project_backup_name(root,name)
     if metadata is None or backup_name is None:
@@ -1074,6 +1134,11 @@ def backup_project(root,name):
     import fcntl
     from coordination import atomic
     path=project_dir(root,name)
+    # Refuse a project whose recorded target is not its own backups/<name> BEFORE the
+    # sidecar is replaced by a `pending` marker, so a clone that was never re-pointed
+    # cannot leave a failed marker beside a foreign target (and cannot overwrite the
+    # source project's backup). native_backup_sync repeats the check for direct callers.
+    validate_backup_target(root,name)
     with (path/'.coordination.lock').open('a') as lock, backup_lock(root,name), \
             last_complete_guard(root,name) as (bundle,last_complete,guard_state):
         fcntl.flock(lock,fcntl.LOCK_EX)
@@ -2104,6 +2169,16 @@ def main():
                 raise ValueError('Deployment is not installed; run install first')
             add_project(root,args.destination)
             print(run_bd(root,args.destination,['backup','restore',str(backup),'--force']))
+            # The native restore brings the SOURCE project's backup configuration with the
+            # restored database: `.beads/dolt-backup.json` and the restored `dolt_backups`
+            # row both still name `backups/<source>`. Left there, `backup <destination>`
+            # would sync the clone into the source project's directory (rewriting a
+            # generation whose complete sidecar and journal snapshot describe the source)
+            # and leave the clone's own directory stale, so re-point the destination at
+            # `backups/<destination>` before anything else. `bd backup init` updates an
+            # already-configured destination in place; validate_backup_target refuses any
+            # clone that was not re-pointed this way.
+            run_bd(root,args.destination,['backup','init',str(root/'backups'/args.destination)])
             restore_coordination(root,args.project,args.destination,
                                  restore_operators=args.restore_operators)
             restored=restore_journal(snapshot,
