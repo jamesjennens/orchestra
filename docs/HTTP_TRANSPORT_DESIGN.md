@@ -164,9 +164,10 @@ own machine and pull work over the API without SSH or shared directories.
   same record, token-hash, expiry, revocation and idempotent-replay machinery as
   the project worker credential, extended with `agent_id` and a project grant.
   The secret is shown once; `.orchestra/agent.json` holds the server URL, the
-  agent id and the project ids and **no secret**. The secret belongs in VS Code
-  secret storage or the OS credential store; an environment variable is only a
-  documented fallback, set from that store, and `.orchestra/` is kept out of Git.
+  agent id and the project ids and **no secret**. The secret belongs in
+  a per-agent curl config file in the user profile (`%USERPROFILE%\.orchestra-agent-<name>.curlrc` on Windows, `~/.orchestra-agent-<name>.curlrc` on macOS/Linux, mode 600) holding one line `header = "Authorization: Bearer <secret>"`; every call hands curl that file with `-K`. An environment variable is only a secondary fallback, and `.orchestra/` is kept out of Git. (Owner's practical update of
+  2026-09-29, superseding the "VS Code secret storage or the OS credential store
+  first" wording of owner decision 9; an agent in VS Code cannot read those stores.)
   The setup snippet and the copyable resume prompt never contain the secret and
   never show it being assigned on a command line (shell history).
 - **Authority.** Project access is granted like membership but is always capped at

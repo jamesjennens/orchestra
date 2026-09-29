@@ -224,15 +224,35 @@ the agent record, the setup payload and the credential secret **once**; an exact
 idempotent retry returns `200` with `secret_available:false` and never re-delivers it.
 
 The setup payload writes `.orchestra/agent.json` with the server URL, the agent id and
-the project ids and no secret. The secret belongs in VS Code secret storage or the OS
-credential store; an environment variable is only a documented fallback, set from that
-store, and `.orchestra/` stays out of Git. The setup snippet never shows the literal
-secret being assigned on a command line: a literal `export` would persist in shell
-history and the process list. Its fallback keeps the secret out of curl's argv as well:
-the user writes a mode-600 curl config file from that store (the header line, e.g.
-`header = "Authorization: Bearer <YOUR_AGENT_SECRET>"` in `~/.orchestra-agent-curlrc`)
-and curl reads the header from it with `-K`, so no shell expansion ever puts the secret
-in the process list. The
+the project ids and no secret, and `.orchestra/` stays out of Git. The secret belongs in
+a per-agent curl config file in the user profile (`%USERPROFILE%\.orchestra-agent-<name>.curlrc` on Windows, `~/.orchestra-agent-<name>.curlrc` on macOS/Linux, mode 600) holding one line `header = "Authorization: Bearer <secret>"`; every call hands curl that file with `-K`. An environment variable is only a secondary fallback (`ORCHESTRA_AGENT_SECRET`).
+This is the owner's practical update of 2026-09-29, which supersedes the "VS Code secret
+storage or the OS credential store first" wording of owner decision 9 on
+kittrial-5bb.22: an agent running in VS Code cannot read those stores, while curl reads
+the file itself. `<name>` is the agent name as a slug (lowercase letters, digits and
+hyphens, at most 40 characters; `agent_slug()`), and the setup payload returns the exact
+names as `secret_file`. Windows steps come first:
+
+1. Open Notepad and paste the one line with the secret shown once.
+2. File > Save As, "Save as type: All files (*.*)", file name
+   `%USERPROFILE%\.orchestra-agent-<name>.curlrc` (Windows file dialogs expand
+   `%USERPROFILE%`; no `.txt`). On macOS/Linux save `~/.orchestra-agent-<name>.curlrc`
+   and `chmod 600` it.
+3. Test it: `curl.exe -fsS -K "$env:USERPROFILE\.orchestra-agent-<name>.curlrc"
+   <server>/v1/agents/me` in PowerShell, or `curl -fsS -K ~/.orchestra-agent-<name>.curlrc
+   <server>/v1/agents/me`. Success prints the agent's JSON; `401` means a wrong secret or
+   header line; curl's "cannot read config from ..." (exit code 26) means a wrong file
+   name or a `.txt` extension.
+
+The web interface's setup dialog shows these steps with Copy buttons (the line with the
+real secret only in the dialog that has just issued it), and `.orchestra/AGENT.md` and
+the setup prompt name the agent's exact file and use `curl.exe -K`/`curl -K` for every
+call. The setup snippet and the resume prompt never show the secret on a command line: a
+literal `export` would persist in shell history and the process list, and curl reads the
+header from it with `-K`, so no shell expansion ever puts the secret in the
+process list either. A lost secret is replaced, never re-shown: `POST
+/v1/agents/{id}/credentials` issues a new one (the old credential works until revoked
+with `POST /v1/agents/{id}/credentials/{credential}/revoke`). The
 agent then calls `GET /v1/agents/me` and `GET /v1/agents/me/next` with its credential as a
 bearer token (`Authorization: Bearer <agent-secret>`); every other project route works as
 before, capped at the owner's live role and the agent's granted projects. A grant may
@@ -755,7 +775,9 @@ the pilot phase, not part of this service.
    and revoke agents in their project) and decision 9 (recommend VS Code secret
    storage or the OS credential store first, environment variable only as a
    documented fallback, never a literal `export` of the secret) are implemented in
-   this revision. The `owner-decisions-pending` checkpoint item is therefore
+   this revision. On 2026-09-29 the owner updated decision 9 in practice: the secret
+   lives in a per-agent curl config file in the user profile, used with `curl -K`
+   (section 6, "Personal agents"); the rest of decision 9 stands. The `owner-decisions-pending` checkpoint item is therefore
    resolved; the disposable-build caveat below still stands until rollout decisions
    1-6 in this list are recorded.
 

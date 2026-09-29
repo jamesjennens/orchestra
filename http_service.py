@@ -31,7 +31,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from http_auth import (AGENT_SECRET_ENV, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CAP_APPROVE,
+from http_auth import (AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CAP_APPROVE,
                        CAP_CHECKPOINTS, CAP_FEEDBACK,
                        CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_READ, CAP_REVIEWS,
                        CAP_TASKS, RESULT_RETENTION_SECONDS, HttpError, Service, Store,
@@ -2261,12 +2261,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                     % (first['kind'], first['task'], first['project']))
         else:
             what = 'There is nothing queued right now.'
+        # kittrial-5bb.48: the secret never reaches curl's argv. curl reads the header
+        # from the per-agent config file the owner stored (``-K``); no variable is
+        # expanded onto the command line.
+        secret_file = agent_secret_file(agent['name'])
         return ("Open your agent folder%s for agent '%s' (%s). %s\n"
-                "Read %s from VS Code secret storage or your OS credential store (an\n"
-                "environment variable is only a fallback), then run:\n"
-                "  curl -fsS -H \"Authorization: Bearer $%s\" %s/v1/agents/me/next"
-                % (where, agent['name'], agent['id'], what, AGENT_SECRET_ENV,
-                   AGENT_SECRET_ENV, server))
+                "Your secret is in %s (never print or copy it). Then run:\n"
+                "  PowerShell:  curl.exe -fsS -K \"%s\" %s/v1/agents/me/next\n"
+                "  macOS/Linux: curl -fsS -K %s %s/v1/agents/me/next"
+                % (where, agent['name'], agent['id'], what, secret_file['windows'],
+                   secret_file['windows_powershell'], server, secret_file['posix'], server))
 
     # -- task routes -----------------------------------------------------------
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks')

@@ -97,6 +97,31 @@ AGENT_DEFAULT_SCOPES = ('tasks', 'checkpoints', 'reviews', 'feedback')
 AGENT_CONFIG_PATH = '.orchestra/agent.json'
 AGENT_SECRET_ENV = 'ORCHESTRA_AGENT_SECRET'
 
+
+def agent_slug(name):
+    """File-name-safe slug of an agent name: lowercase ``[a-z0-9-]``, at most 40 chars.
+
+    Must stay identical to ``slug()`` in ``web/js/agentSetup.js`` (tests compare them).
+    """
+    slug = re.sub(r'[^a-z0-9]+', '-', str(name or '').lower()).strip('-')[:40].strip('-')
+    return slug or 'agent'
+
+
+def agent_secret_file(name):
+    """Where the owner keeps one agent's secret: a per-agent curl config file in the
+    user profile holding one ``header = "Authorization: Bearer <secret>"`` line.
+
+    Owner's practical update of 2026-09-29 (supersedes the "VS Code secret storage or
+    OS credential store first" wording of owner decision 9 on kittrial-5bb.22): an
+    agent running in VS Code cannot read those stores, but curl reads this file with
+    ``-K``, so the secret never reaches a command line, the agent folder or Git.
+    """
+    file_name = '.orchestra-agent-%s.curlrc' % agent_slug(name)
+    return {'name': file_name,
+            'windows': '%USERPROFILE%\\' + file_name,
+            'windows_powershell': '$env:USERPROFILE\\' + file_name,
+            'posix': '~/' + file_name}
+
 # Capabilities are the single authority vocabulary for every route. A route names
 # the capability it needs; the Service decides whether the live principal holds it.
 # Roles grant capabilities to interactive sessions; credential scopes grant a
@@ -1860,11 +1885,12 @@ class Service:
         The secret is returned once beside this payload; ``.orchestra/agent.json``
         holds only the server URL, the agent id and the project ids, so the directory
         the agent runs in is safe to keep. The snippet leads with VS Code secret
-        storage or the OS credential store (owner decision 9); an environment variable
-        is only a documented fallback, read from that store, and no command line ever
-        carries the literal secret (shell history, process list). The fallback hands
-        curl a **config file** (``-K``) that holds the header line, so the shell never
-        expands a secret into curl's argv.
+        storage or the OS credential store (owner decision 9)... superseded by the
+        owner's practical update of 2026-09-29: the secret lives in a per-agent curl
+        config file in the user profile (:func:`agent_secret_file`), Windows steps
+        first, and every call hands curl that file with ``-K``, so no command line
+        ever carries the secret (shell history, process list). The environment
+        variable remains a secondary fallback.
         """
         server_url = self.public_url
         config = {
@@ -1873,41 +1899,48 @@ class Service:
             'projects': list(projects if projects is not None else agent.get('projects') or []),
             'name': agent['name'],
         }
-        endpoint = (server_url or '<ORCHESTRA_SERVER_URL>') + '/v1/agents/me/next'
+        server = server_url or '<ORCHESTRA_SERVER_URL>'
+        secret_file = agent_secret_file(agent['name'])
         snippet = (
+            "# 1. Store the secret (once; outside the agent folder, never in Git).\n"
+            "#    Windows: open Notepad and paste this one line, with the secret shown once:\n"
+            "#      header = \"Authorization: Bearer <YOUR_AGENT_SECRET>\"\n"
+            "#    then File > Save As, \"Save as type: All files (*.*)\", file name:\n"
+            "#      %(win)s\n"
+            "#    macOS/Linux: save the same line to %(posix)s\n"
+            "#    in a text editor, then: chmod 600 %(posix)s (mode 600).\n"
+            "# 2. Test it (success prints the agent's JSON; 401 means a wrong secret or header\n"
+            "#    line; \"cannot read config\" means a wrong file name or a .txt extension):\n"
+            "#    PowerShell:  curl.exe -fsS -K \"%(ps)s\" %(server)s/v1/agents/me\n"
+            "#    macOS/Linux: curl -fsS -K %(posix)s %(server)s/v1/agents/me\n"
+            "# 3. In the agent folder (shell shown; the web page can save these files for you):\n"
             "mkdir -p .orchestra\n"
-            "cat > %s <<'JSON'\n%s\nJSON\n"
-            "printf '\\n.orchestra/\\n' >> .gitignore\n"
-            "# Store the secret shown once in VS Code secret storage or your OS\n"
-            "# credential store and let your client read it from there. Never write it\n"
-            "# into the file above, into Git, or onto a command line: a literal export\n"
-            "# would persist in shell history and the process list.\n"
-            "#\n"
-            "# Fallback only, for a machine with no secret store: keep the secret in a\n"
-            "# curl config file that only you can read (created mode 600), for example\n"
-            "# ~/.orchestra-agent-curlrc holding one line\n"
-            "#   header = \"Authorization: Bearer <YOUR_AGENT_SECRET>\"\n"
-            "# with the secret copied from your credential store - the %s\n"
-            "# environment variable may hold it on such a machine. curl reads the header\n"
-            "# from that file, so the secret never reaches the command line, shell history\n"
-            "# or the process list; never paste it into a command yourself. Then run:\n"
-            "curl -fsS -K ~/.orchestra-agent-curlrc %s\n"
-        ) % (AGENT_CONFIG_PATH, json.dumps(config, indent=2, sort_keys=True),
-             AGENT_SECRET_ENV, endpoint)
+            "cat > %(config_path)s <<'JSON'\n%(config)s\nJSON\n"
+            "[ -f .gitignore ] && ! grep -qx '.orchestra/' .gitignore && printf '\\n.orchestra/\\n' >> .gitignore\n"
+            "# Every call hands curl the config file (-K), so the secret never reaches a\n"
+            "# command line, shell history or the process list:\n"
+            "curl -fsS -K %(posix)s %(server)s/v1/agents/me/next\n"
+            "# Secondary fallback only, for a machine where that file cannot be kept: the\n"
+            "# %(env)s environment variable may hold the secret. Never write the secret\n"
+            "# on a command line, in the agent folder, in agent.json or in Git.\n"
+        ) % {'win': secret_file['windows'], 'ps': secret_file['windows_powershell'],
+             'posix': secret_file['posix'], 'server': server, 'config_path': AGENT_CONFIG_PATH,
+             'config': json.dumps(config, indent=2, sort_keys=True), 'env': AGENT_SECRET_ENV}
         return {
             'config_path': AGENT_CONFIG_PATH,
             'config': config,
             'config_contains_secret': False,
             'secret_env_var': AGENT_SECRET_ENV,
+            'secret_file': secret_file,
             'setup_snippet': snippet,
-            'guidance': 'Keep .orchestra/ out of Git. Keep the secret shown once in '
-                        'VS Code secret storage or the OS credential store and have '
-                        'the client read it from there; the %s environment variable is '
-                        'only a documented fallback, set from that store, and the '
-                        'literal secret must never appear on a command line. In the '
-                        'documented fallback curl reads the header from a mode-600 '
-                        'config file (-K), so the secret stays out of argv. It is '
-                        'shown only once.' % AGENT_SECRET_ENV,
+            'guidance': 'Keep .orchestra/ out of Git. Store the secret, shown once, in a '
+                        'per-agent curl config file in your user profile (%s on Windows, '
+                        '%s on macOS/Linux, mode 600) holding one line: header = '
+                        '"Authorization: Bearer <secret>". Every call hands curl that file '
+                        'with -K, so the secret never appears on a command line, in the '
+                        'agent folder or in Git. The %s environment variable is only a '
+                        'secondary fallback. The secret is shown only once.'
+                        % (secret_file['windows'], secret_file['posix'], AGENT_SECRET_ENV),
         }
 
     def _issue_agent_credential_locked(self, principal, agent, scopes=None, label=None):
