@@ -36,8 +36,10 @@ Rules that the code enforces
 What the stored secret is for
 -----------------------------
 The only secret this tool stores is an HTTP **bearer worker credential** for the
-office/API endpoint, read back from the platform store by a consumer such as
-``http_client``. The ``ssh`` and ``local`` config transports need no secret, so
+office/API endpoint. No module in this kit reads that store automatically yet:
+retrieve it with the credential-store backend
+(``default_store(service=...).retrieve(key)``) and pass it to ``http_client
+--credential``. The ``ssh`` and ``local`` config transports need no secret, so
 the setup CLI stores none by default; storing one is an explicit opt-in
 (``--store-credential``, or ``--secret-stdin``/the hidden prompt when that flag
 is set). The config's ``credential`` block records the store, service, key and
@@ -262,9 +264,11 @@ def build_config(
             "service": request.store_service,
             "key": credential_key,
             "purpose": (
-                "HTTP bearer worker credential for the office/API endpoint; read from the "
-                "platform credential store by http_client. The ssh and local transports do "
-                "not consume it, and the value is never stored in this config."
+                "HTTP bearer worker credential for the office/API endpoint. No client reads "
+                "this store automatically yet: retrieve it with the credential-store backend "
+                "(default_store(service=...).retrieve(key)) and pass it to http_client "
+                "--credential. The ssh and local transports do not consume it, and the value "
+                "is never stored in this config."
             ),
         }
     return config
@@ -304,11 +308,12 @@ def backup_previous_config(path: os.PathLike) -> Path:
     ``--force-config`` is a full replacement, so anything the assistant does not
     manage would otherwise be lost. The previous bytes are preserved verbatim
     (even if they are not valid JSON) with the same owner-only mode as the
-    config itself.
+    config itself. A second replacement does not overwrite the only backup: the
+    new copy gets ``.bak.1``, ``.bak.2``, ... instead.
     """
     target = Path(path).expanduser()
     data = target.read_bytes()
-    backup = target.with_name(target.name + ".bak")
+    backup = _available_backup_path(target)
     handle, temporary = tempfile.mkstemp(prefix=target.name + ".", suffix=".bak.tmp", dir=str(target.parent))
     try:
         with os.fdopen(handle, "wb") as stream:
@@ -325,6 +330,21 @@ def backup_previous_config(path: os.PathLike) -> Path:
             pass
         raise
     return backup
+
+
+def _available_backup_path(target: Path) -> Path:
+    """``<config>.bak`` when free, otherwise ``<config>.bak.N`` (never overwrite)."""
+    base = target.with_name(target.name + ".bak")
+    if not base.exists():
+        return base
+    for index in range(1, 1000):
+        candidate = target.with_name(f"{target.name}.bak.{index}")
+        if not candidate.exists():
+            return candidate
+    raise SetupError(
+        f"too many existing backups for {target}; move or remove some <name>.bak.N files",
+        exit_code=EXIT_ERROR,
+    )
 
 
 def _repository_root(target: Path) -> Optional[Path]:
@@ -351,6 +371,16 @@ def _git_ignores(root: Path, target: Path) -> bool:
     return completed.returncode == 0
 
 
+def _repository_path_warning(target: Path, description: str) -> Optional[str]:
+    root = _repository_root(target)
+    if root is None or _git_ignores(root, target):
+        return None
+    return (
+        f"warning: the {description} {target} is inside the git repository {root} "
+        "and is not git-ignored; add it to .gitignore or keep it outside the checkout"
+    )
+
+
 def repository_config_warning(config_path: os.PathLike) -> Optional[str]:
     """A non-fatal warning when the private config sits in a git checkout.
 
@@ -362,13 +392,18 @@ def repository_config_warning(config_path: os.PathLike) -> Optional[str]:
         target = Path(config_path).expanduser()
     except (TypeError, ValueError):
         return None
-    root = _repository_root(target)
-    if root is None or _git_ignores(root, target):
+    return _repository_path_warning(target, "private config")
+
+
+def repository_backup_warning(backup_path: os.PathLike) -> Optional[str]:
+    """The same warning for the ``.bak`` sibling, which is not covered by an
+    ignore rule for the config itself (for example ``client.local.json`` does
+    not match ``client.local.json.bak``)."""
+    try:
+        target = Path(backup_path).expanduser()
+    except (TypeError, ValueError):
         return None
-    return (
-        f"warning: the private config {target} is inside the git repository {root} "
-        "and is not git-ignored; add it to .gitignore or keep the config outside the checkout"
-    )
+    return _repository_path_warning(target, "config backup")
 
 
 def _prompt_for_missing(
@@ -535,6 +570,11 @@ def run_setup(
                 exit_code=EXIT_ERROR,
             ) from exc
         log_line(f"backed up the previous config to {config_backup}")
+        # The config's ignore rule usually does not cover the .bak sibling, so
+        # check it separately; otherwise it is one `git add .` from publishing.
+        backup_warning = repository_backup_warning(config_backup)
+        if backup_warning:
+            warnings.append(backup_warning)
 
     stored_now = False
     if request.store_secret and credential_key and secret and store is not None:

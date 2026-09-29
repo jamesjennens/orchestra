@@ -485,6 +485,27 @@ class PurposeAndSafetyTests(SetupTestCase):
         mode = stat.S_IMODE(Path(result.config_backup).stat().st_mode)
         self.assertEqual(mode, 0o600)
 
+    def test_second_force_config_keeps_the_first_backup(self):
+        self.config.write_text('{"marker": "one"}', encoding="utf-8")
+        first = sa.backup_previous_config(self.config)
+        self.config.write_text('{"marker": "two"}', encoding="utf-8")
+        second = sa.backup_previous_config(self.config)
+        self.assertNotEqual(first, second)
+        self.assertEqual(first.name, "client.local.json.bak")
+        self.assertEqual(second.name, "client.local.json.bak.1")
+        self.assertEqual(json.loads(first.read_text(encoding="utf-8")), {"marker": "one"})
+        self.assertEqual(json.loads(second.read_text(encoding="utf-8")), {"marker": "two"})
+
+    def test_backup_inside_a_non_ignored_checkout_warns(self):
+        repo = self.dir / "checkout"
+        (repo / ".git").mkdir(parents=True)
+        config = repo / "client.local.json"
+        config.write_text('{"keep": "original"}', encoding="utf-8")
+        with patch.object(sa, "_git_ignores", return_value=False):
+            result = sa.run_setup(self.request(config_path=str(config)), store=self.store,
+                                  interactive=False, confirm_config=True, log=self.logs.append)
+        self.assertTrue(any("config backup" in warning for warning in result.warnings))
+
     def test_default_credential_key_separates_actors_and_checkouts(self):
         base = sa.SetupRequest(project="example")
         actor_a = sa.SetupRequest(project="example", actor="actor-a")

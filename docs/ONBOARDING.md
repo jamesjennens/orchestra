@@ -42,16 +42,16 @@ python3 setup_assistant.py --project example --config /private/example/client.lo
     --actor SAVED_ACTOR --non-interactive
 ```
 
-The `ssh` and `local` transports need no secret, so **none is stored by default**. The only secret the tool stores is an HTTP bearer worker credential for the office/API endpoint, read back from the platform store by a consumer such as `http_client`; opt in with `--store-credential` (or pipe the value with `--secret-stdin`, which implies it). The config's `credential` block records the store, service, key and purpose and never the value. Set an explicit `--credential-key`, or let the default separate actors/checkouts: `<project>`, or `<project>:<12-hex digest of actor|checkout>` when an actor or checkout is known.
+The `ssh` and `local` transports need no secret, so **none is stored by default**. The only secret the tool stores is an HTTP bearer worker credential for the office/API endpoint; opt in with `--store-credential` (or pipe the value with `--secret-stdin`, which implies it). **No module reads that store automatically yet**: retrieve the value with the credential-store backend (`default_store(service=...).retrieve(key)`) and pass it to `http_client --credential`, or use your own consumer. The config's `credential` block records the store, service, key and purpose and never the value. Set an explicit `--credential-key`, or let the default separate actors/checkouts: `<project>`, or `<project>:<12-hex digest of actor|checkout>` when an actor or checkout is known.
 
-Backends are Windows Credential Manager (`pywin32`), the macOS keychain (`security -i`, so the secret stays out of argv), and the Linux Secret Service (`secret-tool`, from `libsecret-tools`). There is no plaintext fallback: an unavailable store is a clean error (exit 5) with an install/enable hint, reported before anything is written. Secrets are read only from a hidden prompt or stdin, never from argv, and every message is redacted.
+Backends are Windows Credential Manager (`pywin32`), the macOS keychain (`security -i`, so the secret stays out of argv), and the Linux Secret Service (`secret-tool`, from `libsecret-tools`). There is no plaintext fallback: an unavailable store is a clean error (exit 5) with an install/enable hint, reported before anything is written. Secrets are read only from a hidden prompt or stdin, never from argv, and every message is redacted. The Windows path has been exercised for real; the Linux `secret-tool` and macOS `security` paths are unit-tested against fakes that mirror the real tools but have not been run on those hosts here.
 
 Safe re-runs and dry runs:
 
-- An existing config or stored credential is replaced only with `--force-config` / `--force-credential` (or an interactive `y`). `--force-config` first copies the previous file to an owner-only `.bak` sibling, so keys this tool does not manage are not lost.
+- An existing config or stored credential is replaced only with `--force-config` / `--force-credential` (or an interactive `y`). `--force-config` first copies the previous file to an owner-only `.bak` sibling, so keys this tool does not manage are not lost; a further replacement keeps the older backups as `.bak.1`, `.bak.2`, ... rather than overwriting them.
 - If a replaced credential was overwritten and the config write then fails, the previous value is restored; a brand-new credential is deleted. A failed rollback is reported, never swallowed.
 - `--dry-run` validates and prints the config without writing, storing a secret, or requiring a reachable credential store.
-- Setup warns on stderr (non-fatal) when `--config` points inside a git checkout and is not git-ignored, so a private config is not published by a stray `git add`.
+- Setup warns on stderr (non-fatal) when `--config` — or the `.bak` it writes — points inside a git checkout and is not git-ignored, so a private config is not published by a stray `git add`.
 - The config file is written atomically (temporary file plus rename) and owner-only where the platform supports it.
 
 ## Minimal prompt

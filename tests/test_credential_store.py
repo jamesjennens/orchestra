@@ -278,8 +278,9 @@ class MacKeychainTests(unittest.TestCase):
 
     def test_store_uses_security_interactive_and_keeps_the_secret_out_of_argv(self):
         # `security add-generic-password ... -w` with no value prompts on
-        # /dev/tty; the secret is fed to `security -i` on stdin instead.
-        store, runner = self.build([(0, "", "")])
+        # /dev/tty; the secret is fed to `security -i` on stdin instead. The
+        # store then reads the value back, so the fake also answers the lookup.
+        store, runner = self.build([(0, "", ""), (0, FAKE_SECRET + "\n", "")])
         with patch.object(sys, "platform", "darwin"):
             store.store("example", FAKE_SECRET, overwrite=True)
         call = runner.calls[0]
@@ -287,6 +288,19 @@ class MacKeychainTests(unittest.TestCase):
         self.assertNotIn(FAKE_SECRET, " ".join(call["argv"]))
         self.assertIn("add-generic-password", call["input"])
         self.assertIn(FAKE_SECRET, call["input"])
+        self.assertEqual(runner.calls[1]["argv"][1], "find-generic-password")
+
+    def test_store_read_back_mismatch_is_an_error(self):
+        # Unverified `security -i` exit status or quoting must not look like success.
+        store, _ = self.build([(0, "", ""), (0, "some-other-value\n", "")])
+        with patch.object(sys, "platform", "darwin"):
+            with self.assertRaises(cs.CredentialStoreError) as caught:
+                store.store("example", FAKE_SECRET, overwrite=True)
+        self.assertIn("read-back", str(caught.exception))
+        self.assertNotIn(FAKE_SECRET, str(caught.exception))
+
+    def test_quote_escapes_quotes_and_backslashes(self):
+        self.assertEqual(cs.MacKeychainStore._quote('pa"ss\\word'), '"pa\\"ss\\\\word"')
 
     def test_store_failure_is_redacted(self):
         store, _ = self.build([(1, "", f"security: failed while handling {FAKE_SECRET}")])

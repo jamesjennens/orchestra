@@ -69,7 +69,7 @@ The bootstrap also accepts `start --name cline --request-id SAVED_REQUEST_UUID`.
 
 ## Per-actor private config and credential keys
 
-Each actor/checkout keeps its own private config (see [private config and the platform credential store](ONBOARDING.md#private-config-and-the-platform-credential-store)). `setup_assistant.py` writes it and, only when explicitly asked (`--store-credential`), stores an HTTP bearer worker credential in the platform credential store rather than in the file. The `ssh` and `local` transports need no secret, so no credential is stored by default.
+Each actor/checkout keeps its own private config (see [private config and the platform credential store](ONBOARDING.md#private-config-and-the-platform-credential-store)). `setup_assistant.py` writes it and, only when explicitly asked (`--store-credential`), stores an HTTP bearer worker credential in the platform credential store rather than in the file. The `ssh` and `local` transports need no secret, so no credential is stored by default. No module reads that store automatically: retrieve the value with the credential-store backend and pass it to `http_client --credential`.
 
 Because two actors or two checkouts of the same project must not share one stored secret, the default credential key is `<project>` when no discriminator is known, otherwise `<project>:<12-hex digest of actor|checkout>`. Pass `--actor` (and/or `--checkout`) so the key is namespaced, or set `--credential-key` explicitly. The digest is stable for a given actor/checkout pair and keeps the key short; it is bookkeeping, not an identity or an access control.
 

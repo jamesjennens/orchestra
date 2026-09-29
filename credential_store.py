@@ -372,6 +372,16 @@ class MacKeychainStore(_CommandStore):
         argv = [self._command_path() or self.executable, "-i"]
         self._run(argv, stdin_text=command + "\n", secrets=[secret],
                   action=f"store the credential for {key!r}")
+        # The exit status and quoting of ``security -i`` are not verifiable on a
+        # non-macOS host, so read the value back and compare. This turns a silent
+        # bad exit code or broken escaping into a clear error instead of a
+        # credential that was never really stored.
+        if self.retrieve(key) != secret:
+            raise CredentialStoreError(
+                f"{self.name}: the read-back after storing the credential for {key!r} did not "
+                "match; the 'security -i' command may be unavailable or its quoting is wrong "
+                "(the value is not echoed)"
+            )
 
     def retrieve(self, key: str) -> Optional[str]:
         self.require_available()
