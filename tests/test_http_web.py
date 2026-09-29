@@ -977,5 +977,137 @@ class MyWorkCacheCase(TeamHarness):
         self.assertEqual(reads + 2, self.backend.queue_reads)
 
 
+
+class AgentSetupDialogCase(unittest.TestCase):
+    """The agent setup dialog never puts the one-time secret in a file or a prompt.
+
+    ``web/js/agentSetup.js`` builds the saved files and the agent prompt from a
+    secretless payload; ``views/agents.js`` saves and copies only what it builds. The
+    static checks hold everywhere; the functional check runs the real module under
+    node when node is installed.
+    """
+    SETUP_JS = WEB / 'js' / 'agentSetup.js'
+    AGENTS_JS = WEB / 'js' / 'views' / 'agents.js'
+
+    @staticmethod
+    def code(path):
+        """Source without comments, so prose about the secret does not count."""
+        text = path.read_text(encoding='utf-8')
+        text = re.sub(r'/\*.*?\*/', '', text, flags=re.S)
+        return '\n'.join(line.split('//')[0] if not re.search(r"['`\"][^'`\"]*//", line)
+                         else line for line in text.splitlines())
+
+    @staticmethod
+    def function_body(text, name):
+        start = text.index('function ' + name + '(')
+        depth, index = 0, text.index('{', start)
+        for position in range(index, len(text)):
+            depth += {'{': 1, '}': -1}.get(text[position], 0)
+            if depth == 0:
+                return text[index:position + 1]
+        raise AssertionError('unbalanced ' + name)
+
+    def test_content_builders_never_read_the_credential(self):
+        code = self.code(self.SETUP_JS)
+        self.assertIsNone(re.search(r'\.credential\b|\.secret\b|\[[\'"]secret[\'"]\]', code))
+        self.assertNotIn('...created', code)
+        payload = self.function_body(code, 'secretlessPayload')
+        self.assertIn('Object.freeze', payload)
+
+    def test_save_and_prompt_paths_use_only_the_secretless_payload(self):
+        code = self.code(self.AGENTS_JS)
+        save = self.function_body(code, 'saveSetupFiles')
+        self.assertIsNone(re.search(r'secret|credential', save, re.I))
+        block = self.function_body(code, 'fileBlock')
+        self.assertIsNone(re.search(r'secret|credential', block, re.I))
+        dialog = self.function_body(code, 'setupDialog')
+        files = re.search(r'const files = (.*);', dialog).group(1)
+        prompt = re.search(r'const prompt = (.*);', dialog).group(1)
+        for built in (files, prompt):
+            self.assertNotIn('secret', built)
+            self.assertNotIn('created', built)
+            self.assertIn('payload', built)
+        # The secret variable is used only for its own box and its own copy button.
+        def unquoted(line):
+            return re.sub(r"'[^']*'|`[^`]*`", "''", line)
+        uses = [line.strip() for line in dialog.splitlines()
+                if re.search(r'\bsecret\b', unquoted(line))]
+        self.assertEqual(3, len(uses), uses)
+        self.assertTrue(any("copyButton('Copy', secret" in line for line in uses), uses)
+        self.assertTrue(any("h('div', { class: 'secret' }, secret)" in line for line in uses), uses)
+
+    def test_resume_prompt_names_the_file_the_dialog_writes(self):
+        setup = self.SETUP_JS.read_text(encoding='utf-8')
+        self.assertIn("export const GUIDE_PATH = '.orchestra/AGENT.md';", setup)
+        self.assertIn('Read ${GUIDE_PATH} in this folder', setup)
+        agents = self.code(self.AGENTS_JS)
+        self.assertIn('return setupText.resumePrompt(', agents)
+        self.assertIn('setupText.GUIDE_PATH', agents)
+
+    def test_save_is_feature_detected_and_gitignore_is_append_only(self):
+        agents = self.code(self.AGENTS_JS)
+        self.assertIn("typeof window.showDirectoryPicker === 'function' && Boolean(window.isSecureContext)", agents)
+        self.assertIn('Saving directly needs Edge or Chrome on an https or localhost address', agents)
+        save = self.function_body(agents, 'saveSetupFiles')
+        self.assertIn("mode: 'readwrite'", save)
+        self.assertIn("error.name === 'AbortError'", save)
+        # .gitignore is opened without create and written with keepExistingData.
+        self.assertIn("root.getFileHandle('.gitignore')", save)
+        self.assertNotIn("getFileHandle('.gitignore', { create", save)
+        self.assertIn('keepExistingData: true', save)
+        self.assertIn('confirmDialog', save)
+        dom = (WEB / 'js' / 'dom.js').read_text(encoding='utf-8')
+        self.assertIn("document.execCommand('copy')", dom)
+
+    def test_real_module_under_node(self):
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node is not installed; the static checks above still apply')
+        import subprocess
+        script = r"""
+const m = await import(process.argv[1]);
+const created = { agent: { id: 'agent_1', name: 'Kestrel', owner_display_name: 'Olive',
+    working_directory: 'C:\\Users\\james\\zcode-x\\', projects: ['p1'] },
+  credential: { id: 'c1', secret: 'SECRET-XYZ-123' }, secret_available: true,
+  setup: { config: { server_url: 'http://127.0.0.1:1', agent_id: 'agent_1', projects: ['p1'],
+    name: 'Kestrel' }, secret_env_var: 'ORCHESTRA_AGENT_SECRET', setup_snippet: 'x' } };
+const mock = { agent: { id: 'usr_9', display_name: 'Wren (agent)', working_directory: '/home/t/wren',
+    projects: [{ id: 'proj_a', name: 'A', role: 'contributor' }] }, owner_name: 'Tomasz',
+  server: 'https://orchestra.example.invalid', credential: { id: 'c', secret: 'MOCK-SECRET-777' } };
+const p = m.secretlessPayload(created, 'http://fallback');
+const q = m.secretlessPayload(mock, 'http://fallback');
+const texts = [m.agentJson(p), m.agentGuide(p), m.setupPrompt(p), JSON.stringify(p),
+               m.agentJson(q), m.agentGuide(q), m.setupPrompt(q), JSON.stringify(q)];
+console.log(JSON.stringify({
+  leaks: texts.filter((t) => t.includes('SECRET-XYZ-123') || t.includes('MOCK-SECRET-777')).length,
+  json: JSON.parse(m.agentJson(p)), mockJson: JSON.parse(m.agentJson(q)),
+  promptHasJson: m.setupPrompt(p).includes(m.agentJson(p).trimEnd()),
+  promptHasGuide: m.setupPrompt(p).includes(m.agentGuide(p).trimEnd()),
+  promptResumes: m.setupPrompt(p).includes('Read .orchestra/AGENT.md in this folder'),
+  paths: [m.destinationPath(p.workingDirectory, m.CONFIG_PATH), m.destinationPath('/home/j/x/', m.GUIDE_PATH),
+          m.destinationPath('D:', m.CONFIG_PATH), m.destinationPath('', m.CONFIG_PATH)],
+  ignore: [m.gitignoreAppend('node_modules'), m.gitignoreAppend('a\r\n'), m.gitignoreAppend('/.orchestra\n'),
+           m.gitignoreAppend('x\n.orchestra/\n'), m.gitignoreAppend('.orchestra-old\n')],
+}));
+"""
+        out = subprocess.run([node, '--input-type=module', '-e', script, self.SETUP_JS.as_uri()],
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual(0, out.returncode, out.stderr)
+        result = json.loads(out.stdout)
+        self.assertEqual(0, result['leaks'])
+        self.assertEqual({'server_url': 'http://127.0.0.1:1', 'agent_id': 'agent_1',
+                          'projects': ['p1'], 'name': 'Kestrel'}, result['json'])
+        self.assertEqual({'server_url': 'https://orchestra.example.invalid', 'agent_id': 'usr_9',
+                          'projects': ['proj_a'], 'name': 'Wren'}, result['mockJson'])
+        self.assertTrue(result['promptHasJson'] and result['promptHasGuide'] and result['promptResumes'])
+        self.assertEqual([
+            {'path': 'C:\\Users\\james\\zcode-x\\.orchestra\\agent.json', 'relative': False},
+            {'path': '/home/j/x/.orchestra/AGENT.md', 'relative': False},
+            {'path': 'D:\\.orchestra\\agent.json', 'relative': False},
+            {'path': '.orchestra\\agent.json', 'relative': True}], result['paths'])
+        self.assertEqual(['\n.orchestra/\n', '.orchestra/\r\n', '', '', '.orchestra/\n'],
+                         result['ignore'])
+
+
 if __name__ == '__main__':
     unittest.main()

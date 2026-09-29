@@ -307,6 +307,11 @@ fieldset.checks { border: 1px solid var(--line); border-radius: var(--radius); p
 fieldset.checks legend { font-size: var(--t-sm); font-weight: 600; color: var(--ink-2); padding: 0 4px; }
 dialog { max-height: calc(100vh - 48px); overflow: auto; }
 dialog pre.json { max-height: 220px; white-space: pre-wrap; }
+dialog.dialog-wide { width: min(760px, calc(100vw - 32px)); }
+.setup-block { display: flex; flex-direction: column; gap: 6px; }
+.copy-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.copy-row h3 { margin: 0; margin-right: auto; }
+.error-text { color: var(--crit); }
 
 /* ---------- responsive ---------- */
 @media (max-width: 960px) {

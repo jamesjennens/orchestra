@@ -1,8 +1,9 @@
 // Personal agents: each belongs to the person who runs it. Nothing polls; when the
 // owner opens this page they see which agent has something to do and which folder to
 // open in VS Code to resume it. Agents themselves read work over the REST API.
-import { h, time, toast, secretDialog } from '../dom.js';
+import { h, time, toast, copyText, copyButton, confirmDialog } from '../dom.js';
 import { pageHead, empty, field, setFieldError, formValues, act, errorState } from '../ui.js';
+import * as setupText from '../agentSetup.js';
 
 export const ATTENTION = {
   feedback: ['Has feedback to act on', 'warn'],
@@ -43,14 +44,13 @@ export function attentionChip(state) {
 }
 
 async function copy(text, what) {
-  try { await navigator.clipboard.writeText(text); toast(what + ' copied'); } catch { toast('Select the text and press Ctrl+C to copy'); }
+  if (await copyText(text)) toast(what + ' copied'); else toast('Select the text and press Ctrl+C to copy');
 }
 
-const plain = (name) => String(name || '').replace(/\s*\(agent[^)]*\)$/, '');
-
+// The same instruction in both modes: the setup dialog writes .orchestra/AGENT.md and
+// this prompt tells the agent to read exactly that file.
 export function resumePrompt(agent) {
-  if (agent.server) return `You are ${plain(agent.display_name)}, an Orchestra agent. Read .orchestra/agent.json in this folder, read your secret from your credential store, and ask Orchestra for your next action at /v1/agents/me/next. Continue from there.`;
-  return `You are ${plain(agent.display_name)}, an Orchestra agent. Read .orchestra/AGENT.md in this folder and follow it: ask Orchestra for your next action and continue from there.`;
+  return setupText.resumePrompt(agent.display_name || agent.name);
 }
 
 // One agent's card: status, what is waiting, and exactly where to go to resume it.
@@ -132,38 +132,144 @@ export async function list(ctx) {
     h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Add an agent')), h('div', { class: 'panel-body' }, form)));
 }
 
-// Shown once after creation: the setup files for the agent's folder and its secret.
-function setupDialog(created) {
-  if (created.setup) return serverSetupDialog(created);
-  const a = created.agent;
-  const agentJson = JSON.stringify({ server: created.server, agent_id: a.id, name: plain(a.display_name), projects: a.projects.map((p) => p.id), token_env: 'ORCHESTRA_TOKEN' }, null, 2);
-  const agentMd = `# ${plain(a.display_name)}\n\nYou are ${plain(a.display_name)}, an Orchestra agent owned by ${created.owner_name}.\n\n1. Read your identity from .orchestra/agent.json. The access token is in the environment variable ORCHESTRA_TOKEN — never write it to a file or commit it.\n2. GET ${created.server}/v1/agents/me/next with header "Authorization: Bearer $ORCHESTRA_TOKEN". It returns your next action: feedback to address, work to continue, or tasks you could claim.\n3. Before coding, read the task brief it links to. Record a checkpoint when you stop, and deliver work for review through the API.\n4. Stop and tell your owner if anything is unclear.`;
-  const secret = created.credential.secret;
-  secretDialog({
-    title: `Set up ${plain(a.display_name)}`,
-    body: `Create a folder .orchestra in ${a.working_directory || 'the agent’s folder'} with agent.json and AGENT.md (below), and keep it out of Git. Set ORCHESTRA_TOKEN to this token in the terminal or VS Code settings you run the agent from. The token is shown once.`,
-    secret,
-  });
-  const dialog = document.querySelector('dialog:last-of-type .dialog-body');
-  if (dialog) {
-    dialog.append(
-      h('h3', { class: 'small' }, '.orchestra/agent.json'), h('pre', { class: 'json' }, agentJson),
-      h('h3', { class: 'small' }, '.orchestra/AGENT.md'), h('pre', { class: 'json' }, agentMd));
+// ---- one-time setup dialog ---------------------------------------------------
+//
+// Shown once after creation. The secret appears only in its own box and its own copy
+// button. Everything that can be saved to disk or pasted into the agent's chat is built
+// by agentSetup.js from secretlessPayload(), which never reads the credential.
+
+const canSaveToFolder = () => typeof window.showDirectoryPicker === 'function' && Boolean(window.isSecureContext);
+
+// Writes .orchestra/agent.json and .orchestra/AGENT.md into a folder the user picks, and
+// appends .orchestra/ to an EXISTING .gitignore that lacks it. Creates or rewrites
+// nothing else. `files` is [[name, text], ...] built from the secretless payload.
+async function saveSetupFiles(files) {
+  let root;
+  try {
+    root = await window.showDirectoryPicker({ id: 'orchestra-agent', mode: 'readwrite' });
+  } catch (error) {
+    if (error && error.name === 'AbortError') return { cancelled: true };
+    throw error;
   }
+  if (root.queryPermission && (await root.queryPermission({ mode: 'readwrite' })) !== 'granted') {
+    const granted = root.requestPermission ? await root.requestPermission({ mode: 'readwrite' }) : 'denied';
+    if (granted !== 'granted') throw Object.assign(new Error('Write permission was not granted'), { name: 'NotAllowedError' });
+  }
+  const missing = (error) => error && (error.name === 'NotFoundError' || error.name === 'TypeMismatchError');
+  let dir = null;
+  try { dir = await root.getDirectoryHandle('.orchestra'); } catch (error) { if (!missing(error)) throw error; }
+  const existing = [];
+  if (dir) {
+    for (const [name] of files) {
+      try { await dir.getFileHandle(name); existing.push('.orchestra/' + name); } catch (error) { if (!missing(error)) throw error; }
+    }
+  }
+  if (existing.length) {
+    const replace = await confirmDialog({
+      title: 'Replace the existing setup files?',
+      body: `${root.name} already has ${existing.join(' and ')}. Replacing points this folder at the new agent. Nothing else in the folder changes.`,
+      confirmLabel: 'Replace', danger: true,
+    });
+    if (!replace) return { cancelled: true };
+  }
+  dir = dir || await root.getDirectoryHandle('.orchestra', { create: true });
+  const written = [];
+  for (const [name, text] of files) {
+    const handle = await dir.getFileHandle(name, { create: true });
+    const out = await handle.createWritable();
+    await out.write(text);
+    await out.close();
+    written.push('.orchestra/' + name);
+  }
+  let ignore = null;
+  try { ignore = await root.getFileHandle('.gitignore'); } catch (error) { if (!missing(error)) throw error; }
+  if (ignore) {
+    const current = await ignore.getFile();
+    const addition = setupText.gitignoreAppend(await current.text());
+    if (addition) {
+      const out = await ignore.createWritable({ keepExistingData: true });
+      await out.seek(current.size);
+      await out.write(addition);
+      await out.close();
+      written.push('.gitignore (added .orchestra/)');
+    }
+  }
+  return { written, folder: root.name };
 }
 
-// The server's own setup: a secretless config file and guidance; the secret is shown once.
-function serverSetupDialog(created) {
-  const setup = created.setup;
-  const name = created.agent.name || created.agent.display_name;
-  secretDialog({
-    title: `Set up ${name}`,
-    body: `${setup.guidance || ''} Save ${setup.config_path} (below) in the agent's folder and keep it out of Git.`,
-    secret: created.credential.secret,
-  });
-  const dialog = document.querySelector('dialog:last-of-type .dialog-body');
-  if (dialog) {
-    dialog.append(h('h3', { class: 'small' }, setup.config_path), h('pre', { class: 'json' }, JSON.stringify(setup.config, null, 2)));
-    if (setup.setup_snippet) dialog.append(h('h3', { class: 'small' }, 'Setup notes'), h('pre', { class: 'json' }, setup.setup_snippet));
+function fileBlock(title, text, folder, relative) {
+  const destination = setupText.destinationPath(folder, relative);
+  const name = relative.split('/').pop();
+  return h('section', { class: 'setup-block', 'aria-label': title },
+    h('div', { class: 'copy-row' },
+      h('h3', { class: 'small' }, title),
+      copyButton('Copy', text, { ariaLabel: 'Copy ' + name + ' contents', what: name }),
+      copyButton('Copy path', destination.path, { ariaLabel: 'Copy the path to save ' + name, what: 'Path' })),
+    h('p', { class: 'small muted' }, 'Save as ', h('code', { class: 'path' }, destination.path),
+      destination.relative ? ' (no folder is recorded for this agent, so this path is relative to its folder)' : null),
+    h('pre', { class: 'json' }, text));
+}
+
+function setupDialog(created) {
+  const secret = created.credential && created.credential.secret;
+  const payload = setupText.secretlessPayload(created, location.origin);
+  const files = [['agent.json', setupText.agentJson(payload)], ['AGENT.md', setupText.agentGuide(payload)]];
+  const folder = payload.workingDirectory;
+  const where = folder ? h('code', { class: 'path' }, folder) : 'the agent’s folder';
+
+  const status = h('p', { class: 'small', role: 'status', hidden: true });
+  let save;
+  if (canSaveToFolder()) {
+    save = h('div', { class: 'copy-row' },
+      h('button', { type: 'button', class: 'primary', 'aria-describedby': 'setup-save-hint', onclick: async (event) => {
+        const button = event.currentTarget;
+        button.disabled = true;
+        status.hidden = true;
+        try {
+          const result = await saveSetupFiles(files);
+          if (!result.cancelled) {
+            status.className = 'small';
+            status.setAttribute('role', 'status');
+            status.textContent = `Saved in ${result.folder}: ${result.written.join(', ')}.`;
+            status.hidden = false;
+            toast('Setup files saved');
+          }
+        } catch (error) {
+          status.className = 'small error-text';
+          status.setAttribute('role', 'alert');
+          status.textContent = error && (error.name === 'NotAllowedError' || error.name === 'SecurityError')
+            ? 'The browser did not allow writing to that folder. Choose a folder you can write to, or use the copy buttons below.'
+            : 'Could not save the files (' + ((error && error.message) || 'unknown error') + '). Use the copy buttons below instead.';
+          status.hidden = false;
+        } finally {
+          button.disabled = false;
+        }
+      } }, 'Save to agent folder…'),
+      h('span', { class: 'small muted', id: 'setup-save-hint' }, 'Pick ', where, '. Writes .orchestra/agent.json and .orchestra/AGENT.md, and adds .orchestra/ to an existing .gitignore. The secret is never saved.'));
+  } else {
+    save = h('p', { class: 'small muted', role: 'note' }, 'Saving directly needs Edge or Chrome on an https or localhost address. Use the copy buttons below instead.');
   }
+
+  const prompt = setupText.setupPrompt(payload);
+  const dialog = h('dialog', { class: 'dialog-wide', 'aria-labelledby': 'setup-title' });
+  dialog.append(
+    h('div', { class: 'dialog-body' },
+      h('h2', { id: 'setup-title' }, `Set up ${payload.name}`),
+      h('p', null, 'Put two small files in ', where, ': ', h('code', null, setupText.CONFIG_PATH), ' and ', h('code', null, setupText.GUIDE_PATH),
+        '. Keep .orchestra/ out of Git. Neither file holds the secret: keep it in VS Code secret storage or your operating system’s credential store. It is shown only once, here.'),
+      h('section', { class: 'setup-block', 'aria-label': 'Secret' },
+        h('div', { class: 'copy-row' }, h('h3', { class: 'small' }, 'Secret (shown once)'), copyButton('Copy', secret, { ariaLabel: 'Copy the secret', what: 'Secret' })),
+        h('div', { class: 'secret' }, secret)),
+      h('section', { class: 'setup-block', 'aria-label': 'Save the setup files' }, save, status),
+      h('section', { class: 'setup-block', 'aria-label': 'Agent prompt' },
+        h('div', { class: 'copy-row' }, h('h3', { class: 'small' }, 'Or let the agent do it'), copyButton('Copy agent prompt', prompt, { what: 'Agent prompt' })),
+        h('p', { class: 'small muted' }, 'Paste this into the agent’s own chat, opened in its folder. It creates both files, updates .gitignore in a Git repository, then continues. It does not contain the secret.'),
+        h('details', null, h('summary', null, 'Show the prompt'), h('pre', { class: 'json' }, prompt))),
+      fileBlock(setupText.CONFIG_PATH, files[0][1], folder, setupText.CONFIG_PATH),
+      fileBlock(setupText.GUIDE_PATH, files[1][1], folder, setupText.GUIDE_PATH),
+      created.setup && created.setup.setup_snippet ? h('details', null, h('summary', null, 'Shell commands instead (optional)'), h('pre', { class: 'json' }, created.setup.setup_snippet)) : null),
+    h('div', { class: 'dialog-foot' }, h('button', { type: 'button', class: 'primary', onclick: () => { dialog.close(); dialog.remove(); } }, 'Done')));
+  dialog.addEventListener('close', () => dialog.remove());
+  document.body.appendChild(dialog);
+  dialog.showModal();
 }

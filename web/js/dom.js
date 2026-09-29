@@ -110,6 +110,42 @@ export function confirmDialog({ title, body, confirmLabel = 'Confirm', danger = 
   });
 }
 
+// Copies text to the clipboard: the async Clipboard API where the page is a secure
+// context, else a temporary off-screen textarea and execCommand('copy'). Resolves
+// true when the copy happened. The textarea is removed at once and never persisted.
+export async function copyText(text) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(text); return true; }
+  } catch { /* fall back below */ }
+  const area = h('textarea', { class: 'visually-hidden', readonly: true, 'aria-hidden': 'true', tabindex: '-1' });
+  area.value = text;
+  const host = document.querySelector('dialog[open]') || document.body; // a modal dialog is the only focusable layer
+  const active = document.activeElement;
+  host.appendChild(area);
+  area.select();
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch { ok = false; }
+  area.remove();
+  if (active && active.focus) active.focus();
+  return ok;
+}
+
+// A small button that copies `text` (or `text()`) and briefly says "Copied".
+export function copyButton(label, text, { ariaLabel, what } = {}) {
+  const button = h('button', { type: 'button', class: 'ghost', 'aria-label': ariaLabel || label }, label);
+  button.addEventListener('click', async () => {
+    const ok = await copyText(typeof text === 'function' ? text() : text);
+    if (ok) {
+      button.textContent = 'Copied';
+      toast((what || 'Text') + ' copied');
+      setTimeout(() => { button.textContent = label; }, 1500);
+    } else {
+      toast('Copy is blocked here: select the text and press Ctrl+C', 'crit');
+    }
+  });
+  return button;
+}
+
 // Shows a one-time secret (reset value, worker credential). It is displayed once and
 // never stored by the page.
 export function secretDialog({ title, body, secret }) {
@@ -117,8 +153,8 @@ export function secretDialog({ title, body, secret }) {
   const box = h('div', { class: 'secret', id: 'secret-value' }, secret);
   const copy = h('button', {
     type: 'button', onclick: async () => {
-      try { await navigator.clipboard.writeText(secret); toast('Copied'); }
-      catch { const range = document.createRange(); range.selectNodeContents(box); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(range); toast('Selected — press Ctrl+C to copy'); }
+      if (await copyText(secret)) { toast('Copied'); return; }
+      const range = document.createRange(); range.selectNodeContents(box); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(range); toast('Selected — press Ctrl+C to copy');
     },
   }, 'Copy');
   dialog.append(
