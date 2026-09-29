@@ -24,6 +24,12 @@ return settled work to the awaiting-integration queue, and an older pass is not
 undone by a newer failure recorded against the same commit under a different
 scope. ``integration.newest_fact`` exposes the newest matching scope's value, so
 that rule is auditable rather than accidental.
+
+Each ``prior_contributions`` entry carries the SAME additive ``integration``
+block, computed from that entry's own FULL commit and the same scopes, so a read
+of a follow-on says whether the replaced revision is integrated instead of only
+showing its record, commit and relation. Prior entries keep every existing key;
+the any-pass-wins rule above is applied unchanged.
 """
 
 
@@ -64,14 +70,25 @@ def effective(result, scopes=None, workflow_state=None):
     ``workflow_state`` overrides the raw state recorded alongside the effective
     one; `project` passes the pre-legacy-label state so the raw chain value stays
     visible even when the legacy ``review-ready`` label supplies the state.
+
+    Every ``prior_contributions`` entry gets the same additive ``integration``
+    block as the current contribution, computed from that entry's own commit over
+    the same ``scopes``. Existing entry keys are untouched, so a follow-on read
+    can answer "is the revision this one follows already integrated?" without
+    re-implementing the rule. The answer is only added when the raw result
+    carries the key, which keeps direct callers of this function working.
     """
     evidence=integration(result.get('contribution'),scopes)
     state=result['review_state']
     if state=='awaiting-integration' and evidence['matches_contribution'] and evidence['fact']=='passed':
         state='integrated'
-    return dict(result,review_state=state,
+    answer=dict(result,review_state=state,
                 workflow_state=result['review_state'] if workflow_state is None else workflow_state,
                 integration=evidence)
+    priors=result.get('prior_contributions')
+    if priors is not None:
+        answer['prior_contributions']=[dict(c,integration=integration(c,scopes)) for c in priors]
+    return answer
 
 
 def scopes_for(rows, task):
