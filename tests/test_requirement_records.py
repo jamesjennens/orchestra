@@ -423,6 +423,96 @@ class RequirementRecordTests(unittest.TestCase):
         self.assertEqual(evidence[0]['decision']['decision_id'], 'decision-1')
         self.assertEqual(evidence[0]['operator'], 'alice')
 
+    def test_operator_accepts_first_revision_on_new_record_and_retries(self):
+        payload = self.draft(operation_id='op-accepted-first', acceptance_state='accepted',
+                             acceptance=self.acceptance())
+        result = self.apply(payload, operator=True)
+        record = self.native.record(result['id'], 1)
+        self.assertEqual(record['acceptance_state'], 'accepted')
+        self.assertEqual(record['sha256'], content_hash(record))
+        self.assertEqual(record['sha256'], rr.requirement_record(payload, result['id'], 1)['sha256'])
+        self.assertEqual(result['acceptance']['record_sha256'], record['sha256'])
+        self.assertIn('requirement:accepted', self.native.row(result['id'])['labels'])
+        self.assertEqual(len(self.native.acceptances(result['id'])), 1)
+        writes = list(self.native.writes())
+        self.assertTrue(self.apply(payload, operator=True)['reconciled'])
+        self.assertEqual(self.native.writes(), writes)
+        self.assertEqual(self.native.record(result['id'], 1), record)
+
+        subsequent = self.revise(task=result['id'], operation_id='op-accepted-second',
+                                 acceptance_state='accepted', acceptance=self.acceptance(
+                                     decision_id='decision-2'))
+        self.assertEqual(self.apply(subsequent, operator=True)['revision'], 2)
+        self.assertEqual(self.native.record(result['id'], 2)['acceptance_state'], 'accepted')
+
+    def test_operator_accepts_first_revision_on_revisionless_existing_task(self):
+        for task, labels in [('req-untyped', []), ('req-typed', ['requirement', 'requirement:draft'])]:
+            with self.subTest(task=task):
+                self.native.seed(task, labels=labels)
+                payload = self.draft(operation_id='op-' + task, task=task, parent=None,
+                                     key='R-' + task, acceptance_state='accepted',
+                                     acceptance=self.acceptance(decision_id='decision-' + task))
+                result = self.apply(payload, operator=True)
+                self.assertFalse(result['created'])
+                self.assertEqual(self.native.record(task, 1)['sha256'],
+                                 rr.requirement_record(payload, task, 1)['sha256'])
+                self.assertIn('requirement:accepted', self.native.row(task)['labels'])
+                self.assertEqual(len(self.native.acceptances(task)), 1)
+
+    def test_accepted_first_revision_refusals_make_no_native_write(self):
+        accepted = self.draft(operation_id='op-accepted-refused', acceptance_state='accepted',
+                              acceptance=self.acceptance())
+        with self.assertRaisesRegex(ValueError, 'acceptance_state must be draft'):
+            self.apply(accepted)
+        self.assertEqual(self.native.calls, [])
+        self.assertEqual(self.receipts(), [])
+        accepted.pop('acceptance')
+        with self.assertRaisesRegex(ValueError, 'F3 acceptance evidence'):
+            self.apply(accepted, operator=True)
+        self.assertEqual(self.native.calls, [])
+        self.assertEqual(self.receipts(), [])
+        accepted['acceptance'] = self.acceptance(owners=[])
+        with self.assertRaisesRegex(ValueError, 'invalid acceptance evidence'):
+            self.apply(accepted, operator=True)
+        self.assertEqual(self.native.calls, [])
+        self.assertEqual(self.receipts(), [])
+
+    def test_operator_cannot_replace_an_existing_first_revision(self):
+        first = self.draft(operation_id='op-first', acceptance_state='accepted',
+                           acceptance=self.acceptance())
+        result = self.apply(first, operator=True)
+        conflicting = self.draft(operation_id='op-other-first', task=result['id'],
+                                 parent=None, title='Different first revision',
+                                 acceptance_state='accepted',
+                                 acceptance=self.acceptance(decision_id='decision-2'))
+        writes = list(self.native.writes())
+        with self.assertRaisesRegex(ValueError, 'different content'):
+            self.apply(conflicting, operator=True)
+        self.assertEqual(self.native.writes(), writes)
+
+    def test_accepted_first_revision_evidence_precedes_label_and_revision(self):
+        payload = self.draft(operation_id='op-accepted-order', acceptance_state='accepted',
+                             acceptance=self.acceptance())
+        self.native.fail_comment_prefix = ACCEPTANCE_PREFIX
+        with self.assertRaisesRegex(ValueError, 'acceptance evidence'):
+            self.apply(payload, operator=True)
+        row = self.native.row('req-1')
+        self.assertIn('requirement:draft', row['labels'])
+        self.assertNotIn('requirement:accepted', row['labels'])
+        self.assertEqual(self.native.comments('req-1'), [])
+        self.native.fail_comment_prefix = None
+        self.assertTrue(self.apply(payload, operator=True)['reconciled'])
+        writes = self.native.writes()
+        evidence_index = next(i for i, call in enumerate(writes)
+                              if call[:2] == ['comments', 'add'] and call[3].startswith(ACCEPTANCE_PREFIX))
+        revision_index = next(i for i, call in enumerate(writes)
+                              if call[:2] == ['comments', 'add'] and call[3].startswith(REVISION_PREFIX))
+        label_index = next(i for i, call in enumerate(writes)
+                           if call[:2] == ['update', 'req-1'] and '--add-label' in call
+                           and call[call.index('--add-label') + 1] == 'requirement:accepted')
+        self.assertLess(evidence_index, revision_index)
+        self.assertLess(revision_index, label_index)
+
     def test_operator_accept_without_evidence_is_refused(self):
         self.apply(self.draft())
         before = list(self.native.writes())
