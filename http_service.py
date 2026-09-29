@@ -27,6 +27,7 @@ import ssl
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from http_auth import (AGENT_SECRET_ENV, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CAP_APPROVE,
@@ -71,6 +72,85 @@ REQUEST_ID = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
 IDEMPOTENCY_KEY = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$')
 CURSOR = re.compile(r'^[A-Za-z0-9_-]{1,%d}$' % MAX_CURSOR)
 LOOPBACK = ('127.0.0.1', '::1', 'localhost')
+
+# ------------------------------------------------------------------ web interface
+#: The browser interface shipped beside this module. ``--web-root`` relocates it and
+#: ``--no-web`` turns static serving off; ``/v1`` is unaffected either way.
+DEFAULT_WEB_ROOT = Path(__file__).resolve().parent / 'web'
+#: The only media types the static route ever serves. Anything else is a 404.
+STATIC_MEDIA_TYPES = {
+    '.html': 'text/html; charset=utf-8',
+    '.css': 'text/css; charset=utf-8',
+    '.js': 'text/javascript; charset=utf-8',
+    '.svg': 'image/svg+xml',
+    '.png': 'image/png',
+    '.ico': 'image/x-icon',
+}
+#: Directories (relative to the web root) whose files may be served. The web root
+#: itself only serves the entry page and an optional favicon.
+STATIC_DIRECTORIES = ('css', 'js', 'js/views', 'img')
+STATIC_TOP_LEVEL = ('index.html', 'favicon.ico')
+#: Development-only files that must never be served by the production service: the
+#: clickable prototype, its in-memory mock and any private sample data.
+STATIC_EXCLUDED = ('prototype.html', 'js/prototype.js', 'js/mock.js')
+STATIC_EXCLUDED_DIRECTORIES = ('data',)
+#: One strict shape for a static path: plain segments, no ``%`` escapes, no dot
+#: segments, no backslashes and no empty segments. It is checked on the raw request
+#: path, before any decoding, so an encoded traversal can never be reinterpreted.
+STATIC_PATH = re.compile(r'^/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]{0,63}/){0,3}'
+                         r'[A-Za-z0-9_-][A-Za-z0-9_.-]{0,63}$')
+STATIC_MAX_BYTES = 4 * 1024 * 1024
+CONTENT_SECURITY_POLICY = ("default-src 'self'; script-src 'self'; style-src 'self'; "
+                           "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; "
+                           "base-uri 'none'; form-action 'self'")
+
+
+def _static_allowed(relative):
+    directory, _, name = relative.rpartition('/')
+    # Exclusions compare case-insensitively so a case-insensitive filesystem cannot
+    # hand out ``js/Mock.js``; the allowlist itself stays exact.
+    folded = relative.lower()
+    if folded in STATIC_EXCLUDED or folded.split('/')[0] in STATIC_EXCLUDED_DIRECTORIES:
+        return False
+    if directory:
+        return directory in STATIC_DIRECTORIES
+    return name in STATIC_TOP_LEVEL
+
+
+def static_file(web_root, raw_path):
+    """Resolve one request path to ``(file, media type)`` under ``web_root``, or ``None``.
+
+    Fail closed: a path outside the fixed allowlist, a development-only file, an
+    unknown extension, a dot/encoded segment, a directory, or a symlink that
+    resolves outside the web root (or onto an excluded file) is simply not found.
+    The caller cannot tell which rule refused it, so the route discloses nothing
+    about the tree.
+    """
+    if web_root is None or not isinstance(raw_path, str):
+        return None
+    if raw_path == '/':
+        raw_path = '/index.html'
+    if not STATIC_PATH.fullmatch(raw_path):
+        return None
+    relative = raw_path[1:]
+    if not _static_allowed(relative):
+        return None
+    suffix = Path(relative).suffix.lower()
+    if suffix not in STATIC_MEDIA_TYPES:
+        return None
+    try:
+        root = Path(web_root).resolve(strict=True)
+        candidate = (root / relative).resolve(strict=True)
+        resolved = candidate.relative_to(root).as_posix()
+    except (OSError, ValueError, RuntimeError):
+        return None
+    # Re-apply the allowlist to the *resolved* location, so a symlink inside web/
+    # cannot alias an excluded file (for example ``js/app.js -> mock.js``).
+    if not _static_allowed(resolved) or Path(resolved).suffix.lower() != suffix:
+        return None
+    if not candidate.is_file():
+        return None
+    return candidate, STATIC_MEDIA_TYPES[suffix]
 
 
 def address_matches(peer, network):
@@ -872,6 +952,7 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     service = None
     backend = None
+    web_root = None
     trusted_proxies = ()
     max_body = MAX_BODY_BYTES
     protocol_version = 'HTTP/1.1'
@@ -891,6 +972,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         try:
             parsed = urlsplit(self.path)
             path = parsed.path
+            if method in ('GET', 'HEAD') and self.web_root is not None and \
+                    not path.startswith('/v1/') and path != '/healthz':
+                return self._serve_static(path)
             query = {k: v[0] for k, v in parse_qs(parsed.query, keep_blank_values=False).items()}
             match = None
             for verb, pattern, name, anonymous, csrf in ROUTES:
@@ -1079,6 +1163,45 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.end_headers()
         if payload and self.command != 'HEAD':
             self.wfile.write(payload)
+
+    def _serve_static(self, path):
+        """Anonymous GET/HEAD of one allowlisted web-interface file (see :func:`static_file`).
+
+        The body is read once and bounded; the response carries the page's strict
+        Content-Security-Policy and revalidates on every load (``no-cache`` plus a
+        content ETag), so a redeploy is picked up without stale scripts.
+        """
+        self._read_body()  # bounded; a stray GET body must not desynchronize keep-alive
+        found = static_file(self.web_root, path)
+        body = None
+        if found is not None:
+            candidate, media_type = found
+            try:
+                with open(candidate, 'rb') as handle:
+                    body = handle.read(STATIC_MAX_BYTES + 1)
+            except OSError:
+                body = None
+            if body is not None and len(body) > STATIC_MAX_BYTES:
+                body = None
+        if body is None:
+            raise not_found('Not found')
+        etag = '"%s"' % hashlib.sha256(body).hexdigest()[:32]
+        status = 304 if self.headers.get('If-None-Match') == etag else 200
+        self.send_response(status)
+        if status == 200:
+            self.send_header('Content-Type', media_type)
+            self.send_header('Content-Length', str(len(body)))
+        self.send_header('ETag', etag)
+        self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Content-Security-Policy', CONTENT_SECURITY_POLICY)
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Referrer-Policy', 'no-referrer')
+        self.send_header('X-Frame-Options', 'DENY')
+        self.send_header('Cross-Origin-Opener-Policy', 'same-origin')
+        self.send_header('X-Request-Id', getattr(self, '_current_request_id', '') or '')
+        self.end_headers()
+        if status == 200 and self.command != 'HEAD':
+            self.wfile.write(body)
 
     def _send_cookie(self, token):
         attributes = 'orchestra_session=%s; Path=/; HttpOnly; SameSite=Strict' % token
@@ -1850,9 +1973,11 @@ class ApiHandler(BaseHTTPRequestHandler):
         return limit, state
 
 
-def build_handler(service, backend, *, trusted_proxies=(), max_body=MAX_BODY_BYTES):
+def build_handler(service, backend, *, trusted_proxies=(), max_body=MAX_BODY_BYTES,
+                  web_root=DEFAULT_WEB_ROOT):
     return type('ConfiguredApiHandler', (ApiHandler,), {
         'service': service, 'backend': backend,
+        'web_root': str(web_root) if web_root is not None else None,
         'trusted_proxies': tuple(trusted_proxies or ()),
         'max_body': max_body,
     })
@@ -1860,7 +1985,7 @@ def build_handler(service, backend, *, trusted_proxies=(), max_body=MAX_BODY_BYT
 
 def create_server(service, backend, *, host='127.0.0.1', port=0, trusted_proxies=(),
                   max_body=MAX_BODY_BYTES, certfile=None, keyfile=None,
-                  allow_plaintext_non_loopback=False):
+                  allow_plaintext_non_loopback=False, web_root=DEFAULT_WEB_ROOT):
     """Bind the service. Refuse a non-loopback plaintext listener unless explicitly allowed."""
     loopback = host in LOOPBACK
     if not loopback and certfile is None and not allow_plaintext_non_loopback:
@@ -1868,7 +1993,8 @@ def create_server(service, backend, *, host='127.0.0.1', port=0, trusted_proxies
                          'explicitly allow disposable plaintext')
     httpd = ThreadingHTTPServer((host, port), build_handler(service, backend,
                                                             trusted_proxies=trusted_proxies,
-                                                            max_body=max_body))
+                                                            max_body=max_body,
+                                                            web_root=web_root))
     httpd.daemon_threads = True
     if certfile:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -1912,6 +2038,12 @@ def main(argv=None):
                         help='canonical base URL of this service, used only to render '
                              'copyable agent setup/resume snippets (e.g. https://host)')
     parser.add_argument('--bootstrap-user', help='one-time operator bootstrap superuser')
+    web = parser.add_mutually_exclusive_group()
+    web.add_argument('--web-root', default=str(DEFAULT_WEB_ROOT),
+                     help='directory holding the browser interface served at / '
+                          '(default: the kit web/ directory)')
+    web.add_argument('--no-web', action='store_true',
+                     help='serve only the JSON API; do not serve the browser interface')
     args = parser.parse_args(argv)
 
     store = Store(args.state)
@@ -1931,9 +2063,11 @@ def main(argv=None):
     backend = build_backend(service, args)
     httpd = create_server(service, backend, host=args.host, port=args.port,
                           trusted_proxies=trusted, max_body=args.max_body,
-                          certfile=args.cert, keyfile=args.key)
-    print('orchestra-http listening on %s:%d (backend=%s)'
-          % (args.host, httpd.server_address[1], args.backend))
+                          certfile=args.cert, keyfile=args.key,
+                          web_root=None if args.no_web else args.web_root)
+    print('orchestra-http listening on %s:%d (backend=%s, web=%s)'
+          % (args.host, httpd.server_address[1], args.backend,
+             'off' if args.no_web else args.web_root))
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
