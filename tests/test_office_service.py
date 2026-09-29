@@ -63,7 +63,8 @@ if 'sql-server' in args:
 elif 'sql' in args:
     port=int(args[args.index('--port')+1])
     with socket.create_connection(('127.0.0.1',port),timeout=1): pass
-    print('result\\n1')
+    query=sys.stdin.read()
+    print('User,Host\\nroot,localhost' if 'mysql.user' in query else 'result\\n1')
 else:
     sys.exit(2)
 ''' % sys.executable, encoding='utf-8')
