@@ -2,6 +2,7 @@
 import { h, mount, brandMark, initials, confirmDialog, toast } from './dom.js';
 import { createApi, fetchTransport } from './api.js';
 import { describe } from './ui.js';
+import { matchRoute, projectOf, RECORD_ROUTES } from './routes.js';
 import * as auth from './views/auth.js';
 import * as work from './views/work.js';
 import * as project from './views/project.js';
@@ -10,28 +11,14 @@ import * as admin from './views/admin.js';
 import * as reqs from './views/requirements.js';
 import * as agents from './views/agents.js';
 
-const ROUTES = [
-  [/^\/$/, work.home],
-  [/^\/welcome$/, work.welcome],
-  [/^\/projects$/, work.directory],
-  [/^\/agents$/, agents.list],
-  [/^\/p\/(?<pid>[\w-]+)$/, project.overview],
-  [/^\/p\/(?<pid>[\w-]+)\/reviews$/, project.reviews],
-  [/^\/p\/(?<pid>[\w-]+)\/feedback$/, project.feedback],
-  [/^\/p\/(?<pid>[\w-]+)\/settings$/, project.settings],
-  [/^\/p\/(?<pid>[\w-]+)\/new$/, task.create],
-  [/^\/p\/(?<pid>[\w-]+)\/t\/(?<tid>[\w-]+)$/, task.detail],
-  [/^\/p\/(?<pid>[\w-]+)\/requirements$/, reqs.brd],
-  [/^\/p\/(?<pid>[\w-]+)\/requirements\/(?<rid>[\w.-]+)$/, reqs.requirement],
-  [/^\/p\/(?<pid>[\w-]+)\/decisions$/, reqs.decisions],
-  [/^\/p\/(?<pid>[\w-]+)\/decisions\/(?<did>[\w.-]+)$/, reqs.decision],
-  [/^\/p\/(?<pid>[\w-]+)\/records\/(?<id>[\w.-]+)$/, reqs.record],
-  [/^\/admin\/users$/, admin.users],
-  [/^\/account$/, admin.account],
-];
-
-// Views whose server routes are not part of every deployment yet.
-const RECORD_ROUTES = /^\/p\/[\w-]+\/(requirements|decisions|records)(\/|$)/;
+// Route name -> view. Patterns live in routes.js (shared ID pattern, testable).
+const VIEWS = {
+  home: work.home, welcome: work.welcome, projects: work.directory, agents: agents.list,
+  project: project.overview, reviews: project.reviews, feedback: project.feedback, settings: project.settings,
+  newTask: task.create, task: task.detail,
+  requirements: reqs.brd, requirement: reqs.requirement, decisions: reqs.decisions, decision: reqs.decision, record: reqs.record,
+  users: admin.users, account: admin.account,
+};
 
 export async function start(root, options = {}) {
   const transport = options.transport || fetchTransport;
@@ -76,8 +63,7 @@ export async function start(root, options = {}) {
 
   let shell;
   function buildShell(route) {
-    const pidMatch = /^\/p\/([\w-]+)/.exec(route);
-    const pid = pidMatch ? pidMatch[1] : null;
+    const pid = projectOf(route);
     const active = ctx.projects.filter((p) => !p.archived);
     const current = pid && ctx.projects.find((p) => p.id === pid);
     const link = (href, label, count) => h('a', { class: 'nav-link', href: ctx.href(href), 'aria-current': route === href ? 'page' : null },
@@ -132,17 +118,17 @@ export async function start(root, options = {}) {
     const mine = ++token;
     const main = buildShell(route);
     mount(root, ctx.options.banner ? [ctx.options.banner(ctx), shell] : shell);
-    for (const [pattern, view] of ROUTES) {
-      const match = pattern.exec(route);
-      if (!match) continue;
+    const match = matchRoute(route);
+    const view = match && VIEWS[match.name];
+    if (view) {
       try {
-        const node = await view(ctx, match.groups || {});
+        const node = await view(ctx, match.params);
         if (mine !== token) return;
         mount(main, node);
       } catch (error) {
         if (mine !== token) return;
         if (error && error.status === 401) return ctx.sessionLost();
-        if (!ctx.features.requirements && error && [404, 501].includes(error.status) && RECORD_ROUTES.test(route)) {
+        if (!ctx.features.requirements && error && [404, 501].includes(error.status) && RECORD_ROUTES.has(match.name)) {
           mount(main, h('div', { class: 'panel' }, h('div', { class: 'empty', role: 'status' }, h('strong', null, 'Not available on this server'),
             h('p', null, 'Requirements, decisions and records are not served by this Orchestra server yet. Tasks, reviews and feedback work as usual.'))));
           document.title = 'Not available · Orchestra';
