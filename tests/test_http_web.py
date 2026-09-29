@@ -13,6 +13,7 @@ Two surfaces, both over a real loopback ``ThreadingHTTPServer`` like
 import contextlib
 import http.client
 import io
+import json
 import os
 import re
 import shutil
@@ -27,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from http_service import (CONTENT_SECURITY_POLICY, DEFAULT_WEB_ROOT, InProcessBackend,
                           create_server, static_file)
-from test_http_review_fixes import EndpointCase
+from test_http_review_fixes import CONTRIBUTION, EndpointCase
 from test_http_service import (BASE, BUNDLE, COMMIT, Response, ServerHarness, unique_dir)
 
 WEB = DEFAULT_WEB_ROOT
@@ -287,6 +288,17 @@ class MembersRouteCase(TeamHarness):
         member = response.data['items'][0]
         self.assertEqual({'user_id', 'username', 'display_name', 'role', 'disabled',
                           'superuser'}, set(member))
+
+    def test_account_flags_only_reach_project_administrators(self):
+        secret = self.request('POST', self.path('/worker-credentials'), {'label': 'w'},
+                              token=self.olive).data['credential']['secret']
+        public = {'user_id', 'username', 'display_name', 'role'}
+        for token in (self.carl, self.vera, secret):
+            items = self.request('GET', self.path('/members'), token=token).data['items']
+            self.assertEqual([public] * 3, [set(m) for m in items])
+        for token in (self.olive, self.admin):
+            items = self.request('GET', self.path('/members'), token=token).data['items']
+            self.assertEqual([public | {'disabled', 'superuser'}] * 3, [set(m) for m in items])
 
     def test_non_member_and_missing_project_are_uniform_404(self):
         self.assert_uniform_not_found('/members')
@@ -662,6 +674,55 @@ class CanonicalBindingReadCase(EndpointCase):
         self.assertEqual([task], [t['id'] for t in mine['assigned']])
         self.assertEqual('changes-requested', mine['assigned'][0]['review_state'])
 
+        # A revision does not resolve a canonical request: that needs the respond step
+        # (slice 2). The brief must keep it open and name the older revision, which is
+        # what the page uses to say so instead of implying it was addressed.
+        body = dict(CONTRIBUTION, operation='contribute', schema_version=1,
+                    operation_id='op-revision-2', commit='d' * 40,
+                    supersedes=review['contribution']['id'],
+                    previous=brief['review']['latest_id'])
+        revised = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (project, task),
+                               body, token=alex)
+        self.assertEqual(201, revised.status, revised.data)
+        brief = self.request('GET', '/v1/projects/%s/tasks/%s/brief' % (project, task),
+                             token=alex).data
+        self.assertEqual('changes-requested', brief['review']['state'])
+        self.assertEqual(2, brief['review']['contribution']['revision'])
+        self.assertEqual(['open'], [r['status'] for r in brief['review']['requests']])
+        self.assertEqual(review['contribution']['id'],
+                         brief['review']['requests'][0]['contribution'])
+        self.assertNotEqual(brief['review']['contribution']['id'],
+                            brief['review']['requests'][0]['contribution'])
+
+    def test_task_list_carries_the_canonical_review_state(self):
+        alex, project = self.setup_project()
+        idle = self.create_task(alex, project, 'idle task').data['id']
+        busy = self.create_task(alex, project, 'busy task').data['id']
+        done = self.create_task(alex, project, 'done task').data['id']
+        self.request('POST', '/v1/projects/%s/tasks/%s/claim' % (project, busy), {}, token=alex)
+        self.assertEqual(201, self.contribute(alex, project, busy).status)
+        closed = self.request('PATCH', '/v1/projects/%s/tasks/%s' % (project, done),
+                              {'status': 'closed'}, token=alex)
+        self.assertEqual(200, closed.status, closed.data)
+        listing = self.request('GET', '/v1/projects/%s/tasks' % project, token=alex)
+        self.assertEqual(200, listing.status, listing.data)
+        rows = {t['id']: t for t in listing.data['items']}
+        self.assertEqual('awaiting-review', rows[busy]['review_state'])
+        # Never "Deliver a contribution" for work that is already awaiting review.
+        self.assertEqual('owner', rows[busy]['next_action']['who'])
+        self.assertEqual('none', rows[idle]['review_state'])
+        self.assertEqual('anyone', rows[idle]['next_action']['who'])
+        # A closed task the work projection no longer lists is unknown, not guessed.
+        self.assertIsNone(rows[done]['review_state'])
+        self.assertIsNone(rows[done]['next_action'])
+        self.assertFalse(listing.data['review_states_complete'])
+        found = self.request('GET', '/v1/projects/%s/tasks?review_state=awaiting-review'
+                             % project, token=alex).data
+        self.assertEqual([busy], [t['id'] for t in found['items']])
+        active = self.request('GET', '/v1/projects/%s/tasks?status=active' % project,
+                              token=alex).data
+        self.assertTrue(active['review_states_complete'])
+
     def test_brief_of_a_hidden_project_is_404_before_any_canonical_read(self):
         alex, project = self.setup_project()
         admin = self.admin_token()
@@ -672,6 +733,184 @@ class CanonicalBindingReadCase(EndpointCase):
                                                token=blair).status)
         self.assertFalse((self.canonical_root / 'canonical.json').exists() and
                          self.canonical_rows())
+
+
+
+# ---------------------------------------------------------------- slice-1 review fixes
+class RouteTableCase(unittest.TestCase):
+    """The browser's hash routes accept every id the server accepts (P2-1).
+
+    ``web/js/routes.js`` holds the route table and the id pattern. This compiles its
+    templates exactly as ``compile()`` does and checks canonical dotted ids route to
+    the right view; it also runs the real module under node when node is installed.
+    """
+    ROUTES_JS = WEB / 'js' / 'routes.js'
+
+    def table(self):
+        text = self.ROUTES_JS.read_text(encoding='utf-8')
+        id_pattern = re.search(r"export const ID = '([^']+)';", text).group(1)
+        templates = re.findall(r"\['(\w+)', '(/[^']*)'\]", text)
+        self.assertGreaterEqual(len(templates), 17)
+        return id_pattern, templates
+
+    @staticmethod
+    def compile(id_pattern, template):
+        parts = re.split(r'(\{[a-z]+\})', template)
+        source = ''.join('(?P<%s>%s)' % (part[1:-1], id_pattern)
+                         if re.fullmatch(r'\{[a-z]+\}', part) else re.escape(part)
+                         for part in parts)
+        return re.compile('^' + source + '$')
+
+    def match(self, route):
+        id_pattern, templates = self.table()
+        for name, template in templates:
+            found = self.compile(id_pattern, template).match(route)
+            if found:
+                return name, found.groupdict()
+        return None
+
+    def test_id_pattern_is_the_server_pattern(self):
+        from http_service import ID
+        self.assertEqual(ID, self.table()[0])
+
+    def test_dotted_canonical_ids_reach_their_views(self):
+        self.assertEqual(('task', {'pid': 'kittrial', 'tid': 'kittrial-5bb.20'}),
+                         self.match('/p/kittrial/t/kittrial-5bb.20'))
+        self.assertEqual(('reviews', {'pid': 'proj.a-b_c'}), self.match('/p/proj.a-b_c/reviews'))
+        self.assertEqual(('project', {'pid': 'jjbp'}), self.match('/p/jjbp'))
+        self.assertEqual(('record', {'pid': 'p', 'id': 'kittrial-5bb.20.1'}),
+                         self.match('/p/p/records/kittrial-5bb.20.1'))
+        for bad in ('/p/../t/x', '/p/x/t/.hidden', '/p/x/t/', '/p/x/t/a/b', '/p/x y'):
+            self.assertIsNone(self.match(bad), bad)
+
+    def test_app_uses_the_shared_table(self):
+        app = (WEB / 'js' / 'app.js').read_text(encoding='utf-8')
+        self.assertIn("from './routes.js'", app)
+        self.assertNotIn('[\\w-]', app)  # no private, narrower id pattern
+
+    def test_the_real_module_under_node(self):
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node is not installed; the Python checks above still apply')
+        import subprocess
+        script = ("import(process.argv[1]).then((r) => console.log(JSON.stringify(["
+                  "r.matchRoute('/p/kittrial/t/kittrial-5bb.20'), r.projectOf('/p/a.b/reviews'),"
+                  "r.matchRoute('/p/x/t/../y')])))")
+        out = subprocess.run([node, '--input-type=module', '-e', script,
+                              self.ROUTES_JS.as_uri()], capture_output=True, text=True,
+                             timeout=60)
+        self.assertEqual(0, out.returncode, out.stderr)
+        task, project, bad = json.loads(out.stdout)
+        self.assertEqual({'name': 'task', 'params': {'pid': 'kittrial',
+                                                      'tid': 'kittrial-5bb.20'}}, task)
+        self.assertEqual('a.b', project)
+        self.assertIsNone(bad)
+
+
+class LookupThrottleCase(TeamHarness):
+    def lookup(self, token, username):
+        return self.request('GET', '/v1/accounts/lookup?username=%s&project=%s'
+                            % (username, self.project), token=token)
+
+    def lookups(self):
+        return [e for e in self.store.state['audit'] if e['action'] == 'accounts.lookup']
+
+    def test_lookups_are_throttled_per_principal(self):
+        self.service.lookup_max = 3
+        for name in ('otto', 'nobody', 'carl'):
+            self.assertIn(self.lookup(self.olive, name).status, (200, 404))
+        limited = self.lookup(self.olive, 'vera')
+        self.assertEqual(429, limited.status, limited.data)
+        self.assertEqual('rate_limited', limited.data['error']['code'])
+        self.assertEqual(limited.headers.get('x-request-id'), limited.data['request_id'])
+        # Another principal has its own budget.
+        self.assertEqual(200, self.lookup(self.admin, 'vera').status)
+        # The window slides: old lookups age out.
+        self.service._lookups[self.ids['olive']] = [0.0] * 3
+        self.assertEqual(200, self.lookup(self.olive, 'vera').status)
+
+    def test_every_lookup_is_audited_without_the_name(self):
+        self.lookup(self.olive, 'otto')
+        self.lookup(self.olive, 'Nobody')
+        self.service.lookup_max = 2
+        self.lookup(self.olive, 'carl')
+        events = self.lookups()
+        self.assertEqual(['found', 'not_found', 'throttled'], [e['outcome'] for e in events])
+        for event in events:
+            self.assertEqual(self.project, event['project_id'])
+            self.assertEqual(self.ids['olive'], event['user_id'])
+            self.assertTrue(event['request_id'])
+            self.assertRegex(event['reason'], r'^username_sha256=[0-9a-f]{16}$')
+        self.assertNotIn('otto', json.dumps(events))
+        self.assertNotIn('nobody', json.dumps(events).lower())
+        # Same name in any case gives the same digest, so repeated probing is visible.
+        self.lookup(self.admin, 'NOBODY')
+        self.assertEqual(self.lookups()[1]['reason'], self.lookups()[-1]['reason'])
+        # A refused caller (not an administrator) is neither charged nor recorded.
+        self.assertEqual(403, self.lookup(self.carl, 'otto').status)
+        self.assertEqual(4, len(self.lookups()))
+        # The project owner reads them in the project audit.
+        audit = self.request('GET', self.path('/audit?limit=100'), token=self.olive).data
+        self.assertEqual(4, len([e for e in audit['items'] if e['action'] == 'accounts.lookup']))
+
+
+class NextActionCase(unittest.TestCase):
+    def test_unknown_review_state_invites_nothing(self):
+        from http_service import next_action
+        self.assertIsNone(next_action({'status': 'open', 'assignee': 'u1', 'review_state': None}))
+        self.assertIsNone(next_action({'status': 'open', 'assignee': None}))
+        self.assertEqual('anyone', next_action({'status': 'open', 'review_state': 'none'})['who'])
+        self.assertEqual('assignee', next_action({'status': 'open', 'assignee': 'u1',
+                                                  'review_state': 'none'})['who'])
+        self.assertNotIn('Deliver', next_action({'status': 'open', 'assignee': 'u1',
+                                                 'review_state': 'integrated'})['text'])
+
+
+class CountingQueueBackend(InProcessBackend):
+    READ_CACHE_SECONDS = 20
+
+    def __init__(self, service):
+        super().__init__(service)
+        self.queue_reads = 0
+
+    def review_queue(self, project_id):
+        self.queue_reads += 1
+        return super().review_queue(project_id)
+
+
+class MyWorkCacheCase(TeamHarness):
+    def setUp(self):
+        super().setUp()
+        self._stop_server()
+        self.backend = CountingQueueBackend(self.service)
+        self.httpd = create_server(self.service, self.backend, host='127.0.0.1', port=0)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    def test_repeat_reads_reuse_the_queue_but_not_authority(self):
+        self.claim(self.carl)
+        first = self.request('GET', '/v1/me/work', token=self.carl).data
+        self.assertEqual([self.task], [t['id'] for t in first['assigned']])
+        reads = self.backend.queue_reads
+        again = self.request('GET', '/v1/me/work', token=self.carl).data
+        self.assertEqual(reads, self.backend.queue_reads)
+        self.assertEqual(first['assigned'], again['assigned'])
+        # Per principal: olive's read is her own.
+        self.request('GET', '/v1/me/work', token=self.olive)
+        self.assertEqual(reads + 1, self.backend.queue_reads)
+        # The queue route itself is never served from the shared cache.
+        self.request('GET', self.path('/queue'), token=self.carl)
+        self.assertEqual(reads + 2, self.backend.queue_reads)
+        # Losing membership takes effect at once, cache or not.
+        self.request('DELETE', self.path('/members/%s' % self.ids['carl']), token=self.olive)
+        self.assertEqual([], self.request('GET', '/v1/me/work', token=self.carl).data['assigned'])
+        # Once the entry expires the next read is fresh.
+        cache = self.httpd.RequestHandlerClass.read_cache
+        for key in list(cache):
+            cache[key] = (0, cache[key][1])
+        self.request('GET', '/v1/me/work', token=self.olive)
+        self.assertEqual(reads + 3, self.backend.queue_reads)
 
 
 if __name__ == '__main__':

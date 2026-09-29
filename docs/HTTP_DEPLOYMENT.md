@@ -682,8 +682,37 @@ the pilot phase, not part of this service.
   `GET /v1/me/work` and `GET /v1/accounts/lookup?username=&project=`. Over the
   canonical binding the brief maps the canonical `brief --json` read and the queue
   pages the canonical `work` action (bounded; `complete: false` past the bound).
-  Canonical task rows from `bd list` carry no review state, so the task list's
-  `review_state` filter only narrows on the in-process backend.
+  Canonical task rows from `bd list` carry no review state, so the task list merges
+  in the review state from that same bounded `work` projection (one queue read per
+  request, shared with the queue). A closed task the projection no longer lists, or
+  a row past its bound, has `review_state: null` and no next action, and the list
+  reports `review_states_complete: false`; it never guesses "claim" or "deliver" for
+  work that may be under review.
+- **`GET /v1/me/work` cost.** On the canonical binding each project costs one bounded
+  `work` walk (up to 10 subprocess reads of 100 rows), for at most 50 of the caller's
+  projects. The same principal's read of a project is reused for 20 seconds
+  (`EndpointBackend.READ_CACHE_SECONDS`, in memory, bounded to 2048 entries), so
+  repeated page loads do not re-export every project. Authority is never cached:
+  each project is re-authorized on every request, so a removed member loses it at
+  once; only the task data may be up to 20 seconds old on My work. The queue, brief
+  and task list always read fresh.
+- **Review respond step (slice 2).** Canonically a requested change stays open until
+  the contributor records a `respond` resolution for it, even after a newer revision
+  arrives. The web interface cannot record responses yet; the task page says the
+  requests are still open instead of implying the new revision resolved them.
+  Contributors respond with their worker tools. (The disposable in-process backend
+  has no respond record and treats a newer revision as resolving the requests.)
+- **Account lookup residual risk.** `GET /v1/accounts/lookup` answers exact usernames
+  for a project administrator, and any account may create a project and so become
+  one; an account holder can therefore still test whether a given username exists.
+  Mitigations: exact match only (no prefix or search), the same 404 for missing,
+  partial and disabled accounts, at most 20 lookups per principal per 10 minutes
+  (`429 rate_limited` beyond that; in memory, reset on restart) and an audit event
+  per authorized lookup on that project (`accounts.lookup`, outcome
+  `found`/`not_found`/`throttled`, reason `username_sha256=<16 hex>` of the
+  lower-cased name, never the name itself). Operators who need stronger guarantees
+  should disable self-service project creation (section 12 of the design) so only
+  real project owners can look names up.
 - **Known limitation `endpoint-blocked-signal`.** `blocked` attention for an agent is
   derived from the in-process canonical checkpoint view (`backend.state['checkpoints']`).
   The canonical endpoint binding does not mirror checkpoints into service state, so
