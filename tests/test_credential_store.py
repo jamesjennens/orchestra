@@ -189,10 +189,30 @@ class LinuxSecretServiceTests(unittest.TestCase):
         self.assertEqual([call["argv"][1] for call in runner.calls], ["lookup", "lookup"])
 
     def test_absent_item_is_none_not_an_error(self):
-        store, _ = self.build([(1, "", "No such secret item at path: /org/freedesktop/secrets/collection/x")])
+        # Real `secret-tool lookup` for a missing item: exit 1, no stdout, no stderr.
+        store, _ = self.build([(1, "", "")])
         with patch.object(sys, "platform", "linux"):
             self.assertIsNone(store.retrieve("example"))
             self.assertFalse(store.exists("example"))
+
+    def test_absent_item_with_a_not_found_message_is_also_none(self):
+        store, _ = self.build([(1, "", "No such secret item at path: /org/freedesktop/secrets/collection/x")])
+        with patch.object(sys, "platform", "linux"):
+            self.assertIsNone(store.retrieve("example"))
+
+    def test_lookup_failure_with_output_is_still_a_real_error(self):
+        # Only a *silent* exit 1 means "absent"; anything it says is a failure.
+        store, _ = self.build([(1, "", "Cannot autolaunch D-Bus without X11 $DISPLAY")])
+        with patch.object(sys, "platform", "linux"):
+            with self.assertRaises(cs.CredentialStoreError):
+                store.retrieve("example")
+
+    def test_retrieve_strips_exactly_one_trailing_newline(self):
+        store, _ = self.build([(0, FAKE_SECRET + "\n", ""), (0, "line-one\nline-two\n", "")])
+        with patch.object(sys, "platform", "linux"):
+            self.assertEqual(store.retrieve("example"), FAKE_SECRET)
+            # Only the tool's terminating newline is removed; an embedded one stays.
+            self.assertEqual(store.retrieve("example"), "line-one\nline-two")
 
     def test_store_failure_raises_redacted_detail(self):
         store, _ = self.build([(1, "", f"Cannot reach the Secret Service; input was {FAKE_SECRET}")])
@@ -210,11 +230,28 @@ class LinuxSecretServiceTests(unittest.TestCase):
                 store.retrieve("example")
         self.assertIn("D-Bus", str(caught.exception))
 
-    def test_delete_reports_removed_absent_and_error(self):
-        store, _ = self.build([(0, "", ""), (1, "", "No such secret item"), (2, "", "D-Bus is not running")])
+    def test_delete_is_honest_about_present_and_absent_items(self):
+        store, runner = self.build([
+            (0, FAKE_SECRET + "\n", ""),  # lookup precheck: present
+            (0, "", ""),                  # clear: succeeded
+            (1, "", ""),                  # lookup precheck: absent (real secret-tool)
+        ])
         with patch.object(sys, "platform", "linux"):
             self.assertTrue(store.delete("example"))
             self.assertFalse(store.delete("example"))
+        self.assertEqual([call["argv"][1] for call in runner.calls], ["lookup", "clear", "lookup"])
+
+    def test_clear_exit_zero_without_a_match_is_not_reported_as_deleted(self):
+        # `secret-tool clear` exits 0 even when nothing matched; the absent
+        # precheck means clear is never run and the result is honestly False.
+        store, runner = self.build([(1, "", "")])
+        with patch.object(sys, "platform", "linux"):
+            self.assertFalse(store.delete("example"))
+        self.assertEqual([call["argv"][1] for call in runner.calls], ["lookup"])
+
+    def test_delete_failure_is_a_real_error(self):
+        store, _ = self.build([(0, FAKE_SECRET + "\n", ""), (2, "", "D-Bus is not running")])
+        with patch.object(sys, "platform", "linux"):
             with self.assertRaises(cs.CredentialStoreError):
                 store.delete("example")
 
@@ -239,14 +276,24 @@ class MacKeychainTests(unittest.TestCase):
         runner = FakeRunner(results)
         return cs.MacKeychainStore(runner=runner, which=lambda name: "/usr/bin/" + name), runner
 
-    def test_store_reads_the_secret_from_stdin_not_argv(self):
+    def test_store_uses_security_interactive_and_keeps_the_secret_out_of_argv(self):
+        # `security add-generic-password ... -w` with no value prompts on
+        # /dev/tty; the secret is fed to `security -i` on stdin instead.
         store, runner = self.build([(0, "", "")])
         with patch.object(sys, "platform", "darwin"):
             store.store("example", FAKE_SECRET, overwrite=True)
-        argv = runner.calls[0]["argv"]
-        self.assertEqual(argv[-1], "-w")
-        self.assertEqual(runner.calls[0]["input"], FAKE_SECRET + "\n")
-        self.assertNotIn(FAKE_SECRET, " ".join(argv))
+        call = runner.calls[0]
+        self.assertEqual(call["argv"], ["/usr/bin/security", "-i"])
+        self.assertNotIn(FAKE_SECRET, " ".join(call["argv"]))
+        self.assertIn("add-generic-password", call["input"])
+        self.assertIn(FAKE_SECRET, call["input"])
+
+    def test_store_failure_is_redacted(self):
+        store, _ = self.build([(1, "", f"security: failed while handling {FAKE_SECRET}")])
+        with patch.object(sys, "platform", "darwin"):
+            with self.assertRaises(cs.CredentialStoreError) as caught:
+                store.store("example", FAKE_SECRET, overwrite=True)
+        self.assertNotIn(FAKE_SECRET, str(caught.exception))
 
     def test_retrieve_and_delete(self):
         store, _ = self.build([(0, FAKE_SECRET + "\n", ""), (44, "", "could not be found in the keychain")])

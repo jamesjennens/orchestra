@@ -23,6 +23,12 @@ raises ``CredentialStoreUnavailable`` with an actionable message when its store
 cannot be reached. No backend falls back to a plaintext file: an unavailable
 store is an error, never a downgrade.
 
+The macOS backend feeds ``security -i`` (its stdin command mode) rather than
+``security add-generic-password ... -w`` without a value: the latter prompts on
+``/dev/tty`` and ignores piped stdin. The Linux backend knows that
+``secret-tool lookup`` exits 1 with empty output for a missing item and that
+``secret-tool clear`` exits 0 even when nothing matched.
+
 Secret handling
 ---------------
 Secrets are passed to helper processes on **stdin**, never in ``argv`` (argv is
@@ -40,7 +46,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
-from typing import Callable, Iterable, List, Optional, Sequence
+from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
 DEFAULT_SERVICE = "orchestra"
 REDACTED = "***REDACTED***"
@@ -176,6 +182,12 @@ class _CommandStore(CredentialStore):
 
     executable = ""
 
+    #: Exit codes that mean "the item is absent" when the command prints
+    #: nothing at all. ``secret-tool lookup`` exits 1 with empty output for a
+    #: missing item; treating that as anything but "absent" would make a fresh
+    #: Linux setup fail.
+    silent_miss_exit_codes: Tuple[int, ...] = ()
+
     def __init__(
         self,
         service: str = DEFAULT_SERVICE,
@@ -228,10 +240,15 @@ class _CommandStore(CredentialStore):
         completed = self._run_raw(argv)
         if completed.returncode == 0:
             value = completed.stdout or ""
+            # Read commands terminate the value with one newline; strip exactly
+            # one so a secret that itself ends in a newline survives intact.
             if value.endswith("\n"):
                 value = value[:-1]
             return value or None
         detail = _clean_detail(completed)
+        if completed.returncode in self.silent_miss_exit_codes and not detail:
+            # Real "not found": the tool exited non-zero and said nothing.
+            return None
         if _is_not_found(detail):
             return None
         raise CredentialStoreError(
@@ -248,6 +265,9 @@ class LinuxSecretServiceStore(_CommandStore):
 
     name = "linux-secret-service"
     executable = "secret-tool"
+
+    #: ``secret-tool lookup`` exits 1 and prints nothing for a missing item.
+    silent_miss_exit_codes = (1,)
 
     def availability(self) -> Availability:
         if not sys.platform.startswith("linux"):
@@ -278,6 +298,9 @@ class LinuxSecretServiceStore(_CommandStore):
         argv = [self._command_path() or self.executable, "store",
                 "--label", f"{self.service} credential for {key}", *self._attrs(key)]
         # secret-tool reads the secret from stdin; it is never placed in argv.
+        # It reads one line, so the added newline terminates the value and is
+        # not stored; _lookup still strips one trailing newline for tools that
+        # do echo it back.
         self._run(argv, stdin_text=secret + "\n", secrets=[secret], action=f"store the credential for {key!r}")
 
     def retrieve(self, key: str) -> Optional[str]:
@@ -289,6 +312,12 @@ class LinuxSecretServiceStore(_CommandStore):
     def delete(self, key: str) -> bool:
         self.require_available()
         self._require_key(key)
+        # ``secret-tool clear`` exits 0 whether or not anything matched, so the
+        # exit code alone cannot say whether a credential was removed. Look the
+        # item up first and report what actually happened instead of claiming a
+        # deletion that did not occur.
+        if self.retrieve(key) is None:
+            return False
         argv = [self._command_path() or self.executable, "clear", *self._attrs(key)]
         completed = self._run_raw(argv)
         if completed.returncode == 0:
@@ -322,15 +351,27 @@ class MacKeychainStore(_CommandStore):
                                 "the 'security' command ships with macOS; check PATH")
         return Availability(True)
 
+    @staticmethod
+    def _quote(value: str) -> str:
+        """Quote one argument for the ``security -i`` command parser."""
+        return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
     def store(self, key: str, secret: str, *, overwrite: bool = False) -> None:
         self.require_available()
         self._guard_secret(secret)
         self._guard_overwrite(key, overwrite)
-        # '-w' without a value makes security read the secret from stdin, so the
-        # secret never appears in this process's argv.
-        argv = [self._command_path() or self.executable, "add-generic-password", "-U",
-                "-s", self.service, "-a", key, "-w"]
-        self._run(argv, stdin_text=secret + "\n", secrets=[secret], action=f"store the credential for {key!r}")
+        # ``security add-generic-password ... -w`` with no value prompts on
+        # /dev/tty (twice) and ignores piped stdin, so the command is fed to
+        # ``security -i`` on stdin instead. The secret therefore never reaches
+        # this process's argv, which other users can read from the process list.
+        command = "add-generic-password -U -s {service} -a {key} -w {secret}".format(
+            service=self._quote(self.service),
+            key=self._quote(key),
+            secret=self._quote(secret),
+        )
+        argv = [self._command_path() or self.executable, "-i"]
+        self._run(argv, stdin_text=command + "\n", secrets=[secret],
+                  action=f"store the credential for {key!r}")
 
     def retrieve(self, key: str) -> Optional[str]:
         self.require_available()

@@ -81,6 +81,9 @@ class SetupTestCase(unittest.TestCase):
             endpoint="/srv/orchestra/endpoint.py",
             root="/srv/orchestra/runtime",
             secret=FAKE_SECRET,
+            # The direct callable defaults to no stored secret (the ssh transport
+            # needs none); these tests opt in to exercise the credential path.
+            store_secret=True,
         )
         values.update(overrides)
         return sa.SetupRequest(**values)
@@ -111,7 +114,11 @@ class FreshSetupTests(SetupTestCase):
         self.assertEqual(config["host"], "example-host")
         self.assertEqual(config["endpoint"], "/srv/orchestra/endpoint.py")
         self.assertEqual(config["project"], "example")
-        self.assertEqual(config["credential"], {"store": "fake-store", "service": "orchestra", "key": "example"})
+        credential = config["credential"]
+        self.assertEqual(credential["store"], "fake-store")
+        self.assertEqual(credential["service"], "orchestra")
+        self.assertEqual(credential["key"], "example")
+        self.assertIn("bearer", credential["purpose"].lower())
         self.assertEqual(self.store.secrets["example"], FAKE_SECRET)
 
     def test_config_file_never_contains_the_secret(self):
@@ -252,9 +259,55 @@ class MissingStoreTests(SetupTestCase):
 
     def test_config_write_failure_removes_the_new_credential(self):
         with patch.object(sa, "write_private_config", side_effect=OSError("disk full")):
-            with self.assertRaises(OSError):
+            with self.assertRaises(sa.SetupError) as caught:
                 self.run_setup()
+        self.assertEqual(caught.exception.exit_code, sa.EXIT_ERROR)
+        self.assertIn("could not write the private config", str(caught.exception))
         self.assertFalse(self.config.exists())
+        self.assertEqual(self.store.secrets, {})
+
+
+class CredentialRollbackTests(SetupTestCase):
+    """A failed run must never leave the credential store worse than it found it."""
+
+    def test_replaced_credential_survives_a_failed_config_write(self):
+        self.store = FakeStore({"example": FAKE_SECRET_OLD})
+        with patch.object(sa, "write_private_config", side_effect=OSError("disk full")):
+            with self.assertRaises(sa.SetupError) as caught:
+                self.run_setup(confirm_credential=True)
+        self.assertEqual(caught.exception.exit_code, sa.EXIT_ERROR)
+        self.assertEqual(self.store.secrets["example"], FAKE_SECRET_OLD)
+
+    def test_new_credential_is_removed_after_a_failed_config_write(self):
+        with patch.object(sa, "write_private_config", side_effect=OSError("disk full")):
+            with self.assertRaises(sa.SetupError):
+                self.run_setup()
+        self.assertEqual(self.store.secrets, {})
+
+    def test_failed_rollback_is_reported_not_swallowed(self):
+        class FailingDelete(FakeStore):
+            def delete(self, key):
+                raise cs.CredentialStoreError("fake-store: the store refused the delete")
+
+        self.store = FailingDelete()
+        with patch.object(sa, "write_private_config", side_effect=OSError("disk full")):
+            with self.assertRaises(sa.SetupError) as caught:
+                self.run_setup()
+        message = str(caught.exception)
+        self.assertIn("could not be rolled back", message)
+        self.assertIn("fake-store", message)
+
+    def test_cli_reports_a_config_write_failure_without_a_traceback(self):
+        with patch.object(sa, "write_private_config", side_effect=OSError("disk full")):
+            code, out, err = self.call_main(
+                "--project", "example", "--config", str(self.config),
+                "--host", "example-host", "--endpoint", "/srv/endpoint.py",
+                "--root", "/srv/orchestra/runtime", "--store-credential",
+                "--secret-stdin", "--non-interactive", stdin_text=FAKE_SECRET + "\n")
+        self.assertEqual(code, sa.EXIT_ERROR)
+        self.assertIn("could not write the private config", err)
+        self.assertNotIn("Traceback", err)
+        self.assertNotIn(FAKE_SECRET, err)
         self.assertEqual(self.store.secrets, {})
 
 
@@ -377,6 +430,96 @@ class RedactionTests(SetupTestCase):
         self.assertIn('"transport": "ssh"', printed)
         self.assertNotIn(FAKE_SECRET, printed)
         self.assertFalse(self.config.exists())
+
+
+class PurposeAndSafetyTests(SetupTestCase):
+    """Secret purpose, opt-in default, key separation, backup, warnings, dry run."""
+
+    def test_cli_defaults_to_no_credential_for_ssh_without_an_opt_in(self):
+        code, out, err = self.call_main(
+            "--project", "example", "--config", str(self.config),
+            "--host", "example-host", "--endpoint", "/srv/endpoint.py",
+            "--root", "/srv/orchestra/runtime", "--non-interactive")
+        self.assertEqual(code, sa.EXIT_OK)
+        self.assertNotIn("credential", self.config_dict())
+        self.assertEqual(self.store.secrets, {})
+        self.assertEqual(self.store.calls, [])
+
+    def test_secret_stdin_with_no_secret_is_a_usage_error(self):
+        code, out, err = self.call_main(
+            "--project", "example", "--config", str(self.config),
+            "--host", "example-host", "--endpoint", "/srv/endpoint.py",
+            "--root", "/srv/orchestra/runtime", "--secret-stdin", "--no-secret",
+            "--non-interactive", stdin_text=FAKE_SECRET + "\n")
+        self.assertEqual(code, sa.EXIT_USAGE)
+        self.assertNotIn("Traceback", err)
+        self.assertFalse(self.config.exists())
+
+    def test_dry_run_does_not_require_a_reachable_store(self):
+        unavailable = FakeStore(available=False, reason="the 'secret-tool' command was not found on PATH",
+                                hint="install libsecret-tools")
+        code, out, err = self.call_main(
+            "--project", "example", "--config", str(self.config),
+            "--host", "example-host", "--endpoint", "/srv/endpoint.py",
+            "--root", "/srv/orchestra/runtime", "--store-credential",
+            "--dry-run", "--non-interactive", store=unavailable)
+        self.assertEqual(code, sa.EXIT_OK)
+        self.assertFalse(self.config.exists())
+        self.assertEqual(unavailable.secrets, {})
+
+    def test_force_config_backs_up_unmanaged_keys_before_replacing(self):
+        self.config.write_text('{"transport": "ssh", "custom_key": "keep me"}', encoding="utf-8")
+        result = self.run_setup(confirm_config=True)
+        self.assertTrue(result.replaced_config)
+        self.assertIsNotNone(result.config_backup)
+        backup = Path(result.config_backup)
+        self.assertTrue(backup.exists())
+        self.assertEqual(json.loads(backup.read_text(encoding="utf-8")),
+                         {"transport": "ssh", "custom_key": "keep me"})
+        self.assertNotIn("custom_key", self.config_dict())
+
+    @unittest.skipUnless(os.name == "posix", "owner-only file mode is a POSIX property")
+    def test_config_backup_is_owner_only(self):
+        self.config.write_text('{"keep": "original"}', encoding="utf-8")
+        result = self.run_setup(confirm_config=True)
+        mode = stat.S_IMODE(Path(result.config_backup).stat().st_mode)
+        self.assertEqual(mode, 0o600)
+
+    def test_default_credential_key_separates_actors_and_checkouts(self):
+        base = sa.SetupRequest(project="example")
+        actor_a = sa.SetupRequest(project="example", actor="actor-a")
+        actor_b = sa.SetupRequest(project="example", actor="actor-b")
+        checkout = sa.SetupRequest(project="example", actor="actor-a", checkout="/home/example/one")
+        self.assertEqual(base.resolved_credential_key(), "example")
+        self.assertNotEqual(actor_a.resolved_credential_key(), base.resolved_credential_key())
+        self.assertNotEqual(actor_a.resolved_credential_key(), actor_b.resolved_credential_key())
+        self.assertNotEqual(actor_a.resolved_credential_key(), checkout.resolved_credential_key())
+        self.assertTrue(actor_a.resolved_credential_key().startswith("example:"))
+        self.assertEqual(sa.SetupRequest(project="example", credential_key="explicit").resolved_credential_key(),
+                         "explicit")
+
+    def test_warns_when_the_config_is_inside_a_checkout_and_not_ignored(self):
+        repo = self.dir / "checkout"
+        (repo / ".git").mkdir(parents=True)
+        config = repo / "client.local.json"
+        with patch.object(sa, "_git_ignores", return_value=False):
+            result = sa.run_setup(self.request(config_path=str(config)), store=self.store,
+                                  interactive=False, log=self.logs.append)
+        self.assertTrue(any("git repository" in warning for warning in result.warnings))
+        self.assertTrue(config.exists())
+
+    def test_no_warning_when_the_config_is_git_ignored(self):
+        repo = self.dir / "checkout"
+        (repo / ".git").mkdir(parents=True)
+        config = repo / "client.local.json"
+        with patch.object(sa, "_git_ignores", return_value=True):
+            result = sa.run_setup(self.request(config_path=str(config)), store=self.store,
+                                  interactive=False, log=self.logs.append)
+        self.assertEqual(result.warnings, ())
+
+    def test_no_warning_outside_a_checkout(self):
+        result = self.run_setup()
+        self.assertEqual(result.warnings, ())
 
 
 class GenericRepositoryTests(unittest.TestCase):

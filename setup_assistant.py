@@ -27,8 +27,24 @@ Rules that the code enforces
   ``--force-credential``, or an interactive ``y`` answer).
 * No plaintext fallback. An unavailable platform store is reported with an
   actionable message (exit code 5) before anything is written.
+* Failures never make the store worse. If a replaced credential was overwritten
+  and the config write then fails, the previous value is restored; a brand-new
+  credential is deleted; a failed rollback is reported, never swallowed.
 * Optional project services are generic data (``--service NAME=ADDRESS``), not
   hardcoded project or firm defaults.
+
+What the stored secret is for
+-----------------------------
+The only secret this tool stores is an HTTP **bearer worker credential** for the
+office/API endpoint, read back from the platform store by a consumer such as
+``http_client``. The ``ssh`` and ``local`` config transports need no secret, so
+the setup CLI stores none by default; storing one is an explicit opt-in
+(``--store-credential``, or ``--secret-stdin``/the hidden prompt when that flag
+is set). The config's ``credential`` block records the store, service, key and
+purpose; it never contains the value. Credential keys default to ``<project>``
+when no discriminator is known, otherwise ``<project>:<12-hex digest of
+actor|checkout>``, so two actors or two checkouts of one project do not share a
+key; pass ``--credential-key`` to override.
 
 Config compatibility: the writer produces the same keys ``client.py`` reads for
 its ``ssh``/``local`` transports (``transport``, ``host``, ``endpoint``,
@@ -39,9 +55,11 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import hashlib
 import json
 import logging
 import os
+import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
@@ -124,13 +142,31 @@ class SetupRequest:
     python: Optional[str] = None
     services: Tuple[ServiceSpec, ...] = ()
     credential_key: Optional[str] = None
+    actor: Optional[str] = None
     #: Explicit secret input. ``repr=False`` keeps it out of dataclass reprs/logs.
     secret: Optional[str] = field(default=None, repr=False)
-    store_secret: bool = True
+    #: Off by default: the ssh/local transports need no secret, so storing one is
+    #: an explicit opt-in (``--store-credential`` on the CLI).
+    store_secret: bool = False
     store_service: str = DEFAULT_SERVICE
 
     def resolved_credential_key(self) -> str:
-        return (self.credential_key or self.project or "").strip()
+        """Credential key: an explicit override, else project plus a discriminator.
+
+        ``<project>`` alone is reused by every actor and checkout of a project,
+        so when an actor and/or checkout is known the key becomes
+        ``<project>:<12-hex sha256 of actor|checkout>``. The digest keeps the key
+        short and stable while separating actors and checkouts.
+        """
+        explicit = (self.credential_key or "").strip()
+        if explicit:
+            return explicit
+        project = (self.project or "").strip()
+        discriminators = [value.strip() for value in (self.actor, self.checkout) if (value or "").strip()]
+        if not discriminators:
+            return project
+        digest = hashlib.sha256("|".join(discriminators).encode("utf-8")).hexdigest()[:12]
+        return f"{project}:{digest}" if project else digest
 
 
 @dataclass
@@ -146,7 +182,9 @@ class SetupResult:
     replaced_config: bool = False
     replaced_credential: bool = False
     dry_run: bool = False
+    config_backup: Optional[str] = None
     messages: Tuple[str, ...] = ()
+    warnings: Tuple[str, ...] = ()
 
     def as_dict(self) -> Dict[str, object]:
         return {
@@ -160,8 +198,10 @@ class SetupResult:
             },
             "config_written": self.config_written,
             "replaced_config": self.replaced_config,
+            "config_backup": self.config_backup,
             "dry_run": self.dry_run,
             "messages": list(self.messages),
+            "warnings": list(self.warnings),
         }
 
 
@@ -221,6 +261,11 @@ def build_config(
             "store": store_name or "platform",
             "service": request.store_service,
             "key": credential_key,
+            "purpose": (
+                "HTTP bearer worker credential for the office/API endpoint; read from the "
+                "platform credential store by http_client. The ssh and local transports do "
+                "not consume it, and the value is never stored in this config."
+            ),
         }
     return config
 
@@ -251,6 +296,79 @@ def write_private_config(path: os.PathLike, config: Dict[str, object]) -> Path:
             pass
         raise
     return target
+
+
+def backup_previous_config(path: os.PathLike) -> Path:
+    """Copy an existing config to an owner-only ``.bak`` sibling before replacing it.
+
+    ``--force-config`` is a full replacement, so anything the assistant does not
+    manage would otherwise be lost. The previous bytes are preserved verbatim
+    (even if they are not valid JSON) with the same owner-only mode as the
+    config itself.
+    """
+    target = Path(path).expanduser()
+    data = target.read_bytes()
+    backup = target.with_name(target.name + ".bak")
+    handle, temporary = tempfile.mkstemp(prefix=target.name + ".", suffix=".bak.tmp", dir=str(target.parent))
+    try:
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(data)
+        try:
+            os.chmod(temporary, 0o600)
+        except OSError:  # pragma: no cover - Windows ignores most mode bits
+            pass
+        os.replace(temporary, backup)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    return backup
+
+
+def _repository_root(target: Path) -> Optional[Path]:
+    """The nearest ancestor holding a ``.git`` entry, or ``None``."""
+    for candidate in (target.parent, *target.parent.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
+def _git_ignores(root: Path, target: Path) -> bool:
+    """Whether ``target`` is ignored by the git repository at ``root``.
+
+    A missing or failing git is reported as "not ignored" so the caller still
+    warns; this is a warning path and must never break setup.
+    """
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), "check-ignore", "-q", "--", str(target)],
+            capture_output=True, text=True, check=False,
+        )
+    except OSError:
+        return False
+    return completed.returncode == 0
+
+
+def repository_config_warning(config_path: os.PathLike) -> Optional[str]:
+    """A non-fatal warning when the private config sits in a git checkout.
+
+    A private config inside the repository is one ``git add`` away from being
+    published. Warn (to stderr, from ``main``) when it is inside a checkout and
+    not already ignored; setup still proceeds.
+    """
+    try:
+        target = Path(config_path).expanduser()
+    except (TypeError, ValueError):
+        return None
+    root = _repository_root(target)
+    if root is None or _git_ignores(root, target):
+        return None
+    return (
+        f"warning: the private config {target} is inside the git repository {root} "
+        "and is not git-ignored; add it to .gitignore or keep the config outside the checkout"
+    )
 
 
 def _prompt_for_missing(
@@ -322,13 +440,36 @@ def run_setup(
     config_path = Path(request.config_path).expanduser()
     credential_key = request.resolved_credential_key() if request.store_secret else None
     messages: List[str] = []
+    warnings: List[str] = []
+    repo_warning = repository_config_warning(config_path)
+    if repo_warning:
+        warnings.append(repo_warning)
 
-    store = store if store is not None else credential_store.default_store(service=request.store_service)
-    store_state = store.describe()
+    # A dry run must not require a reachable store, so the default backend is
+    # only probed when a credential is actually going to be stored.
+    if store is not None:
+        resolved_store = store
+    else:
+        try:
+            resolved_store = credential_store.default_store(service=request.store_service)
+        except CredentialStoreUnavailable:
+            if not dry_run:
+                raise
+            resolved_store = None
+    store = resolved_store
+    if store is None:
+        store_state: Dict[str, object] = {
+            "backend": "none",
+            "available": False,
+            "reason": "dry run: the credential store was not probed",
+        }
+    else:
+        store_state = store.describe()
 
     secret: Optional[str] = None
     if request.store_secret:
-        store.require_available()  # CredentialStoreUnavailable -> handled by main()
+        if store is not None and not dry_run:
+            store.require_available()  # CredentialStoreUnavailable -> handled by main()
         secret = request.secret
         if not secret and interactive:
             secret = getpass_fn(f"Secret for credential {credential_key!r} (input hidden): ")
@@ -337,7 +478,7 @@ def run_setup(
         if not secret and not dry_run:
             raise SetupError(
                 "no secret supplied: pipe the value into --secret-stdin, run "
-                "interactively, or pass --no-secret when the setup needs none",
+                "interactively, or omit --store-credential when the setup needs none",
                 exit_code=EXIT_USAGE,
             )
 
@@ -356,11 +497,15 @@ def run_setup(
             )
 
     replaced_credential = False
-    if request.store_secret and credential_key and store.exists(credential_key):
+    previous_secret: Optional[str] = None
+    if request.store_secret and credential_key and store is not None and not dry_run and store.exists(credential_key):
         if confirm_credential or (
             interactive and _confirm(f"A credential for {credential_key!r} already exists. Replace it?", input_fn)
         ):
             replaced_credential = True
+            # Read the value being replaced *before* overwriting it, so a failed
+            # config write can restore it instead of destroying a working secret.
+            previous_secret = store.retrieve(credential_key)
         else:
             raise SetupError(
                 f"a credential for {credential_key!r} already exists in {store.name}; "
@@ -368,19 +513,31 @@ def run_setup(
                 exit_code=EXIT_CREDENTIAL_EXISTS,
             )
 
-    config = build_config(request, store_name=store.name, credential_key=credential_key)
+    config = build_config(request, store_name=store.name if store is not None else None,
+                          credential_key=credential_key)
 
     if dry_run:
-        log_line(f"dry run: no config written and no credential stored ({store.name})")
+        log_line("dry run: no config written and no credential stored")
         return SetupResult(
             config_path=str(config_path), config=config, store=store_state,
             credential_key=credential_key, secret_stored=False, config_written=False,
             replaced_config=replaced_config, replaced_credential=replaced_credential,
-            dry_run=True, messages=tuple(messages),
+            dry_run=True, messages=tuple(messages), warnings=tuple(warnings),
         )
 
+    config_backup: Optional[str] = None
+    if replaced_config:
+        try:
+            config_backup = str(backup_previous_config(config_path))
+        except OSError as exc:
+            raise SetupError(
+                f"could not back up the existing config {config_path}: {exc}",
+                exit_code=EXIT_ERROR,
+            ) from exc
+        log_line(f"backed up the previous config to {config_backup}")
+
     stored_now = False
-    if request.store_secret and credential_key and secret:
+    if request.store_secret and credential_key and secret and store is not None:
         store.store(credential_key, secret, overwrite=replaced_credential)
         stored_now = True
         log_line(
@@ -390,14 +547,27 @@ def run_setup(
 
     try:
         write_private_config(config_path, config)
-    except BaseException:
-        if stored_now:
-            # Do not leave a credential behind for a config that was not written.
+    except BaseException as exc:
+        rollback_problem: Optional[BaseException] = None
+        if stored_now and credential_key is not None and store is not None:
             try:
-                store.delete(credential_key)
-            except CredentialStoreError:
-                pass
-        raise
+                if previous_secret is not None:
+                    # A replacement is restored, never deleted.
+                    store.store(credential_key, previous_secret, overwrite=True)
+                else:
+                    # Only a credential this run created is removed.
+                    store.delete(credential_key)
+            except BaseException as rollback_exc:  # noqa: BLE001 - reported, never swallowed
+                rollback_problem = rollback_exc
+        if not isinstance(exc, Exception):
+            raise
+        message = f"could not write the private config {config_path}: {exc}"
+        if rollback_problem is not None:
+            message += (
+                f"; the credential for {credential_key!r} could not be rolled back "
+                f"({rollback_problem}), so the store may now hold the new value or none"
+            )
+        raise SetupError(message, exit_code=EXIT_ERROR) from exc
     log_line(f"wrote private config {config_path} ({'replaced' if replaced_config else 'new'})")
     if request.services:
         log_line(f"recorded {len(request.services)} optional service address(es) as config data")
@@ -406,7 +576,8 @@ def run_setup(
         config_path=str(config_path), config=config, store=store_state,
         credential_key=credential_key, secret_stored=stored_now, config_written=True,
         replaced_config=replaced_config, replaced_credential=replaced_credential,
-        dry_run=False, messages=tuple(messages),
+        config_backup=config_backup, dry_run=False, messages=tuple(messages),
+        warnings=tuple(warnings),
     )
 
 
@@ -421,9 +592,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="setup_assistant.py",
         description=(
-            "Write a private client config and store its secret in the platform "
-            "credential store. Secrets are read from a hidden prompt or stdin, "
-            "never from the command line."
+            "Write a private client config and, when explicitly requested, store an "
+            "HTTP bearer worker credential in the platform credential store. Secrets "
+            "are read from a hidden prompt or stdin, never from the command line. The "
+            "ssh and local transports need no secret, so none is stored by default."
         ),
     )
     parser.add_argument("--project", help="project name for the private config")
@@ -433,18 +605,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--endpoint", help="endpoint.py path on the server")
     parser.add_argument("--root", help="Beads runtime root on the server")
     parser.add_argument("--checkout", help="local checkout path recorded in the config")
+    parser.add_argument("--actor", help="actor name/id; distinguishes actors in the default credential key")
     parser.add_argument("--python", help="Python interpreter for the local transport")
     parser.add_argument("--service", action="append", default=[], metavar="NAME=ADDRESS",
                         help="optional project service address; repeatable")
-    parser.add_argument("--credential-key", help="credential-store key (default: the project name)")
+    parser.add_argument("--credential-key",
+                        help="credential-store key (default: <project>, or <project>:<actor/checkout digest>)")
     parser.add_argument("--store-service", default=DEFAULT_SERVICE,
                         help=f"credential-store service namespace (default: {DEFAULT_SERVICE})")
     parser.add_argument("--secret-stdin", action="store_true",
-                        help="read the secret from one line on stdin (never from argv)")
-    parser.add_argument("--no-secret", action="store_true",
-                        help="store no credential at all for this setup")
+                        help="read the secret from one line on stdin (never from argv); implies --store-credential")
+    credential_group = parser.add_mutually_exclusive_group()
+    credential_group.add_argument("--store-credential", action="store_true",
+                                  help="explicitly opt in to storing a secret in the platform credential store")
+    credential_group.add_argument("--no-secret", action="store_true",
+                                  help="store no credential at all for this setup (the default)")
     parser.add_argument("--force-config", action="store_true",
-                        help="explicitly allow replacing an existing config file")
+                        help="explicitly allow replacing an existing config file (a .bak sibling is kept)")
     parser.add_argument("--force-credential", action="store_true",
                         help="explicitly allow replacing an existing stored credential")
     parser.add_argument("--dry-run", action="store_true",
@@ -475,9 +652,14 @@ def main(
 
     secret: Optional[str] = None
     try:
+        if args.secret_stdin and args.no_secret:
+            raise SetupError("--secret-stdin cannot be combined with --no-secret", exit_code=EXIT_USAGE)
         services = tuple(ServiceSpec.parse(text) for text in args.service)
         if args.secret_stdin:
             secret = _read_stdin_secret(stdin)
+        # Storing is opt-in: piping a secret or naming --store-credential is the
+        # explicit request; the ssh/local transports otherwise need none.
+        store_secret = bool(args.store_credential or args.secret_stdin) and not args.no_secret
         interactive = False if args.non_interactive else bool(stdin.isatty() and stdout.isatty())
         request = SetupRequest(
             project=args.project or "",
@@ -490,8 +672,9 @@ def main(
             python=args.python,
             services=services,
             credential_key=args.credential_key,
+            actor=args.actor,
             secret=secret,
-            store_secret=not args.no_secret,
+            store_secret=store_secret,
             store_service=args.store_service,
         )
         result = run_setup(
@@ -519,7 +702,16 @@ def main(
     except CredentialStoreError as exc:
         print(f"setup: {redact_secrets(str(exc), [secret])}", file=stderr)
         return EXIT_ERROR
+    except OSError as exc:
+        # A filesystem failure must be a message and a non-zero exit, not a traceback.
+        print(f"setup: {redact_secrets(str(exc), [secret])}", file=stderr)
+        return EXIT_ERROR
+    except Exception as exc:  # noqa: BLE001 - last-resort reporting for the CLI
+        print(f"setup: {redact_secrets(str(exc), [secret])}", file=stderr)
+        return EXIT_ERROR
 
+    for warning in result.warnings:
+        print(warning, file=stderr)
     if log is None:
         for message in result.messages:
             print(message, file=stdout)

@@ -31,6 +31,29 @@ This atomically installs `projects/example/ONBOARDING.md` under the coordination
 
 The project entry point should explicitly supersede obsolete checkout-local coordination paths where necessary, while retaining repository build rules and current claims. Repository README/AGENTS.md can point to `onboard`; keep a minimal connection command there or in the initial worker prompt. The client/server connection information is the irreducible bootstrap input.
 
+## Private config and the platform credential store
+
+`setup_assistant.py` writes the private `client.local.json`-shaped config that `client.py` reads (`transport`, `host`, `endpoint`, `root`, `python`) and, only when asked, stores a secret in the operating system's credential store instead of in a file:
+
+```sh
+python3 setup_assistant.py --help
+python3 setup_assistant.py --project example --config /private/example/client.local.json \
+    --host example-host --endpoint /srv/orchestra/endpoint.py --root /srv/orchestra/runtime \
+    --actor SAVED_ACTOR --non-interactive
+```
+
+The `ssh` and `local` transports need no secret, so **none is stored by default**. The only secret the tool stores is an HTTP bearer worker credential for the office/API endpoint, read back from the platform store by a consumer such as `http_client`; opt in with `--store-credential` (or pipe the value with `--secret-stdin`, which implies it). The config's `credential` block records the store, service, key and purpose and never the value. Set an explicit `--credential-key`, or let the default separate actors/checkouts: `<project>`, or `<project>:<12-hex digest of actor|checkout>` when an actor or checkout is known.
+
+Backends are Windows Credential Manager (`pywin32`), the macOS keychain (`security -i`, so the secret stays out of argv), and the Linux Secret Service (`secret-tool`, from `libsecret-tools`). There is no plaintext fallback: an unavailable store is a clean error (exit 5) with an install/enable hint, reported before anything is written. Secrets are read only from a hidden prompt or stdin, never from argv, and every message is redacted.
+
+Safe re-runs and dry runs:
+
+- An existing config or stored credential is replaced only with `--force-config` / `--force-credential` (or an interactive `y`). `--force-config` first copies the previous file to an owner-only `.bak` sibling, so keys this tool does not manage are not lost.
+- If a replaced credential was overwritten and the config write then fails, the previous value is restored; a brand-new credential is deleted. A failed rollback is reported, never swallowed.
+- `--dry-run` validates and prints the config without writing, storing a secret, or requiring a reachable credential store.
+- Setup warns on stderr (non-fatal) when `--config` points inside a git checkout and is not git-ignored, so a private config is not published by a stray `git add`.
+- The config file is written atomically (temporary file plus rename) and owner-only where the platform supports it.
+
 ## Minimal prompt
 
 ```text
