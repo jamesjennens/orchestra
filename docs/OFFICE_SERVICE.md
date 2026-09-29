@@ -115,6 +115,17 @@ preserves the previous complete pair on failure. `backup-copy` gates on all
 initialized projects having complete pairs. The external scheduler owns the
 timer, encryption, retention and alert destination.
 
+Collect a read-only, machine-readable UAT record after startup and backup:
+
+```sh
+<PYTHON> <KIT>/tools/office_verify.py --install-root <INSTALL_ROOT> \
+  --root <RUNTIME_ROOT> --port <HTTP_LOOPBACK_PORT>
+```
+
+It checks that the installed source provenance matches the release manifest,
+reports the bundled Python and host libc, and includes the health result and
+exit code. It reads the runtime but changes no records or service state.
+
 For recovery, stop the service, inspect the last backup status and sidecar,
 follow `docs/OPERATIONS.md` for `restore-new` into a **disposable** project,
 compare exports, and only then make an explicit operator decision on the live

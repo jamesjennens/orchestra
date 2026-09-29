@@ -191,8 +191,11 @@ def run(root, logs, config, port, stop_seconds):
         db = web = None
         try:
             env = admin.environment(root)
+            db_env = env.copy()
+            db_env.pop('DOLT_CLI_PASSWORD', None)
+            db_env.pop('BEADS_DOLT_PASSWORD', None)
             db = _spawn([root/'bin/dolt', 'sql-server', '--config', root/'server.json'],
-                        root, logs/'dolt.log', env)
+                        root, logs/'dolt.log', db_env)
             until = time.monotonic()+30
             while time.monotonic() < until and not stop:
                 if db.poll() is not None:

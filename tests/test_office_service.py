@@ -49,6 +49,8 @@ class OfficeServiceTests(unittest.TestCase):
 import json, os, socket, sys, time
 args=sys.argv[1:]
 if 'sql-server' in args:
+    if 'DOLT_CLI_PASSWORD' in os.environ or 'BEADS_DOLT_PASSWORD' in os.environ:
+        sys.exit(17)  # server must not inherit client credentials
     cfg=json.load(open(args[args.index('--config')+1]))
     port=cfg['listener']['port']
     with socket.socket() as s:
