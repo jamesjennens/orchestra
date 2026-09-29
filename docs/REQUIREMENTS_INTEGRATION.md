@@ -83,6 +83,10 @@ python requirement_records.py revise --config client.json --project example --ac
   `brd-section` type label; it needs `parent` only when creating. Untyped
   records, ordinary tasks and epics are refused, so the command cannot relabel
   an arbitrary record.
+  The operator's `requirement-apply` route may instead write an accepted
+  revision 1 with F3 acceptance evidence, including on an existing untyped
+  task with no revision comments. Contributor `draft` remains draft-only and
+  requires a typed task when selecting one.
 - `revise` selects an existing `task`, must write exactly the next revision, and
   is bound to the record's existing kind and key: a `requirement` record cannot
   be revised as `brd-section`, and a keyed record cannot change key.
@@ -147,12 +151,34 @@ publisher integration. Until then a published manifest's acceptance continues to
 be supplied through `publish_brd`'s existing `--acceptance` path.
 
 ```json
-{"schema_version": 1, "operation_id": "session-1/req-1-r2", "kind": "requirement",
+{"schema_version": 1, "operation_id": "session-1/req-1-r2", "operation": "revise",
+ "kind": "requirement",
  "task": "sample-job.7", "title": "R01: Intent", "key": "R01",
  "description": "## Requirement\n...", "revision": 2, "acceptance_state": "accepted",
  "acceptance": {"owners": ["owner-a"], "approvers": ["owner-a"], "policy": "any-owner",
                 "decision_id": "decision-2026-09-25", "evidence": "review 01a0d..."}}
 ```
+
+For a first revision accepted before it entered Orchestra, the operator uses
+`operation: "draft"` (the operation names revision creation, not the acceptance
+state). Supply `parent` to create a task, or replace it with `task` to select
+an existing task with no revision comments:
+
+```json
+{"schema_version": 1, "operation_id": "operator/accepted-r1", "operation": "draft",
+ "kind": "requirement", "parent": "sample-job", "title": "R01: Intent",
+ "key": "R01", "description": "## Requirement\n...", "revision": 1,
+ "acceptance_state": "accepted",
+ "acceptance": {"owners": ["owner-a"], "approvers": ["owner-a"],
+                "policy": "any-owner", "decision_id": "decision-example",
+                "evidence": "approved baseline example"}}
+```
+
+Pass this payload to `admin.py requirement-apply` as below. A later accepted
+revision 2 uses `operation: "revise"`, a new operation ID and a new decision.
+For a new task, the command creates draft labels, then writes acceptance
+evidence, the accepted revision comment, and finally the accepted label. A
+retry with the same operation ID and identical payload adds nothing.
 
 ```sh
 python admin.py --root /path/to/runtime requirement-apply example \

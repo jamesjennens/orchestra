@@ -22,10 +22,12 @@ every reader and survives a restore; the publication-level `manifest_sha256`
 stays owned by `requirements.py`/`publish_brd.py`, and `publication_acceptance`
 rebinds a record decision to a manifest when a BRD is published.
 
-Selection is closed. `draft` with `task=` only accepts records already carrying
-the `requirement`/`brd-section` type label (or records this command created), and
-`revise` is bound to the record's existing kind and key: cross-kind changes and
-key swaps are refused before any native write. Revise follows the trusted-team
+Selection is closed for contributors. Their `draft` with `task=` only accepts
+records already carrying the `requirement`/`brd-section` type label (or records
+this command created). The operator may accept revision 1 on an untyped task
+with no prior revisions and F3 evidence. `revise` is bound to the record's
+existing kind and key: cross-kind changes and key swaps are refused before any
+native write. Revise follows the trusted-team
 model: any contributor actor may revise any draft (see
 docs/REQUIREMENTS_INTEGRATION.md); the actor string is an attribution, not an
 authenticated owner identity.
@@ -214,7 +216,7 @@ def publication_acceptance(acceptance, manifest):
     return full
 
 
-def validate_payload(payload):
+def validate_payload(payload, operator=False):
     if not isinstance(payload, dict):
         raise ValueError('requirement payload must be an object')
     _refuse_injected_labels(payload)
@@ -247,9 +249,17 @@ def validate_payload(payload):
         _positive_int(payload['revision'], 'revision')
     if 'acceptance' in payload:
         _validate_acceptance_shape(payload['acceptance'])
+        if operator:
+            # Check F3 semantics before a new accepted revision allocates a
+            # native task; bind the real revision hash after the task ID is
+            # known. A dummy well-formed hash suffices for this preflight.
+            bound_acceptance(dict(payload['acceptance'], record_sha256='0' * 64))
     if payload['operation'] == 'draft':
         if payload['acceptance_state'] != 'draft':
-            raise ValueError('draft creates a draft revision (acceptance_state must be draft)')
+            if not operator:
+                raise ValueError('draft creates a draft revision (acceptance_state must be draft)')
+            if 'acceptance' not in payload:
+                raise ValueError('An accepted first revision requires F3 acceptance evidence')
         if 'revision' in payload and payload['revision'] != 1:
             raise ValueError('draft creates revision 1; use revise for later revisions')
         if 'task' not in payload and 'parent' not in payload:
@@ -485,10 +495,12 @@ def existing_kind(row):
     return next(iter(present))
 
 
-def require_typed(row, payload):
-    """Selection is closed: only records already typed requirement/brd-section."""
+def require_typed(row, payload, allow_untyped=False):
+    """Selection is typed, except an operator's accepted first revision on a task."""
     kind = existing_kind(row)
     if kind is None:
+        if allow_untyped and row.get('issue_type') == 'task':
+            return
         raise ValueError('Record %s is not a requirement/brd-section record; refusing to relabel it. '
                          'Only records already typed requirement or brd-section (or created by this command) '
                          'may be selected; type an existing record with admin.py requirement-backfill.'
@@ -661,7 +673,7 @@ def apply_native(payload, actor, run, project, operator=False):
     failed evidence write leaves the record reading as draft rather than
     accepted without evidence.
     """
-    validate_payload(payload)
+    validate_payload(payload, operator=operator)
     if not operator and payload['acceptance_state'] == 'accepted':
         raise ValueError('Contributors may only draft requirement records; accepting a record is '
                          'owner/operator-only and requires F3 acceptance evidence. Use a draft revision, or ask '
@@ -705,7 +717,9 @@ def apply_native(payload, actor, run, project, operator=False):
             if prior is not None and not reusable:
                 raise ValueError('Reserved requirement request has no visible record; outcome uncertain. '
                                  'Operator must reconcile before any new request; do not allocate another ID.')
-            labels = sorted(controlled(payload['kind'], payload['acceptance_state'])
+            # A new accepted record starts as draft until its F3 evidence and
+            # accepted revision have both been written.
+            labels = sorted(controlled(payload['kind'], 'draft')
                             | {request_label, 'request-content:' + digest})
             args = ['create', '--title', payload['title'], '--parent', payload['parent'],
                     '--description', payload['description'], '--type', 'task',
@@ -737,13 +751,15 @@ def apply_native(payload, actor, run, project, operator=False):
             raise ValueError('Recorded native requirement record %s is not visible; outcome uncertain. '
                              'Operator must reconcile this operation ID.' % task)
         raise ValueError('Unknown requirement record: ' + task)
+    existing = existing_revisions(row)
     if not created:
-        require_typed(row, payload)
+        allow_untyped = (operator and payload['operation'] == 'draft'
+                         and payload['acceptance_state'] == 'accepted' and not existing)
+        require_typed(row, payload, allow_untyped=allow_untyped)
         if prior is not None and prior.get('created') \
                 and 'request-content:' + digest not in (row.get('labels') or []):
             raise ValueError('Native requirement content mismatch')
     record = requirement_record(payload, task, revision)
-    existing = existing_revisions(row)
     require_bound_key(task, payload, existing)
     _check_revision(payload, revision, existing, record, task)
     bound = _check_acceptance(payload, existing, record, operator, row)
