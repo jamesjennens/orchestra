@@ -91,6 +91,16 @@ export async function detail(ctx, { pid, tid }) {
         h('span', { class: 'chip ' + (r.status === 'open' ? 'warn' : 'ok') }, r.status === 'open' ? 'Open' : 'Resolved'), ' ', r.text,
         r.resolution ? h('div', { class: 'small muted' }, 'Resolution: ', r.resolution) : null))));
   }
+  // Canonically a requested change stays open until the contributor records a response
+  // for it (the review "respond" step), even after a newer revision arrives. The web
+  // interface cannot record responses yet (slice 2), so it says so instead of implying
+  // the new revision resolved them.
+  const carried = c ? openRequests.filter((r) => r.contribution && r.contribution !== c.id) : [];
+  if (carried.length) {
+    reviewBody.append(h('div', { class: 'banner', role: 'note' },
+      `Revision ${c.revision} arrived, but ${carried.length} requested change(s) from an earlier revision are still open. `,
+      'Each stays open until the contributor records a response for it with their worker tools; the web interface cannot record responses yet.'));
+  }
   if (owner && c && review.state === 'awaiting-review' && !project.archived) reviewBody.append(reviewActions(ctx, pid, tid, c, review));
   if (mine && writer && ['none', 'changes-requested'].includes(review.state) && t.status !== 'closed') reviewBody.append(deliverForm(ctx, pid, tid, c, openRequests.length, review));
   const reviewPanel = h('section', { class: 'panel', 'aria-labelledby': 'review-h' },

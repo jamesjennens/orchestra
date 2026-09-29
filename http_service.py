@@ -26,6 +26,7 @@ import secrets
 import ssl
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -64,6 +65,9 @@ AGENT_CLAIMABLE_LIMIT = MAX_PAGE
 #: Bound on the projects one ``GET /v1/me/work`` read walks (the caller's own
 #: memberships, each read once). Reaching it reports ``truncated``.
 ME_WORK_MAX_PROJECTS = 50
+#: Size bound on the per-server short-lived read cache used by ``GET /v1/me/work``
+#: (entries are keyed per principal and project; see ``READ_CACHE_SECONDS``).
+READ_CACHE_MAX_ENTRIES = 2048
 #: Task-list filters the browser sends. Filtering reads the project's one full
 #: snapshot and pages the filtered rows, so the cursor stays exact.
 TASK_STATUS_FILTERS = ('active', 'open', 'in_progress', 'blocked', 'closed')
@@ -392,6 +396,7 @@ class InProcessBackend:
         task = {'id': task_id, 'project_id': project_id, 'title': title.strip(),
                 'priority': priority,
                 'description': description, 'status': 'open', 'assignee': None,
+                'review_state': 'none',
                 'version': 1, 'created_by': principal.user_id,
                 'created_at': now_iso(self.service._now()),
                 'attachments': payload.get('attachments') or []}
@@ -644,6 +649,15 @@ class InProcessBackend:
                 # The disposable backend records no lifecycle evidence, so every fact is
                 # honestly unknown rather than inferred from the review state.
                 'lifecycle': {}, 'depends_on': []}
+
+    #: The disposable backend is cheap to read and tests expect fresh reads.
+    READ_CACHE_SECONDS = 0
+
+    def review_states(self, project_id, queue=None):
+        """Review state of every task: in-process rows carry it themselves."""
+        return {'states': {t['id']: t.get('review_state') or 'none'
+                           for t in self.read_tasks(project_id)['items']},
+                'complete': True}
 
     def review_queue(self, project_id):
         """Every task with current work, highest-attention review states first.
@@ -1112,6 +1126,25 @@ class EndpointBackend:
                                for d in dependencies if isinstance(d, dict)],
                 'warnings': data.get('warnings') or []}
 
+    #: ``GET /v1/me/work`` may reuse one principal's queue read of a project for this
+    #: long, so a burst of page loads does not re-export every project each time.
+    READ_CACHE_SECONDS = 20
+    #: ``review_states`` is derived from ``review_queue`` (see the handler's reuse).
+    REVIEW_STATES_FROM_QUEUE = True
+
+    def review_states(self, project_id, queue=None):
+        """Review state per task from the canonical ``work`` projection.
+
+        ``bd list`` rows carry no review state, so the task list merges this in. The
+        ``work`` queue lists every open task and every closed task whose review is
+        still active; a closed task it omits has a finished (or no) review, which is
+        reported as unknown rather than guessed. ``complete`` is false when the
+        bounded walk stopped early; tasks past the bound are unknown too.
+        """
+        queue = queue if queue is not None else self.review_queue(project_id)
+        return {'states': {item['id']: item['review_state'] for item in queue['items']},
+                'complete': bool(queue.get('complete')), 'closed_unknown': True}
+
     #: Bound on the canonical ``work`` pages one queue read walks (``work`` allows at
     #: most 100 rows per call and re-exports the project each call). Reaching it
     #: reports ``complete: false`` rather than reading on.
@@ -1173,6 +1206,12 @@ def next_action(task):
     state = task.get('review_state')
     if task.get('status') == 'closed' and state not in ACTIVE_REVIEW_STATES:
         return None
+    if state is None:
+        # Unknown (the canonical projection did not cover this row): say nothing
+        # rather than invite a claim or delivery on work that may be under review.
+        return None
+    if state == 'integrated':
+        return {'who': 'owner', 'text': 'Follow the release workflow for the integrated work'}
     if state in ('awaiting-review', 'legacy-review-ready'):
         return {'who': 'owner', 'text': 'Review the delivered contribution'}
     if state == 'changes-requested':
@@ -1251,6 +1290,8 @@ class ApiHandler(BaseHTTPRequestHandler):
     service = None
     backend = None
     web_root = None
+    read_cache = None
+    read_cache_lock = None
     trusted_proxies = ()
     max_body = MAX_BODY_BYTES
     protocol_version = 'HTTP/1.1'
@@ -1267,6 +1308,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         # Per-request agent read cache. An HTTP/1.1 keep-alive connection reuses this
         # handler instance, so the cache is reset for every request and never outlives it.
         self._agent_task_cache = {}
+        self._queue_cache = {}
         try:
             parsed = urlsplit(self.path)
             path = parsed.path
@@ -1606,6 +1648,52 @@ class ApiHandler(BaseHTTPRequestHandler):
         names = self.service.actor_names([t.get('assignee') for t in tasks])
         return [self._task_view(t, names) for t in tasks]
 
+    def _review_queue(self, project_id, shared=False):
+        """One review-queue read of a project per request (and, when ``shared`` and the
+        backend allows it, reused for ``READ_CACHE_SECONDS`` by the same principal).
+
+        Authorization is never cached: callers re-check live authority first.
+        """
+        cache = getattr(self, '_queue_cache', None)
+        if cache is None:
+            cache = self._queue_cache = {}
+        if project_id in cache:
+            return cache[project_id]
+        ttl = getattr(self.backend, 'READ_CACHE_SECONDS', 0) if shared else 0
+        key = (getattr(self._principal, 'user_id', None), project_id)
+        now = time.monotonic()
+        if ttl:
+            with self.read_cache_lock:
+                hit = self.read_cache.get(key)
+            if hit is not None and hit[0] > now:
+                cache[project_id] = hit[1]
+                return hit[1]
+        result = self.backend.review_queue(project_id)
+        cache[project_id] = result
+        if ttl:
+            with self.read_cache_lock:
+                if len(self.read_cache) >= READ_CACHE_MAX_ENTRIES:
+                    for stale in [k for k, v in self.read_cache.items() if v[0] <= now] or \
+                            list(self.read_cache)[:READ_CACHE_MAX_ENTRIES // 2]:
+                        self.read_cache.pop(stale, None)
+                self.read_cache[key] = (now + ttl, result)
+        return result
+
+    def _with_review_states(self, project_id, rows):
+        """Give every row its review state (``None`` when unknown). Returns completeness."""
+        if all(isinstance(r, dict) and 'review_state' in r for r in rows):
+            return True
+        # A backend whose states come from its queue projection reuses this request's
+        # queue read instead of paying for a second one.
+        queue = self._review_queue(project_id) \
+            if getattr(self.backend, 'REVIEW_STATES_FROM_QUEUE', False) else None
+        read = self.backend.review_states(project_id, queue=queue)
+        states = read['states']
+        for row in rows:
+            if isinstance(row, dict) and 'review_state' not in row:
+                row['review_state'] = states.get(row.get('id'))
+        return bool(read.get('complete'))
+
     # -- session and account routes -------------------------------------------
     @route('POST', r'/v1/sessions', anonymous=True, csrf=False)
     def sessions_create(self, ctx):
@@ -1623,8 +1711,8 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('GET', r'/v1/sessions/current')
     def sessions_whoami(self, ctx):
         principal = ctx.principal
-        user = self.service.state['users'].get(principal.user_id) or {}
-        body = {'user': {'id': principal.user_id, 'username': user.get('username'),
+        body = {'user': {'id': principal.user_id,
+                         'username': self.service.username_of(principal.user_id),
                          'display_name': principal.display_name,
                          'superuser': principal.superuser},
                 'via': principal.via,
@@ -1666,7 +1754,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         if not isinstance(project, str) or not SAFE_ID.fullmatch(project):
             raise invalid('project is required: the project the member is being added to')
         return 200, self.service.lookup_account(ctx.principal, project,
-                                                ctx.query.get('username'))
+                                                ctx.query.get('username'),
+                                                request_id=ctx.request_id)
 
     @route('POST', r'/v1/accounts/(?P<uid>' + ID + r')/password')
     def account_password(self, ctx):
@@ -2196,11 +2285,19 @@ class ApiHandler(BaseHTTPRequestHandler):
         filters = self._task_filters(ctx.query)
         if filters:
             rows = [t for t in self.backend.read_tasks(ctx.params['pid']).get('items') or []
-                    if isinstance(t, dict) and task_matches(t, filters)]
+                    if isinstance(t, dict)]
+            complete = self._with_review_states(ctx.params['pid'], rows)
+            rows = [t for t in rows if task_matches(t, filters)]
             result = {'items': rows[state['o']:state['o'] + limit], 'total': len(rows)}
         else:
             result = self.backend.list_tasks(ctx.params['pid'], limit, state['o'])
+            complete = self._with_review_states(ctx.params['pid'], result['items'])
         result['items'] = self._task_views(result['items'])
+        # False when some rows' review state is unknown (``review_state: null``): the
+        # bounded canonical projection did not cover them, or they are closed tasks
+        # whose finished review the queue no longer lists.
+        result['review_states_complete'] = complete and all(
+            t.get('review_state') is not None for t in result['items'])
         result['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query,
                                              state['o'] + limit)
                                  if state['o'] + limit < result['total'] else None)
@@ -2348,7 +2445,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         wanted = ctx.query.get('state')
         if wanted is not None and wanted not in ACTIVE_REVIEW_STATES:
             raise invalid('state must be one of %s' % ', '.join(ACTIVE_REVIEW_STATES))
-        read = self.backend.review_queue(ctx.params['pid'])
+        read = self._review_queue(ctx.params['pid'])
         items = [item for item in read['items']
                  if (item['review_state'] == wanted if wanted else
                      item['review_state'] in ACTIVE_REVIEW_STATES)]
@@ -2380,7 +2477,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             if CAP_READ not in capabilities:
                 continue
             try:
-                read = self.backend.review_queue(project['id'])
+                read = self._review_queue(project['id'], shared=True)
             except HttpError as error:
                 unavailable.append({'project': project['id'], 'reason': error.code})
                 continue
@@ -2469,6 +2566,7 @@ def build_handler(service, backend, *, trusted_proxies=(), max_body=MAX_BODY_BYT
     return type('ConfiguredApiHandler', (ApiHandler,), {
         'service': service, 'backend': backend,
         'web_root': str(web_root) if web_root is not None else None,
+        'read_cache': {}, 'read_cache_lock': threading.Lock(),
         'trusted_proxies': tuple(trusted_proxies or ()),
         'max_body': max_body,
     })

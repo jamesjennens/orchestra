@@ -31,7 +31,7 @@ export async function overview(ctx, { pid }) {
       draw();
     } }, label)));
   const reviewSel = h('select', { id: 'review-filter', 'aria-label': 'Review state', onchange: (e) => { state.review = e.target.value; state.cursor = null; state.stack = []; draw(); } },
-    [['', 'Any review state'], ['awaiting-review', 'Awaiting review'], ['changes-requested', 'Changes requested'], ['approved', 'Approved · not integrated'], ['integrated', 'Integrated'], ['none', 'No contribution']].map(([v, l]) => h('option', { value: v }, l)));
+    [['', 'Any review state'], ['awaiting-review', 'Awaiting review'], ['changes-requested', 'Changes requested'], ['approved', 'Approved · not integrated'], ['none', 'No contribution']].map(([v, l]) => h('option', { value: v }, l)));
   let debounce;
   search.addEventListener('input', () => { clearTimeout(debounce); debounce = setTimeout(() => { state.q = search.value.trim(); state.cursor = null; state.stack = []; draw(); }, 250); });
 
@@ -46,6 +46,11 @@ export async function overview(ctx, { pid }) {
     } finally { tableHost.removeAttribute('aria-busy'); }
     const rows = page.items;
     const start = state.stack.length * PAGE;
+    // The server says when some rows' review state is unknown (closed tasks with a
+    // finished review, or rows past its bounded read); those show their status only.
+    const partial = page.review_states_complete === false
+      ? h('p', { class: 'small muted', role: 'note' }, 'Review state is not known for some tasks shown here (closed tasks, or more tasks than one read covers); they show their status only.')
+      : null;
     tableHost.replaceChildren(
       rows.length ? h('div', { class: 'table-wrap' }, h('table', null,
         h('caption', { class: 'visually-hidden' }, 'Tasks in ' + project.name),
@@ -57,6 +62,7 @@ export async function overview(ctx, { pid }) {
           h('td', { class: 'hide-narrow' }, t.next_action ? t.next_action.text : h('span', { class: 'muted' }, '—')),
           h('td', { class: 'hide-narrow muted' }, t.updated_at ? time(t.updated_at) : '')))))) :
         empty(state.q || state.review ? 'No matching tasks' : 'No tasks yet', state.q || state.review ? 'Try a different search or filter.' : canWrite(project) && !project.archived ? 'Define the first task for this project.' : null),
+      partial,
       h('div', { class: 'pager' },
         h('span', { class: 'num' }, page.total ? `${start + 1}–${start + rows.length} of ${page.total}` : ''),
         h('div', { class: 'actions' },
