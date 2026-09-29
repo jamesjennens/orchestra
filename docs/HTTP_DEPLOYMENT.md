@@ -205,9 +205,13 @@ the project ids and no secret. The secret belongs in VS Code secret storage or t
 credential store; an environment variable is only a documented fallback, set from that
 store, and `.orchestra/` stays out of Git. The setup snippet never shows the literal
 secret being assigned on a command line: a literal `export` would persist in shell
-history and the process list. The
-agent then calls `GET /v1/agents/me` and `GET /v1/agents/me/next` with
-`Authorization: Bearer $ORCHESTRA_AGENT_SECRET`; every other project route works as
+history and the process list. Its fallback keeps the secret out of curl's argv as well:
+the user writes a mode-600 curl config file from that store (the header line, e.g.
+`header = "Authorization: Bearer <YOUR_AGENT_SECRET>"` in `~/.orchestra-agent-curlrc`)
+and curl reads the header from it with `-K`, so no shell expansion ever puts the secret
+in the process list. The
+agent then calls `GET /v1/agents/me` and `GET /v1/agents/me/next` with its credential as a
+bearer token (`Authorization: Bearer <agent-secret>`); every other project route works as
 before, capped at the owner's live role and the agent's granted projects. A grant may
 only name a project the owner can open, including when a superuser edits somebody
 else's agent (`404` otherwise). Set `--public-url https://<HOSTNAME>` so the setup and
@@ -230,11 +234,22 @@ private. `GET /v1/projects/{id}/agents` lists the agents whose grant names the p
 (id, name, owner, `last_seen_at`, `enabled` only, never `working_directory` or
 `working_directory_hidden`), `GET /v1/projects/{id}/agents/{agent}` returns one of
 them, and `DELETE /v1/projects/{id}/agents/{agent}` removes the project from that
-agent's grant with an audit record naming the project and the acting user. Removal
+agent's grant with an audit record naming the project and the acting user. An agent that
+is not granted the project is reported exactly like a nonexistent id: both routes answer
+`404` with the same `Agent not found` message, so a project owner cannot probe the wider
+registry. Removal
 takes effect on the agent's next request: the credential is refused (`403`/`404`) on
 that project's routes and the project drops out of `/v1/agents/me/next`. It revokes
 nothing else - the agent is not disabled, keeps its other projects and credentials,
 and its own owner keeps every other control.
+
+The removal is therefore **not sticky**. It drops one project from the grant; it does not
+mark the agent as barred from the project. The agent's own owner still administers the
+agent and can add that project back immediately while they are still a member of it - the
+same live grant checks apply as for any other grant, and the project owner gets no
+notification beyond the audit record. Whether a project owner should be able to block an
+agent from being re-granted is an **owner decision that is still pending**; no such block
+exists today.
 
 Revoke an agent credential, disable the agent, disable the owner or remove the
 owner's project membership and the agent stops on its next request. The
