@@ -25,11 +25,12 @@ from version import report
 
 
 def private_root(raw):
-    root = Path(raw).expanduser().resolve()
-    if not root.is_absolute() or root == Path('/'):
+    requested = Path(raw).expanduser()
+    if not requested.is_absolute() or requested.is_symlink():
+        raise ValueError('Use a real absolute runtime directory, not a symlink')
+    root = requested.resolve()
+    if root == Path('/'):
         raise ValueError('Use an explicit non-root runtime directory')
-    if root.is_symlink():
-        raise ValueError('Runtime root must not be a symlink')
     return root
 
 
@@ -45,8 +46,9 @@ def service_config(path):
         raise ValueError('Office service HTTP listener must use loopback; put TLS at the approved proxy')
     if bool(config.get('cert')) != bool(config.get('key')):
         raise ValueError('cert and key must be supplied together')
-    if not isinstance(config.get('trusted_proxies', []), list):
-        raise ValueError('trusted_proxies must be a list')
+    if (not isinstance(config.get('trusted_proxies', []), list) or
+            any(not isinstance(value, str) for value in config.get('trusted_proxies', []))):
+        raise ValueError('trusted_proxies must be a list of addresses')
     return config
 
 
