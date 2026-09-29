@@ -144,7 +144,30 @@ should set `X-Forwarded-Proto https` and the service must name the proxy address
 with `--trusted-proxy` for that header to be believed (section 4); otherwise
 browser session cookies are issued without `Secure`. Do not add a wildcard CORS
 origin: credentialed requests require an explicit origin list and the service
-sends `Cache-Control: no-store` on every response.
+sends `Cache-Control: no-store` on every API response.
+
+### Web interface on the same origin
+
+The service also serves the browser interface from the kit's `web/` directory at
+`/`, on the same origin as `/v1`, so the session cookie stays `SameSite=Strict` and
+no CORS is needed. Proxy `/` as above; nothing else is required. Static serving is
+anonymous `GET`/`HEAD` only, from a fixed allowlist (`index.html`, `css/`, `js/`,
+`js/views/`, `img/`; `.html .css .js .svg .png .ico`), with no directory listing.
+The raw path is checked before decoding, so dot and percent-encoded traversal never
+match, and a symlink that resolves outside `web/` (or onto an excluded file) is
+refused. `prototype.html`, `js/prototype.js`, `js/mock.js` and `web/data/` are never
+served. Static responses carry `Content-Security-Policy: default-src 'self';
+script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self';
+frame-ancestors 'none'; base-uri 'none'; form-action 'self'`, `nosniff`,
+`Referrer-Policy: no-referrer`, `X-Frame-Options: DENY` and `Cache-Control:
+no-cache` with an `ETag`, so a redeploy is picked up on the next load.
+`--web-root DIR` serves a different copy; `--no-web` turns the interface off and
+leaves the JSON API unchanged.
+
+Slice 1 of the interface covers sign-in, projects and members, tasks, claims,
+contribution review and feedback. Requirements, decisions and records are hidden
+from its navigation (the service has no routes for them yet) and a direct link
+shows "not available on this server".
 
 ## 6. Worker clients
 
@@ -651,9 +674,16 @@ the pilot phase, not part of this service.
   project-scoped `GET /v1/projects/{id}/agents`,
   `GET /v1/projects/{id}/agents/{agent}` and
   `DELETE /v1/projects/{id}/agents/{agent}`) are implemented and tested. The
-  **browser screens** that render "Your agents", the working directory
-  and the copyable resume prompt are kittrial-5bb.20 and are not built here; this
-  build exposes only the JSON contract they will consume.
+  browser screens that render them are kittrial-5bb.20 (served at `/`, see
+  section 5).
+- The web interface reads `GET /v1/projects/{id}/members`,
+  `GET /v1/projects/{id}/worker-credentials` (metadata only),
+  `GET /v1/projects/{id}/tasks/{task}/brief`, `GET /v1/projects/{id}/queue`,
+  `GET /v1/me/work` and `GET /v1/accounts/lookup?username=&project=`. Over the
+  canonical binding the brief maps the canonical `brief --json` read and the queue
+  pages the canonical `work` action (bounded; `complete: false` past the bound).
+  Canonical task rows from `bd list` carry no review state, so the task list's
+  `review_state` filter only narrows on the in-process backend.
 - **Known limitation `endpoint-blocked-signal`.** `blocked` attention for an agent is
   derived from the in-process canonical checkpoint view (`backend.state['checkpoints']`).
   The canonical endpoint binding does not mirror checkpoints into service state, so
