@@ -10,7 +10,7 @@ import tarfile
 import urllib.request
 from pathlib import Path
 
-def install(root):
+def install(root, asset_dir=None):
     if platform.system() != 'Linux' or platform.machine() not in ('x86_64', 'amd64'):
         raise SystemExit('This tested lockfile supports Linux x86_64 only.')
     root = Path(root).expanduser().resolve()
@@ -27,8 +27,12 @@ def install(root):
                 raise SystemExit(f'Binary/pin mismatch; use a new deployment root for upgrade: {dest}')
             print(f'{name}: verified existing {item["version"]}',flush=True)
             continue
-        with urllib.request.urlopen(item['url'], timeout=60) as response:
-            data=response.read()
+        local = Path(asset_dir) / (name + '.tar.gz') if asset_dir else None
+        if local is not None:
+            data=local.read_bytes()
+        else:
+            with urllib.request.urlopen(item['url'], timeout=60) as response:
+                data=response.read()
         if hashlib.sha256(data).hexdigest()!=item['sha256']: raise SystemExit(f'{name}: archive checksum mismatch')
         with tarfile.open(fileobj=io.BytesIO(data),mode='r:gz') as archive:
             member=archive.getmember(item['member'])

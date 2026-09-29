@@ -1,0 +1,132 @@
+# Foreground office service and offline releases
+
+This is the unprivileged, externally supervised deployment shape. The support
+team's scheduler starts one foreground `office_service.py run` process and sends
+SIGTERM to stop it. The process starts its own Dolt and authenticated HTTP/API
+children, writes their output under `--logs`, and exits nonzero if either child
+fails. It holds an exclusive lock under `--root`; a second start is refused.
+Linux kills the children if the supervisor itself is SIGKILLed, and a subsequent
+start uses the same durable runtime. This does not make an interrupted backup a
+completed backup: inspect `backup-status` and run a fresh backup after such a
+stop. No root or user systemd manager is required.
+
+Use separate private paths for the installation, mutable runtime and logs.
+Coordination records, HTTP identities and backup snapshots are private data,
+not source code. The release tree contains code and public binaries only. The
+operator supplies actual account names, paths, proxy, certificates, contact
+route, schedule and artifact repository in the local service request; none
+belong in this repository. Test on UAT first and obtain its verification output
+before proposing a production rollout.
+
+## Build and install an offline release
+
+Build on a trusted Linux build host with Python 3.10+, the exact source commit,
+the two archives pinned by `versions.json`, and a relocatable Python 3.10+ Linux
+x86-64 `install_only` archive verified against its chosen upstream digest. For
+RHEL 8, choose a build that supports glibc 2.28 or earlier. Pass its exact
+relative executable path inside the archive. `build` verifies all three input
+digests, packages the source from `git archive` rather than the working tree,
+and writes exact commit provenance plus a SHA-256 for the finished artifact.
+
+```sh
+python3 tools/office_release.py build --repo <SOURCE_CHECKOUT> \
+  --commit <FULL_COMMIT> --build-id <IMMUTABLE_RELEASE_ID> \
+  --python-archive <PINNED_PYTHON_TARBALL> --python-sha256 <PINNED_SHA256> \
+  --python-executable <PATH_INSIDE_PYTHON_ARCHIVE> \
+  --bd-archive <PINNED_BD_TARBALL> --dolt-archive <PINNED_DOLT_TARBALL> \
+  --output <RELEASE_TARBALL>
+```
+
+Publish the artifact, its SHA-256, this installation tool and the source commit
+through the approved artifact route. On the target, the installer itself needs
+only the system Python 3.6 standard library; the service uses the bundled
+interpreter. `install` verifies the artifact digest and inner archives, extracts
+to `releases/<ID>`, checks the bundled interpreter version, then switches
+`current` by atomic symlink rename. It preserves the prior release as
+`previous`. A repeated release ID is refused; install a new immutable ID.
+
+```sh
+python3 office_release.py install --archive <RELEASE_TARBALL> \
+  --sha256 <RELEASE_SHA256> --install-root <INSTALL_ROOT>
+python3 office_release.py verify --install-root <INSTALL_ROOT>
+python3 office_release.py rollback --install-root <INSTALL_ROOT>
+```
+
+Stop the supervised process before switching releases, then start it from the
+new `current` link. Rollback switches code and interpreter; it never rolls back
+the mutable runtime. Preserve a verified backup before any upgrade whose state
+format changes. The support team's release record should include artifact
+digest, source commit, UAT verification output and the previous release ID.
+
+## Prepare a private runtime
+
+Use the bundled interpreter, with `<PYTHON>` denoting
+`<INSTALL_ROOT>/current/python-runtime/<PATH_INSIDE_PYTHON_ARCHIVE>` and `<KIT>`
+denoting `<INSTALL_ROOT>/current/kit`. `prepare` copies the release's digest
+pinned Dolt and Beads archives into `<RUNTIME_ROOT>/bin`, creates a private
+database configuration and initializes nonsecret Dolt settings. It never
+starts a systemd unit. The first `run` sets the fresh Dolt root password; if
+stopped between that change and the next check, the next `run` verifies the
+stored password and continues. Keep `deployment.private.json` private.
+
+```sh
+<PYTHON> <KIT>/office_service.py prepare --root <RUNTIME_ROOT> --db-port <DB_PORT>
+```
+
+Create an operator-owned mode-0600 JSON file outside source control:
+
+```json
+{"schema_version":1,"http_host":"127.0.0.1","http_state":"<RUNTIME_ROOT>/http-state.json","trusted_proxies":["127.0.0.1"],"public_url":"https://<APPROVED_HOST>"}
+```
+
+The HTTP listener is loopback only. A separately approved reverse proxy
+terminates TLS. Bootstrap the first HTTP superuser through the documented
+`http_service.py --bootstrap-user` prompt under the bundled interpreter;
+the password is entered interactively. The `endpoint` backend is selected by
+the supervisor and operates against this runtime's canonical project data.
+
+## External scheduler commands
+
+The scheduler should set a private working directory, pass the log and runtime
+paths below, and treat a nonzero exit as a failed service. It may run 24x7 or
+follow the approved day schedule. Send SIGTERM and allow at least the selected
+`--stop-seconds` plus scheduler overhead before SIGKILL; the default child
+deadline is five seconds. On a SIGKILL restart, verify backup state before
+depending on a possibly interrupted native backup.
+
+```sh
+<PYTHON> <KIT>/office_service.py run --root <RUNTIME_ROOT> \
+  --logs <LOG_DIR> --config <PRIVATE_OFFICE_JSON> --port <HTTP_LOOPBACK_PORT> \
+  --stop-seconds 5
+```
+
+Schedule these separate commands while the service is up:
+
+| Cadence | Command | Required result |
+| --- | --- | --- |
+| Daily, after startup | `<PYTHON> <KIT>/admin.py --root <RUNTIME_ROOT> backup --all` | Exit 0; durable long-sync backup and status file. |
+| Frequent | `<PYTHON> <KIT>/office_service.py health --root <RUNTIME_ROOT> --port <HTTP_LOOPBACK_PORT>` | Exit 0 and one line with version, DB, web and latest backup status/time. |
+| After successful backup, optional | `<PYTHON> <KIT>/admin.py --root <RUNTIME_ROOT> backup-copy <OFF_MACHINE_STAGING>` | Exit 0 before the approved encrypted off-box transfer. |
+
+`health` exits nonzero if the database or web listener is down, if a backup
+failed, or if no completed backup is recorded. It reports a missing backup as
+`unknown`, never as success. `backup --all` writes `backup-status.json` and
+preserves the previous complete pair on failure. `backup-copy` gates on all
+initialized projects having complete pairs. The external scheduler owns the
+timer, encryption, retention and alert destination.
+
+For recovery, stop the service, inspect the last backup status and sidecar,
+follow `docs/OPERATIONS.md` for `restore-new` into a **disposable** project,
+compare exports, and only then make an explicit operator decision on the live
+runtime. Keep the native directory, coordination sidecar and operation journal
+snapshot together. Do not test restore against a live installation.
+
+## UAT verification record
+
+Have the service-account operator return: OS and glibc version, release ID and
+source commit from `verify`, artifact SHA-256, first and second start results,
+`health` before and after the daily backup, SIGTERM stop duration, forced
+SIGKILL/restart outcome, disposable restore/export comparison, install/rollback
+round trip, and any skipped check with its reason. The coordinator reviews this
+record and the support runbook before a production release. Contact and
+escalation names belong in the private support ticket.
