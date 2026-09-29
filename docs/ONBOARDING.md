@@ -29,6 +29,8 @@ python3 admin.py --root /home/beads/beads-runtime backup example
 
 This atomically installs `projects/example/ONBOARDING.md` under the coordination lock. It is owner-maintained, outside generated views, and preserved as text in the existing coordination backup sidecar. Restore using this version or newer; older kits reject the new sidecar entry. Back up after updates. Project creation does not invent instructions: `onboard` fails until configured.
 
+Host operator commands - accepted requirement revisions, backfills, operator voids and operator handoffs - are not part of worker onboarding. See the [start guide](../start_here/README.md) and [installation and recovery](OPERATIONS.md) before running one or handing it to the owner or host operator.
+
 The project entry point should explicitly supersede obsolete checkout-local coordination paths where necessary, while retaining repository build rules and current claims. Repository README/AGENTS.md can point to `onboard`; keep a minimal connection command there or in the initial worker prompt. The client/server connection information is the irreducible bootstrap input.
 
 ## Private config and the platform credential store
