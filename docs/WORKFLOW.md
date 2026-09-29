@@ -30,7 +30,7 @@ Distinct entries that share a timestamp are all kept. To resume without losing t
 Complete the [independent-worker preflight](WORKER_GUIDE.md) before claiming implementation: coordination/repository access, fresh source, writable workspace, your own environment and required imports in the actual execution context. Record the base revision and check overlapping ownership again before claiming.
 
 1. Read the job, its open tasks and dependencies, and relevant recent comments.
-2. Compare declared files, interfaces, migrations and test/shared resources with currently claimed work. File lists are advisory; disjoint files can still change the same contract.
+2. Compare declared files, interfaces, migrations and test/shared resources with currently claimed work. File lists are advisory; disjoint files can still change the same contract. Give the task's own files/areas in the template's `Owns / must not change` section a specific entry, and stay out of anything another open task declares there; if a change is genuinely needed in an area another task owns, raise a note and coordinate it before editing.
 3. Create a bounded child task if one does not exist. Record intent, plan, impact and acceptance before starting. Use templates/TASK.md as its description.
 4. Claim it with `b update TASK --claim --json`. If that fails, inspect the owner and choose other work or coordinate a handoff. Do not replace another assignee to bypass a claim.
 5. Use a separate checkout/worktree and contribution branch containing the task ID. Record the branch and base commit in a comment, then refresh. Contributors sharing a server still need independent working directories.

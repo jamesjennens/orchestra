@@ -29,6 +29,14 @@ cycle, keyed by task and exact commit. Keep seen,
 delivered, reviewed, integrated, deployed and live-verified distinct. Do not create
 tasks to occupy workers or infer success from a process exit.
 
+When you split work for parallel execution, require each child/task description to
+fill the template's "Owns / must not change" declaration (the files or areas it may
+change and the files or areas it must not change). Compare the declarations before
+dispatch and resolve any conflict or gap there, not at integration; a description
+with no ownership declaration and a plausible overlap is not ready to authorize.
+The declaration is task-scoped guidance, not a lock: it does not replace review or
+the project's merge authority.
+
 The kit does not yet supply a durable coordinator intake/obligation ledger. Until it
 does, maintain a private access-controlled interim register and preserve each
 source pointer, coverage result, decision, owner and revisit time. Include the
