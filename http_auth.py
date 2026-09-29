@@ -65,6 +65,11 @@ RESET_TTL_SECONDS = 30 * 60
 IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60
 LOGIN_WINDOW_SECONDS = 5 * 60
 LOGIN_MAX_ATTEMPTS = 10
+#: Account lookups (``GET /v1/accounts/lookup``) one principal may make per window. Any
+#: session can create a project and so administer one; the bound keeps the exact-match
+#: lookup from becoming a fast username enumerator. Every lookup is also audited.
+LOOKUP_WINDOW_SECONDS = 10 * 60
+LOOKUP_MAX_PER_WINDOW = 20
 AUDIT_LIMIT = 10000
 #: How long a committed canonical result stays replayable in the record store. It is a
 #: time-only retention: nothing is ever evicted by entry count or serialized bytes, and
@@ -721,7 +726,8 @@ class Service:
                  credential_ttl=CREDENTIAL_TTL_SECONDS, reset_ttl=RESET_TTL_SECONDS,
                  idempotency_ttl=IDEMPOTENCY_TTL_SECONDS,
                  result_retention=RESULT_RETENTION_SECONDS,
-                 login_max_attempts=LOGIN_MAX_ATTEMPTS, public_url=None):
+                 login_max_attempts=LOGIN_MAX_ATTEMPTS, public_url=None,
+                 lookup_max=LOOKUP_MAX_PER_WINDOW, lookup_window=LOOKUP_WINDOW_SECONDS):
         self.store = store
         self.session_idle = session_idle
         self.session_absolute = session_absolute
@@ -734,6 +740,9 @@ class Service:
         #: setup/resume snippets. It is deployment configuration, never request data.
         self.public_url = (public_url or '').rstrip('/') or None
         self._failures = {}
+        self.lookup_max = lookup_max
+        self.lookup_window = lookup_window
+        self._lookups = {}
 
     # -- helpers ---------------------------------------------------------------
     @property
@@ -1510,14 +1519,23 @@ class Service:
         """
         with self.store.lock:
             self.check_authority(principal, project_id, CAP_READ)
+            # Account state (disabled, superuser) is administrative detail: only a
+            # principal that administers this project's membership receives it.
+            try:
+                self.check_authority(principal, project_id, CAP_PROJECT_ADMIN)
+                admin = True
+            except HttpError:
+                admin = False
             members = self.state['memberships'].get(project_id, {})
             items = []
             for user_id, role in members.items():
                 user = self.state['users'].get(user_id) or {}
-                items.append({'user_id': user_id, 'username': user.get('username'),
-                              'display_name': user.get('display_name') or user_id,
-                              'role': role, 'disabled': bool(user.get('disabled')),
-                              'superuser': bool(user.get('superuser'))})
+                item = {'user_id': user_id, 'username': user.get('username'),
+                        'display_name': user.get('display_name') or user_id, 'role': role}
+                if admin:
+                    item['disabled'] = bool(user.get('disabled'))
+                    item['superuser'] = bool(user.get('superuser'))
+                items.append(item)
         items.sort(key=lambda m: ((m['display_name'] or '').lower(), m['user_id']))
         return items
 
@@ -1542,24 +1560,45 @@ class Service:
         items.sort(key=lambda c: (c['created_at'] or '', c['id']))
         return items
 
-    def lookup_account(self, principal, project_id, username):
+    def lookup_account(self, principal, project_id, username, request_id=None):
         """Exact username lookup for adding a member to ``project_id``.
 
-        Only a principal that may administer that project's membership can ask, so
-        the lookup never discloses more than the membership form already can. The
+        Only a principal that may administer that project's membership can ask. The
         match is exact (case-insensitive, as usernames are unique that way); a
         missing, disabled or malformed-but-valid name all give the same 404.
+
+        Residual risk: any session may create a project and so administer one, so a
+        determined account holder can still test usernames one at a time. Each
+        principal is therefore held to :data:`LOOKUP_MAX_PER_WINDOW` lookups per
+        :data:`LOOKUP_WINDOW_SECONDS` (429 beyond it), and every authorized lookup is
+        audited on the project with a digest of the queried name, never the name.
         """
         if principal is None or principal.via == 'credential':
             raise forbidden('Session authority required to look up accounts')
         if not isinstance(username, str) or not re.fullmatch(
                 r'[A-Za-z0-9][A-Za-z0-9_.@-]{1,63}', username):
             raise invalid('username must be 2-64 characters of letters, digits, . _ @ -')
+        digest = 'username_sha256=' + hashlib.sha256(
+            username.lower().encode('utf-8')).hexdigest()[:16]
         with self.store.lock:
             self.check_authority(principal, project_id, CAP_PROJECT_ADMIN)
+            cutoff = self._now() - self.lookup_window
+            recent = [t for t in self._lookups.get(principal.user_id, []) if t >= cutoff]
+            if len(recent) >= self.lookup_max:
+                self._lookups[principal.user_id] = recent
+                self.audit(request_id, principal, 'accounts.lookup', 'throttled',
+                           project_id=project_id, reason=digest)
+                self.store.save()
+                raise throttled('Too many account lookups; wait a few minutes and try again')
+            recent.append(self._now())
+            self._lookups[principal.user_id] = recent
             user_id = self.state['usernames'].get(username.lower())
             user = self.state['users'].get(user_id) if user_id else None
-            if not user or user.get('disabled'):
+            found = bool(user) and not user.get('disabled')
+            self.audit(request_id, principal, 'accounts.lookup',
+                       'found' if found else 'not_found', project_id=project_id, reason=digest)
+            self.store.save()
+            if not found:
                 raise not_found('No active account with that username')
             return {'id': user['id'], 'username': user['username'],
                     'display_name': user['display_name']}
@@ -1572,19 +1611,26 @@ class Service:
         those up simply finds no name.
         """
         names = ActorNames()
-        for actor in actors:
-            if not isinstance(actor, str) or actor in names:
-                continue
-            user = self.state['users'].get(actor)
-            agent = self.state['agents'].get(actor)
-            if isinstance(user, dict):
-                names[actor] = user.get('display_name') or actor
-            elif isinstance(agent, dict):
-                names[actor] = '%s (agent of %s)' % (agent.get('name') or actor,
-                                                     self._owner_name(agent.get('owner')))
-            else:
-                names[actor] = actor
+        with self.store.lock:
+            for actor in actors:
+                if not isinstance(actor, str) or actor in names:
+                    continue
+                user = self.state['users'].get(actor)
+                agent = self.state['agents'].get(actor)
+                if isinstance(user, dict):
+                    names[actor] = user.get('display_name') or actor
+                elif isinstance(agent, dict):
+                    names[actor] = '%s (agent of %s)' % (agent.get('name') or actor,
+                                                         self._owner_name(agent.get('owner')))
+                else:
+                    names[actor] = actor
         return names
+
+    def username_of(self, user_id):
+        """The account's username, read under the store lock (``None`` if unknown)."""
+        with self.store.lock:
+            user = self.state['users'].get(user_id)
+            return user.get('username') if isinstance(user, dict) else None
 
     # -- personal agents -------------------------------------------------------
     #
