@@ -255,6 +255,137 @@ class NativeSyncCase(RuntimeCase):
         self.assertIsNone(handle.pid)
 
 
+class BackupRepointCase(RuntimeCase):
+    """kittrial-5bb.51: repair a mis-pointed clone, and make URL resolution cwd-independent."""
+
+    def own_url(self, name):
+        return (self.root / 'backups' / name).resolve().as_uri()
+
+    def test_a_relative_bare_url_resolves_against_the_project_not_the_cwd(self):
+        make_project(self.root, 'alpha')
+        (self.root / 'backups' / 'alpha').mkdir(exist_ok=True)
+        record = self.root / 'projects' / 'alpha' / '.beads' / 'dolt-backup.json'
+        elsewhere = Path(self.temp.name) / 'elsewhere'
+        elsewhere.mkdir()
+        previous = os.getcwd()
+        os.chdir(elsewhere)
+        try:
+            # Against the project directory this is the project's own target; against the
+            # cwd it would be <elsewhere>/backups/alpha, so the old code refused here.
+            record.write_text(json.dumps({'backup_name': 'default',
+                                          'backup_url': '../../backups/alpha'}), encoding='utf-8')
+            admin.validate_backup_target(self.root, 'alpha')
+            # A relative path that points inside the project rather than at its backup is
+            # refused no matter where the command runs.
+            record.write_text(json.dumps({'backup_name': 'default',
+                                          'backup_url': 'backups/alpha'}), encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'backups/alpha'):
+                admin.validate_backup_target(self.root, 'alpha')
+        finally:
+            os.chdir(previous)
+
+    def test_the_refusal_names_the_backup_repoint_command(self):
+        # The plain `bd backup init DIR` advice fails without the kit environment (the
+        # reviewer's Error 1045), so the message must name the operator command instead.
+        make_project(self.root, 'alpha')
+        (self.root / 'projects' / 'alpha' / '.beads' / 'dolt-backup.json').write_text(
+            json.dumps({'backup_name': 'default',
+                        'backup_url': (self.root / 'backups' / 'pilotone').as_uri()}),
+            encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'admin.py backup-repoint alpha'):
+            admin.validate_backup_target(self.root, 'alpha')
+
+    def test_backup_repoint_runs_init_under_the_kit_env_and_verifies_both_records(self):
+        make_project(self.root, 'alpha')
+        record = self.root / 'projects' / 'alpha' / '.beads' / 'dolt-backup.json'
+
+        def native(root, name, args):
+            record.write_text(json.dumps({'backup_name': 'default',
+                                          'backup_url': self.own_url(name)}), encoding='utf-8')
+            return 'Backup destination configured'
+
+        with patch.object(admin, 'run_bd', side_effect=native) as run, \
+                patch.object(admin, 'sql',
+                             return_value='name,url\ndefault,%s\n' % self.own_url('alpha')):
+            report = admin.repoint_backup(self.root, 'alpha')
+        run.assert_called_once_with(self.root, 'alpha',
+                                    ['backup', 'init', str(self.root / 'backups' / 'alpha')])
+        self.assertEqual(report['row_checked'], True)
+        self.assertEqual(report['backup_url'], self.own_url('alpha'))
+        self.assertEqual(report['row_url'], self.own_url('alpha'))
+
+    def test_backup_repoint_refuses_when_the_db_row_still_names_the_source(self):
+        make_project(self.root, 'alpha')
+        record = self.root / 'projects' / 'alpha' / '.beads' / 'dolt-backup.json'
+
+        def native(root, name, args):
+            record.write_text(json.dumps({'backup_name': 'default',
+                                          'backup_url': self.own_url(name)}), encoding='utf-8')
+            return 'configured'
+
+        with patch.object(admin, 'run_bd', side_effect=native), \
+                patch.object(admin, 'sql', return_value=(
+                    'name,url\ndefault,%s\n' % (self.root / 'backups' / 'pilotone').as_uri())):
+            with self.assertRaisesRegex(ValueError, 'dolt_backups row'):
+                admin.repoint_backup(self.root, 'alpha')
+
+    def test_backup_repoint_refuses_when_the_file_still_names_the_source(self):
+        make_project(self.root, 'alpha')
+        record = self.root / 'projects' / 'alpha' / '.beads' / 'dolt-backup.json'
+
+        def native(root, name, args):
+            record.write_text(json.dumps({
+                'backup_name': 'default',
+                'backup_url': (self.root / 'backups' / 'pilotone').as_uri()}), encoding='utf-8')
+            return 'configured'
+
+        with patch.object(admin, 'run_bd', side_effect=native), \
+                patch.object(admin, 'sql') as query:
+            with self.assertRaisesRegex(ValueError, 'dolt-backup.json'):
+                admin.repoint_backup(self.root, 'alpha')
+        query.assert_not_called()
+
+    def test_backup_repoint_is_honest_when_the_row_cannot_be_read(self):
+        # No loopback coordinates: `bd backup init` still runs, but the row cannot be
+        # checked and the report says so instead of claiming a verification.
+        make_project(self.root, 'alpha', server=False)
+        record = self.root / 'projects' / 'alpha' / '.beads' / 'dolt-backup.json'
+
+        def native(root, name, args):
+            record.write_text(json.dumps({'backup_name': 'default',
+                                          'backup_url': self.own_url(name)}), encoding='utf-8')
+            return 'configured'
+
+        with patch.object(admin, 'run_bd', side_effect=native), \
+                patch.object(admin, 'sql') as query:
+            report = admin.repoint_backup(self.root, 'alpha')
+        query.assert_not_called()
+        self.assertEqual(report['row_checked'], False)
+        self.assertIsNone(report['row_url'])
+
+    def test_backup_repoint_refuses_an_uninitialized_project(self):
+        with patch.object(admin, 'run_bd') as run:
+            with self.assertRaisesRegex(ValueError, 'Unknown/uninitialized'):
+                admin.repoint_backup(self.root, 'alpha')
+        run.assert_not_called()
+
+    def test_the_backup_repoint_command_prints_the_verified_report(self):
+        make_project(self.root, 'alpha')
+        record = self.root / 'projects' / 'alpha' / '.beads' / 'dolt-backup.json'
+
+        def native(root, name, args):
+            record.write_text(json.dumps({'backup_name': 'default',
+                                          'backup_url': self.own_url(name)}), encoding='utf-8')
+            return 'configured'
+
+        with patch.object(admin, 'run_bd', side_effect=native), \
+                patch.object(admin, 'sql',
+                             return_value='name,url\ndefault,%s\n' % self.own_url('alpha')):
+            stdout, stderr, code = self.run_admin('backup-repoint', 'alpha')
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)['row_checked'], True)
+
+
 class SyncClientHandleCase(RuntimeCase):
     def test_spawn_records_the_pid_and_returns_the_captured_stdout(self):
         handle = admin.SyncClientHandle()

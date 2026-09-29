@@ -356,13 +356,15 @@ def project_backup_name(root,name):
     value=record.get('backup_name')
     return value if isinstance(value,str) and value else None
 
-def local_backup_path(url):
+def local_backup_path(url,base=None):
     """The local path a recorded ``backup_url`` names, or None when it names no local path.
 
     ``bd backup init`` records a filesystem destination as a ``file://`` URL (a bare path is
     accepted too). A DoltHub remote, a malformed URL, or a ``file:`` URL carrying a host is
     not this runtime's ``backups/<name>`` directory, so it resolves to None and a caller
-    comparing targets refuses it.
+    comparing targets refuses it. A bare relative path used to resolve against the process
+    cwd, which made the same record acceptable or refused depending on where ``admin.py``
+    was invoked; passing ``base`` (the project directory) makes that verdict deterministic.
     """
     if not isinstance(url,str) or not url:return None
     if url.startswith('file:'):
@@ -370,7 +372,9 @@ def local_backup_path(url):
         if parts.scheme!='file' or parts.netloc not in ('','localhost'):return None
         return Path(url2pathname(unquote(parts.path))).resolve()
     if '://' in url:return None
-    return Path(url).expanduser().resolve()
+    path=Path(url).expanduser()
+    if base is not None and not path.is_absolute():path=Path(base)/path
+    return path.resolve()
 
 def expected_backup_target(root,name):
     """The native backup directory a project named ``name`` must record: ``backups/<name>``."""
@@ -392,12 +396,73 @@ def validate_backup_target(root,name):
     url=record.get('backup_url')
     if url is None:return
     expected=expected_backup_target(root,name)
-    if local_backup_path(url)!=expected:
+    if local_backup_path(url,project_dir(root,name))!=expected:
         raise ValueError(
             'Project %s records native backup target %s, not %s; refusing to sync, because a '
             'restored clone inherits the source project\'s target and would overwrite that '
-            'project\'s backup. Re-point it with `bd backup init %s` or re-run `restore-new`.'
-            %(name,url,expected,expected))
+            'project\'s backup. Re-point it with `admin.py backup-repoint %s`, which runs '
+            '`bd backup init` under the kit environment and verifies both the recorded file '
+            'and the dolt_backups row; re-running `restore-new` onto an existing project is '
+            'refused and would discard the clone.'
+            %(name,url,expected,name))
+
+def backup_rows(root,name):
+    """The ``dolt_backups`` rows a project's database records, or None when they cannot be read.
+
+    ``project_backup_record`` reads the kit's local view (``.beads/dolt-backup.json``);
+    ``backup-repoint`` reads this row as well, so a re-point is confirmed in both the file
+    and the database itself. A project with no loopback server coordinates has no SQL client
+    to ask, so None means "could not be checked" rather than "no rows". The database name is
+    validated before it reaches the statement, exactly like the backup name.
+    """
+    metadata=project_server_metadata(root,name)
+    if metadata is None:return None
+    database=metadata[3]
+    if not re.fullmatch(r'[A-Za-z0-9_]{1,64}',database):
+        raise ValueError('The project records an unusable Dolt database name')
+    rows=[]
+    for row in csv.reader(io.StringIO(sql(root,"USE `%s`; SELECT name,url FROM dolt_backups;"%database))):
+        if len(row)>=2 and row[0] and row[0]!='name':rows.append((row[0],row[1]))
+    return rows
+
+def repoint_backup(root,name):
+    """Point a project's native backup at its own ``backups/<name>`` and verify both records.
+
+    ``restore-new`` re-points a clone it creates, but a clone restored before that re-point
+    existed still records the SOURCE project's target, and ``validate_backup_target`` then
+    refuses to sync it. The refusal used to tell the operator to run a bare ``bd backup
+    init``, which fails without the kit environment (and can silently re-point a live
+    project). This command runs it through ``run_bd`` (the project directory,
+    ``DOLT_CLI_PASSWORD`` from ``environment(root)``) and then reads back BOTH
+    ``.beads/dolt-backup.json`` and the ``dolt_backups`` row, failing closed when either
+    still names another target. It is idempotent: ``bd backup init`` updates an
+    already-configured destination in place. Re-pointing moves no data, so the operator must
+    back the SOURCE project up again afterwards - its ``backups/<source>`` may already hold
+    this clone's data.
+    """
+    path=project_dir(root,name)
+    if not (path/'.beads'/'metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+    expected=expected_backup_target(root,name)
+    with backup_lock(root,name):
+        run_bd(root,name,['backup','init',str(expected)])
+    record=project_backup_record(root,name)
+    recorded=None if record is None else record.get('backup_url')
+    if recorded is None or local_backup_path(recorded,path)!=expected:
+        raise ValueError(
+            'backup-repoint %s did not hold: .beads/dolt-backup.json records %s, not %s'
+            %(name,recorded,expected))
+    backup_name=project_backup_name(root,name)
+    rows=backup_rows(root,name)
+    if rows is None:
+        return {'project':name,'backup_name':backup_name,'backup_url':recorded,
+                'row_url':None,'row_checked':False}
+    row_urls=[url for row_name,url in rows if row_name==backup_name]
+    if not row_urls or local_backup_path(row_urls[0],path)!=expected:
+        raise ValueError(
+            'backup-repoint %s did not hold: the dolt_backups row for %r records %s, not %s'
+            %(name,backup_name,row_urls[0] if row_urls else None,expected))
+    return {'project':name,'backup_name':backup_name,'backup_url':recorded,
+            'row_url':row_urls[0],'row_checked':True}
 
 def native_backup_sync(root,name,client=None):
     """Synchronize one project's native Dolt backup without bd's fixed read timeout.
@@ -1948,6 +2013,7 @@ def main():
     a=sub.add_parser('backup-copy');a.add_argument('destination',metavar='DEST',
                    help='copy every project\'s last complete backup pair under this off-machine directory; '
                         'refuses unless backup-status --require-complete would pass')
+    a=sub.add_parser('backup-repoint');a.add_argument('project')
     a=sub.add_parser('restore-new');a.add_argument('project');a.add_argument('destination')
     a.add_argument('--restore-operators',action='store_true',dest='restore_operators',
                    help='explicitly re-grant the operator allowlist entries the backup records that this '
@@ -2102,6 +2168,7 @@ def main():
         print(json.dumps({'operators':current}))
     elif args.command=='backup':backup_projects(root,args.projects,args.all_projects)
     elif args.command=='backup-copy':backup_copy(root,args.destination)
+    elif args.command=='backup-repoint':print(json.dumps(repoint_backup(root,args.project),sort_keys=True))
     elif args.command=='backup-status':
         record=read_backup_status(root)
         print(json.dumps(record,sort_keys=True))
