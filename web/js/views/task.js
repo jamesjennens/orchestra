@@ -108,8 +108,9 @@ export async function detail(ctx, { pid, tid }) {
       const action = e.action || e.kind;
       const [label, tone] = ACTIONS[action] || [action, ''];
       const detail = e.detail || e.body;
+      const who = [e.user_name, e.author_name, e.author, e.actor, e.user_id].find((v) => typeof v === 'string' && v) || '';
       historyList.append(h('li', null, h('span', { class: 'dot ' + tone, 'aria-hidden': 'true' }),
-        h('div', null, h('div', { class: 'event-head' }, h('strong', null, e.user_name || e.author_name || e.author || e.actor || e.user_id), h('span', null, label), time(e.time || e.timestamp)), detail ? h('p', { class: 'event-body prose' }, detail) : null)));
+        h('div', null, h('div', { class: 'event-head' }, h('strong', null, who), h('span', null, label), time(e.time || e.timestamp)), detail ? h('p', { class: 'event-body prose' }, detail) : null)));
     }
     if (!page.items.length && !cursor) historyList.append(h('li', null, h('span'), h('p', { class: 'muted' }, 'No history yet.')));
     cursor = page.next_cursor; more.hidden = !cursor;

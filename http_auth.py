@@ -262,6 +262,15 @@ class Principal:
             self.user_id, self.via, self.credential_id)
 
 
+class ActorNames(dict):
+    """Actor label -> display name; a lookup with a non-string key finds nothing."""
+
+    def get(self, key, default=None):
+        if not isinstance(key, str):
+            return default
+        return dict.get(self, key, default)
+
+
 # ----------------------------------------------------------------------------- store
 def _blank_state():
     return {
@@ -1559,8 +1568,10 @@ class Service:
         """Display names for task actors (account ids and agent ids), best effort.
 
         Anything that is neither a known account nor a known agent keeps its label.
+        Canonical rows may carry a structured (non-string) author; looking one of
+        those up simply finds no name.
         """
-        names = {}
+        names = ActorNames()
         for actor in actors:
             if not isinstance(actor, str) or actor in names:
                 continue

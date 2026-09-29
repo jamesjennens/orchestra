@@ -2321,6 +2321,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         result = self.backend.task_history(ctx.params['pid'], ctx.params['tid'], limit,
                                            state['o'], canonical=state['x'])
         who = lambda e: (e.get('user_id') or e.get('author')) if isinstance(e, dict) else None
+        # (A canonical entry's author may be structured; ActorNames.get ignores it.)
         names = self.service.actor_names([who(e) for e in result['items']])
         body = {'items': [dict(e, user_name=names.get(who(e))) if isinstance(e, dict) else e
                           for e in result['items']], 'total': result['total']}
