@@ -12,6 +12,31 @@ export const ATTENTION = {
   blocked: ['Blocked', 'crit'],
 };
 
+// The server reports attention as { state, summary, counts }; the prototype's mock
+// uses a flat word. One card shape serves both.
+const SERVER_ATTENTION = { 'changes-requested': 'feedback', blocked: 'blocked', 'waiting-review': 'waiting', working: 'working', idle: 'idle' };
+export function attentionOf(agent) {
+  if (typeof agent.attention === 'string') return agent.attention;
+  return SERVER_ATTENTION[agent.attention && agent.attention.state] || 'idle';
+}
+
+function normalize(ctx, agent) {
+  if (typeof agent.attention === 'string') return agent;
+  const byId = Object.fromEntries((ctx.projects || []).map((p) => [p.id, p]));
+  const attention = agent.attention || {};
+  return {
+    ...agent,
+    server: true,
+    display_name: agent.display_name || agent.name,
+    attention: attentionOf(agent),
+    summary: attention.summary || null,
+    claimable: (attention.counts && attention.counts.claimable) || 0,
+    items: agent.items || [],
+    projects: (agent.projects || []).map((p) => (typeof p === 'string' ? { id: p, name: (byId[p] || {}).name || p, role: 'granted' } : p)),
+    disabled: agent.enabled === false,
+  };
+}
+
 export function attentionChip(state) {
   const [label, tone] = ATTENTION[state] || [state, ''];
   return h('span', { class: 'chip ' + tone }, label);
@@ -24,11 +49,13 @@ async function copy(text, what) {
 const plain = (name) => String(name || '').replace(/\s*\(agent[^)]*\)$/, '');
 
 export function resumePrompt(agent) {
+  if (agent.server) return `You are ${plain(agent.display_name)}, an Orchestra agent. Read .orchestra/agent.json in this folder, read your secret from your credential store, and ask Orchestra for your next action at /v1/agents/me/next. Continue from there.`;
   return `You are ${plain(agent.display_name)}, an Orchestra agent. Read .orchestra/AGENT.md in this folder and follow it: ask Orchestra for your next action and continue from there.`;
 }
 
 // One agent's card: status, what is waiting, and exactly where to go to resume it.
-export function agentCard(ctx, agent, { compact = false } = {}) {
+export function agentCard(ctx, raw, { compact = false } = {}) {
+  const agent = normalize(ctx, raw);
   const folder = agent.working_directory;
   return h('article', { class: 'agent-card' + (agent.attention === 'feedback' ? ' needs' : '') },
     h('div', { class: 'agent-head' },
@@ -36,6 +63,7 @@ export function agentCard(ctx, agent, { compact = false } = {}) {
       attentionChip(agent.attention)),
     agent.items && agent.items.length ? h('ul', { class: 'agent-items' }, agent.items.map((i) => h('li', null,
       h('a', { href: ctx.href(`/p/${i.project_id}/t/${i.task_id}`) }, i.title), h('span', { class: 'small muted' }, ' — ', i.text)))) :
+      agent.summary ? h('p', { class: 'small muted' }, agent.summary) :
       agent.attention === 'idle' ? h('p', { class: 'small muted' }, `${agent.claimable} unclaimed task(s) in its projects.`) : null,
     h('div', { class: 'resume' },
       h('div', { class: 'resume-row' },
@@ -106,6 +134,7 @@ export async function list(ctx) {
 
 // Shown once after creation: the setup files for the agent's folder and its secret.
 function setupDialog(created) {
+  if (created.setup) return serverSetupDialog(created);
   const a = created.agent;
   const agentJson = JSON.stringify({ server: created.server, agent_id: a.id, name: plain(a.display_name), projects: a.projects.map((p) => p.id), token_env: 'ORCHESTRA_TOKEN' }, null, 2);
   const agentMd = `# ${plain(a.display_name)}\n\nYou are ${plain(a.display_name)}, an Orchestra agent owned by ${created.owner_name}.\n\n1. Read your identity from .orchestra/agent.json. The access token is in the environment variable ORCHESTRA_TOKEN — never write it to a file or commit it.\n2. GET ${created.server}/v1/agents/me/next with header "Authorization: Bearer $ORCHESTRA_TOKEN". It returns your next action: feedback to address, work to continue, or tasks you could claim.\n3. Before coding, read the task brief it links to. Record a checkpoint when you stop, and deliver work for review through the API.\n4. Stop and tell your owner if anything is unclear.`;
@@ -120,5 +149,21 @@ function setupDialog(created) {
     dialog.append(
       h('h3', { class: 'small' }, '.orchestra/agent.json'), h('pre', { class: 'json' }, agentJson),
       h('h3', { class: 'small' }, '.orchestra/AGENT.md'), h('pre', { class: 'json' }, agentMd));
+  }
+}
+
+// The server's own setup: a secretless config file and guidance; the secret is shown once.
+function serverSetupDialog(created) {
+  const setup = created.setup;
+  const name = created.agent.name || created.agent.display_name;
+  secretDialog({
+    title: `Set up ${name}`,
+    body: `${setup.guidance || ''} Save ${setup.config_path} (below) in the agent's folder and keep it out of Git.`,
+    secret: created.credential.secret,
+  });
+  const dialog = document.querySelector('dialog:last-of-type .dialog-body');
+  if (dialog) {
+    dialog.append(h('h3', { class: 'small' }, setup.config_path), h('pre', { class: 'json' }, JSON.stringify(setup.config, null, 2)));
+    if (setup.setup_snippet) dialog.append(h('h3', { class: 'small' }, 'Setup notes'), h('pre', { class: 'json' }, setup.setup_snippet));
   }
 }

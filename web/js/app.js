@@ -30,10 +30,16 @@ const ROUTES = [
   [/^\/account$/, admin.account],
 ];
 
+// Views whose server routes are not part of every deployment yet.
+const RECORD_ROUTES = /^\/p\/[\w-]+\/(requirements|decisions|records)(\/|$)/;
+
 export async function start(root, options = {}) {
   const transport = options.transport || fetchTransport;
   const api = createApi(transport);
-  const ctx = { api, me: null, projects: [], root, dirty: false, options };
+  // Requirements, decisions and records are not served by the HTTP service yet
+  // (slice 1): the production entry hides them; the prototype's mock turns them on.
+  const features = { requirements: false, ...(options.features || {}) };
+  const ctx = { api, me: null, projects: [], root, dirty: false, options, features };
   let memoryRoute = '/';
 
   const currentRoute = () => {
@@ -96,8 +102,8 @@ export async function start(root, options = {}) {
           current ? [
             link('/p/' + pid, 'Tasks'),
             link('/p/' + pid + '/reviews', 'Reviews'),
-            link('/p/' + pid + '/requirements', 'Requirements'),
-            link('/p/' + pid + '/decisions', 'Decisions'),
+            ctx.features.requirements ? link('/p/' + pid + '/requirements', 'Requirements') : null,
+            ctx.features.requirements ? link('/p/' + pid + '/decisions', 'Decisions') : null,
             link('/p/' + pid + '/feedback', 'Feedback'),
             link('/p/' + pid + '/settings', 'Members & settings'),
           ] : null),
@@ -136,6 +142,12 @@ export async function start(root, options = {}) {
       } catch (error) {
         if (mine !== token) return;
         if (error && error.status === 401) return ctx.sessionLost();
+        if (!ctx.features.requirements && error && [404, 501].includes(error.status) && RECORD_ROUTES.test(route)) {
+          mount(main, h('div', { class: 'panel' }, h('div', { class: 'empty', role: 'status' }, h('strong', null, 'Not available on this server'),
+            h('p', null, 'Requirements, decisions and records are not served by this Orchestra server yet. Tasks, reviews and feedback work as usual.'))));
+          document.title = 'Not available · Orchestra';
+          return;
+        }
         mount(main, h('div', { class: 'panel' }, h('div', { class: 'empty', role: 'alert' }, h('strong', null, 'Could not load this page'), h('p', null, describe(error)))));
       }
       const title = main.querySelector('h1');

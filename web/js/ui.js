@@ -27,6 +27,7 @@ export function statusChip(status) {
   return h('span', { class: 'chip ' + tone }, label);
 }
 export function priority(p) {
+  if (p === undefined || p === null) return null;
   return h('span', { class: 'mono small muted', title: 'Priority' }, PRIORITY[p] ?? 'P?');
 }
 export function roleTag(role) {
@@ -76,6 +77,7 @@ export function describe(error) {
     case 413: return 'That is too large to send.';
     case 422: return error.message || 'Some details are not valid.';
     case 429: return 'Too many attempts. Wait a few minutes and try again.';
+    case 501: return 'This server does not support that yet.';
     default: return error.status >= 500 ? 'The server could not confirm whether this was saved. Retry — it is safe and will not create a duplicate.' : (error.message || 'Request failed.');
   }
 }

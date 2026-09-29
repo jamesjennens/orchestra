@@ -6,6 +6,8 @@ const ACTIONS = {
   'task-created': ['Created the task', ''], 'task-claimed': ['Claimed the task', 'accent'], 'task-updated': ['Edited the task', ''],
   'contribution': ['Delivered a contribution', 'accent'], 'change-requested': ['Requested a change', 'warn'], 'change-resolved': ['Change resolved', 'ok'],
   'review-approve': ['Approved', 'ok'], 'review-request-changes': ['Requested changes', 'warn'],
+  'approve': ['Approved', 'ok'], 'request-changes': ['Requested changes', 'warn'], 'respond': ['Responded to review', ''],
+  'checkpoint-added': ['Recorded a checkpoint', ''], 'checkpoint': ['Recorded a checkpoint', ''], 'comment': ['Commented', ''],
 };
 
 export async function create(ctx, { pid }) {
@@ -35,7 +37,7 @@ export async function create(ctx, { pid }) {
 export async function detail(ctx, { pid, tid }) {
   const [project, brief] = await Promise.all([ctx.api.project(pid), ctx.api.brief(pid, tid)]);
   const t = brief.task;
-  const review = brief.review;
+  const review = { requests: [], ...brief.review };
   const owner = isOwner(project);
   const writer = canWrite(project) && !project.archived;
   const mine = t.assignee === ctx.me.id;
@@ -89,8 +91,8 @@ export async function detail(ctx, { pid, tid }) {
         h('span', { class: 'chip ' + (r.status === 'open' ? 'warn' : 'ok') }, r.status === 'open' ? 'Open' : 'Resolved'), ' ', r.text,
         r.resolution ? h('div', { class: 'small muted' }, 'Resolution: ', r.resolution) : null))));
   }
-  if (owner && c && review.state === 'awaiting-review' && !project.archived) reviewBody.append(reviewActions(ctx, pid, tid, c));
-  if (mine && writer && ['none', 'changes-requested'].includes(review.state) && t.status !== 'closed') reviewBody.append(deliverForm(ctx, pid, tid, c, openRequests.length));
+  if (owner && c && review.state === 'awaiting-review' && !project.archived) reviewBody.append(reviewActions(ctx, pid, tid, c, review));
+  if (mine && writer && ['none', 'changes-requested'].includes(review.state) && t.status !== 'closed') reviewBody.append(deliverForm(ctx, pid, tid, c, openRequests.length, review));
   const reviewPanel = h('section', { class: 'panel', 'aria-labelledby': 'review-h' },
     h('div', { class: 'panel-head' }, h('h2', { class: 'small', id: 'review-h' }, 'Contribution & review'), reviewChip(review.state)), reviewBody);
 
@@ -102,9 +104,12 @@ export async function detail(ctx, { pid, tid }) {
     let page;
     try { page = await ctx.api.history(pid, tid, { limit: 20, cursor }); } catch (error) { historyList.replaceChildren(h('li', null, h('span'), h('p', { class: 'muted' }, describe(error)))); return; }
     for (const e of page.items) {
-      const [label, tone] = ACTIONS[e.action] || [e.action, ''];
+      // In-process events carry action/user/time; canonical entries carry kind/author/timestamp/body.
+      const action = e.action || e.kind;
+      const [label, tone] = ACTIONS[action] || [action, ''];
+      const detail = e.detail || e.body;
       historyList.append(h('li', null, h('span', { class: 'dot ' + tone, 'aria-hidden': 'true' }),
-        h('div', null, h('div', { class: 'event-head' }, h('strong', null, e.user_name || e.user_id), h('span', null, label), time(e.time)), e.detail ? h('p', { class: 'event-body prose' }, e.detail) : null)));
+        h('div', null, h('div', { class: 'event-head' }, h('strong', null, e.user_name || e.author_name || e.author || e.actor || e.user_id), h('span', null, label), time(e.time || e.timestamp)), detail ? h('p', { class: 'event-body prose' }, detail) : null)));
     }
     if (!page.items.length && !cursor) historyList.append(h('li', null, h('span'), h('p', { class: 'muted' }, 'No history yet.')));
     cursor = page.next_cursor; more.hidden = !cursor;
@@ -112,7 +117,7 @@ export async function detail(ctx, { pid, tid }) {
   more.addEventListener('click', loadHistory);
   loadHistory();
   const historyPanel = h('section', { class: 'panel', 'aria-labelledby': 'hist-h' },
-    h('div', { class: 'panel-head' }, h('h2', { class: 'small', id: 'hist-h' }, 'History'), h('span', { class: 'small muted' }, 'Newest first')),
+    h('div', { class: 'panel-head' }, h('h2', { class: 'small', id: 'hist-h' }, 'History')),
     h('div', { class: 'panel-body' }, historyList, h('div', null, more)));
 
   // ---- edit (version-checked) --------------------------------------------------
@@ -152,12 +157,12 @@ export async function detail(ctx, { pid, tid }) {
   const side = h('aside', { class: 'side', 'aria-label': 'Task details' },
     h('section', { class: 'panel' }, h('div', { class: 'panel-body' }, h('dl', { class: 'kv' },
       h('dt', null, 'Status'), h('dd', null, statusChip(t.status)),
-      h('dt', null, 'Priority'), h('dd', null, priority(t.priority)),
+      t.priority !== undefined && t.priority !== null ? [h('dt', null, 'Priority'), h('dd', null, priority(t.priority))] : null,
       h('dt', null, 'Assignee'), h('dd', null, t.assignee_name || h('span', { class: 'muted' }, 'Unclaimed')),
       h('dt', null, 'Created'), h('dd', null, time(t.created_at)),
-      h('dt', null, 'Updated'), h('dd', null, time(t.updated_at)),
+      t.updated_at ? [h('dt', null, 'Updated'), h('dd', null, time(t.updated_at))] : null,
       h('dt', null, 'ID'), h('dd', null, h('code', null, t.id)),
-      h('dt', null, 'Version'), h('dd', { class: 'num' }, String(t.version))))),
+      t.version !== undefined ? [h('dt', null, 'Version'), h('dd', { class: 'num' }, String(t.version))] : null))),
     brief.depends_on && brief.depends_on.length ? h('section', { class: 'panel' },
       h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Depends on')),
       h('ul', { class: 'panel-body open-items' }, brief.depends_on.map((d) => h('li', null, h('a', { href: ctx.href(`/p/${pid}/t/${d.id}`) }, d.title), ' ', statusChip(d.status))))) : null,
@@ -171,7 +176,11 @@ export async function detail(ctx, { pid, tid }) {
     h('div', { class: 'detail' }, h('div', { class: 'stack' }, editPanel, briefPanel, reviewPanel, historyPanel), side));
 }
 
-function reviewActions(ctx, pid, tid, contribution) {
+// Review bodies carry the canonical fields (the contribution id being judged and the
+// latest review record as ``previous``), so a stale page is refused with a 409 instead
+// of judging a revision the reviewer never saw.
+function reviewActions(ctx, pid, tid, contribution, review) {
+  const target = { contribution: contribution.id, previous: review.latest_id ?? null, contribution_revision: contribution.revision, contribution_commit: contribution.commit };
   const status = h('div', { class: 'banner crit', role: 'alert', hidden: true });
   const form = h('form', { class: 'form', novalidate: true },
     h('h3', { class: 'small' }, `Review revision ${contribution.revision}`),
@@ -181,7 +190,7 @@ function reviewActions(ctx, pid, tid, contribution) {
       h('button', { type: 'submit', name: 'request', class: '' }, 'Request changes'),
       h('button', { type: 'button', class: 'primary', onclick: async (e) => {
         if (!(await confirmDialog({ title: `Approve revision ${contribution.revision}?`, body: `Commit ${shortSha(contribution.commit)} will be marked reviewed and approved. It is not integrated or deployed until those steps are recorded separately.`, confirmLabel: 'Approve' }))) return;
-        await submit(e.currentTarget, { operation: 'approve', contribution_revision: contribution.revision, contribution_commit: contribution.commit }, 'Approved');
+        await submit(e.currentTarget, { operation: 'approve', ...target, summary: `Approved revision ${contribution.revision} in the web interface` }, 'Approved');
       } }, 'Approve')));
   async function submit(button, body, message) {
     try {
@@ -199,29 +208,46 @@ function reviewActions(ctx, pid, tid, contribution) {
     const items = formValues(form)['r-items'].split('\n').map((s) => s.trim()).filter(Boolean);
     if (!items.length) return setFieldError(form, 'r-items', 'Describe at least one change, or use Approve.');
     setFieldError(form, 'r-items', '');
-    await submit(form.querySelector('button[name=request]'), { operation: 'request-changes', contribution_revision: contribution.revision, contribution_commit: contribution.commit, items }, 'Changes requested');
+    await submit(form.querySelector('button[name=request]'), { operation: 'request-changes', ...target, items: items.map((text, i) => ({ id: 'item-' + (i + 1), text })) }, 'Changes requested');
   });
   return form;
 }
 
-function deliverForm(ctx, pid, tid, previous, openCount) {
+function deliverForm(ctx, pid, tid, previous, openCount, review) {
   const details = h('details', { class: 'deliver', open: openCount > 0 || undefined });
   const form = h('form', { class: 'form', novalidate: true },
     openCount ? h('p', { class: 'small muted' }, `This revision should address the ${openCount} open request(s) above.`) : null,
     h('div', { class: 'form-row' },
-      field({ id: 'd-branch', label: 'Branch', value: previous && previous.branch ? previous.branch : '', placeholder: 'contrib/…' }),
-      field({ id: 'd-commit', label: 'Commit (full hash)', placeholder: '40 hex characters', maxlength: 40 })),
+      field({ id: 'd-repository', label: 'Repository', value: previous && previous.repository ? previous.repository : '', placeholder: 'git@host:team/repo.git', hint: 'Where the reviewer fetches your branch.' }),
+      field({ id: 'd-branch', label: 'Branch', value: previous && previous.branch ? previous.branch : '', placeholder: 'contrib/…' })),
+    h('div', { class: 'form-row' },
+      field({ id: 'd-commit', label: 'Commit (full hash)', placeholder: '40 hex characters', maxlength: 40 }),
+      field({ id: 'd-base', label: 'Based on (full hash)', placeholder: 'the commit you started from', maxlength: 40 })),
     field({ id: 'd-summary', label: 'What changed', type: 'textarea', rows: 4, hint: 'Summarise the change and how you tested it.' }),
     h('div', null, h('button', { type: 'submit', class: 'primary' }, previous ? `Deliver revision ${previous.revision + 1}` : 'Deliver for review')));
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     const v = formValues(form);
+    const repository = v['d-repository'].trim();
+    const branch = v['d-branch'].trim();
+    if (!repository) return setFieldError(form, 'd-repository', 'Say where the reviewer can fetch the work.');
+    setFieldError(form, 'd-repository', '');
+    if (!branch) return setFieldError(form, 'd-branch', 'Name the branch that holds the work.');
+    setFieldError(form, 'd-branch', '');
     const commit = v['d-commit'].trim().toLowerCase();
     if (!/^[0-9a-f]{40}$/.test(commit)) return setFieldError(form, 'd-commit', 'Paste the full 40-character commit hash.');
     setFieldError(form, 'd-commit', '');
+    const base = v['d-base'].trim().toLowerCase();
+    if (!/^[0-9a-f]{40}$/.test(base)) return setFieldError(form, 'd-base', 'Paste the full 40-character hash of the commit you started from.');
+    setFieldError(form, 'd-base', '');
     if (!v['d-summary'].trim()) return setFieldError(form, 'd-summary', 'Summarise what changed.');
     setFieldError(form, 'd-summary', '');
-    const done = await act(form.querySelector('button[type=submit]'), () => ctx.api.review(pid, tid, { operation: 'contribute', commit, branch: v['d-branch'].trim() || null, summary: v['d-summary'].trim() }), { success: 'Delivered for review' }).catch(() => null);
+    const body = {
+      operation: 'contribute', repository, commit, base_commit: base, branch, summary: v['d-summary'].trim(),
+      delivery: { kind: 'remote', remote: repository, branch },
+      supersedes: previous ? previous.id ?? null : null, previous: review.latest_id ?? null,
+    };
+    const done = await act(form.querySelector('button[type=submit]'), () => ctx.api.review(pid, tid, body), { success: 'Delivered for review' }).catch(() => null);
     if (done) ctx.render();
   });
   details.append(h('summary', null, previous ? 'Deliver a revision' : 'Deliver your contribution'), form);

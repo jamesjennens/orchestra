@@ -196,6 +196,11 @@ export function createMock(options = {}) {
     }
   };
   const findTask = (pid, tid) => db.tasks.find((t) => t.project_id === pid && t.id === tid);
+  // The real brief/queue name each revision by id and report the latest review record,
+  // which the page sends back so a stale review is refused.
+  const contributionId = (t) => (t.contribution ? `con_${t.id}_${t.contribution.revision}` : null);
+  const contributionView = (t) => t.contribution && { ...t.contribution, id: contributionId(t), author_name: name(t.contribution.author) };
+  const openCount = (t) => t.requests.filter((r) => r.status === 'open').length;
   const guardProject = (pid) => (visible(pid) ? null : err(404, 'not_found', 'Project not found'));
 
   on('POST', '/v1/sessions', (b) => {
@@ -324,7 +329,7 @@ export function createMock(options = {}) {
   on('GET', '/v1/projects/(?<pid>[\\w-]+)/tasks/(?<tid>[\\w-]+)', (b, p) => { const g = guardProject(p.pid); if (g) return g; const t = findTask(p.pid, p.tid); return t ? ok(taskView(t)) : err(404, 'not_found', 'Task not found'); });
   on('GET', '/v1/projects/(?<pid>[\\w-]+)/tasks/(?<tid>[\\w-]+)/brief', (b, p) => {
     const g = guardProject(p.pid); if (g) return g; const t = findTask(p.pid, p.tid); if (!t) return err(404, 'not_found', 'Task not found');
-    return ok({ task: taskView(t), checkpoint: t.checkpoint && { ...t.checkpoint, author_name: name(t.checkpoint.author) }, lifecycle: t.lifecycle, review: { state: t.review_state, contribution: t.contribution && { ...t.contribution, author_name: name(t.contribution.author) }, requests: t.requests }, depends_on: t.depends_on.map((id) => { const d = db.tasks.find((x) => x.id === id); return d ? { id, title: d.title, status: d.status } : { id, title: id, status: 'unknown' }; }) });
+    return ok({ task: taskView(t), checkpoint: t.checkpoint && { ...t.checkpoint, author_name: name(t.checkpoint.author) }, lifecycle: t.lifecycle, review: { state: t.review_state, contribution: contributionView(t), requests: t.requests, open_requests: openCount(t), latest_id: contributionId(t) }, depends_on: t.depends_on.map((id) => { const d = db.tasks.find((x) => x.id === id); return d ? { id, title: d.title, status: d.status } : { id, title: id, status: 'unknown' }; }) });
   });
   on('PATCH', '/v1/projects/(?<pid>[\\w-]+)/tasks/(?<tid>[\\w-]+)', (b, p) => {
     const g = guardProject(p.pid); if (g) return g; const t = findTask(p.pid, p.tid); if (!t) return err(404, 'not_found', 'Task not found');
@@ -345,10 +350,11 @@ export function createMock(options = {}) {
     const g = guardProject(p.pid); if (g) return g; const t = findTask(p.pid, p.tid); if (!t) return err(404, 'not_found', 'Task not found');
     if (b.operation === 'request-changes' || b.operation === 'approve') {
       if (!isOwner(p.pid)) return err(403, 'forbidden', 'Only a project owner can review');
-      if (!t.contribution || b.contribution_revision !== t.contribution.revision || t.review_state !== 'awaiting-review') return err(409, 'conflict', 'This contribution changed or was already reviewed; reload to see the current revision');
+      const stale = b.contribution !== undefined ? b.contribution !== contributionId(t) : b.contribution_revision !== t.contribution.revision;
+      if (!t.contribution || stale || t.review_state !== 'awaiting-review') return err(409, 'conflict', 'This contribution changed or was already reviewed; reload to see the current revision');
       if (b.operation === 'approve') { t.review_state = 'approved'; t.lifecycle.reviewed = yes('Approved by ' + name(db.session)); }
       else {
-        const items = (b.items || []).map((x) => String(x).trim()).filter(Boolean);
+        const items = (b.items || []).map((x) => String(typeof x === 'string' ? x : (x && x.text) || '').trim()).filter(Boolean);
         if (!items.length) return err(422, 'invalid_payload', 'Add at least one requested change');
         items.forEach((text, i) => t.requests.push({ id: 'rq' + (db.seq += 1) + i, text, status: 'open', by: db.session }));
         t.review_state = 'changes-requested'; t.lifecycle.reviewed = no('Changes requested');
@@ -382,8 +388,9 @@ export function createMock(options = {}) {
   });
   on('GET', '/v1/projects/(?<pid>[\\w-]+)/queue', (b, p) => {
     const g = guardProject(p.pid); if (g) return g;
-    const items = db.tasks.filter((t) => t.project_id === p.pid && ['awaiting-review', 'changes-requested', 'approved'].includes(t.review_state)).map(taskView);
-    return ok({ items, total: items.length, next_cursor: null });
+    const items = db.tasks.filter((t) => t.project_id === p.pid && ['awaiting-review', 'changes-requested', 'approved'].includes(t.review_state))
+      .map((t) => ({ ...taskView(t), contribution: contributionView(t), open_requests: openCount(t) }));
+    return ok({ items, total: items.length, next_cursor: null, complete: true });
   });
   on('GET', '/v1/me/work', () => {
     const mine = []; const toReview = [];

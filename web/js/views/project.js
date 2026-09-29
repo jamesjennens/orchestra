@@ -51,11 +51,11 @@ export async function overview(ctx, { pid }) {
         h('caption', { class: 'visually-hidden' }, 'Tasks in ' + project.name),
         h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Task'), h('th', { scope: 'col' }, 'State'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Assignee'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Next action'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Updated'))),
         h('tbody', null, rows.map((t) => h('tr', { class: 'row-link', onclick: (e) => { if (e.target.tagName !== 'A') ctx.go(`/p/${pid}/t/${t.id}`); } },
-          h('td', null, h('a', { class: 'title', href: ctx.href(`/p/${pid}/t/${t.id}`) }, t.title), h('div', { class: 'sub' }, priority(t.priority), ' · ', h('span', { class: 'mono' }, t.id))),
+          h('td', null, h('a', { class: 'title', href: ctx.href(`/p/${pid}/t/${t.id}`) }, t.title), h('div', { class: 'sub' }, t.priority != null ? [priority(t.priority), ' · '] : null, h('span', { class: 'mono' }, t.id))),
           h('td', null, t.review_state && t.review_state !== 'none' ? reviewChip(t.review_state) : statusChip(t.status)),
           h('td', { class: 'hide-narrow' }, t.assignee_name || h('span', { class: 'muted' }, 'Unclaimed')),
           h('td', { class: 'hide-narrow' }, t.next_action ? t.next_action.text : h('span', { class: 'muted' }, '—')),
-          h('td', { class: 'hide-narrow muted' }, time(t.updated_at))))))) :
+          h('td', { class: 'hide-narrow muted' }, t.updated_at ? time(t.updated_at) : '')))))) :
         empty(state.q || state.review ? 'No matching tasks' : 'No tasks yet', state.q || state.review ? 'Try a different search or filter.' : canWrite(project) && !project.archived ? 'Define the first task for this project.' : null),
       h('div', { class: 'pager' },
         h('span', { class: 'num' }, page.total ? `${start + 1}–${start + rows.length} of ${page.total}` : ''),
@@ -76,24 +76,31 @@ export async function overview(ctx, { pid }) {
 export async function reviews(ctx, { pid }) {
   const project = await load(ctx, pid);
   const data = await ctx.api.queue(pid);
+  // The disposable server calls an approved contribution "approved"; the canonical
+  // review projection calls it "awaiting-integration". Both land in one group.
   const groups = [
-    ['awaiting-review', 'Awaiting review', 'An owner needs to approve or request changes. These stay listed until someone acts, however old.'],
-    ['changes-requested', 'Changes requested', 'Waiting on the contributor to deliver a revision.'],
-    ['approved', 'Approved · not yet integrated', 'Accepted work that still needs integrating. Holds and dependencies are shown on each task.'],
+    [['awaiting-review', 'legacy-review-ready'], 'Awaiting review', 'An owner needs to approve or request changes. These stay listed until someone acts, however old.'],
+    [['changes-requested'], 'Changes requested', 'Waiting on the contributor to deliver a revision.'],
+    [['approved', 'awaiting-integration'], 'Approved · not yet integrated', 'Accepted work that still needs integrating. Holds and dependencies are shown on each task.'],
+    [['error'], 'Needs operator attention', 'The review record could not be read cleanly; an operator has to repair it.'],
   ];
+  const openRequests = (t) => (t.open_requests ?? (t.requests || []).filter((r) => r.status === 'open').length);
   return h('div', { class: 'stack' },
     pageHead({ crumbs: crumbs(ctx, project, 'Reviews'), title: 'Reviews', lede: 'Every contribution in flight, grouped by who has to act next.' }),
-    groups.map(([key, title, note]) => {
-      const rows = data.items.filter((t) => t.review_state === key);
+    data.complete === false ? h('div', { class: 'banner' }, 'This list is incomplete: the project has more contributions in flight than one read covers.') : null,
+    groups.map(([keys, title, note]) => {
+      const key = keys[0];
+      const rows = data.items.filter((t) => keys.includes(t.review_state));
+      if (key === 'error' && !rows.length) return null;
       return h('section', { class: 'panel', 'aria-labelledby': 'g-' + key },
         h('div', { class: 'panel-head' }, h('h2', { class: 'small', id: 'g-' + key }, title, ' ', h('span', { class: 'nav-count' }, rows.length)), h('span', { class: 'small muted hide-narrow' }, note)),
         rows.length ? h('div', { class: 'table-wrap' }, h('table', null,
           h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Task'), h('th', { scope: 'col' }, 'Contribution'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Open requests'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Waiting since'))),
           h('tbody', null, rows.map((t) => h('tr', { class: 'row-link', onclick: (e) => { if (e.target.tagName !== 'A') ctx.go(`/p/${pid}/t/${t.id}`); } },
             h('td', null, h('a', { class: 'title', href: ctx.href(`/p/${pid}/t/${t.id}`) }, t.title), h('div', { class: 'sub' }, t.assignee_name || 'Unassigned')),
-            h('td', null, t.contribution ? [h('span', null, 'Revision ', t.contribution.revision, ' · '), h('code', null, shortSha(t.contribution.commit))] : '—'),
-            h('td', { class: 'hide-narrow num' }, String(t.requests.filter((r) => r.status === 'open').length)),
-            h('td', { class: 'hide-narrow muted' }, time(t.contribution ? t.contribution.at : t.updated_at))))))) :
+            h('td', null, t.contribution ? [t.contribution.revision ? h('span', null, 'Revision ', t.contribution.revision, ' · ') : null, h('code', null, shortSha(t.contribution.commit))] : '—'),
+            h('td', { class: 'hide-narrow num' }, String(openRequests(t))),
+            h('td', { class: 'hide-narrow muted' }, (t.contribution && t.contribution.at) || t.updated_at ? time((t.contribution && t.contribution.at) || t.updated_at) : '')))))) :
           empty('Nothing here', null));
     }));
 }
@@ -105,9 +112,10 @@ export async function feedback(ctx, { pid }) {
     let data;
     try { data = await ctx.api.feedback(pid); } catch (error) { list.replaceChildren(errorState(error, draw)); return; }
     list.replaceChildren(data.items.length ? h('ul', { class: 'timeline panel-body', 'aria-label': 'Feedback' }, data.items.map((f) => h('li', null,
-      h('span', { class: 'dot ' + (f.status === 'open' ? 'warn' : 'ok'), 'aria-hidden': 'true' }),
+      h('span', { class: 'dot ' + (f.status === 'resolved' ? 'ok' : 'warn'), 'aria-hidden': 'true' }),
       h('div', null,
-        h('div', { class: 'event-head' }, h('strong', null, f.author_name), time(f.at), h('span', { class: 'chip ' + (f.status === 'open' ? 'warn' : 'ok') }, f.status === 'open' ? 'Open' : 'Resolved')),
+        h('div', { class: 'event-head' }, h('strong', null, f.author_name || f.actor || ''), time(f.at || f.created_at),
+          f.status ? h('span', { class: 'chip ' + (f.status === 'open' ? 'warn' : 'ok') }, f.status === 'open' ? 'Open' : 'Resolved') : null),
         h('p', { class: 'event-body prose' }, f.text),
         f.triage ? h('p', { class: 'small muted' }, 'Triage: ', f.triage) : null)))) :
       empty('No feedback yet', 'Problems, ideas and friction reported by the team appear here.'));
@@ -178,7 +186,7 @@ export async function settings(ctx, { pid }) {
       const username = v['m-username'].trim().replace(/^@/, '');
       if (!username) return setFieldError(form, 'm-username', 'Enter a username.');
       let account;
-      try { account = await ctx.api.lookup(username); } catch (error) {
+      try { account = await ctx.api.lookup(username, pid); } catch (error) {
         return setFieldError(form, 'm-username', error.status === 404 ? 'No active account has that username.' : describe(error));
       }
       setFieldError(form, 'm-username', '');
@@ -204,7 +212,7 @@ export async function settings(ctx, { pid }) {
         h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Label'), h('th', { scope: 'col' }, 'Issued by'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Scopes'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Expires'), h('th', { scope: 'col' }, h('span', { class: 'visually-hidden' }, 'Actions')))),
         h('tbody', null, data.items.map((c) => h('tr', null,
           h('td', null, c.label, c.revoked ? h('div', { class: 'sub' }, 'Revoked') : null),
-          h('td', null, c.user_name),
+          h('td', null, c.user_name || c.user_id || ''),
           h('td', { class: 'hide-narrow mono small' }, c.scopes.join(', ')),
           h('td', { class: 'hide-narrow muted' }, time(c.expires_at)),
           h('td', null, c.revoked ? null : h('button', { type: 'button', class: 'danger', onclick: async (e) => {
@@ -223,7 +231,7 @@ export async function settings(ctx, { pid }) {
       h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Recent activity (audit)')),
       data.items.length ? h('div', { class: 'table-wrap' }, h('table', null,
         h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'When'), h('th', { scope: 'col' }, 'Who'), h('th', { scope: 'col' }, 'Action'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Detail'))),
-        h('tbody', null, data.items.map((a) => h('tr', null, h('td', { class: 'muted' }, time(a.time)), h('td', null, a.user_name), h('td', { class: 'mono small' }, a.action), h('td', { class: 'hide-narrow' }, a.detail || '')))))) :
+        h('tbody', null, data.items.map((a) => h('tr', null, h('td', { class: 'muted' }, time(a.time)), h('td', null, a.user_name || a.user_id || ''), h('td', { class: 'mono small' }, a.action, a.outcome && a.outcome !== 'committed' ? ' · ' + a.outcome : ''), h('td', { class: 'hide-narrow' }, a.detail || '')))))) :
         empty('No administrative activity yet', null)));
   }
 

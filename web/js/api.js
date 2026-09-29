@@ -83,17 +83,18 @@ export function createApi(transport) {
     createAccount: (username, display_name) => mutate('POST', '/v1/accounts', { username, display_name }),
     issueReset: (uid) => mutate('POST', `/v1/accounts/${uid}/reset`, {}),
     disableAccount: (uid) => mutate('POST', `/v1/accounts/${uid}/disable`, {}),
-    lookup: (username) => call('GET', '/v1/accounts/lookup', { params: { username } }),
+    // Exact username lookup, scoped to the project being administered (owners only).
+    lookup: (username, project) => call('GET', '/v1/accounts/lookup', { params: { username, project } }),
 
     // projects
     projects: () => call('GET', '/v1/projects'),
     project: (pid) => call('GET', `/v1/projects/${pid}`),
     createProject: (name) => mutate('POST', '/v1/projects', { name }),
     archiveProject: (pid) => mutate('POST', `/v1/projects/${pid}/archive`, {}),
-    members: (pid) => call('GET', `/v1/projects/${pid}/members`),
+    members: (pid) => call('GET', `/v1/projects/${pid}/members`, { params: { limit: 100 } }),
     setMember: (pid, uid, role) => mutate('PUT', `/v1/projects/${pid}/members/${uid}`, { role }),
     removeMember: (pid, uid) => mutate('DELETE', `/v1/projects/${pid}/members/${uid}`),
-    credentials: (pid) => call('GET', `/v1/projects/${pid}/worker-credentials`),
+    credentials: (pid) => call('GET', `/v1/projects/${pid}/worker-credentials`, { params: { limit: 100 } }),
     issueCredential: (pid, scopes, label) => mutate('POST', `/v1/projects/${pid}/worker-credentials`, { scopes, label }),
     revokeCredential: (pid, cid) => mutate('POST', `/v1/projects/${pid}/worker-credentials/${cid}/revoke`, {}),
 

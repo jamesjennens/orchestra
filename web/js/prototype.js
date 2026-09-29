@@ -38,4 +38,4 @@ async function extraData() {
   try { const r = await fetch('data/harness.json', { cache: 'no-store' }); return r.ok ? await r.json() : null; } catch { return null; }
 }
 
-extraData().then((extra) => start(document.getElementById('app'), { transport: createMock({ extra }), loginHint, banner })).then((c) => { ctx = c; });
+extraData().then((extra) => start(document.getElementById('app'), { transport: createMock({ extra }), loginHint, banner, features: { requirements: true } })).then((c) => { ctx = c; });

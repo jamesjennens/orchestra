@@ -601,6 +601,19 @@ class SessionAndTaskListCase(TeamHarness):
         everything = self.request('GET', self.path('/tasks'), token=self.vera).data
         self.assertEqual(2, everything['total'])
 
+    def test_approved_filter_and_named_history(self):
+        self.claim(self.carl)
+        self.contribute(self.carl)
+        self.review(self.olive, 'approve')
+        for state in ('approved', 'awaiting-integration'):
+            found = self.request('GET', self.path('/tasks?review_state=' + state),
+                                 token=self.vera).data
+            self.assertEqual([self.task], [t['id'] for t in found['items']], state)
+        history = self.request('GET', self.path('/tasks/%s/history' % self.task),
+                               token=self.vera).data
+        self.assertEqual(['olive', 'carl', 'carl', 'olive'],
+                         [e['user_name'] for e in history['items']])
+
 
 class CanonicalBindingReadCase(EndpointCase):
     """The same reads over ``EndpointBackend`` and the strict canonical stub."""

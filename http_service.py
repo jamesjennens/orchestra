@@ -1194,8 +1194,13 @@ def task_matches(task, filters):
     if status and status != 'active' and task.get('status') != status:
         return False
     review = filters.get('review_state')
-    if review and (task.get('review_state') or 'none') != review:
-        return False
+    if review:
+        # ``approved`` (disposable backend) and ``awaiting-integration`` (canonical
+        # projection) are the same state; either filter finds both.
+        approved = ('approved', 'awaiting-integration')
+        wanted = approved if review in approved else (review,)
+        if (task.get('review_state') or 'none') not in wanted:
+            return False
     assignee = filters.get('assignee')
     if assignee and task.get('assignee') != assignee:
         return False
@@ -2315,7 +2320,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         limit, state = self._page(ctx, ctx.query)
         result = self.backend.task_history(ctx.params['pid'], ctx.params['tid'], limit,
                                            state['o'], canonical=state['x'])
-        body = {'items': result['items'], 'total': result['total']}
+        who = lambda e: (e.get('user_id') or e.get('author')) if isinstance(e, dict) else None
+        names = self.service.actor_names([who(e) for e in result['items']])
+        body = {'items': [dict(e, user_name=names.get(who(e))) if isinstance(e, dict) else e
+                          for e in result['items']], 'total': result['total']}
         if result.get('activity_cursor'):
             body['activity_cursor'] = result['activity_cursor']
         continuation = result.get('canonical_cursor')
