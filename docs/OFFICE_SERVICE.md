@@ -38,22 +38,26 @@ python3 tools/office_release.py build --repo <SOURCE_CHECKOUT> \
 ```
 
 Publish the artifact, its SHA-256, this installation tool and the source commit
-through the approved artifact route. On the target, the installer itself needs
-only the system Python 3.6 standard library; the service uses the bundled
+through the approved artifact route. On RHEL 8, run the installer with
+`/usr/libexec/platform-python` (Python 3.6); `python3` may not be installed.
+The installer needs only that standard library; the service uses the bundled
 interpreter. `install` verifies the artifact digest and inner archives, extracts
 to `releases/<ID>`, checks the bundled interpreter version, then switches
 `current` by atomic symlink rename. It preserves the prior release as
 `previous`. A repeated release ID is refused; install a new immutable ID.
 
 ```sh
-python3 office_release.py install --archive <RELEASE_TARBALL> \
+<INSTALLER_PYTHON> office_release.py install --archive <RELEASE_TARBALL> \
   --sha256 <RELEASE_SHA256> --install-root <INSTALL_ROOT>
-python3 office_release.py verify --install-root <INSTALL_ROOT>
-python3 office_release.py rollback --install-root <INSTALL_ROOT>
+<INSTALLER_PYTHON> office_release.py verify --install-root <INSTALL_ROOT>
+<INSTALLER_PYTHON> office_release.py rollback --install-root <INSTALL_ROOT>
 ```
 
 Stop the supervised process before switching releases, then start it from the
-new `current` link. Rollback switches code and interpreter; it never rolls back
+new `current` link. The installer and rollback command print a restart reminder;
+do not let an old process serve requests after switching. Each running child
+uses paths pinned to the release that started it, and restarting makes the new
+release active. Rollback switches code and interpreter; it never rolls back
 the mutable runtime. Preserve a verified backup before any upgrade whose state
 format changes. The support team's release record should include artifact
 digest, source commit, UAT verification output and the previous release ID.
@@ -84,14 +88,24 @@ terminates TLS. Bootstrap the first HTTP superuser through the documented
 `http_service.py --bootstrap-user` prompt under the bundled interpreter;
 the password is entered interactively. The `endpoint` backend is selected by
 the supervisor and operates against this runtime's canonical project data.
+Start the service once, then run `<PYTHON> <KIT>/admin.py --root <RUNTIME_ROOT>
+add-project <PROJECT>` before scheduling `backup --all`. A new empty runtime
+has no initialized project to back up. `add-project` prints a worker client
+endpoint under that release's exact path. Regenerate each worker's client
+configuration after install or rollback if its endpoint still points to an
+older release.
 
 ## External scheduler commands
 
 The scheduler should set a private working directory, pass the log and runtime
-paths below, and treat a nonzero exit as a failed service. It may run 24x7 or
+paths below, and treat a nonzero exit as a failed service. A child crash makes
+the supervisor exit nonzero; the external scheduler must restart it. It may run 24x7 or
 follow the approved day schedule. Send SIGTERM and allow at least the selected
 `--stop-seconds` plus scheduler overhead before SIGKILL; the default child
-deadline is five seconds. On a SIGKILL restart, verify backup state before
+deadline is five seconds, shared with time reserved for Dolt; a child that
+requires SIGKILL makes the supervisor exit nonzero. The supervisor creates the
+log directory mode 0700 and its log files mode 0600. The external scheduler
+owns log rotation and retention. On a SIGKILL restart, verify backup state before
 depending on a possibly interrupted native backup.
 
 ```sh

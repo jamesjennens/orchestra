@@ -51,6 +51,7 @@ args=sys.argv[1:]
 if 'sql-server' in args:
     if 'DOLT_CLI_PASSWORD' in os.environ or 'BEADS_DOLT_PASSWORD' in os.environ:
         sys.exit(17)  # server must not inherit client credentials
+    time.sleep(float(os.environ.get('FAKE_DOLT_READY_DELAY', '0')))
     cfg=json.load(open(args[args.index('--config')+1]))
     port=cfg['listener']['port']
     with socket.socket() as s:
@@ -87,14 +88,23 @@ else:
         except OSError:
             return False
 
-    def start(self):
-        proc = subprocess.Popen(self.command('run', '--config', str(self.config),
-                                             '--logs', str(self.logs)),
+    def start(self, script=None, env=None, ready=True):
+        command = self.command('run', '--config', str(self.config), '--logs', str(self.logs))
+        if script is not None:
+            command[1] = str(script)
+        proc = subprocess.Popen(command,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, start_new_session=True)
+                                text=True, start_new_session=True, env=env)
         self.addCleanup(lambda: self.stop_if_running(proc))
-        self.wait_for(lambda: self.port_up(self.db_port) and self.port_up(self.web_port))
+        if ready:
+            self.wait_for(lambda: self.port_up(self.db_port) and self.port_up(self.web_port))
         return proc
+
+    @staticmethod
+    def children(proc):
+        output = subprocess.check_output(['ps', '--ppid', str(proc.pid), '-o', 'pid=,args='], text=True)
+        return [(int(line.strip().split(None, 1)[0]), line.strip().split(None, 1)[1])
+                for line in output.splitlines() if line.strip()]
 
     @staticmethod
     def stop_if_running(proc):
@@ -138,6 +148,36 @@ else:
         self.config.write_text('{"schema_version":1,"extra":true}', encoding='utf-8')
         with self.assertRaisesRegex(ValueError, 'Unknown'):
             service_config(self.config)
+
+    def test_children_use_pinned_release_paths(self):
+        alias = self.base/'current'
+        alias.symlink_to(self.script.parent, target_is_directory=True)
+        proc = self.start(script=alias/'office_service.py')
+        children = self.children(proc)
+        web = [args for _, args in children if 'http_service.py' in args]
+        self.assertEqual(len(web), 1, children)
+        self.assertIn(str(self.script.parent/'http_service.py'), web[0])
+        self.assertIn(str(self.script.parent/'endpoint.py'), web[0])
+        self.assertNotIn(str(alias/'http_service.py'), web[0])
+
+    def test_slow_web_child_gets_bounded_grace_and_nonzero_exit(self):
+        proc = self.start()
+        web = [pid for pid, args in self.children(proc) if 'http_service.py' in args]
+        self.assertEqual(len(web), 1)
+        os.kill(web[0], signal.SIGSTOP)
+        start = time.monotonic()
+        proc.terminate()
+        self.assertEqual(proc.wait(timeout=7), 1)
+        self.assertLess(time.monotonic()-start, 7)
+        self.wait_for(lambda: not self.port_up(self.db_port) and not self.port_up(self.web_port))
+
+    def test_sigterm_during_database_startup_exits_cleanly(self):
+        env = os.environ.copy()
+        env['FAKE_DOLT_READY_DELAY'] = '10'
+        proc = self.start(env=env, ready=False)
+        self.wait_for(lambda: (self.logs/'dolt.log').exists())
+        proc.terminate()
+        self.assertEqual(proc.wait(timeout=7), 0)
 
 
 if __name__ == '__main__':

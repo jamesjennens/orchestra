@@ -62,8 +62,11 @@ def _after_fork():
 
 
 def _spawn(command, root, log_path, env):
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(log_path, 'ab', buffering=0) as stream:
+    log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    log_path.parent.chmod(0o700)
+    fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, 'ab', buffering=0) as stream:
         return subprocess.Popen([str(part) for part in command], cwd=root, env=env,
                                 stdin=subprocess.DEVNULL, stdout=stream,
                                 stderr=subprocess.STDOUT, start_new_session=True,
@@ -72,7 +75,7 @@ def _spawn(command, root, log_path, env):
 
 def _stop(child, deadline):
     if child is None or child.poll() is not None:
-        return
+        return False
     try:
         os.killpg(child.pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -85,13 +88,28 @@ def _stop(child, deadline):
         except ProcessLookupError:
             pass
         child.wait()
+        return True
+    return False
+
+
+def _sql_probe(root, query, password=None):
+    """Bound each readiness query so shutdown cannot hang in the SQL client."""
+    cfg = admin.config(root)
+    env = admin.environment(root)
+    if password is not None:
+        env['DOLT_CLI_PASSWORD'] = password
+    return subprocess.run(
+        [str(root/'bin/dolt'), '--host', '127.0.0.1', '--port', str(cfg['port']),
+         '--no-tls', '--user', 'root', 'sql', '--result-format', 'csv'],
+        input=query, text=True, encoding='utf-8', capture_output=True,
+        check=True, timeout=5, env=env, cwd=root).stdout
 
 
 def _database_ready(root):
     try:
-        admin.sql(root, 'SELECT 1;')
+        _sql_probe(root, 'SELECT 1;')
         return True
-    except (OSError, subprocess.CalledProcessError, ValueError):
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError):
         return False
 
 
@@ -99,7 +117,7 @@ def _bootstrap_database(root):
     """Finish first-start authentication; retries work after a killed parent."""
     if _database_ready(root):
         return
-    users = admin.sql(root, 'SELECT User,Host FROM mysql.user;', password='')
+    users = _sql_probe(root, 'SELECT User,Host FROM mysql.user;', password='')
     rows = list(csv.DictReader(io.StringIO(users)))
     hosts = [row['Host'] for row in rows if row.get('User') == 'root']
     if not hosts:
@@ -107,7 +125,7 @@ def _bootstrap_database(root):
     password = admin.config(root)['password']
     changes = ["ALTER USER 'root'@'%s' IDENTIFIED BY '%s';" %
                (host.replace("'", "''"), password) for host in hosts]
-    admin.sql(root, '\n'.join(changes), password='')
+    _sql_probe(root, '\n'.join(changes), password='')
     if not _database_ready(root):
         raise RuntimeError('Dolt root authentication did not become ready')
 
@@ -177,7 +195,8 @@ def run(root, logs, config, port, stop_seconds):
         raise ValueError('Prepare this runtime before starting it')
     settings = service_config(config)
     logs = Path(logs).expanduser().resolve()
-    logs.mkdir(parents=True, exist_ok=True)
+    logs.mkdir(parents=True, exist_ok=True, mode=0o700)
+    logs.chmod(0o700)
     lock_fd = os.open(root/'office-service.lock', os.O_CREAT | os.O_RDWR, 0o600)
     try:
         try:
@@ -191,6 +210,7 @@ def run(root, logs, config, port, stop_seconds):
         old_term = signal.signal(signal.SIGTERM, request_stop)
         old_int = signal.signal(signal.SIGINT, request_stop)
         db = web = None
+        forced = False
         try:
             env = admin.environment(root)
             db_env = env.copy()
@@ -199,38 +219,46 @@ def run(root, logs, config, port, stop_seconds):
             db = _spawn([root/'bin/dolt', 'sql-server', '--config', root/'server.json'],
                         root, logs/'dolt.log', db_env)
             until = time.monotonic()+30
+            ready = False
             while time.monotonic() < until and not stop:
                 if db.poll() is not None:
                     raise RuntimeError('Dolt exited during startup; inspect dolt.log')
                 try:
                     _bootstrap_database(root)
+                    ready = True
                     break
-                except (OSError, subprocess.CalledProcessError):
+                except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
                     time.sleep(.2)
-            else:
+            if not stop and not ready:
                 raise RuntimeError('Dolt did not become ready within 30 seconds')
-            command = [sys.executable, Path(__file__).with_name('http_service.py'),
+            release_script = Path(__file__).resolve()
+            release_python = os.path.realpath(sys.executable)
+            command = [release_python, release_script.with_name('http_service.py'),
                        '--state', settings.get('http_state', str(root/'http-state.json')),
                        '--host', '127.0.0.1', '--port', port,
-                       '--backend', 'endpoint', '--endpoint-python', sys.executable,
-                       '--endpoint', Path(__file__).with_name('endpoint.py'), '--root', root]
+                       '--backend', 'endpoint', '--endpoint-python', release_python,
+                       '--endpoint', release_script.with_name('endpoint.py'), '--root', root]
             for arg, key in (('--cert','cert'), ('--key','key'), ('--public-url','public_url')):
                 if settings.get(key): command.extend([arg, settings[key]])
             for proxy in settings.get('trusted_proxies', []):
                 command.extend(['--trusted-proxy', proxy])
             if settings.get('endpoint_timeout'):
                 command.extend(['--endpoint-timeout', settings['endpoint_timeout']])
-            web = _spawn(command, root, logs/'http.log', env)
-            while not stop:
-                if db.poll() is not None or web.poll() is not None:
-                    raise RuntimeError('A supervised child exited; inspect service logs')
-                time.sleep(.2)
+            if not stop:
+                web = _spawn(command, root, logs/'http.log', env)
+                while not stop:
+                    if db.poll() is not None or web.poll() is not None:
+                        raise RuntimeError('A supervised child exited; inspect service logs')
+                    time.sleep(.2)
         finally:
             deadline = time.monotonic()+stop_seconds
-            _stop(web, deadline)
-            _stop(db, deadline)
+            web_forced = _stop(web, time.monotonic()+stop_seconds/2)
+            db_forced = _stop(db, deadline)
+            forced = web_forced or db_forced
             signal.signal(signal.SIGTERM, old_term)
             signal.signal(signal.SIGINT, old_int)
+        if forced:
+            raise RuntimeError('A supervised child required SIGKILL during shutdown')
     finally:
         os.close(lock_fd)
 

@@ -108,6 +108,24 @@ class OfficeReleaseTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertFalse((install_root/'current').exists())
 
+    def test_link_chain_cannot_escape_extraction_root(self):
+        from tools.office_release import safe_extract
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode='w') as output:
+            for name in ('a/b/up', 'a/b/up/up2', 'a/b/up/up2/up3'):
+                link = tarfile.TarInfo(name)
+                link.type = tarfile.SYMTYPE
+                link.linkname = '..'
+                output.addfile(link)
+            payload = b'escaped'
+            item = tarfile.TarInfo('a/b/up/up2/up3/ESCAPED.txt')
+            item.size = len(payload)
+            output.addfile(item, io.BytesIO(payload))
+        destination = self.base/'extract'
+        with self.assertRaisesRegex(ValueError, 'symlink'):
+            safe_extract(archive.getvalue(), destination)
+        self.assertFalse((self.base/'ESCAPED.txt').exists())
+
 
 if __name__ == '__main__':
     unittest.main()

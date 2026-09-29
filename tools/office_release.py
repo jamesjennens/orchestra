@@ -56,11 +56,26 @@ def _safe_path(raw):
 
 def safe_extract(data, destination):
     """Extract a digest-verified tar; refuse special files and escaping links."""
+    destination = Path(destination).resolve()
     destination.mkdir(parents=True, exist_ok=True)
+    root = destination
+    def inside(path):
+        return os.path.commonpath((str(root), str(path.resolve()))) == str(root)
+    def safe_parent(path):
+        parent = path.parent
+        if not inside(parent):
+            raise ValueError('Archive parent escapes extraction root: ' + str(path))
+        while parent != destination:
+            if parent.is_symlink():
+                raise ValueError('Archive member traverses a symlink: ' + str(path))
+            parent = parent.parent
     with tarfile.open(fileobj=io.BytesIO(data), mode='r:*') as archive:
         for item in archive:
             relative = _safe_path(item.name)
             target = destination/relative
+            safe_parent(target)
+            if target.is_symlink() or (target.exists() and not item.isdir()):
+                raise ValueError('Duplicate or linked archive member: ' + item.name)
             if item.isdir():
                 target.mkdir(parents=True, exist_ok=True)
             elif item.isfile():
@@ -71,12 +86,14 @@ def safe_extract(data, destination):
             elif item.issym():
                 if item.linkname.startswith('/'):
                     raise ValueError('Absolute archive symlink: ' + item.name)
-                _safe_path(str(relative.parent / item.linkname).replace('\\', '/'))
+                link = target.parent/item.linkname
+                if not inside(link):
+                    raise ValueError('Archive symlink escapes extraction root: ' + item.name)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.symlink_to(item.linkname)
             elif item.islnk():
                 source = destination/_safe_path(item.linkname)
-                if not source.is_file():
+                if not inside(source) or source.is_symlink() or not source.is_file():
                     raise ValueError('Archive hard link target missing: ' + item.linkname)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 os.link(str(source), str(target))
@@ -219,6 +236,7 @@ def install(args):
     _link(root, 'current', 'releases/'+manifest['build_id'])
     print('Installed %s source=%s previous=%s' % (manifest['build_id'],
                                                   manifest['source_commit'], old or 'none'))
+    print('Restart the supervised service after this release switch; running processes must not mix revisions.')
 
 
 def rollback(args):
@@ -231,6 +249,7 @@ def rollback(args):
     if current:
         _link(root, 'previous', current)
     print('Current release is now ' + prior)
+    print('Restart the supervised service after rollback; running processes must not mix revisions.')
 
 
 def verify(args):
