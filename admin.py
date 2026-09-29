@@ -241,6 +241,24 @@ def operators(root, strict=False):
                              'or unset ORCHESTRA_OPERATORS before this command.')
     return allowed
 
+def stored_operators(cfg):
+    """The deployment allowlist as a list of identity strings.
+
+    ``deployment.private.json`` is hand-editable and ``operators()`` already
+    treats a bare string as a one-element allowlist, so a string is normalised
+    here rather than iterated: ``list('alice')`` is exactly what rewrote a string
+    allowlist as the single letters of its name while dropping the real identity
+    and granting five one-letter operators. Every writer of the allowlist uses
+    this one normalisation point, and a value that is neither a list nor a string
+    is refused before any write instead of being silently coerced.
+    """
+    from recovery import identity
+    value=cfg.get('operators')
+    if value is None:return []
+    if isinstance(value,str):value=[value]
+    elif not isinstance(value,list):raise ValueError('deployment operators must be a list of actor identities')
+    return [identity(item,'Invalid operator identity in the deployment allowlist') for item in value]
+
 def atomic_private_write(path, text):
     """Write a private config file atomically at mode 0600.
 
@@ -1668,9 +1686,10 @@ def merge_operators(root,actors):
     marker=root/'deployment.private.json'
     if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
     from recovery import identity
+    if isinstance(actors,str):actors=[actors]
     wanted=[identity(item,'Invalid operator identity') for item in actors]
     cfg=config(root)
-    current=list(cfg.get('operators') or [])
+    current=stored_operators(cfg)
     added=[item for item in wanted if item not in current]
     if not added:return []
     cfg['operators']=current+added
@@ -1997,7 +2016,7 @@ def main():
         if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
         from recovery import identity
         cfg=config(root)
-        current=list(cfg.get('operators') or [])
+        current=stored_operators(cfg)
         if args.action=='list':print(json.dumps({'operators':current}));return
         # Config is the single authority source; a shell-only ORCHESTRA_OPERATORS
         # that disagrees is refused before the change rather than applied here

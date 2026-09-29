@@ -617,6 +617,84 @@ class AdminVoidRecordTests(unittest.TestCase):
         self.assertIn('ops-james', out.getvalue())
         self.assertIn('--restore-operators', out.getvalue())
 
+    def test_merge_operators_treats_a_string_allowlist_as_one_identity(self):
+        """Review item restore-operators-string-allowlist (kittrial-5bb.47).
+
+        ``deployment.private.json`` may hold a bare string, which ``operators()``
+        has always accepted as a one-element allowlist. ``merge_operators`` used
+        ``list(cfg.get('operators') or [])``, so ``restore-new
+        --restore-operators`` rewrote 'alice' as ['a','l','i','c','e'] plus the
+        re-granted identity: the real operator lost authority while five
+        one-letter identities gained it.
+        """
+        marker = self.root / 'deployment.private.json'
+        marker.write_text(json.dumps({'password': 'x', 'unit': 'none', 'operators': 'alice'}),
+                          encoding='utf-8')
+        self.assertEqual(admin.operators(self.root), frozenset({'alice'}))
+        self.assertEqual(admin.merge_operators(self.root, ['ops-a']), ['ops-a'])
+        self.assertEqual(json.loads(marker.read_text(encoding='utf-8'))['operators'], ['alice', 'ops-a'])
+        self.assertEqual(admin.operators(self.root), frozenset({'alice', 'ops-a'}))
+
+    def test_merge_operators_keeps_a_list_allowlist_and_is_additive(self):
+        marker = self.root / 'deployment.private.json'
+        self.assertEqual(admin.merge_operators(self.root, ['observer']), ['observer'])
+        self.assertEqual(json.loads(marker.read_text(encoding='utf-8'))['operators'], ['operator', 'observer'])
+        # A second pass re-grants nothing: an identity already listed is untouched.
+        self.assertEqual(admin.merge_operators(self.root, ['operator', 'observer']), [])
+        self.assertEqual(json.loads(marker.read_text(encoding='utf-8'))['operators'], ['operator', 'observer'])
+
+    def test_merge_operators_refuses_a_malformed_allowlist_before_a_write(self):
+        marker = self.root / 'deployment.private.json'
+        marker.write_text(json.dumps({'password': 'x', 'unit': 'none', 'operators': {'alice': 1}}),
+                          encoding='utf-8')
+        before = marker.read_text(encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'operators must be a list'):
+            admin.merge_operators(self.root, ['ops-a'])
+        self.assertEqual(marker.read_text(encoding='utf-8'), before)
+        marker.write_text(json.dumps({'password': 'x', 'unit': 'none', 'operators': ['ok', 'not an identity!']}),
+                          encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'Invalid operator identity'):
+            admin.merge_operators(self.root, ['ops-a'])
+
+    def test_operators_cli_reports_and_extends_a_string_allowlist(self):
+        marker = self.root / 'deployment.private.json'
+        marker.write_text(json.dumps({'password': 'x', 'unit': 'none', 'operators': 'alice'}),
+                          encoding='utf-8')
+
+        def cli(*argv):
+            with patch.object(sys, 'argv', ['admin.py', '--root', str(self.root), *argv]), \
+                    patch.object(admin, 'root_path', return_value=self.root), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                admin.main()
+            return json.loads(out.getvalue())['operators']
+
+        self.assertEqual(cli('operators', 'list'), ['alice'])
+        self.assertEqual(cli('operators', 'add', 'ops-a'), ['alice', 'ops-a'])
+        self.assertEqual(admin.operators(self.root), frozenset({'alice', 'ops-a'}))
+
+    def test_restore_operators_flag_regrants_around_a_string_allowlist(self):
+        """End-to-end repro of kittrial-5bb.47 through ``restore-new``."""
+        marker = self.root / 'deployment.private.json'
+        marker.write_text(json.dumps({'password': 'x', 'unit': 'none', 'operators': 'operator'}),
+                          encoding='utf-8')
+        (self.root / 'backups').mkdir()
+        (self.root / 'backups' / 'trial').mkdir()
+        (self.root / 'projects' / 'other').mkdir()
+        with patch.object(admin, 'run_bd', return_value='synced'):
+            admin.backup_project(self.root, 'trial')
+        self.assertEqual(admin.coordination_operators(self.root, 'trial'), ['operator'])
+        # The deployment now lists a different single operator as a bare string.
+        marker.write_text(json.dumps({'password': 'x', 'unit': 'none', 'operators': 'other'}),
+                          encoding='utf-8')
+        argv = ['admin.py', '--root', str(self.root), 'restore-new', 'trial', 'other', '--restore-operators']
+        with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', return_value=self.root), \
+                patch.object(admin, 'add_project'), \
+                patch.object(admin, 'run_bd', return_value='restored'), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            admin.main()
+        self.assertEqual(json.loads(marker.read_text(encoding='utf-8'))['operators'], ['other', 'operator'])
+        self.assertIn('operator', out.getvalue())
+
     def test_coordination_backup_refuses_a_malformed_operator_snapshot(self):
         (self.root / 'backups').mkdir()
         (self.root / 'backups' / 'trial.coordination.json').write_text(
