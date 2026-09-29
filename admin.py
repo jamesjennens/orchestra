@@ -70,7 +70,17 @@ class TerminatedBySignal(BaseException):
         self.signum=signum
 
 def raise_termination(signum,frame):
-    """Signal handler that turns a stop into an exception so the cleanup path runs."""
+    """Signal handler that turns a stop into an exception so the cleanup path runs.
+
+    The FIRST stop becomes ``TerminatedBySignal``. A second ``SIGTERM`` would otherwise
+    kill the interpreter inside the cleanup the first one started - including inside
+    ``terminate_process_group``, before the ``killpg`` that stops the client group - so
+    this also ignores later ``SIGTERM`` for the rest of the guarded section; the guard
+    restores the previous handler in its ``finally``. ``SIGKILL`` remains the operator's
+    way to force a stop that runs no cleanup.
+    """
+    try: signal.signal(signum,signal.SIG_IGN)
+    except (ValueError,OSError,RuntimeError,AttributeError): pass
     raise TerminatedBySignal(signum)
 
 @contextmanager
@@ -89,7 +99,11 @@ def signal_termination_guard():
     ``ValueError`` elsewhere), an embedded host may have its own handlers and a platform
     may refuse the signal, so an install that is not possible is skipped instead of
     failing the backup for a reason unrelated to it: the caller keeps the previous
-    behaviour, which is the honest limitation this cannot remove.
+    behaviour, which is the honest limitation this cannot remove. Once a stop has been
+    turned into the exception, later ``SIGTERM`` delivery is ignored for the rest of the
+    block (see ``raise_termination``), so the cleanup it started cannot itself be
+    interrupted; a very short window whose state must change as one unit additionally
+    holds the signal with ``sigterm_blocked``.
     """
     previous={}
     if threading.current_thread() is threading.main_thread():
@@ -104,6 +118,37 @@ def signal_termination_guard():
     finally:
         for signum,handler in previous.items():
             try: signal.signal(signum,handler)
+            except (ValueError,OSError,RuntimeError,AttributeError): pass
+
+@contextmanager
+def sigterm_blocked():
+    """Hold ``SIGTERM`` delivery for the duration of one very short critical window.
+
+    ``signal_termination_guard`` turns a stop into an exception, which is what runs the
+    cleanup. Two windows in ``backup_project``'s critical section must not be split by
+    that exception, because the state the cleanup would then see is not yet consistent:
+
+    * ``promote_journal_snapshot`` followed by the guard's ``promoted`` flag: a stop
+      between them makes the guard restore the previous complete sidecar beside the
+      journal that was already promoted, pairing two different generations.
+    * ``Popen`` followed by the handle's pid/process recording in ``spawn_sync_client``:
+      a stop between them orphans the sync client, whose group the cleanup can no longer
+      find by pid.
+
+    A signal delivered while blocked stays pending and is handled as soon as the mask is
+    restored, so the stop is deferred, never dropped. ``signal.pthread_sigmask`` is
+    POSIX-only; where it (or the mask call) is unavailable the window is simply not
+    widened, which is the pre-existing behaviour rather than a new failure.
+    """
+    previous=None
+    if hasattr(signal,'pthread_sigmask') and hasattr(signal,'SIG_BLOCK'):
+        try: previous=signal.pthread_sigmask(signal.SIG_BLOCK,{signal.SIGTERM})
+        except (ValueError,OSError,RuntimeError,AttributeError): previous=None
+    try:
+        yield
+    finally:
+        if previous is not None:
+            try: signal.pthread_sigmask(signal.SIG_SETMASK,previous)
             except (ValueError,OSError,RuntimeError,AttributeError): pass
 
 class SyncClientHandle:
@@ -179,11 +224,16 @@ def spawn_sync_client(command,handle,**kwargs):
     """
     args=list(map(str,command))
     timeout=kwargs.pop('timeout',None)
-    process=subprocess.Popen(args,text=True,encoding='utf-8',stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE,start_new_session=True,**kwargs)
-    handle.pid=process.pid
-    handle.process=process
-    handle.finished=False
+    # A stop landing between the spawn and the pid record would orphan the client: the
+    # cleanup has no pid to kill and the group keeps writing the backup. SIGTERM is held
+    # for exactly those statements; a stop arriving here is delivered when the window
+    # closes and then runs the normal cleanup against a handle that already knows the pid.
+    with sigterm_blocked():
+        process=subprocess.Popen(args,text=True,encoding='utf-8',stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE,start_new_session=True,**kwargs)
+        handle.pid=process.pid
+        handle.process=process
+        handle.finished=False
     try:
         stdout,stderr=process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -1271,12 +1321,14 @@ def backup_project(root,name):
         # belongs to the previous complete pair) in place for restore-new.
         staged=None
         client=SyncClientHandle()
-        try:
-            # SIGTERM is turned into an exception for exactly this section (SIGINT already
-            # raises KeyboardInterrupt), so the guard and the `finally` below still run on a
-            # normal operator stop instead of the interpreter dying with the dolt client
-            # still writing.
-            with signal_termination_guard():
+        # SIGTERM is turned into an exception for exactly this section (SIGINT already
+        # raises KeyboardInterrupt) and later SIGTERMs are ignored, so the cleanup below
+        # still runs on a normal operator stop instead of the interpreter dying with the
+        # dolt client still writing. The cleanup runs INSIDE the guard, while its handler
+        # is still installed: outside it, a second stop would kill the interpreter before
+        # terminate_process_group could kill the client group.
+        with signal_termination_guard():
+            try:
                 # A staging file from an earlier hard kill is cleaned at the start of the run,
                 # under the backup lock (see discard_stale_journal_staging).
                 discard_stale_journal_staging(root,name)
@@ -1299,27 +1351,33 @@ def backup_project(root,name):
                 if manifest is not None:record[NATIVE_MANIFEST_KEY]=manifest
                 atomic(bundle,record)
                 # The new generation is now native + complete sidecar + promoted journal;
-                # from here the guard must not put the previous sidecar back.
-                promote_journal_snapshot(root,name,staged)
-                staged=None
-                guard_state['promoted']=True
+                # from here the guard must not put the previous sidecar back. SIGTERM is
+                # held across the promotion and the flag together: a stop landing between
+                # them would restore the previous sidecar beside an already-promoted
+                # journal, pairing two generations (see sigterm_blocked).
+                with sigterm_blocked():
+                    promote_journal_snapshot(root,name,staged)
+                    staged=None
+                    guard_state['promoted']=True
                 # Refresh the durable last-complete copy so the next run has a restorable
                 # pair to protect even if it is interrupted before it can write anything.
                 # A failure here leaves the new complete generation in place (the guard no
                 # longer rolls it back), and the next run's guard refreshes this copy.
                 _atomic_copy(bundle,last_complete)
-        finally:
-            # On ANY path that is not a normally-finished client - SIGTERM/SIGINT, the
-            # explicit ceiling, an exception - stop the whole process group here, while the
-            # backup lock is still held, so the dolt client and anything it spawned cannot
-            # keep writing backups/<name> past the lock (the reviewer reproduced that after
-            # SIGTERM). A successful run is a no-op: the client already exited.
-            terminate_process_group(client)
-            if staged is not None:
-                try:
-                    if Path(staged).exists():Path(staged).unlink()
-                except OSError:
-                    pass
+            finally:
+                # On ANY path that is not a normally-finished client - SIGTERM/SIGINT, the
+                # explicit ceiling, an exception - stop the whole process group here, while
+                # the backup lock and the SIGTERM guard are both still held, so the dolt
+                # client and anything it spawned cannot keep writing backups/<name> past the
+                # lock (the reviewer reproduced that after SIGTERM) and a second stop cannot
+                # kill the interpreter before the group is killed. A successful run is a
+                # no-op: the client already exited.
+                terminate_process_group(client)
+                if staged is not None:
+                    try:
+                        if Path(staged).exists():Path(staged).unlink()
+                    except OSError:
+                        pass
         return output
 
 def utc_stamp():
@@ -1583,9 +1641,13 @@ def backup_copy(root,destination):
     is held only long enough to re-check the pair and copy the sidecar plus the journal
     snapshot: the long native ``copytree`` runs after the coordination lock is released, so
     copying a large database cannot block endpoint writes on it. Both commands take the two
-    locks in the same order, so no deadlock is possible. The completeness record that gated
-    the copy is published last; if anything fails, the destination is left without it
-    and the command exits non-zero with a clear error. The scheduled, encrypted
+    locks in the same order, so no deadlock is possible. Each project's native directory is
+    also checked against the manifest its complete sidecar records, before and after that
+    project's ``copytree``: a directory that no longer matches — a killed or interrupted run
+    can leave it partly rewritten — is refused instead of copied, and a sidecar that records
+    no manifest is reported as unverifiable rather than called clean. The completeness record
+    that gated the copy is published last; if anything fails, the destination is left without
+    it and the command exits non-zero with a clear error. The scheduled, encrypted
     off-machine system, its retention and its encryption stay the operator's: this is a
     generic, credential-free reference the operator can gate and schedule. It reads and
     copies files only; it never touches a unit, timer or schedule.
@@ -1646,12 +1708,37 @@ def backup_copy(root,destination):
                     complete,reason=backup_pair_state(root,name)
                     if not complete:
                         raise RuntimeError('%s is no longer a complete pair on disk: %s'%(name,reason))
+                    # The complete sidecar records the native directory as its generation
+                    # finished. Copying on regardless would propagate a pair whose Dolt and
+                    # journal disagree (a killed or interrupted run can leave the native
+                    # directory partly rewritten); a sidecar that records no manifest is
+                    # reported as unverifiable, never called clean.
+                    sidecar_record=complete_sidecar(sidecar)
+                    state,detail=native_backup_change(root,name,sidecar_record)
+                    if state=='changed':
+                        raise SystemExit('backup-copy refused: the native backup of %s no longer matches '
+                                         'the manifest its complete sidecar records, so a copy would pair '
+                                         'two generations: %s. Take a fresh complete backup of %s (or '
+                                         'restore it) before copying.'%(name,detail,name))
+                    if state=='unknown':
+                        print('Note: the native backup under backups/%s could not be checked against its '
+                              'complete sidecar, because %s; this copy cannot claim the directory is the '
+                              'one that sidecar belongs to.'%(name,detail))
                     _atomic_copy(sidecar,staging/(name+'.coordination.json'))
                     if journal.is_file():
                         staged_journal=staging/journal.name
                         _atomic_copy(journal,staged_journal)
                         journals+=1
                 shutil.copytree(native,staging/name)
+                # The long copytree runs with the project's backup lock held, so the kit
+                # cannot rewrite the directory underneath it; a direct native writer bypasses
+                # that lock, so re-check and refuse rather than move a mixed directory into
+                # the destination.
+                state,detail=native_backup_change(root,name,sidecar_record)
+                if state=='changed':
+                    raise SystemExit('backup-copy refused: the native backup of %s changed while it was '
+                                     'being copied: %s. No completeness record was published under %s.'%(
+                                         name,detail,destination))
             staged.append((name,staging/name,staging/(name+'.coordination.json'),staged_journal))
         # Every project staged: move each pair into place, replacing (not merging) the
         # destination, then publish the completeness record last.

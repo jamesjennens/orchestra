@@ -483,6 +483,46 @@ class SyncClientHandleCase(RuntimeCase):
         self.assertFalse(admin.staged_journal_snapshot_path(self.root, 'alpha').exists())
         self.assertIs(signal.getsignal(signal.SIGTERM), previous)
 
+    @unittest.skipUnless(hasattr(signal, 'pthread_sigmask'), 'POSIX signal masks are required')
+    def test_sigterm_is_held_across_a_critical_window_and_the_mask_is_restored(self):
+        # P3: a stop landing between promote_journal_snapshot() and the guard's promoted flag
+        # restores the previous sidecar beside an already-promoted journal, and one landing
+        # between Popen() and the pid record orphans the client. Those windows hold SIGTERM.
+        before = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        with admin.sigterm_blocked():
+            held = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+            self.assertIn(signal.SIGTERM, held)
+        self.assertEqual(signal.pthread_sigmask(signal.SIG_BLOCK, set()), before)
+
+    @unittest.skipUnless(hasattr(signal, 'pthread_sigmask'), 'POSIX signal masks are required')
+    def test_a_stop_held_out_of_a_window_is_delivered_when_the_window_closes(self):
+        # A held stop is deferred, never dropped: the guard still sees it as soon as the
+        # mask is restored, so the normal cleanup runs.
+        previous = signal.getsignal(signal.SIGTERM)
+        with self.assertRaises(admin.TerminatedBySignal):
+            with admin.signal_termination_guard():
+                with admin.sigterm_blocked():
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    self.assertIn(signal.SIGTERM,
+                                  signal.pthread_sigmask(signal.SIG_BLOCK, set()))
+        self.assertIs(signal.getsignal(signal.SIGTERM), previous)
+
+    @unittest.skipUnless(hasattr(os, 'killpg'), 'POSIX signal delivery is required')
+    def test_a_second_sigterm_cannot_interrupt_the_cleanup_the_first_started(self):
+        # P3: terminate_process_group used to run after the guard restored the previous
+        # handler, so a second SIGTERM killed the interpreter before killpg. Later stops are
+        # now ignored for the rest of the guard, and the group kill runs inside it.
+        marks = []
+        with self.assertRaises(admin.TerminatedBySignal):
+            with admin.signal_termination_guard():
+                try:
+                    os.kill(os.getpid(), signal.SIGTERM)
+                finally:
+                    marks.append(signal.getsignal(signal.SIGTERM))
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    marks.append('survived')
+        self.assertEqual(marks, [signal.SIG_IGN, 'survived'])
+
 
 class LastCompletePairCase(RuntimeCase):
     def setUp(self):
@@ -867,6 +907,63 @@ class BackupCopyCase(RuntimeCase):
         self.assertNotEqual(code, 0)
         self.assertIn('no longer a complete pair', stderr)
         self.assertFalse((self.destination / admin.BACKUP_STATUS_NAME).exists())
+
+    def _pair_with_manifest(self, name='alpha'):
+        """Write the sidecar's manifest for the current native directory."""
+        manifest, problem = admin.native_backup_manifest(self.root / 'backups' / name)
+        self.assertIsNone(problem)
+        sidecar = self.root / 'backups' / (name + '.coordination.json')
+        complete = json.loads(sidecar.read_text(encoding='utf-8'))
+        complete[admin.NATIVE_MANIFEST_KEY] = manifest
+        sidecar.write_text(json.dumps(complete), encoding='utf-8')
+
+    def test_the_copy_refuses_a_native_directory_that_changed_after_its_generation(self):
+        # P3: a killed or interrupted run can leave the native directory partly rewritten
+        # while its sidecar still records the previous generation. Copying that pair would
+        # propagate a Dolt directory whose journal belongs to a different generation.
+        self.record()
+        (self.root / 'backups' / 'alpha' / 'chunk').write_text('one', encoding='utf-8')
+        self._pair_with_manifest()
+        (self.root / 'backups' / 'alpha' / 'half-written-chunk').write_text(
+            'a newer, partial sync', encoding='utf-8')
+        stdout, stderr, code = self.run_admin('backup-copy', str(self.destination))
+        self.assertNotEqual(code, 0)
+        self.assertIn('no longer matches the manifest', stderr)
+        self.assertIn('alpha', stderr)
+        self.assertFalse((self.destination / admin.BACKUP_STATUS_NAME).exists())
+        self.assertEqual(list(self.destination.glob('.backup-copy-staging-*')), [])
+        # Nothing was moved into place for the other project either.
+        self.assertFalse((self.destination / 'beta').exists())
+
+    def test_the_copy_refuses_a_native_directory_that_changed_while_it_was_copied(self):
+        # A direct native writer bypasses the project's backup lock, so the directory can
+        # still change during the long copytree; the after-check refuses the mixed copy.
+        self.record()
+        (self.root / 'backups' / 'alpha' / 'chunk').write_text('one', encoding='utf-8')
+        self._pair_with_manifest()
+        real_copytree = shutil.copytree
+
+        def racing(source, target, **kwargs):
+            result = real_copytree(source, target, **kwargs)
+            if Path(source).name == 'alpha':
+                (Path(source) / 'written-mid-copy').write_text('direct write', encoding='utf-8')
+            return result
+
+        with patch('shutil.copytree', side_effect=racing):
+            stdout, stderr, code = self.run_admin('backup-copy', str(self.destination))
+        self.assertNotEqual(code, 0)
+        self.assertIn('changed while it was being copied', stderr)
+        self.assertFalse((self.destination / admin.BACKUP_STATUS_NAME).exists())
+        self.assertEqual(list(self.destination.glob('.backup-copy-staging-*')), [])
+
+    def test_the_copy_reports_an_unverifiable_manifest_instead_of_refusing(self):
+        # A sidecar written before the manifest existed must not be called clean, but it
+        # must not block an off-machine copy either.
+        self.record()
+        stdout, stderr, code = self.run_admin('backup-copy', str(self.destination))
+        self.assertEqual(code, 0, stderr)
+        self.assertIn('could not be checked', stdout)
+        self.assertTrue((self.destination / admin.BACKUP_STATUS_NAME).is_file())
 
 
 if __name__ == '__main__':
