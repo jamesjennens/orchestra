@@ -1,7 +1,26 @@
 """Append-only contribution delivery and actionable review requests.
 
 The endpoint must hold the project coordination lock across execute(). Native
-comment authors supply attribution; actor labels are not authentication.
+comment authors supply attribution; actor labels are not authentication, so the
+follow-on gate compares normalised attribution keys (case-folded, with any
+``/``-namespace suffix dropped) and judges the assignee as it was when the
+approval was recorded: ``execute`` stamps the optional ``assignee_at_approval``
+snapshot on an ``approve`` record. A record with no usable snapshot -- absent
+because it was written before the field existed, or an explicit null written while
+the task was unassigned -- falls back to the current assignee, which is the
+pre-snapshot fail-closed reading.
+
+Rollback compatibility: the snapshot is additive for readers, not for writers. A
+kit built before the field existed validates an ``approve`` record against the
+exact pre-snapshot field set, so it treats a record that carries
+``assignee_at_approval`` as malformed and refuses the whole chain ("Malformed
+contribution-review history; operator reconciliation required"). Deploying this
+change and later rolling the kit back is therefore safe only while no approve
+record with the snapshot has been written; once one exists the older kit cannot
+read that task until an operator voids the affected record or the tolerant reader
+is restored. ``docs/REVIEWS.md`` records the hazard, the operator remedy and the
+staged alternative (a tolerant reader in one release, the writer in the next).
+See also ``ASSIGNEE_SNAPSHOT`` below.
 """
 import json
 import re
@@ -16,6 +35,14 @@ EXTRA = {
     'respond': {'contribution', 'resolutions'},
     'approve': {'contribution', 'summary'},
 }
+# Optional additive field on an ``approve`` record: the task assignee at the moment
+# the approval was written. Stamped server-side by ``execute``; approve records
+# written before this field existed keep validating without it, and a null value is
+# treated like a missing one (fall back to the current assignee). Adding the field
+# is not rollback-safe: a kit that predates it validates the approve field set
+# exactly and refuses a record that carries it. See the module docstring and
+# docs/REVIEWS.md.
+ASSIGNEE_SNAPSHOT = 'assignee_at_approval'
 
 
 def text(value, name, limit=500):
@@ -26,6 +53,27 @@ def text(value, name, limit=500):
 def identity(value):
     if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,160}', value):
         raise ValueError('Invalid workflow ID')
+
+
+def author_key(value):
+    """Normalised attribution key for a native author or an assignee label.
+
+    Native authors are attribution, not authentication (see the module docstring):
+    the transport has no identity system, so ``Worker``/``worker`` and
+    ``worker/sub``/``worker`` name the same attributing principal. The follow-on
+    gate applies this key to both sides of its author and assignee comparisons.
+
+    Only case and the ``/``-namespace suffix are normalised. ``worker@host``,
+    ``worker-2`` and ``worker.`` stay distinct from ``worker``, while
+    ``team/alice`` and ``team/bob`` both reduce to ``team`` and are therefore
+    treated as one author. Those extra refusals are deliberate, they apply on the
+    HTTP path too (where the author is the authenticated principal), and they
+    change nothing about the comparison being attribution rather than
+    authentication.
+    """
+    if not isinstance(value, str):
+        return value
+    return value.strip().casefold().partition('/')[0]
 
 
 def fields(value, expected):
@@ -43,7 +91,14 @@ def validate(p, task):
         if set(p) not in (expected, expected | {'follows'}):
             raise ValueError('Invalid review workflow fields')
     else:
-        fields(p, COMMON | EXTRA[p['operation']])
+        expected = COMMON | EXTRA[p['operation']]
+        if p['operation'] == 'approve':
+            # The assignee snapshot is additive: approve records written before it
+            # existed keep validating, and the server stamps it before the append.
+            if set(p) not in (expected, expected | {ASSIGNEE_SNAPSHOT}):
+                raise ValueError('Invalid review workflow fields')
+        else:
+            fields(p, expected)
     if type(p['schema_version']) is not int or p['schema_version'] != 1 or p['task'] != task:
         raise ValueError('Invalid review workflow version/task')
     identity(task); identity(p['operation_id'])
@@ -79,6 +134,9 @@ def validate(p, task):
         identity(p['contribution'])
         if op == 'approve':
             text(p['summary'], 'summary', 1200)
+            snapshot = p.get(ASSIGNEE_SNAPSHOT)
+            if snapshot is not None:
+                text(snapshot, 'assignee snapshot', 300)
         else:
             values = p['items'] if op == 'request-changes' else p['resolutions']
             if not isinstance(values, list) or not 1 <= len(values) <= 20:
@@ -435,20 +493,32 @@ def project(issue, operators=None):
     return projection(ordered, voids, invalid, refused, positions)
 
 
-def approving_record(ordered, contribution_id):
-    """The native ``approve`` comment the shared projection counted for a revision.
+def approving_entry(ordered, contribution_id):
+    """The ``(payload, native comment)`` pair of the LAST ``approve`` naming a revision.
 
     A later contribution resets the approval and the projection refuses to approve
-    while requests are unresolved, so the LAST ``approve`` naming this contribution
-    is the record the projection used. The native author on that comment is the
-    attribution the follow-on gate checks; it is the transport's record of who
-    actually wrote the approval.
+    while requests are unresolved, so the last ``approve`` naming this contribution
+    is the record the projection used. The payload carries the server-stamped
+    ``assignee_at_approval`` snapshot when the record has one, so the gate can judge
+    the assignee as it was then rather than as it is now.
     """
     found = None
     for p, c in ordered:
         if p['operation'] == 'approve' and p['contribution'] == contribution_id:
-            found = c
+            found = (p, c)
     return found
+
+
+def approving_record(ordered, contribution_id):
+    """The native ``approve`` comment the shared projection counted for a revision.
+
+    The native author on that comment is the attribution the follow-on gate
+    checks; it is the transport's record of who actually wrote the approval. Use
+    ``approving_entry`` when the approving payload (and its assignee snapshot) is
+    needed as well.
+    """
+    entry = approving_entry(ordered, contribution_id)
+    return entry[1] if entry else None
 
 
 def require_integrated_follow_on(payload, state, ordered, rows, task, assignee=None):
@@ -459,14 +529,22 @@ def require_integrated_follow_on(payload, state, ordered, rows, task, assignee=N
 
     * the raw append-only chain must show the prior revision **approved with no
       unresolved requests** (``awaiting-integration``);
-    * that approving record's **native author** must differ from both the prior
-      contribution's author and the current task assignee. Native comment authors
-      supply *attribution, not authentication*, on the SSH/endpoint path: a caller
-      can label itself anything, so this check refuses the contributor's own
-      approval (and the assignee's) without pretending to be an identity system.
-      The HTTP ``CAP_APPROVE`` capability is the real approval authority: there the
-      native author is bound to the authenticated principal, so a worker credential
-      cannot approve at all;
+    * that approving record's **normalised native author** must differ from both the
+      prior contribution's author and the task assignee **as it was when the
+      approval was recorded**. Native comment authors supply *attribution, not
+      authentication*, on the SSH/endpoint path: a caller can label itself anything,
+      so this check refuses the contributor's own approval (and the assignee's)
+      without pretending to be an identity system. Attribution keys are compared
+      case-folded with any ``/``-namespace suffix dropped, so ``Worker`` and
+      ``worker/sub`` cannot pass as a distinct author. The assignee comes from the
+      ``assignee_at_approval`` snapshot the server stamped on the approve record, so
+      a handoff after the approval neither opens nor closes the gate; a record with
+      no usable snapshot -- absent (legacy) or an explicit null written while the
+      task was unassigned -- falls back to the caller's current assignee (fail
+      closed as before), so an unassign/approve/take-back cycle cannot open the
+      gate. The HTTP ``CAP_APPROVE`` capability is the
+      real approval authority: there the native author is bound to the
+      authenticated principal, so a worker credential cannot approve at all;
     * the shared per-scope integration evidence (kittrial-5bb.24,
       ``review_state.integration`` over ``review_state.scopes_for``) must record a
       passed ``integrated`` fact for the prior contribution's FULL commit, and the
@@ -489,17 +567,25 @@ def require_integrated_follow_on(payload, state, ordered, rows, task, assignee=N
         raise ValueError('Contribution follows a revision that is not approved; a reviewer must '
                          'approve the prior contribution with no unresolved requests before an '
                          'additive follow-on can use it as its base')
-    approval = approving_record(ordered, prior['comment_id'])
-    if approval is None:
+    entry = approving_entry(ordered, prior['comment_id'])
+    if entry is None:
         raise ValueError('Contribution follows a revision that is not approved; a reviewer must '
                          'approve the prior contribution with no unresolved requests before an '
                          'additive follow-on can use it as its base')
+    approving, approval = entry
     author = approval.get('author')
-    if author == prior.get('author'):
+    if author_key(author) == author_key(prior.get('author')):
         raise ValueError('Contribution follows a revision approved by its own author; an additive '
                          'follow-on requires an approving record whose native author is neither the '
                          'prior contribution author nor the task assignee')
-    if assignee and author == assignee:
+    # Judge the assignee as it was when the approval was recorded. The snapshot is
+    # stamped server-side. A record with no usable snapshot -- absent (written
+    # before the field existed) or an explicit null (written while the task was
+    # unassigned) -- falls back to the caller's current assignee, the pre-snapshot
+    # fail-closed reading, so an unassign/approve/take-back cycle cannot open the
+    # gate.
+    approve_assignee = approving.get(ASSIGNEE_SNAPSHOT) or assignee
+    if approve_assignee and author_key(author) == author_key(approve_assignee):
         raise ValueError('Contribution follows a revision approved by the task assignee; an additive '
                          'follow-on requires an approving record whose native author is neither the '
                          'prior contribution author nor the task assignee')
@@ -513,6 +599,19 @@ def require_integrated_follow_on(payload, state, ordered, rows, task, assignee=N
     if payload['base_commit'].lower() != evidence['integration_commit'].lower():
         raise ValueError('Contribution base_commit must equal the prior integration commit '
                          + evidence['integration_commit'])
+
+
+def _retry_matches(stored, incoming):
+    """Whether a retried payload matches the stored record apart from the snapshot.
+
+    ``execute`` stamps ``assignee_at_approval`` before the append, so a caller can
+    never reproduce the stored approve bytes exactly. The snapshot is ignored on
+    both sides so a retry of the same operation stays idempotent even when the
+    assignee changed in between.
+    """
+    def scrubbed(p):
+        return {k: v for k, v in p.items() if k != ASSIGNEE_SNAPSHOT} if isinstance(p, dict) else p
+    return scrubbed(stored) == scrubbed(incoming)
 
 
 def execute(rows, task, actor, payload, run, operators=None):
@@ -530,7 +629,7 @@ def execute(rows, task, actor, payload, run, operators=None):
     # Exact retries remain recoverable after ownership changes or later revisions.
     for p, c in ordered:
         if p['operation_id'] == payload['operation_id']:
-            if p == payload and c['author'] == actor:
+            if _retry_matches(p, payload) and c['author'] == actor:
                 return dict(comment_id=str(c['id']), reconciled=True, **receipt(state, rows, task))
             raise ValueError('Operation ID already used with different payload or actor')
     voided_operations = _voided_operation_ids(issue, voids)
@@ -544,6 +643,11 @@ def execute(rows, task, actor, payload, run, operators=None):
         raise ValueError('Only the current assigned owner may contribute/respond; resume or handoff first')
     if payload['operation'] == 'request-changes' and issue.get('status') == 'closed':
         raise ValueError('Reopen the closed task explicitly before requesting changes')
+    # The assignee an approval is judged against is recorded server-side, from the
+    # task row, so a caller cannot forge it to open the follow-on gate.
+    if payload['operation'] == 'approve':
+        payload = dict(payload, **{ASSIGNEE_SNAPSHOT: issue.get('assignee')})
+        validate(payload, task)
     # Validate the entire transition before the sole native mutation.
     preview_positions = dict(positions)
     preview_positions['pending-write'] = len(issue.get('comments') or [])

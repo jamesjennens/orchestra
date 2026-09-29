@@ -13,6 +13,18 @@ the optional ``follows`` relation instead of being forced to declare that it
 * a self-approval, an assignee approval, a self-recorded ``integrated=passed``
   lifecycle fact by the contributor alone and a changes-requested prior do NOT open
   the gate; all refusals write nothing;
+* the assignee is judged as it was when the approval was recorded
+  (``assignee_at_approval``, stamped server-side on the approve record), so a later
+  handoff neither opens the gate (I5) nor closes it on a genuine reviewer who
+  becomes the assignee afterwards (I6); a record with no usable snapshot -- absent,
+  or an explicit null written while the task was unassigned -- falls back to the
+  current assignee, so an unassign/approve/take-back cycle cannot open the gate;
+* both author comparisons normalise case and the ``/``-namespace suffix, so
+  ``Worker``/``worker`` and ``worker/sub``/``worker`` cannot pass as distinct
+  authors (I11) and ``team/alice``/``team/bob`` fold to one author, while
+  ``worker@host``, ``worker-2`` and ``worker.`` stay distinct; an exact retry of an
+  approve stays idempotent across an assignee change and a caller-supplied snapshot
+  is overwritten;
 * a newer lifecycle scope recorded for other work does not make a genuinely
   integrated prior un-followable (the shared projection is per-scope);
 * no scoped evidence at all fails closed (there is no ``fact is None`` fallback);
@@ -120,6 +132,21 @@ class FollowOnChainTests(unittest.TestCase):
             lifecycle.apply_native(dict(base, operation_id=scope_op + '-int', dimension='integrated',
                                         value=value), actor, run)
 
+    def raw_approve(self, contribution_id, author, operation_id='op-legacy-approve'):
+        """Append an approve record by hand, as the transport wrote it before the
+        ``assignee_at_approval`` snapshot existed (no snapshot field at all)."""
+        payload = dict(schema_version=1, operation='approve', operation_id=operation_id,
+                       task='task-1', previous=contribution_id, contribution=contribution_id,
+                       summary='Reviewed')
+        cid = str(len(self.issue['comments']) + 1)
+        self.issue['comments'].append(dict(id=cid, text=w.PREFIX + json.dumps(payload),
+                                           author=author, created_at='2026-09-16T00:00:00Z'))
+        return cid
+
+    def stored_payload(self):
+        """The payload the last native comment stored."""
+        return json.loads(self.issue['comments'][-1]['text'][len(w.PREFIX):])
+
     def shared(self):
         """`review TASK`'s projection: the shared review-state overlay with scopes."""
         from review_state import project as reviewed, scopes_for
@@ -202,6 +229,161 @@ class FollowOnChainTests(unittest.TestCase):
             self.send(self.contribution(COMMIT_2, base=MERGE_1, supersedes=None, follows=first),
                       'owner')
         self.assertEqual(len(self.issue['comments']), before)
+
+    def test_assignee_at_approval_time_refuses_the_later_follow_on(self):
+        """I5: X approves while X is the assignee and the task then returns to W.
+
+        The approval was an assignee self-approval when it was recorded, so W's
+        follow-on must still be refused after the handoff: judging the CURRENT
+        assignee (W) would wrongly open the gate.
+        """
+        first = self.send(self.contribution(COMMIT_1))['comment_id']
+        self.issue['assignee'] = 'x'            # X takes the task over
+        self.send(self.payload('approve', contribution=first, summary='Approved while assignee x'), 'x')
+        self.record_lifecycle(COMMIT_1, MERGE_1)
+        self.issue['assignee'] = 'worker'       # handed back to the contributor
+        self.assertEqual(w.project(self.issue)['review_state'], 'awaiting-integration')
+        before = len(self.issue['comments'])
+        with self.assertRaisesRegex(ValueError, 'approved by the task assignee'):
+            self.send(self.contribution(COMMIT_2, base=MERGE_1, supersedes=None, follows=first))
+        self.assertEqual(len(self.issue['comments']), before)
+
+    def test_reviewer_who_later_becomes_assignee_can_follow_on(self):
+        """I6: the reviewer was not the assignee when approving, so their follow-on
+        on the genuinely integrated prior must be accepted after they take the task."""
+        first = self.send(self.contribution(COMMIT_1))['comment_id']
+        self.send(self.payload('approve', contribution=first, summary='Reviewed before the handoff'),
+                  'reviewer')
+        self.record_lifecycle(COMMIT_1, MERGE_1)
+        self.issue['assignee'] = 'reviewer'     # the reviewer is handed the task later
+        second = self.send(self.contribution(COMMIT_2, base=MERGE_1, supersedes=None, follows=first),
+                           'reviewer')['comment_id']
+        state = w.project(self.issue)
+        self.assertEqual(state['contribution']['comment_id'], second)
+        self.assertEqual(state['contribution']['follows'], first)
+        self.assertEqual(state['review_state'], 'awaiting-review')
+
+    def test_case_variant_label_does_not_open_the_self_approval_gate(self):
+        """I11: ``Worker`` approving its own ``worker`` contribution is a self-approval."""
+        first = self.send(self.contribution(COMMIT_1))['comment_id']
+        self.send(self.payload('approve', contribution=first, summary='Self approved as Worker'),
+                  'Worker')
+        self.record_lifecycle(COMMIT_1, MERGE_1)
+        before = len(self.issue['comments'])
+        with self.assertRaisesRegex(ValueError, 'approved by its own author'):
+            self.send(self.contribution(COMMIT_2, base=MERGE_1, supersedes=None, follows=first))
+        self.assertEqual(len(self.issue['comments']), before)
+
+    def test_namespace_variant_label_does_not_open_the_self_approval_gate(self):
+        """I11: ``worker/sub`` approving its own ``worker`` contribution is a self-approval."""
+        first = self.send(self.contribution(COMMIT_1))['comment_id']
+        self.send(self.payload('approve', contribution=first, summary='Self approved as worker/sub'),
+                  'worker/sub')
+        self.record_lifecycle(COMMIT_1, MERGE_1)
+        before = len(self.issue['comments'])
+        with self.assertRaisesRegex(ValueError, 'approved by its own author'):
+            self.send(self.contribution(COMMIT_2, base=MERGE_1, supersedes=None, follows=first))
+        self.assertEqual(len(self.issue['comments']), before)
+
+    def test_case_variant_assignee_label_is_normalised(self):
+        """I11: an approval by ``worker`` while the assignee label is ``Worker`` is an
+        assignee approval (a distinct contribution author makes the message unambiguous)."""
+        self.issue['assignee'] = 'author-a'
+        first = self.send(self.contribution(COMMIT_1), 'author-a')['comment_id']
+        self.issue['assignee'] = 'Worker'       # handoff to a case variant of worker
+        self.send(self.payload('approve', contribution=first, summary='Approved by Worker'), 'worker')
+        self.record_lifecycle(COMMIT_1, MERGE_1, actor='worker')
+        self.issue['assignee'] = 'worker'
+        before = len(self.issue['comments'])
+        with self.assertRaisesRegex(ValueError, 'approved by the task assignee'):
+            self.send(self.contribution(COMMIT_2, base=MERGE_1, supersedes=None, follows=first))
+        self.assertEqual(len(self.issue['comments']), before)
+
+    def test_namespace_variant_assignee_label_is_normalised(self):
+        """I11: an approval by ``worker/sub`` while the assignee is ``worker`` is an
+        assignee approval."""
+        self.issue['assignee'] = 'author-a'
+        first = self.send(self.contribution(COMMIT_1), 'author-a')['comment_id']
+        self.issue['assignee'] = 'worker'
+        self.send(self.payload('approve', contribution=first, summary='Approved by worker/sub'),
+                  'worker/sub')
+        self.record_lifecycle(COMMIT_1, MERGE_1, actor='worker')
+        before = len(self.issue['comments'])
+        with self.assertRaisesRegex(ValueError, 'approved by the task assignee'):
+            self.send(self.contribution(COMMIT_2, base=MERGE_1, supersedes=None, follows=first))
+        self.assertEqual(len(self.issue['comments']), before)
+
+    def test_legacy_approve_without_snapshot_falls_back_to_current_assignee(self):
+        """An approve record written before the snapshot existed must keep failing
+        closed against the current assignee."""
+        first = self.send(self.contribution(COMMIT_1))['comment_id']
+        self.issue['assignee'] = 'owner'
+        self.raw_approve(first, 'owner')        # legacy record: no assignee snapshot
+        self.assertNotIn(w.ASSIGNEE_SNAPSHOT, self.stored_payload())
+        self.record_lifecycle(COMMIT_1, MERGE_1, actor='owner')
+        self.assertEqual(w.project(self.issue)['review_state'], 'awaiting-integration')
+        before = len(self.issue['comments'])
+        with self.assertRaisesRegex(ValueError, 'approved by the task assignee'):
+            self.send(self.contribution(COMMIT_2, base=MERGE_1, supersedes=None, follows=first),
+                      'owner')
+        self.assertEqual(len(self.issue['comments']), before)
+
+    def test_approve_stamps_the_assignee_server_side(self):
+        """The snapshot is the server's current assignee, not the caller's value, and
+        an exact retry stays idempotent after the assignee changes."""
+        first = self.send(self.contribution(COMMIT_1))['comment_id']
+        forged = self.payload('approve', contribution=first, summary='Reviewed')
+        forged[w.ASSIGNEE_SNAPSHOT] = 'forged-actor'
+        receipt = self.send(forged, 'reviewer')
+        self.assertEqual('worker', self.stored_payload()[w.ASSIGNEE_SNAPSHOT])
+        self.issue['assignee'] = 'replacement'
+        retried = self.send(forged, 'reviewer')
+        self.assertTrue(retried['reconciled'])
+        self.assertEqual(retried['comment_id'], receipt['comment_id'])
+        self.assertEqual(len(self.issue['comments']), 2)   # contribution + one approval
+
+    def test_explicit_null_snapshot_falls_back_to_the_current_assignee(self):
+        """N3: an approval written while the task was unassigned carries an explicit
+        null snapshot, and the gate must treat it like a missing snapshot and fall
+        back to the current assignee, so an unassign/approve/take-back cycle cannot
+        open the gate."""
+        first = self.send(self.contribution(COMMIT_1))['comment_id']
+        self.issue['assignee'] = None
+        self.send(self.payload('approve', contribution=first, summary='Approved while unassigned'),
+                  'reviewer')
+        self.assertIsNone(self.stored_payload()[w.ASSIGNEE_SNAPSHOT])
+        self.record_lifecycle(COMMIT_1, MERGE_1, actor='worker')
+        self.issue['assignee'] = 'reviewer'     # the approver takes the task back
+        before = len(self.issue['comments'])
+        with self.assertRaisesRegex(ValueError, 'approved by the task assignee'):
+            self.send(self.contribution(COMMIT_2, base=MERGE_1, supersedes=None, follows=first),
+                      'reviewer')
+        self.assertEqual(len(self.issue['comments']), before)
+
+    def test_namespace_prefix_shares_one_author_key(self):
+        """N6: ``team/alice`` and ``team/bob`` fold to one author key, so an approval
+        of ``team/alice``'s revision by ``team/bob`` is a self-approval. The extra
+        refusal is deliberate and the fold applies on HTTP too."""
+        self.issue['assignee'] = 'team/alice'
+        first = self.send(self.contribution(COMMIT_1), 'team/alice')['comment_id']
+        self.send(self.payload('approve', contribution=first, summary='Approved by team/bob'),
+                  'team/bob')
+        self.record_lifecycle(COMMIT_1, MERGE_1, actor='team/bob')
+        self.issue['assignee'] = 'team/alice'
+        before = len(self.issue['comments'])
+        with self.assertRaisesRegex(ValueError, 'approved by its own author'):
+            self.send(self.contribution(COMMIT_2, base=MERGE_1, supersedes=None, follows=first),
+                      'team/alice')
+        self.assertEqual(len(self.issue['comments']), before)
+
+    def test_author_key_normalises_only_case_and_namespace(self):
+        """Pin the documented normalisation: case and a ``/``-namespace fold, while
+        ``@``, a numeric suffix and a dot remain distinct attributions."""
+        self.assertEqual(w.author_key('Worker'), w.author_key('worker'))
+        self.assertEqual(w.author_key('worker/sub/deeper'), w.author_key('worker'))
+        self.assertEqual(w.author_key('team/alice'), w.author_key('team/bob'))
+        for distinct in ('worker@host', 'worker-2', 'worker.'):
+            self.assertNotEqual(w.author_key(distinct), w.author_key('worker'))
 
     def test_changes_requested_prior_is_refused_even_when_self_integrated(self):
         first = self.send(self.contribution(COMMIT_1))['comment_id']
