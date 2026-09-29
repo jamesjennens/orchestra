@@ -97,7 +97,13 @@ else:
                                 text=True, start_new_session=True, env=env)
         self.addCleanup(lambda: self.stop_if_running(proc))
         if ready:
-            self.wait_for(lambda: self.port_up(self.db_port) and self.port_up(self.web_port))
+            try:
+                self.wait_for(lambda: self.port_up(self.db_port) and self.port_up(self.web_port))
+            except AssertionError:
+                error = proc.stderr.read() if proc.poll() is not None else '<still running>'
+                logs = {name: (self.logs/name).read_text(errors='replace')
+                        for name in ('dolt.log', 'http.log') if (self.logs/name).exists()}
+                self.fail('service did not become ready: stderr=%r logs=%r' % (error, logs))
         return proc
 
     @staticmethod
