@@ -73,11 +73,18 @@ class BackupTests(unittest.TestCase):
         self.assertEqual(data['status'], 'complete')
         self.assertEqual(data['files'], {self.request_name: self.receipt, '.merge-context.json': self.context})
 
-    def test_native_failure_replaces_old_complete_marker_with_pending(self):
+    def test_native_failure_keeps_the_previous_complete_pair_restorable(self):
+        # kittrial-5bb.39 rev2: a failed run must not leave only a `pending` marker
+        # behind, so the complete sidecar saved aside before the marker is put back and
+        # restore can still use the previous complete pair.
         self.save_bundle()
         with patch.object(admin, 'run_bd', side_effect=RuntimeError('sync failed')):
             with self.assertRaises(RuntimeError): admin.backup_project(self.root, 'source')
-        self.assertEqual(json.loads(self.bundle.read_text(encoding='utf-8'))['status'], 'pending')
+        self.assertEqual(json.loads(self.bundle.read_text(encoding='utf-8'))['status'], 'complete')
+        self.assertEqual(admin.coordination_backup(self.root, 'source'),
+                         {self.request_name: self.receipt, '.merge-context.json': self.context})
+        aside = admin.last_complete_sidecar_path(self.root, 'source')
+        self.assertEqual(json.loads(aside.read_text(encoding='utf-8'))['status'], 'complete')
 
     def test_onboarding_is_captured_in_backup_and_restored_as_text(self):
         (self.source/'ONBOARDING.md').write_text('Private project instructions 漢',encoding='utf-8')

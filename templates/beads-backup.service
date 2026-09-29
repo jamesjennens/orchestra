@@ -1,8 +1,14 @@
-# Edit paths/project before copying to the service account's user systemd directory.
+# Replace the placeholder paths before copying to the service account's user systemd directory.
+# `backup --all` backs up every initialized project of this runtime in one run, so a project
+# added later is covered by the same schedule. It writes <runtime>/backups/backup-status.json
+# with one entry per project; a project whose native directory + coordination sidecar pair is
+# not complete is recorded as not complete with the reason, never silently complete. Check the
+# record with `admin.py --root <runtime> backup-status --require-complete` before copying the
+# pairs it names off-machine.
 [Unit]
-Description=Back up one Orchestra project and coordination journals
+Description=Back up every Orchestra project and coordination journal
 
 [Service]
 Type=oneshot
 UMask=0077
-ExecStart=/usr/bin/python3 /home/beads/orchestra/admin.py --root /home/beads/beads-runtime backup example
+ExecStart=/usr/bin/python3 /home/beads/orchestra/admin.py --root /home/beads/beads-runtime backup --all
