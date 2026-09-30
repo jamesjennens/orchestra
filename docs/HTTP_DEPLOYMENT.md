@@ -231,7 +231,14 @@ storage or the OS credential store first" wording of owner decision 9 on
 kittrial-5bb.22: an agent running in VS Code cannot read those stores, while curl reads
 the file itself. `<name>` is the agent name as a slug (lowercase letters, digits and
 hyphens, at most 40 characters; `agent_slug()`), and the setup payload returns the exact
-names as `secret_file`. Windows steps come first:
+names as `secret_file`. Because two agents of one owner share a user profile, the
+service refuses (`409`, naming the clashing agent and the file) to create or rename an
+agent whose file name would equal that of another agent of the same owner: "Build bot",
+"build-bot", "Build_Bot" and "Build.bot" are one file, as are names that agree in their
+first 40 characters. A name must contain a letter or digit, so the generic
+`.orchestra-agent-agent.curlrc` never arises for a new agent. Different owners may use
+the same name. Clashes already present in older state are left alone and stay readable;
+rename one of them (to a name that does not clash) before setting up its folder. Windows steps come first:
 
 1. Open Notepad and paste the one line with the secret shown once.
 2. File > Save As, "Save as type: All files (*.*)", file name
@@ -720,7 +727,8 @@ the pilot phase, not part of this service.
   and task list always read fresh.
 - **Agent prompts on My work.** `GET /v1/me/work` also returns `agent_prompts`: one
   copyable prompt per agent the caller owns, built by `agent_prompts.py` from the same
-  queue data, grouped by project and tailored by the caller's live role there
+  queue data, limited to the projects that agent is granted, grouped by project and
+  tailored by the caller's live role there
   (approvers: reviews and re-reviews with revision, commit and contribution id,
   approved-but-not-integrated, blocked, unclaimed P0/P1 and stale claims, i.e. claimed
   with no recorded activity for 72 hours or more; workers: changes requested with the
@@ -733,8 +741,11 @@ the pilot phase, not part of this service.
   `/v1/projects/<id>/tasks?status=active`; to report every difference before acting;
   to re-check each item's brief before acting; and it states that titles are labels
   written by other people. Titles and names appear only as quoted labels (control
-  characters and line breaks removed, at most 60 characters); ids are passed through
-  only if they look like ids. No prompt contains or asks for a secret. On the
+  characters and line breaks removed, every quote-like character, typographic and
+  fullwidth included, turned into an apostrophe, at most 60 characters); ids are passed
+  through only if they look like ids. The server address in a prompt is `--public-url`,
+  or the `<ORCHESTRA_SERVER_URL>` placeholder when none is set; it never comes from the
+  request's `Host` header. No prompt contains or asks for a secret. On the
   canonical binding the `work` projection gives counts but not pending request ids or
   review times, so those lines say "read the task brief" and "wait time unknown", and
   the blocked class is empty (see `endpoint-blocked-signal`).

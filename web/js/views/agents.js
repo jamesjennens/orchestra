@@ -129,7 +129,12 @@ export async function list(ctx) {
     if (name.length < 2) return setFieldError(form, 'a-name', 'Give the agent a name of at least 2 characters.');
     setFieldError(form, 'a-name', '');
     const chosen = [...form.querySelectorAll('input[name=project]:checked')].map((i) => i.value);
-    const created = await act(form.querySelector('button[type=submit]'), () => ctx.api.createAgent({ name, tool: v['a-tool'].trim(), working_directory: v['a-dir'].trim(), projects: chosen }), { success: 'Agent added' }).catch(() => null);
+    // A name whose secret file would clash with another of your agents (409), or an
+    // invalid name (422), is explained next to the name field in the server's words.
+    const created = await act(form.querySelector('button[type=submit]'), () => ctx.api.createAgent({ name, tool: v['a-tool'].trim(), working_directory: v['a-dir'].trim(), projects: chosen }), {
+      success: 'Agent added',
+      onError: (e) => { if (e.status === 409 || e.status === 422) { setFieldError(form, 'a-name', e.message); return true; } return false; },
+    }).catch(() => null);
     if (!created) return;
     form.reset();
     setupDialog(ctx, created, { secret: created.credential && created.credential.secret });

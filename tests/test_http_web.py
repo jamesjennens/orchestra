@@ -1013,6 +1013,125 @@ class AgentPromptRouteCase(TeamHarness):
         self.assertIn('agentPromptPanel(ctx, data)', work)
 
 
+class AgentSecretFileClashCase(TeamHarness):
+    """Two agents of one owner may never share a secret file (review P2)."""
+
+    def create(self, token, name, key=None):
+        return self.request('POST', '/v1/agents', {'name': name, 'projects': [self.project]},
+                            token=token, key=key)
+
+    def test_names_that_share_a_file_are_refused_for_the_same_owner(self):
+        first = self.create(self.olive, 'Build bot')
+        self.assertEqual(201, first.status, first.data)
+        for clash in ('build-bot', 'Build_Bot', 'Build.bot', 'BUILD  BOT', 'build bot'):
+            refused = self.create(self.olive, clash)
+            self.assertEqual(409, refused.status, (clash, refused.data))
+            message = refused.data['error']['message']
+            self.assertIn('.orchestra-agent-build-bot.curlrc', message)
+            self.assertIn('"Build bot"', message)
+            self.assertEqual(first.data['agent']['id'],
+                             refused.data['error']['detail']['clashes_with'])
+        self.assertEqual(1, len(self.request('GET', '/v1/agents', token=self.olive).data['items']))
+
+    def test_the_40_character_prefix_counts(self):
+        base = 'a' * 40
+        self.assertEqual(201, self.create(self.olive, base + ' one').status)
+        refused = self.create(self.olive, base + ' two')
+        self.assertEqual(409, refused.status, refused.data)
+        self.assertEqual(201, self.create(self.olive, 'b' + base[1:] + ' two').status)
+
+    def test_a_name_without_letters_or_digits_is_refused(self):
+        for name in ('_-_', '...', '- -'):
+            response = self.create(self.olive, name)
+            self.assertEqual(422, response.status, (name, response.data))
+        from http_auth import Service
+        with self.assertRaises(Exception):
+            Service._agent_name('._')
+
+    def test_rename_is_checked_too(self):
+        one = self.create(self.olive, 'Kestrel').data['agent']['id']
+        two = self.create(self.olive, 'Wren').data['agent']['id']
+        clash = self.request('PATCH', '/v1/agents/%s' % two, {'name': 'kestrel'}, token=self.olive)
+        self.assertEqual(409, clash.status, clash.data)
+        self.assertEqual(one, clash.data['error']['detail']['clashes_with'])
+        self.assertEqual('Wren', self.request('GET', '/v1/agents/%s' % two,
+                                              token=self.olive).data['name'])
+        # Renaming an agent to another spelling of its own name is fine.
+        same = self.request('PATCH', '/v1/agents/%s' % one, {'name': 'KESTREL'}, token=self.olive)
+        self.assertEqual(200, same.status, same.data)
+        self.assertEqual(200, self.request('PATCH', '/v1/agents/%s' % two, {'name': 'Heron'},
+                                           token=self.olive).status)
+
+    def test_different_owners_may_share_a_file_name(self):
+        self.assertEqual(201, self.create(self.olive, 'Build bot').status)
+        self.assertEqual(201, self.create(self.carl, 'build-bot').status)
+
+    def test_existing_clashes_in_old_state_stay_readable(self):
+        one = self.create(self.olive, 'Build bot').data['agent']['id']
+        # Old state could already hold a clash; simulate it directly.
+        with self.store.lock:
+            twin = dict(self.store.state['agents'][one], id='agent_oldtwin00000000',
+                        name='build-bot')
+            self.store.state['agents'][twin['id']] = twin
+            self.store.save()
+        listed = self.request('GET', '/v1/agents', token=self.olive)
+        self.assertEqual(200, listed.status, listed.data)
+        self.assertEqual({'Build bot', 'build-bot'}, {a['name'] for a in listed.data['items']})
+        self.assertEqual(200, self.request('GET', '/v1/agents/agent_oldtwin00000000',
+                                           token=self.olive).status)
+        self.assertEqual(200, self.request('GET', '/v1/me/work', token=self.olive).status)
+        # Editing something other than the name still works for both.
+        self.assertEqual(200, self.request('PATCH', '/v1/agents/agent_oldtwin00000000',
+                                           {'notes': 'kept'}, token=self.olive).status)
+
+    def test_the_form_shows_the_servers_message(self):
+        agents = (WEB / 'js' / 'views' / 'agents.js').read_text(encoding='utf-8')
+        self.assertIn("if (e.status === 409 || e.status === 422) { setFieldError(form, 'a-name', "
+                      "e.message); return true; }", agents)
+
+
+class AgentPromptScopeCase(TeamHarness):
+    """Review P3-a/b: prompt address and project scope."""
+
+    def test_prompt_uses_the_placeholder_not_the_host_header(self):
+        self.request('POST', '/v1/agents', {'name': 'olive-coord', 'projects': [self.project]},
+                     token=self.olive)
+        response = self.request('GET', '/v1/me/work', token=self.olive,
+                                headers={'Host': 'evil.example:666'})
+        self.assertEqual(200, response.status, response.data)
+        text = response.data['agent_prompts'][0]['text']
+        self.assertNotIn('evil.example', text)
+        self.assertNotIn('127.0.0.1', text)
+        self.assertIn('<ORCHESTRA_SERVER_URL>/v1/agents/me/next', text)
+
+    def test_prompt_uses_public_url_when_configured(self):
+        self.service.public_url = 'https://orchestra.office.example'
+        self.request('POST', '/v1/agents', {'name': 'olive-coord', 'projects': [self.project]},
+                     token=self.olive)
+        text = self.request('GET', '/v1/me/work', token=self.olive,
+                            headers={'Host': 'evil.example'}).data['agent_prompts'][0]['text']
+        self.assertIn('https://orchestra.office.example/v1/agents/me/next', text)
+        self.assertNotIn('evil.example', text)
+
+    def test_each_agent_prompt_covers_only_its_granted_projects(self):
+        beta = self.create_project(self.olive, 'Beta')
+        beta_task = self.create_task(self.olive, beta, 'Beta work').data['id']
+        self.request('POST', '/v1/agents', {'name': 'alpha-only', 'projects': [self.project]},
+                     token=self.olive)
+        self.request('POST', '/v1/agents', {'name': 'beta-only', 'projects': [beta]},
+                     token=self.olive)
+        self.request('POST', '/v1/agents', {'name': 'none-granted', 'projects': []},
+                     token=self.olive)
+        prompts = {p['agent_name']: p['text'] for p in
+                   self.request('GET', '/v1/me/work', token=self.olive).data['agent_prompts']}
+        self.assertIn('Project %s ' % self.project, prompts['alpha-only'])
+        self.assertNotIn(beta, prompts['alpha-only'])
+        self.assertNotIn(beta_task, prompts['alpha-only'])
+        self.assertIn('- task %s ' % beta_task, prompts['beta-only'])
+        self.assertNotIn(self.project, prompts['beta-only'])
+        self.assertNotIn('- task ', prompts['none-granted'])
+
+
 class NextActionCase(unittest.TestCase):
     def test_unknown_review_state_matches_no_review_filter(self):
         from http_service import task_matches

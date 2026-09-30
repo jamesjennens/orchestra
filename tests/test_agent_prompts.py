@@ -196,6 +196,14 @@ class SanitisingCase(unittest.TestCase):
         self.assertIn(ap.UNTRUSTED_LINE, text)
         self.assertLess(text.index(ap.UNTRUSTED_LINE), text.index('- task t1'))
 
+    def test_every_quote_like_character_becomes_an_apostrophe(self):
+        quotes = ('\u201c\u201d\u2018\u2019\u00ab\u00bb\u201e\u201f\u201a\u201b'
+                  '\u2039\u203a\uff02\uff07\uff40\u300c\u300d\u300e\u300f\u301d\u301e'
+                  '\u2032\u2033"\'`')
+        result = ap.label('a' + quotes + 'b')
+        self.assertEqual('"a' + "'" * len(quotes) + 'b"', result)
+        self.assertEqual('"He said \'stop\' \'now\'"', ap.label('He said \u201cstop\u201d \u00abnow\u00bb'))
+
     def test_label_rules(self):
         self.assertEqual('"a b c"', ap.label('a\n\tb\r\n  c'))
         self.assertEqual('"untitled"', ap.label(None))

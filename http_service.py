@@ -1662,13 +1662,6 @@ class ApiHandler(BaseHTTPRequestHandler):
         view['next_action'] = next_action(view)
         return view
 
-    def _request_origin(self):
-        """This request's own origin, for prompts when no --public-url is set."""
-        host = self.headers.get('Host') or ''
-        if not re.fullmatch(r'[A-Za-z0-9.:\[\]-]{1,255}', host):
-            return '<ORCHESTRA_SERVER_URL>'
-        return ('https://' if self._is_secure() else 'http://') + host
-
     def _task_views(self, tasks):
         names = self.service.actor_names([t.get('assignee') for t in tasks])
         return [self._task_view(t, names) for t in tasks]
@@ -2547,11 +2540,17 @@ class ApiHandler(BaseHTTPRequestHandler):
         except HttpError:
             agents = []
         # One copyable prompt per agent the person owns, built from exactly this data.
-        server = self.service.public_url or self._request_origin()
+        # The address comes only from --public-url, never from the request's Host
+        # header (which a client controls); otherwise the placeholder, like the setup
+        # snippet.
+        server = self.service.public_url or '<ORCHESTRA_SERVER_URL>'
         owner_name = principal.display_name or principal.user_id
-        prompts = [agent_prompts.build_prompt(agent, owner_name, classified, generated_at,
-                                              server)
-                   for agent in agents if agent.get('owner') == principal.user_id]
+        # Each agent's prompt covers only the projects that agent is granted.
+        prompts = [agent_prompts.build_prompt(
+            agent, owner_name,
+            [p for p in classified if p['id'] in set(agent.get('projects') or [])],
+            generated_at, server)
+            for agent in agents if agent.get('owner') == principal.user_id]
         return 200, {'assigned': self._task_views(assigned[:MAX_PAGE]),
                      'to_review': self._task_views(to_review[:MAX_PAGE]),
                      'agents': agents, 'agent_prompts': prompts,

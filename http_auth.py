@@ -1692,7 +1692,33 @@ class Service:
         if not isinstance(name, str) or not AGENT_NAME.fullmatch(name.strip()):
             raise invalid('Agent name must be 1-64 characters of letters, digits, '
                           'space, . _ -')
+        # The name also names the owner's secret file (agent_secret_file); a name with
+        # no letter or digit would fall back to the generic "agent" file.
+        if not re.search(r'[A-Za-z0-9]', name):
+            raise invalid('Agent name must contain a letter or digit')
         return name.strip()
+
+    def _check_agent_file_name(self, owner_id, name, exclude_id=None):
+        """Refuse a name whose secret file would clash with another of the owner's agents.
+
+        The secret file is named from the agent name (``agent_slug``: lowercase letters,
+        digits and hyphens, at most 40 characters), so "Build bot", "build-bot" and
+        "Build_Bot" share one file, as do names that agree in their first 40
+        characters. Two agents of the same owner live in the same user profile, so a
+        second one would overwrite the first one's secret: refuse it with 409. Other
+        owners may reuse the name (different profile). Existing clashes in old state are
+        left alone and stay readable. Call with ``store.lock`` held.
+        """
+        slug = agent_slug(name)
+        for other in self.state['agents'].values():
+            if other.get('owner') == owner_id and other.get('id') != exclude_id and \
+                    agent_slug(other.get('name')) == slug:
+                raise conflict(
+                    'Agent name "%s" would share the secret file %s with your agent "%s" (%s). '
+                    'Choose a name that differs in more than case or punctuation.'
+                    % (name, agent_secret_file(name)['name'], other.get('name'), other.get('id')),
+                    {'clashes_with': other.get('id'),
+                     'secret_file': agent_secret_file(name)['name']})
 
     @staticmethod
     def _agent_text(value, field, limit):
@@ -1991,6 +2017,7 @@ class Service:
                      if a['owner'] == principal.user_id]
             if len(owned) >= AGENT_MAX_PER_OWNER:
                 raise conflict('At most %d agents per account' % AGENT_MAX_PER_OWNER)
+            self._check_agent_file_name(principal.user_id, clean_name)
             granted = self._agent_projects(principal, projects)
             agent_id = 'agent_' + secrets.token_hex(8)
             agent = {
@@ -2046,7 +2073,9 @@ class Service:
             self._refresh_authority(principal)
             agent = self._agent_owned(principal, agent_id)
             if 'name' in payload and payload.get('name') is not None:
-                agent['name'] = self._agent_name(payload.get('name'))
+                new_name = self._agent_name(payload.get('name'))
+                self._check_agent_file_name(agent['owner'], new_name, exclude_id=agent['id'])
+                agent['name'] = new_name
             for field, limit in (('tool', AGENT_TOOL_MAX), ('machine', AGENT_MACHINE_MAX),
                                  ('notes', AGENT_NOTES_MAX),
                                  ('working_directory', AGENT_DIRECTORY_MAX)):
