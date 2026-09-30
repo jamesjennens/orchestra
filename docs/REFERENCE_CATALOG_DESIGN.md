@@ -1,13 +1,34 @@
 # Durable per-project reference catalog - design proposal
 
-Status: **proposal, revision 1. Not implemented, not accepted.** This document
+Status: **proposal, revision 2. Not implemented, not accepted.** This document
 changes no code. It proposes a record kind, an authority model, client commands,
-attention surfacing, repo sync, backup coverage and a migration path for review
-by the coordinator and acceptance by the project owner.
+attention surfacing, repo sync, backup/rollback coverage and a migration path for
+review by the coordinator and acceptance by the project owner.
 
 Nothing here is implemented: there is no `ref` command, no `reference` record
 kind and no review-by surface in the current kit. Every change named below is a
-follow-up implementation slice (§13), to be filed only after acceptance.
+follow-up implementation slice (section 15), to be filed only after acceptance.
+
+Revision 2 was written against `main` `8e1f9ec6f4d818de8983f59f80aa896111a99712`
+(revision 1 was written 71 commits earlier, against `a3e33a4`). Every code-level
+claim below was re-verified against that checkout, and the closed-issue behaviour
+relied on in section 3.2 was verified by driving the pinned `bd 1.2.2` binary
+against a disposable database (section 3.2, evidence note).
+
+## Revision 2 changes (review 01a0f0d0)
+
+| Review item | Where it is answered |
+| --- | --- |
+| `reserved-labels` | 3.7 - reserve `reference`, `reference:` and `reference-key:` in the shared label guard. |
+| `authority-claim` | 3.10 and 4 - one authority: the deployment operator allowlist. |
+| `rollback` | 10.3 - rollback compatibility and the staged tolerant-reader release. |
+| `entries-as-tasks` | 3.2 - entry anchors are created **closed**; 6.0 lists every reader that must still filter. |
+| `shared-core` | 12.1 - one extracted keyed-record core for requirements, references and `.58`. |
+| `drift-check` | 9 - pointer mode default, self-verifying export, `authority-changed-since-pinned`. |
+| `owner-identity-attention` | 3.4, 7.1 and 7.3 - durable owner identity, counts-vs-items routing, per-entry failure isolation. |
+| `http-untrusted-text` | 8 - HTTP read routes only, `token()`/`label()` in prompts, `trust` in briefs, plain-text web. |
+| `simplify-and-slices` | 3.5, 6.3, 6.4 and 15 - expected revision, one `ref retire`, slices 0-2. |
+| `owner-questions-and-58` | 12.2, 16 - recommended answers and the shared plan with kittrial-5bb.58. |
 
 ## 1. Problem and asks
 
@@ -21,32 +42,42 @@ facts: identity authorities, settlement instants, which scheduled step writes
 which store, server schedules and paths, units of external feeds, and restart
 mode semantics.
 
-The asks this design answers:
+The task's asks, and where this design answers them:
 
-1. a reference record kind: key, statement, authority (repo path + commit, or
-   URL), owner, review-by date, tags, supersession chain, readable as
-   `ref get calendar.trading` and `ref list --tag data`;
-2. two-way links between decisions and entries;
-3. review-by dates surfaced in `work` and `brief` as attention items (expired or
-   due-soon);
-4. optionally, briefs show entries tagged to the areas a task touches;
-5. no drift with repository documents: either sync/export with a repo file, or
-   entries that only point at repo paths.
+| Ask | Where |
+| --- | --- |
+| storage: a reserved machine-record kind, and how it relates to `requirements.py`, BRD/decision traceability (kittrial-5bb.22) and the web interface (kittrial-5bb.20) | 3, 12.1 |
+| who may create, revise, supersede or retire an entry | 4 |
+| client commands and JSON shapes | 6 |
+| review-by dates surfaced in `work` and `brief` as attention | 7 |
+| briefs show entries tagged to the areas a task touches | 7.1 |
+| repo sync without drift; conflict rule | 9 |
+| backup coverage and restore behaviour | 10.1, 10.2 |
+| migration path from a project's `REFERENCE.md` | 11 |
+| three worked examples with placeholders | 13 |
+
+Plus the two design constraints carried from revision 1: this stays design-only
+(no `ref` command, record kind, validator, publisher or web route is
+implemented), and the public repository stays free of private hostnames, project
+names and firm-specific detail - every example below is a placeholder.
 
 ## 2. Design at a glance
 
 | Question | Decision |
 | --- | --- |
 | Storage | Reserved machine-record kind (`Kind: reference-entry-v1`) on one native anchor issue per entry, with controlled labels. Not a new bd issue type, not a manifest field. |
-| Keying | Immutable lowercase dotted key, unique per project, mirrored in a controlled `reference-key:` label for lookup. |
-| Versioning | Monotonic revision per key; same key/revision with different content is refused. Content-addressed with `sha256`. |
-| Supersession | Two levels: revision chain (`supersedes` exact reference) and key retirement (`replaces` / `replaced_by`, accepted by an operator). |
-| Authority | Contributor proposes and revises drafts; owner/operator acceptance is the only route to `accepted`, with F3 acceptance evidence bound to the record hash. |
-| Reads | `ref get`, `ref list`, `ref decisions`, `ref check` (read-only); writes `ref propose`, `ref revise` (contributor) and the operator route for acceptance. |
-| Attention | Additive project-level `attention` block in `work` and additive `attention` array in `brief`; new kind `reference-review`; reading changes nothing. |
-| Repo sync | Mode `repo-export` (default): catalog is authoritative, file is a deterministic projection guarded by receipts and `ref export --check`. Mode `repo-path-only`: no file, repo-path authorities only. |
-| Backup | Entries are native comments, so the native backup covers them; local receipt journals join the coordination sidecar like the requirement journals. |
-| Migration | `ref import` from `REFERENCE.md` creates **draft** entries only; nothing imported is accepted. |
+| Anchor | The anchor issue is created and **closed** by the write operation before the first revision comment, so every current and older task view hides it (3.2). |
+| Key | Immutable lowercase dotted key, unique per project, mirrored in a controlled `reference-key:` label for lookup. |
+| Versioning | Monotonic revision per key; `ref revise` must state the exact next `revision` and the content hash it expects to replace (`expected_sha256`). Same key/revision with different content is refused. No hash chain. |
+| Retirement | One operator operation, `ref retire KEY --successor KEY2`, writes the superseded revision. `replaces` is derived at read time; there is no asymmetric window. |
+| Owner | A durable person/account identity (`account:<uid>` or `person:<name>`), never a session actor (3.4). |
+| Authority | Contributors draft and revise; only the deployment operator allowlist accepts, with F3 acceptance evidence bound to the record hash (4). |
+| Reads | `ref get`, `ref list`, `ref decisions`, `ref check` (read-only); writes `ref propose`, `ref revise` (contributor), and operator `ref retire` / acceptance. |
+| Attention | Additive project-level `attention` block in `work` (counts always, items only for the entry owner or an approver) and a bounded `attention` array in `brief` (at most 3, trust-marked); reading changes nothing. |
+| Repo sync | Pointer mode is the **default** (entries point at repo paths; no generated file). Export is opt-in per project, writes a **self-verifying** file (catalog digest and body digest in its header) and needs no sidecar journal. |
+| Backup | Entries are native comments, so the native backup covers them; the only new local journal is `.reference-requests/`, which joins the coordination sidecar. |
+| Rollback | Staged release. Slice 0 is a **tolerant reader** (reserve, whitelist, filter, no writes) and is the oldest kit a catalog deployment may roll back to (10.3). |
+| Migration | `ref import` from `REFERENCE.md` creates **draft** entries only, and is deferred to a later slice (11). |
 | Implementation now | None. This document only. |
 
 ## 3. Storage model
@@ -56,7 +87,7 @@ The asks this design answers:
 `requirements.py:34` already has a field named `REFERENCE_FIELDS`
 (`id`, `revision`, `sha256`), but that is **not** a reference catalog: it is an
 in-manifest content pointer resolved against the manifest's own record index
-(`requirements.py:142-171`). It answers "which exact revision of this record does
+(`requirements.py:147`). It answers "which exact revision of this record does
 this manifest cite", not "what is the authority for this operational fact". The
 two must not be conflated, and the catalog must not become a new manifest field:
 changing the manifest schema would require a `REQUIREMENTS_CONTRACT` revision and
@@ -77,29 +108,55 @@ pattern for `Kind: requirement-revision-v1` and
 derived and never caller-supplied, raw `comments add` of the prefix is refused
 by the guard in `reserved_comments.py`, and operator acceptance is bound to the
 revision's content hash. The catalog reuses that pattern rather than inventing a
-second storage mechanism.
+second storage mechanism, and revision 2 extracts the shared machinery instead
+of copying it (section 12.1).
 
-### 3.2 Native anchor
+### 3.2 Native anchor: one closed issue per entry
 
 Each entry is one native issue, created by the dedicated `ref propose` operation:
 
 - native issue type `task` (the requirement-record precedent uses the ordinary
   issue type; the controlled labels, not the type, identify the record);
+- **status `closed`**, set by the operation before the first revision comment;
 - controlled type label `reference`;
 - controlled state label, exactly one of `reference:draft`,
   `reference:accepted`, `reference:superseded`;
 - controlled lookup label `reference-key:` + the key with `.` replaced by `-`;
-- the usual `request:<hash>` / `request-content:<hash>` idempotency labels.
+- the usual native-first idempotency receipt in `.reference-requests/`.
 
-`work` must skip rows carrying the `reference` type label, exactly as it already
-skips `event`, `gate` and `merge-slot` (`work.py:175`), so a catalog of hundreds
-of entries never appears as claimable work. That is an additive filter in the
-implementation slice, not part of this design.
+The anchor is created closed so that **every reader, including an older kit that
+has never heard of the catalog, already hides it**:
 
-> Serialization note: `work.py` is owned by the in-progress checkpoint/freshness
-> claim at this base. The implementation slice that adds the filter and the
-> `work` attention block must be sequenced after that claim releases, or
-> delivered as a coordinated follow-on.
+- `work.py:175` filters by `issue_type` (`event`, `gate`, `merge-slot`), not by
+  label, so a label filter would not have helped; `work.py:180` already skips any
+  closed row whose review state is not one of
+  `changes-requested`/`awaiting-review`/`awaiting-integration`/`legacy-review-ready`/`error`,
+  and a freshly written anchor has no review state at all;
+- the HTTP task list (`http_service.py:2318`) applies only the caller's own
+  filters; the canonical queue drops a closed row with no active review
+  (`http_service.py:664-680`, and the backend rule at `:1220`); `/v1/me/work`
+  (`http_service.py:2494`) consumes that queue; and `agent_prompts.classify`
+  (`agent_prompts.py:104-136`) never places a closed row in a work class.
+
+Closing the anchor is therefore the one fix that covers the HTTP task list, the
+queue, `/v1/me/work`, the agent prompts and every older kit at once, instead of
+requiring a new label filter on each surface and on each historical version.
+
+**Verified: `bd 1.2.2` accepts comments and labels on a closed issue.** The pin
+is `versions.json:3-8` (`bd 1.2.2`, sha256 `8140098a…`) with the same pin stated
+in `README.md:5`. Against the installed pinned binary
+(`bd version 1.2.2 (6c124203e)`) and a disposable database created with
+`bd init --non-interactive` under a temporary directory, the sequence
+`create` -> `close` -> `comments add` -> `update --add-label probe:x` returned
+exit code 0 for both writes and left the issue with
+`labels=['probe:x'] status='closed'` and the comment present. No live
+installation was touched. `bd create` has no `--status` flag, so the operation
+creates the anchor and closes it explicitly before writing the first revision
+comment; both steps happen inside the one locked operation, so no reader ever
+sees an open anchor.
+
+What the tolerant reader (slice 0, section 10.3) must filter even before any
+writer exists is listed in 6.0.
 
 ### 3.3 Key
 
@@ -111,7 +168,7 @@ A key is an immutable lowercase dotted slug, at most 80 characters:
 
 Examples: `calendar.trading`, `identity.authority`, `settlement.instant`. Keys are
 unique per project. Key changes are refused for an existing entry: a different
-key is a different entry, related by `replaces`/`replaced_by` (§3.5).
+key is a different entry, related by retirement (3.5).
 
 Because bd label values are not guaranteed to accept `.`, the lookup label
 substitutes `-` for `.`. `ref get` resolves through the label and then verifies
@@ -148,18 +205,12 @@ The field set is closed:
     "commit": "0000000000000000000000000000000000000000",
     "anchor": "HOLIDAYS"
   },
-  "owner": "alex/session1",
+  "owner": "account:u-0001",
   "review_by": "2027-01-15",
   "tags": ["calendar", "data"],
   "decisions": ["example-project-42"],
-  "supersedes": {
-    "id": "example-project-17",
-    "revision": 2,
-    "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
-  },
-  "replaces": null,
-  "replaced_by": null,
   "acceptance_state": "draft",
+  "successor": null,
   "origin": {"type": "authored"},
   "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
 }
@@ -170,23 +221,43 @@ Field rules:
 | Field | Rule |
 | --- | --- |
 | `schema_version` | integer `1`. |
-| `key` | §3.3, immutable. |
+| `key` | 3.3, immutable. |
 | `revision` | positive integer, exactly the next revision for the key. |
 | `title` | nonempty, <= 200 characters. |
-| `statement` | nonempty, <= 2000 characters; state the fact, not the evidence. |
-| `authority` | exactly one closed object, `repo-path` or `url` (§3.6). |
-| `owner` | nonempty attribution string; the person who refreshes the entry. Attribution, not authenticated identity. |
+| `statement` | nonempty, <= 2000 characters; state the fact, not the evidence. Untrusted text (section 8). |
+| `authority` | exactly one closed object, `repo-path` or `url` (3.6). |
+| `owner` | durable person/account identity, `account:<uid>` or `person:<name>`; a session actor string is refused at write. Attribution, not authenticated identity, but durable enough to route attention and attribute contributor statistics. |
 | `review_by` | `YYYY-MM-DD`, real calendar date. Required for an accepted revision, optional for a draft. |
 | `tags` | 0..12 unique lowercase slugs `^[a-z][a-z0-9-]{0,31}$`. |
-| `decisions` | unique native decision issue IDs (§3.8). |
-| `supersedes` | `null` for revision 1, else exact `{id, revision, sha256}` of the previous revision of the same key. |
-| `replaces` | `null`, or the key this entry replaces. Set on the replacement entry. |
-| `replaced_by` | `null`, or the key that replaces this entry. Set on the retired entry. |
+| `decisions` | unique native decision issue IDs (3.9). |
 | `acceptance_state` | `draft`, `accepted` or `superseded`; written by the operation, never caller-supplied. |
+| `successor` | `null` for every revision except a retirement revision, which names the key that replaces this one. Set only by `ref retire`. |
 | `origin` | `{"type":"authored"}` or `{"type":"import","path":"REFERENCE.md","digest":"<64 hex>"}`. |
 | `sha256` | content hash of every other field. |
 
-### 3.5 Versioning and supersession
+There is deliberately **no** `supersedes`, `replaces` or `replaced_by` field
+(3.5), and no `acceptance` object in the record: acceptance evidence is a
+separate reserved comment (4).
+
+The owner identity rule is concrete:
+
+- `account:<uid>` names a project member account in an office deployment - the
+  durable HTTP canonical user id (`docs/HTTP_TRANSPORT_DESIGN.md:103`: accounts
+  have stable opaque user IDs and display names). This is the preferred form and
+  the one `.58` statistics attribute against.
+- `person:<name>` names a person-level actor for a project with no account
+  registry. It must not contain a session marker.
+- A value that looks like a session actor (it contains `/session`, or matches the
+  `name/sessionN` shape the client allocates) is **refused at write**. Sessions
+  are ephemeral, so a session owner could never receive routed attention and
+  could never be attributed in a statistic.
+- Shape and the session refusal are enforced on every write. `account:`
+  membership in the project is resolved where a member directory is reachable
+  (the office deployment); where it is not, the write is accepted and `ref check`
+  reports `owner-unresolved` as a warning. The record notes the resolution rule;
+  it never claims the owner string is authenticated.
+
+### 3.5 Versioning, revision expectation and retirement
 
 Revisions are append-only and never rewritten. A meaningful change - including a
 change to `acceptance_state`, a `review_by` change, or an authority move - is a
@@ -195,18 +266,30 @@ revision is tolerated (idempotent); conflicting bytes for the same key and
 revision are refused, which is the same rule `export_requirements.check_history`
 applies to requirement revisions.
 
-Two levels of supersession:
+Revision 2 replaces the revision hash chain and the two-step
+`replaces`/`replaced_by` acceptance with two simpler mechanisms, as reviewed:
 
-- **Revision chain.** Revision *N* cites revision *N-1* by exact
-  `{id, revision, sha256}`. A dangling, mismatched or cyclic chain is a malformed
-  record and fails closed (§3.7).
-- **Key retirement.** When entry `K` is replaced by a different key `K2`, the
-  operator accepts `K2` with `replaces: "K"` and then accepts `K` with
-  `replaced_by: "K2"` (state `reference:superseded`). Both halves are separate
-  operator decisions. `ref get K` on a superseded key follows `replaced_by` one
-  hop, returns the retired record plus a `resolved` pointer to `K2`, and never
-  loops: a chain longer than 8 hops or a cycle is reported as a warning and the
-  walk stops at the last well-formed record.
+- **Expected revision (compare-and-swap).** `ref revise` must state `revision`,
+  exactly the next revision for the key, and `expected_sha256`, the content hash
+  of the newest existing revision it believes it is replacing. A mismatch in
+  either is refused before any native write. The revision ledger on a single
+  native issue is already ordered by comment order, so a per-revision
+  `supersedes {id, revision, sha256}` pointer added nothing but a second
+  invariant to validate. This is the rule `requirement_records.revise` uses
+  (`requirement_records.py:568` `_check_revision`).
+- **One retirement operation.** `ref retire KEY --successor KEY2` (operator
+  only) writes exactly one revision of `KEY` with `acceptance_state:
+  "superseded"`, `successor: "KEY2"`, and the acceptance evidence for the
+  retirement. `replaces` is **derived at read time**: `ref get KEY2` reports
+  `replaces: ["KEY", ...]` by scanning the catalog for retirement revisions whose
+  `successor` is `KEY2`. There is no window in which one half of a pair exists
+  without the other, so the `asymmetric-supersession` check of revision 1 is
+  gone; the replacement's own content is unchanged by the retirement.
+- `ref get KEY` on a retired key returns the retired revision plus a `resolved`
+  pointer to `successor`, and never loops: a chain longer than 8 hops or a cycle
+  is reported as a warning and the walk stops at the last well-formed record.
+- `ref check` checks the derived relation instead: `retirement-target-missing`
+  (a `successor` naming no key) and `retirement-cycle`.
 
 ### 3.6 Authority
 
@@ -224,30 +307,92 @@ Two levels of supersession:
   `..` or start with `~`; `commit` is a 40-character lowercase hex revision and
   is required for an accepted revision; `anchor` is an optional symbol or heading
   inside the file.
-- `url`: `retrieved` is the date a human last verified the page. The kit makes no
-  network request: `ref check` reports a `url` authority whose `retrieved` date is
-  older than the entry's `review_by` window as a warning, and never fetches it.
+- `url`: `url` must be `https://`, must not carry userinfo, and is at most 2048
+  characters; `retrieved` is the date a human last verified the page and must not
+  be later than today. The kit makes no network request: `ref check` reports a
+  `url` authority whose `retrieved` date is older than the entry's `review_by`
+  window as a warning, and never fetches it.
 
 The server never reads a repository path. Authority resolution is a client/operator
-concern (`ref check`, §6.5), which is why an entry can be accurate without the
+concern (`ref check`, section 9), which is why an entry can be accurate without the
 coordination server having the project checkout.
 
-### 3.7 Reserved-write guard and malformed records
+### 3.7 Reserved namespace: guards, labels and malformed records
 
-Implementation adds two prefixes to `reserved_comments.RESERVED`:
+**Reserved comments.** Implementation adds two prefixes to
+`reserved_comments.RESERVED` (`reserved_comments.py:164-174`, with `PREFIXES`
+derived at `:176`):
 
 - `Kind: reference-entry-v1` -> writer `ref propose|revise`;
 - `Kind: reference-acceptance-v1` -> writer `admin.py reference-apply`.
 
 Raw `comments add` of either prefix is refused on the contributor endpoint, in
 every pflag/attachment ordering the existing guard already normalizes, so the
-dedicated operations are the only writers. A comment that claims one of these
-prefixes but fails schema validation makes the affected read fail closed and name
-the offending comment, exactly like a malformed checkpoint
-(`docs/OPERATIONS.md`, "Malformed structured history"). Repair is the existing
-operator `void-record` path; nothing new is needed and nothing is deleted.
+dedicated operations are the only writers.
 
-### 3.8 Relation to requirements.py and BRD/decision traceability
+**Reserved labels (review item `reserved-labels`).** Reserving only the comment
+prefixes is not enough. Revision 1 left the label namespace open, so a
+contributor could run `update X --add-label reference:accepted` on an anchor, or
+inherit an accepted-looking label through `create --parent`, and forge a row that
+reads accepted to every reader. This is exactly the fix requirements needed
+(kittrial-pth.26) and it is applied the same way, through the one shared
+predicate:
+
+```python
+# reserved_comments.py, replacing :654-655
+RESERVED_LABEL_PREFIXES = ('request:', 'request-content:', 'requirement:',
+                           'reference:', 'reference-key:')
+RESERVED_EXACT_LABELS = frozenset({'requirement', 'brd-section', 'reference'})
+```
+
+All three additions are required and none implies another: `reference:` is a
+prefix, `reference-key:` is a **separate** prefix (it does not begin with
+`reference:`), and `reference` is an exact type label. This mirrors requirements
+exactly (`requirement` exact, `requirement:` prefix, `brd-section` exact).
+
+One namespace feeds both checks (`reserved_comments.py:645-651`), so extending it
+closes both routes at once:
+
+- `reserved_label_in_args` (`reserved_comments.py:752`) inspects every
+  label-writing spelling in `LABEL_WRITE_FLAGS` (`:667-670`, verified against
+  bd 1.2.2 including the undocumented `create --label` alias) and refuses
+  `update X --add-label reference:accepted`, `--set-labels`, `--remove-label`
+  and the `create` spellings before any native write;
+- `first_reserved_label` (`reserved_comments.py:764`) is the read-before-write
+  guard used by `endpoint._guard_reserved_labels` (`endpoint.py:64`), which
+  refuses `create --parent X` when the parent already holds a reserved label -
+  bd inherits parent labels unless `--no-inherit-labels` is given - and refuses
+  `update X --set-labels` that would move the namespace off a record that
+  currently holds it.
+
+An unrecognized `create`/`update` flag still fails closed through
+`unresolved_bd_flags` (`endpoint.py:225`), so a future hidden bd alias cannot
+silently reopen the route. The design records no new label mechanism: it adds
+three names to the existing namespace and nothing else.
+
+**Malformed records fail per entry.** A comment that claims one of these prefixes
+but fails schema validation makes **only that entry** read as `state: malformed`;
+it must never fail `ref list`, `work` or `brief` for the whole project (7.3).
+Repair is the existing operator `void-record` path; nothing new is needed and
+nothing is deleted. A reader that meets an unknown newer `Kind: reference-entry-v2`
+comment reports that entry as `unsupported` and leaves it visible to an operator,
+rather than failing the read (3.8).
+
+### 3.8 Forward compatibility
+
+The field set is closed, so under revision 1 every future field would have been a
+5bb.44-style break. State the rule now:
+
+- a new field means a new kind version, `Kind: reference-entry-v2`, with its own
+  closed field set and validator;
+- a reader that meets a `Kind: reference-entry-vN` comment for an unknown `N`
+  marks that one entry `unsupported`, reports it, and keeps reading the entries
+  it does understand; it never fails the whole catalog;
+- an older reader meeting a v2 comment therefore loses one entry, not the
+  catalog - the same tolerant-reader principle as 10.3, applied at the record
+  level.
+
+### 3.9 Relation to requirements.py and BRD/decision traceability
 
 - **No manifest change.** The catalog is not part of `requirements-baseline.json`
   or the publication manifest. `REFERENCE_FIELDS` keeps its current meaning. If
@@ -261,78 +406,128 @@ operator `void-record` path; nothing new is needed and nothing is deleted.
   the `decision` label, and refuses an unknown link. The reverse direction is a
   read-time view, `ref decisions DECISION-ID`, computed over the catalog; **no**
   write ever edits a decision record, so the decision lifecycle, the render
-  backlink scanner (`render.py:33`, which already understands
-  `Supersedes`/`Supports`/`Contradicts`/`Comments-on` between comments) and the
-  review workflow are untouched.
+  backlink scanner (`render.py:33`) and the review workflow are untouched.
 - **Impact views.** An impact selection's `context_ids` already names decisions
   and discussions to retain alongside selected requirements
   (`export_requirements.selection_from_manifest`); a catalog key is not added
   there in this design, because that would require touching the impact contract.
+  `requirement_impact.py` stays requirements-specific: it validates manifests and
+  walks a work graph (`requirement_impact.py:23`), and the catalog does not feed
+  it.
 
-### 3.9 Relation to the agent registry and the web interface
+### 3.10 Relation to the agent registry, the HTTP service and the web interface
 
-At this base commit, the integrated personal-agent work is the **owner-bound
-agent registry**, not BRD/decision traceability (the task text's phrasing does
-not match the record; the discrepancy is recorded honestly here). The catalog's
-`owner` field and acceptance authority deliberately reuse existing authority
-sources rather than inventing one:
+At this base commit, the integrated personal-agent work is the owner-bound agent
+registry plus the office web interface slice 1 (kittrial-5bb.20). Three
+corrections to revision 1 belong here:
 
-- acceptance authority is the deployment operator allowlist already used by
-  `void-record` and `requirement-apply`
-  (`admin.py`, `docs/OPERATIONS.md`), so a restore's operator policy applies
-  unchanged;
-- where an actor is an agent, the actor string is the agent identity the registry
-  already issues; the catalog treats it as attribution, exactly as every other
-  record does, and the registry's owner-bound cap is enforced by the existing
-  HTTP authority layer, not re-implemented here.
+- **Acceptance authority is the deployment operator allowlist, not
+  `requirement-apply`.** Revision 1 said acceptance "reuses the operator
+  allowlist used by `void-record` and `requirement-apply`". That is false on this
+  base and is corrected in section 4.
+- **The web interface is not "in progress" with a plan to add a propose write.**
+  Revision 1's "in progress" note and its planned web write are removed. Slice 1
+  exposes references as **HTTP reads only** (section 8). There is no separate
+  `http_web.py` module: the browser client is static assets under `web/` served
+  by `http_service.py` (`DEFAULT_WEB_ROOT` at `:91`, the `STATIC_*` allowlists at
+  `:93-148`). The read routes and the rendering rules are specified in section 8
+  and reuse the file's existing route and escaping conventions.
+- **The catalog's `owner` field is attribution, not authority.** Where an actor
+  is an agent, the actor string is the agent identity the registry already
+  issues; the catalog treats it as attribution, exactly as every other record
+  does, and the registry's owner-bound cap is enforced by the existing HTTP
+  authority layer, not re-implemented here. Attention routing uses the durable
+  `owner` identity (3.4), not the agent credential.
 
-The web interface (in progress) exposes the catalog as
-**read-only views plus the propose write**, using the same JSON shapes as the
-client (§6): a catalog list filtered by tag/state/due, an entry detail with its
-acceptance evidence and links, and a due/expired badge driven by the same
-`reference-review` attention projection. Implementation adds routes to the
-existing `ROUTES`/`@route` registry in `http_service.py`, which that claim owns;
-the follow-up slices must serialize with it and must not re-declare the
-projection, so the web view and `work`/`brief` cannot disagree.
+## 4. Authority: who writes and who accepts
 
-## 4. Authority model
+Revision 2 picks **one** authority explicitly, as reviewed: acceptance requires
+the **deployment operator allowlist**, the same source `void-record` enforces.
 
-The split mirrors `requirement_records.py`'s F3 split, because that is the kit's
-reviewed answer to "contributor proposes, operator accepts":
+- **Where it lives and how it is configured.** The allowlist is the `operators`
+  list in `deployment.private.json` on the coordination host. `admin.operators`
+  (`admin.py:262-294`) is the reader and the single authority source; a
+  deployment that configures no operators authorizes nobody. `ORCHESTRA_OPERATORS`
+  is **not** an authority source, and a host write command with `strict=True`
+  refuses when the shell variable disagrees with the configuration
+  (`admin.py:288-293`). The list is maintained with
+  `admin.py operators add|remove|list` (`admin.py:2246-2269`), and
+  `docs/OPERATIONS.md:58-66` documents it for coordinators.
+- **Why not `requirement-apply`.** On this base `requirement-apply` is
+  shell-trusted only: `admin.py:2214-2223` calls
+  `apply_native(payload, args.actor, run, path, operator=True)` and never reads
+  the allowlist. `docs/OPERATIONS.md:61-63` states it plainly: "All five are
+  shell-trusted: access to the service account's shell is the boundary. Only
+  `void-record` also checks the deployment operator allowlist". By contrast
+  `void-record` (`admin.py:2234-2245`) calls `operators(root, strict=True)` and
+  passes that set into `apply_void`. A reference statement is instruction-grade
+  text that agents will act on, so the catalog adopts the allowlist and the
+  requirement-apply gap is recorded as a separate follow-up (15, "later").
+- **What happens when the accepting operator is removed.** `admin.py:2262-2265`
+  already states the policy for voids: `operators remove ACTOR --confirm-revoke`
+  warns that "voids they authored stop applying on reads (re-add restores them)".
+  References adopt the same single, reversible policy. The acceptance evidence
+  comment stays in native history forever; the **reader** requires the stored
+  native author of the evidence comment to be on the live allowlist. After a
+  removal:
+  - the entry no longer reads accepted: `ref get` returns
+    `state: draft-only`, `acceptance: null` and `acceptance_inert: true` with the
+    removed operator named;
+  - `ref list` marks it `draft-only`, and the review-by attention item is
+    suppressed for it (an inert acceptance must not masquerade as authority any
+    more than a draft may);
+  - recovery is deliberate and cheap: re-add the operator with
+    `admin.py operators add`, and the same acceptance evidence applies again with
+    no rewrite; or accept the entry again with a currently listed operator, which
+    writes a new acceptance evidence record.
+  Nothing is deleted in either direction, so this is the same restorable
+  behaviour as a void, not a new authority source.
+- **Restore does not re-grant.** `docs/OPERATIONS.md:174` and `:183`: the
+  allowlist is deployment-wide, `restore-new` leaves it untouched, and the
+  operator re-grants it explicitly with `--restore-operators` when the whole
+  recorded list is intended. A restored project therefore shows accepted entries
+  only for operators the host still lists.
+
+The rest of the split mirrors `requirement_records.py`'s F3 split, because that is
+the kit's reviewed answer to "contributor proposes, operator accepts":
 
 | Action | Who | Evidence written |
 | --- | --- | --- |
 | Create a new entry as `reference:draft` (`ref propose`) | any contributor actor | one `reference-entry-v1` revision, `acceptance_state: draft` |
 | Revise an entry's draft (`ref revise`) | any contributor actor (trusted team) | next `reference-entry-v1` revision, `draft` |
-| Accept an entry (`admin.py reference-apply`) | deployment operator / project owner | next revision with `acceptance_state: accepted` **plus** `reference-acceptance-v1` acceptance evidence bound to that revision's `record_sha256` |
-| Supersede or retire a key | operator only | revision with `acceptance_state: superseded` (`replaced_by`) plus acceptance evidence |
+| Accept an entry (`admin.py reference-apply`) | deployment operator (allowlist) / project owner | next revision with `acceptance_state: accepted` **plus** `reference-acceptance-v1` evidence bound to that revision's `record_sha256` |
+| Retire a key (`ref retire KEY --successor KEY2`) | operator only | one revision with `acceptance_state: superseded`, `successor`, plus acceptance evidence |
 | Propose a change to an accepted entry | any contributor | a higher draft revision; the **accepted** pointer does not move until an operator accepts |
 | Set or change `review_by` | any contributor proposes; operator accepts | takes effect only on acceptance; a draft's date is shown as proposed, never as the effective deadline |
 
 Acceptance evidence reuses the existing F3 shape (`requirements.ACCEPTANCE_FIELDS`
-minus `manifest_sha256`, plus `record_sha256`), the existing policies
-`any-owner` / `all-owners`, and the existing subset rule
+minus `manifest_sha256`, plus `record_sha256` - `requirement_records.py:81-82`),
+the existing policies `any-owner` / `all-owners`, and the existing subset rule
 (`approvers` must be a subset of `owners`; `all-owners` requires identical sets).
 `decision_id` and `evidence` are required, so an acceptance always points at a
 recorded decision and a durable evidence pointer. The acceptance record is
 written **before** the accepted revision and label move, so an uncertain write can
 never leave an entry that reads accepted with no evidence - the ordering
-`requirement_records.py` already documents.
+`requirement_records.py:55-58` already documents.
 
-No new authority source is introduced. A payload's own `operator`/`owner` string
-is never authority; the deployment allowlist is, exactly as
-`docs/OPERATIONS.md` states for void records.
+A payload's own `operator`/`owner` string is never authority; the deployment
+allowlist is, exactly as `docs/OPERATIONS.md` states for void records. Agent and
+worker credentials are never approvers (section 8).
 
 ## 5. What authority means to a reader
 
 `ref get` returns both halves so no reader can mistake a proposal for authority:
 
-- `record`: the newest revision whose chain is valid and whose
-  `acceptance_state` is `accepted` or `superseded`, or `null` if the key has only
-  drafts;
-- `proposed`: the newest `draft` revision that has no acceptance, or `null`;
-- `state`: `accepted`, `superseded`, `draft-only` or `malformed`;
-- `acceptance`: the operator evidence for `record`, or `null`.
+- `record`: the newest revision whose `acceptance_state` is `accepted` (or
+  `superseded`, for a retired key) and whose acceptance evidence author is still
+  an allowlisted operator, or `null` if the key has only drafts;
+- `proposed`: the newest `draft` revision, or `null`;
+- `state`: `accepted`, `superseded`, `draft-only`, `malformed` or `unsupported`;
+- `acceptance`: the operator evidence for `record`, or `null`;
+- `acceptance_inert`: `true` when an acceptance exists but its operator is no
+  longer allowlisted (4), naming the operator;
+- `warnings`: bounded, per-entry warnings such as `authority-changed` (9) and
+  `retirement-cycle` (3.5).
 
 A key with `state: draft-only` is explicitly **not authoritative**: `ref list`
 marks it, `ref check` reports it, and the attention block never presents a draft
@@ -346,6 +541,29 @@ reading clears nothing and that unsummarized prose is not classified.
 Output follows the v1 client contract: one JSON envelope, JSON on `stdout`,
 diagnostics on `stderr`, excerpt objects for long text, bounded pages, nonzero
 exit with a labelled `ValueError` on refusal.
+
+### 6.0 Surfaces that must hide catalog rows
+
+Even with closed anchors (3.2), the tolerant reader (slice 0) and the writer
+slice must each guarantee the same list, and tests must assert it on every
+version. A row is a catalog anchor when it carries the `reference` label, and a
+comment is a catalog comment when its body starts with `Kind: reference-`.
+Catalog rows and comments must never appear in:
+
+1. `work` / `work --mine` (`work.py:174-193`);
+2. the HTTP task list `GET /v1/projects/{pid}/tasks` (`http_service.py:2318`);
+3. `GET /v1/projects/{pid}/queue` (`http_service.py:2472`);
+4. `GET /v1/me/work` (`http_service.py:2494`);
+5. the agent prompts built by `agent_prompts.classify`
+   (`agent_prompts.py:104-136`);
+6. rendered task views (`render.py`, the review-queue projection at
+   `render.py:36-47`).
+
+Slice 0 filters on all six even though it writes nothing, because a newer kit in
+the same deployment can create entries that a tolerant-but-older kit reads, and
+because `create-child` can create a labelled row without the reference
+operation. Closed status alone is the backstop for kits older than slice 0; the
+explicit filter is what a tolerant kit promises.
 
 ### 6.1 `ref get KEY`
 
@@ -363,36 +581,40 @@ b ref get calendar.trading --json
     "title": "Trading calendar authority",
     "statement": "Every chart and settlement calculation derives holidays and early closes from the pinned calendar module, never from an inline list.",
     "authority": {"type": "repo-path", "path": "src/example/calendar.py", "commit": "0000000000000000000000000000000000000000", "anchor": "HOLIDAYS"},
-    "owner": "alex/session1",
+    "owner": "account:u-0001",
     "review_by": "2027-01-15",
     "tags": ["calendar", "data"],
     "decisions": ["example-project-42"],
-    "replaces": null,
-    "replaced_by": null,
+    "successor": null,
     "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
   },
   "record_comment_id": "01a00000-0000-7000-8000-000000000000",
   "acceptance": {
     "decision_id": "example-project-42",
-    "owners": ["owner/one"],
-    "approvers": ["owner/one"],
+    "owners": ["account:u-0001"],
+    "approvers": ["account:u-0001"],
     "policy": "any-owner",
     "evidence": "decision example-project-42",
     "record_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
-    "operator": "owner/one",
+    "operator": "account:u-0009",
     "at": "2026-09-27T20:00:00Z"
   },
+  "acceptance_inert": false,
+  "replaces": [],
   "proposed": null,
   "due": "ok",
   "resolved": null,
+  "warnings": [],
   "coverage": "newest accepted revision and its acceptance evidence; unresolved drafts are returned in proposed"
 }
 ```
 
 `title` and `statement` are excerpt objects (`{"text", "omitted_chars"}`) under
 the `brief`/`history` contract; `sha256`, IDs and cursors are never excerpted.
-`due` is `ok`, `due-soon`, `expired` or `unset` (§7.2). Unknown key: nonzero exit,
-`stderr` names the key and suggests `ref list`.
+`due` is `ok`, `due-soon`, `expired` or `unset` (7.2). Unknown key: nonzero exit,
+`stderr` names the key and suggests `ref list`. A malformed or unsupported entry
+returns that entry with the matching `state` and a bounded `warnings` entry; it
+does not fail the command for other keys.
 
 ### 6.2 `ref list`
 
@@ -405,37 +627,38 @@ b ref list --tag data --state accepted --due expired --limit 20 --json
   "total": 2,
   "items": [
     {"key": "calendar.trading", "title": "Trading calendar authority", "state": "accepted",
-     "owner": "alex/session1", "review_by": "2026-01-15", "due": "expired",
+     "owner": "account:u-0001", "review_by": "2026-01-15", "due": "expired",
      "tags": ["calendar", "data"], "revision": 3, "native_id": "example-project-17"},
     {"key": "feed.units", "title": "External feed units", "state": "draft-only",
-     "owner": "bob/session4", "review_by": null, "due": "unset",
+     "owner": "person:bob", "review_by": null, "due": "unset",
      "tags": ["data"], "revision": 1, "native_id": "example-project-23"}
   ],
   "next_offset": null,
-  "coverage": "one row per key: newest accepted/superseded revision, or newest draft when no revision is accepted"
+  "coverage": "one row per key: newest accepted/superseded revision, or newest draft when no revision is accepted; 1 entry skipped as malformed"
 }
 ```
 
-Options: `--tag TAG` (repeatable, AND), `--owner ACTOR`, `--state
+Options: `--tag TAG` (repeatable, AND), `--owner IDENTITY`, `--state
 draft-only|accepted|superseded|all`, `--due expired|due-soon|unset`, `--limit`
 1..100, `--offset` >= 0. Ordering: expired, then due-soon, then unset, then key.
-Long text clips at 200 characters like `work` rows.
+Long text clips at 200 characters like `work` rows. A malformed entry is reported
+in `coverage` and never fails the page (7.3).
 
 ### 6.3 `ref propose` / `ref revise`
 
 A closed payload; `operation` comes from the subcommand, and
-`acceptance_state`, `labels`, `acceptance` and `sha256` are refused if
-caller-supplied:
+`acceptance_state`, `successor`, `labels`, `acceptance` and `sha256` are refused
+if caller-supplied:
 
 ```json
-{"schema_version": 1, "operation_id": "alex/session1-ref-1",
+{"schema_version": 1, "operation_id": "alex-ref-1",
  "key": "calendar.trading", "title": "Trading calendar authority",
  "statement": "Every chart derives holidays and early closes from the pinned calendar module.",
  "authority": {"type": "repo-path", "path": "src/example/calendar.py",
                "commit": "0000000000000000000000000000000000000000", "anchor": "HOLIDAYS"},
- "owner": "alex/session1", "review_by": "2027-01-15", "tags": ["calendar", "data"],
- "decisions": ["example-project-42"], "supersedes": null,
- "replaces": null, "replaced_by": null}
+ "owner": "account:u-0001", "review_by": "2027-01-15", "tags": ["calendar", "data"],
+ "decisions": ["example-project-42"], "revision": 1,
+ "expected_sha256": null}
 ```
 
 ```sh
@@ -443,17 +666,17 @@ b ref propose --file entry.json --json
 b ref revise  --file entry.json --json
 ```
 
-- `propose` creates revision 1 as `reference:draft`, or is refused if the key
-  already exists.
-- `revise` requires `supersedes` to be the exact `{id, revision, sha256}` of the
-  current newest revision, must write exactly the next revision, and is bound to
-  the key: a key swap is refused before any native write.
-- Refusals: duplicate key, key-swap, stale/dangling `supersedes`, unknown
-  decision link, `review_by` in the past on a **new** accepted proposal (allowed
-  on a draft, since drafting a correction for an overdue entry is the normal
-  repair), `repo-path` authority with an absolute/`..` path, `replaced_by`/
-  `replaces` asymmetry at accept time, and (in `repo-path-only` mode, §8) any
-  `url` authority.
+- `propose` creates the closed anchor and revision 1 as `reference:draft`, or is
+  refused if the key already exists.
+- `revise` requires `revision` to be exactly the next revision and
+  `expected_sha256` to be the content hash of the newest existing revision, and
+  is bound to the key: a key swap is refused before any native write.
+- Refusals: duplicate key, key-swap, stale `expected_sha256` or wrong `revision`,
+  unknown decision link, session-actor `owner`, `review_by` in the past on a
+  **new** accepted proposal (allowed on a draft, since drafting a correction for
+  an overdue entry is the normal repair), `repo-path` authority with an
+  absolute/`..` path, a non-`https` or userinfo `url`, and a `url` authority in a
+  project whose policy refuses external authorities.
 - Idempotency: `operation_id` plus a `.reference-requests/` receipt journal, the
   same native-first pattern as `.requirement-requests`: preflight reads before
   the receipt is written, and an uncertain real write leaves a pending receipt
@@ -461,7 +684,23 @@ b ref revise  --file entry.json --json
 - Returns `{"key", "revision", "native_id", "record_comment_id", "state":
   "draft", "reconciled": false}`.
 
-### 6.4 `ref decisions DECISION-ID`
+### 6.4 `ref retire KEY --successor KEY2`
+
+One operator operation, replacing revision 1's two-step acceptance:
+
+```sh
+b ref retire calendar.trading --successor calendar.trading-v2 --file acceptance.json --json
+```
+
+It writes exactly one revision of `KEY` with `acceptance_state: "superseded"`,
+`successor: "KEY2"`, the unchanged content fields, and the `reference-acceptance-v1`
+evidence for the retirement. `replaces` is derived at read time (3.5). Refused
+for a non-operator actor, for a missing/unknown successor key, for a successor
+that would create a cycle, and for a `KEY` that is already retired. Because both
+halves are written by one operation, no asymmetric pair can exist and `ref check`
+has no asymmetry case to detect.
+
+### 6.5 `ref decisions DECISION-ID`
 
 ```json
 {"decision": "example-project-42", "entries": [{"key": "calendar.trading", "state": "accepted", "revision": 3}], "total": 1}
@@ -469,10 +708,10 @@ b ref revise  --file entry.json --json
 
 Read-only reverse view over the catalog. It never writes the decision.
 
-### 6.5 `ref check`
+### 6.6 `ref check`
 
 ```sh
-b ref check --repo C:\path\to\project-checkout --json
+b ref check --repo /path/to/project-checkout --json
 ```
 
 ```json
@@ -483,10 +722,12 @@ b ref check --repo C:\path\to\project-checkout --json
      "detail": "src/example/ledger.py not found at commit 0000000000000000000000000000000000000000"}
   ],
   "warnings": [
+    {"key": "calendar.trading", "code": "authority-changed-since-pinned",
+     "detail": "src/example/calendar.py#HOLIDAYS differs at HEAD from pinned commit 0000000000000000000000000000000000000000; review_by 2027-01-15"},
     {"key": "identity.authority", "code": "url-not-reverified",
      "detail": "url authority retrieved 2025-01-01, review_by 2026-01-15"},
-    {"key": "calendar.trading", "code": "asymmetric-supersession",
-     "detail": "replaced_by names feed.units but feed.units does not replace calendar.trading"}
+    {"key": "feed.units", "code": "owner-unresolved",
+     "detail": "account:u-0042 is not a current member of this project"}
   ],
   "coverage": "offline read-only checks against the supplied checkout; no network access"
 }
@@ -494,42 +735,63 @@ b ref check --repo C:\path\to\project-checkout --json
 
 `ref check` runs on a machine that has the project checkout, never on the server,
 and makes no network request. Nonempty `failures` exits nonzero; warnings do not.
-Checks: `repo-path` path and anchor present at the recorded commit, `url`
-`retrieved` within the review window, `review_by` present on accepted entries,
-dangling or asymmetric supersession, `decisions` links still resolving, and
-malformed reserved records (reported, not repaired).
+Checks:
 
-### 6.6 Operator acceptance
+- `repo-path` path and anchor present at the recorded commit;
+- **`authority-changed-since-pinned`** (review item `drift-check`): the anchored
+  content at HEAD differs from the same content at the pinned commit. This is the
+  real drift signal and the stale-calendar case;
+- `url` `retrieved` within the review window;
+- `review_by` present on accepted entries;
+- `retirement-target-missing` and `retirement-cycle`;
+- `owner-unresolved`;
+- `decisions` links still resolving;
+- malformed and unsupported reserved records (reported, not repaired).
+
+### 6.7 Operator acceptance and reconcile
 
 ```sh
 python3 admin.py --root <runtime> reference-apply --file acceptance.json
 ```
 
 ```json
-{"schema_version": 1, "operation_id": "owner/one-apply-1",
+{"schema_version": 1, "operation_id": "owner-apply-1",
  "key": "calendar.trading", "revision": 3,
  "record_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
  "acceptance_state": "accepted",
- "acceptance": {"decision_id": "example-project-42", "owners": ["owner/one"],
-                "approvers": ["owner/one"], "policy": "any-owner",
+ "acceptance": {"decision_id": "example-project-42", "owners": ["account:u-0001"],
+                "approvers": ["account:u-0001"], "policy": "any-owner",
                 "evidence": "decision example-project-42"}}
 ```
 
-Refused for a non-operator actor, for a hash that does not match the named
-revision, for a missing decision/evidence pointer, and for a policy violation.
-`reference-backfill` applies the controlled labels to an entry created outside
-the operation, mirroring `requirement-backfill`, and writes acceptance evidence
-when the target state is accepted.
+Refused for an actor outside the deployment operator allowlist (4), for a hash
+that does not match the named revision, for a missing decision/evidence pointer,
+and for a policy violation. `reference-apply` with `operation: "draft",
+acceptance_state: "accepted"` writes a **direct accepted revision 1**, the
+operator route requirements gained in kittrial-5bb.56
+(`docs/REQUIREMENTS_INTEGRATION.md:162-199`), so an owner writing an obviously
+true entry does not need propose-then-apply.
 
-## 7. Review-by surfacing in `work` and `brief`
+`reference-reconcile` finishes a `reference-*` operation whose real write was
+uncertain, exactly as `requirement-reconcile` does today
+(`admin.py:2224-2233`, `docs/REQUIREMENTS_INTEGRATION.md:258-271`). In the shared
+core (12.1) both become one generalized `record-reconcile`; the
+`reference-reconcile` spelling is kept for operators.
+
+## 7. Attention: review-by in `work`, `brief`, My work and prompts
 
 ### 7.1 Where it appears, and where it must not
 
 `attention` does not exist in `work.py` or `briefing.py` today, so this is new
-ground. A reference entry is **not** a task: it has no owner-assignee, no review
-state and no lifecycle. The design therefore adds a **project-level**
-`attention` block to `work` (not a per-task field, not a synthetic queue row) and
-a bounded `attention` array to `brief` (tasks stay the unit of a brief).
+ground there. It does already exist in the HTTP service for the agent registry:
+`http_service._agent_attention` (`http_service.py:2164-2239`) returns
+`{'state','summary','counts','actions','truncated','computed_at'}`, and the
+catalog reuses that shape rather than inventing a second one (12.2).
+
+A reference entry is **not** a task: it has no owner-assignee, no review state and
+no lifecycle. The design therefore adds a **project-level** `attention` block to
+`work` (not a per-task field, not a synthetic queue row) and a bounded `attention`
+array to `brief` (tasks stay the unit of a brief).
 
 `work` shape, additive:
 
@@ -538,12 +800,10 @@ a bounded `attention` array to `brief` (tasks stay the unit of a brief).
  "coverage": "Fresh current view; ...",
  "attention": {
    "reference_review": {
-     "expired": 1, "due_soon": 1, "unset": 2, "total": 4,
+     "expired": 1, "due_soon": 1, "unset": 2, "total": 4, "truncated": false,
      "items": [
        {"key": "calendar.trading", "review_by": "2026-01-15", "due": "expired",
-        "owner": "alex/session1", "state": "accepted", "revision": 3},
-       {"key": "feed.units", "review_by": "2026-10-01", "due": "due-soon",
-        "owner": "bob/session4", "state": "accepted", "revision": 2}
+        "owner": "account:u-0001", "state": "accepted", "revision": 3}
      ],
      "next_offset": null
    }
@@ -551,19 +811,35 @@ a bounded `attention` array to `brief` (tasks stay the unit of a brief).
 }
 ```
 
+Routing rules (review item `owner-identity-attention`):
+
+- `work` **always** returns the project-wide counts (`expired`, `due_soon`,
+  `unset`, `total`) so a filter on the task queue can never hide an expired
+  authority. It returns full `items` only when the caller is the entry's `owner`
+  or an approver; otherwise `items` is empty and `truncated` is true with a
+  coverage note naming the count.
+- `brief` shows at most 3 items, deterministically: entries whose tags match the
+  task's own labels, plus expired and due-soon entries, expired first, with
+  `attention_total`/`attention_more`.
+- **My work** (`GET /v1/me/work` and the browser view) shows expired and due-soon
+  entries to the entry owner and to project owners, and counts to everyone else.
+- **Agent prompts** get counts and keys only, and only for approvers
+  (`agent_prompts.classify` already tailors by `CAP_APPROVE`/`CAP_TASKS`,
+  `agent_prompts.py:100-136`). No statement text ever reaches a prompt (8).
+
 New bounded options `--ref-limit` (1..100) and `--ref-offset` (>= 0). The block is
 computed regardless of `--owner`/`--state`/`--mine` task filters, because the
-reference catalog is project-wide and a filter on the task queue must not hide an
-expired authority. Only accepted (and superseded, flagged) entries appear;
-`draft-only` entries appear as `unset`-class proposals only when `--state
-draft-only` is requested.
+reference catalog is project-wide. Only accepted (and superseded, flagged)
+entries appear; `draft-only` entries appear as `unset`-class proposals only when
+`--state draft-only` is requested.
 
 `brief TASK` shape, additive:
 
 ```json
 {"attention": [
   {"kind": "reference-review", "key": "calendar.trading", "due": "expired",
-   "review_by": "2026-01-15", "text": "Authority for the trading calendar is past its review date.",
+   "review_by": "2026-01-15", "trust": "accepted",
+   "text": "Authority for the trading calendar is past its review date.",
    "source": "ref calendar.trading"}
 ],
  "attention_total": 1, "attention_more": null}
@@ -573,10 +849,9 @@ draft-only` is requested.
   vocabulary (`blocker`, `question`, `decision`, `correction`, `dependency`,
   `briefing.py:13`) is **not** extended: those are author-declared open items, and
   a computed date reminder must not masquerade as one.
-- Default selection: every project entry that is expired or due-soon, expired
-  first, bounded to 3 with `attention_total`/`attention_more`; plus, when the
-  caller passes `--ref-tag TAG` (repeatable), entries whose tags match (ask 4,
-  implemented as an explicit opt-in rather than invented inference).
+- `trust` is `accepted` or `draft` and is always present when a brief carries
+  entry text (8). An item built only from an accepted entry carries
+  `trust: "accepted"`; a draft excerpt is framed as untrusted.
 - Reading changes nothing: no status, lifecycle, checkpoint or open item is
   touched by a `work`/`brief` read, consistent with `docs/BRIEFINGS.md`.
 
@@ -600,90 +875,285 @@ UTC date:
 default `30`, bounded 1..365. No time-of-day, no time zone and no per-entry
 window in v1 - one window keeps the projection deterministic and testable.
 
-## 8. Repo sync/export and the conflict rule
+### 7.3 Failure isolation
 
-A per-project `reference_mode` configuration selects one of two modes. Both give
-"no drift"; a project picks one at adoption.
+A malformed entry must fail **only itself**. The rule is concrete:
 
-### 8.1 `repo-export` (default)
+- every catalog read is per entry: one unparseable revision comment, one bad
+  label, an unresolvable `owner`, a duplicate key, an unknown
+  `Kind: reference-entry-vN` or an invalid field marks that entry with
+  `state: malformed` (or `unsupported`) and excludes it from the rows it cannot
+  describe;
+- the enclosing read still succeeds: `ref list`, `ref get`, `work`, `brief`,
+  My work and the agent prompts return every other entry, and add a bounded
+  `coverage` note with the number of affected entries and at most the first 10
+  anchor ids;
+- `work` never degrades the task queue because one entry is malformed: the
+  `attention.reference_review` counts are computed over the entries that parsed,
+  `malformed` is counted separately and reported, and no task row changes state;
+- no read raises. Repair remains the operator `void-record` path on the offending
+  comment.
 
-`ref export --out docs/REFERENCE.md` writes a deterministic projection of the
-accepted catalog:
+This is stricter than the existing handoff-journal handling, which surfaces a
+malformed journal by setting `state: 'error'` on every item in the read
+(`work.py:191-192`); the catalog deliberately does not copy that blast radius.
+
+## 8. HTTP and web exposure of untrusted text
+
+Personal agents reach Orchestra only over HTTP, so slice 1 needs read routes:
+
+- `GET /v1/projects/{pid}/references` and
+  `GET /v1/projects/{pid}/references/{key}`, both `CAP_READ`
+  (`http_authority.py:314`), registered with the existing
+  `@route('GET', ...)` decorator and the `self._project(ctx, CAP_READ)` guard
+  used by every project read (`http_service.py:2318-2320`). Dotted keys route
+  fine since `3935d59`.
+- **No HTTP writes in v1.** A propose write needs a new credential scope, and
+  adding a scope is itself a rollback concern because older kits validate scope
+  lists (`docs/HTTP_DEPLOYMENT.md:188-193`). HTTP writes are deferred with the
+  rest of the web writes (15).
+
+Agent and worker credentials must never be accepted as approvers:
+
+- `docs/HTTP_DEPLOYMENT.md:190-193`: "No credential can administer accounts or
+  projects, issue or revoke credentials, or approve a review, whatever the role
+  of the account that issued it. Issuing a credential never lends the issuer's
+  authority to it."
+- `docs/HTTP_DEPLOYMENT.md:791-794`: "Review approval is owner-only; a
+  contributor cannot approve, and a worker credential never can."
+- Web acceptance, when it is added later, requires a human session with
+  `CAP_APPROVE` (`reviews.approve`, `http_authority.py:319`) and never an agent
+  or worker credential.
+
+Untrusted text rules. A `statement` is up to 2000 characters of
+instruction-grade text, and a **draft** can be written by any contributor or
+agent, so it is untrusted input wherever it is displayed or quoted:
+
+1. **Prompts.** Agent prompts carry only server-derived tokens: key, due class,
+   date and count, formatted with `agent_prompts.token()`
+   (`agent_prompts.py:56-59`, whose `_SAFE_TOKEN` allowlist is at `:42`). A
+   title, if shown at all, goes through `agent_prompts.label()`
+   (`:45-53`), which strips control and format characters, collapses whitespace,
+   collapses every quote-like character to an apostrophe and truncates. A
+   statement is **never** placed in a prompt, not even quoted.
+2. **Briefs.** A brief carries entry text only as an excerpt object with an
+   explicit `trust: "accepted" | "draft"` field. A draft excerpt sits under the
+   existing untrusted framing (`agent_prompts.UNTRUSTED_LINE`,
+   `agent_prompts.py:34`) and the same quote collapsing.
+3. **Web rendering.** The web renders a statement as **plain text**, not through
+   `markdown()`. Requirement and decision bodies currently go through
+   `markdown()` (`web/js/md.js`, used at `web/js/views/requirements.js:56`, `:85`
+   and `:159`); that is acceptable for owner-authored baseline text, but a
+   reference draft is attacker-writable instruction text, so it must not become
+   markup, headings or autolinks. A URL authority becomes a link **only** when it
+   is a validated `https` URL (3.6), rendered with
+   `rel="noopener noreferrer"`; anything else is shown as inert text.
+4. **Audit and errors.** No statement text goes into HTTP audit records or error
+   bodies; the audit read is `GET /v1/projects/{pid}/audit`
+   (`http_service.py:2590`), and it records ids, actors and outcomes, not record
+   bodies. A refusal names the key, never the statement.
+
+The browser client is static assets under `web/` served by `http_service.py`
+(`DEFAULT_WEB_ROOT` `:91`; the served set is `STATIC_DIRECTORIES` `:103`,
+`STATIC_TOP_LEVEL` `:104`, with `prototype.html`, `js/prototype.js` and
+`js/mock.js` excluded at `:107`). There is no separate `http_web.py`; the read
+routes and these rendering rules follow the conventions in `http_service.py` and
+`web/js/`.
+
+## 9. Repo sync without drift
+
+**Pointer mode is the default.** A per-project `reference_mode` configuration
+selects the projection behaviour; the default is `pointer`: entries point at repo
+paths (or validated `url` authorities), no file is generated, and there is no
+second copy of the catalog in the tree - which is what the owner asked for. A
+project that wants a generated file opts in with `reference_mode: export`.
+Revision 1's separate `repo-path-only` mode is dropped: it is just pointer mode
+plus a policy that refuses `url` authorities.
+
+### 9.1 Opt-in export, self-verifying
+
+When export is enabled, `ref export --out docs/REFERENCE.md` writes a
+deterministic projection of the accepted catalog:
 
 ```markdown
-<!-- orchestra-reference-export: schema=1 project=example-project digest=3333333333333333333333333333333333333333333333333333333333333333 generated=2026-09-27T20:00:00Z -->
+<!-- orchestra-reference-export: schema=1 project=example-project catalog_digest=3333333333333333333333333333333333333333333333333333333333333333 body_digest=4444444444444444444444444444444444444444444444444444444444444444 generated=2026-09-27T20:00:00Z -->
 | Key | Revision | Statement | Authority | Owner | Review by | Tags |
 | --- | --- | --- | --- | --- | --- | --- |
-| `calendar.trading` | 3 | Every chart derives holidays and early closes from the pinned calendar module. | `src/example/calendar.py@0000000#HOLIDAYS` | alex/session1 | 2027-01-15 | calendar, data |
+| `calendar.trading` | 3 | Every chart derives holidays and early closes from the pinned calendar module. | `src/example/calendar.py@0000000#HOLIDAYS` | account:u-0001 | 2027-01-15 | calendar, data |
 ```
 
-- `digest` is `content_hash({"schema": 1, "project": <name>, "entries":
+- `catalog_digest` is `content_hash({"schema": 1, "project": <name>, "entries":
   [{"key","revision","sha256"}, ...]})` over the sorted accepted entries.
+- `body_digest` is the SHA-256 of the rendered body bytes.
+- **There is no `.reference-exports/` journal.** Revision 1's journal was
+  unnecessary and lived in the wrong place: the file is written in a client
+  checkout while the journal would live in the server runtime sidecar. The file
+  is **self-verifying** instead - the header carries both digests, so a hand edit
+  breaks `body_digest` and a stale catalog breaks `catalog_digest`, with no
+  sidecar receipt to lose, back up or restore.
+- **Conflict rule.** `ref export` refuses to overwrite a file whose header or
+  body does not verify against the current catalog and the re-rendered body.
+  `--force` is operator-only and prints exactly what it overwrote. A hand-edited
+  file is reported, never silently clobbered. A hand edit never becomes a
+  catalog entry: the only route from a repo file into the catalog is `ref import`
+  (11), which creates **drafts**.
 - Ordering, escaping and whitespace are fixed, so the rendering is byte-stable.
 - The catalog (native records) is **authoritative**; the file is a projection and
-  is never read back as authority.
-- **Conflict rule.** `ref export` refuses to overwrite a file whose bytes do not
-  match the digest recorded in the local `.reference-exports/` receipt journal.
-  A hand-edited file is therefore reported, never silently clobbered; `--force`
-  is operator-only and prints exactly what it overwrote. `ref export --check
-  docs/REFERENCE.md` recomputes the catalog digest, compares the header, and
-  re-renders the body in memory for a byte comparison, failing on any drift -
-  suitable for CI. A hand-edit never becomes a catalog entry: the only route from
-  a repo file into the catalog is `ref import` (§10), which creates **drafts**.
-- Two writers cannot race: writes go through the project lock, and the export
-  journal is local coordination state (`.reference-exports/`), covered by the
-  backup sidecar like the other journals.
+  is never read back as authority. In pointer mode no file exists at all.
 
-### 8.2 `repo-path-only`
+### 9.2 What can run in CI, and what cannot
 
-No generated file. Entries may carry only `repo-path` authorities; a `url`
-authority is refused at propose time, and `ref export` refuses. `ref check`
-verifies each path and anchor at the recorded commit. This is the stricter option
-for a project that already maintains reference documentation by hand and does not
-want a second copy in the tree.
+Revision 1 claimed `ref export --check` was "suitable for CI". That is wrong:
+a CI runner has no access to the coordination catalog. Be precise:
 
-**Recommendation:** `repo-export` by default, with `repo-path` authorities for
-facts the project's own code or docs already state, and `url` reserved for
-external authorities that have an `owner` and a `retrieved` date. Internal facts
-point at the repository; the export exists so a reader without the client still
-sees the catalog.
+- **In CI** only an offline self-consistency check of the committed file can run:
+  the header parses, `body_digest` matches the body, the schema version is known,
+  and the table is well-formed. That catches hand edits and merge damage. CI
+  cannot check staleness against the catalog.
+- **On a machine that can reach the catalog** (the coordinator or a contributor
+  with client access), `ref export --check` recomputes `catalog_digest` from the
+  catalog and re-renders the body, so it detects staleness. A stale file is
+  surfaced as an `export-stale` attention item in the same
+  `attention.reference_review` block (7), never as a CI failure that CI cannot
+  actually compute.
 
-## 9. Backup coverage and restore behaviour
+### 9.3 Authority drift: `ref check --repo`
 
-- **Native backup covers the records.** Entries, revision chains and acceptance
+Ask 5 is about **authority** drift, and revision 1 did not meet it: its `ref check`
+only confirmed that the anchored path existed at the pinned commit, which never
+changes. Slice 2 adds the real signal:
+
+- for every accepted `repo-path` authority, compare the anchored content at HEAD
+  with the same content at the pinned `commit`. With `anchor` set, compare only
+  that symbol or `## <anchor>` section; without it, compare the whole file.
+- when they differ, emit the warning `authority-changed-since-pinned`. The
+  warning contains the key, the path, the anchor, the pinned commit, whether the
+  difference is at the file or the anchor level, and the entry's `review_by`.
+- the check runs only with `--repo` (a client/operator machine with a git
+  checkout; e.g. `git show <commit>:<path>` versus the working tree). The server
+  never reads a repo path (3.6).
+- surfacing: in `ref check`'s `warnings`; as an `authority-changed` class in the
+  `attention.reference_review` item set (7); and in `ref get`'s `warnings` array.
+  It is a warning, not a failure: an authority that legitimately changed is
+  repaired by a new revision with a new pinned commit, which is the whole point
+  of the catalog.
+
+This is the check that would have caught the stale trading calendar: the
+`HOLIDAYS` anchor changed at HEAD after the pinned commit, so the entry's
+authority moved while its `review_by` was still in the future.
+
+## 10. Backup, restore and rollback compatibility
+
+### 10.1 Backup coverage
+
+- **Native backup covers the records.** Entries, revision ledgers and acceptance
   evidence are native comments on native issues, so
   `admin.py backup ... backup sync` and `restore-new` already carry them;
-  `restore-new` retains issue IDs and comments, so keys, revision chains, links
-  and acceptance evidence survive a restore with no re-keying.
-- **Local journals join the coordination sidecar.** `.reference-requests/`
-  (propose/revise idempotency receipts) and `.reference-exports/` (export
-  digests) are the operator recovery cache, exactly like `.requirement-requests/`
-  and `.requirement-backfills/`. `admin.py backup_project` must read them into
-  `files` under their own path prefixes, and restore must validate them via
-  `validate_coordination_files`, following the requirement-journal block
-  (`admin.py:453-465`). `.reference-acceptances/` receipt cache, if the
-  implementation keeps one, joins the same list.
-- **Restore semantics.** Reading an accepted entry after restore does not depend
-  on any local journal: the acceptance evidence comment is the authority, the
-  same guarantee `requirement_records.py` documents for
-  `requirement-acceptance-v1`. A lost journal costs at most an idempotency
-  receipt, never an entry or an acceptance.
+  `restore-new` retains issue IDs and comments, so keys, links and acceptance
+  evidence survive a restore with no re-keying. A closed anchor is an ordinary
+  native issue and is covered the same way.
+- **One new journal joins the coordination sidecar.** `.reference-requests/`
+  (propose/revise idempotency receipts) is the operator recovery cache, exactly
+  like `.requirement-requests/` and `.requirement-backfills/`.
+  `admin.py backup_project` must read it into `files` under its own path prefix,
+  and restore must validate it - which requires the whitelist change in 10.3.
+  The requirement-journal block is the model (`admin.py:1287`, `:1315`, and the
+  validator at `:922-927`).
+- **Revision 2 removes two journals.** `.reference-exports/` is gone (9.1), and
+  no `.reference-acceptances/` receipt cache is introduced: acceptance evidence
+  is a native comment, so it needs no local journal. That leaves exactly one new
+  sidecar path, and therefore one rollback hazard instead of three.
 - **Not backed up, deliberately.** Nothing reference-specific is added to
   `.history-snapshots`-style disposable caches; the design adds no new store that
   is neither native nor a small receipt journal.
-- **Authority on restore.** Acceptance authority is the deployment operator
-  allowlist, whose restore policy is unchanged (native records and sidecar
-  restored; allowlist not re-granted by default). A restored project therefore
-  shows accepted entries, and accepting a *new* revision again requires a
-  currently listed operator.
 
-> Serialization note: the `admin.py` backup-path change touches the file owned by
-> the in-progress backup-coverage claim at this base, so that
-> implementation slice must be sequenced after it.
+### 10.2 Restore semantics
 
-## 10. Migration path from a project's `REFERENCE.md`
+Reading an accepted entry after restore does not depend on any local journal: the
+acceptance evidence comment is the authority, the same guarantee
+`requirement_records.py` documents for `requirement-acceptance-v1`. A lost
+journal costs at most an idempotency receipt, never an entry or an acceptance.
 
-`ref import` is one-way and draft-only:
+Acceptance authority after restore is the deployment operator allowlist, whose
+restore policy is unchanged: `restore-new` restores the native records and the
+coordination sidecar and leaves the deployment allowlist untouched
+(`docs/OPERATIONS.md:174`), printing by name any operators the backup records
+that the host does not list, unless `--restore-operators` is passed
+(`docs/OPERATIONS.md:183`). A restored project therefore shows accepted entries,
+and accepting a *new* revision again requires a currently listed operator.
+
+### 10.3 Rollback compatibility and the staged release
+
+This is the kittrial-5bb.44 class of problem, and `docs/REVIEWS.md:102-114`
+already prescribes the answer: "ship a **tolerant reader** first (accept and
+ignore the optional field, write nothing new), deploy it, and only then ship the
+**writer** ... rolling the writer back to the tolerant reader is then safe."
+`review_workflow.py:13-23` records the same hazard and remedy for a different
+change.
+
+**Hazard 1 - the sidecar refuses the whole restore.** `admin.py:899-904`
+validates every path in a coordination backup: `:903` matches only
+`.coordination-requests`, `.handoffs`, `.handoff-requests`,
+`.handoff-recoveries`, `.requirement-requests` and `.requirement-backfills`, and
+`:904` raises `ValueError('Invalid coordination backup path')` for anything else.
+A backup that contains `.reference-requests/...` therefore cannot be restored by
+a kit that predates the catalog - the **entire** restore is refused, not just the
+reference part.
+
+**Hazard 2 - older views and older guards.** After a kit rollback:
+
+- older `work` lists every anchor as ordinary work, because `work.py:175` filters
+  by `issue_type` and knows nothing about a `reference` label; the HTTP task
+  list, queue, `/v1/me/work` and the agent prompts likewise. Closed anchors are
+  the one mitigation that survives the rollback (3.2);
+- the older reserved guard does not know `reference`, `reference:` or
+  `reference-key:` (3.7), so raw forging of `Kind: reference-*` comments and
+  `reference:*` labels is allowed again;
+- an acceptance written under the catalog reads as ordinary prose, and the older
+  kit neither enforces the operator allowlist for it nor treats it as authority.
+
+**The staged release.** Slice 0 is the tolerant reader and is the oldest kit a
+catalog deployment may roll back to:
+
+| Release | Contents | Writes |
+| --- | --- | --- |
+| Slice 0 - tolerant reader (shared with kittrial-5bb.58) | reserve the two comment prefixes and the three labels (3.7); whitelist `.reference-requests/` in `validate_coordination_files`; filter catalog rows and comments out of all six surfaces in 6.0; report an unknown `Kind: reference-entry-vN` as `unsupported` per entry | **none anywhere** |
+| Slice 1 - core writers | shared keyed-record core; closed anchors; draft/revise; operator accept with F3 evidence and the allowlist; `ref get`/`ref list`; HTTP GET routes; `work`/`brief` attention | reference records only |
+| Slice 2 - the rest | `ref check --repo` with `authority-changed-since-pinned`; `ref retire`; `ref decisions`; My work and prompt counts; optional export | export file only, opt-in |
+
+Rolling slice 1 back to slice 0 is safe: entries exist, but slice 0 hides them
+from every work surface, still refuses raw writes into their namespace, and
+whitelists their sidecar so a backup round-trips. Rolling slice 1 back to a
+**pre-catalog** kit is not safe, and an operator must know exactly what is lost:
+
+- a backup containing `.reference-requests/` cannot be restored at all
+  (hazard 1);
+- entries created by slice 0's filter rules are no longer filtered, because a
+  pre-catalog kit has no filter (hazard 2) - the closed anchors are all that keep
+  them out of work views;
+- the label and comment namespace is forgeable again, and the allowlist check on
+  an acceptance is not applied by that kit.
+
+Operator recovery from an accidental pre-catalog rollback:
+
+1. Keep or redeploy the slice 0 tolerant reader on the host. It reads and hides
+   the catalog without writing, so it is the safe landing point.
+2. If a pre-catalog kit must be restored from a catalog-era backup, remove the
+   `.reference-requests/` paths from the coordination sidecar **before** the
+   restore, and understand that the entries themselves are native comments the
+   old kit will import but not understand.
+3. On a pre-catalog kit, treat every `reference`-labelled row as a foreign record:
+   do not claim it, do not edit it, and `void-record` the `Kind: reference-*`
+   comments only if the older kit exposes them as malformed structured history
+   (`docs/OPERATIONS.md`, "Malformed structured history"). Nothing is deleted;
+   re-installing the tolerant reader makes the entries readable again.
+4. Re-grant the deployment allowlist deliberately (`admin.py operators add` or
+   `--restore-operators`) before accepting anything.
+
+## 11. Migration path from a project's `REFERENCE.md`
+
+`ref import` is one-way and draft-only, and slice 2 defers it: it is migration
+tooling for a problem that exists in one project, so it ships last (15).
 
 ```sh
 b ref import --file REFERENCE.md --dry-run --json
@@ -701,7 +1171,8 @@ reliably and guessing would create silent wrong authorities:
 - **Table mode.** A Markdown table with the exact columns
   `key | statement | authority | owner | review-by | tags`. Extra or missing
   columns are refused.
-- Every imported entry becomes revision 1 with `acceptance_state: draft` and
+- Every imported entry becomes revision 1 on a closed anchor with
+  `acceptance_state: draft` and
   `origin: {"type": "import", "path": "REFERENCE.md", "digest": "<sha256 of the
   file>"}`. **Nothing imported is accepted.** The owner accepts entries through
   the normal operator route, one at a time, so migration cannot silently promote
@@ -713,76 +1184,188 @@ reliably and guessing would create silent wrong authorities:
   `.reference-requests/`.
 - The source `REFERENCE.md` is left untouched. The recommended end state is:
   import, accept the still-true entries, then either delete `REFERENCE.md` after
-  adding a one-line pointer to `ref list`, or keep it as the `repo-export`
-  projection, where `ref export --check` guards it.
+  adding a one-line pointer to `ref list`, or keep it as the opt-in export
+  projection (9.1), where the self-verifying header guards it.
 - Dates are never invented: if neither the file nor `--review-by` supplies a
   date, the entry is created with `review_by: null` and `ref check` reports it as
   a draft needing a date before acceptance.
 
-## 11. Worked examples (placeholders only)
+## 12. Shared machinery and the kittrial-5bb.58 relationship
 
-### 11.1 Repo-path authority: the calendar that expires
+### 12.1 One keyed-record core, not a parallel module
+
+Revision 1 proposed `reference_records.py` as a parallel implementation of
+roughly 1000 lines of `requirement_records.py` (which is 1029 lines today):
+controlled labels, native-first receipts, reconcile, backfill and F3 acceptance
+binding. That duplication is rejected. Instead, extract a **shared keyed-record
+core** used by requirements, references and the kittrial-5bb.58 proposals.
+
+**Module boundary.**
+
+- New `keyed_records.py` holds the kind-independent machinery. Its public
+  surface is a small set of primitives plus a spec object:
+  - `RecordSpec`: `kind`, `type_label`, `state_labels` (`draft`/`accepted`/
+    `superseded`), `revision_prefix`, `acceptance_prefix`, `journal`,
+    `key_regex`, `fields`, `validator`, and the flags
+    `allow_accepted_first_revision` and `supports_retire`;
+  - envelope validation: `refuse_injected_labels`, `checked_fields`,
+    `validate_envelope(payload, spec)`;
+  - controlled labels: `controlled_labels(spec, acceptance_state)` and
+    `apply_controlled_labels(run, task, current, spec, acceptance_state)` -
+    mirroring `requirement_records.py:320` and `:554`;
+  - ledger reads: `existing_revisions(row, spec)` and `latest_revision(existing)`
+    - mirroring `requirement_records.py:353` and `:381`;
+  - acceptance evidence: `existing_acceptances(row, spec)`,
+    `bound_acceptance(acceptance)`, `bind_acceptance(acceptance, record)` and
+    `acceptance_evidence(...)` - mirroring `:385`, `:142`, `:166`, `:414`;
+  - receipts and recovery: `validate_receipt(record, spec)`, the `.*-requests/`
+    journal helpers, and `reconcile(project, operation_id, actor, reason,
+    disposition, run, spec, issue_id=None)` - mirroring `:453` and `:899`;
+  - selection and keys: `require_typed(row, payload, spec, allow_untyped)`,
+    `existing_key(existing)`, `require_bound_key(task, payload, existing)`,
+    `check_key_unique(rows, payload, task)` - mirroring `:498`, `:513`, `:520`,
+    `:530`;
+  - the single accept/revise entry point `apply_native(payload, actor, run,
+    project, spec, operator=False)` - generalizing `:662`.
+- `requirement_records.py` keeps what is genuinely specific: the
+  `requirement`/`brd-section` kinds and their `description`/`parent` semantics;
+  `publication_acceptance(acceptance, manifest)` (`:182`); the
+  `requirements.ACCEPTANCE_FIELDS` binding; the backfill field set
+  (`:83-84`); and the F3 acceptance shape. It becomes a spec plus thin wrappers,
+  and its existing tests must keep passing unchanged.
+- `reference_records.py` keeps what is specific to the catalog: the key regex
+  (3.3), the `authority` object validator (3.6), `review_by`/`successor`, the due
+  classification (7.2), the `decisions` link check (3.9), the owner identity rule
+  (3.4), and `retire` (6.4).
+- `.58` proposals keep their disposition vocabulary (12.2) and their statistics;
+  they use the same core for draft/accepted state, labels, receipts and F3
+  evidence.
+
+**Routes requirements gained on this base, covered by the core.**
+
+- The operator-only **direct accepted revision 1** (kittrial-5bb.56,
+  `docs/REQUIREMENTS_INTEGRATION.md:162-199`): `operation: "draft"` with
+  `acceptance_state: "accepted"` and F3 evidence. Generalized as
+  `RecordSpec.allow_accepted_first_revision`, so `ref propose`/`reference-apply`
+  get the same route in slice 1 with no second code path - and the same refusal
+  for the contributor form.
+- A **reconcile command**: `admin.py requirement-reconcile` (`admin.py:2224-2233`,
+  `requirement_records.reconcile` `:899`). Generalized to one
+  `admin.py record-reconcile --kind ...`; `requirement-reconcile` and
+  `reference-reconcile` stay as operator spellings, and `.reference-requests/`
+  reconciles exactly like `.requirement-requests/`.
+- The existing operator `backfill` path (`:824`) is requirements-specific
+  (relabelling records created before the operation); the core exposes
+  `apply_controlled_labels` for it rather than a generic catalog backfill, which
+  the catalog does not need.
+
+`requirement_impact.py` stays out of the core: it is a manifest/work-graph view
+(`requirement_impact.py:23`), and the catalog has no manifest.
+
+### 12.2 Sharing with kittrial-5bb.58
+
+In `.58`, contributors submit requirement proposals into a coordinator input
+queue; the coordinator incorporates, rejects or escalates each one to the owner,
+and contributors get a log and statistics. The two designs share:
+
+1. **One proposal intake and input queue, one outcome vocabulary.** A reference
+   draft **is** a proposal. Requirement proposals and reference drafts go into
+   one queue with one disposition vocabulary - `incorporated`, `rejected`,
+   `escalated-to-owner` - and accepting a reference is "incorporate". No second
+   vocabulary is introduced for the catalog.
+2. **The keyed-record core** (12.1): draft/accepted states, controlled labels,
+   reserved prefixes, receipts, reconcile and F3 evidence.
+3. **One attention block.** Reuse the existing shape from
+   `http_service._agent_attention` (`http_service.py:2164-2239`:
+   `state`, `summary`, `counts`, `actions`, `truncated`, `computed_at`) with
+   kinds `reference-review`, `proposal-pending` and `proposal-escalated`. Design
+   the shape once and let `work`, `brief` and My work project it (7.1).
+4. **Durable contributor identity.** The `account:`/`person:` rule (3.4) serves
+   both the catalog `owner` and `.58` attribution and statistics. A session actor
+   is refused in both.
+5. **One owner acceptance surface.** Shell in v1 (`reference-apply`,
+   `requirement-apply`), one owner "accept" screen later for requirements,
+   references and escalated proposals together - never for agent or worker
+   credentials.
+6. **One tolerant-reader release.** Slice 0 covers both features' new kinds,
+   labels and journals in a single deployable step (10.3).
+
+Kept separate: review-by and due logic (catalog only), and statistics and the
+scoreboard (`.58` only).
+
+Ordering recommendation (16.9): build the shared core and the tolerant reader
+once; the catalog's slice 1 goes first because it is smaller and more concrete;
+`.58` builds on the same core. The owner should accept the two designs together,
+or `.41` waits for the `.58` design.
+
+## 13. Worked examples (placeholders only)
+
+Every value below is a placeholder: `example-project` is a project, `u-0001` and
+`u-0009` are member accounts, `src/example/...` is a repository path and the
+commits and hashes are zero-filled or repeated digits. None of it refers to a
+real project, host or firm.
+
+### 13.1 Repo-path authority: the calendar that expires
 
 ```json
-{"schema_version": 1, "operation_id": "alex/session1-ref-1",
+{"schema_version": 1, "operation_id": "alex-ref-1",
  "key": "calendar.trading",
  "title": "Trading calendar authority",
  "statement": "Every chart and settlement calculation derives holidays and early closes from the pinned calendar module, never from an inline list; the module's lists expire at year end.",
  "authority": {"type": "repo-path", "path": "src/example/calendar.py",
                "commit": "0000000000000000000000000000000000000000", "anchor": "HOLIDAYS"},
- "owner": "alex/session1", "review_by": "2026-12-31",
- "tags": ["calendar", "data"], "decisions": [], "supersedes": null,
- "replaces": null, "replaced_by": null}
+ "owner": "account:u-0001", "review_by": "2026-12-31",
+ "tags": ["calendar", "data"], "decisions": [], "revision": 1,
+ "expected_sha256": null}
 ```
 
 Read: `ref get calendar.trading` -> `state: accepted`, `due: expired` after
-2026-12-31, and an `attention.reference_review` item in `work`; `ref check`
-reports the anchor if it no longer exists at the recorded commit.
+2026-12-31, and a counts-plus-owner-item `attention.reference_review` in `work`.
+When someone edits `HOLIDAYS` in `src/example/calendar.py` at HEAD, slice 2's
+`ref check --repo` reports the `authority-changed-since-pinned` warning and the
+same warning appears on `ref get` - the stale-calendar case, caught.
 
-### 11.2 URL authority: an external identity registry
+### 13.2 URL authority: an external identity registry
 
 ```json
-{"schema_version": 1, "operation_id": "bob/session4-ref-7",
+{"schema_version": 1, "operation_id": "bob-ref-7",
  "key": "identity.registry",
  "title": "Identity registry authority",
  "statement": "Employee identifiers are issued by the corporate identity registry; the registry page is the authority for the issuer format.",
  "authority": {"type": "url", "url": "https://example.invalid/identity/issuer-format",
                "retrieved": "2026-09-01"},
- "owner": "bob/session4", "review_by": "2027-03-01",
- "tags": ["identity"], "decisions": ["example-project-42"], "supersedes": null,
- "replaces": null, "replaced_by": null}
+ "owner": "person:bob", "review_by": "2027-03-01",
+ "tags": ["identity"], "decisions": ["example-project-42"], "revision": 1,
+ "expected_sha256": null}
 ```
 
 Read: `ref decisions example-project-42` lists it; `ref check` warns
 `url-not-reverified` once `retrieved` falls outside the review window. No network
-call is made.
+call is made. On the web the URL is a link only because it is a validated
+`https` URL; the statement is rendered as plain text.
 
-### 11.3 Supersession and a decision link: settlement instant changed
+### 13.3 Retirement: the settlement instant changed
 
-Accepted predecessor (retired later):
+`settlement.instant` (an accepted entry at revision 2, pinned to
+`src/example/ledger.py@0000000#SETTLEMENT`) is replaced by a different key. One
+operator operation writes the retirement:
 
-```json
-{"schema_version": 1, "key": "settlement.instant", "revision": 2,
- "title": "Settlement instant",
- "statement": "Settlement is calculated at the close of the primary session.",
- "authority": {"type": "repo-path", "path": "src/example/ledger.py",
-               "commit": "0000000000000000000000000000000000000000", "anchor": "SETTLEMENT"},
- "owner": "alex/session1", "review_by": "2027-01-15", "tags": ["settlement"],
- "decisions": ["example-project-42"],
- "supersedes": {"id": "example-project-31", "revision": 1,
-                "sha256": "4444444444444444444444444444444444444444444444444444444444444444"},
- "replaces": null, "replaced_by": "settlement.instant-intraday",
- "acceptance_state": "superseded", "origin": {"type": "authored"},
- "sha256": "5555555555555555555555555555555555555555555555555555555555555555"}
+```sh
+b ref retire settlement.instant --successor settlement.instant-intraday --file retirement.json --json
 ```
 
-Replacement accepted first with `replaces: "settlement.instant"`, then the
-predecessor accepted with `replaced_by` as above. Read: `ref get
-settlement.instant` returns the retired record plus `resolved` pointing at the
-replacement, and `ref check` fails an asymmetric pair where one half was accepted
-and the other was not.
+The retirement revision of `settlement.instant` carries
+`"acceptance_state": "superseded"` and
+`"successor": "settlement.instant-intraday"`, and its acceptance evidence names
+the operator and the decision. Read: `ref get settlement.instant` returns the
+retired record plus `resolved` pointing at the successor, and `ref get
+settlement.instant-intraday` reports `replaces: ["settlement.instant"]`, derived
+at read time. `ref check` reports `retirement-target-missing` if the successor
+key does not exist, and `retirement-cycle` if a retirement loop is ever written -
+there is no half-accepted pair to detect, because one operation wrote both
+halves.
 
-## 12. Rejected alternatives
+## 14. Rejected alternatives
 
 | Alternative | Why rejected |
 | --- | --- |
@@ -791,51 +1374,111 @@ and the other was not.
 | A single catalog comment per project | No per-entry state or labels, unbounded comment growth, and no additivity for `work` filtering. |
 | Entries only in the project repository file | Not visible to other sessions' workers without a checkout, and not durable against a bad edit - the exact failure the owner reported. |
 | A new server-side JSON store | A second store beside native records would need its own backup, restore, locking and conflict policy. The kit's reviewed answer is native records plus a small receipt journal. |
+| **Open** anchor issues plus a per-surface label filter | Four surfaces (HTTP task list, queue, `/v1/me/work`, agent prompts) do not filter at all today, `work.py:175` filters by `issue_type`, and an older kit has no filter. Closed anchors hide the row everywhere at once, including on kits that predate the catalog. |
+| A filter by the `reference` label alone, ignoring `issue_type` | Keeps the row visible to every reader that has no filter, and cannot be honoured by an older kit. Retained only as the tolerant reader's extra filter (6.0), never as the primary mechanism. |
 | Extending the checkpoint `kind` vocabulary with `reference-review` | Confuses author-declared open items with computed date reminders; unresolved items must stay author-owned. |
 | Fetching `url` authorities server-side | The server has no network authority and no checkout; verification belongs in `ref check` on a client/operator machine. |
+| A per-revision `supersedes {id, revision, sha256}` hash chain | A second invariant over a single native issue whose comment ledger is already ordered; it added a malformed-record class and an asymmetric-pair window. Replaced by an expected revision plus an expected content hash (3.5). |
+| Two-step `replaces`/`replaced_by` acceptances | Could leave one half accepted and the other not, which `ref check` then had to detect. One `ref retire` writes both at once, and `replaces` is derived. |
+| A `.reference-exports/` receipt journal | The file is written in a client checkout while the journal would live in the server sidecar; it was a second sidecar path and a second rollback hazard for no benefit. The file is self-verifying instead (9.1). |
+| `repo-export` as the default mode | A generated file is a second copy of the catalog, which is what the owner wanted to avoid. Pointer mode is the default and export is opt-in (9). |
+| A separate `repo-path-only` mode | It is pointer mode plus a policy that refuses `url` authorities; a mode adds configuration for nothing (9). |
+| Claiming `ref export --check` is CI-ready | CI cannot reach the coordination catalog, so CI can only self-check the committed file. Staleness belongs on the coordinator side as attention (9.2). |
+| A session actor as `owner` (revision 1's `alex/session1`) | Sessions are ephemeral: routed attention could never reach a person, and `.58` statistics could never attribute an entry durably. A durable `account:`/`person:` identity is required (3.4). |
+| Session actors as approvers, or any agent/worker credential | The HTTP authority layer already refuses this: review approval is owner-only and a worker credential never can (8). |
+| Rendering a reference statement with the web's `markdown()` helper | A draft statement is attacker-writable, instruction-grade text; `markdown()` is for owner-authored baseline text. Statements render as plain text, and only validated `https` URLs become links (8). |
+| An HTTP propose write in v1 | Needs a new credential scope, and adding a scope is itself a rollback concern because older kits validate scope lists (8). |
+| A parallel `reference_records.py` that copies `requirement_records.py` | Duplicates roughly 1000 lines of labels, receipts, reconcile, backfill and F3 binding. Extract the keyed-record core instead (12.1). |
+| Deferring the whole catalog design until `.58` lands | The catalog's slice 1 is smaller and more concrete; the shared core and the tolerant reader can be built once, in either order, so `.41` should not block on `.58` (12.2, 16.9). |
 
-## 13. Follow-up implementation slices (proposed, not filed)
+## 15. Follow-up implementation slices (proposed, not filed)
 
-Filed by the owner only after this design is accepted:
+Filed by the owner only after this design is accepted. Exactly three slices, then
+a "later" list. No web write and no import before the later list.
 
-1. `reference_records.py`: the `reference-entry-v1` record kind, controlled
-   labels, key resolution, propose/revise with the `.reference-requests/` receipt
-   journal, reserved-prefix guard entries, and unit tests.
-2. `admin.py reference-apply|reference-backfill` + `reference-acceptance-v1`
-   evidence, reusing the F3 acceptance validation.
-3. `ref` client action and endpoint dispatch: `get`, `list`, `decisions`,
-   `check`, `export`, `import`, plus `docs/CLI_CONTRACT.md` additions.
-4. `work`/`brief` `attention` block and `reference-review` items, `work` filter
-   for `reference` rows, help/limit payloads (`work.py`/`briefing.py`, serialized
-   with the checkpoint/freshness claim).
-5. `admin.py backup_project` sidecar coverage for the new journals (serialized
-   with the backup-coverage claim).
-6. Web read views and the propose write over the existing route registry
-   (serialized with the web-interface claim).
-7. `docs/OPERATIONS.md` migration/runbook section and a `templates/` reference
-   entry example, if the owner wants a copyable payload.
+**Slice 0 - tolerant reader (shared with kittrial-5bb.58).** Reserve
+`Kind: reference-entry-v1` and `Kind: reference-acceptance-v1` in
+`reserved_comments.RESERVED` and add `reference`, `reference:` and
+`reference-key:` to `RESERVED_LABEL_PREFIXES`/`RESERVED_EXACT_LABELS`
+(`reserved_comments.py:164`, `:654-655`); whitelist `.reference-requests/` in
+`admin.validate_coordination_files` (`admin.py:903`); filter catalog rows and
+comments out of the six surfaces in 6.0; report an unknown
+`Kind: reference-entry-vN` as `unsupported` per entry. **No writes anywhere.** A
+test must assert that slice 0 writes nothing.
 
-## 14. Open questions for the coordinator and owner
+**Slice 1 - core draft/accept, `ref get`/`ref list`, HTTP GET, attention.**
 
-1. **Mandatory review-by.** This design requires `review_by` for an accepted
-   entry and allows `null` on a draft. Is "no accepted entry without a review-by
-   date" the right hard rule, or should timeless entries be allowed with an
-   explicit `review_by: "never"` sentinel?
-2. **Who accepts.** This design grants acceptance to the deployment operator
-   allowlist (reusing `requirement-apply`). Should a per-project coordinator
-   identity that is not a deployment operator also accept, and if so where does
-   that authority live and how is it restored?
-3. **key-level retirement** takes two operator acceptances (replacement first,
-   then predecessor). Is the two-step asymmetry acceptable, or should one
-   operator operation perform both writes atomically?
-4. **Brief selection.** Should a task's brief auto-match entries by tags derived
-   from the task's area, or stay explicit (`brief --ref-tag`) as designed here?
-5. **`repo-export` default.** Is a generated in-tree `REFERENCE.md` acceptable in
-   projects that already maintain one, or should adoption default to
-   `repo-path-only`?
-6. **Scale.** Reads resolve keys through a controlled label per entry. At what
-   catalog size (hundreds? thousands?) should `ref list` move to a maintained
-   project-level index, and is a bounded linear read acceptable until then?
-7. **Export file location.** `docs/REFERENCE.md` is the suggestion; should the
-   owner fix a single path per project so `ref export --check` can run in CI
-   without configuration?
+- extract `keyed_records.py` from `requirement_records.py` and re-point
+  requirements at it, with the existing requirement tests unchanged (12.1);
+- `reference_records.py`: the `reference-entry-v1` kind, closed anchors,
+  propose/revise with `expected_sha256` and the `.reference-requests/` receipt
+  journal, key resolution, the owner identity rule;
+- `admin.py reference-apply` (+ `reference-reconcile`) with
+  `reference-acceptance-v1` evidence, F3 binding, the deployment operator
+  allowlist check, and the direct accepted revision 1 enabling
+  `allow_accepted_first_revision`;
+- `ref get` and `ref list --tag/--due/--state`, the `ref` client action and
+  endpoint dispatch, plus `docs/CLI_CONTRACT.md` additions;
+- `GET /v1/projects/{pid}/references` and `/references/{key}` at `CAP_READ`, with
+  the untrusted-text rules of section 8;
+- `work` counts plus the entry-owner/approver items, and `brief` top-3 with
+  `trust`; failure isolation per entry (7.3); help/limit payloads.
+
+**Slice 2 - `ref check`, retire, `ref decisions`, My work, optional export.**
+
+- `ref check --repo` including `authority-changed-since-pinned` (9.3);
+- `ref retire KEY --successor KEY2` (6.4) and the derived `replaces` view;
+- `ref decisions DECISION-ID`;
+- My work and agent-prompt counts (7.1);
+- optional per-project export with the self-verifying header (9.1);
+- `docs/OPERATIONS.md` migration/runbook section and a `templates/` reference
+  entry example.
+
+**Later, only if asked.** `ref import` (11); any web write and web acceptance
+(human `reviews.approve` session only); tag auto-match beyond task labels; and a
+separate follow-up task to close the `requirement-apply` allowlist gap this
+design recorded in section 4.
+
+## 16. Owner questions, with recommended answers
+
+Every question below now carries a recommended answer. They are decisions for the
+owner, not open design gaps; the recommendation is what slice 1 will implement
+unless the owner chooses otherwise.
+
+1. **Mandatory review-by.** *Recommended:* `review_by` is required on every
+   accepted entry and there is no `"never"` sentinel; cap it at 24 months ahead.
+   Re-confirming a timeless fact once every two years costs little, and it keeps
+   one rule in the validator. Drafts may omit it.
+2. **Who accepts.** *Recommended:* the project owner(s) and the
+   operator-allowlisted coordinator, through the shell route in v1
+   (`admin.py reference-apply`). Web acceptance for project owners comes later,
+   with a human session holding `reviews.approve`; never an agent or worker
+   credential. Contributors and agents only propose.
+3. **Retirement.** *Recommended:* one operation,
+   `ref retire KEY --successor KEY2`. No two-step acceptance; `replaces` is
+   derived at read time (3.5).
+4. **Brief selection.** *Recommended:* deterministic. Show entries whose tags
+   match the task's own labels, plus expired and due-soon entries, at most 3,
+   expired first. No inference; `--ref-tag` remains an explicit override.
+5. **Default repo mode.** *Recommended:* pointer mode by default, export opt-in
+   per project. A generated file is a second copy of the catalog (9).
+6. **Scale.** *Recommended:* a bounded linear read of up to 500 entries per
+   project, with a `coverage` note beyond that; add a project-level index only if
+   a project approaches 500.
+7. **Export path.** *Recommended:* a fixed `docs/REFERENCE.md` per project when
+   export is enabled, so the file location needs no per-project configuration.
+8. **Owner identity.** *Recommended:* a durable person/account identity -
+   `account:<uid>` for an office deployment (the project member account), or
+   `person:<name>` for an SSH-only project. Session actors are refused at write
+   (3.4).
+9. **Order relative to kittrial-5bb.58.** *Recommended:* build the shared
+   keyed-record core and the tolerant reader once; the catalog's slice 1 goes
+   first because it is smaller and more concrete; `.58` builds on the same core.
+   The owner should accept both designs together, or `.41` waits for the `.58`
+   design (12.2).
+
+**Recorded gap, not a question.** On this base `requirement-apply` does not
+check the deployment operator allowlist (`admin.py:2214-2223`,
+`docs/OPERATIONS.md:61-63`). The catalog deliberately does not copy that gap, and
+the fix belongs in a separate follow-up task against `requirement-apply`, not in
+this design.
