@@ -29,6 +29,14 @@ def tar_bytes(name, content, mode=0o644):
     return output.getvalue()
 
 
+def symlink_member(name, linkname):
+    item = tarfile.TarInfo(name)
+    item.type = tarfile.SYMTYPE
+    item.linkname = linkname
+    item.mode = 0o777
+    return item
+
+
 @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux release install only')
 class OfficeReleaseTests(unittest.TestCase):
     def setUp(self):
@@ -125,6 +133,46 @@ class OfficeReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'symlink'):
             safe_extract(archive.getvalue(), destination)
         self.assertFalse((self.base/'ESCAPED.txt').exists())
+
+    def test_deferred_symlink_targets_cannot_escape_extraction_root(self):
+        # Each link is judged lexically when inserted (its target does not exist yet);
+        # a later member completes the target so the link ends up outside the root.
+        from tools.office_release import safe_extract
+        variants = (
+            (('l1', 'l2/..'), ('l2', '.')),
+            (('l1', 'm/n/../..'), ('m', '.'), ('n', '.')),
+        )
+        for index, links in enumerate(variants):
+            archive = io.BytesIO()
+            with tarfile.open(fileobj=archive, mode='w') as output:
+                for name, linkname in links:
+                    output.addfile(symlink_member(name, linkname))
+            destination = self.base/('deferred-%d' % index)
+            with self.assertRaisesRegex(ValueError, 'symlink'):
+                safe_extract(archive.getvalue(), destination)
+
+    def test_benign_symlink_still_extracts(self):
+        from tools.office_release import safe_extract
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode='w') as output:
+            payload = b'data'
+            item = tarfile.TarInfo('pkg/real.txt')
+            item.size = len(payload)
+            item.mode = 0o644
+            output.addfile(item, io.BytesIO(payload))
+            output.addfile(symlink_member('pkg/link.txt', 'real.txt'))
+            directory = tarfile.TarInfo('pkg/sub')
+            directory.type = tarfile.DIRTYPE
+            directory.mode = 0o755
+            output.addfile(directory)
+            output.addfile(symlink_member('pkg/sublink', 'sub'))
+        destination = self.base/'benign'
+        safe_extract(archive.getvalue(), destination)
+        link = destination/'pkg'/'link.txt'
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(os.readlink(str(link)), 'real.txt')
+        self.assertEqual(link.read_bytes(), b'data')
+        self.assertTrue((destination/'pkg'/'sublink').is_dir())
 
 
 if __name__ == '__main__':

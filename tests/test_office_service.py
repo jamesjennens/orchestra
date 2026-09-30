@@ -3,12 +3,14 @@ import json
 import os
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux supervisor only')
@@ -157,6 +159,41 @@ else:
         self.config.write_text('{"schema_version":1,"extra":true}', encoding='utf-8')
         with self.assertRaisesRegex(ValueError, 'Unknown'):
             service_config(self.config)
+
+    def test_existing_log_directory_is_left_undisturbed(self):
+        self.logs.mkdir(mode=0o700)
+        os.chmod(self.logs, 0o755)
+        proc = self.start()
+        self.assertIsNone(proc.poll())
+        self.assertEqual(stat.S_IMODE(self.logs.stat().st_mode), 0o755)
+
+    def test_newly_created_log_directory_is_tightened(self):
+        self.assertFalse(self.logs.exists())
+        self.start()
+        self.assertEqual(stat.S_IMODE(self.logs.stat().st_mode), 0o700)
+
+    def test_log_directory_ownership_and_denied_chmod_never_abort(self):
+        # A directory genuinely owned by another account needs root or a second
+        # account, so the ownership branch and the chmod failure are exercised
+        # directly instead of through a foreign-owned fixture.
+        from office_service import log_directory
+        existing = self.base/'existing-logs'
+        existing.mkdir(mode=0o700)
+        os.chmod(existing, 0o755)
+        with mock.patch.object(Path, 'chmod') as chmod:
+            log_directory(existing)
+        chmod.assert_not_called()
+        self.assertEqual(stat.S_IMODE(existing.stat().st_mode), 0o755)
+        foreign = self.base/'fresh-foreign-logs'
+        with mock.patch.object(Path, 'chmod') as chmod, \
+                mock.patch('office_service.os.geteuid', return_value=os.geteuid()+1):
+            log_directory(foreign)
+        chmod.assert_not_called()
+        self.assertTrue(foreign.is_dir())
+        denied = self.base/'denied-chmod-logs'
+        with mock.patch.object(Path, 'chmod', side_effect=OSError(13, 'Permission denied')):
+            log_directory(denied)
+        self.assertTrue(denied.is_dir())
 
     def test_children_use_pinned_release_paths(self):
         alias = self.base/'current'

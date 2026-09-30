@@ -61,9 +61,28 @@ def _after_fork():
         os._exit(1)
 
 
+def log_directory(raw):
+    """Create the log directory, tightening only a new directory this account owns.
+
+    A scheduler may pass a log directory owned by another account (for example a
+    supervisor that collects logs as a different user or group). Chmod there either
+    fails with EPERM or locks that account out, so an existing directory is left
+    exactly as it is; the 0600 log files opened below carry the confidentiality.
+    """
+    directory = Path(raw)
+    existed = directory.exists()
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if existed:
+        return
+    try:
+        if directory.stat().st_uid == os.geteuid():
+            directory.chmod(0o700)
+    except OSError:
+        pass
+
+
 def _spawn(command, root, log_path, env):
-    log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    log_path.parent.chmod(0o700)
+    log_directory(log_path.parent)
     fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
     os.fchmod(fd, 0o600)
     with os.fdopen(fd, 'ab', buffering=0) as stream:
@@ -195,8 +214,7 @@ def run(root, logs, config, port, stop_seconds):
         raise ValueError('Prepare this runtime before starting it')
     settings = service_config(config)
     logs = Path(logs).expanduser().resolve()
-    logs.mkdir(parents=True, exist_ok=True, mode=0o700)
-    logs.chmod(0o700)
+    log_directory(logs)
     lock_fd = os.open(root/'office-service.lock', os.O_CREAT | os.O_RDWR, 0o600)
     try:
         try:

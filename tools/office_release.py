@@ -99,6 +99,21 @@ def safe_extract(data, destination):
                 os.link(str(source), str(target))
             else:
                 raise ValueError('Unsupported archive member: ' + item.name)
+    # A link whose textual target did not exist yet was only judged lexically when it
+    # was inserted; later members can complete that target and change where it points.
+    # After the loop every member is materialized, so re-resolve each link and refuse
+    # the release if any of them lands outside the extraction root.
+    for parent, directories, files in os.walk(str(destination), followlinks=False):
+        for name in list(directories) + list(files):
+            entry = Path(parent)/name
+            if not entry.is_symlink():
+                continue
+            try:
+                contained = inside(entry)
+            except (OSError, RuntimeError):
+                contained = False
+            if not contained:
+                raise ValueError('Extracted symlink escapes extraction root: ' + str(entry))
 
 
 def _git(repo, *args):
