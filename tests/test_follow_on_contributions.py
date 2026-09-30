@@ -680,9 +680,9 @@ OPERATOR = 'coordinator-1'
 
 def revert_payload(operation_id='revert-1', contribution='1', integration_commit=MERGE_1,
                    revert_commit='b' * 40, reason='Re-merge dropped the change',
-                   evidence=None):
+                   evidence=None, task='task-1'):
     payload = dict(schema_version=1, operation='revert-record', operation_id=operation_id,
-                   task='task-1', contribution=contribution,
+                   task=task, contribution=contribution,
                    integration_commit=integration_commit, revert_commit=revert_commit,
                    reason=reason)
     if evidence is not None:
@@ -708,6 +708,9 @@ class IntegrationRevertTests(FollowOnChainTests):
     def operator_revert(self, payload=None, actor=OPERATOR):
         """Run the operator write path with the deployment allowlist configured."""
         os.environ['ORCHESTRA_OPERATORS'] = OPERATOR
+        payload = payload if payload is not None else revert_payload(task=self.issue['id'])
+        if payload.get('task') != self.issue['id']:
+            payload = dict(payload, task=self.issue['id'])
 
         def run(args):
             cid = str(len(self.issue['comments']) + 1)
@@ -715,7 +718,7 @@ class IntegrationRevertTests(FollowOnChainTests):
                                                created_at='2026-09-16T00:00:00Z'))
             return json.dumps({'id': cid})
 
-        return w.apply_revert(self.rows, 'task-1', actor, payload or revert_payload(), run,
+        return w.apply_revert(self.rows, self.issue['id'], actor, payload, run,
                               operator=True, operators=[OPERATOR])
 
     def reviewed(self, operators=None):
@@ -726,7 +729,7 @@ class IntegrationRevertTests(FollowOnChainTests):
 
     def scopes(self):
         from review_state import scopes_for
-        return scopes_for(self.rows, 'task-1')
+        return scopes_for(self.rows, self.issue['id'])
 
     def warning_lines(self, state):
         return [w for w in state['warnings'] if w.startswith('Integration fact disagreement')]
@@ -831,7 +834,8 @@ class IntegrationRevertTests(FollowOnChainTests):
         self.integration_case()
         before = len(self.issue['comments'])
         with self.assertRaisesRegex(ValueError, 'not authorized over the contributor review transport'):
-            w.apply_revert(self.rows, 'task-1', OPERATOR, revert_payload(), self.run_native,
+            w.apply_revert(self.rows, self.issue['id'], OPERATOR,
+                           revert_payload(task=self.issue['id']), self.run_native,
                            operators=[OPERATOR])
         self.assertEqual(len(self.issue['comments']), before)
 
@@ -839,7 +843,8 @@ class IntegrationRevertTests(FollowOnChainTests):
         self.integration_case()
         before = len(self.issue['comments'])
         with self.assertRaisesRegex(ValueError, 'No operator allowlist'):
-            w.apply_revert(self.rows, 'task-1', OPERATOR, revert_payload(), self.run_native,
+            w.apply_revert(self.rows, self.issue['id'], OPERATOR,
+                           revert_payload(task=self.issue['id']), self.run_native,
                            operator=True, operators=[])
         self.assertEqual(len(self.issue['comments']), before)
 
@@ -847,13 +852,14 @@ class IntegrationRevertTests(FollowOnChainTests):
         self.integration_case()
         before = len(self.issue['comments'])
         with self.assertRaisesRegex(ValueError, 'not a server-side configured operator'):
-            w.apply_revert(self.rows, 'task-1', 'worker', revert_payload(), self.run_native,
+            w.apply_revert(self.rows, self.issue['id'], 'worker',
+                           revert_payload(task=self.issue['id']), self.run_native,
                            operator=True, operators=[OPERATOR])
         self.assertEqual(len(self.issue['comments']), before)
 
     def test_record_whose_author_is_not_an_operator_is_ignored(self):
         self.integration_case()
-        self.append_revert(revert_payload(), author='worker')
+        self.append_revert(revert_payload(task=self.issue['id']), author='worker')
         reverts, invalid = w.revert_records(self.issue, [OPERATOR])
         self.assertEqual(reverts, [])
         self.assertEqual(len(invalid), 1)

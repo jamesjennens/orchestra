@@ -750,10 +750,16 @@ class AdminVoidRecordTests(unittest.TestCase):
 
 
 class AdminRevertRecordTests(unittest.TestCase):
-    """The audited integration revert record has one operator-only write route."""
+    """The audited integration revert record has one operator-only write route.
+
+    The task id is the one the shared follow-on/revert fixture uses, so these
+    tests drive the same rows the projection tests do through the operator CLI.
+    """
 
     MERGE = 'e' * 40
     SOURCE = 'a' * 40
+    TASK_ID = 'task-1'
+    PROJECT_ID = 'task-1'
 
     def setUp(self):
         # Reuse the whole-task fixture (contribution, independent approval and
@@ -766,7 +772,7 @@ class AdminRevertRecordTests(unittest.TestCase):
         self.root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         try:
-            (self.root / 'projects' / PROJECT).mkdir(parents=True)
+            (self.root / 'projects' / self.PROJECT_ID).mkdir(parents=True)
         except OSError as exc:  # confined environments may forbid nested temp directories
             self.skipTest('nested temporary directory unavailable: ' + str(exc))
         (self.root / 'deployment.private.json').write_text(
@@ -780,14 +786,14 @@ class AdminRevertRecordTests(unittest.TestCase):
         argv = args[2:] if args[:1] == ['--actor'] else args
         if argv[:1] == ['export']:
             return '\n'.join(json.dumps(row) for row in self.rows)
-        self.assertEqual(argv[:3], ['comments', 'add', TASK])
+        self.assertEqual(argv[:3], ['comments', 'add', self.TASK_ID])
         self.writes.append(argv)
         self.rows[0]['comments'].append(
             dict(id='r1', text=argv[3], author='operator', created_at=STAMP))
         return json.dumps({'id': 'r1'})
 
     def payload(self, **extra):
-        p = dict(schema_version=1, operation='revert-record', operation_id='rv1', task=TASK,
+        p = dict(schema_version=1, operation='revert-record', operation_id='rv1', task=self.TASK_ID,
                  contribution='1', integration_commit=self.MERGE, revert_commit='f' * 40,
                  reason='The integration commit no longer contains the reviewed change')
         p.update(extra)
@@ -796,8 +802,8 @@ class AdminRevertRecordTests(unittest.TestCase):
     def invoke(self, payload, actor='operator'):
         path = self.root / 'revert.json'
         path.write_text(json.dumps(payload), encoding='utf-8')
-        argv = ['admin.py', '--root', str(self.root), 'revert-record', PROJECT, '--actor', actor,
-                '--file', str(path)]
+        argv = ['admin.py', '--root', str(self.root), 'revert-record', self.PROJECT_ID,
+                '--actor', actor, '--file', str(path)]
         with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', return_value=self.root), \
                 patch.object(admin, 'run_bd', side_effect=self.native), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
