@@ -26,10 +26,13 @@ import secrets
 import ssl
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from http_auth import (AGENT_SECRET_ENV, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CAP_APPROVE,
+import agent_prompts
+from http_auth import (AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CAP_APPROVE,
                        CAP_CHECKPOINTS, CAP_FEEDBACK,
                        CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_READ, CAP_REVIEWS,
                        CAP_TASKS, RESULT_RETENTION_SECONDS, HttpError, Service, Store,
@@ -60,6 +63,16 @@ AGENT_MAX_PAGES = 200
 #: an agent's own changes-requested, blocked or awaiting-review task is always collected
 #: however many claimable tasks sit beside it.
 AGENT_CLAIMABLE_LIMIT = MAX_PAGE
+#: Bound on the projects one ``GET /v1/me/work`` read walks (the caller's own
+#: memberships, each read once). Reaching it reports ``truncated``.
+ME_WORK_MAX_PROJECTS = 50
+#: Size bound on the per-server short-lived read cache used by ``GET /v1/me/work``
+#: (entries are keyed per principal and project; see ``READ_CACHE_SECONDS``).
+READ_CACHE_MAX_ENTRIES = 2048
+#: Task-list filters the browser sends. Filtering reads the project's one full
+#: snapshot and pages the filtered rows, so the cursor stays exact.
+TASK_STATUS_FILTERS = ('active', 'open', 'in_progress', 'blocked', 'closed')
+TASK_FILTER_TEXT_MAX = 200
 IDEMPOTENCY_HEADER = 'Idempotency-Key'
 ATTACHMENT_MEDIA_TYPES = ('text/plain', 'text/markdown')
 # One identifier pattern for every route parameter. Canonical Orchestra ids contain
@@ -71,6 +84,85 @@ REQUEST_ID = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
 IDEMPOTENCY_KEY = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$')
 CURSOR = re.compile(r'^[A-Za-z0-9_-]{1,%d}$' % MAX_CURSOR)
 LOOPBACK = ('127.0.0.1', '::1', 'localhost')
+
+# ------------------------------------------------------------------ web interface
+#: The browser interface shipped beside this module. ``--web-root`` relocates it and
+#: ``--no-web`` turns static serving off; ``/v1`` is unaffected either way.
+DEFAULT_WEB_ROOT = Path(__file__).resolve().parent / 'web'
+#: The only media types the static route ever serves. Anything else is a 404.
+STATIC_MEDIA_TYPES = {
+    '.html': 'text/html; charset=utf-8',
+    '.css': 'text/css; charset=utf-8',
+    '.js': 'text/javascript; charset=utf-8',
+    '.svg': 'image/svg+xml',
+    '.png': 'image/png',
+    '.ico': 'image/x-icon',
+}
+#: Directories (relative to the web root) whose files may be served. The web root
+#: itself only serves the entry page and an optional favicon.
+STATIC_DIRECTORIES = ('css', 'js', 'js/views', 'img')
+STATIC_TOP_LEVEL = ('index.html', 'favicon.ico')
+#: Development-only files that must never be served by the production service: the
+#: clickable prototype, its in-memory mock and any private sample data.
+STATIC_EXCLUDED = ('prototype.html', 'js/prototype.js', 'js/mock.js')
+STATIC_EXCLUDED_DIRECTORIES = ('data',)
+#: One strict shape for a static path: plain segments, no ``%`` escapes, no dot
+#: segments, no backslashes and no empty segments. It is checked on the raw request
+#: path, before any decoding, so an encoded traversal can never be reinterpreted.
+STATIC_PATH = re.compile(r'^/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]{0,63}/){0,3}'
+                         r'[A-Za-z0-9_-][A-Za-z0-9_.-]{0,63}$')
+STATIC_MAX_BYTES = 4 * 1024 * 1024
+CONTENT_SECURITY_POLICY = ("default-src 'self'; script-src 'self'; style-src 'self'; "
+                           "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; "
+                           "base-uri 'none'; form-action 'self'")
+
+
+def _static_allowed(relative):
+    directory, _, name = relative.rpartition('/')
+    # Exclusions compare case-insensitively so a case-insensitive filesystem cannot
+    # hand out ``js/Mock.js``; the allowlist itself stays exact.
+    folded = relative.lower()
+    if folded in STATIC_EXCLUDED or folded.split('/')[0] in STATIC_EXCLUDED_DIRECTORIES:
+        return False
+    if directory:
+        return directory in STATIC_DIRECTORIES
+    return name in STATIC_TOP_LEVEL
+
+
+def static_file(web_root, raw_path):
+    """Resolve one request path to ``(file, media type)`` under ``web_root``, or ``None``.
+
+    Fail closed: a path outside the fixed allowlist, a development-only file, an
+    unknown extension, a dot/encoded segment, a directory, or a symlink that
+    resolves outside the web root (or onto an excluded file) is simply not found.
+    The caller cannot tell which rule refused it, so the route discloses nothing
+    about the tree.
+    """
+    if web_root is None or not isinstance(raw_path, str):
+        return None
+    if raw_path == '/':
+        raw_path = '/index.html'
+    if not STATIC_PATH.fullmatch(raw_path):
+        return None
+    relative = raw_path[1:]
+    if not _static_allowed(relative):
+        return None
+    suffix = Path(relative).suffix.lower()
+    if suffix not in STATIC_MEDIA_TYPES:
+        return None
+    try:
+        root = Path(web_root).resolve(strict=True)
+        candidate = (root / relative).resolve(strict=True)
+        resolved = candidate.relative_to(root).as_posix()
+    except (OSError, ValueError, RuntimeError):
+        return None
+    # Re-apply the allowlist to the *resolved* location, so a symlink inside web/
+    # cannot alias an excluded file (for example ``js/app.js -> mock.js``).
+    if not _static_allowed(resolved) or Path(resolved).suffix.lower() != suffix:
+        return None
+    if not candidate.is_file():
+        return None
+    return candidate, STATIC_MEDIA_TYPES[suffix]
 
 
 def address_matches(peer, network):
@@ -275,9 +367,13 @@ class InProcessBackend:
 
     def _event(self, project_id, task_id, action, principal, actor=None):
         events = self.state.setdefault('events', [])
-        events.append({'time': now_iso(self.service._now()), 'project': project_id,
+        moment = now_iso(self.service._now())
+        events.append({'time': moment, 'project': project_id,
                        'task': task_id, 'action': action, 'user_id': principal.user_id,
                        'actor': actor or principal.actor})
+        task = self.state['tasks'].get(task_id) if task_id else None
+        if isinstance(task, dict):
+            task['updated_at'] = moment
         if len(events) > 5000:
             del events[:len(events) - 5000]
 
@@ -294,9 +390,14 @@ class InProcessBackend:
         description = payload.get('description') or ''
         if not isinstance(description, str) or len(description) > 20000:
             raise invalid('Task description is too long')
+        priority = payload.get('priority', 2)
+        if type(priority) is not int or not 0 <= priority <= 4:
+            raise invalid('Task priority must be an integer 0-4')
         task_id = 'task_' + secrets.token_hex(6)
         task = {'id': task_id, 'project_id': project_id, 'title': title.strip(),
+                'priority': priority,
                 'description': description, 'status': 'open', 'assignee': None,
+                'review_state': 'none',
                 'version': 1, 'created_by': principal.user_id,
                 'created_at': now_iso(self.service._now()),
                 'attachments': payload.get('attachments') or []}
@@ -379,13 +480,29 @@ class InProcessBackend:
                 raise invalid('commit must be a full 40-character lowercase SHA')
             if not isinstance(base_commit, str) or not re.fullmatch(r'[0-9a-f]{40}', base_commit):
                 raise invalid('base_commit must be a full 40-character lowercase SHA')
-            if not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest):
+            delivery = payload.get('delivery')
+            branch = None
+            if digest is None and isinstance(delivery, dict):
+                # The canonical review protocol's delivery object (review_workflow):
+                # a remote branch or a bundle with its digest.
+                if delivery.get('kind') == 'remote':
+                    branch = delivery.get('branch')
+                    if not isinstance(branch, str) or not branch.strip() or len(branch) > 300 or \
+                            not isinstance(delivery.get('remote'), str) or \
+                            not delivery['remote'].strip() or len(delivery['remote']) > 1000:
+                        raise invalid('A remote delivery needs a remote and a branch')
+                elif delivery.get('kind') == 'bundle':
+                    digest = delivery.get('sha256')
+                else:
+                    raise invalid('Delivery must be remote or bundle')
+            if branch is None and (not isinstance(digest, str) or
+                                   not re.fullmatch(r'[0-9a-f]{64}', digest)):
                 raise invalid('bundle_sha256 must be a 64-character lowercase hex digest')
             if not isinstance(summary, str) or not summary.strip() or len(summary) > 1200:
                 raise invalid('Contribution summary must be 1-1200 characters')
             record = {'id': 'con_' + secrets.token_hex(6), 'task_id': task['id'],
                       'kind': 'contribution', 'commit': commit, 'base_commit': base_commit,
-                      'bundle_sha256': digest, 'summary': summary.strip(),
+                      'bundle_sha256': digest, 'branch': branch, 'summary': summary.strip(),
                       'actor': payload.get('actor') or principal.actor,
                       'created_at': now_iso(self.service._now())}
             contributions.append(record)
@@ -393,11 +510,21 @@ class InProcessBackend:
             task['version'] += 1
             self._event(project_id, task['id'], 'contribution', principal, record['actor'])
             return {'contribution': record, 'task_version': task['version']}
-        if not contributions:
+        current = [r for r in contributions if r['kind'] == 'contribution']
+        if not current:
             raise conflict('There is no contribution to review')
+        # A review names the revision it judges (canonical ``contribution``); a stale
+        # reviewer who read an older revision is refused instead of judging new work.
+        named = payload.get('contribution')
+        if named is not None and named != current[-1]['id']:
+            raise conflict('A newer contribution arrived; reread the task before reviewing',
+                           {'current_contribution': current[-1]['id']})
+        items = self._review_items(payload.get('items')) if operation == 'request-changes' \
+            else []
         record = {'id': 'rev_' + secrets.token_hex(6), 'task_id': task['id'], 'kind': operation,
-                  'contribution_id': contributions[-1]['id'],
+                  'contribution_id': current[-1]['id'],
                   'summary': (payload.get('summary') or '')[:1200],
+                  'items': items,
                   'actor': payload.get('actor') or principal.actor,
                   'created_at': now_iso(self.service._now())}
         contributions.append(record)
@@ -405,6 +532,24 @@ class InProcessBackend:
         task['version'] += 1
         self._event(project_id, task['id'], operation, principal, record['actor'])
         return {'review': record, 'task_version': task['version']}
+
+    @staticmethod
+    def _review_items(raw):
+        """Normalize requested-change items: plain strings or canonical ``{id, text}``."""
+        if raw is None:
+            return []
+        if not isinstance(raw, list) or len(raw) > 20:
+            raise invalid('Review items must be a list of at most 20 entries')
+        items = []
+        for index, item in enumerate(raw):
+            if isinstance(item, str):
+                item = {'id': 'item-%d' % (index + 1), 'text': item}
+            if not isinstance(item, dict) or not isinstance(item.get('text'), str) or \
+                    not item['text'].strip() or len(item['text']) > 1000 or \
+                    not isinstance(item.get('id'), str) or not SAFE_ID.fullmatch(item['id']):
+                raise invalid('Each review item needs an id and 1-1000 characters of text')
+            items.append({'id': item['id'], 'text': item['text'].strip()})
+        return items
 
     def _feedback_add(self, principal, project_id, payload):
         text = payload.get('text')
@@ -451,6 +596,119 @@ class InProcessBackend:
     def list_feedback(self, project_id, limit, offset):
         items = self.state.get('feedback', {}).get(project_id, [])
         return {'items': items[offset:offset + limit], 'total': len(items)}
+
+    def _review_view(self, task):
+        """The task's review chain, projected like ``review_workflow.projection``.
+
+        A requested change is open until a later revision arrives (the disposable
+        backend has no separate ``respond`` record).
+        """
+        records = self.state.get('contributions', {}).get(task['id'], [])
+        contributions = [r for r in records if r['kind'] == 'contribution']
+        requests = []
+        for position, record in enumerate(records):
+            if record['kind'] != 'request-changes':
+                continue
+            later = [r for r in records[position + 1:] if r['kind'] == 'contribution']
+            items = record.get('items') or (
+                [{'id': 'item-1', 'text': record['summary']}] if record.get('summary') else [])
+            for item in items:
+                resolved = later[0] if later else None
+                requests.append({
+                    'id': item['id'], 'request': record['id'], 'text': item['text'],
+                    'contribution': record['contribution_id'], 'author': record['actor'],
+                    'at': record['created_at'], 'status': 'resolved' if resolved else 'open',
+                    'resolution': ('Addressed in revision %d' % (contributions.index(resolved) + 1))
+                    if resolved else None})
+        contribution = None
+        if contributions:
+            current = contributions[-1]
+            contribution = {'id': current['id'], 'revision': len(contributions),
+                            'commit': current['commit'], 'base_commit': current['base_commit'],
+                            'branch': current.get('branch'), 'summary': current['summary'],
+                            'author': current['actor'], 'at': current['created_at']}
+        return {'state': task.get('review_state') or 'none', 'contribution': contribution,
+                'requests': requests,
+                'open_requests': sum(1 for r in requests if r['status'] == 'open'),
+                'latest_id': records[-1]['id'] if records else None,
+                'latest_at': records[-1]['created_at'] if records else None,
+                'revisions': len(contributions)}
+
+    def task_brief(self, project_id, task_id):
+        """Everything the task page shows, from one read of the in-process state."""
+        task = self._task(project_id, task_id)
+        checkpoints = self.state.get('checkpoints', {}).get(task_id) or []
+        checkpoint = None
+        if checkpoints:
+            last = checkpoints[-1]
+            checkpoint = {'id': last['id'], 'at': last['created_at'], 'author': last['actor'],
+                          'summary': last['summary'], 'next_action': last.get('next_action'),
+                          'open_items': [{'id': item.get('id'),
+                                          'kind': item.get('kind') or 'item',
+                                          'text': item.get('text')}
+                                         for item in last.get('open_items') or []]}
+        return {'task': dict(task), 'checkpoint': checkpoint, 'review': self._review_view(task),
+                # The disposable backend records no lifecycle evidence, so every fact is
+                # honestly unknown rather than inferred from the review state.
+                'lifecycle': {}, 'depends_on': []}
+
+    #: The disposable backend is cheap to read and tests expect fresh reads.
+    READ_CACHE_SECONDS = 0
+
+    def review_states(self, project_id, queue=None):
+        """Review state of every task: in-process rows carry it themselves."""
+        return {'states': {t['id']: t.get('review_state') or 'none'
+                           for t in self.read_tasks(project_id)['items']},
+                'complete': True}
+
+    def review_queue(self, project_id):
+        """Every task with current work, highest-attention review states first.
+
+        Mirrors ``work.queue``: a closed task stays listed only while its review is
+        still active. The project is read once; the route pages the result.
+        """
+        items = []
+        for task in self.read_tasks(project_id)['items']:
+            review = self._review_view(task)
+            if task.get('status') == 'closed' and review['state'] not in ACTIVE_REVIEW_STATES:
+                continue
+            items.append(queue_item(
+                project_id, task, review['state'], review['contribution'],
+                review['open_requests'],
+                pending_request_ids=[r['id'] for r in review['requests'] if r['status'] == 'open'],
+                waiting_since=review['latest_at']))
+        items.sort(key=queue_order)
+        return {'items': items, 'complete': True}
+
+
+#: Review states that still need someone to act (``work.queue`` keeps these even on a
+#: closed task). ``approved`` is the in-process name for ``awaiting-integration``.
+ACTIVE_REVIEW_STATES = ('changes-requested', 'error', 'awaiting-review', 'legacy-review-ready',
+                        'awaiting-integration', 'approved')
+QUEUE_PRIORITY = {'changes-requested': 0, 'error': 1, 'awaiting-review': 2,
+                  'legacy-review-ready': 2, 'awaiting-integration': 3, 'approved': 3}
+
+
+def queue_order(item):
+    return (QUEUE_PRIORITY.get(item['review_state'], 4), str(item['id']))
+
+
+def queue_item(project_id, task, review_state, contribution, open_requests,
+               pending_request_ids=None, waiting_since=None):
+    """One review-queue row, in the shape both backends return.
+
+    ``pending_request_ids`` and ``waiting_since`` (time of the latest review record)
+    are filled where the backend knows them; the canonical ``work`` projection
+    reports only a count of pending items, so there they stay empty/``None``.
+    """
+    return {'id': task.get('id'), 'project_id': project_id, 'title': task.get('title'),
+            'status': task.get('status'), 'assignee': task.get('assignee'),
+            'priority': task.get('priority'), 'created_at': task.get('created_at'),
+            'updated_at': task.get('updated_at'),
+            'review_state': review_state or 'none', 'contribution': contribution,
+            'open_requests': open_requests,
+            'pending_request_ids': list(pending_request_ids or []),
+            'waiting_since': waiting_since}
 
 
 class EndpointBackend:
@@ -815,6 +1073,128 @@ class EndpointBackend:
         raise not_implemented('Canonical backend has no feedback read yet: %s'
                               % self.READ_UNRESOLVED['list_feedback'])
 
+    #: Unresolved checkpoint items and pending review requests shown per brief. The
+    #: canonical ``brief`` bounds these itself (``--items-limit`` 1..10, five pending
+    #: requests with a count); the page links to ``history`` for the rest.
+    BRIEF_ITEMS = 10
+
+    def task_brief(self, project_id, task_id):
+        """Map the canonical ``brief --json`` read onto the task page's shape.
+
+        Two canonical reads: ``bd show`` for the editable task row (title,
+        description, version) and ``brief`` for checkpoint, review projection,
+        lifecycle facts and dependencies. Nothing is inferred beyond what they say.
+        """
+        task = self.get_task(project_id, task_id)
+        data = self._run('brief', project_id, self.actor_namespace + '/read',
+                         [str(task_id), '--json', '--items-limit', str(self.BRIEF_ITEMS)])
+        if not isinstance(data, dict):
+            raise uncertain('Canonical brief returned an unexpected shape')
+        checkpoint = None
+        if data.get('checkpoint'):
+            point = data['checkpoint']
+            unresolved = data.get('unresolved') or {}
+            checkpoint = {'id': point.get('comment_id'), 'at': point.get('timestamp'),
+                          'author': point.get('author'), 'summary': data.get('current_position'),
+                          'next_action': data.get('next_action'),
+                          'branch': point.get('branch'), 'source_commit': point.get('source_commit'),
+                          'newer_activity': point.get('newer_activity'),
+                          'open_items': [{'id': item.get('id'), 'kind': item.get('kind'),
+                                          'text': item.get('text')}
+                                         for item in unresolved.get('items') or []
+                                         if isinstance(item, dict)],
+                          'open_items_total': unresolved.get('total')}
+        review = data.get('review') or {}
+        current = review.get('contribution')
+        priors = review.get('prior_contributions_total') or 0
+        contribution = None
+        if isinstance(current, dict):
+            delivery = current.get('delivery') or {}
+            contribution = {'id': current.get('comment_id'), 'revision': priors + 1,
+                            'commit': current.get('commit'),
+                            'base_commit': current.get('base_commit'),
+                            'branch': delivery.get('branch') if isinstance(delivery, dict) else None,
+                            'repository': current.get('repository'),
+                            'summary': current.get('summary'), 'author': current.get('author'),
+                            'at': current.get('timestamp')}
+        requests = [{'id': item.get('item'), 'request': item.get('request'),
+                     'text': item.get('text'), 'contribution': item.get('contribution'),
+                     'author': item.get('author'), 'at': item.get('timestamp'),
+                     'status': 'open', 'resolution': None}
+                    for item in review.get('pending_requests') or [] if isinstance(item, dict)]
+        lifecycle = {dimension: {'value': fact.get('value'), 'note': None}
+                     for dimension, fact in (data.get('lifecycle') or {}).items()
+                     if isinstance(fact, dict)}
+        dependencies = (data.get('dependencies') or {}).get('items') or []
+        return {'task': task, 'checkpoint': checkpoint,
+                'review': {'state': review.get('review_state') or 'none',
+                           'contribution': contribution, 'requests': requests,
+                           'open_requests': review.get('pending_total', len(requests)),
+                           'latest_id': review.get('latest_comment_id'),
+                           'revisions': priors + 1 if contribution else 0,
+                           'warnings': review.get('warnings') or []},
+                'lifecycle': lifecycle,
+                'depends_on': [{'id': d.get('depends_on_id'), 'title': d.get('depends_on_id'),
+                                'status': 'unknown', 'type': d.get('type')}
+                               for d in dependencies if isinstance(d, dict)],
+                'warnings': data.get('warnings') or []}
+
+    #: ``GET /v1/me/work`` may reuse one principal's queue read of a project for this
+    #: long, so a burst of page loads does not re-export every project each time.
+    READ_CACHE_SECONDS = 20
+    #: ``review_states`` is derived from ``review_queue`` (see the handler's reuse).
+    REVIEW_STATES_FROM_QUEUE = True
+
+    def review_states(self, project_id, queue=None):
+        """Review state per task from the canonical ``work`` projection.
+
+        ``bd list`` rows carry no review state, so the task list merges this in. The
+        ``work`` queue lists every open task and every closed task whose review is
+        still active; a closed task it omits has a finished (or no) review, which is
+        reported as unknown rather than guessed. ``complete`` is false when the
+        bounded walk stopped early; tasks past the bound are unknown too.
+        """
+        queue = queue if queue is not None else self.review_queue(project_id)
+        return {'states': {item['id']: item['review_state'] for item in queue['items']},
+                'complete': bool(queue.get('complete')), 'closed_unknown': True}
+
+    #: Bound on the canonical ``work`` pages one queue read walks (``work`` allows at
+    #: most 100 rows per call and re-exports the project each call). Reaching it
+    #: reports ``complete: false`` rather than reading on.
+    QUEUE_MAX_PAGES = 10
+
+    def review_queue(self, project_id):
+        """The canonical ``work`` queue (review projection per task), fully paged.
+
+        ``work`` already applies the kit's own rules: structured review wins over
+        legacy labels, a closed task stays listed only while its review is active,
+        and rows come highest-attention first.
+        """
+        items = []
+        offset = 0
+        complete = False
+        for _ in range(self.QUEUE_MAX_PAGES):
+            page = self._run('work', project_id, self.actor_namespace + '/read',
+                             ['--limit', str(MAX_PAGE), '--offset', str(offset), '--json'])
+            if not isinstance(page, dict):
+                raise uncertain('Canonical work queue returned an unexpected shape')
+            for row in page.get('items') or []:
+                if not isinstance(row, dict):
+                    continue
+                contribution = ({'id': row.get('contribution_id'), 'commit': row.get('commit'),
+                                 'revision': None, 'at': None}
+                                if row.get('contribution_id') else None)
+                task = {'id': row.get('task'), 'title': row.get('title'),
+                        'status': row.get('status'), 'assignee': row.get('owner')}
+                items.append(queue_item(project_id, task, row.get('review_state'),
+                                        contribution, row.get('pending_review_items') or 0))
+            offset = page.get('next_offset')
+            if offset is None:
+                complete = True
+                break
+        items.sort(key=queue_order)
+        return {'items': items, 'complete': complete}
+
 
 def _canonical_payload(stdout):
     """Parse the JSON body a canonical command returned, tolerating NDJSON."""
@@ -832,6 +1212,60 @@ def _canonical_payload(stdout):
                 except ValueError:
                     continue
     raise uncertain('Canonical command returned unparsable data; outcome may be unknown')
+
+
+def next_action(task):
+    """Who acts next on a task, derived only from its status, assignee and review state."""
+    state = task.get('review_state')
+    if task.get('status') == 'closed' and state not in ACTIVE_REVIEW_STATES:
+        return None
+    if state is None:
+        # Unknown (the canonical projection did not cover this row): say nothing
+        # rather than invite a claim or delivery on work that may be under review.
+        return None
+    if state == 'integrated':
+        return {'who': 'owner', 'text': 'Follow the release workflow for the integrated work'}
+    if state in ('awaiting-review', 'legacy-review-ready'):
+        return {'who': 'owner', 'text': 'Review the delivered contribution'}
+    if state == 'changes-requested':
+        return {'who': 'assignee', 'text': 'Address the requested changes'}
+    if state in ('approved', 'awaiting-integration'):
+        return {'who': 'owner', 'text': 'Integrate the approved contribution'}
+    if state == 'error':
+        return {'who': 'owner', 'text': 'Needs operator attention'}
+    if task.get('assignee'):
+        return {'who': 'assignee', 'text': 'Deliver a contribution'}
+    return {'who': 'anyone', 'text': 'Claim this task'}
+
+
+def task_matches(task, filters):
+    """Apply the browser's task-list filters to one canonical row."""
+    status = filters.get('status')
+    if status == 'active' and task.get('status') == 'closed':
+        return False
+    if status and status != 'active' and task.get('status') != status:
+        return False
+    review = filters.get('review_state')
+    if review:
+        # An unknown state (``None``: the canonical projection did not cover the row)
+        # matches no review filter, not even ``none``.
+        if task.get('review_state') is None:
+            return False
+        # ``approved`` (disposable backend) and ``awaiting-integration`` (canonical
+        # projection) are the same state; either filter finds both.
+        approved = ('approved', 'awaiting-integration')
+        wanted = approved if review in approved else (review,)
+        if (task.get('review_state') or 'none') not in wanted:
+            return False
+    assignee = filters.get('assignee')
+    if assignee and task.get('assignee') != assignee:
+        return False
+    text = filters.get('q')
+    if text:
+        haystack = ' '.join(str(task.get(key) or '') for key in ('id', 'title', 'description'))
+        if text.lower() not in haystack.lower():
+            return False
+    return True
 
 
 # ------------------------------------------------------------------ HTTP adapter
@@ -872,6 +1306,9 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     service = None
     backend = None
+    web_root = None
+    read_cache = None
+    read_cache_lock = None
     trusted_proxies = ()
     max_body = MAX_BODY_BYTES
     protocol_version = 'HTTP/1.1'
@@ -888,9 +1325,13 @@ class ApiHandler(BaseHTTPRequestHandler):
         # Per-request agent read cache. An HTTP/1.1 keep-alive connection reuses this
         # handler instance, so the cache is reset for every request and never outlives it.
         self._agent_task_cache = {}
+        self._queue_cache = {}
         try:
             parsed = urlsplit(self.path)
             path = parsed.path
+            if method in ('GET', 'HEAD') and self.web_root is not None and \
+                    not path.startswith('/v1/') and path != '/healthz':
+                return self._serve_static(path)
             query = {k: v[0] for k, v in parse_qs(parsed.query, keep_blank_values=False).items()}
             match = None
             for verb, pattern, name, anonymous, csrf in ROUTES:
@@ -1080,6 +1521,45 @@ class ApiHandler(BaseHTTPRequestHandler):
         if payload and self.command != 'HEAD':
             self.wfile.write(payload)
 
+    def _serve_static(self, path):
+        """Anonymous GET/HEAD of one allowlisted web-interface file (see :func:`static_file`).
+
+        The body is read once and bounded; the response carries the page's strict
+        Content-Security-Policy and revalidates on every load (``no-cache`` plus a
+        content ETag), so a redeploy is picked up without stale scripts.
+        """
+        self._read_body()  # bounded; a stray GET body must not desynchronize keep-alive
+        found = static_file(self.web_root, path)
+        body = None
+        if found is not None:
+            candidate, media_type = found
+            try:
+                with open(candidate, 'rb') as handle:
+                    body = handle.read(STATIC_MAX_BYTES + 1)
+            except OSError:
+                body = None
+            if body is not None and len(body) > STATIC_MAX_BYTES:
+                body = None
+        if body is None:
+            raise not_found('Not found')
+        etag = '"%s"' % hashlib.sha256(body).hexdigest()[:32]
+        status = 304 if self.headers.get('If-None-Match') == etag else 200
+        self.send_response(status)
+        if status == 200:
+            self.send_header('Content-Type', media_type)
+            self.send_header('Content-Length', str(len(body)))
+        self.send_header('ETag', etag)
+        self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Content-Security-Policy', CONTENT_SECURITY_POLICY)
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Referrer-Policy', 'no-referrer')
+        self.send_header('X-Frame-Options', 'DENY')
+        self.send_header('Cross-Origin-Opener-Policy', 'same-origin')
+        self.send_header('X-Request-Id', getattr(self, '_current_request_id', '') or '')
+        self.end_headers()
+        if status == 200 and self.command != 'HEAD':
+            self.wfile.write(body)
+
     def _send_cookie(self, token):
         attributes = 'orchestra_session=%s; Path=/; HttpOnly; SameSite=Strict' % token
         if self._is_secure():
@@ -1146,6 +1626,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             self.service.idempotency_release(digest)
             raise
         self.service.idempotency_commit(digest, status, stored)
+        self._forget_cached_reads(ctx.principal, project_id)
         self.service.audit(ctx.request_id, ctx.principal, route_name, 'committed',
                            project_id=project_id, reason=reason)
         self.service.store.save()
@@ -1162,6 +1643,89 @@ class ApiHandler(BaseHTTPRequestHandler):
         payload = dict(ctx.payload or {})
         payload['task_id'] = ctx.params['tid']
         return payload
+
+    def _paged(self, ctx, items, limit, state, **extra):
+        """One bounded page of an in-memory list, with a cursor bound to this query."""
+        offset = state['o']
+        body = {'items': items[offset:offset + limit], 'total': len(items)}
+        body['next_cursor'] = (make_cursor(ctx.principal, ctx.params.get('pid'), ctx.query,
+                                           offset + limit)
+                               if offset + limit < len(items) else None)
+        body.update(extra)
+        return body
+
+    def _task_view(self, task, names):
+        """A task row plus presentation fields (assignee name, next action). Additive."""
+        view = dict(task)
+        assignee = view.get('assignee')
+        view['assignee_name'] = names.get(assignee, assignee) if assignee else None
+        view['next_action'] = next_action(view)
+        return view
+
+    def _task_views(self, tasks):
+        names = self.service.actor_names([t.get('assignee') for t in tasks])
+        return [self._task_view(t, names) for t in tasks]
+
+    def _review_queue(self, project_id, shared=False):
+        """One review-queue read of a project per request (and, when ``shared`` and the
+        backend allows it, reused for ``READ_CACHE_SECONDS`` by the same principal).
+
+        Authorization is never cached: callers re-check live authority first.
+        """
+        cache = getattr(self, '_queue_cache', None)
+        if cache is None:
+            cache = self._queue_cache = {}
+        if project_id in cache:
+            return cache[project_id]
+        ttl = getattr(self.backend, 'READ_CACHE_SECONDS', 0) if shared else 0
+        key = (getattr(self._principal, 'user_id', None), project_id)
+        now = time.monotonic()
+        if ttl:
+            with self.read_cache_lock:
+                hit = self.read_cache.get(key)
+            if hit is not None and hit[0] > now:
+                cache[project_id] = hit[1]
+                return hit[1]
+        result = self.backend.review_queue(project_id)
+        cache[project_id] = result
+        if ttl:
+            with self.read_cache_lock:
+                if len(self.read_cache) >= READ_CACHE_MAX_ENTRIES:
+                    for stale in [k for k, v in self.read_cache.items() if v[0] <= now] or \
+                            list(self.read_cache)[:READ_CACHE_MAX_ENTRIES // 2]:
+                        self.read_cache.pop(stale, None)
+                self.read_cache[key] = (now + ttl, result)
+        return result
+
+    def _forget_cached_reads(self, principal, project_id):
+        """Drop the principal's cached ``/v1/me/work`` reads after its own write.
+
+        The project's entry goes (all of them when the write had no project), so the
+        author sees their own claim, delivery or review at once; other principals'
+        entries still expire on their short TTL.
+        """
+        cache = getattr(self, 'read_cache', None)
+        if cache is None or principal is None:
+            return
+        with self.read_cache_lock:
+            for key in [k for k in cache if k[0] == principal.user_id and
+                        (project_id is None or k[1] == project_id)]:
+                cache.pop(key, None)
+
+    def _with_review_states(self, project_id, rows):
+        """Give every row its review state (``None`` when unknown). Returns completeness."""
+        if all(isinstance(r, dict) and 'review_state' in r for r in rows):
+            return True
+        # A backend whose states come from its queue projection reuses this request's
+        # queue read instead of paying for a second one.
+        queue = self._review_queue(project_id) \
+            if getattr(self.backend, 'REVIEW_STATES_FROM_QUEUE', False) else None
+        read = self.backend.review_states(project_id, queue=queue)
+        states = read['states']
+        for row in rows:
+            if isinstance(row, dict) and 'review_state' not in row:
+                row['review_state'] = states.get(row.get('id'))
+        return bool(read.get('complete'))
 
     # -- session and account routes -------------------------------------------
     @route('POST', r'/v1/sessions', anonymous=True, csrf=False)
@@ -1180,11 +1744,19 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('GET', r'/v1/sessions/current')
     def sessions_whoami(self, ctx):
         principal = ctx.principal
-        return 200, {'user': {'id': principal.user_id, 'display_name': principal.display_name,
-                              'superuser': principal.superuser},
-                     'via': principal.via,
-                     'credential': principal.credential_id,
-                     'project': principal.credential_project}
+        body = {'user': {'id': principal.user_id,
+                         'username': self.service.username_of(principal.user_id),
+                         'display_name': principal.display_name,
+                         'superuser': principal.superuser},
+                'via': principal.via,
+                'credential': principal.credential_id,
+                'project': principal.credential_project}
+        # A browser keeps its CSRF token in memory only, so a reload re-reads it here.
+        # It is returned only to the cookie session it belongs to; a cross-origin page
+        # cannot read this same-origin response.
+        if ctx.auth_source == 'cookie' and principal.csrf:
+            body['csrf_token'] = principal.csrf
+        return 200, body
 
     @route('DELETE', r'/v1/sessions/current')
     def sessions_delete(self, ctx):
@@ -1207,6 +1779,16 @@ class ApiHandler(BaseHTTPRequestHandler):
     def accounts_list(self, ctx):
         self.require(ctx, CAP_ACCOUNTS_ADMIN)
         return 200, {'items': self.service.list_users(ctx.principal)}
+
+    @route('GET', r'/v1/accounts/lookup')
+    def accounts_lookup(self, ctx):
+        """Exact username -> account, for a project administrator adding a member."""
+        project = ctx.query.get('project')
+        if not isinstance(project, str) or not SAFE_ID.fullmatch(project):
+            raise invalid('project is required: the project the member is being added to')
+        return 200, self.service.lookup_account(ctx.principal, project,
+                                                ctx.query.get('username'),
+                                                request_id=ctx.request_id)
 
     @route('POST', r'/v1/accounts/(?P<uid>' + ID + r')/password')
     def account_password(self, ctx):
@@ -1316,6 +1898,20 @@ class ApiHandler(BaseHTTPRequestHandler):
         return self._mutate(ctx, 'members.remove', ctx.params['pid'], remove,
                             capability=CAP_PROJECT_ADMIN)
 
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/members')
+    def members_list(self, ctx):
+        self._project(ctx, CAP_READ)
+        limit, state = self._page(ctx, ctx.query)
+        items = self.service.list_members(ctx.principal, ctx.params['pid'])
+        return 200, self._paged(ctx, items, limit, state)
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/worker-credentials')
+    def credentials_list(self, ctx):
+        self._project(ctx, CAP_PROJECT_ADMIN)
+        limit, state = self._page(ctx, ctx.query)
+        items = self.service.list_worker_credentials(ctx.principal, ctx.params['pid'])
+        return 200, self._paged(ctx, items, limit, state)
+
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/worker-credentials')
     def credential_issue(self, ctx):
         payload = ctx.payload or {}
@@ -1389,14 +1985,18 @@ class ApiHandler(BaseHTTPRequestHandler):
         return self._mutate(ctx, 'agents.create', None, create, status=201,
                             capability=CAP_AGENTS, replay_status=200)
 
+    def _agent_items(self, principal):
+        items = []
+        for agent in self.service.list_agents(principal):
+            attention = self._agent_attention(principal, agent)
+            items.append(dict(agent, attention=self._agent_attention_view(agent, attention),
+                              resume_prompt=self._agent_resume_prompt(agent, attention)))
+        return items
+
     @route('GET', r'/v1/agents')
     def agents_list(self, ctx):
         self.require(ctx, CAP_AGENTS)
-        items = []
-        for agent in self.service.list_agents(ctx.principal):
-            attention = self._agent_attention(ctx.principal, agent)
-            items.append(dict(agent, attention=self._agent_attention_view(agent, attention),
-                              resume_prompt=self._agent_resume_prompt(agent, attention)))
+        items = self._agent_items(ctx.principal)
         return 200, {'items': items, 'total': len(items),
                      'generated_at': now_iso(self.service._now())}
 
@@ -1674,12 +2274,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                     % (first['kind'], first['task'], first['project']))
         else:
             what = 'There is nothing queued right now.'
+        # kittrial-5bb.48: the secret never reaches curl's argv. curl reads the header
+        # from the per-agent config file the owner stored (``-K``); no variable is
+        # expanded onto the command line.
+        secret_file = agent_secret_file(agent['name'])
         return ("Open your agent folder%s for agent '%s' (%s). %s\n"
-                "Read %s from VS Code secret storage or your OS credential store (an\n"
-                "environment variable is only a fallback), then run:\n"
-                "  curl -fsS -H \"Authorization: Bearer $%s\" %s/v1/agents/me/next"
-                % (where, agent['name'], agent['id'], what, AGENT_SECRET_ENV,
-                   AGENT_SECRET_ENV, server))
+                "Your secret is in %s (never print or copy it). Then run:\n"
+                "  PowerShell:  curl.exe -fsS -K \"%s\" %s/v1/agents/me/next\n"
+                "  macOS/Linux: curl -fsS -K %s %s/v1/agents/me/next"
+                % (where, agent['name'], agent['id'], what, secret_file['windows'],
+                   secret_file['windows_powershell'], server, secret_file['posix'], server))
 
     # -- task routes -----------------------------------------------------------
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks')
@@ -1715,16 +2319,80 @@ class ApiHandler(BaseHTTPRequestHandler):
     def tasks_list(self, ctx):
         self._project(ctx, CAP_READ)
         limit, state = self._page(ctx, ctx.query)
-        result = self.backend.list_tasks(ctx.params['pid'], limit, state['o'])
+        filters = self._task_filters(ctx.query)
+        if filters:
+            rows = [t for t in self.backend.read_tasks(ctx.params['pid']).get('items') or []
+                    if isinstance(t, dict)]
+            complete = self._with_review_states(ctx.params['pid'], rows)
+            rows = [t for t in rows if task_matches(t, filters)]
+            result = {'items': rows[state['o']:state['o'] + limit], 'total': len(rows)}
+        else:
+            result = self.backend.list_tasks(ctx.params['pid'], limit, state['o'])
+            complete = self._with_review_states(ctx.params['pid'], result['items'])
+        result['items'] = self._task_views(result['items'])
+        # False when some rows' review state is unknown (``review_state: null``): the
+        # bounded canonical projection did not cover them, or they are closed tasks
+        # whose finished review the queue no longer lists.
+        result['review_states_complete'] = complete and all(
+            t.get('review_state') is not None for t in result['items'])
         result['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query,
                                              state['o'] + limit)
                                  if state['o'] + limit < result['total'] else None)
         return 200, result
 
+    @staticmethod
+    def _task_filters(query):
+        filters = {key: query[key] for key in ('status', 'review_state', 'assignee', 'q')
+                   if query.get(key)}
+        if 'status' in filters and filters['status'] not in TASK_STATUS_FILTERS:
+            raise invalid('status must be one of %s' % ', '.join(TASK_STATUS_FILTERS))
+        if 'review_state' in filters and not re.fullmatch(r'[a-z][a-z-]{0,39}',
+                                                          filters['review_state']):
+            raise invalid('review_state is not a review state')
+        if 'assignee' in filters and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}',
+                                                      filters['assignee']):
+            raise invalid('assignee is not an actor label')
+        if len(filters.get('q', '')) > TASK_FILTER_TEXT_MAX:
+            raise invalid('q must be at most %d characters' % TASK_FILTER_TEXT_MAX)
+        return filters
+
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')')
     def tasks_get(self, ctx):
         self._project(ctx, CAP_READ)
-        return 200, self.backend.get_task(ctx.params['pid'], ctx.params['tid'])
+        return 200, self._task_views([self.backend.get_task(ctx.params['pid'],
+                                                             ctx.params['tid'])])[0]
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/brief')
+    def tasks_brief(self, ctx):
+        """The task page in one read: row, current checkpoint, review chain, facts.
+
+        Readable by any project member (``CAP_READ``), exactly like the task and its
+        history. Reading never acknowledges anything.
+        """
+        self._project(ctx, CAP_READ)
+        pid, tid = ctx.params['pid'], ctx.params['tid']
+        brief = self.backend.task_brief(pid, tid)
+        review = brief['review']
+        checkpoint = brief.get('checkpoint')
+        contribution = review.get('contribution')
+        actors = [brief['task'].get('assignee')]
+        actors += [checkpoint.get('author')] if checkpoint else []
+        actors += [contribution.get('author')] if contribution else []
+        actors += [r.get('author') for r in review.get('requests') or []]
+        names = self.service.actor_names(actors)
+        task = dict(brief['task'], review_state=review.get('state') or 'none')
+        brief['task'] = self._task_view(task, names)
+        if checkpoint:
+            checkpoint['author_name'] = names.get(checkpoint.get('author'))
+        if contribution:
+            contribution['author_name'] = names.get(contribution.get('author'))
+        for request in review.get('requests') or []:
+            request['author_name'] = names.get(request.get('author'))
+        base = '/v1/projects/%s/tasks/%s' % (pid, tid)
+        brief['links'] = {'task': base, 'history': base + '/history',
+                          'reviews': base + '/reviews', 'checkpoints': base + '/checkpoints'}
+        brief['generated_at'] = now_iso(self.service._now())
+        return 200, brief
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/claim')
     def tasks_claim(self, ctx):
@@ -1786,7 +2454,11 @@ class ApiHandler(BaseHTTPRequestHandler):
         limit, state = self._page(ctx, ctx.query)
         result = self.backend.task_history(ctx.params['pid'], ctx.params['tid'], limit,
                                            state['o'], canonical=state['x'])
-        body = {'items': result['items'], 'total': result['total']}
+        who = lambda e: (e.get('user_id') or e.get('author')) if isinstance(e, dict) else None
+        # (A canonical entry's author may be structured; ActorNames.get ignores it.)
+        names = self.service.actor_names([who(e) for e in result['items']])
+        body = {'items': [dict(e, user_name=names.get(who(e))) if isinstance(e, dict) else e
+                          for e in result['items']], 'total': result['total']}
         if result.get('activity_cursor'):
             body['activity_cursor'] = result['activity_cursor']
         continuation = result.get('canonical_cursor')
@@ -1795,6 +2467,95 @@ class ApiHandler(BaseHTTPRequestHandler):
                         state['o'] + len(result['items']), continuation)
             if continuation else None)
         return 200, body
+
+    # -- review queue and personal work ---------------------------------------
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/queue')
+    def project_queue(self, ctx):
+        """Contributions in flight, grouped by who acts next (the Reviews page).
+
+        Readable by any project member (``CAP_READ``): every row is already visible
+        in the task list; the queue only orders and projects it. ``state`` narrows to
+        one review state.
+        """
+        self._project(ctx, CAP_READ)
+        limit, state = self._page(ctx, ctx.query)
+        wanted = ctx.query.get('state')
+        if wanted is not None and wanted not in ACTIVE_REVIEW_STATES:
+            raise invalid('state must be one of %s' % ', '.join(ACTIVE_REVIEW_STATES))
+        read = self._review_queue(ctx.params['pid'])
+        items = [item for item in read['items']
+                 if (item['review_state'] == wanted if wanted else
+                     item['review_state'] in ACTIVE_REVIEW_STATES)]
+        body = self._paged(ctx, items, limit, state, complete=bool(read.get('complete')),
+                           generated_at=now_iso(self.service._now()))
+        body['items'] = self._task_views(body['items'])
+        return 200, body
+
+    @route('GET', r'/v1/me/work')
+    def me_work(self, ctx):
+        """The signed-in person's own work and review attention across their projects.
+
+        Session only (an agent reads ``/v1/agents/me/next``). Walks the caller's own
+        memberships, re-authorizing each project with the live ``CAP_READ`` check,
+        one queue read per project and at most :data:`ME_WORK_MAX_PROJECTS` projects.
+        ``to_review`` lists contributions only in projects where the caller holds the
+        approval capability. Computed at read time; nothing is scheduled or marked.
+        """
+        principal = ctx.principal
+        if principal.via == 'credential':
+            raise forbidden('Session authority required; an agent reads /v1/agents/me/next')
+        actor = principal.actor or principal.user_id
+        projects = [p for p in self.service.list_projects(principal)
+                    if not p.get('archived') and principal.user_id in (p.get('members') or [])]
+        truncated = len(projects) > ME_WORK_MAX_PROJECTS
+        assigned, to_review, unavailable, classified = [], [], [], []
+        generated_at = now_iso(self.service._now())
+        now = agent_prompts.parse_time(generated_at)
+        blocked = self._agent_blocked_tasks()
+        for project in projects[:ME_WORK_MAX_PROJECTS]:
+            capabilities = self.service.capabilities_for(principal, project['id'])
+            if CAP_READ not in capabilities:
+                continue
+            try:
+                read = self._review_queue(project['id'], shared=True)
+            except HttpError as error:
+                unavailable.append({'project': project['id'], 'reason': error.code})
+                continue
+            truncated = truncated or not read.get('complete')
+            names = self.service.actor_names([i.get('assignee') for i in read['items']])
+            classified.append(agent_prompts.classify(project, capabilities, read['items'],
+                                                     actor, blocked, now, names))
+            for item in read['items']:
+                row = dict(item, project_name=project['name'])
+                if item.get('assignee') == actor and item.get('status') != 'closed':
+                    assigned.append(row)
+                if CAP_APPROVE in capabilities and item['review_state'] in (
+                        'awaiting-review', 'legacy-review-ready', 'awaiting-integration',
+                        'approved'):
+                    to_review.append(row)
+        if len(assigned) > MAX_PAGE or len(to_review) > MAX_PAGE:
+            truncated = True
+        try:
+            agents = self._agent_items(principal)
+        except HttpError:
+            agents = []
+        # One copyable prompt per agent the person owns, built from exactly this data.
+        # The address comes only from --public-url, never from the request's Host
+        # header (which a client controls); otherwise the placeholder, like the setup
+        # snippet.
+        server = self.service.public_url or '<ORCHESTRA_SERVER_URL>'
+        owner_name = principal.display_name or principal.user_id
+        # Each agent's prompt covers only the projects that agent is granted.
+        prompts = [agent_prompts.build_prompt(
+            agent, owner_name,
+            [p for p in classified if p['id'] in set(agent.get('projects') or [])],
+            generated_at, server)
+            for agent in agents if agent.get('owner') == principal.user_id]
+        return 200, {'assigned': self._task_views(assigned[:MAX_PAGE]),
+                     'to_review': self._task_views(to_review[:MAX_PAGE]),
+                     'agents': agents, 'agent_prompts': prompts,
+                     'truncated': truncated, 'unavailable': unavailable,
+                     'generated_at': generated_at}
 
     # -- feedback and audit ----------------------------------------------------
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/feedback')
@@ -1818,6 +2579,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._project(ctx, CAP_READ)
         limit, state = self._page(ctx, ctx.query)
         result = self.backend.list_feedback(ctx.params['pid'], limit, state['o'])
+        names = self.service.actor_names([f.get('user_id') for f in result['items']])
+        result['items'] = [dict(f, author_name=names.get(f.get('user_id'), f.get('actor')),
+                                at=f.get('created_at')) for f in result['items']]
         result['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query,
                                              state['o'] + limit)
                                  if state['o'] + limit < result['total'] else None)
@@ -1828,7 +2592,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._project(ctx, CAP_PROJECT_ADMIN)
         limit, state = self._page(ctx, ctx.query)
         events = [e for e in self.service.state['audit'] if e.get('project_id') == ctx.params['pid']]
-        body = {'items': events[state['o']:state['o'] + limit], 'total': len(events)}
+        page = events[state['o']:state['o'] + limit]
+        names = self.service.actor_names([e.get('user_id') for e in page])
+        body = {'items': [dict(e, user_name=names.get(e.get('user_id')), detail=e.get('reason'))
+                          for e in page], 'total': len(events)}
         body['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query,
                                            state['o'] + limit)
                                if state['o'] + limit < len(events) else None)
@@ -1850,9 +2617,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         return limit, state
 
 
-def build_handler(service, backend, *, trusted_proxies=(), max_body=MAX_BODY_BYTES):
+def build_handler(service, backend, *, trusted_proxies=(), max_body=MAX_BODY_BYTES,
+                  web_root=DEFAULT_WEB_ROOT):
     return type('ConfiguredApiHandler', (ApiHandler,), {
         'service': service, 'backend': backend,
+        'web_root': str(web_root) if web_root is not None else None,
+        'read_cache': {}, 'read_cache_lock': threading.Lock(),
         'trusted_proxies': tuple(trusted_proxies or ()),
         'max_body': max_body,
     })
@@ -1860,7 +2630,7 @@ def build_handler(service, backend, *, trusted_proxies=(), max_body=MAX_BODY_BYT
 
 def create_server(service, backend, *, host='127.0.0.1', port=0, trusted_proxies=(),
                   max_body=MAX_BODY_BYTES, certfile=None, keyfile=None,
-                  allow_plaintext_non_loopback=False):
+                  allow_plaintext_non_loopback=False, web_root=DEFAULT_WEB_ROOT):
     """Bind the service. Refuse a non-loopback plaintext listener unless explicitly allowed."""
     loopback = host in LOOPBACK
     if not loopback and certfile is None and not allow_plaintext_non_loopback:
@@ -1868,7 +2638,8 @@ def create_server(service, backend, *, host='127.0.0.1', port=0, trusted_proxies
                          'explicitly allow disposable plaintext')
     httpd = ThreadingHTTPServer((host, port), build_handler(service, backend,
                                                             trusted_proxies=trusted_proxies,
-                                                            max_body=max_body))
+                                                            max_body=max_body,
+                                                            web_root=web_root))
     httpd.daemon_threads = True
     if certfile:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -1912,6 +2683,12 @@ def main(argv=None):
                         help='canonical base URL of this service, used only to render '
                              'copyable agent setup/resume snippets (e.g. https://host)')
     parser.add_argument('--bootstrap-user', help='one-time operator bootstrap superuser')
+    web = parser.add_mutually_exclusive_group()
+    web.add_argument('--web-root', default=str(DEFAULT_WEB_ROOT),
+                     help='directory holding the browser interface served at / '
+                          '(default: the kit web/ directory)')
+    web.add_argument('--no-web', action='store_true',
+                     help='serve only the JSON API; do not serve the browser interface')
     args = parser.parse_args(argv)
 
     store = Store(args.state)
@@ -1931,9 +2708,11 @@ def main(argv=None):
     backend = build_backend(service, args)
     httpd = create_server(service, backend, host=args.host, port=args.port,
                           trusted_proxies=trusted, max_body=args.max_body,
-                          certfile=args.cert, keyfile=args.key)
-    print('orchestra-http listening on %s:%d (backend=%s)'
-          % (args.host, httpd.server_address[1], args.backend))
+                          certfile=args.cert, keyfile=args.key,
+                          web_root=None if args.no_web else args.web_root)
+    print('orchestra-http listening on %s:%d (backend=%s, web=%s)'
+          % (args.host, httpd.server_address[1], args.backend,
+             'off' if args.no_web else args.web_root))
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

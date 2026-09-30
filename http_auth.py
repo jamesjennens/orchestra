@@ -65,6 +65,11 @@ RESET_TTL_SECONDS = 30 * 60
 IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60
 LOGIN_WINDOW_SECONDS = 5 * 60
 LOGIN_MAX_ATTEMPTS = 10
+#: Account lookups (``GET /v1/accounts/lookup``) one principal may make per window. Any
+#: session can create a project and so administer one; the bound keeps the exact-match
+#: lookup from becoming a fast username enumerator. Every lookup is also audited.
+LOOKUP_WINDOW_SECONDS = 10 * 60
+LOOKUP_MAX_PER_WINDOW = 20
 AUDIT_LIMIT = 10000
 #: How long a committed canonical result stays replayable in the record store. It is a
 #: time-only retention: nothing is ever evicted by entry count or serialized bytes, and
@@ -91,6 +96,31 @@ AGENT_MAX_CREDENTIALS = 20
 AGENT_DEFAULT_SCOPES = ('tasks', 'checkpoints', 'reviews', 'feedback')
 AGENT_CONFIG_PATH = '.orchestra/agent.json'
 AGENT_SECRET_ENV = 'ORCHESTRA_AGENT_SECRET'
+
+
+def agent_slug(name):
+    """File-name-safe slug of an agent name: lowercase ``[a-z0-9-]``, at most 40 chars.
+
+    Must stay identical to ``slug()`` in ``web/js/agentSetup.js`` (tests compare them).
+    """
+    slug = re.sub(r'[^a-z0-9]+', '-', str(name or '').lower()).strip('-')[:40].strip('-')
+    return slug or 'agent'
+
+
+def agent_secret_file(name):
+    """Where the owner keeps one agent's secret: a per-agent curl config file in the
+    user profile holding one ``header = "Authorization: Bearer <secret>"`` line.
+
+    Owner's practical update of 2026-09-29 (supersedes the "VS Code secret storage or
+    OS credential store first" wording of owner decision 9 on kittrial-5bb.22): an
+    agent running in VS Code cannot read those stores, but curl reads this file with
+    ``-K``, so the secret never reaches a command line, the agent folder or Git.
+    """
+    file_name = '.orchestra-agent-%s.curlrc' % agent_slug(name)
+    return {'name': file_name,
+            'windows': '%USERPROFILE%\\' + file_name,
+            'windows_powershell': '$env:USERPROFILE\\' + file_name,
+            'posix': '~/' + file_name}
 
 # Capabilities are the single authority vocabulary for every route. A route names
 # the capability it needs; the Service decides whether the live principal holds it.
@@ -260,6 +290,15 @@ class Principal:
     def __repr__(self):
         return 'Principal(user_id=%r, via=%r, credential_id=%r)' % (
             self.user_id, self.via, self.credential_id)
+
+
+class ActorNames(dict):
+    """Actor label -> display name; a lookup with a non-string key finds nothing."""
+
+    def get(self, key, default=None):
+        if not isinstance(key, str):
+            return default
+        return dict.get(self, key, default)
 
 
 # ----------------------------------------------------------------------------- store
@@ -712,7 +751,8 @@ class Service:
                  credential_ttl=CREDENTIAL_TTL_SECONDS, reset_ttl=RESET_TTL_SECONDS,
                  idempotency_ttl=IDEMPOTENCY_TTL_SECONDS,
                  result_retention=RESULT_RETENTION_SECONDS,
-                 login_max_attempts=LOGIN_MAX_ATTEMPTS, public_url=None):
+                 login_max_attempts=LOGIN_MAX_ATTEMPTS, public_url=None,
+                 lookup_max=LOOKUP_MAX_PER_WINDOW, lookup_window=LOOKUP_WINDOW_SECONDS):
         self.store = store
         self.session_idle = session_idle
         self.session_absolute = session_absolute
@@ -725,6 +765,9 @@ class Service:
         #: setup/resume snippets. It is deployment configuration, never request data.
         self.public_url = (public_url or '').rstrip('/') or None
         self._failures = {}
+        self.lookup_max = lookup_max
+        self.lookup_window = lookup_window
+        self._lookups = {}
 
     # -- helpers ---------------------------------------------------------------
     @property
@@ -1488,6 +1531,148 @@ class Service:
             self.store.save()
         return {'id': credential_id, 'revoked': True}
 
+    # -- web interface reads (kittrial-5bb.20) ----------------------------------
+    #
+    # Each read re-checks live authority itself (the route checks it too), so a
+    # caller that reaches these methods some other way still meets the boundary.
+    def list_members(self, principal, project_id):
+        """The project's members with their display identity and role.
+
+        Readable by anyone who may read the project (``CAP_READ``): the same
+        principals already see the member ids in :meth:`project_view`. Only public
+        account fields are returned; never a verifier, session or credential.
+        """
+        with self.store.lock:
+            self.check_authority(principal, project_id, CAP_READ)
+            # Account state (disabled, superuser) is administrative detail: only a
+            # principal that administers this project's membership receives it.
+            try:
+                self.check_authority(principal, project_id, CAP_PROJECT_ADMIN)
+                admin = True
+            except HttpError:
+                admin = False
+            members = self.state['memberships'].get(project_id, {})
+            items = []
+            for user_id, role in members.items():
+                user = self.state['users'].get(user_id) or {}
+                item = {'user_id': user_id, 'username': user.get('username'),
+                        'display_name': user.get('display_name') or user_id, 'role': role}
+                if admin:
+                    item['disabled'] = bool(user.get('disabled'))
+                    item['superuser'] = bool(user.get('superuser'))
+                items.append(item)
+        items.sort(key=lambda m: ((m['display_name'] or '').lower(), m['user_id']))
+        return items
+
+    def list_worker_credentials(self, principal, project_id):
+        """Metadata of the project's worker credentials: never a secret or its hash.
+
+        Project administration (owner/superuser) only, the same authority that may
+        issue them. Personal-agent credentials are governed on the agent routes and
+        are not listed here.
+        """
+        with self.store.lock:
+            self.check_authority(principal, project_id, CAP_PROJECT_ADMIN)
+            items = []
+            for credential in self.state['credentials'].values():
+                if not isinstance(credential, dict) or credential.get('agent_id') or \
+                        credential.get('project_id') != project_id:
+                    continue
+                view = self.credential_view(credential)
+                view['user_id'] = credential.get('user_id')
+                view['user_name'] = self._owner_name(credential.get('user_id'))
+                items.append(view)
+        items.sort(key=lambda c: (c['created_at'] or '', c['id']))
+        return items
+
+    def lookup_account(self, principal, project_id, username, request_id=None):
+        """Exact username lookup for adding a member to ``project_id``.
+
+        Only a principal that may administer that project's membership can ask. The
+        match is exact (case-insensitive, as usernames are unique that way); a
+        missing, disabled or malformed-but-valid name all give the same 404.
+
+        Residual risk: any session may create a project and so administer one, so a
+        determined account holder can still test usernames one at a time. Each
+        principal is therefore held to :data:`LOOKUP_MAX_PER_WINDOW` lookups per
+        :data:`LOOKUP_WINDOW_SECONDS` (429 beyond it), and every authorized lookup is
+        audited on the project with a keyed digest of the queried name (see
+        :meth:`_lookup_digest`), never the name.
+        """
+        if principal is None or principal.via == 'credential':
+            raise forbidden('Session authority required to look up accounts')
+        if not isinstance(username, str) or not re.fullmatch(
+                r'[A-Za-z0-9][A-Za-z0-9_.@-]{1,63}', username):
+            raise invalid('username must be 2-64 characters of letters, digits, . _ @ -')
+        with self.store.lock:
+            self.check_authority(principal, project_id, CAP_PROJECT_ADMIN)
+            digest = 'username_hmac=' + self._lookup_digest(username)
+            cutoff = self._now() - self.lookup_window
+            recent = [t for t in self._lookups.get(principal.user_id, []) if t >= cutoff]
+            if len(recent) >= self.lookup_max:
+                self._lookups[principal.user_id] = recent
+                self.audit(request_id, principal, 'accounts.lookup', 'throttled',
+                           project_id=project_id, reason=digest)
+                self.store.save()
+                raise throttled('Too many account lookups; wait a few minutes and try again')
+            recent.append(self._now())
+            self._lookups[principal.user_id] = recent
+            user_id = self.state['usernames'].get(username.lower())
+            user = self.state['users'].get(user_id) if user_id else None
+            found = bool(user) and not user.get('disabled')
+            self.audit(request_id, principal, 'accounts.lookup',
+                       'found' if found else 'not_found', project_id=project_id, reason=digest)
+            self.store.save()
+            if not found:
+                raise not_found('No active account with that username')
+            return {'id': user['id'], 'username': user['username'],
+                    'display_name': user['display_name']}
+
+    def _lookup_digest(self, username):
+        """HMAC-SHA256 (first 16 hex) of the lower-cased username under a deployment key.
+
+        The key is 32 random bytes generated once and kept only in the private service
+        state (``lookup_audit_key``); it is never logged, audited or returned. A reader
+        of the audit can see that the same name was probed repeatedly but cannot
+        reverse a digest by hashing a dictionary of likely usernames. Call with
+        ``store.lock`` held.
+        """
+        key = self.state.get('lookup_audit_key')
+        if not isinstance(key, str) or len(key) < 32:
+            key = self.state['lookup_audit_key'] = secrets.token_hex(32)
+            self.store.save()
+        return hmac.new(bytes.fromhex(key), username.lower().encode('utf-8'),
+                        hashlib.sha256).hexdigest()[:16]
+
+    def actor_names(self, actors):
+        """Display names for task actors (account ids and agent ids), best effort.
+
+        Anything that is neither a known account nor a known agent keeps its label.
+        Canonical rows may carry a structured (non-string) author; looking one of
+        those up simply finds no name.
+        """
+        names = ActorNames()
+        with self.store.lock:
+            for actor in actors:
+                if not isinstance(actor, str) or actor in names:
+                    continue
+                user = self.state['users'].get(actor)
+                agent = self.state['agents'].get(actor)
+                if isinstance(user, dict):
+                    names[actor] = user.get('display_name') or actor
+                elif isinstance(agent, dict):
+                    names[actor] = '%s (agent of %s)' % (agent.get('name') or actor,
+                                                         self._owner_name(agent.get('owner')))
+                else:
+                    names[actor] = actor
+        return names
+
+    def username_of(self, user_id):
+        """The account's username, read under the store lock (``None`` if unknown)."""
+        with self.store.lock:
+            user = self.state['users'].get(user_id)
+            return user.get('username') if isinstance(user, dict) else None
+
     # -- personal agents -------------------------------------------------------
     #
     # An agent is a personal identity owned by exactly one user: "Kestrel, agent of
@@ -1507,7 +1692,33 @@ class Service:
         if not isinstance(name, str) or not AGENT_NAME.fullmatch(name.strip()):
             raise invalid('Agent name must be 1-64 characters of letters, digits, '
                           'space, . _ -')
+        # The name also names the owner's secret file (agent_secret_file); a name with
+        # no letter or digit would fall back to the generic "agent" file.
+        if not re.search(r'[A-Za-z0-9]', name):
+            raise invalid('Agent name must contain a letter or digit')
         return name.strip()
+
+    def _check_agent_file_name(self, owner_id, name, exclude_id=None):
+        """Refuse a name whose secret file would clash with another of the owner's agents.
+
+        The secret file is named from the agent name (``agent_slug``: lowercase letters,
+        digits and hyphens, at most 40 characters), so "Build bot", "build-bot" and
+        "Build_Bot" share one file, as do names that agree in their first 40
+        characters. Two agents of the same owner live in the same user profile, so a
+        second one would overwrite the first one's secret: refuse it with 409. Other
+        owners may reuse the name (different profile). Existing clashes in old state are
+        left alone and stay readable. Call with ``store.lock`` held.
+        """
+        slug = agent_slug(name)
+        for other in self.state['agents'].values():
+            if other.get('owner') == owner_id and other.get('id') != exclude_id and \
+                    agent_slug(other.get('name')) == slug:
+                raise conflict(
+                    'Agent name "%s" would share the secret file %s with your agent "%s" (%s). '
+                    'Choose a name that differs in more than case or punctuation.'
+                    % (name, agent_secret_file(name)['name'], other.get('name'), other.get('id')),
+                    {'clashes_with': other.get('id'),
+                     'secret_file': agent_secret_file(name)['name']})
 
     @staticmethod
     def _agent_text(value, field, limit):
@@ -1700,11 +1911,12 @@ class Service:
         The secret is returned once beside this payload; ``.orchestra/agent.json``
         holds only the server URL, the agent id and the project ids, so the directory
         the agent runs in is safe to keep. The snippet leads with VS Code secret
-        storage or the OS credential store (owner decision 9); an environment variable
-        is only a documented fallback, read from that store, and no command line ever
-        carries the literal secret (shell history, process list). The fallback hands
-        curl a **config file** (``-K``) that holds the header line, so the shell never
-        expands a secret into curl's argv.
+        storage or the OS credential store (owner decision 9)... superseded by the
+        owner's practical update of 2026-09-29: the secret lives in a per-agent curl
+        config file in the user profile (:func:`agent_secret_file`), Windows steps
+        first, and every call hands curl that file with ``-K``, so no command line
+        ever carries the secret (shell history, process list). The environment
+        variable remains a secondary fallback.
         """
         server_url = self.public_url
         config = {
@@ -1713,41 +1925,48 @@ class Service:
             'projects': list(projects if projects is not None else agent.get('projects') or []),
             'name': agent['name'],
         }
-        endpoint = (server_url or '<ORCHESTRA_SERVER_URL>') + '/v1/agents/me/next'
+        server = server_url or '<ORCHESTRA_SERVER_URL>'
+        secret_file = agent_secret_file(agent['name'])
         snippet = (
+            "# 1. Store the secret (once; outside the agent folder, never in Git).\n"
+            "#    Windows: open Notepad and paste this one line, with the secret shown once:\n"
+            "#      header = \"Authorization: Bearer <YOUR_AGENT_SECRET>\"\n"
+            "#    then File > Save As, \"Save as type: All files (*.*)\", file name:\n"
+            "#      %(win)s\n"
+            "#    macOS/Linux: save the same line to %(posix)s\n"
+            "#    in a text editor, then: chmod 600 %(posix)s (mode 600).\n"
+            "# 2. Test it (success prints the agent's JSON; 401 means a wrong secret or header\n"
+            "#    line; \"cannot read config\" means a wrong file name or a .txt extension):\n"
+            "#    PowerShell:  curl.exe -fsS -K \"%(ps)s\" %(server)s/v1/agents/me\n"
+            "#    macOS/Linux: curl -fsS -K %(posix)s %(server)s/v1/agents/me\n"
+            "# 3. In the agent folder (shell shown; the web page can save these files for you):\n"
             "mkdir -p .orchestra\n"
-            "cat > %s <<'JSON'\n%s\nJSON\n"
-            "printf '\\n.orchestra/\\n' >> .gitignore\n"
-            "# Store the secret shown once in VS Code secret storage or your OS\n"
-            "# credential store and let your client read it from there. Never write it\n"
-            "# into the file above, into Git, or onto a command line: a literal export\n"
-            "# would persist in shell history and the process list.\n"
-            "#\n"
-            "# Fallback only, for a machine with no secret store: keep the secret in a\n"
-            "# curl config file that only you can read (created mode 600), for example\n"
-            "# ~/.orchestra-agent-curlrc holding one line\n"
-            "#   header = \"Authorization: Bearer <YOUR_AGENT_SECRET>\"\n"
-            "# with the secret copied from your credential store - the %s\n"
-            "# environment variable may hold it on such a machine. curl reads the header\n"
-            "# from that file, so the secret never reaches the command line, shell history\n"
-            "# or the process list; never paste it into a command yourself. Then run:\n"
-            "curl -fsS -K ~/.orchestra-agent-curlrc %s\n"
-        ) % (AGENT_CONFIG_PATH, json.dumps(config, indent=2, sort_keys=True),
-             AGENT_SECRET_ENV, endpoint)
+            "cat > %(config_path)s <<'JSON'\n%(config)s\nJSON\n"
+            "[ -f .gitignore ] && ! grep -qx '.orchestra/' .gitignore && printf '\\n.orchestra/\\n' >> .gitignore\n"
+            "# Every call hands curl the config file (-K), so the secret never reaches a\n"
+            "# command line, shell history or the process list:\n"
+            "curl -fsS -K %(posix)s %(server)s/v1/agents/me/next\n"
+            "# Secondary fallback only, for a machine where that file cannot be kept: the\n"
+            "# %(env)s environment variable may hold the secret. Never write the secret\n"
+            "# on a command line, in the agent folder, in agent.json or in Git.\n"
+        ) % {'win': secret_file['windows'], 'ps': secret_file['windows_powershell'],
+             'posix': secret_file['posix'], 'server': server, 'config_path': AGENT_CONFIG_PATH,
+             'config': json.dumps(config, indent=2, sort_keys=True), 'env': AGENT_SECRET_ENV}
         return {
             'config_path': AGENT_CONFIG_PATH,
             'config': config,
             'config_contains_secret': False,
             'secret_env_var': AGENT_SECRET_ENV,
+            'secret_file': secret_file,
             'setup_snippet': snippet,
-            'guidance': 'Keep .orchestra/ out of Git. Keep the secret shown once in '
-                        'VS Code secret storage or the OS credential store and have '
-                        'the client read it from there; the %s environment variable is '
-                        'only a documented fallback, set from that store, and the '
-                        'literal secret must never appear on a command line. In the '
-                        'documented fallback curl reads the header from a mode-600 '
-                        'config file (-K), so the secret stays out of argv. It is '
-                        'shown only once.' % AGENT_SECRET_ENV,
+            'guidance': 'Keep .orchestra/ out of Git. Store the secret, shown once, in a '
+                        'per-agent curl config file in your user profile (%s on Windows, '
+                        '%s on macOS/Linux, mode 600) holding one line: header = '
+                        '"Authorization: Bearer <secret>". Every call hands curl that file '
+                        'with -K, so the secret never appears on a command line, in the '
+                        'agent folder or in Git. The %s environment variable is only a '
+                        'secondary fallback. The secret is shown only once.'
+                        % (secret_file['windows'], secret_file['posix'], AGENT_SECRET_ENV),
         }
 
     def _issue_agent_credential_locked(self, principal, agent, scopes=None, label=None):
@@ -1798,6 +2017,7 @@ class Service:
                      if a['owner'] == principal.user_id]
             if len(owned) >= AGENT_MAX_PER_OWNER:
                 raise conflict('At most %d agents per account' % AGENT_MAX_PER_OWNER)
+            self._check_agent_file_name(principal.user_id, clean_name)
             granted = self._agent_projects(principal, projects)
             agent_id = 'agent_' + secrets.token_hex(8)
             agent = {
@@ -1853,7 +2073,9 @@ class Service:
             self._refresh_authority(principal)
             agent = self._agent_owned(principal, agent_id)
             if 'name' in payload and payload.get('name') is not None:
-                agent['name'] = self._agent_name(payload.get('name'))
+                new_name = self._agent_name(payload.get('name'))
+                self._check_agent_file_name(agent['owner'], new_name, exclude_id=agent['id'])
+                agent['name'] = new_name
             for field, limit in (('tool', AGENT_TOOL_MAX), ('machine', AGENT_MACHINE_MAX),
                                  ('notes', AGENT_NOTES_MAX),
                                  ('working_directory', AGENT_DIRECTORY_MAX)):

@@ -144,7 +144,30 @@ should set `X-Forwarded-Proto https` and the service must name the proxy address
 with `--trusted-proxy` for that header to be believed (section 4); otherwise
 browser session cookies are issued without `Secure`. Do not add a wildcard CORS
 origin: credentialed requests require an explicit origin list and the service
-sends `Cache-Control: no-store` on every response.
+sends `Cache-Control: no-store` on every API response.
+
+### Web interface on the same origin
+
+The service also serves the browser interface from the kit's `web/` directory at
+`/`, on the same origin as `/v1`, so the session cookie stays `SameSite=Strict` and
+no CORS is needed. Proxy `/` as above; nothing else is required. Static serving is
+anonymous `GET`/`HEAD` only, from a fixed allowlist (`index.html`, `css/`, `js/`,
+`js/views/`, `img/`; `.html .css .js .svg .png .ico`), with no directory listing.
+The raw path is checked before decoding, so dot and percent-encoded traversal never
+match, and a symlink that resolves outside `web/` (or onto an excluded file) is
+refused. `prototype.html`, `js/prototype.js`, `js/mock.js` and `web/data/` are never
+served. Static responses carry `Content-Security-Policy: default-src 'self';
+script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self';
+frame-ancestors 'none'; base-uri 'none'; form-action 'self'`, `nosniff`,
+`Referrer-Policy: no-referrer`, `X-Frame-Options: DENY` and `Cache-Control:
+no-cache` with an `ETag`, so a redeploy is picked up on the next load.
+`--web-root DIR` serves a different copy; `--no-web` turns the interface off and
+leaves the JSON API unchanged.
+
+Slice 1 of the interface covers sign-in, projects and members, tasks, claims,
+contribution review and feedback. Requirements, decisions and records are hidden
+from its navigation (the service has no routes for them yet) and a direct link
+shows "not available on this server".
 
 ## 6. Worker clients
 
@@ -201,15 +224,42 @@ the agent record, the setup payload and the credential secret **once**; an exact
 idempotent retry returns `200` with `secret_available:false` and never re-delivers it.
 
 The setup payload writes `.orchestra/agent.json` with the server URL, the agent id and
-the project ids and no secret. The secret belongs in VS Code secret storage or the OS
-credential store; an environment variable is only a documented fallback, set from that
-store, and `.orchestra/` stays out of Git. The setup snippet never shows the literal
-secret being assigned on a command line: a literal `export` would persist in shell
-history and the process list. Its fallback keeps the secret out of curl's argv as well:
-the user writes a mode-600 curl config file from that store (the header line, e.g.
-`header = "Authorization: Bearer <YOUR_AGENT_SECRET>"` in `~/.orchestra-agent-curlrc`)
-and curl reads the header from it with `-K`, so no shell expansion ever puts the secret
-in the process list. The
+the project ids and no secret, and `.orchestra/` stays out of Git. The secret belongs in
+a per-agent curl config file in the user profile (`%USERPROFILE%\.orchestra-agent-<name>.curlrc` on Windows, `~/.orchestra-agent-<name>.curlrc` on macOS/Linux, mode 600) holding one line `header = "Authorization: Bearer <secret>"`; every call hands curl that file with `-K`. An environment variable is only a secondary fallback (`ORCHESTRA_AGENT_SECRET`).
+This is the owner's practical update of 2026-09-29, which supersedes the "VS Code secret
+storage or the OS credential store first" wording of owner decision 9 on
+kittrial-5bb.22: an agent running in VS Code cannot read those stores, while curl reads
+the file itself. `<name>` is the agent name as a slug (lowercase letters, digits and
+hyphens, at most 40 characters; `agent_slug()`), and the setup payload returns the exact
+names as `secret_file`. Because two agents of one owner share a user profile, the
+service refuses (`409`, naming the clashing agent and the file) to create or rename an
+agent whose file name would equal that of another agent of the same owner: "Build bot",
+"build-bot", "Build_Bot" and "Build.bot" are one file, as are names that agree in their
+first 40 characters. A name must contain a letter or digit, so the generic
+`.orchestra-agent-agent.curlrc` never arises for a new agent. Different owners may use
+the same name. Clashes already present in older state are left alone and stay readable;
+rename one of them (to a name that does not clash) before setting up its folder. Windows steps come first:
+
+1. Open Notepad and paste the one line with the secret shown once.
+2. File > Save As, "Save as type: All files (*.*)", file name
+   `%USERPROFILE%\.orchestra-agent-<name>.curlrc` (Windows file dialogs expand
+   `%USERPROFILE%`; no `.txt`). On macOS/Linux save `~/.orchestra-agent-<name>.curlrc`
+   and `chmod 600` it.
+3. Test it: `curl.exe -fsS -K "$env:USERPROFILE\.orchestra-agent-<name>.curlrc"
+   <server>/v1/agents/me` in PowerShell, or `curl -fsS -K ~/.orchestra-agent-<name>.curlrc
+   <server>/v1/agents/me`. Success prints the agent's JSON; `401` means a wrong secret or
+   header line; curl's "cannot read config from ..." (exit code 26) means a wrong file
+   name or a `.txt` extension.
+
+The web interface's setup dialog shows these steps with Copy buttons (the line with the
+real secret only in the dialog that has just issued it), and `.orchestra/AGENT.md` and
+the setup prompt name the agent's exact file and use `curl.exe -K`/`curl -K` for every
+call. The setup snippet and the resume prompt never show the secret on a command line: a
+literal `export` would persist in shell history and the process list, and curl reads the
+header from it with `-K`, so no shell expansion ever puts the secret in the
+process list either. A lost secret is replaced, never re-shown: `POST
+/v1/agents/{id}/credentials` issues a new one (the old credential works until revoked
+with `POST /v1/agents/{id}/credentials/{credential}/revoke`). The
 agent then calls `GET /v1/agents/me` and `GET /v1/agents/me/next` with its credential as a
 bearer token (`Authorization: Bearer <agent-secret>`); every other project route works as
 before, capped at the owner's live role and the agent's granted projects. A grant may
@@ -654,9 +704,74 @@ the pilot phase, not part of this service.
   project-scoped `GET /v1/projects/{id}/agents`,
   `GET /v1/projects/{id}/agents/{agent}` and
   `DELETE /v1/projects/{id}/agents/{agent}`) are implemented and tested. The
-  **browser screens** that render "Your agents", the working directory
-  and the copyable resume prompt are kittrial-5bb.20 and are not built here; this
-  build exposes only the JSON contract they will consume.
+  browser screens that render them are kittrial-5bb.20 (served at `/`, see
+  section 5).
+- The web interface reads `GET /v1/projects/{id}/members`,
+  `GET /v1/projects/{id}/worker-credentials` (metadata only),
+  `GET /v1/projects/{id}/tasks/{task}/brief`, `GET /v1/projects/{id}/queue`,
+  `GET /v1/me/work` and `GET /v1/accounts/lookup?username=&project=`. Over the
+  canonical binding the brief maps the canonical `brief --json` read and the queue
+  pages the canonical `work` action (bounded; `complete: false` past the bound).
+  Canonical task rows from `bd list` carry no review state, so the task list merges
+  in the review state from that same bounded `work` projection (one queue read per
+  request, shared with the queue). A closed task the projection no longer lists, or
+  a row past its bound, has `review_state: null` and no next action, and the list
+  reports `review_states_complete: false`; it never guesses "claim" or "deliver" for
+  work that may be under review.
+- **`GET /v1/me/work` cost.** On the canonical binding each project costs one bounded
+  `work` walk (up to 10 subprocess reads of 100 rows), for at most 50 of the caller's
+  projects. The same principal's read of a project is reused for 20 seconds
+  (`EndpointBackend.READ_CACHE_SECONDS`, in memory, bounded to 2048 entries), so
+  repeated page loads do not re-export every project. A principal's own successful
+  write drops their cached reads of that project, so their action shows at once.
+  Authority is never cached:
+  each project is re-authorized on every request, so a removed member loses it at
+  once; only the task data may be up to 20 seconds old on My work. The queue, brief
+  and task list always read fresh.
+- **Agent prompts on My work.** `GET /v1/me/work` also returns `agent_prompts`: one
+  copyable prompt per agent the caller owns, built by `agent_prompts.py` from the same
+  queue data, limited to the projects that agent is granted, grouped by project and
+  tailored by the caller's live role there
+  (approvers: reviews and re-reviews with revision, commit and contribution id,
+  approved-but-not-integrated, blocked, unclaimed P0/P1 and stale claims, i.e. claimed
+  with no recorded activity for 72 hours or more; workers: changes requested with the
+  pending request item ids where the backend knows them, their claimed and delivered
+  tasks, claimable tasks; viewers: a read-only status summary that tells the agent not
+  to change anything). At most 25 items, then "and N more". Every prompt carries its
+  snapshot time, tells the agent to fetch its own list first (`/v1/agents/me/next`
+  with `curl -K` and its per-agent file) and, for items that concern the owner rather
+  than the agent, to compare with `/v1/projects/<id>/queue` and
+  `/v1/projects/<id>/tasks?status=active`; to report every difference before acting;
+  to re-check each item's brief before acting; and it states that titles are labels
+  written by other people. Titles and names appear only as quoted labels (control
+  characters and line breaks removed, every quote-like character, typographic and
+  fullwidth included, turned into an apostrophe, at most 60 characters); ids are passed
+  through only if they look like ids. The server address in a prompt is `--public-url`,
+  or the `<ORCHESTRA_SERVER_URL>` placeholder when none is set; it never comes from the
+  request's `Host` header. No prompt contains or asks for a secret. On the
+  canonical binding the `work` projection gives counts but not pending request ids or
+  review times, so those lines say "read the task brief" and "wait time unknown", and
+  the blocked class is empty (see `endpoint-blocked-signal`).
+- **Review respond step (slice 2).** Canonically a requested change stays open until
+  the contributor records a `respond` resolution for it, even after a newer revision
+  arrives. The web interface cannot record responses yet; the task page says the
+  requests are still open instead of implying the new revision resolved them.
+  Contributors respond with their worker tools. (The disposable in-process backend
+  has no respond record and treats a newer revision as resolving the requests.)
+- **Account lookup residual risk.** `GET /v1/accounts/lookup` answers exact usernames
+  for a project administrator, and any account may create a project and so become
+  one; an account holder can therefore still test whether a given username exists.
+  Mitigations: exact match only (no prefix or search), the same 404 for missing,
+  partial and disabled accounts, at most 20 lookups per principal per 10 minutes
+  (`429 rate_limited` beyond that; in memory, reset on restart) and an audit event
+  per authorized lookup on that project (`accounts.lookup`, outcome
+  `found`/`not_found`/`throttled`, reason `username_hmac=<16 hex>`: HMAC-SHA256 of
+  the lower-cased name under a per-deployment key, never the name itself). The key
+  (`lookup_audit_key`) is generated once into the private service state and is never
+  logged or returned; it is backed up and restored with that state, and deleting it
+  only makes earlier digests incomparable with later ones. Operators who need stronger guarantees
+  should disable self-service project creation (section 12 of the design) so only
+  real project owners can look names up.
 - **Known limitation `endpoint-blocked-signal`.** `blocked` attention for an agent is
   derived from the in-process canonical checkpoint view (`backend.state['checkpoints']`).
   The canonical endpoint binding does not mirror checkpoints into service state, so
@@ -694,7 +809,9 @@ the pilot phase, not part of this service.
    and revoke agents in their project) and decision 9 (recommend VS Code secret
    storage or the OS credential store first, environment variable only as a
    documented fallback, never a literal `export` of the secret) are implemented in
-   this revision. The `owner-decisions-pending` checkpoint item is therefore
+   this revision. On 2026-09-29 the owner updated decision 9 in practice: the secret
+   lives in a per-agent curl config file in the user profile, used with `curl -K`
+   (section 6, "Personal agents"); the rest of decision 9 stands. The `owner-decisions-pending` checkpoint item is therefore
    resolved; the disposable-build caveat below still stands until rollout decisions
    1-6 in this list are recorded.
 

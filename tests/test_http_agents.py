@@ -196,7 +196,11 @@ class AgentRegistryTests(AgentHarness):
 
 
 class AgentSecretGuidanceTests(AgentHarness):
-    """Owner decision 9: recommend a secret store; an env var is only a fallback.
+    """Owner decision 9 as updated on 2026-09-29: a per-agent curl config file.
+
+    The secret lives in ``%USERPROFILE%\\.orchestra-agent-<slug>.curlrc`` (Windows) or
+    ``~/.orchestra-agent-<slug>.curlrc`` and every call hands it to curl with ``-K``;
+    an env var is only a secondary fallback.
 
     The one-time secret must never be shown being assigned on a command line, and
     ``.orchestra/agent.json`` must stay secretless while the secret itself is still
@@ -222,15 +226,23 @@ class AgentSecretGuidanceTests(AgentHarness):
         self.assertNotIn(secret, json.dumps(setup))
         self.assertNotRegex(snippet, r'export\s+\w+=')
         self.assertNotIn('%s=' % AGENT_SECRET_ENV, snippet)
-        # The store is named first; the environment variable is only the fallback.
-        self.assertIn('VS Code secret storage', snippet)
-        self.assertIn('credential store', snippet)
+        # The per-agent file is named first (Windows steps first); the environment
+        # variable is only a secondary fallback.
+        windows = '%USERPROFILE%\\.orchestra-agent-kestrel.curlrc'
+        self.assertEqual({'name': '.orchestra-agent-kestrel.curlrc', 'windows': windows,
+                          'windows_powershell': '$env:USERPROFILE\\.orchestra-agent-kestrel.curlrc',
+                          'posix': '~/.orchestra-agent-kestrel.curlrc'}, setup['secret_file'])
+        self.assertIn(windows, snippet)
+        self.assertIn('All files (*.*)', snippet)
+        self.assertIn('curl.exe -fsS -K "$env:USERPROFILE\\.orchestra-agent-kestrel.curlrc"',
+                      snippet)
+        self.assertLess(snippet.index(windows), snippet.index('~/.orchestra-agent-kestrel.curlrc'))
         self.assertIn('environment variable', snippet)
-        self.assertLess(snippet.index('VS Code secret storage'),
-                        snippet.index(AGENT_SECRET_ENV))
-        self.assertIn('VS Code secret storage', setup['guidance'])
-        self.assertLess(setup['guidance'].index('VS Code secret storage'),
+        self.assertLess(snippet.index(windows), snippet.index(AGENT_SECRET_ENV))
+        self.assertIn(windows, setup['guidance'])
+        self.assertLess(setup['guidance'].index(windows),
                         setup['guidance'].index(AGENT_SECRET_ENV))
+        self.assertNotIn('VS Code secret storage', snippet)
         # The config file stays secretless and the secret is still shown once.
         self.assertFalse(setup['config_contains_secret'])
         self.assertNotIn('secret', setup['config'])
@@ -293,9 +305,10 @@ class AgentSecretGuidanceTests(AgentHarness):
         self.assertEqual(200, listing.status, listing.data)
         self.assertNotIn(secret, json.dumps(listing.data))
 
-    def test_docs_recommend_the_secret_store_before_the_environment_fallback(self):
-        phrase = ('VS Code secret storage or the OS credential store; an environment '
-                  'variable is only a documented fallback')
+    def test_docs_recommend_the_secret_file_before_the_environment_fallback(self):
+        phrase = ('a per-agent curl config file in the user profile '
+                  '(`%USERPROFILE%\\.orchestra-agent-<name>.curlrc` on Windows, '
+                  '`~/.orchestra-agent-<name>.curlrc` on macOS/Linux, mode 600)')
         for name in self.DOCS:
             flat = ' '.join((ROOT / name).read_text(encoding='utf-8').split())
             self.assertIn(phrase, flat, name)
@@ -376,7 +389,13 @@ class AgentRestContractTests(AgentHarness):
         self.assertEqual('/home/priya/work/kestrel', item['working_directory'])
         self.assertIn(self.agent_id, item['resume_prompt'])
         self.assertIn('/home/priya/work/kestrel', item['resume_prompt'])
-        self.assertIn('ORCHESTRA_AGENT_SECRET', item['resume_prompt'])
+        # kittrial-5bb.48: the prompt names the per-agent secret file and hands it to
+        # curl with -K; no secret or variable ever lands on the command line.
+        self.assertIn('.orchestra-agent-kestrel.curlrc', item['resume_prompt'])
+        self.assertIn('curl.exe -fsS -K "$env:USERPROFILE\\.orchestra-agent-kestrel.curlrc"',
+                      item['resume_prompt'])
+        self.assertNotIn('Authorization', item['resume_prompt'])
+        self.assertNotIn('$ORCHESTRA_AGENT_SECRET', item['resume_prompt'])
         self.assertNotIn(self.secret, json.dumps(owner.data))
 
     def test_agent_scope_and_role_cap(self):
