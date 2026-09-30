@@ -79,6 +79,43 @@ def journal_ids(path):
         connection.close()
 
 
+def root_spellings(path):
+    """Two spellings of the same directory, or None when the platform has only one.
+
+    A Windows runner's temp directory has an 8.3 short name (``C:/Users/RUNNER~1``)
+    as well as its long form (``C:/Users/runneradmin``). A containment check that
+    compares literal paths accepts a destination inside the runtime when the root is
+    passed with one spelling and the destination resolves to the other - which is
+    how a copy destination inside the runtime reached the copy on CI. POSIX has no
+    short names, so a directory symlink alias supplies the second spelling. Returns
+    ``(short, long)`` or None where the platform offers only one spelling.
+    """
+    path = Path(path)
+    if os.name == 'nt':
+        import ctypes
+
+        def resolved(function):
+            buffer = ctypes.create_unicode_buffer(32768)
+            if not function(str(path), buffer, len(buffer)):
+                return None
+            return Path(buffer.value)
+
+        short = resolved(ctypes.windll.kernel32.GetShortPathNameW)
+        long = resolved(ctypes.windll.kernel32.GetLongPathNameW)
+        if short is None or long is None:
+            return None
+        if os.path.normcase(str(short)) == os.path.normcase(str(long)):
+            return None
+        return short, long
+    alias = path.parent / (path.name + '-alias')
+    if not alias.is_symlink():
+        try:
+            alias.symlink_to(path, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            return None
+    return alias, path.resolve()
+
+
 class RuntimeCase(unittest.TestCase):
     """A disposable runtime root with the fake ``fcntl`` the POSIX lock code needs."""
 
@@ -313,7 +350,8 @@ class BackupRepointCase(RuntimeCase):
                              return_value='name,url\ndefault,%s\n' % self.own_url('alpha')):
             report = admin.repoint_backup(self.root, 'alpha')
         run.assert_called_once_with(self.root, 'alpha',
-                                    ['backup', 'init', str(self.root / 'backups' / 'alpha')])
+                                    ['backup', 'init',
+                                     str((self.root / 'backups' / 'alpha').resolve())])
         self.assertEqual(report['row_checked'], True)
         self.assertEqual(report['backup_url'], self.own_url('alpha'))
         self.assertEqual(report['row_url'], self.own_url('alpha'))
@@ -835,6 +873,22 @@ class BackupCopyCase(RuntimeCase):
         self.assertNotEqual(code, 0)
         self.assertIn('inside the runtime', stderr)
         self.assertFalse((self.root / 'offmachine').exists())
+
+    def test_the_copy_refuses_an_inside_destination_through_an_alternate_root_spelling(self):
+        # The containment refusal must compare resolved paths: with the root spelled
+        # one way and the destination resolving to the other spelling of the same
+        # directory (8.3 short name on a Windows runner, symlink alias on POSIX), the
+        # literal-parents check let a copy destination inside the runtime through.
+        self.record()
+        spellings = root_spellings(self.root)
+        if spellings is None:
+            self.skipTest('No short/long spelling pair of the runtime root on this platform')
+        short, long = spellings
+        with self.assertRaises(SystemExit) as caught:
+            admin.backup_copy(short, str(long / 'offmachine'))
+        self.assertIn('inside the runtime', str(caught.exception))
+        self.assertIn(os.path.normcase(str(long.resolve())), os.path.normcase(str(caught.exception)))
+        self.assertFalse((long / 'offmachine').exists())
 
     def test_the_copy_refuses_a_relative_destination(self):
         self.record()
