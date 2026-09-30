@@ -759,7 +759,8 @@ class AdminRevertRecordTests(unittest.TestCase):
     MERGE = 'e' * 40
     SOURCE = 'a' * 40
     TASK_ID = 'task-1'
-    PROJECT_ID = 'task-1'
+    # A valid admin project name; the native task id stays the fixture's.
+    PROJECT_ID = 'reverttask'
 
     def setUp(self):
         # Reuse the whole-task fixture (contribution, independent approval and
