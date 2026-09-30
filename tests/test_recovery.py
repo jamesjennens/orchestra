@@ -769,6 +769,9 @@ class AdminRevertRecordTests(unittest.TestCase):
         self.fixture = IntegrationRevertTests('run')
         self.fixture.setUp()
         self.addCleanup(self.fixture.tearDown)
+        # Build the integrated chain: contribution, independent approval and the
+        # passed scoped integration the revert must name.
+        self.fixture.integration_case()
         self.rows = self.fixture.rows
         self.root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
