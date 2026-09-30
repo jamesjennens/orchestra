@@ -611,13 +611,41 @@ def journal_directory(project):
     return directory
 
 
+def revert_journal_writable(directory):
+    """Prove ``directory`` accepts a write, or ``ValueError`` so nothing is written.
+
+    ``mkdir(exist_ok=True)`` only proves the path exists; a directory that exists
+    but is not writable used to let ``revert-record`` (and the retraction path)
+    write the native comment first and then die with a raw ``PermissionError``
+    from the journal write (kittrial-5bb.52 review item ``smaller``). The probe
+    write is the real check: ``os.access`` lies for a privileged process, while a
+    create-and-remove in the directory fails exactly when the journal write would.
+    The probe name cannot collide with an entry (``<sha256>.json``) and is removed
+    again, so a reader never sees it.
+    """
+    from uuid import uuid4
+    probe = directory / ('.writable-' + uuid4().hex + '.tmp')
+    try:
+        probe.write_text('probe', encoding='utf-8')
+    except OSError as exc:
+        raise ValueError('Refusing ' + JOURNAL_DIR + ': the directory is not writable (%s); '
+                         'no native write was attempted' % (exc,)) from None
+    try:
+        probe.unlink()
+    except OSError:
+        pass
+    return directory
+
+
 def open_revert_journal(project):
     """The journal directory for a WRITER; refuses when it cannot be used.
 
     Mirrors ``requirement_records._journal``: a symlink is refused outright and the
     directory is created when missing, so a host that cannot persist the entry
     refuses BEFORE its native write instead of recording a revert no reader would
-    honour.
+    honour. A directory that exists but cannot be written is refused the same way
+    (``revert_journal_writable``), so the host never emits a native revert or
+    retraction comment it cannot journal.
     """
     if project is None:
         raise ValueError('Recording an integration revert requires the project directory that holds the '
@@ -631,7 +659,7 @@ def open_revert_journal(project):
         raise ValueError('Cannot create ' + JOURNAL_DIR + ': %s' % (exc,))
     if not directory.is_dir():
         raise ValueError(JOURNAL_DIR + ' is not a directory; refusing to record an integration revert')
-    return directory
+    return revert_journal_writable(directory)
 
 
 def publish_revert_journal(project, entry):
@@ -889,6 +917,14 @@ def apply_revert(rows, task, actor, payload, run, operator=False, operators=None
     a silent no-op and can never be recorded for work that is not integrated. A
     later ``integrated=passed`` under a different integration commit re-integrates
     the work: the revert removes exactly one recorded commit.
+
+    The operation id MUST be unpredictable (a fresh random value per revert):
+    an EXACT retry of one operation id with the same actor and payload adopts the
+    earlier native comment and journals that one instead of writing a second
+    record, which is what makes an interrupted write reconcilable (kittrial-5bb.52
+    review item ``smaller``). That adoption is payload-bound, but a predictable id
+    such as a counter lets a planted same-author, same-payload comment be adopted
+    by the real retry, so docs and examples use random ids.
     """
     if not operator:
         raise ValueError('Integration revert records are not authorized over the contributor review '

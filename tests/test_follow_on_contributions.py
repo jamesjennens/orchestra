@@ -43,6 +43,7 @@ the optional ``follows`` relation instead of being forced to declare that it
 """
 import json
 import os
+import secrets
 import shutil
 import sys
 import tempfile
@@ -680,10 +681,16 @@ from review_workflow import REVERT_PREFIX  # noqa: E402
 OPERATOR = 'coordinator-1'
 
 
-def revert_payload(operation_id='revert-1', contribution='1', integration_commit=MERGE_1,
+def revert_payload(operation_id=None, contribution='1', integration_commit=MERGE_1,
                    revert_commit='b' * 40, reason='Re-merge dropped the change',
                    evidence=None, task='task-1'):
-    payload = dict(schema_version=1, operation='revert-record', operation_id=operation_id,
+    # kittrial-5bb.52 item smaller (c): the operation id is UNPREDICTABLE per call.
+    # An exact same-id/same-payload retry is adopted onto the earlier native comment
+    # by apply_revert, so a fixture default a test can predict would let a planted
+    # comment be adopted; tests that need the retry path pass one explicit id to
+    # both calls.
+    payload = dict(schema_version=1, operation='revert-record',
+                   operation_id=operation_id or 'revert-' + secrets.token_hex(8),
                    task=task, contribution=contribution,
                    integration_commit=integration_commit, revert_commit=revert_commit,
                    reason=reason)
@@ -940,8 +947,11 @@ class IntegrationRevertTests(FollowOnChainTests):
 
     def test_revert_is_idempotent_and_refuses_a_duplicate(self):
         self.integration_case()
-        first = self.operator_revert()
-        retried = self.operator_revert()
+        # The retry path needs the SAME operation id twice; the fixture default is
+        # unpredictable, so pin one id for this test only.
+        payload = revert_payload(task=self.issue['id'])
+        first = self.operator_revert(payload)
+        retried = self.operator_revert(payload)
         self.assertTrue(retried['reconciled'])
         self.assertEqual(retried['comment_id'], first['comment_id'])
         before = len(self.issue['comments'])

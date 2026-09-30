@@ -1424,18 +1424,33 @@ def initialized_projects(root):
     return sorted(found)
 
 def revoked_revert_records(root,actor,limit=5):
-    """Name the host-issued integration revert records one operator authored.
+    """Name the host-issued records one operator's revocation changes.
 
     ``operators remove ACTOR --confirm-revoke`` makes every record that operator
     authored stop applying: voids (the pre-existing warning) and, since
-    kittrial-5bb.52, the host-issued integration revert records too, so revoking an
-    operator silently re-integrates what they reverted. Read-only and best-effort:
-    each initialized project is exported, its host journal is consulted, and a
-    project that cannot be read is reported as unreadable rather than failed --
-    the allowlist change must not depend on one broken runtime.
+    kittrial-5bb.52, the host-issued integration revert records and RETRACTIONS
+    too. Those pull in opposite directions and both must be reported: a revert the
+    actor issued stops applying, while a retraction the actor issued also stops
+    applying, which RE-APPLIES the revert it retracted (kittrial-5bb.52 review item
+    ``smaller``).
+
+    The answer is the difference between the reverts honoured under the LIVE
+    deployment allowlist and under that allowlist without ``actor``, read by the
+    same reader every other read uses. That is what makes retractions count: a
+    revert already retracted by another operator is reported as neither stopping
+    nor re-applying, and the scan never invents a single-actor authority by passing
+    the revoked actor alone. Read-only and best-effort: each initialized project is
+    exported, its host journal is consulted, and a project that cannot be read is
+    reported as unreadable rather than failed -- the allowlist change must not
+    depend on one broken runtime.
     """
     from review_workflow import revert_records
-    found=[];unreadable=0
+    def listed(found):
+        shown=', '.join(found[:limit])
+        return shown+(' (+%d more)'%(len(found)-limit) if len(found)>limit else '')
+    authority=operators(root)
+    remaining=frozenset(item for item in authority if item!=actor)
+    stopped=[];reapplied=[];unreadable=0
     for name in initialized_projects(root):
         path=project_dir(root,name)
         try:
@@ -1446,21 +1461,27 @@ def revoked_revert_records(root,actor,limit=5):
         for row in rows:
             if not isinstance(row,dict) or row.get('issue_type')=='event':continue
             try:
-                records,_=revert_records(row,[actor],path)
+                before,_=revert_records(row,authority,path)
+                after,_=revert_records(row,remaining,path)
             except (ValueError,TypeError,KeyError):
                 unreadable+=1
                 continue
-            for record in records:
-                if record.get('author')==actor:
-                    found.append(str(row.get('id') or '?')+'/'+record['comment_id'])
-    found=sorted(set(found))
-    if not found:
-        return (' (no host-issued integration revert record from this operator is visible; '
-                'projects that could not be read: %d)'%unreadable)
-    shown=', '.join(found[:limit])
-    if len(found)>limit:shown+=' (+%d more)'%(len(found)-limit)
-    return (' (host-issued integration revert records that stop applying: '+shown+
-            '; projects that could not be read: %d)'%unreadable)
+            task=str(row.get('id') or '?')
+            was={record['comment_id'] for record in before}
+            now={record['comment_id'] for record in after}
+            stopped.extend(task+'/'+cid for cid in sorted(was-now))
+            reapplied.extend(task+'/'+cid for cid in sorted(now-was))
+    stopped=sorted(set(stopped));reapplied=sorted(set(reapplied))
+    parts=[]
+    if stopped:
+        parts.append('host-issued integration revert records that stop applying: '+listed(stopped))
+    if reapplied:
+        parts.append('host-issued retractions that stop applying, so these reverted integrations '
+                     're-apply: '+listed(reapplied))
+    if not parts:
+        parts.append('no host-issued integration revert record stops or re-applies')
+    parts.append('projects that could not be read: %d'%unreadable)
+    return ' ('+'; '.join(parts)+')'
 
 
 def backup_pair_state(root,name):
@@ -2340,8 +2361,8 @@ def main():
         else:
             if not args.confirm_revoke:
                 raise ValueError('operators remove revokes ' + actor + ': voids they authored stop applying on '
-                                 'reads, and so do the integration revert records they issued'
-                                 + revoked_revert_records(root,actor) +
+                                 'reads, and so do the host-issued integration revert records and retractions '
+                                 'they authored' + revoked_revert_records(root,actor) +
                                  ' (re-add restores them). Re-run with --confirm-revoke to acknowledge this.')
             if actor in current:current.remove(actor)
         if current:cfg['operators']=current
