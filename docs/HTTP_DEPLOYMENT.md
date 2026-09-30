@@ -243,13 +243,16 @@ that project's routes and the project drops out of `/v1/agents/me/next`. It revo
 nothing else - the agent is not disabled, keeps its other projects and credentials,
 and its own owner keeps every other control.
 
-The removal is therefore **not sticky**. It drops one project from the grant; it does not
-mark the agent as barred from the project. The agent's own owner still administers the
-agent and can add that project back immediately while they are still a member of it - the
-same live grant checks apply as for any other grant, and the project owner gets no
-notification beyond the audit record. Whether a project owner should be able to block an
-agent from being re-granted is an **owner decision that is still pending**; no such block
-exists today.
+The removal is therefore **not sticky**, and that is the owner's settled decision rather than
+an open question. It drops one project from the grant; it does not mark the agent as barred
+from the project. The agent's own owner still administers the agent and can add that project
+back immediately while they are still a member of it - the same live grant checks apply as
+for any other grant, and the project owner gets no notification beyond the audit record. On
+2026-09-29 the owner resolved whether a project owner may block a re-grant (kittrial-5bb.46
+comment `01a0eea4-48b0-7045-855b-28299dfe7143`, "leave as is"): the revoke **stays
+non-sticky**, the agent's owner may re-grant while still a project member, and **no blocking
+state is added**. The control for an untrusted member is removing that member from the
+project, not barring the agent from being re-granted.
 
 Revoke an agent credential, disable the agent, disable the owner or remove the
 owner's project membership and the agent stops on its next request. The
