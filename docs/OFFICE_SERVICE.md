@@ -103,9 +103,15 @@ the supervisor exit nonzero; the external scheduler must restart it. It may run 
 follow the approved day schedule. Send SIGTERM and allow at least the selected
 `--stop-seconds` plus scheduler overhead before SIGKILL; the default child
 deadline is five seconds, shared with time reserved for Dolt; a child that
-requires SIGKILL makes the supervisor exit nonzero. The supervisor creates the
-log directory mode 0700 and its log files mode 0600. The external scheduler
-owns log rotation and retention. On a SIGKILL restart, verify backup state before
+requires SIGKILL makes the supervisor exit nonzero. The supervisor tightens the
+log directory to mode 0700 only when this run newly created it and the service
+account owns it; a pre-existing `--logs` directory (for example one owned by a
+supervisor account that collects logs as another user or group) is left with the
+mode and ownership it already has, and no chmod there can stop startup. Log files
+are always opened mode 0600 with `O_NOFOLLOW`, so their confidentiality does not
+depend on the directory mode. The external scheduler
+owns log rotation, retention, and the log directory's ownership and mode. On a
+SIGKILL restart, verify backup state before
 depending on a possibly interrupted native backup.
 
 ```sh
