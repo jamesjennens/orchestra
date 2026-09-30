@@ -2101,6 +2101,7 @@ def main():
     a.add_argument('--issue-id',dest='issue_id',default=None,
                    help='with --disposition complete, the exact native record to confirm')
     a=sub.add_parser('void-record');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('revert-record');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('operators');a.add_argument('action',choices=['list','add','remove']);a.add_argument('actor',nargs='?')
     a.add_argument('--confirm-revoke',action='store_true',dest='confirm_revoke',
                    help='with remove: acknowledge that this operator\'s earlier operator voids stop applying')
@@ -2243,6 +2244,18 @@ def main():
             fcntl.flock(lock,fcntl.LOCK_EX)
             rows=[json.loads(line) for line in run_bd(root,args.project,['export','--all']).splitlines() if line.strip()]
             print(json.dumps(apply_void(rows,payload['task'],args.actor,payload,run,operator=True,operators=authority)))
+    elif args.command=='revert-record':
+        import fcntl
+        from review_workflow import apply_revert
+        path=project_dir(root,args.project)
+        payload=json.loads(Path(args.file).read_text(encoding='utf-8-sig'))
+        if not isinstance(payload,dict) or not isinstance(payload.get('task'),str):raise ValueError('Integration revert payload must name its task')
+        authority=operators(root, strict=True)
+        def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            rows=[json.loads(line) for line in run_bd(root,args.project,['export','--all']).splitlines() if line.strip()]
+            print(json.dumps(apply_revert(rows,payload['task'],args.actor,payload,run,operator=True,operators=authority)))
     elif args.command=='operators':
         marker=root/'deployment.private.json'
         if not marker.is_file():raise ValueError('Deployment is not installed; run install first')

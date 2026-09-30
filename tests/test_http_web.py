@@ -1480,5 +1480,142 @@ console.log(JSON.stringify({
                          result['ignore'])
 
 
+
+
+# ============================================================================
+# kittrial-5bb.52: the HTTP equivalents of the any-pass-wins
+# integration disagreement warning.
+# ============================================================================
+
+from http_service import EndpointBackend, queue_item  # noqa: E402
+import types  # noqa: E402
+
+MERGE_1 = 'e' * 40
+MERGE_2 = 'f' * 40
+WARNING = ('Integration fact disagreement for the current contribution: the '
+           'any-pass-wins fact is passed under scope {source_commit=%s} but the newest '
+           'matching scope records failed under scope {source_commit=%s}; any-pass-wins is '
+           'retained by owner decision, so both facts and scopes are named here'
+           % (MERGE_1, MERGE_2))
+INTEGRATION = {'fact': 'passed', 'newest_fact': 'failed', 'scope': {'integration_commit': MERGE_1},
+               'newest_scope': {'integration_commit': MERGE_2},
+               'source_commit': 'a' * 40, 'integration_commit': MERGE_1,
+               'scope_token': 'token-1', 'newest_scope_token': 'token-2',
+               'matches_contribution': True, 'reverted': False}
+DISAGREEMENT = {'kind': 'newest-scope-disagrees', 'contribution': 'c1', 'relation': None,
+                'fact': 'passed', 'newest_fact': 'failed',
+                'scope': INTEGRATION['scope'], 'newest_scope': INTEGRATION['newest_scope']}
+
+
+def backend(work_page=None, brief=None, task=None):
+    """A canonical backend whose two canonical reads are supplied as fixtures."""
+    # Only the authority-store path is read from the service during construction.
+    service = types.SimpleNamespace(store=types.SimpleNamespace(path='/tmp/store'))
+    b = EndpointBackend(sys.executable, 'endpoint.py', '/tmp/root', service=service)
+    b._work_page = work_page
+    b._brief = brief
+    b._task = task
+
+    def run(action, project, actor, args, attachments=None, operation_id=None,
+            authority=None, require_authority=False, route=None):
+        if action == 'work':
+            return b._work_page
+        if action == 'brief':
+            return b._brief
+        if action == 'bd':
+            return b._task
+        raise AssertionError('unexpected canonical read: %s %s' % (action, args))
+
+    b._run = run
+    return b
+
+
+def work_row(warnings=(WARNING,)):
+    return {'task': 'task-1', 'title': 'Reverted work', 'owner': 'worker', 'status': 'open',
+            'review_state': 'integrated', 'contribution_id': 'c1', 'commit': 'a' * 40,
+            'pending_review_items': 0, 'review': None,
+            'integration': dict(INTEGRATION),
+            'integration_disagreements': [dict(DISAGREEMENT)],
+            'integration_warnings': list(warnings)}
+
+
+class ReviewQueueWarningsTests(unittest.TestCase):
+    def test_queue_row_carries_the_integration_block_and_warning(self):
+        page = backend(work_page={'items': [work_row()], 'total': 1, 'next_offset': None})
+        result = page.review_queue('proj')
+        self.assertTrue(result['complete'])
+        self.assertEqual(result['warnings'], [WARNING])
+        row = result['items'][0]
+        self.assertEqual(row['integration'], INTEGRATION)
+        self.assertEqual(row['integration_warnings'], [WARNING])
+        self.assertEqual(row['review_state'], 'integrated')
+        self.assertEqual(row['contribution']['id'], 'c1')
+
+    def test_review_states_read_carries_the_same_warning(self):
+        page = backend(work_page={'items': [work_row()], 'total': 1, 'next_offset': None})
+        states = page.review_states('proj')
+        self.assertEqual(states['states'], {'task-1': 'integrated'})
+        self.assertEqual(states['warnings'], [WARNING])
+
+    def test_no_warning_when_the_facts_agree(self):
+        row = work_row(warnings=())
+        row['integration_warnings'] = []
+        row['integration_disagreements'] = []
+        page = backend(work_page={'items': [row], 'total': 1, 'next_offset': None})
+        result = page.review_queue('proj')
+        self.assertEqual(result['warnings'], [])
+        self.assertEqual(result['items'][0]['integration_warnings'], [])
+
+    def test_duplicate_warnings_across_rows_are_reported_once(self):
+        page = backend(work_page={'items': [work_row(), dict(work_row(), task='task-2')],
+                                  'total': 2, 'next_offset': None})
+        self.assertEqual(page.review_queue('proj')['warnings'], [WARNING])
+
+
+class QueueItemShapeTests(unittest.TestCase):
+    def test_additive_fields_default_to_empty(self):
+        row = queue_item('proj', {'id': 'task-1', 'title': 'T'}, 'awaiting-review', None, 0)
+        self.assertIsNone(row['integration'])
+        self.assertEqual(row['integration_warnings'], [])
+
+    def test_existing_fields_are_unchanged(self):
+        row = queue_item('proj', {'id': 'task-1', 'title': 'T', 'status': 'open',
+                                  'assignee': 'worker', 'priority': 2},
+                         'awaiting-integration', {'id': 'c1'}, 3,
+                         pending_request_ids=['r1'], waiting_since='2026-09-16T00:00:00Z',
+                         integration=dict(INTEGRATION), integration_warnings=[WARNING])
+        self.assertEqual(row['id'], 'task-1')
+        self.assertEqual(row['review_state'], 'awaiting-integration')
+        self.assertEqual(row['pending_request_ids'], ['r1'])
+        self.assertEqual(row['waiting_since'], '2026-09-16T00:00:00Z')
+        self.assertEqual(row['integration'], INTEGRATION)
+        self.assertEqual(row['integration_warnings'], [WARNING])
+
+
+class TaskBriefWarningsTests(unittest.TestCase):
+    def _brief(self, **review):
+        base = {'task': 'task-1', 'checkpoint': None, 'current_position': 'p',
+                'next_action': 'n', 'acceptance': '', 'intent': '',
+                'lifecycle': {}, 'dependencies': {'items': []},
+                'review': dict({'review_state': 'integrated', 'contribution': None,
+                                'pending_requests': [], 'pending_total': 0,
+                                'latest_comment_id': 'c9', 'prior_contributions_total': 0,
+                                'warnings': [WARNING],
+                                'integration_disagreements': [DISAGREEMENT]}, **review)}
+        b = backend(brief=base, task={'id': 'task-1', 'title': 'T'})
+        return b.task_brief('proj', 'task-1')
+
+    def test_brief_carries_the_warning_and_the_structured_entries(self):
+        data = self._brief()
+        self.assertEqual(data['review']['warnings'], [WARNING])
+        self.assertEqual(data['review']['integration_disagreements'], [DISAGREEMENT])
+        self.assertEqual(data['review']['state'], 'integrated')
+
+    def test_brief_without_a_disagreement_stays_empty(self):
+        data = self._brief(warnings=[], integration_disagreements=[])
+        self.assertEqual(data['review']['warnings'], [])
+        self.assertEqual(data['review']['integration_disagreements'], [])
+
+
 if __name__ == '__main__':
     unittest.main()

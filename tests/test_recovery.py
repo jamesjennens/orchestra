@@ -749,5 +749,99 @@ class AdminVoidRecordTests(unittest.TestCase):
         self.assertEqual(self.writes, [])
 
 
+class AdminRevertRecordTests(unittest.TestCase):
+    """The audited integration revert record has one operator-only write route."""
+
+    MERGE = 'e' * 40
+    SOURCE = 'a' * 40
+
+    def setUp(self):
+        # Reuse the whole-task fixture (contribution, independent approval and
+        # passed scoped integration evidence) the revert tests already build.
+        from test_follow_on_contributions import IntegrationRevertTests
+        self.fixture = IntegrationRevertTests('run')
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.tearDown)
+        self.rows = self.fixture.rows
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        try:
+            (self.root / 'projects' / PROJECT).mkdir(parents=True)
+        except OSError as exc:  # confined environments may forbid nested temp directories
+            self.skipTest('nested temporary directory unavailable: ' + str(exc))
+        (self.root / 'deployment.private.json').write_text(
+            json.dumps({'password': 'x', 'unit': 'none', 'operators': ['operator']}), encoding='utf-8')
+        self.patcher = patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2)})
+        self.patcher.start()
+        self.addCleanup(self.patcher.stop)
+        self.writes = []
+
+    def native(self, root, name, args):
+        argv = args[2:] if args[:1] == ['--actor'] else args
+        if argv[:1] == ['export']:
+            return '\n'.join(json.dumps(row) for row in self.rows)
+        self.assertEqual(argv[:3], ['comments', 'add', TASK])
+        self.writes.append(argv)
+        self.rows[0]['comments'].append(
+            dict(id='r1', text=argv[3], author='operator', created_at=STAMP))
+        return json.dumps({'id': 'r1'})
+
+    def payload(self, **extra):
+        p = dict(schema_version=1, operation='revert-record', operation_id='rv1', task=TASK,
+                 contribution='1', integration_commit=self.MERGE, revert_commit='f' * 40,
+                 reason='The integration commit no longer contains the reviewed change')
+        p.update(extra)
+        return p
+
+    def invoke(self, payload, actor='operator'):
+        path = self.root / 'revert.json'
+        path.write_text(json.dumps(payload), encoding='utf-8')
+        argv = ['admin.py', '--root', str(self.root), 'revert-record', PROJECT, '--actor', actor,
+                '--file', str(path)]
+        with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', return_value=self.root), \
+                patch.object(admin, 'run_bd', side_effect=self.native), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            admin.main()
+        return json.loads(out.getvalue())
+
+    def test_operator_cli_writes_one_audited_revert_and_retries_idempotently(self):
+        result = self.invoke(self.payload())
+        self.assertEqual(result['contribution'], '1')
+        self.assertEqual(result['integration_commit'], self.MERGE)
+        self.assertFalse(result['reconciled'])
+        self.assertEqual(len(self.writes), 1)
+        self.assertTrue(self.writes[0][3].startswith(w.REVERT_PREFIX))
+        retried = self.invoke(self.payload())
+        self.assertTrue(retried['reconciled'])
+        self.assertEqual(retried['comment_id'], result['comment_id'])
+        self.assertEqual(len(self.writes), 1)
+
+    def test_operator_cli_refuses_an_actor_outside_the_allowlist(self):
+        with self.assertRaisesRegex(ValueError, 'not a server-side configured operator'):
+            self.invoke(self.payload(operator='rogue'), actor='rogue')
+        self.assertEqual(self.writes, [])
+
+    def test_operator_cli_refuses_without_a_task(self):
+        with self.assertRaisesRegex(ValueError, 'name its task'):
+            self.invoke({'operation': 'revert-record'})
+        self.assertEqual(self.writes, [])
+
+    def test_operator_cli_refuses_a_commit_that_is_not_the_integration(self):
+        with self.assertRaisesRegex(ValueError, 'must name the contribution integration commit'):
+            self.invoke(self.payload(integration_commit='9' * 40))
+        self.assertEqual(self.writes, [])
+
+    def test_operator_cli_refuses_an_unintegrated_contribution(self):
+        # A second, unintegrated contribution: the named commit is not the one the
+        # shared projection reports as passing for it, so nothing is written.
+        self.fixture.issue['assignee'] = 'worker'
+        p = self.fixture.contribution('d' * 40, base='b' * 40)
+        p['supersedes'] = None
+        second = self.fixture.send(p)['comment_id']
+        with self.assertRaisesRegex(ValueError, 'currently integrated'):
+            self.invoke(self.payload(contribution=second))
+        self.assertEqual(self.writes, [])
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -141,11 +141,11 @@ class Parser(argparse.ArgumentParser):
         hint=next((text for flag,text in MISTAKEN_FLAGS.items() if flag in message),None)
         raise ValueError(message+('; hint: '+hint if hint else ''))
 
-def workflow(issue,scopes=None,operators=None):
+def workflow(issue,scopes=None,operators=None,reverts=None):
     from review_state import project as reviewed
-    return reviewed(issue,scopes,operators)
+    return reviewed(issue,scopes,operators,reverts)
 
-def queue(rows,actor,args,request_dir=None, operators=None):
+def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes=None):
     if help_requested(args):return help_payload('work')
     parser=Parser(add_help=False)
     group=parser.add_mutually_exclusive_group();group.add_argument('--mine',action='store_true');group.add_argument('--owner')
@@ -171,11 +171,24 @@ def queue(rows,actor,args,request_dir=None, operators=None):
             except (OSError,json.JSONDecodeError,ValueError) as exc:
                 journal_errors.append({'path':request_file.name,'error':str(exc)[:300]})
     facts={r['id']:r for r in project_facts(rows)};evidence={r['id']:r['scopes'] for r in integration_evidence(rows)};items=[]
+    # `reverts`/`scopes` (the validated operator revert records and the lifecycle
+    # integration evidence, both already read by the caller) are optional: a direct
+    # caller that omits them gets exactly the pre-existing queue, and the shared
+    # projection falls back to reading the scopes itself.
+    from review_state import reverts_for, scopes_for
     for row in rows:
         if row.get('issue_type') in ('event','gate','merge-slot'):continue
         if owner is not None and row.get('assignee')!=owner:continue
-        try:review=workflow(row,evidence.get(row['id']),operators=operators);state=review['review_state'];error=None
+        task_reverts=reverts if reverts is not None else reverts_for(rows,row['id'],operators)
+        task_scopes=evidence.get(row['id']) if scopes is None else scopes
+        try:review=workflow(row,task_scopes,operators=operators,reverts=task_reverts);state=review['review_state'];error=None
         except ValueError as e:review={};state='error';error=str(e)[:300]
+        # The integration disagreement signal (kittrial-5bb.52): the owner decision
+        # keeps any-pass-wins, so a newer scope that disagrees with the reported
+        # fact is surfaced here instead of silently changing the answer.
+        from review_state import disagreement_warnings
+        disagreements=review.get('integration_disagreements') or []
+        integration_warnings=disagreement_warnings(disagreements)
         fact=facts.get(row['id'],{}).get('facts',{})
         if row.get('status')=='closed' and state not in ('changes-requested','awaiting-review','awaiting-integration','legacy-review-ready','error'):continue
         if a.state and a.state!=state:continue
@@ -200,11 +213,19 @@ def queue(rows,actor,args,request_dir=None, operators=None):
                       # names the current contribution. The ANY-scope answer is additive as
                       # `integration.matches_contribution`.
                       'lifecycle_matches_contribution':None if not contribution else scope.get('source_commit','').lower()==contribution['commit'].lower(),
-                      'integration':review.get('integration'),'workflow_state':review.get('workflow_state'),'error':error})
+                      'integration':review.get('integration'),'workflow_state':review.get('workflow_state'),'error':error,
+                      # Additive (kittrial-5bb.52): the integration disagreement entries
+                      # naming both facts and both scopes, and their rendered warnings.
+                      'integration_disagreements':disagreements,'integration_warnings':integration_warnings})
     priority={'changes-requested':0,'error':1,'awaiting-review':2,'legacy-review-ready':2,'awaiting-integration':3}
     items.sort(key=lambda r:(priority.get(r['review_state'],4),r['task']))
     result={'owner':owner,'total':len(items),'items':items[a.offset:a.offset+a.limit],'next_offset':a.offset+a.limit if a.offset+a.limit<len(items) else None,
             'coverage':'Fresh current view; structured review takes precedence over legacy review-ready labels. Lifecycle facts remain independent; malformed handoff journals are surfaced as errors.'}
+    warnings=[]
+    for item in items:
+        for warning in item['integration_warnings']:
+            if warning not in warnings:warnings.append(warning)
+    if warnings:warnings.sort();result['warnings']=warnings
     if journal_errors:
         result['journal_errors']=journal_errors
         result['coverage']=result['coverage']+' Journal validation completed before task filters; errors apply to this entire page.'

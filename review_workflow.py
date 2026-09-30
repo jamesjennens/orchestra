@@ -21,6 +21,15 @@ read that task until an operator voids the affected record or the tolerant reade
 is restored. ``docs/REVIEWS.md`` records the hazard, the operator remedy and the
 staged alternative (a tolerant reader in one release, the writer in the next).
 See also ``ASSIGNEE_SNAPSHOT`` below.
+
+Revert records (``Kind: integration-revert-v1``) are deliberately a SEPARATE
+record kind, not a sixth contribution-review operation. They are written only by
+the operator CLI (``admin.py revert-record``), never over the contributor review
+transport, and no existing reader looks for their prefix, so an old kit ignores
+them completely: reads keep working and no chain validation can fail. That is
+rollback-safe by construction, with one documented limit -- an old kit cannot
+SEE that a contribution was reverted (fail-open, not fail-closed). See
+``docs/REVIEWS.md``.
 """
 import json
 import re
@@ -43,6 +52,19 @@ EXTRA = {
 # exactly and refuses a record that carries it. See the module docstring and
 # docs/REVIEWS.md.
 ASSIGNEE_SNAPSHOT = 'assignee_at_approval'
+# The audited revert record. A separate reserved kind (see the module docstring),
+# written only by the operator CLI; ``issued_revert`` is its exact schema and
+# ``revert_records`` its tolerant reader.
+REVERT_PREFIX = 'Kind: integration-revert-v1\n'
+REVERT_OPERATION = 'revert-record'
+REVERT_FIELDS = {'schema_version', 'operation', 'operation_id', 'task', 'contribution',
+                 'integration_commit', 'revert_commit', 'reason',
+                 'evidence', 'operator'}
+REVERT_REQUIRED_FIELDS = REVERT_FIELDS - {'evidence'}
+REVERT_REASON_LIMIT = 1000
+REVERT_EVIDENCE_LIMIT = 8
+REVERT_BYTE_LIMIT = 24000
+COMMIT_TEXT = re.compile(r'(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})')
 
 
 def text(value, name, limit=500):
@@ -284,7 +306,7 @@ def check_void(issue, payload, voided):
 
 
 def history(issue, operators=None):
-    """Apply operator voids; return (ordered, voids, invalid, refused, positions).
+    """Apply operator voids; return (ordered, voids, invalid, refused, positions, reverts).
 
     A well-formed void that would remove a record the surviving history still
     forms is *refused*: it has no effect on the projection and is surfaced as a
@@ -294,6 +316,12 @@ def history(issue, operators=None):
     `operators` (the endpoint supplies it; None falls back to the host
     ORCHESTRA_OPERATORS configuration). `positions` maps comment id to native
     order so a void's position relative to an approval is observable.
+
+    `reverts` are the separately-prefixed, operator-audited integration revert
+    records (see ``revert_records``). They are NOT part of the contribution chain
+    and never affect its linking; an invalid one is ignored rather than raising.
+    They are returned separately so the shared projection can consult them
+    without re-reading the comments.
 
     Raises when the history cannot be reconciled even after applied voids,
     including when surviving records still reference a voided revision.
@@ -310,7 +338,8 @@ def history(issue, operators=None):
         applied[p['target']] = (p, c)
     ordered = records(issue, set(applied))
     positions = {str(c.get('id')): i for i, c in enumerate(issue.get('comments') or [])}
-    return ordered, list(applied.values()), invalid, refused, positions
+    reverts, _ = revert_records(issue, operators)
+    return ordered, list(applied.values()), invalid, refused, positions, reverts
 
 
 def apply_void(rows, task, actor, payload, run, operator=False, operators=None):
@@ -358,6 +387,176 @@ def apply_void(rows, task, actor, payload, run, operator=False, operators=None):
     return dict(comment_id=str(result['id']), reconciled=False, target=payload['target'])
 
 
+def issued_revert(p, task):
+    """Validate one revert payload. Raises for anything that is not an exact record.
+
+    The payload is the audit trail: WHO (``operator``, bound to the native comment
+    author and to the server-side allowlist by ``apply_revert``/``revert_records``),
+    WHICH integration commit is being reverted (``integration_commit``), the
+    evidence for the revert (``revert_commit`` plus optional ``evidence``
+    pointers) and WHY (``reason``). ``evidence`` is optional so "the revert commit
+    OR evidence" is enough; every other field is required. ``operator`` is
+    included in ``REVERT_REQUIRED_FIELDS`` here because the admin route stamps it
+    before the write; callers that validate an unstamped payload add it first.
+    """
+    if not isinstance(p, dict) or not REVERT_REQUIRED_FIELDS <= set(p) <= REVERT_FIELDS:
+        raise ValueError('Invalid integration revert record fields')
+    if type(p['schema_version']) is not int or p['schema_version'] != 1 or p['task'] != task:
+        raise ValueError('Invalid integration revert record version/task')
+    if p['operation'] != REVERT_OPERATION:
+        raise ValueError('Invalid integration revert record operation')
+    identity(task)
+    identity(p['operation_id'])
+    identity(p['contribution'])
+    identity(p['operator'])
+    for key in ('integration_commit', 'revert_commit'):
+        if not isinstance(p[key], str) or not COMMIT_TEXT.fullmatch(p[key]):
+            raise ValueError(f'{key}: require exact 40/64 hexadecimal commit')
+    text(p['reason'], 'revert reason', REVERT_REASON_LIMIT)
+    evidence = p.get('evidence')
+    if evidence is not None:
+        if (not isinstance(evidence, list) or len(evidence) > REVERT_EVIDENCE_LIMIT
+                or any(not isinstance(item, str) or not item.strip() or len(item) > 500
+                       for item in evidence)):
+            raise ValueError(f'evidence: require at most {REVERT_EVIDENCE_LIMIT} nonempty pointers of '
+                             'up to 500 characters')
+    if len(canonical_bytes(p)) > REVERT_BYTE_LIMIT:
+        raise ValueError('Integration revert record exceeds 24 KB')
+
+
+def revert_body(p):
+    """Canonical native comment body for one validated revert payload."""
+    return REVERT_PREFIX + canonical_bytes(p).decode()
+
+
+def revert_records(issue, operators=None):
+    """Read the revert records on one issue as ``(reverts, invalid)``.
+
+    Tolerant reader, deliberately: a revert comment that is malformed, whose
+    declared operator does not match its native author, whose author is not on the
+    server-side operator allowlist, or whose named contribution or integration
+    commit does not exist is IGNORED and listed in ``invalid``. A bad revert
+    record must never make every read on the task fail, exactly like an invalid
+    void or checkpoint, and an unaudited record must never change the projection.
+    An unconfigured allowlist therefore authorizes nobody.
+
+    Each returned entry carries ``comment_id``, ``order`` (native position),
+    ``operator``, ``contribution``, ``integration_commit``, ``revert_commit``,
+    ``reason``, ``evidence``, ``author`` and ``timestamp``.
+    """
+    authority = recovery.configured_operators(operators)
+    comments = issue.get('comments') or []
+    order = {}
+    for position, comment in enumerate(comments):
+        order.setdefault(str(comment.get('id')), position)
+    reverts = []
+    invalid = []
+    operations = set()
+    targets = set()
+    for comment in comments:
+        raw = comment.get('text', '')
+        if not isinstance(raw, str) or not raw.startswith(REVERT_PREFIX):
+            continue
+        cid = str(comment.get('id'))
+        try:
+            p = json.loads(raw[len(REVERT_PREFIX):])
+            issued_revert(p, issue['id'])
+            identity(cid)
+            author = comment.get('author')
+            text(author, 'revert record author', 300)
+            text(comment.get('created_at'), 'revert record timestamp', 100)
+            if author != p['operator']:
+                raise ValueError('Integration revert record provenance does not match its native author')
+            if author not in authority:
+                raise ValueError('Integration revert record author is not a configured operator')
+            if p['operation_id'] in operations or (p['contribution'], p['integration_commit'].lower()) in targets:
+                raise ValueError('Conflicting integration revert record')
+            operations.add(p['operation_id'])
+            targets.add((p['contribution'], p['integration_commit'].lower()))
+            reverts.append(dict(p, comment_id=cid, order=order.get(cid, len(comments)),
+                                author=author, timestamp=comment.get('created_at')))
+        except (ValueError, KeyError, TypeError):
+            invalid.append(cid)
+            continue
+    return reverts, invalid
+
+
+def apply_revert(rows, task, actor, payload, run, operator=False, operators=None):
+    """Append one audited revert record; operator is supplied only by the admin CLI.
+
+    Follows ``apply_void``: the issuing operator is bound into the record so reads
+    can verify native provenance, and the issuing actor must be on the server-side
+    operator allowlist the host supplies (deployment configuration or
+    ORCHESTRA_OPERATORS). A payload that names a different operator than the
+    issuing actor, an actor outside the allowlist, or an unconfigured allowlist is
+    refused before any native mutation, and the contributor review transport never
+    reaches this function at all.
+
+    The named contribution must exist in the chain and the named
+    ``integration_commit`` must currently be the contribution's effective passing
+    integration commit, read from the shared projection, so a revert can never be
+    a silent no-op and can never be recorded for work that is not integrated. A
+    later ``integrated=passed`` under a different integration commit re-integrates
+    the work: the revert removes exactly one recorded commit.
+    """
+    if not operator:
+        raise ValueError('Integration revert records are not authorized over the contributor review '
+                         'transport; an operator must use admin.py revert-record on the coordination host')
+    text(actor, 'actor', 300)
+    authority = recovery.configured_operators(operators)
+    if not authority:
+        raise ValueError('No operator allowlist is configured on the coordination host; add the acting '
+                         'operator to deployment.private.json before recording a revert')
+    if actor not in authority:
+        raise ValueError('Actor ' + actor + ' is not a server-side configured operator; only a configured '
+                         'operator may record a revert')
+    if not isinstance(payload, dict):
+        raise ValueError('Invalid integration revert record')
+    payload = dict(payload)
+    payload.setdefault('operator', actor)
+    if payload['operator'] != actor:
+        raise ValueError('Revert record operator must match the issuing actor')
+    issued_revert(payload, task)
+    matches = [r for r in rows if r.get('id') == task]
+    if len(matches) != 1 or matches[0].get('issue_type') == 'event':
+        raise ValueError('Task missing, duplicated or is an event')
+    issue = matches[0]
+    existing, _ = revert_records(issue, operators)
+    for p in existing:
+        if p['operation_id'] == payload['operation_id']:
+            if {k: v for k, v in p.items()
+                if k in REVERT_FIELDS} == payload and p['author'] == actor:
+                return dict(comment_id=p['comment_id'], reconciled=True,
+                            contribution=p['contribution'],
+                            integration_commit=p['integration_commit'])
+            raise ValueError('Revert operation ID already used with different payload or actor')
+        if (p['contribution'] == payload['contribution']
+                and p['integration_commit'].lower() == payload['integration_commit'].lower()):
+            raise ValueError('Another integration revert record already reverts '
+                             + payload['integration_commit'] + ' for contribution ' + payload['contribution'])
+    # Validate the whole transition before the sole native mutation: the named
+    # contribution must exist and the named commit must be the one the shared
+    # projection currently reports as its passing integration.
+    state = projection(records(issue))
+    known = [c for c in [state.get('contribution')] + list(state.get('prior_contributions') or [])
+             if isinstance(c, dict) and c.get('comment_id') == payload['contribution']]
+    if not known:
+        raise ValueError('Revert record must name the current or a prior contribution of this task: '
+                         + payload['contribution'])
+    from review_state import integration, reverts_for, scopes_for
+    evidence = integration(known[0], scopes_for(rows, task), reverts_for(rows, task, operators))
+    if evidence['fact'] != 'passed' or not evidence['integration_commit']:
+        raise ValueError('Revert record requires a contribution that is currently integrated; '
+                         'record integrated=failed lifecycle evidence instead')
+    if payload['integration_commit'].lower() != evidence['integration_commit'].lower():
+        raise ValueError('Revert record must name the contribution integration commit being reverted ('
+                         + evidence['integration_commit'] + ')')
+    result = json.loads(run(['comments', 'add', task, revert_body(payload), '--json']))
+    return dict(comment_id=str(result['id']), reconciled=False,
+                contribution=payload['contribution'],
+                integration_commit=payload['integration_commit'])
+
+
 def describe_contribution_mismatch(op, supplied, current, latest):
     """Actionable refusal for a review operation that names the wrong revision.
 
@@ -390,12 +589,16 @@ def receipt(state, rows, task):
     return {key: answer[key] for key in ('review_state', 'workflow_state', 'integration')}
 
 
-def projection(ordered, voids=None, invalid=None, refused=None, positions=None):
+def projection(ordered, voids=None, invalid=None, refused=None, positions=None, reverts=None):
     """Project the chain. ``prior_contributions`` keeps every revision the current
     one replaced visible, tagged with its ``relation`` (``follows`` additive or
     ``supersedes``), so a follow-on never removes the prior revision's record from
     the chain. The prior revision's scoped lifecycle facts are not re-scoped: they
-    stay recorded in lifecycle history under their own scope."""
+    stay recorded in lifecycle history under their own scope.
+
+    ``reverts`` is the validated operator revert list (``history`` returns it);
+    it is carried on the result as the additive ``reverts`` key so the shared
+    integration overlay can subtract exactly the reverted integration commit."""
     contribution = None; prior = []; pending = {}; approved = False; approved_id = None; latest = None
     for p, c in ordered:
         cid = str(c['id']); op = p['operation']
@@ -485,12 +688,12 @@ def projection(ordered, voids=None, invalid=None, refused=None, positions=None):
         warnings.append('Malformed or stale operator void comments ignored: ' + ', '.join(invalid[:5]))
     return dict(contribution=contribution, prior_contributions=prior, review_state=state,
                 pending_requests=list(pending.values()), latest_comment_id=latest,
-                recoveries=recoveries, warnings=warnings)
+                recoveries=recoveries, warnings=warnings, reverts=list(reverts or []))
 
 
 def project(issue, operators=None):
-    ordered, voids, invalid, refused, positions = history(issue, operators)
-    return projection(ordered, voids, invalid, refused, positions)
+    ordered, voids, invalid, refused, positions, reverts = history(issue, operators)
+    return projection(ordered, voids, invalid, refused, positions, reverts)
 
 
 def approving_entry(ordered, contribution_id):
@@ -521,7 +724,7 @@ def approving_record(ordered, contribution_id):
     return entry[1] if entry else None
 
 
-def require_integrated_follow_on(payload, state, ordered, rows, task, assignee=None):
+def require_integrated_follow_on(payload, state, ordered, rows, task, assignee=None, operators=None):
     """Refuse an additive follow-on whose prior revision is not genuinely approved.
 
     ``follows`` asserts that the reviewer's base is already integrated, so the gate
@@ -589,13 +792,13 @@ def require_integrated_follow_on(payload, state, ordered, rows, task, assignee=N
         raise ValueError('Contribution follows a revision approved by the task assignee; an additive '
                          'follow-on requires an approving record whose native author is neither the '
                          'prior contribution author nor the task assignee')
-    from review_state import integration, scopes_for
-    evidence = integration(prior, scopes_for(rows, task))
+    from review_state import integration, reverts_for, scopes_for
+    evidence = integration(prior, scopes_for(rows, task), reverts_for(rows, task, operators))
     if evidence['fact'] != 'passed' or not evidence['integration_commit']:
         raise ValueError('Contribution follows a revision that is not integrated; require a passed '
                          'integrated lifecycle fact scoped to the prior contribution commit, read from '
-                         'the shared review-state projection, before an additive follow-on can use it '
-                         'as its base')
+                         'the shared review-state projection (an operator-reverted integration commit '
+                         'does not count), before an additive follow-on can use it as its base')
     if payload['base_commit'].lower() != evidence['integration_commit'].lower():
         raise ValueError('Contribution base_commit must equal the prior integration commit '
                          + evidence['integration_commit'])
@@ -619,12 +822,15 @@ def execute(rows, task, actor, payload, run, operators=None):
     if isinstance(payload, dict) and payload.get('operation') == recovery.OPERATION:
         raise ValueError('Operator void records are not accepted over the contributor review transport; '
                          'an operator must use admin.py void-record on the coordination host')
+    if isinstance(payload, dict) and payload.get('operation') == REVERT_OPERATION:
+        raise ValueError('Integration revert records are not accepted over the contributor review '
+                         'transport; an operator must use admin.py revert-record on the coordination host')
     validate(payload, task); text(actor, 'actor', 300)
     matches = [r for r in rows if r.get('id') == task]
     if len(matches) != 1 or matches[0].get('issue_type') == 'event':
         raise ValueError('Task missing, duplicated or is an event')
-    issue = matches[0]; ordered, voids, invalid, refused, positions = history(issue, operators)
-    state = projection(ordered, voids, invalid, refused, positions)
+    issue = matches[0]; ordered, voids, invalid, refused, positions, reverts = history(issue, operators)
+    state = projection(ordered, voids, invalid, refused, positions, reverts)
     effective_state = receipt(state, rows, task)['review_state']
     # Exact retries remain recoverable after ownership changes or later revisions.
     for p, c in ordered:
@@ -652,13 +858,14 @@ def execute(rows, task, actor, payload, run, operators=None):
     preview_positions = dict(positions)
     preview_positions['pending-write'] = len(issue.get('comments') or [])
     preview = projection(ordered + [(payload, {'id': 'pending-write', 'author': actor, 'created_at': 'pending'})],
-                         voids, invalid, refused, preview_positions)
+                         voids, invalid, refused, preview_positions, reverts)
     # A follow-on may only base itself on a prior revision approved by a distinct
     # native author and genuinely integrated. Resolve the approving record from the
     # chain and the integration evidence from the shared review-state projection
     # here, still before the sole native mutation, so the refusal writes nothing.
     if payload['operation'] == 'contribute' and payload.get('follows') is not None:
-        require_integrated_follow_on(payload, state, ordered, rows, task, issue.get('assignee'))
+        require_integrated_follow_on(payload, state, ordered, rows, task, issue.get('assignee'),
+                                     operators)
     result = json.loads(run(['comments', 'add', task, PREFIX + canonical_bytes(payload).decode(), '--json']))
     return dict(comment_id=str(result['id']), reconciled=False, **receipt(preview, rows, task))
 

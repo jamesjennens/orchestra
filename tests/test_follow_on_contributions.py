@@ -42,6 +42,7 @@ the optional ``follows`` relation instead of being forced to declare that it
   failure.
 """
 import json
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -541,7 +542,8 @@ class FollowOnChainTests(unittest.TestCase):
         for entry in review['prior_contributions']:
             self.assertEqual(set(entry),
                              {'comment_id', 'commit', 'relation', 'timestamp', 'integration'})
-            self.assertIn(entry['integration']['fact'], ('unknown', 'passed', 'failed'))
+            self.assertIn(entry['integration']['fact'],
+                          ('unknown', 'passed', 'failed', 'reverted'))
         # The recent slice preserves order and matches the complete projection.
         self.assertEqual([c['comment_id'] for c in review['prior_contributions']],
                          [c['comment_id'] for c in complete['prior_contributions'][-briefing.PRIOR_BRIEF_LIMIT:]])
@@ -659,6 +661,338 @@ class FollowOnChainTests(unittest.TestCase):
                             prior['integration']['scope_token'])
         # A newest-wins reading is not what the projection now does or did before.
         self.assertTrue(prior['integration']['matches_contribution'])
+
+
+# ===========================================================================
+# kittrial-5bb.52: the integration disagreement warning and the explicit
+# audited revert record. The owner decision on kittrial-5bb.32 (comment
+# 01a0eea4) keeps any-pass-wins, so a conflict between `newest_fact` and `fact`
+# is warned about instead of silently changing the answer, and removing an
+# integrated commit is a separate operator-audited record.
+# ===========================================================================
+
+from review_state import disagreement_warnings, integration_disagreements  # noqa: E402
+from requirements import canonical_bytes  # noqa: E402
+from review_workflow import REVERT_PREFIX  # noqa: E402
+
+OPERATOR = 'coordinator-1'
+
+
+def revert_payload(operation_id='revert-1', contribution='1', integration_commit=MERGE_1,
+                   revert_commit='b' * 40, reason='Re-merge dropped the change',
+                   evidence=None):
+    payload = dict(schema_version=1, operation='revert-record', operation_id=operation_id,
+                   task='task-1', contribution=contribution,
+                   integration_commit=integration_commit, revert_commit=revert_commit,
+                   reason=reason)
+    if evidence is not None:
+        payload['evidence'] = evidence
+    return payload
+
+
+class IntegrationRevertTests(FollowOnChainTests):
+    """The (a) warning and (b) revert record for the shared integration projection."""
+
+    def tearDown(self):
+        os.environ.pop('ORCHESTRA_OPERATORS', None)
+
+    # -- fixtures ----------------------------------------------------------
+    def append_revert(self, payload, author=OPERATOR):
+        """Append a revert comment exactly as the operator CLI would."""
+        cid = str(len(self.issue['comments']) + 1)
+        body = REVERT_PREFIX + canonical_bytes(payload).decode()
+        self.issue['comments'].append(dict(id=cid, text=body, author=author,
+                                           created_at='2026-09-16T00:00:00Z'))
+        return cid
+
+    def operator_revert(self, payload=None, actor=OPERATOR):
+        """Run the operator write path with the deployment allowlist configured."""
+        os.environ['ORCHESTRA_OPERATORS'] = OPERATOR
+
+        def run(args):
+            cid = str(len(self.issue['comments']) + 1)
+            self.issue['comments'].append(dict(id=cid, text=args[3], author=actor,
+                                               created_at='2026-09-16T00:00:00Z'))
+            return json.dumps({'id': cid})
+
+        return w.apply_revert(self.rows, 'task-1', actor, payload or revert_payload(), run,
+                              operator=True, operators=[OPERATOR])
+
+    def reviewed(self, operators=None):
+        """The shared projection with the operator allowlist the host supplies."""
+        from review_state import project as reviewed
+        return reviewed(self.issue, self.scopes(),
+                        [OPERATOR] if operators is None else operators)
+
+    def scopes(self):
+        from review_state import scopes_for
+        return scopes_for(self.rows, 'task-1')
+
+    def warning_lines(self, state):
+        return [w for w in state['warnings'] if w.startswith('Integration fact disagreement')]
+
+    # -- (a) the disagreement warning --------------------------------------
+    def test_current_contribution_warns_when_the_newest_scope_disagrees(self):
+        self.integration_case()
+        # A newer matching scope records a failure; any-pass-wins keeps the pass.
+        self.record_lifecycle(COMMIT_1, MERGE_2, scope_op='scope-2', value='failed')
+        state = self.reviewed()
+        block = state['integration']
+        self.assertEqual((block['fact'], block['newest_fact']), ('passed', 'failed'))
+        self.assertEqual(block['scope']['integration_commit'], MERGE_1)
+        self.assertEqual(block['newest_scope']['integration_commit'], MERGE_2)
+        # The structured signal names both facts and both scopes.
+        self.assertEqual(len(state['integration_disagreements']), 1)
+        entry = state['integration_disagreements'][0]
+        self.assertEqual(entry['kind'], 'newest-scope-disagrees')
+        self.assertEqual((entry['fact'], entry['newest_fact']), ('passed', 'failed'))
+        self.assertEqual(entry['scope']['integration_commit'], MERGE_1)
+        self.assertEqual(entry['newest_scope']['integration_commit'], MERGE_2)
+        self.assertEqual(entry['contribution'], self.issue['comments'][0]['id'])
+        # The human-readable warning travels on the read and renders in the brief.
+        lines = self.warning_lines(state)
+        self.assertEqual(len(lines), 1)
+        self.assertIn(MERGE_1, lines[0])
+        self.assertIn(MERGE_2, lines[0])
+        result = briefing.brief(self.rows, 'proj', 'task-1', operators=[OPERATOR])
+        self.assertTrue(any(w.startswith('Integration fact disagreement')
+                            for w in result['warnings']))
+        rendered = briefing.format_brief(result)
+        self.assertIn('Integration fact disagreement', rendered)
+        self.assertIn(MERGE_1, rendered)
+        self.assertIn(MERGE_2, rendered)
+
+    def test_no_warning_when_the_newest_scope_agrees(self):
+        self.integration_case()
+        state = self.reviewed()
+        self.assertEqual(state['integration']['fact'], 'passed')
+        self.assertEqual(state['integration']['newest_fact'], 'passed')
+        self.assertEqual(state['integration_disagreements'], [])
+        self.assertEqual(self.warning_lines(state), [])
+
+    def test_prior_contribution_disagreement_is_warned_about(self):
+        first = self.integration_case()
+        self.record_lifecycle(COMMIT_1, MERGE_2, scope_op='scope-2', value='failed')
+        self.send(self.contribution(COMMIT_2, base=MERGE_1, supersedes=None, follows=first))
+        state = self.reviewed()
+        prior = state['prior_contributions'][0]
+        self.assertEqual((prior['integration']['fact'], prior['integration']['newest_fact']),
+                         ('passed', 'failed'))
+        entries = [d for d in state['integration_disagreements'] if d['contribution'] == first]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]['relation'], 'follows')
+        self.assertEqual(entries[0]['scope']['integration_commit'], MERGE_1)
+        self.assertEqual(entries[0]['newest_scope']['integration_commit'], MERGE_2)
+        self.assertTrue(any(first in line for line in self.warning_lines(state)))
+        result = briefing.brief(self.rows, 'proj', 'task-1', operators=[OPERATOR])
+        self.assertTrue(any(first in w for w in result['warnings']
+                            if w.startswith('Integration fact disagreement')))
+
+    def test_work_row_and_page_carry_the_disagreement(self):
+        from work import queue
+        self.integration_case()
+        self.record_lifecycle(COMMIT_1, MERGE_2, scope_op='scope-2', value='failed')
+        page = queue(self.rows, 'worker', ['--mine'], operators=[OPERATOR])
+        item = page['items'][0]
+        self.assertEqual(item['integration']['fact'], 'passed')
+        self.assertEqual(item['integration']['newest_fact'], 'failed')
+        self.assertEqual(len(item['integration_disagreements']), 1)
+        self.assertTrue(item['integration_warnings'][0].startswith('Integration fact disagreement'))
+        self.assertTrue(page['warnings'])
+        self.assertIn(MERGE_1, page['warnings'][0])
+        self.assertIn(MERGE_2, page['warnings'][0])
+
+    def test_work_row_has_no_warning_when_the_facts_agree(self):
+        from work import queue
+        self.integration_case()
+        item = queue(self.rows, 'worker', ['--mine'], operators=[OPERATOR])['items'][0]
+        self.assertEqual(item['integration_disagreements'], [])
+        self.assertEqual(item['integration_warnings'], [])
+
+    def test_disagreement_helpers_are_pure(self):
+        self.integration_case()
+        self.record_lifecycle(COMMIT_1, MERGE_2, scope_op='scope-2', value='failed')
+        state = self.reviewed()
+        self.assertEqual(integration_disagreements(state), state['integration_disagreements'])
+        self.assertEqual(disagreement_warnings(state['integration_disagreements']),
+                         self.warning_lines(state))
+        # A raw workflow projection (no integration block) yields nothing.
+        self.assertEqual(integration_disagreements(w.project(self.issue)), [])
+
+    # -- (b) the revert record ---------------------------------------------
+    def test_transport_refuses_a_revert_payload(self):
+        self.integration_case()
+        before = len(self.issue['comments'])
+        with self.assertRaisesRegex(ValueError, 'admin.py revert-record'):
+            self.send(revert_payload())
+        self.assertEqual(len(self.issue['comments']), before)
+
+    def test_apply_revert_refuses_without_the_operator_flag(self):
+        self.integration_case()
+        before = len(self.issue['comments'])
+        with self.assertRaisesRegex(ValueError, 'not authorized over the contributor review transport'):
+            w.apply_revert(self.rows, 'task-1', OPERATOR, revert_payload(), self.run_native,
+                           operators=[OPERATOR])
+        self.assertEqual(len(self.issue['comments']), before)
+
+    def test_apply_revert_refuses_an_unconfigured_allowlist(self):
+        self.integration_case()
+        before = len(self.issue['comments'])
+        with self.assertRaisesRegex(ValueError, 'No operator allowlist'):
+            w.apply_revert(self.rows, 'task-1', OPERATOR, revert_payload(), self.run_native,
+                           operator=True, operators=[])
+        self.assertEqual(len(self.issue['comments']), before)
+
+    def test_apply_revert_refuses_an_actor_outside_the_allowlist(self):
+        self.integration_case()
+        before = len(self.issue['comments'])
+        with self.assertRaisesRegex(ValueError, 'not a server-side configured operator'):
+            w.apply_revert(self.rows, 'task-1', 'worker', revert_payload(), self.run_native,
+                           operator=True, operators=[OPERATOR])
+        self.assertEqual(len(self.issue['comments']), before)
+
+    def test_record_whose_author_is_not_an_operator_is_ignored(self):
+        self.integration_case()
+        self.append_revert(revert_payload(), author='worker')
+        reverts, invalid = w.revert_records(self.issue, [OPERATOR])
+        self.assertEqual(reverts, [])
+        self.assertEqual(len(invalid), 1)
+        state = self.reviewed()
+        self.assertEqual(state['integration']['fact'], 'passed')
+        self.assertFalse(state['integration']['reverted'])
+
+    def test_revert_removes_the_named_integration_commit(self):
+        first = self.integration_case()
+        receipt = self.operator_revert()
+        self.assertFalse(receipt['reconciled'])
+        self.assertEqual(receipt['contribution'], first)
+        self.assertEqual(receipt['integration_commit'], MERGE_1)
+        block = self.reviewed()['integration']
+        self.assertEqual(block['fact'], 'reverted')
+        self.assertTrue(block['reverted'])
+        self.assertTrue(block['matches_contribution'])
+        self.assertEqual(block['scope']['integration_commit'], MERGE_1)
+        # The raw chain still records the approval; only the integration answer moved.
+        self.assertEqual(w.project(self.issue)['review_state'], 'awaiting-integration')
+
+    def test_revert_is_idempotent_and_refuses_a_duplicate(self):
+        self.integration_case()
+        first = self.operator_revert()
+        retried = self.operator_revert()
+        self.assertTrue(retried['reconciled'])
+        self.assertEqual(retried['comment_id'], first['comment_id'])
+        before = len(self.issue['comments'])
+        with self.assertRaisesRegex(ValueError, 'already reverts'):
+            self.operator_revert(revert_payload(operation_id='revert-2'))
+        self.assertEqual(len(self.issue['comments']), before)
+
+    def test_revert_requires_a_currently_integrated_contribution(self):
+        first = self.send(self.contribution(COMMIT_1))['comment_id']
+        before = len(self.issue['comments'])
+        with self.assertRaisesRegex(ValueError, 'requires a contribution that is currently integrated'):
+            self.operator_revert(revert_payload(contribution=first))
+        self.assertEqual(len(self.issue['comments']), before)
+
+    def test_revert_must_name_the_reported_integration_commit(self):
+        first = self.integration_case()
+        before = len(self.issue['comments'])
+        with self.assertRaisesRegex(ValueError, 'must name the contribution integration commit'):
+            self.operator_revert(revert_payload(contribution=first, integration_commit=MERGE_2))
+        self.assertEqual(len(self.issue['comments']), before)
+
+    def test_revert_must_name_a_known_contribution(self):
+        self.integration_case()
+        before = len(self.issue['comments'])
+        with self.assertRaisesRegex(ValueError, 'current or a prior contribution'):
+            self.operator_revert(revert_payload(contribution='999'))
+        self.assertEqual(len(self.issue['comments']), before)
+
+    def test_later_passed_fact_with_another_integration_commit_reintegrates(self):
+        self.integration_case()
+        self.operator_revert()
+        self.assertEqual(self.reviewed()['integration']['fact'], 'reverted')
+        # The explicit re-integration evidence: a NEW passing scope/commit.
+        self.record_lifecycle(COMMIT_1, MERGE_2, scope_op='scope-2')
+        block = self.reviewed()['integration']
+        self.assertEqual(block['fact'], 'passed')
+        self.assertFalse(block['reverted'])
+        self.assertEqual(block['integration_commit'], MERGE_2)
+        self.assertEqual(self.shared()['review_state'], 'integrated')
+
+    def test_reverting_a_prior_contribution_is_reported_by_the_follow_on(self):
+        first = self.integration_case()
+        second = self.send(self.contribution(COMMIT_2, base=MERGE_1, supersedes=None,
+                                             follows=first))['comment_id']
+        self.operator_revert(revert_payload(contribution=first))
+        state = self.reviewed()
+        prior = state['prior_contributions'][0]
+        self.assertEqual(prior['comment_id'], first)
+        self.assertEqual(prior['integration']['fact'], 'reverted')
+        self.assertTrue(prior['integration']['reverted'])
+        self.assertEqual(state['contribution']['comment_id'], second)
+
+    def test_reverted_base_is_refused_with_no_write(self):
+        first = self.integration_case()
+        self.operator_revert(revert_payload(contribution=first))
+        before = len(self.issue['comments'])
+        with self.assertRaisesRegex(ValueError, 'not integrated'):
+            self.send(self.contribution(COMMIT_2, base=MERGE_1, supersedes=None, follows=first))
+        self.assertEqual(len(self.issue['comments']), before)
+
+    def test_base_after_revert_is_accepted_again_once_reintegrated(self):
+        first = self.integration_case()
+        self.operator_revert(revert_payload(contribution=first))
+        # The explicit re-integration evidence becomes the newest passing scope, so
+        # the accepted base is its integration commit again.
+        self.record_lifecycle(COMMIT_1, MERGE_2, scope_op='scope-2')
+        before = len(self.issue['comments'])
+        self.send(self.contribution(COMMIT_2, base=MERGE_2, supersedes=None, follows=first))
+        self.assertEqual(len(self.issue['comments']), before + 1)
+
+    def test_revert_of_one_of_two_passing_scopes_refuses_that_base(self):
+        first = self.integration_case()
+        self.record_lifecycle(COMMIT_1, MERGE_2, scope_op='scope-2')
+        self.operator_revert(revert_payload(contribution=first, integration_commit=MERGE_2))
+        block = self.reviewed()['integration']
+        # Any-pass-wins keeps the work integrated through the OTHER, unreverted
+        # scope, and the reported base moves back to that surviving pass.
+        self.assertEqual(block['fact'], 'passed')
+        self.assertEqual(block['integration_commit'], MERGE_1)
+        self.assertEqual(block['newest_scope']['integration_commit'], MERGE_2)
+        before = len(self.issue['comments'])
+        with self.assertRaisesRegex(ValueError, 'must equal the prior integration commit'):
+            self.send(self.contribution(COMMIT_2, base=MERGE_2, supersedes=None, follows=first))
+        self.assertEqual(len(self.issue['comments']), before)
+        self.send(self.contribution(COMMIT_2, base=MERGE_1, supersedes=None, follows=first))
+        self.assertEqual(len(self.issue['comments']), before + 1)
+
+    def test_old_chain_reader_ignores_the_new_record(self):
+        """Rollback compatibility: an old kit only knows the chain prefix.
+
+        The revert comment sits in the middle of the chain; the pre-existing reader
+        still walks the chain, so nothing fails. The documented limit is fail-open:
+        the old kit cannot SEE the revert.
+        """
+        first = self.integration_case()
+        self.operator_revert(revert_payload(contribution=first))
+        ordered = w.records(self.issue)
+        self.assertEqual([p['operation'] for p, _ in ordered], ['contribute', 'approve'])
+        self.assertEqual(w.project(self.issue)['contribution']['comment_id'], first)
+
+    def test_revert_record_does_not_change_any_existing_record_schema(self):
+        self.assertEqual(w.EXTRA['approve'], {'contribution', 'summary'})
+        self.assertEqual(w.EXTRA['contribute'],
+                         {'repository', 'commit', 'base_commit', 'delivery', 'summary', 'supersedes'})
+        self.assertNotIn('revert-record', w.EXTRA)
+        self.assertEqual(w.REVERT_PREFIX, 'Kind: integration-revert-v1\n')
+
+    def test_malformed_revert_comment_is_ignored_not_fatal(self):
+        self.integration_case()
+        cid = str(len(self.issue['comments']) + 1)
+        self.issue['comments'].append(dict(id=cid, text=REVERT_PREFIX + '{not json',
+                                           author=OPERATOR, created_at='2026-09-16T00:00:00Z'))
+        self.assertEqual(self.reviewed()['integration']['fact'], 'passed')
+        self.assertEqual(w.revert_records(self.issue, [OPERATOR])[1], [cid])
 
 
 if __name__ == '__main__':

@@ -32,6 +32,8 @@ ITEM_FIELDS = {
     'lifecycle_matches_contribution', 'error',
     # Additive fields from the shared review-state projection (kittrial-5bb.24).
     'workflow_state', 'integration',
+    # Additive integration disagreement signal (kittrial-5bb.52).
+    'integration_disagreements', 'integration_warnings',
 }
 BRIEF_FIELDS = {
     'task', 'title', 'owner', 'status', 'activity_cursor', 'checkpoint', 'intent',
