@@ -22,7 +22,7 @@ DOCUMENTS = {
     'decision-template': 'templates/DECISION.md',
 }
 PROJECT_LIMIT = 8000
-ENDPOINT_REFERENCE = re.compile(r'(?:[A-Za-z]:)?[\\/][A-Za-z0-9_.\\/-]*\.py')
+ENDPOINT_REFERENCE = re.compile(r'(?:[A-Za-z]:)?[\\/][A-Za-z0-9_.~\\/-]*\.py')
 ENDPOINT_REFUSAL = 'serves only'
 
 def write_project(path, text):
@@ -66,19 +66,25 @@ def probe_endpoints(text, project, kit):
     names and reports the ones carrying the guard. It is deterministic and
     offline: nothing is executed and no request is sent, so a server with no
     network still gets the warning. The caller warns and still installs the
-    document; the probe never blocks or changes the write.
+    document; the probe never blocks or changes the write. A reference is reported
+    by its resolved path, so a Windows 8.3 short name and its long form describe
+    one file rather than hiding or duplicating it.
     """
     generic=(Path(kit).resolve()/'endpoint.py')
-    warnings=[]
-    for reference in dict.fromkeys(ENDPOINT_REFERENCE.findall(text)):
+    warnings=[];seen=set()
+    for reference in ENDPOINT_REFERENCE.findall(text):
         try:
-            path=Path(reference)
-            if path.resolve()==generic:continue
+            path=Path(reference).resolve()
+        except (OSError,RuntimeError):
+            continue  # not a usable path on this host
+        if path==generic or path in seen:continue
+        seen.add(path)
+        try:
             source=path.read_text(encoding='utf-8-sig')
         except (OSError,UnicodeError,RuntimeError):
             continue  # not on this host, or not text: nothing deterministic to probe
         if ENDPOINT_REFUSAL in source.lower():
-            warnings.append(f'WARNING: the onboarding document for {project} names endpoint {reference}, '
+            warnings.append(f'WARNING: the onboarding document for {project} names endpoint {path}, '
                             f'which refuses projects other than its own ("{ENDPOINT_REFUSAL}"); workers must '
                             f'use the kit endpoint {generic} instead. The document was still installed; '
                             f'correct the endpoint and reinstall it.')

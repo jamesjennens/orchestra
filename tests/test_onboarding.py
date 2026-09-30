@@ -75,6 +75,30 @@ class OnboardingTests(unittest.TestCase):
         self.assertIn(str(generic.resolve()),warnings[0])
         self.assertIn('serves only',warnings[0])
         self.assertEqual(o.probe_endpoints('endpoint: /no/such/host/endpoint.py','example',self.kit),[])
+    def test_endpoint_probe_reads_a_reference_through_a_short_name_directory(self):
+        # A Windows runner's temp directory carries an 8.3 short name (RUNNER~1). The
+        # path pattern must allow the '~', or the reference is matched only from the
+        # next separator, read as a non-existent relative path, and silently skipped -
+        # which is how a restricted endpoint produced no warning on CI.
+        short=self.root/'RUNNER~1';short.mkdir()
+        generic=self.kit/'endpoint.py';generic.write_text('# serves every project\n',encoding='utf-8')
+        wrapper=short/'wrapper-endpoint.py'
+        wrapper.write_text("raise SystemExit('This deployment serves only other')\n",encoding='utf-8')
+        warnings=o.probe_endpoints(f'Canonical service/endpoint: {generic}\nworker wrapper: {wrapper}\n',
+                                   'example',self.kit)
+        self.assertEqual(len(warnings),1)
+        self.assertIn(str(wrapper.resolve()),warnings[0])
+        self.assertIn(str(generic.resolve()),warnings[0])
+        self.assertIn('serves only',warnings[0])
+    def test_endpoint_probe_reports_one_warning_for_two_spellings_of_one_endpoint(self):
+        generic=self.kit/'endpoint.py';generic.write_text('# serves every project\n',encoding='utf-8')
+        wrapper=self.root/'wrapper-endpoint.py'
+        wrapper.write_text("raise SystemExit('This deployment serves only other')\n",encoding='utf-8')
+        alias=self.root/'alias-endpoint.py'
+        try:alias.symlink_to(wrapper)
+        except OSError:self.skipTest('No symlink privilege')
+        document=f'Canonical service/endpoint: {generic}\nfirst: {wrapper}\nalias: {alias}\n'
+        self.assertEqual(len(o.probe_endpoints(document,'example',self.kit)),1)
     @unittest.skipIf(sys.platform=='win32','set-onboarding takes the POSIX coordination lock')
     def test_set_onboarding_warns_but_still_installs_a_restricted_endpoint(self):
         project=self.root/'projects'/'example';(project/'.beads').mkdir(parents=True)

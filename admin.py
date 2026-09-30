@@ -1588,6 +1588,20 @@ def copy_destination_path(value):
         raise ValueError('Destination path must not contain whitespace')
     return path
 
+def path_is_within(path,directory):
+    """Whether ``path`` names ``directory`` itself or a location inside it.
+
+    ``Path.resolve`` collapses 8.3 short names (``C:/Users/RUNNER~1`` on a Windows
+    runner), symlinks and ``..`` so one runtime cannot be spelled two ways, and
+    ``normcase`` folds the case difference Windows ignores. Comparing the literal
+    spelling instead let a destination inside the runtime pass the containment
+    refusal whenever the root was spelled with its short name.
+    """
+    path=Path(path).resolve();directory=Path(directory).resolve()
+    return (os.path.normcase(str(path))==os.path.normcase(str(directory))
+            or any(os.path.normcase(str(parent))==os.path.normcase(str(directory))
+                   for parent in path.parents))
+
 def _replace_with(staged,target):
     """Move ``staged`` onto ``target``, replacing it fully instead of merging.
 
@@ -1663,9 +1677,9 @@ def backup_copy(root,destination):
         destination=copy_destination_path(destination)
     except ValueError as error:
         raise SystemExit('backup-copy refused: '+str(error)) from None
-    if destination==root or root in destination.parents:
+    if path_is_within(destination,root):
         raise SystemExit('backup-copy refused: destination %s is inside the runtime %s; use an off-machine '
-                         'location'%(destination,root))
+                         'location'%(destination,Path(root).resolve()))
     backups=root/'backups'
     destination.mkdir(parents=True,exist_ok=True)
     target_status=destination/BACKUP_STATUS_NAME
