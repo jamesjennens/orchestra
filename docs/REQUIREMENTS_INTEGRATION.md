@@ -185,6 +185,19 @@ python admin.py --root /path/to/runtime requirement-apply example \
   --actor operator --file record.json
 ```
 
+The file passed to `admin.py` must carry `operation` itself; this is the one place
+it differs from the `requirement_records.py draft`/`revise` payloads above, where
+the subcommand supplies it. Accepting or demoting an existing record writes the
+record's next revision, so the first example uses `"operation": "revise"`, and that
+`revise` example is accepted unchanged by the contributor form
+`requirement_records.validate_payload(payload)` (run it first; the validator reads
+the file and writes nothing). The accepted-first-revision example is an operator
+payload: check it with the operator form
+`requirement_records.validate_payload(payload, operator=True)`, because the
+contributor form (default `operator=False`) refuses `operation: "draft"` with
+`acceptance_state: "accepted"`, while `operator=True` additionally runs the F3
+acceptance check.
+
 Acceptance without evidence, a contributor acceptance attempt, a contributor
 acceptance object on a draft, and contributor demotion are all refused before any
 native write.
