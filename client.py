@@ -148,6 +148,33 @@ def request(config,project,actor,args,action='bd',path=None):
     try:return json.loads(p.stdout)
     except json.JSONDecodeError:raise RuntimeError('Invalid endpoint response; inspect state before retrying.') from None
 
+def _capability(args,out):
+    """Client-side, read-only capability lookup over the caller's own checkout.
+
+    It never contacts the endpoint and needs no config, project or actor. The
+    module is loaded from this client's own directory by path, so an unrelated
+    `capabilities` module elsewhere on sys.path is never used; a standalone client
+    copied without it gets a clear refusal instead.
+    """
+    import importlib.util
+    module_path = Path(__file__).resolve().parent/'capabilities.py'
+    if not module_path.is_file():
+        sys.stderr.write('ValueError: capability commands need capabilities.py from the same Orchestra kit '
+                         'next to this client\n')
+        return 2
+    spec = importlib.util.spec_from_file_location('orchestra_capabilities', module_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    code,stdout,stderr = module.run(args)
+    if out:
+        # Same client-owned capture as the endpoint actions: UTF-8, LF, no BOM,
+        # and no file at all on a nonzero exit.
+        if code == 0:
+            with open(out,'w',encoding='utf-8',newline='') as capture:
+                capture.write(stdout)
+        sys.stderr.write(stderr);return code
+    sys.stdout.write(stdout);sys.stderr.write(stderr);return code
+
 def main():
     p=argparse.ArgumentParser();p.add_argument('--version',action='store_true')
     p.add_argument('--config');p.add_argument('--project');p.add_argument('--actor')
@@ -156,9 +183,11 @@ def main():
     if a.version:
         print(line(report(Path(__file__).resolve().parent, "client")))
         return 0
+    args=a.args[1:] if a.args[:1]==['--'] else a.args
+    if args[:1]==['capability']:
+        return _capability(args[1:],a.out)
     if not a.config or not a.project:
         p.error('the following arguments are required: --config, --project')
-    args=a.args[1:] if a.args[:1]==['--'] else a.args
     action='bd';path=None
     if args[:1]==['refresh']:action='refresh';args=[]
     elif args[:1]==['view']:
