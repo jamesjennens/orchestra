@@ -1,5 +1,13 @@
 name: Tests
-on: [push, pull_request, workflow_dispatch]
+# Run on main, release tags, pull requests and manual dispatch only. Worker
+# contribution branches (contrib/*) are tested by the coordinator's release gate
+# and by the pull request, not on every push (owner decision 2026-09-30).
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
