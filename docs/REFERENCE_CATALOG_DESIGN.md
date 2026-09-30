@@ -1,6 +1,6 @@
 # Durable per-project reference catalog - design proposal
 
-Status: **proposal, revision 2. Not implemented, not accepted.** This document
+Status: **proposal, revision 3. Not implemented, not accepted.** This document
 changes no code. It proposes a record kind, an authority model, client commands,
 attention surfacing, repo sync, backup/rollback coverage and a migration path for
 review by the coordinator and acceptance by the project owner.
@@ -9,11 +9,24 @@ Nothing here is implemented: there is no `ref` command, no `reference` record
 kind and no review-by surface in the current kit. Every change named below is a
 follow-up implementation slice (section 15), to be filed only after acceptance.
 
-Revision 2 was written against `main` `8e1f9ec6f4d818de8983f59f80aa896111a99712`
-(revision 1 was written 71 commits earlier, against `a3e33a4`). Every code-level
-claim below was re-verified against that checkout, and the closed-issue behaviour
-relied on in section 3.2 was verified by driving the pinned `bd 1.2.2` binary
-against a disposable database (section 3.2, evidence note).
+Revision 3 revises revision 2 on the same base, `main`
+`8e1f9ec6f4d818de8983f59f80aa896111a99712` (revision 1 was written 71 commits
+earlier, against `a3e33a4`), in response to the second review round (comment
+`01a0f121`, items `hidden-overstated`, `authority-edges`, `slice0-schema`,
+`export-conflict` and `consistency`). Every code-level claim below was
+re-verified against that checkout, and the closed-issue behaviour relied on in
+section 3.2 was verified by driving the pinned `bd 1.2.2` binary against a
+disposable database (section 3.2, evidence note).
+
+## Revision 3 changes (review 01a0f121)
+
+| Review item | Where it is answered |
+| --- | --- |
+| `hidden-overstated` | 3.2 and 6.0 - "every reader hides it" is corrected: the HTTP task list reads `bd list --all`, so a closed anchor still shows as a closed task in the web Closed/All tabs and `q` search, and the task detail/history/brief routes show the raw `Kind: reference-*` comments. `GET /tasks/{id}`, `/history` and `/brief` are added to the filter list and must 404 (or point at the reference route). 7.1 states the SSH routing rule. |
+| `authority-edges` | 3.4 refuses the real `session-<uuid>` actor shape; 4 and 7.1 raise an `acceptance-inert` attention item to approvers after an operator removal or a restore without `--restore-operators`; 4 states plainly that a project owner accepts only as an allowlisted operator with shell access, and that the allowlist holds actor strings, not `account:` identities. |
+| `slice0-schema` | 10.3 and 15 - slice 0 freezes the `.reference-requests/` receipt schema and ships its validator, not only the path whitelist; slice 0 does not wait for `.58`, and `.58` gets its own tolerant-reader step. |
+| `export-conflict` | 9.1 - refuse only when `body_digest` does not match the body (a hand edit); a stale `catalog_digest` is the expected reason to regenerate. |
+| `consistency` | 3.2 keeps the `request:`/`request-content:` labels that reconcile looks records up by; 12.1 and 15 require byte-identical requirement record, evidence and receipt bytes with a byte-compatibility test; 7.1 says My work lands in slice 2. |
 
 ## Revision 2 changes (review 01a0f0d0)
 
@@ -66,7 +79,7 @@ names and firm-specific detail - every example below is a placeholder.
 | Question | Decision |
 | --- | --- |
 | Storage | Reserved machine-record kind (`Kind: reference-entry-v1`) on one native anchor issue per entry, with controlled labels. Not a new bd issue type, not a manifest field. |
-| Anchor | The anchor issue is created and **closed** by the write operation before the first revision comment, so every current and older task view hides it (3.2). |
+| Anchor | The anchor issue is created and **closed** by the write operation before the first revision comment, so the work surfaces - including an older kit's - hide it (3.2). Closed status alone does not hide it everywhere: the HTTP task list reads `bd list --all` and the web Closed/All tabs, `q` search and the task detail/history/brief pages still show the closed row, so slice 0 filters it explicitly (3.2, 6.0). |
 | Key | Immutable lowercase dotted key, unique per project, mirrored in a controlled `reference-key:` label for lookup. |
 | Versioning | Monotonic revision per key; `ref revise` must state the exact next `revision` and the content hash it expects to replace (`expected_sha256`). Same key/revision with different content is refused. No hash chain. |
 | Retirement | One operator operation, `ref retire KEY --successor KEY2`, writes the superseded revision. `replaces` is derived at read time; there is no asymmetric window. |
@@ -122,25 +135,47 @@ Each entry is one native issue, created by the dedicated `ref propose` operation
 - controlled state label, exactly one of `reference:draft`,
   `reference:accepted`, `reference:superseded`;
 - controlled lookup label `reference-key:` + the key with `.` replaced by `-`;
-- the usual native-first idempotency receipt in `.reference-requests/`.
+- the idempotency labels the requirement records already write at create time,
+  kept unchanged: `request:` + the request identity and `request-content:` + the
+  content digest. They are not decoration: the native-first path finds a record
+  created by an earlier or uncertain write by the `request:` label
+  (`requirement_records.py:707-712`) and `requirement_records.reconcile` finds it
+  the same way (`:953`), so a catalog that dropped them could not reconcile an
+  uncertain create. The catalog keeps both labels alongside the
+  `.reference-requests/` receipt.
 
-The anchor is created closed so that **every reader, including an older kit that
-has never heard of the catalog, already hides it**:
+The anchor is created closed so that **the work surfaces, including an older kit
+that has never heard of the catalog, already hide it** - but closed status alone
+does **not** hide it everywhere, and revision 2 overstated that:
 
 - `work.py:175` filters by `issue_type` (`event`, `gate`, `merge-slot`), not by
   label, so a label filter would not have helped; `work.py:180` already skips any
   closed row whose review state is not one of
   `changes-requested`/`awaiting-review`/`awaiting-integration`/`legacy-review-ready`/`error`,
   and a freshly written anchor has no review state at all;
-- the HTTP task list (`http_service.py:2318`) applies only the caller's own
-  filters; the canonical queue drops a closed row with no active review
+- the canonical queue drops a closed row with no active review
   (`http_service.py:664-680`, and the backend rule at `:1220`); `/v1/me/work`
   (`http_service.py:2494`) consumes that queue; and `agent_prompts.classify`
-  (`agent_prompts.py:104-136`) never places a closed row in a work class.
+  (`agent_prompts.py:104-136`) never places a closed row in a work class;
+- **but the HTTP task list reads the whole project**: `read_tasks` is
+  `bd list --all --limit 0 --json` (`http_service.py:1006-1018`), and `tasks_list`
+  applies only the caller's own `status`/`review_state`/`assignee`/`q` filters
+  (`http_service.py:2318-2341`). So the web project page's **Closed** and **All**
+  tabs and its `q` search (`web/js/views/project.js:28`) show the anchor as an
+  ordinary closed task;
+- `GET /tasks/{id}` (`http_service.py:2359-2363`),
+  `GET /tasks/{id}/history` (`http_service.py:2451-2469`) and
+  `GET /tasks/{id}/brief` (`http_service.py:2365-2395`) apply no catalog filter
+  at all, so an anchor id returns the row and its history **including the raw
+  `Kind: reference-*` comments**, which the task page renders as plain prose
+  (`web/js/views/task.js:120-123`).
 
-Closing the anchor is therefore the one fix that covers the HTTP task list, the
-queue, `/v1/me/work`, the agent prompts and every older kit at once, instead of
-requiring a new label filter on each surface and on each historical version.
+Closing the anchor is therefore necessary but not sufficient. It covers `work`,
+the queue, `/v1/me/work`, the agent prompts and every kit older than slice 0 at
+once - and it needs no new filter on any historical version - while slice 0's
+explicit filter (6.0) covers the HTTP task list, the task detail/history/brief
+routes and the web. A tolerant kit filters; a kit older than slice 0 shows only a
+closed task and its raw comments, never an open claimable one.
 
 **Verified: `bd 1.2.2` accepts comments and labels on a closed issue.** The pin
 is `versions.json:3-8` (`bd 1.2.2`, sha256 `8140098a…`) with the same pin stated
@@ -247,10 +282,15 @@ The owner identity rule is concrete:
   the one `.58` statistics attribute against.
 - `person:<name>` names a person-level actor for a project with no account
   registry. It must not contain a session marker.
-- A value that looks like a session actor (it contains `/session`, or matches the
-  `name/sessionN` shape the client allocates) is **refused at write**. Sessions
-  are ephemeral, so a session owner could never receive routed attention and
-  could never be attributed in a statistic.
+- A value that is, or contains, a session actor is **refused at write**. The
+  kit's real session actors are `session-<uuid>`: `sessions.validate` requires
+  `actor.startswith('session-')` with a UUID suffix (`sessions.py:19`), and
+  `sessions.register` allocates exactly `'session-' + str(uuid.uuid4())`
+  (`sessions.py:170`). The refusal matches that shape - and the legacy `/session`
+  or `name/sessionN` markers older clients wrote - rather than `name/sessionN`
+  alone, which would have let `person:session-4e40...` through. Sessions are
+  ephemeral, so a session owner could never receive routed attention and could
+  never be attributed in a statistic.
 - Shape and the session refusal are enforced on every write. `account:`
   membership in the project is resolved where a member directory is reachable
   (the office deployment); where it is not, the write is accepted and `ref check`
@@ -473,9 +513,14 @@ the **deployment operator allowlist**, the same source `void-record` enforces.
   - the entry no longer reads accepted: `ref get` returns
     `state: draft-only`, `acceptance: null` and `acceptance_inert: true` with the
     removed operator named;
-  - `ref list` marks it `draft-only`, and the review-by attention item is
-    suppressed for it (an inert acceptance must not masquerade as authority any
-    more than a draft may);
+  - `ref list` marks it `draft-only`, and the review-by item is **replaced, not
+    silently dropped**: the entry raises an **`acceptance-inert` attention item**
+    to approvers - the live allowlist - with a project-level count and the removed
+    operator named (7.1). An entry whose authority went inert must never go quiet:
+    an expired authority that suppresses its own reminder is worse than one that
+    never had a review date, because the silence looks like health. The same item
+    is raised after a restore that leaves the accepting operator off the host
+    allowlist (below);
   - recovery is deliberate and cheap: re-add the operator with
     `admin.py operators add`, and the same acceptance evidence applies again with
     no rewrite; or accept the entry again with a currently listed operator, which
@@ -485,8 +530,10 @@ the **deployment operator allowlist**, the same source `void-record` enforces.
 - **Restore does not re-grant.** `docs/OPERATIONS.md:174` and `:183`: the
   allowlist is deployment-wide, `restore-new` leaves it untouched, and the
   operator re-grants it explicitly with `--restore-operators` when the whole
-  recorded list is intended. A restored project therefore shows accepted entries
-  only for operators the host still lists.
+  recorded list is intended. A restored project therefore reads an entry whose
+  accepting operator the host does not list as `acceptance_inert: true`, and that
+  entry raises the same `acceptance-inert` attention item to approvers rather than
+  disappearing from review-by attention.
 
 The rest of the split mirrors `requirement_records.py`'s F3 split, because that is
 the kit's reviewed answer to "contributor proposes, operator accepts":
@@ -495,10 +542,27 @@ the kit's reviewed answer to "contributor proposes, operator accepts":
 | --- | --- | --- |
 | Create a new entry as `reference:draft` (`ref propose`) | any contributor actor | one `reference-entry-v1` revision, `acceptance_state: draft` |
 | Revise an entry's draft (`ref revise`) | any contributor actor (trusted team) | next `reference-entry-v1` revision, `draft` |
-| Accept an entry (`admin.py reference-apply`) | deployment operator (allowlist) / project owner | next revision with `acceptance_state: accepted` **plus** `reference-acceptance-v1` evidence bound to that revision's `record_sha256` |
+| Accept an entry (`admin.py reference-apply`) | a deployment operator: an actor on the allowlist, with shell access. A project owner accepts only in that form - ownership alone is not acceptance authority | next revision with `acceptance_state: accepted` **plus** `reference-acceptance-v1` evidence bound to that revision's `record_sha256` |
 | Retire a key (`ref retire KEY --successor KEY2`) | operator only | one revision with `acceptance_state: superseded`, `successor`, plus acceptance evidence |
 | Propose a change to an accepted entry | any contributor | a higher draft revision; the **accepted** pointer does not move until an operator accepts |
 | Set or change `review_by` | any contributor proposes; operator accepts | takes effect only on acceptance; a draft's date is shown as proposed, never as the effective deadline |
+
+**Two identity spaces, never mixed.** A record's `owner` is the durable
+`account:`/`person:` attribution identity (3.4). Acceptance authority is a
+different thing: an **actor string** from the deployment allowlist.
+`recovery.identity` (`recovery.py:50-53`) accepts only
+`[A-Za-z0-9][A-Za-z0-9_.-]{0,160}`, so a colon is not even a legal character in
+an allowlist entry: `account:u-0009` can never be an operator, and revision 2's
+example that wrote it as one mixed the two spaces. The `operator` reported by
+`ref get` (6.1) is that allowlisted actor string, e.g. the placeholder
+`operator-0009` (13); it is taken from the stored **native author** of the
+evidence comment, never from a caller-supplied string, because the F3 evidence
+object has no `operator` field (`requirements.ACCEPTANCE_FIELDS`,
+`requirements.py:35-42`). `admin.py operators list`
+(`admin.py:2252`) prints the exact strings. A project owner is therefore not an
+approver by virtue of ownership: they accept only after an operator adds their
+actor to the allowlist with `admin.py operators add`, and only with shell access
+to the coordination host - the same boundary `docs/OPERATIONS.md:61-66` states.
 
 Acceptance evidence reuses the existing F3 shape (`requirements.ACCEPTANCE_FIELDS`
 minus `manifest_sha256`, plus `record_sha256` - `requirement_records.py:81-82`),
@@ -557,9 +621,22 @@ Catalog rows and comments must never appear in:
 5. the agent prompts built by `agent_prompts.classify`
    (`agent_prompts.py:104-136`);
 6. rendered task views (`render.py`, the review-queue projection at
-   `render.py:36-47`).
+   `render.py:36-47`);
+7. `GET /v1/projects/{pid}/tasks/{id}` for an anchor id
+   (`http_service.py:2359-2363`);
+8. `GET /v1/projects/{pid}/tasks/{id}/history` (`http_service.py:2451-2469`);
+9. `GET /v1/projects/{pid}/tasks/{id}/brief` (`http_service.py:2365-2395`).
 
-Slice 0 filters on all six even though it writes nothing, because a newer kit in
+Surfaces 7-9 have no catalog filter at all today: an anchor id returns the row
+and its history, including the raw `Kind: reference-*` comments, and the web task
+page renders the history body as prose (`web/js/views/task.js:120-123`). Slice 0
+and slice 1 must therefore make each of the three **return 404 for a row carrying
+the `reference` label, or return a pointer to the reference route**
+(`ref get <key>`), never the raw record; the browser task page follows the same
+rule. The HTTP task list (surface 2) keeps the closed row out of the Closed/All
+tabs and `q` search by filtering on the label.
+
+Slice 0 filters on all nine even though it writes nothing, because a newer kit in
 the same deployment can create entries that a tolerant-but-older kit reads, and
 because `create-child` can create a labelled row without the reference
 operation. Closed status alone is the backstop for kits older than slice 0; the
@@ -596,7 +673,7 @@ b ref get calendar.trading --json
     "policy": "any-owner",
     "evidence": "decision example-project-42",
     "record_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
-    "operator": "account:u-0009",
+    "operator": "operator-0009",
     "at": "2026-09-27T20:00:00Z"
   },
   "acceptance_inert": false,
@@ -611,7 +688,11 @@ b ref get calendar.trading --json
 
 `title` and `statement` are excerpt objects (`{"text", "omitted_chars"}`) under
 the `brief`/`history` contract; `sha256`, IDs and cursors are never excerpted.
-`due` is `ok`, `due-soon`, `expired` or `unset` (7.2). Unknown key: nonzero exit,
+`acceptance.operator` is the allowlisted **actor string** whose shell command
+produced the evidence - the native author of the evidence comment, not the
+record's `owner` and not an `account:` identity (4); the placeholder above is
+`operator-0009` for that reason. `due` is `ok`, `due-soon`,
+`expired` or `unset` (7.2). Unknown key: nonzero exit,
 `stderr` names the key and suggests `ref list`. A malformed or unsupported entry
 returns that entry with the matching `state` and a bounded `warnings` entry; it
 does not fail the command for other keys.
@@ -677,10 +758,12 @@ b ref revise  --file entry.json --json
   an overdue entry is the normal repair), `repo-path` authority with an
   absolute/`..` path, a non-`https` or userinfo `url`, and a `url` authority in a
   project whose policy refuses external authorities.
-- Idempotency: `operation_id` plus a `.reference-requests/` receipt journal, the
-  same native-first pattern as `.requirement-requests`: preflight reads before
-  the receipt is written, and an uncertain real write leaves a pending receipt
-  reconciled from native state rather than creating a duplicate.
+- Idempotency: `operation_id` plus a `.reference-requests/` receipt journal and
+  the `request:`/`request-content:` labels on the created anchor (3.2), the same
+  native-first pattern as `.requirement-requests`: preflight reads before the
+  receipt is written, and an uncertain real write leaves a pending receipt
+  reconciled from native state - found by its `request:` label, exactly as
+  `requirement_records.py:953` does - rather than creating a duplicate.
 - Returns `{"key", "revision", "native_id", "record_comment_id", "state":
   "draft", "reconciled": false}`.
 
@@ -800,6 +883,7 @@ array to `brief` (tasks stay the unit of a brief).
  "coverage": "Fresh current view; ...",
  "attention": {
    "reference_review": {
+     "acceptance_inert": 1,
      "expired": 1, "due_soon": 1, "unset": 2, "total": 4, "truncated": false,
      "items": [
        {"key": "calendar.trading", "review_by": "2026-01-15", "due": "expired",
@@ -823,9 +907,28 @@ Routing rules (review item `owner-identity-attention`):
   `attention_total`/`attention_more`.
 - **My work** (`GET /v1/me/work` and the browser view) shows expired and due-soon
   entries to the entry owner and to project owners, and counts to everyone else.
+  **This is a slice-2 deliverable, not slice 1** (15): slice 1 ships the `work`
+  counts/items and the `brief` block, and the My work and prompt-count promises in
+  this list arrive with slice 2 and its own tests.
 - **Agent prompts** get counts and keys only, and only for approvers
   (`agent_prompts.classify` already tailors by `CAP_APPROVE`/`CAP_TASKS`,
-  `agent_prompts.py:100-136`). No statement text ever reaches a prompt (8).
+  `agent_prompts.py:100-136`). No statement text ever reaches a prompt (8). These
+  prompt counts are slice 2 as well.
+- **The SSH/endpoint route has no roles.** The endpoint sees actors, not project
+  roles, and its session actors are `session-<uuid>` (3.4), so on that route
+  "approver" means exactly: the caller's actor is on the deployment operator
+  allowlist (`recovery.configured_operators`, `recovery.py:56-86`, fed from
+  `deployment.private.json` `operators`). There is no role lookup to consult and
+  no session-derived ownership: an entry's owner is matched **only** through
+  `ref list --owner IDENTITY`, which filters on the durable `owner` field. A
+  session actor is never treated as an owner or an approver.
+- **`acceptance-inert`.** When an entry's acceptance evidence author is no longer
+  on the live allowlist - an operator was removed, or the project was restored
+  without `--restore-operators` (4) - the block adds an `acceptance_inert` count
+  and, to approvers, an item naming the key and the removed operator. It is
+  recomputed on every read like the due classes, and it is never suppressed: the
+  review-by items for such an entry are reported under `acceptance_inert` rather
+  than silently dropped.
 
 New bounded options `--ref-limit` (1..100) and `--ref-offset` (>= 0). The block is
 computed regardless of `--owner`/`--state`/`--mine` task filters, because the
@@ -991,12 +1094,17 @@ deterministic projection of the accepted catalog:
   is **self-verifying** instead - the header carries both digests, so a hand edit
   breaks `body_digest` and a stale catalog breaks `catalog_digest`, with no
   sidecar receipt to lose, back up or restore.
-- **Conflict rule.** `ref export` refuses to overwrite a file whose header or
-  body does not verify against the current catalog and the re-rendered body.
-  `--force` is operator-only and prints exactly what it overwrote. A hand-edited
-  file is reported, never silently clobbered. A hand edit never becomes a
-  catalog entry: the only route from a repo file into the catalog is `ref import`
-  (11), which creates **drafts**.
+- **Conflict rule.** `ref export` refuses to overwrite a file **only when
+  `body_digest` does not match the body bytes** - that is a hand edit, and a
+  hand-edited file is reported, never silently clobbered. A stale
+  `catalog_digest` is **not** a refusal: it is the expected state after any
+  accepted change, and it is precisely why the file is being regenerated.
+  Revision 2 refused on a header that did not verify against the current catalog,
+  which refused every legitimate update - the very change the export exists to
+  publish. A stale `catalog_digest` is instead reported by `ref export --check`
+  against the catalog (9.2). `--force` is operator-only and prints exactly what it
+  overwrote. A hand edit never becomes a catalog entry: the only route from a
+  repo file into the catalog is `ref import` (11), which creates **drafts**.
 - Ordering, escaping and whitespace are fixed, so the rendering is byte-stable.
 - The catalog (native records) is **authoritative**; the file is a projection and
   is never read back as authority. In pointer mode no file exists at all.
@@ -1056,9 +1164,9 @@ authority moved while its `review_by` was still in the future.
   (propose/revise idempotency receipts) is the operator recovery cache, exactly
   like `.requirement-requests/` and `.requirement-backfills/`.
   `admin.py backup_project` must read it into `files` under its own path prefix,
-  and restore must validate it - which requires the whitelist change in 10.3.
-  The requirement-journal block is the model (`admin.py:1287`, `:1315`, and the
-  validator at `:922-927`).
+  and restore must validate it - which requires both the whitelist change and the
+  receipt-schema validator in 10.3. The requirement-journal block is the model
+  (`admin.py:1287`, `:1315`, and the validator at `:922-927`).
 - **Revision 2 removes two journals.** `.reference-exports/` is gone (9.1), and
   no `.reference-acceptances/` receipt cache is introduced: acceptance evidence
   is a native comment, so it needs no local journal. That leaves exactly one new
@@ -1100,12 +1208,41 @@ A backup that contains `.reference-requests/...` therefore cannot be restored by
 a kit that predates the catalog - the **entire** restore is refused, not just the
 reference part.
 
+**Hazard 1b - the whitelist alone is not enough.** Whitelisting the path is
+necessary but not sufficient, and revision 2 stopped one step short.
+`validate_coordination_files` validates each recognised journal's **contents**,
+not only its path: `admin.py:922-927` calls `requirement_records.validate_receipt`
+for `.requirement-requests/` and `.requirement-backfills/`. A slice 0 that only
+adds `.reference-requests/` to the `:903` regex would restore reference receipts
+**unvalidated**; a slice 0 that adds nothing would make a slice-1 backup
+unrestorable. Slice 0 therefore ships the **frozen receipt schema and its
+validator** together with the whitelist, and slice 0 and slice 1 use the same
+schema. The frozen fields are the ones `requirement_records.validate_receipt`
+already enforces (`requirement_records.py:453-484`): a 64-hex `sha256`, a
+`status` in `RECEIPT_STATUSES` (`requirement_records.py:88`:
+`pending`/`complete`/`failed`/`released`), an optional nonempty `actor`, an
+optional nonempty `id`, an optional integer `revision >= 1`, and an optional
+bound `acceptance` object. Slice 0's validator must **accept a well-formed
+slice-1 receipt and reject malformed bytes**, with a test for each direction -
+otherwise slice 0 either resurrects an unreadable receipt or refuses a valid one.
+
+**Slice 0 does not wait for `.58`, and `.58` is not in it.** `.58`'s journals,
+prefixes and receipt schema are not designed yet, so folding them into this
+slice would freeze schemas that do not exist and would block `.41` on an
+undesigned task. `.58` ships **its own** tolerant-reader step with its own design
+- the same reserve/whitelist/filter/validator shape, its own frozen receipt
+schema - and the two steps may be deployed together if the designs land close
+together. That is an ordering choice, not a dependency, and it replaces revision
+2's "slice 0 shared with `.58`".
+
 **Hazard 2 - older views and older guards.** After a kit rollback:
 
-- older `work` lists every anchor as ordinary work, because `work.py:175` filters
-  by `issue_type` and knows nothing about a `reference` label; the HTTP task
-  list, queue, `/v1/me/work` and the agent prompts likewise. Closed anchors are
-  the one mitigation that survives the rollback (3.2);
+- older `work` still hides a closed anchor (`work.py:180`), but a pre-catalog
+  kit's HTTP task list (`bd list --all`, `http_service.py:1006-1018`), its `q`
+  search and its task detail/history/brief routes show the anchor as an ordinary
+  closed task **with its raw `Kind: reference-*` comments** (3.2, 6.0); closed
+  anchors are the one mitigation that survives the rollback, and they only cover
+  the work surfaces;
 - the older reserved guard does not know `reference`, `reference:` or
   `reference-key:` (3.7), so raw forging of `Kind: reference-*` comments and
   `reference:*` labels is allowed again;
@@ -1117,20 +1254,22 @@ catalog deployment may roll back to:
 
 | Release | Contents | Writes |
 | --- | --- | --- |
-| Slice 0 - tolerant reader (shared with kittrial-5bb.58) | reserve the two comment prefixes and the three labels (3.7); whitelist `.reference-requests/` in `validate_coordination_files`; filter catalog rows and comments out of all six surfaces in 6.0; report an unknown `Kind: reference-entry-vN` as `unsupported` per entry | **none anywhere** |
+| Slice 0 - tolerant reader (reference namespace only; `.58` ships its own step) | reserve the two comment prefixes and the three labels (3.7); whitelist `.reference-requests/` in `validate_coordination_files` **and ship the frozen receipt schema with its validator** (`admin.py:903`, `:922-927`); filter catalog rows and comments out of all nine surfaces in 6.0, with `GET /tasks/{id}`, `/history` and `/brief` returning 404 (or a pointer to the reference route) for an anchor id; report an unknown `Kind: reference-entry-vN` as `unsupported` per entry | **none anywhere** |
 | Slice 1 - core writers | shared keyed-record core; closed anchors; draft/revise; operator accept with F3 evidence and the allowlist; `ref get`/`ref list`; HTTP GET routes; `work`/`brief` attention | reference records only |
 | Slice 2 - the rest | `ref check --repo` with `authority-changed-since-pinned`; `ref retire`; `ref decisions`; My work and prompt counts; optional export | export file only, opt-in |
 
 Rolling slice 1 back to slice 0 is safe: entries exist, but slice 0 hides them
-from every work surface, still refuses raw writes into their namespace, and
-whitelists their sidecar so a backup round-trips. Rolling slice 1 back to a
-**pre-catalog** kit is not safe, and an operator must know exactly what is lost:
+from all nine surfaces in 6.0, still refuses raw writes into their namespace, and
+whitelists and validates their sidecar so a backup round-trips. Rolling slice 1
+back to a **pre-catalog** kit is not safe, and an operator must know exactly what
+is lost:
 
 - a backup containing `.reference-requests/` cannot be restored at all
   (hazard 1);
 - entries created by slice 0's filter rules are no longer filtered, because a
   pre-catalog kit has no filter (hazard 2) - the closed anchors are all that keep
-  them out of work views;
+  them out of work surfaces, and the HTTP task list, `q` search and the task
+  detail/history/brief pages show them as closed tasks with raw record comments;
 - the label and comment namespace is forgeable again, and the allowlist check on
   an acceptance is not applied by that kit.
 
@@ -1241,6 +1380,21 @@ core** used by requirements, references and the kittrial-5bb.58 proposals.
   they use the same core for draft/accepted state, labels, receipts and F3
   evidence.
 
+**Byte compatibility is a hard requirement, not a preference.** The extraction
+must leave the bytes requirements write **unchanged**: the canonical JSON of a
+`requirement-revision-v1` record, the `requirement-acceptance-v1` evidence and
+every `.requirement-requests/` receipt must be byte-identical before and after
+the core extraction, because an older kit must still read them and a rollback
+must not invalidate them (10.3, `docs/REVIEWS.md:102-114`). The extracted core
+must not "normalise" a field order, a separator, a label set or a status
+spelling on the way through, and it must keep the `request:`/`request-content:`
+labels on the created record (3.2). Slice 1 therefore carries a
+**byte-compatibility test**: it produces a requirement record, its acceptance
+evidence and a receipt through the pre-extraction code path and through the
+extracted core and asserts identical bytes and identical `sha256` in both
+directions. Without that test the refactor is its own rollback hazard, which is
+exactly what this section exists to avoid.
+
 **Routes requirements gained on this base, covered by the core.**
 
 - The operator-only **direct accepted revision 1** (kittrial-5bb.56,
@@ -1287,8 +1441,12 @@ and contributors get a log and statistics. The two designs share:
    `requirement-apply`), one owner "accept" screen later for requirements,
    references and escalated proposals together - never for agent or worker
    credentials.
-6. **One tolerant-reader release.** Slice 0 covers both features' new kinds,
-   labels and journals in a single deployable step (10.3).
+6. **A tolerant-reader step per feature, deployable together.** Each design ships
+   its own reserve/whitelist/filter/validator step with its **own frozen receipt
+   schema** (10.3); if the two designs land together, the two steps deploy as one.
+   `.41` does not wait for `.58`, and `.58` does not depend on `.41`'s schema -
+   revision 2's single shared slice 0 froze journals and prefixes `.58` has not
+   designed.
 
 Kept separate: review-by and due logic (catalog only), and statistics and the
 scoreboard (`.58` only).
@@ -1300,10 +1458,10 @@ or `.41` waits for the `.58` design.
 
 ## 13. Worked examples (placeholders only)
 
-Every value below is a placeholder: `example-project` is a project, `u-0001` and
-`u-0009` are member accounts, `src/example/...` is a repository path and the
-commits and hashes are zero-filled or repeated digits. None of it refers to a
-real project, host or firm.
+Every value below is a placeholder: `example-project` is a project, `u-0001` is a
+member account and `operator-0009` is an allowlisted operator actor,
+`src/example/...` is a repository path and the commits and hashes are zero-filled
+or repeated digits. None of it refers to a real project, host or firm.
 
 ### 13.1 Repo-path authority: the calendar that expires
 
@@ -1389,27 +1547,42 @@ halves.
 | Rendering a reference statement with the web's `markdown()` helper | A draft statement is attacker-writable, instruction-grade text; `markdown()` is for owner-authored baseline text. Statements render as plain text, and only validated `https` URLs become links (8). |
 | An HTTP propose write in v1 | Needs a new credential scope, and adding a scope is itself a rollback concern because older kits validate scope lists (8). |
 | A parallel `reference_records.py` that copies `requirement_records.py` | Duplicates roughly 1000 lines of labels, receipts, reconcile, backfill and F3 binding. Extract the keyed-record core instead (12.1). |
-| Deferring the whole catalog design until `.58` lands | The catalog's slice 1 is smaller and more concrete; the shared core and the tolerant reader can be built once, in either order, so `.41` should not block on `.58` (12.2, 16.9). |
+| Refusing an export whose `catalog_digest` no longer matches the current catalog (revision 2) | Every accepted change breaks that match, so the normal regeneration was refused - the export could never publish a change. Only a `body_digest` mismatch (a hand edit) is a refusal; a stale `catalog_digest` is why `ref export` runs (9.1). |
+| Suppressing review-by attention when an acceptance goes inert (revision 2) | An expired authority that suppresses its own reminder goes silent, and the silence looks like health. The entry raises an `acceptance-inert` attention item to approvers instead (4, 7.1). |
+| Matching a session actor by the `name/sessionN` shape alone (revision 2's refusal) | Real session actors are `session-<uuid>` (`sessions.py:19`, `:170`), so `person:session-4e40...` passed the check. The refusal matches the real shape (3.4). |
+| An `account:`/`person:` owner identity as the acceptance operator (revision 2's example) | The allowlist holds actor strings and `recovery.identity` refuses a colon (`recovery.py:50-53`), so `account:u-0009` can never be an operator. Acceptance evidence names the allowlisted actor; a project owner accepts only as one, with shell access (4). |
+| One shared tolerant-reader release for `.41` and `.58` (revision 2's slice 0) | `.58`'s journals, prefixes and receipt schema are not designed, so a shared slice 0 would freeze schemas that do not exist and block `.41` on an undesigned task. Each ships its own step; they may deploy together (10.3, 12.2). |
+| Whitelisting `.reference-requests/` without shipping its validator (revision 2's slice 0) | `validate_coordination_files` checks journal contents (`admin.py:922-927`), so the whitelist alone restores receipts unvalidated or refuses valid slice-1 receipts. Slice 0 ships the frozen schema and its validator (10.3, 15). |
+| Claiming a closed anchor hides the catalog from **every** reader (revision 2) | The HTTP task list reads `bd list --all` (`http_service.py:1006-1018`), and the task detail/history/brief routes show the row and its raw `Kind: reference-*` comments (`:2359-2363`, `:2451-2469`, `:2365-2395`). Closed status hides the work surfaces; slice 0's explicit filter covers the rest, including those three routes (3.2, 6.0). |
+| Deferring the whole catalog design until `.58` lands | The catalog's slice 1 is smaller and more concrete; the shared core and the two tolerant-reader steps can be built independently, in either order, so `.41` should not block on `.58` (12.2, 16.9). |
 
 ## 15. Follow-up implementation slices (proposed, not filed)
 
 Filed by the owner only after this design is accepted. Exactly three slices, then
 a "later" list. No web write and no import before the later list.
 
-**Slice 0 - tolerant reader (shared with kittrial-5bb.58).** Reserve
-`Kind: reference-entry-v1` and `Kind: reference-acceptance-v1` in
-`reserved_comments.RESERVED` and add `reference`, `reference:` and
+**Slice 0 - tolerant reader (reference namespace only; does not wait for
+`.58`).** Reserve `Kind: reference-entry-v1` and `Kind: reference-acceptance-v1`
+in `reserved_comments.RESERVED` and add `reference`, `reference:` and
 `reference-key:` to `RESERVED_LABEL_PREFIXES`/`RESERVED_EXACT_LABELS`
 (`reserved_comments.py:164`, `:654-655`); whitelist `.reference-requests/` in
-`admin.validate_coordination_files` (`admin.py:903`); filter catalog rows and
-comments out of the six surfaces in 6.0; report an unknown
-`Kind: reference-entry-vN` as `unsupported` per entry. **No writes anywhere.** A
-test must assert that slice 0 writes nothing.
+`admin.validate_coordination_files` **and ship the frozen receipt schema with its
+validator** (`admin.py:903`, `:922-927`), so a slice-0 restore accepts a
+well-formed slice-1 receipt and refuses malformed bytes; filter catalog rows and
+comments out of the nine surfaces in 6.0, with `GET /tasks/{id}`, `/history` and
+`/brief` returning 404 (or a pointer to the reference route) for an anchor id;
+report an unknown `Kind: reference-entry-vN` as `unsupported` per entry. **No
+writes anywhere.** A test must assert that slice 0 writes nothing. `.58`'s
+journals, prefixes and receipt schema are not designed yet, so **`.58` gets its
+own tolerant-reader step with its own design** (10.3); the two steps may be
+deployed together, but `.41` does not block on `.58`.
 
 **Slice 1 - core draft/accept, `ref get`/`ref list`, HTTP GET, attention.**
 
 - extract `keyed_records.py` from `requirement_records.py` and re-point
-  requirements at it, with the existing requirement tests unchanged (12.1);
+  requirements at it, with the existing requirement tests unchanged (12.1), plus
+  the **byte-compatibility test**: requirement record, acceptance evidence and
+  receipt bytes (and `sha256`) identical before and after the extraction (12.1);
 - `reference_records.py`: the `reference-entry-v1` kind, closed anchors,
   propose/revise with `expected_sha256` and the `.reference-requests/` receipt
   journal, key resolution, the owner identity rule;
@@ -1429,7 +1602,8 @@ test must assert that slice 0 writes nothing.
 - `ref check --repo` including `authority-changed-since-pinned` (9.3);
 - `ref retire KEY --successor KEY2` (6.4) and the derived `replaces` view;
 - `ref decisions DECISION-ID`;
-- My work and agent-prompt counts (7.1);
+- My work and agent-prompt counts (7.1, which states they land here and not in
+  slice 1);
 - optional per-project export with the self-verifying header (9.1);
 - `docs/OPERATIONS.md` migration/runbook section and a `templates/` reference
   entry example.
@@ -1449,10 +1623,13 @@ unless the owner chooses otherwise.
    accepted entry and there is no `"never"` sentinel; cap it at 24 months ahead.
    Re-confirming a timeless fact once every two years costs little, and it keeps
    one rule in the validator. Drafts may omit it.
-2. **Who accepts.** *Recommended:* the project owner(s) and the
-   operator-allowlisted coordinator, through the shell route in v1
-   (`admin.py reference-apply`). Web acceptance for project owners comes later,
-   with a human session holding `reviews.approve`; never an agent or worker
+2. **Who accepts.** *Recommended:* an actor on the deployment operator allowlist,
+   through the shell route in v1 (`admin.py reference-apply`). A project owner
+   accepts only in that form - their actor must be added with
+   `admin.py operators add` and they need shell access; ownership alone is not
+   acceptance authority, and the allowlist holds actor strings, not
+   `account:`/`person:` identities (4). Web acceptance for project owners comes
+   later, with a human session holding `reviews.approve`; never an agent or worker
    credential. Contributors and agents only propose.
 3. **Retirement.** *Recommended:* one operation,
    `ref retire KEY --successor KEY2`. No two-step acceptance; `replaces` is
@@ -1472,10 +1649,12 @@ unless the owner chooses otherwise.
    `person:<name>` for an SSH-only project. Session actors are refused at write
    (3.4).
 9. **Order relative to kittrial-5bb.58.** *Recommended:* build the shared
-   keyed-record core and the tolerant reader once; the catalog's slice 1 goes
-   first because it is smaller and more concrete; `.58` builds on the same core.
-   The owner should accept both designs together, or `.41` waits for the `.58`
-   design (12.2).
+   keyed-record core once; the catalog's slice 1 goes first because it is smaller
+   and more concrete; `.58` builds on the same core. Each feature ships its **own**
+   tolerant-reader step with its own frozen receipt schema, because `.58`'s
+   journals and prefixes are not designed yet; the two steps may deploy together
+   (10.3, 12.2). The owner should accept both designs together, or `.41` proceeds
+   without waiting for the `.58` design.
 
 **Recorded gap, not a question.** On this base `requirement-apply` does not
 check the deployment operator allowlist (`admin.py:2214-2223`,
