@@ -842,14 +842,14 @@ class AdminRevertRecordTests(unittest.TestCase):
         self.assertEqual(self.writes, [])
 
     def test_operator_cli_refuses_an_unintegrated_contribution(self):
-        # A second, unintegrated contribution: the named commit is not the one the
-        # shared projection reports as passing for it, so nothing is written.
+        # A second, superseding contribution with no scoped integration of its own:
+        # the named commit is not the one the shared projection reports as passing
+        # for it, so nothing is written.
         self.fixture.issue['assignee'] = 'worker'
         p = self.fixture.contribution('d' * 40, base='b' * 40)
-        p['supersedes'] = None
         second = self.fixture.send(p)['comment_id']
         with self.assertRaisesRegex(ValueError, 'currently integrated'):
-            self.invoke(self.payload(contribution=second))
+            self.invoke(self.payload(contribution=second, integration_commit=self.MERGE))
         self.assertEqual(self.writes, [])
 
 
