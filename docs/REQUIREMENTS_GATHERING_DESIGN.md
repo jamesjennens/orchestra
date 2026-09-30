@@ -1,6 +1,6 @@
 # Contributed requirement proposals - design proposal
 
-Status: **proposal, revision 2. Not implemented, not accepted.** This document
+Status: **proposal, revision 3. Not implemented, not accepted.** This document
 changes no code. It proposes a record kind, a lifecycle and authority model, a
 coordinator input queue, an escalation path, attribution and statistics, a
 "my contributions" read, client commands, HTTP routes, backup/rollback coverage
@@ -22,6 +22,43 @@ model (4.1/6.3/6.4); the settings record renamed and rehomed
 1a/1b (8.3/11); and the smaller items (live acceptance for credit, the
 per-requirement 90-day cap, owner question 12.14, and the `_agent_attention`
 shaped JSON in 5.1).
+
+Revision 3 (2026-09-30) answers the coordinator's five review items on revision
+2 (commit `057c7fa`), and all five are changes to this text:
+
+1. **the `requirement-apply` allowlist migration** (P2): 3.6 and owner question
+   12.2 now carry the enrolment step - list the actors that run
+   `requirement-apply` today starting with `james`, add them with
+   `admin.py operators add`, confirm with `operators list`, and test that an
+   unlisted actor is refused and a listed one succeeds - and slice 1a lands the
+   check and the enrolment as one unit (11).
+2. **the actor-map keying** (P2): `contributions.actor_map` is keyed on a stable
+   person-level **namespace** (matched on the session registry's `name`) beside
+   an exact-actor entry for a reused actor, because SSH actors are fresh
+   `session-<uuid>` values and the registry has no owner field; re-mapping the
+   coordinator is a session-start runbook step, and a project that maintains
+   neither says plainly that its SSH attribution is mostly unverified and keeps
+   the scoreboard off (4.2, 12.13).
+3. **compare-and-swap settings writes** (P3): 8.3 specifies that every
+   `contribution-settings-v1` write is composed server-side from the previous
+   record with compare-and-swap, that a `hide-self` write can change only the
+   caller's own entry, and that slice 1a freezes the full v1 field set so slice 2
+   adds no field (7.1, 8.2).
+4. **the real attention action shape** (P3): 5.1's `actions` now carry
+   `priority`, `kind`, `project` and `task` and sort by
+   `(priority, project, task)`, exactly as `_agent_attention` builds and sorts
+   them (`http_service.py:2113-2121`, `:2222-2223`), with only the bounded
+   `label` and the route `token` added.
+5. **tagged unions before v1 freezes** (P2, for kittrial-5bb.60):
+   `requirement-proposal-v1.target` and
+   `proposal-disposition-v1.incorporation` are tagged unions discriminated by
+   `kind` (`{"kind": "requirement", ...}`), so the capability index adds
+   `alias`/`capability` **variants** rather than a `-v2` kind or a parallel
+   record; a non-`requirement` incorporation carries **zero** weight, because it
+   has no `requirement_id` for the per-requirement cap to bound (3.3, 3.4, 6.2,
+   6.5). This is option (b); option (a), a separate alias record kind with its
+   own prefix, labels and slice-0 step, is rejected as the more expensive answer
+   to the same need.
 
 Nothing here is implemented: there is no `proposal` command, no
 `requirement-proposal` record kind, no disposition ledger, no queue block and no
@@ -97,7 +134,7 @@ detail - every example below is a placeholder.
 | Reuse | The proposal is a pointer. Writing a requirement revision stays `requirement_records.apply_native`; acceptance stays `admin.py requirement-apply` with F3 evidence bound to `record_sha256`. A disposition names the resulting `{id, revision, sha256}` and, when it changed an accepted baseline, the offline `change` object and manifest hashes. |
 | Queue | Additive project-level `attention.proposal_queue` in `work`, shaped like `_agent_attention` (counts always, items only for coordinators), a bounded `attention` array in `brief`, and a queue group on the web Reviews page. In slices 1a/1b/2 the queue holds requirement proposals only; the shared one queue with reference drafts (`kind: reference`) is slice 3, after both slice 1s land (9.2, 11). Nothing is marked by reading. |
 | Escalation | Coordinator-only transition; the owner answers with a second disposition, `approved` (with a `decision` object naming a native `decision` issue) or `rejected` (with a reason), and never handles a requirement id. `approved` returns the proposal to the coordinator, who drafts the revision and records `incorporated` later. Notification is read-time attention (no push system exists); no email, no webhook. |
-| Statistics | Computed at read time from the two ledgers, bounded and deterministic: counts by outcome, an incorporated weight read from the linked requirement's **live** acceptance state and capped per requirement id per 90 days, median/mean time to disposition, 30-day activity. Shown to the contributor for themselves, to coordinators in full, to project members only as an aggregate scoreboard over server-bound identities. |
+| Statistics | Computed at read time from the two ledgers, bounded and deterministic: counts by outcome, an incorporated weight read from the linked requirement's **live** acceptance state and capped per requirement id per 90 days (a non-`requirement` tagged-union incorporation carries **zero** weight, 3.4, 6.2), median/mean time to disposition, 30-day activity. Shown to the contributor for themselves, to coordinators in full, to project members only as an aggregate scoreboard over server-bound identities. |
 | Scoreboard | A project-page panel (top contributors by incorporated weight over 90 days plus project totals), **off by default**, on per project, with a self-service hide. Ranks only server-bound identities (4.2); an unverified declaration is shown as `unverified` and never ranked. Never shows raw text or rejection reasons. |
 | Agents | An agent credential submits for its owner; the record names `submitter` (the owner's durable identity) and `submitted_by_agent`. Weight accrues to the owner. No credential can triage, decide or approve anything. |
 | Backup | Proposals, dispositions and contribution settings are native comments, so the native backup covers them. One new sidecar path, `.proposal-requests/`, with a frozen receipt schema and validator shipped in slice 0. |
@@ -201,7 +238,7 @@ The field set is closed:
   "revision": 1,
   "submitter": "account:u-0001",
   "submitted_by_agent": null,
-  "target": {"kind": "requirement-key", "key": "req-0001"},
+  "target": {"kind": "requirement", "requirement_key": "req-0001"},
   "text": "Charts must be reproducible from the persisted daily snapshot, not recomputed from the live feed.",
   "rationale": "Two runs on the same input currently disagree, so a reader cannot reproduce a number without rerunning the feed.",
   "evidence": ["https://example.invalid/incidents/example-17", "src/example/chart.py@0000000000000000000000000000000000000000"],
@@ -223,7 +260,7 @@ Field rules:
 | `revision` | positive integer; `1` at submit, `+1` on each submitter revision while the proposal is `needs-info` or `submitted`. |
 | `submitter` | durable `account:<uid>` or `person:<name>` (4.2). Refused if it is, or contains, a session actor. On HTTP it is bound server-side to the authenticated principal; it is never taken from the payload. |
 | `submitted_by_agent` | `null`, or `{"agent_id": "agent-0003", "on_behalf_of": "account:u-0001"}` where `on_behalf_of` equals `submitter` and is bound server-side from the agent record. Attribution, not authority. |
-| `target` | optional: `{"kind":"requirement-key","key":"..."}`, `{"kind":"area","area":"<slug>"}`, or `{"kind":"new-requirement"}`. A `requirement-key` target is validated to resolve to an existing requirement record (`requirements.REQUIREMENT_FIELDS` identity) at write time; an unresolvable key is refused by name, never silently dropped. |
+| `target` | optional **tagged union** discriminated by `kind`, closed in v1 to the requirement family: `{"kind":"requirement","requirement_key":"..."}`, `{"kind":"requirement-area","area":"<slug>"}`, or `{"kind":"requirement-new"}`. The union is tagged from the first frozen version (3.8) so kittrial-5bb.60 adds `{"kind":"alias",...}` and `{"kind":"capability",...}` **variants** rather than a `-v2` kind or a parallel record; a `kind` outside the closed v1 set is refused. A `requirement` target's key is validated to resolve to an existing requirement record (`requirements.REQUIREMENT_FIELDS` identity) at write time; an unresolvable key is refused by name, never silently dropped. |
 | `text` | nonempty, <= 4000 characters. The proposal itself. Untrusted text (8.7). |
 | `rationale` | <= 4000 characters; optional at submit, required before a coordinator may mark it `incorporated` (5.4). |
 | `evidence` | 0..20 links, each <= 2000 characters, the same shape as the feedback journal's evidence list (`feedback.py:17-18`, `:138-141`). A `repo:` entry is `path@<40-hex commit>` and is a pointer only; the server never reads a repository path. |
@@ -260,6 +297,7 @@ Kind: proposal-disposition-v1
   "escalation": null,
   "decision": null,
   "incorporation": {
+    "kind": "requirement",
     "requirement_id": "example-project-208",
     "requirement_revision": 3,
     "requirement_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
@@ -287,7 +325,7 @@ Field rules and per-state requirements:
 | `duplicate_of` | required for `duplicate-of`; must name an existing proposal key that is not itself. |
 | `escalation` | required for `escalated-to-owner`: `{"question": "...", "owner_identity": "account:u-0002", "due_by": "YYYY-MM-DD"\|null}`. `owner_identity` is the coordinator's named decider; the route verifies it is a durable identity and a project owner. |
 | `decision` | required when `role` is `owner` (both the `approved` and the owner `rejected` disposition): `{"decision_id": "<native decision issue id>"}`, naming an existing native `decision` issue validated against `templates/DECISION.md`. The choice itself is `to_state`; the object never carries a requirement id, because the owner does not handle requirement ids (5.4). |
-| `incorporation` | required for `incorporated`: the linked requirement `{id, revision, sha256}`, the linked revision's `acceptance_state`, the F3 `decision_id` when accepted, the BRD `manifest_baseline`/`manifest_sha256` when the revision has been published, and the offline `change_classification` when the incorporation changed an accepted baseline (3.9). Written by the coordinator on the `approved -> incorporated` transition, never by the owner. |
+| `incorporation` | required for `incorporated`: a **tagged union** discriminated by `kind`, whose only v1 variant is `{"kind":"requirement", ...}` and carries the linked requirement `{requirement_id, requirement_revision, requirement_sha256}`, the linked revision's `acceptance_state`, the F3 `decision_id` when accepted, the BRD `manifest_baseline`/`manifest_sha256` when the revision has been published, and the offline `change_classification` when the incorporation changed an accepted baseline (3.9). The `kind` discriminator is frozen with v1 so kittrial-5bb.60's alias/capability incorporations are a variant, not a second record kind (3.8); a non-`requirement` incorporation carries **zero** weight in statistics (6.2). Written by the coordinator on the `approved -> incorporated` transition, never by the owner. |
 | `at` | ISO-8601 UTC, stamped by the command. |
 | `sha256` | content hash of every other field. |
 
@@ -407,6 +445,31 @@ incorporation path is a pointer plus the existing machinery:
    should start checking the allowlist is an **owner decision**, because it
    changes who can accept requirements today; it is owner question 12.2, with a
    recommendation, and it is an explicit dependency of slice 1a (11).
+
+   **Enabling the check is a migration, not just a comparison.** The allowlist
+   check fails closed, so the identities that run `requirement-apply` today must
+   be enrolled **before** the check deploys, or `requirement-apply --actor james`
+   starts failing on the next deploy. The check and the enrolment are therefore
+   one reviewed unit, landed with slice 1a (11), with these steps:
+
+   1. **List who runs `requirement-apply` today**, starting with `james`: the
+      operator reads the deployment's operator list and its recent
+      `requirement-apply` history and writes the actor strings down. A deployment
+      that cannot enumerate them keeps shell trust instead (12.2).
+   2. **Add each one** with `admin.py operators add <actor>`
+      (`docs/OPERATIONS.md:152`), the same allowlist `void-record` checks.
+   3. **Confirm** with `admin.py operators list` (`docs/OPERATIONS.md:153`). An
+      empty or short list is a deploy blocker, not a warning.
+   4. **Test both directions**: an unlisted actor is refused, and a listed actor
+      (`james`) succeeds. That pair is a slice-1a test, not an operator ritual.
+   5. **Re-check after a `restore-new`**, because a restore does not re-grant the
+      allowlist unless `--restore-operators` is passed (8.4).
+
+   Until that enrolment is done, the shell-only boundary in this section and 4.1
+   is the authority, and the design says so rather than assuming the check has
+   shipped. If the owner answers 12.2 no, steps 1-5 are not needed and the
+   shell-only statement stands as the documented limitation.
+
 3. Only after the owner has returned `approved` does the coordinator draft the
    requirement revision and then write the `incorporated` disposition, naming the
    exact `{requirement_id, requirement_revision, requirement_sha256}` it landed
@@ -512,6 +575,15 @@ existing operator `void-record` path; nothing is deleted.
 
 The field sets are closed, so a new field is a new kind version:
 
+- **A new proposal *family* is not a new field or a new kind.** `target` and
+  `incorporation` are tagged unions (§§3.3, 3.4) whose `kind` discriminator is
+  frozen with v1 and whose only v1 variant is `requirement`. kittrial-5bb.60's
+  alias and capability proposals therefore add `{"kind":"alias", ...}` and
+  `{"kind":"capability", ...}` **variants** to the same two fields - a small
+  reader widening in the style of slice 3's `kind: reference` - instead of a
+  `-v2` record kind, a parallel kind, or a rewrite of the disposition ledger.
+  That is the whole reason the union is tagged before slice 1a freezes v1, and it
+  costs one discriminator field now;
 - a new proposal field means `Kind: requirement-proposal-v2` with its own closed
   field set and validator; dispositions likewise;
 - a reader that meets an unknown `N` marks that one proposal `unsupported`,
@@ -562,7 +634,7 @@ intake record. This design does not rename it and does not duplicate it:
 | Accept the linked requirement revision (F3) | `admin.py requirement-apply` - the **shell route only**, which does not read the operator allowlist today (3.6, 12.2) | not in v1 (web acceptance is a later slice, 11) |
 | Read a proposal queue/scoreboard | any actor on a project they can read (trusted team) | `CAP_READ` member; the scoreboard ranks server-bound identities only (4.2) |
 | Read another person's per-proposal detail | proposal text, rationale and evidence: any actor on a project they can read (trusted team); a rejection reason, a coordinator question or an escalation: coordinators only | `CAP_READ` member for proposal text; a rejection reason, a coordinator question or an escalation only for the submitter and `CAP_APPROVE` members (6.3, 6.4) |
-| Hide one's own scoreboard row | the caller, naming their mapped durable identity (`proposal hide-self`), or the operator for anyone | the session member for their own bound `account:` identity (`/v1/me/contributions/visibility`) |
+| Hide one's own scoreboard row | the caller, naming their mapped durable identity (`proposal hide-self`), or the operator for anyone; a composed compare-and-swap write that may change only the caller's own entry (8.3) | the session member for their own bound `account:` identity (`/v1/me/contributions/visibility`); same single-entry rule (8.3) |
 
 **Why `CAP_APPROVE` is the v1 coordinator, and not a new role.** The office
 model has exactly three roles (`http_authority.py:328`:
@@ -617,12 +689,12 @@ statistics is only as strong as its binding, so this design separates the two:
   `account:<uid>`; a caller cannot claim another identity, and attribution is
   exact.
 - **SSH is a declaration until the operator maps it.** An SSH `submitter`
-  becomes server-bound for attribution only when the operator has mapped the
+  becomes server-bound for attribution only when the operator has resolved the
   calling **actor** to a durable person identity in the project's actor-to-person
   map - an operator-maintained list in the `contribution-settings-v1` record
-  (8.3), maintained by `proposal settings --map-actor <actor> --to <identity>`.
-  The raw actor string stays in the native history and the audit; the statistic
-  key is the mapped identity.
+  (8.3), maintained by `proposal settings --map-actor <actor> --to <identity>`
+  (or `--namespace <name> --to <identity>`, below). The raw actor string stays in
+  the native history and the audit; the statistic key is the mapped identity.
 - **Unmapped means `unverified`.** An SSH submission whose actor is not in the
   map is still accepted and recorded, but its attribution is marked
   `identity: "unverified"`: it appears in the queue and in a coordinator's table
@@ -635,6 +707,47 @@ statistics is only as strong as its binding, so this design separates the two:
   first" error rather than allowed through an unenforceable check, so the
   no-self-decision rule actually fires instead of comparing an actor string with
   a durable identity.
+
+**What the map is keyed on: person-level namespaces, not session actors.** The
+obvious key - the exact actor string - does not survive contact with the session
+registry. `sessions.register` allocates a fresh `'session-' + str(uuid.uuid4())`
+for every session (`sessions.py:170`), and only the coordinator reuses its actor
+by policy, so an exact-actor map needs an operator edit for every new contributor
+session, leaves nearly every SSH submission `unverified`, and refuses every new
+coordinator session until someone re-maps it. The registry offers no better key:
+`sessions.validate` requires each record to be exactly
+`{request_id, actor, name, created_at}` (`sessions.py:17`) - there is **no owner
+field** - so the one stable, human-chosen, person-level value it holds is `name`.
+The map therefore holds two entry shapes and resolves them in order:
+
+1. **an exact actor** (`session-<uuid>` -> `person:<name>`), for a durable actor
+   the team deliberately reuses - typically the coordinator lane;
+2. **a namespace** (`<name>` -> `person:<name>`), matched against the calling
+   actor's registered session `name` when that name is exactly the namespace or
+   begins with `<namespace>/` or `<namespace>-` (so both the plain `james` and
+   the legacy `james/sessionN` forms resolve). A person who registers every
+   session under their own stable name is mapped **once**, not once per session.
+
+The operator can read which name an actor registered with from the session
+registry (`sessions show <actor>`), so a mapping is reviewable rather than
+guessed.
+
+Two honest limits. Namespace matching is a declaration boundary exactly like the
+rest of SSH attribution - only as strong as the team's naming discipline - so an
+exact-actor entry is preferred wherever the team reuses an actor. And a project
+that maintains **neither** kind of entry is not silently half-mapped: its SSH
+submissions are mostly `unverified`, they are still triaged, they are never
+ranked, and it should leave the scoreboard **off** (12.13).
+
+**Mapping the coordinator is a session-start step.** A new coordinator session
+brings a new `session-<uuid>`, so the operator maps it before the first
+disposition: after `session register`/onboard, run
+`proposal settings --map-actor <new actor> --to person:<name>`, or map the
+coordinator's namespace once so its later sessions resolve on their own. Until
+then a disposition by that actor is refused with "map this actor first" - the
+intended fail-closed behaviour, not a silent unverified write. The step belongs
+in the session-start runbook (`docs/OPERATIONS.md`: a slice-1a note with the
+mapping command, then the fuller runbook section in slice 2; 11).
 
 ### 4.3 Coordinator role and escalation target
 
@@ -679,7 +792,11 @@ extra keys as additive), never a synthetic task row and never a per-task field.
                 "escalated": 1, "approved": 1, "stale": 1,
                 "incorporated_unaccepted": 1, "malformed": 0, "total": 12},
      "actions": [
-       {"kind": "route", "priority": 1,
+       {"priority": 1, "kind": "proposal-triage",
+        "project": "example-project", "task": "example-project-317",
+        "reason": "A submitted proposal needs triage.",
+        "links": {"proposal": "/v1/projects/example-project/proposals/p-3f2a1b0c9d8e",
+                  "brief": "/v1/projects/example-project/tasks/example-project-317/brief"},
         "label": {"text": "proposal list --state submitted", "omitted_chars": 0},
         "token": "proposal.list.submitted"}
      ],
@@ -689,7 +806,7 @@ extra keys as additive), never a synthetic task row and never a per-task field.
        {"kind": "requirement", "proposal": "p-3f2a1b0c9d8e",
         "task": "example-project-317", "state": "escalated", "age_days": 9,
         "submitter": "account:u-0001", "identity": "verified",
-        "target": {"kind": "requirement-key", "key": "req-0001"},
+        "target": {"kind": "requirement", "requirement_key": "req-0001"},
         "title": {"text": "Charts must be reproducible ...", "omitted_chars": 0}}
      ],
      "next_offset": null
@@ -698,10 +815,23 @@ extra keys as additive), never a synthetic task row and never a per-task field.
 }
 ```
 
-**The block is the `_agent_attention` shape.** `state`, `summary`, `counts`,
+**The block is the `_agent_attention` shape, and its `actions` are the real
+action shape.** `state`, `summary`, `counts`,
 `actions`, `truncated` and `computed_at` are exactly the fields
 `_agent_attention` returns (`http_service.py:2237-2239`): `summary` is a plain
-string, `actions` is a bounded list, and `counts` is a flat map. `items` and
+string, `actions` is a bounded list, and `counts` is a flat map. Each action is
+built like `_agent_action` and carries the same identifying keys -
+`priority`, `kind`, `project`, `task`, `reason` and `links`
+(`http_service.py:2113-2121`) - and the list is sorted by
+`(priority, project, task)`, exactly the key `_agent_attention` sorts on
+(`http_service.py:2222-2223`). A proposal is not a task, so the task-only keys
+`title`, `status`, `review_state` and `assignee` are absent; `task` carries the
+proposal's native anchor id, which is what a reader needs to open the queue row.
+Two keys are **additive** and change neither the shape nor the sort: `label` is a
+bounded `{text, omitted_chars}` excerpt because proposal text is untrusted, and
+`token` is the CLI route token the existing agent surfaces already use. A reader
+that handles agent attention therefore handles this block, and this is a match of
+the real shape rather than a documented variant of it. `items` and
 `next_offset` are the additive, bounded queue detail, and `kind` on each item is
 `requirement` in slices 1a/1b/2 and `reference` once the shared queue of 9.2
 lands in slice 3. The sibling `attention.reference_review` key in
@@ -753,8 +883,9 @@ plus `attention_total`/`attention_more`, with a new `kind` value
  "attention_total": 1, "attention_more": null}
 ```
 
-- Selection is **deterministic**: proposals whose `target.requirement-key` or
-  `target.area` matches the briefed task's labels/requirement key, plus, for a
+- Selection is **deterministic**: proposals whose `target` names the briefed
+  task's requirement key (`{"kind":"requirement","requirement_key":...}`) or its
+  area (`{"kind":"requirement-area","area":...}`), plus, for a
   coordinator, the oldest `submitted`/`escalated`/`approved` proposals; oldest
   first, at most 3.
 - The checkpoint unresolved-item vocabulary
@@ -904,7 +1035,7 @@ Per contributor (keyed by durable identity):
 | --- | --- |
 | `submitted` | total proposals whose `submitter` is this identity (all revisions collapsed) |
 | `outcomes` | counts of the terminal and open states: `under_review`, `incorporated`, `rejected`, `duplicate`, `escalated`, `needs_info`; plus `stale`, a **derived subset flag** (an open proposal past `stale_days`), so it overlaps the open states and is not summed into `submitted` |
-| `incorporated_weight` | sum over incorporated proposals, reading the linked requirement revision's **live** `acceptance_state` at read time (not the snapshot the disposition recorded): **1.0** when that revision is `accepted` today, **0.5** when it is still `draft`, **0** otherwise, so a later demotion or rejection of the revision drops the credit at the next read. The sum is capped per `(submitter, requirement_id)` over a **rolling 90-day window** at **1.0**, so neither N proposals on one revision nor a chain of new revisions of the same requirement multiplies the credit for one idea. |
+| `incorporated_weight` | sum over incorporated proposals, reading the linked requirement revision's **live** `acceptance_state` at read time (not the snapshot the disposition recorded): **1.0** when that revision is `accepted` today, **0.5** when it is still `draft`, **0** otherwise, so a later demotion or rejection of the revision drops the credit at the next read. The sum is capped per `(submitter, requirement_id)` over a **rolling 90-day window** at **1.0**, so neither N proposals on one revision nor a chain of new revisions of the same requirement multiplies the credit for one idea. An incorporation whose tagged-union `kind` is not `requirement` (kittrial-5bb.60's alias/capability variants, 3.4) carries **zero** weight and is left out of this sum entirely: it has no `requirement_id` for the cap to bound, so any non-zero weight would be a cheap farming route (6.5). A separate, separately-capped alias metric would be a .60 decision, not a v1 field. |
 | `identity` | `verified` or `unverified` (4.2). Unverified contributions are excluded from this per-contributor table and from the scoreboard, and appear only in project totals. |
 | `time_to_disposition_days` | for terminal proposals, the median and mean of `disposition.at - first_revision.created_at`, in whole days; `null` when there are none |
 | `recent_activity` | proposals submitted and dispositions received in the last 30 days |
@@ -978,6 +1109,7 @@ Two consequences of reading the **live** state:
 | --- | --- |
 | **Duplicate farming** (submit the same idea repeatedly) | `duplicate-of` dispositions are neutral: `0` weight and not counted as `rejected`, so copying earns nothing and the submitter is not punished for a coordinator's dedup. A proposal that is a duplicate of already-accepted content is recorded `rejected` with a reason naming the requirement, so the vocabulary stays small. |
 | **Splitting one idea into many** | The per-requirement cap (6.2) means incorporated proposals on one requirement id earn at most `1.0` in a rolling 90 days, however many revisions are cut. A `split-suspect` warning is raised to coordinators when one submitter has more than 3 incorporated proposals on one requirement id within 90 days, or more than 5 in one target area in 30 days. |
+| **Alias farming** (kittrial-5bb.60) | An alias/capability incorporation has no `requirement_id`, so the per-requirement cap cannot bound it. v1 therefore gives every non-`requirement` tagged-union incorporation **zero** weight and keeps it off the scoreboard entirely (3.4, 6.2): alias volume can never earn requirement credit. If .60 wants an alias metric, it adds its own capped counter and its own farming rule as part of that slice, against the frozen tagged-union `kind` discriminator rather than a new record kind. |
 | **Self-scoring by coordinators** | A coordinator may never record a disposition on a proposal whose `submitter` is their own durable identity; the write is refused. The comparison uses the server-bound or operator-mapped identity on both sides (4.2), so on SSH the check genuinely fires instead of comparing an allowlist actor string with a durable identity; an unmapped caller is refused. A self-submitted proposal that needs a decision is escalated, and the owner (a different actor) decides. |
 | **Identity spoofing on SSH** (submitting as someone else) | The statistic key is the operator-maintained actor-to-person map, not the declared string (4.2). An unmapped declaration is `unverified`: it is triaged normally but earns no score and is never ranked, so there is nothing to steal. A mapped actor is accountable for what its actor string submits. |
 | **Reciprocal dispositions** (A triages B's, B triages A's) | A `disposition-pair` warning is raised to the owner when two actors dispose each other's proposals more than 5 times in 30 days. It is a warning, not a block: repeated legitimate collaboration exists. |
@@ -1019,6 +1151,13 @@ dedicated closed settings anchor (8.3):
   `contributions.due_soon_days` (default 7, 1..30) for the queue's derived
   `stale` and escalation-due classes.
 
+These five fields plus the owner decider identities are the **frozen v1 field
+set** (8.3). Slice 1a creates the record with all of them and is the only writer
+of `actor_map` and the deciders; slice 2 writes `scoreboard` and
+`hidden_scoreboard` into the same record and adds no field and no second kind.
+Every write is composed from the previous record with compare-and-swap, and a
+self-service hide may change only the caller's own entry (8.3).
+
 When the scoreboard is off, the panel is absent, `contributions/summary` returns
 totals only with `scoreboard: "off"`, and `proposal mine` and the coordinator
 queue are unaffected.
@@ -1051,7 +1190,7 @@ Each entry contains:
 | `state`, `stale` | derived state and the derived staleness flag |
 | `submitted_at`, `age_days` | first revision timestamp |
 | `revision` | the submitter's current revision number |
-| `target` | the named requirement key or area, or `new-requirement` |
+| `target` | the tagged-union target (3.3): a named requirement key (`{"kind":"requirement",...}`), an area (`{"kind":"requirement-area",...}`), or `{"kind":"requirement-new"}` |
 | `identity` | `verified` or `unverified`, from the server binding or the operator's actor map (4.2) |
 | `disposition` | the newest disposition: `to_state`, `at`, `role`, and the one field that answers "what happened": `reason` (rejected), `question` (needs-info), `duplicate_of`, `escalation`, `decision` (an owner approval), or `incorporation` |
 | `linked_requirement` | `{id, revision, sha256, acceptance_state, manifest_sha256}` from the incorporation, with `acceptance_state` read live (6.2) |
@@ -1066,7 +1205,12 @@ The same surfaces carry the self-service scoreboard hide: a person may flip
 their **own** entry in `contributions.hidden_scoreboard` with
 `proposal hide-self --submitter <mapped identity>` on SSH, or
 `POST /v1/me/contributions/visibility` on HTTP (session-bound). Nothing else
-about the log changes, and the log itself is never hidden (6.4, 6.6).
+about the log changes, and the log itself is never hidden (6.4, 6.6). The write
+is **composed server-side from the previous `contribution-settings-v1` record**
+and committed with compare-and-swap, and the server refuses it unless every field
+other than the caller's own `hidden_scoreboard` entry is byte-identical to that
+previous record - so a hide-self can never add, remove or alter an `actor_map`
+entry, a decider identity or the scoreboard switch (8.3).
 
 ### 7.2 Agents submitting on a person's behalf
 
@@ -1127,9 +1271,9 @@ nonzero exit with a labelled `ValueError` on refusal.
 | `proposal review KEY --file payload.json` | coordinator | `under-review`, `rejected`, `duplicate-of`, `needs-info`, `escalate`, `incorporate` |
 | `proposal decide KEY --file payload.json` | owner, not the escalator | `approved` or `rejected` from `escalated-to-owner`, with a `decision` object naming a native decision issue; never a requirement id (5.4) |
 | `proposal mine --submitter IDENTITY [--limit N] [--offset N]` | the caller, naming the durable identity (7.1) | 7.1 |
-| `proposal hide-self [--show]` | the caller, for their own server-bound or operator-mapped identity | flips their own row in `contributions.hidden_scoreboard` (6.4/6.6) |
+| `proposal hide-self [--show]` | the caller, for their own server-bound or operator-mapped identity | flips their own row in `contributions.hidden_scoreboard` (6.4/6.6); a composed compare-and-swap write that may change only that one entry (8.3) |
 | `proposal stats [--full]` | `--full` requires coordinator authority | 6.2/6.3 |
-| `proposal settings --scoreboard on\|off [--hide IDENTITY] [--show IDENTITY] [--map-actor ACTOR --to IDENTITY]` | owner/operator | writes the `contribution-settings-v1` record (8.3) |
+| `proposal settings --scoreboard on\|off [--hide IDENTITY] [--show IDENTITY] [--map-actor ACTOR --to IDENTITY] [--namespace NAME --to IDENTITY]` | owner/operator | composed compare-and-swap write of the one `contribution-settings-v1` record (8.3) |
 
 The `review` payload shape:
 
@@ -1163,7 +1307,7 @@ guard (`:1639-1640`):
 | `POST /v1/projects/{pid}/proposals/{prid}/dispositions` | `CAP_APPROVE` | triage; the owner decision is `approved`/`rejected` with a `decision` object and a distinct actor |
 | `GET /v1/projects/{pid}/contributions/summary` | `CAP_READ` | totals; verified scoreboard rows only when enabled, `?full=1` requires `CAP_APPROVE` |
 | `GET /v1/me/contributions` | session | 7.1; refused for a credential principal; ships in slice 1b |
-| `POST /v1/me/contributions/visibility` | session | hide or show the caller's **own** scoreboard row (6.4, 6.6); refused for a credential principal |
+| `POST /v1/me/contributions/visibility` | session | hide or show the caller's **own** scoreboard row (6.4, 6.6); refused for a credential principal; a composed compare-and-swap write that may change only that one entry (8.3) |
 | `GET /v1/agents/me/contributions` | agent credential | the owner's contributions for that agent |
 
 The `/v1/me/contributions` route and the web "My contributions" panel ship in
@@ -1192,7 +1336,7 @@ error envelope from `http_auth.py:135-189`.
 | Proposal anchor | native issue, type `task`, closed | labels `proposal`, `proposal:<state>`, `proposal-key:<slug>`, `request:`, `request-content:` |
 | Proposal revision | `Kind: requirement-proposal-v1` comment | writer `proposal submit|revise` only |
 | Disposition | `Kind: proposal-disposition-v1` comment | writer `proposal review|decide` only; append-only audit |
-| Contribution settings | `Kind: contribution-settings-v1` comment | writer `proposal settings` (owner/operator only) and the self-service hide (8.2); lives on **one dedicated closed anchor per project** carrying the exact reserved label `contribution-settings`; fields `contributions.{scoreboard, hidden_scoreboard, actor_map, stale_days, due_soon_days}` and the owner decider identities. A native record rather than a second sidecar file, so the native backup covers it. |
+| Contribution settings | `Kind: contribution-settings-v1` comment | writer `proposal settings` (owner/operator only) and the self-service hide (8.2); lives on **one dedicated closed anchor per project** carrying the exact reserved label `contribution-settings`. **v1 is frozen in slice 1a** with its full field set - `contributions.{scoreboard, hidden_scoreboard, actor_map, stale_days, due_soon_days}` and the owner decider identities - so slice 2 writes `scoreboard`/`hidden_scoreboard` and adds **no field and no second record kind** (11). Every write is composed server-side from the newest previous record and committed with **compare-and-swap** on a `previous_sha256` over that record, exactly as a disposition binds `proposal_sha256` (3.4): a stale read is refused before any native write, and the closed validator rejects extra keys. A `hide-self`/visibility write is a composed write that may change **only the caller's own entry** in `contributions.hidden_scoreboard`: the server re-checks that every other field - `actor_map` above all, plus the decider identities, `scoreboard`, `stale_days` and `due_soon_days` - is byte-identical to the previous record and refuses the write otherwise, so the contributor route can never touch the authority-bearing map. A native record rather than a second sidecar file, so the native backup covers it. |
 | Receipt journal | `.proposal-requests/<64hex>.json` | operator recovery cache; frozen schema in slice 0 (8.4) |
 | Requirement linkage | existing `Kind: requirement-revision-v1` / `requirement-acceptance-v1` | untouched; referenced by id/revision/sha256 |
 
@@ -1236,7 +1380,10 @@ settings record is scope creep here and a future collision.
   `--restore-operators` is passed additively
   (`admin.py:1907-1928`, `:2012-2014`), so after a restore the coordinator
   dispositions still require a currently listed operator on the SSH route and
-  `CAP_APPROVE` membership on HTTP.
+  `CAP_APPROVE` membership on HTTP. If `requirement-apply` has started checking
+  the allowlist, the `operators list` re-check of 3.6/12.2 is part of the restore
+  drill, not an afterthought: a restored deployment with an empty allowlist would
+  fail every acceptance closed.
 - **Not backed up, deliberately.** Statistics are computed, never stored, so
   there is no statistics store to back up, restore or drift. The scoreboard is a
   view.
@@ -1534,7 +1681,7 @@ refers to a real project, host or firm.
 ```json
 {"schema_version": 1, "operation_id": "alex-prop-1", "operation": "submit",
  "submitter": "account:u-0001",
- "target": {"kind": "requirement-key", "key": "req-0001"},
+  "target": {"kind": "requirement", "requirement_key": "req-0001"},
  "text": "Charts must be reproducible from the persisted daily snapshot.",
  "rationale": "Two runs on the same input currently disagree.",
  "evidence": ["https://example.invalid/incidents/example-17"],
@@ -1549,7 +1696,8 @@ existing `requirement` action, the owner accepts it with F3 evidence through
 {"schema_version": 1, "operation_id": "coord-prop-1", "operation": "review",
  "key": "p-3f2a1b0c9d8e", "previous": "<newest disposition id>",
  "proposal_sha256": "6666...", "to_state": "incorporated",
- "incorporation": {"requirement_id": "example-project-208",
+ "incorporation": {"kind": "requirement",
+                   "requirement_id": "example-project-208",
                    "requirement_revision": 3, "requirement_sha256": "7777...",
                    "acceptance_state": "accepted",
                    "acceptance_decision_id": "example-project-42",
@@ -1645,26 +1793,40 @@ with the reference catalog, after both slice 1s have landed.
   `requirement-proposal-v1` and `proposal-disposition-v1` kinds, closed anchors,
   `submit`/`revise` with `expected_sha256`, the `.proposal-requests/` journal,
   the durable-identity and session-refusal rule, the state machine of 3.5
-  including `approved`, and the derived fields;
+  including `approved`, and the derived fields. **v1 freezes the tagged unions**:
+  `target` and `incorporation` ship with their `kind` discriminator and the
+  `requirement` variant only (3.3, 3.4, 3.8), so `kittrial-5bb.60` adds
+  `alias`/`capability` variants instead of a `-v2` kind;
 - the `proposal` client action and endpoint branch (8.1), plus
   `docs/CLI_CONTRACT.md` additions;
 - dispositions and the operator-allowlist authority split, including the
   no-self-disposition and no-self-decision rules computed through the
   actor-to-person map, and the `contribution-settings-v1` record that holds the
-  map and the owner deciders (4.2, 6.6);
+  map and the owner deciders (4.2, 6.6). The map ships with its two entry shapes
+  - person-level **namespace** plus exact actor (4.2) - and the record ships with
+  its **full frozen v1 field set** and the compare-and-swap composition of 8.3,
+  even though only `actor_map` and the deciders have a writer in this slice; a
+  `proposal settings --namespace` writer is part of it, and a slice-1a
+  `docs/OPERATIONS.md` note records the **session-start step**: map the
+  coordinator's new actor (or its namespace) before its first disposition (4.2);
 - owner `decide` as `approved`/`rejected` with a `decision` object, and the
   coordinator's later incorporation as a pointer to
   `requirement_records`/`admin.py requirement-apply`, with the BRD manifest link
   and the `change_classification` bridge (3.6, 3.9);
 - `work` counts/items and the `brief` top-3 with `trust`, both in the
-  `_agent_attention` shape (5.1), with per-proposal failure isolation and bounded
+  `_agent_attention` shape with `_agent_action`-shaped, `(priority, project,
+  task)`-sorted actions (5.1), with per-proposal failure isolation and bounded
   coverage;
 - **it depends on the owner's answer to 12.2.** If the owner decides
   `requirement-apply` should check the operator allowlist, that change to
-  `admin.py` lands here (or immediately before it) and is reviewed with the
-  slice. If the owner keeps shell trust, 3.6's shell-only boundary is the
-  documented authority and the slice proceeds unchanged. The design does not
-  assume either answer.
+  `admin.py` lands here (or immediately before it), reviewed as **one unit with
+  its migration**: list the actors that run `requirement-apply` today starting
+  with `james`, `admin.py operators add` each of them, confirm with
+  `operators list` and refuse to deploy against an empty list, and ship the two
+  tests - an unlisted actor is refused, a listed one succeeds (3.6, 12.2). There
+  is no window in which `requirement-apply --actor james` fails closed. If the
+  owner keeps shell trust, 3.6's shell-only boundary is the documented authority
+  and the slice proceeds unchanged. The design does not assume either answer.
 
 **Slice 1b - HTTP routes, scope and web.**
 
@@ -1679,11 +1841,14 @@ with the reference catalog, after both slice 1s have landed.
 
 - `proposal stats` and `GET /v1/projects/{pid}/contributions/summary`;
 - the scoreboard panel over verified identities, and the
-  `contribution-settings-v1` fields `scoreboard`, `hidden_scoreboard`,
-  `actor_map`, `stale_days` and `due_soon_days`, with the self-service hide;
+  `contribution-settings-v1` fields `scoreboard` and `hidden_scoreboard`, with
+  the self-service hide. These are **writes into the v1 record frozen in slice
+  1a** (8.3): no new field, no second record kind, and every write keeps the
+  compare-and-swap composition and the single-entry rule for a hide;
 - the `split-suspect` and `disposition-pair` warnings and the agent marker;
-- `docs/OPERATIONS.md` runbook section (promotion, settings, actor mapping,
-  rollback floor) and a `templates/` proposal example.
+- `docs/OPERATIONS.md` runbook section (promotion, settings, actor mapping
+  including the session-start coordinator re-map from slice 1a, rollback floor)
+  and a `templates/` proposal example.
 
 **Slice 3 - one queue, two kinds (after both slice 1s have landed).**
 
@@ -1701,6 +1866,14 @@ defers it (12.2); `attention.feedback_triage`, which this design defers (9.1);
 accepting an incorporation as the source of the offline `change` object (3.9); a
 real notification channel; and a dedicated "requirements gathering project" mode
 that disables task creation (12.14).
+
+**kittrial-5bb.60 - the capability index - adds variants, not kinds.** Alias and
+capability proposals add `{"kind":"alias", ...}` /
+`{"kind":"capability", ...}` variants to the already-frozen tagged unions of 3.3
+and 3.4, appear in the queue exactly as slice 3's `kind: reference` widening does,
+and carry **zero** weight in v1 statistics (6.2, 6.5). That slice owns any
+separate, separately-capped alias metric; it must not be retrofitted into the v1
+weight.
 
 ## 12. Owner questions, with recommended answers
 
@@ -1722,10 +1895,20 @@ choices that do not block the slices.
    the allowlist, so whoever can run the operator CLI can accept a requirement
    revision (3.6), and this design will call it far more often than the kit does
    now. Close the gap by checking the allowlist exactly as `void-record` does
-   (`admin.py:2240`), and land it with slice 1a. **Slice 1a depends on this
-   answer** (11). If the owner prefers to keep shell trust, the design proceeds
-   with the shell-only boundary stated plainly in 3.6 and 4.1, and the gap is
-   recorded as a known limitation rather than hidden.
+   (`admin.py:2240`), and land it with slice 1a. **The check is a migration, not
+   just a comparison**, because it fails closed: before it deploys, (a) list
+   every actor that runs `requirement-apply` today, starting with `james`;
+   (b) add each with `admin.py operators add <actor>` (`docs/OPERATIONS.md:152`);
+   (c) confirm with `admin.py operators list` (`docs/OPERATIONS.md:153`) and
+   treat an empty or short list as a deploy blocker; (d) test that an **unlisted**
+   actor is refused and a **listed** one (`james`) succeeds - that pair is a
+   slice-1a test; (e) re-check `operators list` after any `restore-new`, which
+   does not re-grant the allowlist unless `--restore-operators` is passed (8.4).
+   The check and the enrolment are one reviewed unit (3.6, 11). **Slice 1a
+   depends on this answer** (11). If the owner prefers to keep shell trust, the
+   design proceeds with the shell-only boundary stated plainly in 3.6 and 4.1,
+   none of steps (a)-(e) is needed, and the gap is recorded as a known limitation
+   rather than hidden.
 3. **Scoreboard default.** *Recommended:* off by default, enabled per project by
    an owner, with the per-person self-service hide. The owner said "maybe" - a
    named public ranking is a deliberate social choice, not a kit default.
@@ -1771,13 +1954,25 @@ choices that do not block the slices.
     merging their storage or their vocabularies. `attention.feedback_triage` is
     deferred, not part of this design (9.1).
 13. **SSH attribution: map actors to people, or trust declarations?**
-    *Recommended:* map them. Only server-bound identities - an HTTP
-    `account:<uid>`, or an SSH actor the operator has mapped in
-    `contributions.actor_map` - are ranked and counted per person; everything
+    *Recommended:* map them, keyed on **stable person-level namespaces** rather
+    than on exact session actors. A `session-<uuid>` actor is fresh every session
+    (`sessions.py:170`) and only the coordinator reuses its actor, so an
+    exact-actor map needs an operator edit per session, leaves most SSH
+    submissions unverified, and refuses each new coordinator session; and the
+    session registry has **no owner field** to key on (`sessions.py:17` requires
+    exactly `request_id`, `actor`, `name`, `created_at`). The map therefore
+    accepts a **namespace** entry (`james` -> `person:james`, matched on the
+    registered session **name**, the one stable person-level value the registry
+    holds) beside an exact-actor entry for a reused actor such as the coordinator,
+    and mapping a new coordinator actor is a session-start runbook step (4.2,
+    11). Only server-bound identities - an HTTP `account:<uid>`, or an SSH actor
+    resolved through that map - are ranked and counted per person; everything
     else is `unverified` and stays off the ranking (4.2, 6.1). Without the map
     the scoreboard is a declaration contest and the no-self-decision check
-    cannot fire; a project that will not maintain a map should leave the
-    scoreboard off.
+    cannot fire, so a project that will maintain neither kind of entry is told
+    plainly that its SSH attribution is mostly unverified and should leave the
+    scoreboard **off** - the submissions are still triaged, they are never
+    ranked.
 14. **The literal ask: "a requirements gathering project ... rather than
     tasks".** *Recommended:* **any project** in v1 - proposals are an additive
     surface in every project, exactly like feedback - with a dedicated project
