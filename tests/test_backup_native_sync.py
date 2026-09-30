@@ -14,6 +14,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import signal
 import sqlite3
@@ -180,7 +181,8 @@ class NativeSyncCase(RuntimeCase):
             encoding='utf-8')
         with patch.object(admin, 'spawn_sync_client') as spawn, \
                 patch.object(admin, 'run_bd') as native:
-            with self.assertRaisesRegex(ValueError, 'backups/alphan'):
+            with self.assertRaisesRegex(
+                    ValueError, re.escape(str((self.root / 'backups' / 'alphan').resolve()))):
                 admin.native_backup_sync(self.root, 'alphan')
         spawn.assert_not_called()
         native.assert_not_called()
@@ -193,7 +195,8 @@ class NativeSyncCase(RuntimeCase):
             with self.subTest(url=url):
                 (self.root / 'projects' / 'alpha' / '.beads' / 'dolt-backup.json').write_text(
                     json.dumps({'backup_name': 'default', 'backup_url': url}), encoding='utf-8')
-                with self.assertRaisesRegex(ValueError, 'backups/alpha'):
+                with self.assertRaisesRegex(
+                        ValueError, re.escape(str((self.root / 'backups' / 'alpha').resolve()))):
                     admin.native_backup_sync(self.root, 'alpha')
 
     def test_backup_refuses_a_foreign_target_before_the_pending_marker(self):
@@ -203,7 +206,8 @@ class NativeSyncCase(RuntimeCase):
                         'backup_url': (self.root / 'backups' / 'alpha').resolve().as_uri()}),
             encoding='utf-8')
         with patch.object(admin, 'native_backup_sync') as sync:
-            with self.assertRaisesRegex(ValueError, 'backups/alphan'):
+            with self.assertRaisesRegex(
+                    ValueError, re.escape(str((self.root / 'backups' / 'alphan').resolve()))):
                 admin.backup_project(self.root, 'alphan')
         sync.assert_not_called()
         self.assertFalse((self.root / 'backups' / 'alphan.coordination.json').exists())
@@ -405,7 +409,9 @@ class SyncClientHandleCase(RuntimeCase):
         self.assertIn('nope', caught.exception.stderr)
         self.assertTrue(handle.finished)
 
-    @unittest.skipUnless(hasattr(signal, 'SIGTERM'), 'SIGTERM is required')
+    @unittest.skipUnless(os.name == 'posix',
+                         'POSIX signal delivery is required: on Windows hasattr(signal, "SIGTERM") '
+                         'is true but os.kill(pid, SIGTERM) is TerminateProcess and kills the run')
     def test_sigterm_raises_inside_the_guard_and_the_previous_handler_is_restored(self):
         previous = signal.getsignal(signal.SIGTERM)
         with self.assertRaises(admin.TerminatedBySignal) as caught:

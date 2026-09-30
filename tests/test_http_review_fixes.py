@@ -2810,7 +2810,10 @@ class JournalBackupCase(unittest.TestCase):
             (root / 'projects' / name).mkdir(parents=True, exist_ok=True)
 
         argv = ['admin.py', '--root', str(self.root), 'restore-new', 'source', 'destination']
+        # admin.root_path validates a Linux path, so on Windows it refuses the temporary
+        # root before restore-new runs; the other tests in this case patch it the same way.
         with _patch.object(admin, 'add_project', side_effect=fake_add), \
+                _patch.object(admin, 'root_path', return_value=self.root), \
                 _patch.object(admin, 'run_bd', return_value='restored'), \
                 _patch.object(sys, 'argv', argv), contextlib.redirect_stdout(io.StringIO()):
             admin.main()

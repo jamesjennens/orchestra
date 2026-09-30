@@ -439,15 +439,18 @@ class ScheduledCoverageGuidanceCase(unittest.TestCase):
         return path
 
     def admin_line(self, root, *projects):
+        # A systemd ExecStart line carries a POSIX path, so render the root with
+        # forward slashes even when the test runs on Windows: shlex parses backslashes
+        # as escapes and would mangle a native Windows path.
         return ('ExecStart=/usr/bin/python3 /opt/orchestra/admin.py --root %s backup %s'
-                % (root, ' '.join(projects)))
+                % (Path(root).as_posix(), ' '.join(projects)))
 
     def line(self, *projects):
         return self.admin_line(self.root, *projects)
 
     def wrapper_line(self, root=None, script='/opt/orchestra/longsync-wrapper.py'):
         return ('ExecStart=/usr/bin/python3 %s --root %s --project second'
-                % (script, root or self.root))
+                % (script, Path(root or self.root).as_posix()))
 
     def test_no_unit_reports_no_coverage_and_the_exact_line(self):
         covered, message = admin.scheduled_backup_coverage(self.root, 'second')
@@ -508,7 +511,8 @@ class ScheduledCoverageGuidanceCase(unittest.TestCase):
         self.assertIn('second', message)
 
     def test_bare_backup_with_no_project_is_reported_as_no_coverage(self):
-        self.write_unit('ExecStart=/usr/bin/python3 /opt/orchestra/admin.py --root %s backup' % self.root)
+        self.write_unit('ExecStart=/usr/bin/python3 /opt/orchestra/admin.py --root %s backup'
+                        % self.root.as_posix())
         covered, message = admin.scheduled_backup_coverage(self.root, 'second')
         self.assertFalse(covered)
         self.assertIn('cover only no project', message)
@@ -545,7 +549,7 @@ class ScheduledCoverageGuidanceCase(unittest.TestCase):
         self.write_unit(
             'ExecStart=/usr/bin/python3 /opt/wrapper.py --root %s --project first\n'
             'ExecStart=/usr/bin/python3 /opt/wrapper.py --root %s --project second'
-            % (self.root, self.root),
+            % (self.root.as_posix(), self.root.as_posix()),
             name='beads-example-backup.service')
         covered, message = admin.scheduled_backup_coverage(self.root, 'second')
         self.assertFalse(covered)
@@ -560,7 +564,7 @@ class ScheduledCoverageGuidanceCase(unittest.TestCase):
         self.assertNotIn('backup --all', message)
 
     def test_a_wrapper_with_no_project_names_is_not_full_coverage(self):
-        self.write_unit('ExecStart=/usr/bin/python3 /opt/report.py --root %s' % self.root)
+        self.write_unit('ExecStart=/usr/bin/python3 /opt/report.py --root %s' % self.root.as_posix())
         covered, message = admin.scheduled_backup_coverage(self.root, 'second')
         self.assertFalse(covered)
         self.assertIn('names no project', message)
@@ -571,7 +575,7 @@ class ScheduledCoverageGuidanceCase(unittest.TestCase):
 
     def test_a_wrapper_project_equals_form_is_parsed(self):
         self.write_unit(
-            'ExecStart=/usr/bin/python3 /opt/wrapper.py --root=%s --project=second' % self.root)
+            'ExecStart=/usr/bin/python3 /opt/wrapper.py --root=%s --project=second' % self.root.as_posix())
         covered, message = admin.scheduled_backup_coverage(self.root, 'second')
         self.assertFalse(covered)
         self.assertIn('already include second', message)
