@@ -678,7 +678,7 @@ class InProcessBackend:
                 pending_request_ids=[r['id'] for r in review['requests'] if r['status'] == 'open'],
                 waiting_since=review['latest_at']))
         items.sort(key=queue_order)
-        return {'items': items, 'complete': True}
+        return {'items': items, 'complete': True, 'warnings': []}
 
 
 #: Review states that still need someone to act (``work.queue`` keeps these even on a
@@ -694,12 +694,18 @@ def queue_order(item):
 
 
 def queue_item(project_id, task, review_state, contribution, open_requests,
-               pending_request_ids=None, waiting_since=None):
+               pending_request_ids=None, waiting_since=None, integration=None,
+               integration_warnings=None):
     """One review-queue row, in the shape both backends return.
 
     ``pending_request_ids`` and ``waiting_since`` (time of the latest review record)
     are filled where the backend knows them; the canonical ``work`` projection
     reports only a count of pending items, so there they stay empty/``None``.
+
+    ``integration`` and ``integration_warnings`` are additive (kittrial-5bb.52):
+    the canonical backend passes the ``work`` row's integration block and its
+    any-pass-wins disagreement warnings through; the disposable backend records no
+    lifecycle evidence and leaves them ``None``/empty.
     """
     return {'id': task.get('id'), 'project_id': project_id, 'title': task.get('title'),
             'status': task.get('status'), 'assignee': task.get('assignee'),
@@ -708,7 +714,9 @@ def queue_item(project_id, task, review_state, contribution, open_requests,
             'review_state': review_state or 'none', 'contribution': contribution,
             'open_requests': open_requests,
             'pending_request_ids': list(pending_request_ids or []),
-            'waiting_since': waiting_since}
+            'waiting_since': waiting_since,
+            'integration': integration,
+            'integration_warnings': list(integration_warnings or [])}
 
 
 class EndpointBackend:
@@ -1132,7 +1140,11 @@ class EndpointBackend:
                            'open_requests': review.get('pending_total', len(requests)),
                            'latest_id': review.get('latest_comment_id'),
                            'revisions': priors + 1 if contribution else 0,
-                           'warnings': review.get('warnings') or []},
+                           'warnings': review.get('warnings') or [],
+                           # Additive (kittrial-5bb.52): the machine-readable
+                           # any-pass-wins disagreement entries naming both facts
+                           # and both scopes.
+                           'integration_disagreements': review.get('integration_disagreements') or []},
                 'lifecycle': lifecycle,
                 'depends_on': [{'id': d.get('depends_on_id'), 'title': d.get('depends_on_id'),
                                 'status': 'unknown', 'type': d.get('type')}
@@ -1155,8 +1167,11 @@ class EndpointBackend:
         bounded walk stopped early; tasks past the bound are unknown too.
         """
         queue = queue if queue is not None else self.review_queue(project_id)
+        # The integration disagreement warnings (kittrial-5bb.52) travel with the
+        # states read as the same additive top-level list ``review_queue`` returns.
         return {'states': {item['id']: item['review_state'] for item in queue['items']},
-                'complete': bool(queue.get('complete')), 'closed_unknown': True}
+                'complete': bool(queue.get('complete')), 'closed_unknown': True,
+                'warnings': list(queue.get('warnings') or [])}
 
     #: Bound on the canonical ``work`` pages one queue read walks (``work`` allows at
     #: most 100 rows per call and re-exports the project each call). Reaching it
@@ -1171,6 +1186,7 @@ class EndpointBackend:
         and rows come highest-attention first.
         """
         items = []
+        warnings = []
         offset = 0
         complete = False
         for _ in range(self.QUEUE_MAX_PAGES):
@@ -1186,14 +1202,21 @@ class EndpointBackend:
                                 if row.get('contribution_id') else None)
                 task = {'id': row.get('task'), 'title': row.get('title'),
                         'status': row.get('status'), 'assignee': row.get('owner')}
+                row_warnings = [w for w in row.get('integration_warnings') or []
+                                if isinstance(w, str)]
+                for warning in row_warnings:
+                    if warning not in warnings:
+                        warnings.append(warning)
                 items.append(queue_item(project_id, task, row.get('review_state'),
-                                        contribution, row.get('pending_review_items') or 0))
+                                        contribution, row.get('pending_review_items') or 0,
+                                        integration=row.get('integration'),
+                                        integration_warnings=row_warnings))
             offset = page.get('next_offset')
             if offset is None:
                 complete = True
                 break
         items.sort(key=queue_order)
-        return {'items': items, 'complete': complete}
+        return {'items': items, 'complete': complete, 'warnings': sorted(warnings)}
 
 
 def _canonical_payload(stdout):

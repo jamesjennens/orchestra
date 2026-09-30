@@ -38,7 +38,14 @@ def render(rows,dest,operators=None):
     # endpoint supplies to `work`/`review`/`brief`. Without it a valid void is
     # inert here while the other reads apply it, so the generated CURRENT.md
     # disagreed with the queue.
-    review_queue=queue(rows,'',[],operators=operators)
+    # The host-issued revert journal lives in the project coordination directory,
+    # which is the PARENT of the `views` destination the refresh route renders into
+    # (endpoint.py: render(rows, path/'views', ...)), so journal=dest.parent is the
+    # same project directory `work`, `brief` and `review` are given. Without it the
+    # queue projection trusted no revert and CURRENT.md showed reverted work as
+    # integrated with no warning while every other read said awaiting-integration
+    # (kittrial-5bb.52 review item `render-journal`).
+    review_queue=queue(rows,'',[],operators=operators,journal=dest.parent)
     review_items=[r for r in review_queue['items'] if r['review_state']!='none']
     if review_items:
         def review_cell(value):return str('unknown' if value is None or value=='' else value).replace('|','\\|').replace('\n',' ')[:160]

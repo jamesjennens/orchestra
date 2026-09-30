@@ -21,7 +21,7 @@ from handoff import (
 from lifecycle import PREFIX as LIFECYCLE_PREFIX
 from requirements import ACCEPTANCE_FIELDS, SHA256_TEXT
 from recovery import PREFIX as VOID_PREFIX
-from review_workflow import PREFIX as REVIEW_PREFIX
+from review_workflow import PREFIX as REVIEW_PREFIX, REVERT_PREFIX
 from worker_gate import PREFIX as PLAN_PREFIX, parse_body as parse_plan_body
 
 
@@ -171,6 +171,7 @@ RESERVED = (
     (HANDOFF_COMPLETE_PREFIX, 'handoff completion', 'handoff TASK --file handoff.json'),
     (PLAN_PREFIX, 'worker plan registration', 'worker_gate.py register'),
     (VOID_PREFIX, 'operator void record', 'admin.py void-record on the coordination host'),
+    (REVERT_PREFIX, 'integration revert record', 'admin.py revert-record on the coordination host'),
 )
 
 PREFIXES = tuple(prefix for prefix, _, _ in RESERVED)
@@ -1109,6 +1110,11 @@ def is_legitimate_writer(body, actor=None, task=None):
         # written by the host-side structured operation (admin.py void-record,
         # under the project lock); every raw path stays rejected, exactly like
         # handoff records.
+        return False
+    if body.startswith(REVERT_PREFIX):
+        # Same reasoning for the audited integration revert record: operator
+        # authority comes from the deployment allowlist and the host-side
+        # admin.py revert-record command, never from the record's own fields.
         return False
     return False
 

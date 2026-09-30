@@ -39,7 +39,7 @@ from handoff import (
 from lifecycle import PREFIX as LIFECYCLE_PREFIX
 from recovery import PREFIX as VOID_PREFIX
 from requirements import canonical_bytes, content_hash
-from review_workflow import PREFIX as REVIEW_PREFIX
+from review_workflow import PREFIX as REVIEW_PREFIX, REVERT_PREFIX
 from worker_gate import PREFIX as PLAN_PREFIX, payload_for, body_for
 
 
@@ -79,15 +79,39 @@ def forged_void_body(target='c1', original='ORIGINAL BYTES', operator='mallory/s
     return VOID_PREFIX + canonical_bytes(payload).decode()
 
 
+def forged_revert_body(operator='mallory/session9'):
+    payload = {
+        'schema_version': 1,
+        'operation': 'revert-record',
+        'operation_id': 'forged-revert-1',
+        'task': 'task-1',
+        'contribution': 'c1',
+        'integration_commit': 'a' * 40,
+        'revert_commit': 'b' * 40,
+        'reason': 'pretend an integrated change was reverted',
+        'operator': operator,
+    }
+    return REVERT_PREFIX + canonical_bytes(payload).decode()
+
+
 class ReservedPrefixTests(unittest.TestCase):
     def test_all_structured_prefixes_are_reserved(self):
         self.assertGreaterEqual(len(PREFIXES), 8)
-        for prefix in (REVIEW_PREFIX, CHECKPOINT_PREFIX, LIFECYCLE_PREFIX, VOID_PREFIX):
+        for prefix in (REVIEW_PREFIX, CHECKPOINT_PREFIX, LIFECYCLE_PREFIX, VOID_PREFIX,
+                       REVERT_PREFIX):
             self.assertIn(prefix, PREFIXES)
         self.assertIn('Kind: task-handoff-v1\n', PREFIXES)
         self.assertIn('Kind: task-handoff-complete-v1\n', PREFIXES)
         self.assertIn('Kind: requirement-revision-v1\n', PREFIXES)
         self.assertIn('Kind: plan-registration.\n', PREFIXES)
+
+    def test_voidable_kinds_match_the_owning_modules(self):
+        """``recovery`` repeats the prefixes instead of importing them cyclically."""
+        from recovery import KIND_PREFIXES
+        from review_workflow import PREFIX as REVIEW, REVERT_PREFIX as REVERT
+        self.assertEqual(KIND_PREFIXES['contribution-review'], REVIEW)
+        # Voiding a revert record is the retraction path (kittrial-5bb.52 item 2).
+        self.assertEqual(KIND_PREFIXES['integration-revert'], REVERT)
 
     def test_oversized_invalid_json_with_reserved_prefix_rejected(self):
         body = REVIEW_PREFIX + '{not valid json' * 5000
@@ -335,6 +359,26 @@ class ReservedPrefixTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r'unresolvable comment target'):
             check_raw_request(['comments', 'add', '@attachment:0', '--json'],
                               {'0': {'flag': '--file', 'text': body}}, actor='mallory/session9')
+
+    def test_revert_raw_records_always_rejected_on_endpoint_path(self):
+        # Operator revert authority cannot be established from self-asserted
+        # comment fields either: a canonical revert payload is refused on every
+        # raw path, positional or transported file, for every actor (kittrial-5bb.52).
+        body = forged_revert_body()
+        match = reserved_match(body)
+        self.assertIsNotNone(match)
+        self.assertEqual(match[0], REVERT_PREFIX)
+        self.assertEqual(match[1], 'integration revert record')
+        self.assertIn('admin.py revert-record', match[2])
+        self.assertFalse(is_legitimate_writer(body, actor='mallory/session9', task='task-1'))
+        self.assertFalse(is_legitimate_writer(body, actor='alice/session1', task='task-1'))
+        for actor in ('mallory/session9', 'alice/session1'):
+            with self.assertRaisesRegex(ValueError, r'Refusing raw'):
+                check_raw_request(['comments', 'add', 'task-1', body, '--json'], {}, actor=actor)
+        args = ['comments', 'add', 'task-1', '@attachment:0', '--json']
+        with self.assertRaisesRegex(ValueError, r'file-transport'):
+            check_raw_request(args, {'0': {'flag': '--file', 'text': body}},
+                              actor='mallory/session9', task='task-1')
 
     def test_flags_before_add_cannot_hide_a_forged_reserved_body(self):
         # Native bd accepts global/author flags before `add`; the guard must

@@ -10,13 +10,33 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import briefing as b
 import client
+import review_workflow as w
 from requirements import canonical_bytes
 from lifecycle import DIMENSIONS
-from test_lifecycle import NativeStore, payload
+from test_lifecycle import NativeStore, payload, scope
 
 TASK = 'trial-task'
 PROJECT = 'trial'
 STAMP = '2026-09-15T10:00:00Z'
+
+
+def contribution(commit):
+    return dict(schema_version=1, operation='contribute', operation_id='send-1', task=TASK,
+                previous=None, repository='ssh://git/example', commit=commit,
+                base_commit='b' * 40,
+                delivery=dict(kind='bundle', path='server:/rev.bundle', sha256='c' * 64),
+                summary='Contribution delivered', supersedes=None)
+
+
+def approval(contribution_id):
+    return dict(schema_version=1, operation='approve', operation_id='approve-1', task=TASK,
+                previous=contribution_id, contribution=contribution_id, summary='Reviewed')
+
+
+def add_review(data, p, cid, author='alice/session'):
+    data[0].setdefault('comments', []).append(
+        dict(id=cid, author=author, created_at=STAMP,
+             text=w.PREFIX + canonical_bytes(p).decode()))
 
 
 def comment(cid, text='A finding', stamp=STAMP):
@@ -269,6 +289,56 @@ class ClientBriefingTests(unittest.TestCase):
                               [TASK, '--file', str(path)], 'checkpoint', None))
             self.assertEqual(wire['args'], [TASK, '@attachment:0'])
             self.assertEqual(wire['attachments']['0'], dict(flag='--file', text=contents))
+
+
+class IntegrationDisagreementBriefTests(unittest.TestCase):
+    """The any-pass-wins disagreement is visible in the compact brief (5bb.52).
+
+    The owner decision on kittrial-5bb.32 keeps any-pass-wins, so a brief that
+    reports a `passed` integration fact while the newest matching scope records
+    something else must say so, naming both facts and both scopes, in both the
+    JSON `warnings` list and the rendered `format_brief` output.
+    """
+
+    COMMIT = 'a' * 40
+
+    def _reviewed(self):
+        store = NativeStore()
+        seeded = scope(source_commit=self.COMMIT)
+        store.record(payload('lifecycle-scope', operation='scope-1', scope=seeded))
+        store.record(payload('integrated', operation='fact-integrated', scope=seeded))
+        store.rows[0]['comments'] = []
+        store.rows[0]['assignee'] = 'alice/session'
+        add_review(store.rows, contribution(self.COMMIT), 'delivery')
+        add_review(store.rows, approval('delivery'), 'approval', 'reviewer')
+        return store
+
+    def test_brief_warns_and_renders_the_disagreement(self):
+        store = self._reviewed()
+        second = scope(source_commit=self.COMMIT, integration_commit='merge-b',
+                       release_id='release-2')
+        store.record(payload('lifecycle-scope', operation='scope-2', scope=second))
+        store.record(payload('integrated', 'failed', 'fact-2', scope=second,
+                             evidence=['report:newer-failure']))
+        result = b.brief(store.rows, PROJECT, TASK)
+        warnings = [line for line in result['warnings']
+                    if line.startswith('Integration fact disagreement')]
+        self.assertEqual(len(warnings), 1)
+        for text in ('merge-a', 'merge-b', 'passed', 'failed'):
+            self.assertIn(text, warnings[0])
+        self.assertEqual(result['review']['integration']['fact'], 'passed')
+        self.assertEqual(result['review']['integration']['newest_fact'], 'failed')
+        rendered = b.format_brief(result)
+        self.assertIn('Integration fact disagreement', rendered)
+        self.assertIn('merge-a', rendered)
+        self.assertIn('merge-b', rendered)
+
+    def test_brief_has_no_warning_when_the_facts_agree(self):
+        store = self._reviewed()
+        result = b.brief(store.rows, PROJECT, TASK)
+        self.assertFalse(any(line.startswith('Integration fact disagreement')
+                             for line in result['warnings']))
+        self.assertNotIn('Integration fact disagreement', b.format_brief(result))
 
 
 if __name__ == '__main__':

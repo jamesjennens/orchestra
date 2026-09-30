@@ -24,7 +24,10 @@ the contributor transport. Applying a void to a record that is part of the
 contribution chain the surviving records currently form is refused by the owning
 module, so an unauthorised void cannot remove a current approval. Reads require
 a void to follow its target in native order, so a void planted before its target
-cannot reorder or reconcile history.
+cannot reorder or reconcile history. The owning module additionally lets a void
+target an `integration-revert` record, to retract an operator revert; a revert is
+not part of the contribution chain, so it is not protected by it, and the owning
+module refuses to retract a revert the host did not issue.
 """
 import hashlib
 import json
@@ -35,7 +38,15 @@ from requirements import canonical_bytes
 PREFIX = 'Kind: record-void-v1\n'
 OPERATION = 'void-record'
 DISPOSITIONS = ('void',)
-KIND_PREFIXES = {'contribution-review': 'Kind: contribution-review-v1\n'}
+# Voidable target kinds. ``contribution-review`` reconciles a malformed,
+# duplicate or conflicting review record. ``integration-revert`` RETRACTS an
+# operator integration revert (kittrial-5bb.52 review item
+# ``retraction-and-same-commit``): the owning module refuses to void a revert the
+# host did not issue, and it requires the retraction to be host-journaled before
+# the native write. The prefix is repeated here rather than imported because
+# review_workflow imports this module; test_recovery pins the two together.
+KIND_PREFIXES = {'contribution-review': 'Kind: contribution-review-v1\n',
+                 'integration-revert': 'Kind: integration-revert-v1\n'}
 FIELDS = {'schema_version', 'operation', 'operation_id', 'task', 'target', 'target_kind',
           'target_sha256', 'original', 'reason', 'disposition', 'operator'}
 ORIGINAL_LIMIT = 60000

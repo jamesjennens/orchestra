@@ -29,6 +29,10 @@ BRIEF_MISTAKEN_FLAGS={
 # through `review TASK`, so the embedded view carries only a bounded recent slice
 # (without summaries) plus a total and a pointer.
 PRIOR_BRIEF_LIMIT=5
+# The embedded host-issued revert list is bounded the same way (kittrial-5bb.52
+# review item `smaller`): the compact read carries the newest slice plus a total
+# and a pointer, never the unclipped list.
+REVERT_BRIEF_LIMIT=5
 
 def token(data):return base64.urlsafe_b64encode(canonical_bytes(data)).decode().rstrip('=')
 
@@ -148,7 +152,7 @@ def clip(value,limit):
     value=str(value or '')
     return {'text':value[:limit],'omitted_chars':max(0,len(value)-limit)}
 
-def brief(rows,project,task,offset=0,limit=5,operators=None):
+def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None):
     if type(offset) is not int or offset<BRIEF_ITEM_OFFSET_MIN or type(limit) is not int or not BRIEF_ITEM_LIMIT_MIN<=limit<=BRIEF_ITEM_LIMIT_MAX:
         raise ValueError('Invalid unresolved-item page: --items-offset must be >= %d and --items-limit must be %d..%d' % (BRIEF_ITEM_OFFSET_MIN,BRIEF_ITEM_LIMIT_MIN,BRIEF_ITEM_LIMIT_MAX))
     issue=task_row(rows,task);current,invalid=checkpoints(issue)
@@ -159,8 +163,8 @@ def brief(rows,project,task,offset=0,limit=5,operators=None):
     if offset>len(items):raise ValueError('Unresolved-item offset exceeds total')
     deps=[d for d in (issue.get('dependencies') or []) if d.get('type')!='parent-child']
     from work import workflow
-    from review_state import scopes_for
-    review=workflow(issue,scopes_for(rows,task),operators=operators)
+    from review_state import is_integration_warning, scopes_for
+    review=workflow(issue,scopes_for(rows,task),operators=operators,journal=journal)
     # ORIGINAL meaning: does the scope currently shown in `lifecycle`/`lifecycle_scope`
     # (the newest recorded scope) belong to the current contribution? The ANY-scope
     # answer is additive as `review.integration.matches_contribution`.
@@ -176,6 +180,14 @@ def brief(rows,project,task,offset=0,limit=5,operators=None):
                  'awaiting-review':'Reviewer: retrieve and verify the current contribution, then record review feedback or approval.',
                  'awaiting-integration':'Authorized integrator: integrate the approved contribution and record scoped integration evidence.',
                  'integrated':'Integration is recorded for this contribution; follow the project release/deployment workflow and scoped lifecycle evidence.'}
+    # The integration overlay warnings (kittrial-5bb.52) are part of the shared
+    # projection's warnings; surface them in the compact read too, so a revert, a
+    # resolved-elsewhere fact conflict or an ignored revert record is visible
+    # without reading review TASK.
+    integration_warnings=[w for w in review.get('warnings') or [] if is_integration_warning(w)]
+    # The host-issued revert list is bounded the same way the prior-contribution
+    # chain is; the untruncated count stays available beside the slice.
+    reverts=review.get('reverts') or []
     return {'task':task,'title':clip(issue.get('title'),200),'owner':clip(issue.get('assignee') or 'unassigned',96),'status':issue.get('status'),
             'activity_cursor':activity_cursor(data),'checkpoint':None if p is None else {'comment_id':str(c['id']),'author':clip(c.get('author'),96),'timestamp':c.get('created_at'),'source_commit':p['source_commit'],'branch':p['branch'],'incorporated_activity_cursor':p['activity_cursor'],
                 'newer_activity':p['activity_cursor']!=activity_cursor(snapshot(rows,project,task,str(c['id'])))},
@@ -185,12 +197,16 @@ def brief(rows,project,task,offset=0,limit=5,operators=None):
             'unresolved':{'coverage':'explicit checkpoint items only; unsummarized prose is not classified','total':len(items) if p else None,'items':items[offset:offset+limit],'next_offset':offset+limit if offset+limit<len(items) else None},
             'review':dict(review,pending_requests=pending[:5],pending_total=len(pending),more='review '+task if len(pending)>5 else None,
                           prior_contributions=bounded_priors,prior_contributions_total=len(priors),
-                          prior_contributions_more='review '+task if len(priors)>PRIOR_BRIEF_LIMIT else None),
+                          prior_contributions_more='review '+task if len(priors)>PRIOR_BRIEF_LIMIT else None,
+                          reverts=reverts[-REVERT_BRIEF_LIMIT:],reverts_total=len(reverts),
+                          reverts_more='review '+task if len(reverts)>REVERT_BRIEF_LIMIT else None),
             'lifecycle_matches_contribution':matches_contribution,
             'dependencies':{'total':len(deps),'items':[{k:clip(d.get(k),160) for k in ('depends_on_id','type')} for d in deps[:8]],'omitted':max(0,len(deps)-8)},
             'lifecycle':{dim:dict(value=f['value'],event_id=f['event_id']) for dim,f in facts['facts'].items()},
             'lifecycle_scope':{k:clip(v,160) for k,v in (facts['scope'] or {}).items()},
-            'warnings':(['Malformed checkpoint comments ignored: '+', '.join(invalid[:5])] if invalid else [])+['Newer activity also includes edits, deletions or changed task fields. Prose resolutions never silently clear explicit items.'],
+            'warnings':(['Malformed checkpoint comments ignored: '+', '.join(invalid[:5])] if invalid else [])
+                       +integration_warnings
+                       +['Newer activity also includes edits, deletions or changed task fields. Prose resolutions never silently clear explicit items.'],
             'evidence':{'issue':'show '+task,'history':'history '+task,'checkpoint_entry':task+'-c'+str(c['id']) if c else None}}
 
 def save_checkpoint(rows,project,task,p,actor,run):
@@ -332,7 +348,7 @@ def execute(root,path,project,actor,action,args,attachments,run,operators=None):
     else:
         rows=[json.loads(x) for x in run(['export','--all']).splitlines() if x.strip()]
         if action=='brief':
-            result=brief(rows,project,a.task,a.items_offset,a.items_limit,operators=operators)
+            result=brief(rows,project,a.task,a.items_offset,a.items_limit,operators=operators,journal=path)
             return json.dumps(result,ensure_ascii=False,indent=2)+'\n' if a.json else format_brief(result)
         data=snapshot(rows,project,a.task);digest=content_hash(data);cache.mkdir(exist_ok=True)
         file=cache/(digest+'.json')
