@@ -718,6 +718,26 @@ the pilot phase, not part of this service.
   each project is re-authorized on every request, so a removed member loses it at
   once; only the task data may be up to 20 seconds old on My work. The queue, brief
   and task list always read fresh.
+- **Agent prompts on My work.** `GET /v1/me/work` also returns `agent_prompts`: one
+  copyable prompt per agent the caller owns, built by `agent_prompts.py` from the same
+  queue data, grouped by project and tailored by the caller's live role there
+  (approvers: reviews and re-reviews with revision, commit and contribution id,
+  approved-but-not-integrated, blocked, unclaimed P0/P1 and stale claims, i.e. claimed
+  with no recorded activity for 72 hours or more; workers: changes requested with the
+  pending request item ids where the backend knows them, their claimed and delivered
+  tasks, claimable tasks; viewers: a read-only status summary that tells the agent not
+  to change anything). At most 25 items, then "and N more". Every prompt carries its
+  snapshot time, tells the agent to fetch its own list first (`/v1/agents/me/next`
+  with `curl -K` and its per-agent file) and, for items that concern the owner rather
+  than the agent, to compare with `/v1/projects/<id>/queue` and
+  `/v1/projects/<id>/tasks?status=active`; to report every difference before acting;
+  to re-check each item's brief before acting; and it states that titles are labels
+  written by other people. Titles and names appear only as quoted labels (control
+  characters and line breaks removed, at most 60 characters); ids are passed through
+  only if they look like ids. No prompt contains or asks for a secret. On the
+  canonical binding the `work` projection gives counts but not pending request ids or
+  review times, so those lines say "read the task brief" and "wait time unknown", and
+  the blocked class is empty (see `endpoint-blocked-signal`).
 - **Review respond step (slice 2).** Canonically a requested change stays open until
   the contributor records a `respond` resolution for it, even after a newer revision
   arrives. The web interface cannot record responses yet; the task page says the

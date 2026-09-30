@@ -31,6 +31,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+import agent_prompts
 from http_auth import (AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CAP_APPROVE,
                        CAP_CHECKPOINTS, CAP_FEEDBACK,
                        CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_READ, CAP_REVIEWS,
@@ -630,6 +631,7 @@ class InProcessBackend:
                 'requests': requests,
                 'open_requests': sum(1 for r in requests if r['status'] == 'open'),
                 'latest_id': records[-1]['id'] if records else None,
+                'latest_at': records[-1]['created_at'] if records else None,
                 'revisions': len(contributions)}
 
     def task_brief(self, project_id, task_id):
@@ -670,8 +672,11 @@ class InProcessBackend:
             review = self._review_view(task)
             if task.get('status') == 'closed' and review['state'] not in ACTIVE_REVIEW_STATES:
                 continue
-            items.append(queue_item(project_id, task, review['state'],
-                                    review['contribution'], review['open_requests']))
+            items.append(queue_item(
+                project_id, task, review['state'], review['contribution'],
+                review['open_requests'],
+                pending_request_ids=[r['id'] for r in review['requests'] if r['status'] == 'open'],
+                waiting_since=review['latest_at']))
         items.sort(key=queue_order)
         return {'items': items, 'complete': True}
 
@@ -688,14 +693,22 @@ def queue_order(item):
     return (QUEUE_PRIORITY.get(item['review_state'], 4), str(item['id']))
 
 
-def queue_item(project_id, task, review_state, contribution, open_requests):
-    """One review-queue row, in the shape both backends return."""
+def queue_item(project_id, task, review_state, contribution, open_requests,
+               pending_request_ids=None, waiting_since=None):
+    """One review-queue row, in the shape both backends return.
+
+    ``pending_request_ids`` and ``waiting_since`` (time of the latest review record)
+    are filled where the backend knows them; the canonical ``work`` projection
+    reports only a count of pending items, so there they stay empty/``None``.
+    """
     return {'id': task.get('id'), 'project_id': project_id, 'title': task.get('title'),
             'status': task.get('status'), 'assignee': task.get('assignee'),
             'priority': task.get('priority'), 'created_at': task.get('created_at'),
             'updated_at': task.get('updated_at'),
             'review_state': review_state or 'none', 'contribution': contribution,
-            'open_requests': open_requests}
+            'open_requests': open_requests,
+            'pending_request_ids': list(pending_request_ids or []),
+            'waiting_since': waiting_since}
 
 
 class EndpointBackend:
@@ -1649,6 +1662,13 @@ class ApiHandler(BaseHTTPRequestHandler):
         view['next_action'] = next_action(view)
         return view
 
+    def _request_origin(self):
+        """This request's own origin, for prompts when no --public-url is set."""
+        host = self.headers.get('Host') or ''
+        if not re.fullmatch(r'[A-Za-z0-9.:\[\]-]{1,255}', host):
+            return '<ORCHESTRA_SERVER_URL>'
+        return ('https://' if self._is_secure() else 'http://') + host
+
     def _task_views(self, tasks):
         names = self.service.actor_names([t.get('assignee') for t in tasks])
         return [self._task_view(t, names) for t in tasks]
@@ -2495,7 +2515,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         projects = [p for p in self.service.list_projects(principal)
                     if not p.get('archived') and principal.user_id in (p.get('members') or [])]
         truncated = len(projects) > ME_WORK_MAX_PROJECTS
-        assigned, to_review, unavailable = [], [], []
+        assigned, to_review, unavailable, classified = [], [], [], []
+        generated_at = now_iso(self.service._now())
+        now = agent_prompts.parse_time(generated_at)
+        blocked = self._agent_blocked_tasks()
         for project in projects[:ME_WORK_MAX_PROJECTS]:
             capabilities = self.service.capabilities_for(principal, project['id'])
             if CAP_READ not in capabilities:
@@ -2506,6 +2529,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                 unavailable.append({'project': project['id'], 'reason': error.code})
                 continue
             truncated = truncated or not read.get('complete')
+            names = self.service.actor_names([i.get('assignee') for i in read['items']])
+            classified.append(agent_prompts.classify(project, capabilities, read['items'],
+                                                     actor, blocked, now, names))
             for item in read['items']:
                 row = dict(item, project_name=project['name'])
                 if item.get('assignee') == actor and item.get('status') != 'closed':
@@ -2520,10 +2546,17 @@ class ApiHandler(BaseHTTPRequestHandler):
             agents = self._agent_items(principal)
         except HttpError:
             agents = []
+        # One copyable prompt per agent the person owns, built from exactly this data.
+        server = self.service.public_url or self._request_origin()
+        owner_name = principal.display_name or principal.user_id
+        prompts = [agent_prompts.build_prompt(agent, owner_name, classified, generated_at,
+                                              server)
+                   for agent in agents if agent.get('owner') == principal.user_id]
         return 200, {'assigned': self._task_views(assigned[:MAX_PAGE]),
                      'to_review': self._task_views(to_review[:MAX_PAGE]),
-                     'agents': agents, 'truncated': truncated, 'unavailable': unavailable,
-                     'generated_at': now_iso(self.service._now())}
+                     'agents': agents, 'agent_prompts': prompts,
+                     'truncated': truncated, 'unavailable': unavailable,
+                     'generated_at': generated_at}
 
     # -- feedback and audit ----------------------------------------------------
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/feedback')

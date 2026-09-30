@@ -400,7 +400,13 @@ export function createMock(options = {}) {
       if (t.assignee === db.session) mine.push(v);
       if (isOwner(t.project_id) && (role(t.project_id) === 'owner') && ['awaiting-review', 'approved'].includes(t.review_state)) toReview.push(v);
     }
-    return ok({ assigned: mine, to_review: toReview, agents: agentsOf(db.session).map((a) => agentView(a, me())) });
+    // The real service builds these prompts from the same data (agent_prompts.py); the
+    // prototype only shows a sample so the buttons can be tried.
+    const viewerOnly = Object.entries(db.memberships).every(([pid, m]) => !m[db.session] || m[db.session] === 'viewer');
+    const agentPrompts = agentsOf(db.session).map((a) => ({ agent_id: a.id, agent_name: a.display_name, kind: viewerOnly ? 'status' : 'action',
+      label: (viewerOnly ? 'Copy status summary for ' : 'Copy prompt for ') + a.display_name, items: mine.length + toReview.length, omitted: 0,
+      text: `Prototype sample prompt for ${a.display_name}. The real service lists ${mine.length + toReview.length} item(s) here with ids, states and actions.` }));
+    return ok({ assigned: mine, to_review: toReview, agents: agentsOf(db.session).map((a) => agentView(a, me())), agent_prompts: agentPrompts, generated_at: new Date().toISOString() });
   });
   on('GET', '/v1/projects/(?<pid>[\\w-]+)/feedback', (b, p) => guardProject(p.pid) || ok({ items: db.feedback[p.pid].map((f) => ({ ...f, author_name: name(f.author) })), total: db.feedback[p.pid].length, next_cursor: null }));
   on('POST', '/v1/projects/(?<pid>[\\w-]+)/feedback', (b, p) => {

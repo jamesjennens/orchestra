@@ -1,4 +1,4 @@
-import { h, time } from '../dom.js';
+import { h, time, copyButton } from '../dom.js';
 import { pageHead, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, roleTag } from '../ui.js';
 import { agentCard, attentionOf } from './agents.js';
 
@@ -37,10 +37,29 @@ export async function home(ctx) {
   return h('div', { class: 'stack' },
     pageHead({ title: 'My work', lede: `Everything waiting on you across ${ctx.projects.filter((p) => !p.archived).length} active project(s). Opening a task never marks it done.` }),
     incomplete ? h('div', { class: 'banner' }, 'Some projects could not be read just now, or there is more work than one page shows. Open a project to see all of its tasks.') : null,
+    agentPromptPanel(ctx, data),
     agentsPanel,
     panel('Revisions requested', revisions.length, workTable(ctx, revisions, { emptyTitle: 'No revisions requested', emptyBody: 'When a reviewer asks for changes to your work, it appears here first.' })),
     panel('Waiting for your review', data.to_review.length, workTable(ctx, data.to_review, { emptyTitle: 'Nothing to review', emptyBody: 'Contributions to projects you own appear here until you approve them or request changes.' }), 'Stays here until you act — no reminder needed'),
     panel('Assigned to you', assigned.length, workTable(ctx, assigned, { emptyTitle: 'Nothing assigned', emptyBody: 'Claim a task from a project to start work on it.' })));
+}
+
+// "Copy prompt for my agent": one button per agent the person owns. The server builds
+// each prompt from this same My work data (ids, states and actions it derives; titles
+// only as sanitised labels; never a secret). A person who can only view gets a
+// read-only status summary instead.
+export function agentPromptPanel(ctx, data) {
+  const prompts = data.agent_prompts || [];
+  const body = prompts.length
+    ? h('div', { class: 'panel-body stack' },
+      h('p', { class: 'small muted' }, 'Paste into the agent’s chat in its folder. The agent first checks its own list in Orchestra and reports any difference to you before acting.'),
+      h('div', { class: 'copy-row' }, prompts.map((p) => copyButton(p.label, p.text, { ariaLabel: p.label, what: p.kind === 'status' ? 'Status summary' : 'Prompt' }))),
+      h('p', { class: 'small muted' }, prompts.map((p) => `${p.agent_name}: ${p.items} item(s)${p.omitted ? ` (+${p.omitted} more)` : ''}`).join(' · '),
+        data.generated_at ? [' · snapshot ', time(data.generated_at)] : null))
+    : h('div', { class: 'panel-body' }, h('p', { class: 'small muted' }, 'You have no agents yet. ',
+      h('a', { href: ctx.href('/agents') }, 'Add one on My agents'), ' to copy a prompt with this work for it.'));
+  return h('section', { class: 'panel', 'aria-labelledby': 'h-agent-prompts' },
+    h('div', { class: 'panel-head' }, h('h2', { class: 'small', id: 'h-agent-prompts' }, 'Copy prompt for my agent')), body);
 }
 
 export async function welcome(ctx) {
