@@ -900,7 +900,7 @@ def validate_coordination_files(files):
     if not isinstance(files,dict):raise ValueError('Invalid coordination files map')
     for name,record in files.items():
         quarantine = isinstance(name,str) and re.fullmatch(r'\.feedback\.jsonl\.(?:[a-f0-9]{16}|[a-f0-9]{64})\.incomplete',name)
-        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-backfills)/[a-f0-9]{64}\.json',name)
+        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-backfills|\.integration-reverts)/[a-f0-9]{64}\.json',name)
         if name not in ('.merge-context.json','ONBOARDING.md','.sessions.json','.feedback.jsonl') and not quarantine and not journal:raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
         if name=='.sessions.json':
@@ -925,6 +925,14 @@ def validate_coordination_files(files):
         if name.startswith('.requirement-backfills/'):
             from requirement_records import validate_receipt
             validate_receipt(record,backfill=True)
+        if name.startswith('.integration-reverts/'):
+            # The host-issued revert journal (kittrial-5bb.52 P1). Its record shape
+            # and its <sha256>.json path/hash binding are validated by the reader's
+            # own validator, so a backup can never carry an entry the reader would
+            # have to guess about.
+            from review_workflow import JOURNAL_DIR, validate_revert_journal_entry
+            validate_revert_journal_entry(record,name.partition('/')[2])
+            if not name.startswith(JOURNAL_DIR+'/'):raise ValueError('Invalid coordination backup path')
         if name=='ONBOARDING.md' and (set(record)!={'text'} or not isinstance(record['text'],str) or not record['text'].strip() or len(record['text'].encode('utf-8'))>8000):raise ValueError('Invalid onboarding backup')
         if name=='.feedback.jsonl':
             from feedback import validate_feed_text
@@ -1296,6 +1304,17 @@ def backup_project(root,name):
         for record in requirement_backfills.glob('*.json'):
             if record.is_symlink():raise ValueError('Requirement backfill receipt must not be a symlink')
             files['.requirement-backfills/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
+        # The host-issued integration revert journal (kittrial-5bb.52 P1). It is the
+        # proof a revert was issued on this host, so a restore that dropped it would
+        # silently un-revert every reverted contribution: it is backed up, validated
+        # and restored exactly like the requirement journals. The path is also what
+        # the deployment order in docs/REVIEWS.md requires to be covered before the
+        # first revert is recorded.
+        revert_journal=path/'.integration-reverts'
+        if revert_journal.is_symlink():raise ValueError('Integration revert journal must not be a symlink')
+        for record in revert_journal.glob('*.json'):
+            if record.is_symlink():raise ValueError('Integration revert journal entry must not be a symlink')
+            files['.integration-reverts/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
         if (path/'ONBOARDING.md').exists() or (path/'ONBOARDING.md').is_symlink():
             from onboarding import read_document, PROJECT_LIMIT
             files['ONBOARDING.md']={'text':read_document(path,'ONBOARDING.md',PROJECT_LIMIT)}
@@ -1403,6 +1422,46 @@ def initialized_projects(root):
         if not re.fullmatch(r'[a-z][a-z0-9]{1,23}',path.name):continue
         if (path/'.beads'/'metadata.json').is_file():found.append(path.name)
     return sorted(found)
+
+def revoked_revert_records(root,actor,limit=5):
+    """Name the host-issued integration revert records one operator authored.
+
+    ``operators remove ACTOR --confirm-revoke`` makes every record that operator
+    authored stop applying: voids (the pre-existing warning) and, since
+    kittrial-5bb.52, the host-issued integration revert records too, so revoking an
+    operator silently re-integrates what they reverted. Read-only and best-effort:
+    each initialized project is exported, its host journal is consulted, and a
+    project that cannot be read is reported as unreadable rather than failed --
+    the allowlist change must not depend on one broken runtime.
+    """
+    from review_workflow import revert_records
+    found=[];unreadable=0
+    for name in initialized_projects(root):
+        path=project_dir(root,name)
+        try:
+            rows=[json.loads(line) for line in run_bd(root,name,['export','--all']).splitlines() if line.strip()]
+        except (OSError,ValueError,TypeError,KeyError):
+            unreadable+=1
+            continue
+        for row in rows:
+            if not isinstance(row,dict) or row.get('issue_type')=='event':continue
+            try:
+                records,_=revert_records(row,[actor],path)
+            except (ValueError,TypeError,KeyError):
+                unreadable+=1
+                continue
+            for record in records:
+                if record.get('author')==actor:
+                    found.append(str(row.get('id') or '?')+'/'+record['comment_id'])
+    found=sorted(set(found))
+    if not found:
+        return (' (no host-issued integration revert record from this operator is visible; '
+                'projects that could not be read: %d)'%unreadable)
+    shown=', '.join(found[:limit])
+    if len(found)>limit:shown+=' (+%d more)'%(len(found)-limit)
+    return (' (host-issued integration revert records that stop applying: '+shown+
+            '; projects that could not be read: %d)'%unreadable)
+
 
 def backup_pair_state(root,name):
     """(complete, reason) for one project's last backup pair, read from disk.
@@ -1967,7 +2026,9 @@ def restore_coordination(root,source,destination,restore_operators=False):
         target=path/name
         if target.is_symlink() or target.parent.is_symlink() or target.with_suffix('.tmp').is_symlink():raise ValueError('Coordination restore paths must not be symlinks')
     # Validate every requirement receipt before the first write, so a malformed
-    # one cannot create a journal directory or a partial restore.
+    # one cannot create a journal directory or a partial restore. The host-issued
+    # integration revert journal (kittrial-5bb.52 P1) is validated the same way:
+    # a bad entry must refuse the whole restore rather than silently un-revert.
     for name,record in files.items():
         if name.startswith('.requirement-requests/'):
             from requirement_records import validate_receipt
@@ -1975,6 +2036,9 @@ def restore_coordination(root,source,destination,restore_operators=False):
         elif name.startswith('.requirement-backfills/'):
             from requirement_records import validate_receipt
             validate_receipt(record,backfill=True)
+        elif name.startswith('.integration-reverts/'):
+            from review_workflow import validate_revert_journal_entry
+            validate_revert_journal_entry(record,name.partition('/')[2])
     for name,record in files.items():
         target=project_dir(root,destination)/name
         target.parent.mkdir(exist_ok=True)
@@ -2243,7 +2307,8 @@ def main():
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             rows=[json.loads(line) for line in run_bd(root,args.project,['export','--all']).splitlines() if line.strip()]
-            print(json.dumps(apply_void(rows,payload['task'],args.actor,payload,run,operator=True,operators=authority)))
+            print(json.dumps(apply_void(rows,payload['task'],args.actor,payload,run,operator=True,
+                                        operators=authority,journal=path)))
     elif args.command=='revert-record':
         import fcntl
         from review_workflow import apply_revert
@@ -2255,7 +2320,8 @@ def main():
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             rows=[json.loads(line) for line in run_bd(root,args.project,['export','--all']).splitlines() if line.strip()]
-            print(json.dumps(apply_revert(rows,payload['task'],args.actor,payload,run,operator=True,operators=authority)))
+            print(json.dumps(apply_revert(rows,payload['task'],args.actor,payload,run,operator=True,
+                                          operators=authority,journal=path)))
     elif args.command=='operators':
         marker=root/'deployment.private.json'
         if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
@@ -2273,8 +2339,10 @@ def main():
             if actor not in current:current.append(actor)
         else:
             if not args.confirm_revoke:
-                raise ValueError('operators remove revokes ' + actor + ': voids they authored stop applying on reads '
-                                 '(re-add restores them). Re-run with --confirm-revoke to acknowledge this.')
+                raise ValueError('operators remove revokes ' + actor + ': voids they authored stop applying on '
+                                 'reads, and so do the integration revert records they issued'
+                                 + revoked_revert_records(root,actor) +
+                                 ' (re-add restores them). Re-run with --confirm-revoke to acknowledge this.')
             if actor in current:current.remove(actor)
         if current:cfg['operators']=current
         else:cfg.pop('operators',None)

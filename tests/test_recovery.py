@@ -792,9 +792,10 @@ class AdminRevertRecordTests(unittest.TestCase):
             return '\n'.join(json.dumps(row) for row in self.rows)
         self.assertEqual(argv[:3], ['comments', 'add', self.TASK_ID])
         self.writes.append(argv)
+        cid = 'w%d' % len(self.writes)
         self.rows[0]['comments'].append(
-            dict(id='r1', text=argv[3], author='operator', created_at=STAMP))
-        return json.dumps({'id': 'r1'})
+            dict(id=cid, text=argv[3], author='operator', created_at=STAMP))
+        return json.dumps({'id': cid})
 
     def payload(self, **extra):
         p = dict(schema_version=1, operation='revert-record', operation_id='rv1', task=self.TASK_ID,
@@ -851,6 +852,200 @@ class AdminRevertRecordTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'currently integrated'):
             self.invoke(self.payload(contribution=second, integration_commit=self.MERGE))
         self.assertEqual(self.writes, [])
+
+
+    def test_operator_cli_writes_the_host_journal_entry_beside_the_native_record(self):
+        """The P1 fix: the CLI is the only writer of the host-issued proof.
+
+        A native revert comment is not authority by itself (its stored author is the
+        self-declared request actor), so the write route also journals the record
+        under the project lock and the reader honours the comment only with it.
+        """
+        result = self.invoke(self.payload())
+        directory = self.root / 'projects' / self.PROJECT_ID / w.JOURNAL_DIR
+        entries = sorted(directory.glob('*.json'))
+        self.assertEqual(len(entries), 1)
+        entry = json.loads(entries[0].read_text(encoding='utf-8'))
+        self.assertEqual(entries[0].name, entry['sha256'] + '.json')
+        self.assertEqual(w.validate_revert_journal_entry(entry, entries[0].name), entry)
+        self.assertEqual(entry['comment_id'], result['comment_id'])
+        self.assertEqual((entry['kind'], entry['task'], entry['contribution']), (
+            w.JOURNAL_REVERT, self.TASK_ID, '1'))
+        self.assertEqual(entry['operator'], 'operator')
+        # The reader honours the record WITH the journal and ignores it WITHOUT it.
+        issue = self.rows[0]
+        honoured, invalid = w.revert_records(issue, ['operator'], self.root / 'projects' / self.PROJECT_ID)
+        self.assertEqual([r['comment_id'] for r in honoured], [result['comment_id']])
+        self.assertEqual(invalid, [])
+        forged_only, problems = w.revert_records(issue, ['operator'])
+        self.assertEqual(forged_only, [])
+        self.assertIn(result['comment_id'], problems)
+        # A retry writes no second native comment and re-persists the same entry.
+        retried = self.invoke(self.payload())
+        self.assertTrue(retried['reconciled'])
+        self.assertEqual(len(self.writes), 1)
+        self.assertEqual(len(sorted(directory.glob('*.json'))), 1)
+
+    def test_operator_cli_refuses_a_symlinked_journal_path_with_no_write(self):
+        journal = self.root / 'projects' / self.PROJECT_ID / w.JOURNAL_DIR
+        try:
+            journal.symlink_to(self.root / 'projects' / self.PROJECT_ID, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest('symlinks unavailable')
+        with self.assertRaisesRegex(ValueError, 'symlink'):
+            self.invoke(self.payload())
+        self.assertEqual(self.writes, [])
+
+    def test_retraction_of_the_host_record_through_the_operator_cli(self):
+        """`void-record` retracts a host-issued revert and journals the retraction."""
+        result = self.invoke(self.payload())
+        revert_text = next(c['text'] for c in self.rows[0]['comments']
+                           if str(c['id']) == result['comment_id'])
+        payload = dict(void(result['comment_id'], revert_text, operation_id='vr1',
+                            target_kind='integration-revert'), task=self.TASK_ID)
+        path = self.root / 'void.json'
+        path.write_text(json.dumps(payload), encoding='utf-8')
+        argv = ['admin.py', '--root', str(self.root), 'void-record', self.PROJECT_ID,
+                '--actor', 'operator', '--file', str(path)]
+        with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', return_value=self.root), \
+                patch.object(admin, 'run_bd', side_effect=self.native), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            admin.main()
+        receipt = json.loads(out.getvalue())
+        self.assertEqual(receipt['target'], result['comment_id'])
+        project = self.root / 'projects' / self.PROJECT_ID
+        kinds = sorted(json.loads(p.read_text(encoding='utf-8'))['kind']
+                       for p in (project / w.JOURNAL_DIR).glob('*.json'))
+        self.assertEqual(kinds, [w.JOURNAL_REVERT, w.JOURNAL_RETRACTION])
+        honoured, _ = w.revert_records(self.rows[0], ['operator'], project)
+        self.assertEqual(honoured, [])
+
+    def test_operator_cli_refuses_a_revert_when_the_journal_cannot_be_used(self):
+        """Refused BEFORE the native write, so no un-journaled revert exists."""
+        journal = self.root / 'projects' / self.PROJECT_ID / w.JOURNAL_DIR
+        journal.mkdir(parents=True, exist_ok=True)
+        # A FILE where the journal directory belongs: every reader and writer treats
+        # that as unusable, so the operator route refuses before any write.
+        journal.rmdir()
+        journal.write_text('not a directory', encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, r'\.integration-reverts'):
+            self.invoke(self.payload())
+        self.assertEqual(self.writes, [])
+
+    def test_operators_remove_warns_about_the_revert_records_it_revokes(self):
+        """kittrial-5bb.52 item 2: revocation must name the reverts it disables."""
+        result = self.invoke(self.payload())
+        argv = ['admin.py', '--root', str(self.root), 'operators', 'remove', 'operator']
+        with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', return_value=self.root), \
+                patch.object(admin, 'initialized_projects', return_value=[self.PROJECT_ID]), \
+                patch.object(admin, 'run_bd', side_effect=self.native), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(ValueError, 'confirm-revoke') as caught:
+                admin.main()
+        message = str(caught.exception)
+        self.assertIn('integration revert record', message.lower())
+        self.assertIn(self.TASK_ID + '/' + result['comment_id'], message)
+
+
+class AdminRevertJournalBackupTests(unittest.TestCase):
+    """The host revert journal survives backup, validation and restore (P1)."""
+
+    MERGE = 'e' * 40
+    SOURCE = 'a' * 40
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        try:
+            (self.root / 'projects' / 'trial').mkdir(parents=True)
+        except OSError as exc:  # confined environments may forbid nested temp directories
+            self.skipTest('nested temporary directory unavailable: ' + str(exc))
+        (self.root / 'deployment.private.json').write_text(
+            json.dumps({'password': 'x', 'unit': 'none', 'operators': ['operator']}), encoding='utf-8')
+        self.patcher = patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2)})
+        self.patcher.start()
+        self.addCleanup(self.patcher.stop)
+        self.entry = self.journal_entry()
+
+    def payload(self, operation_id='rv1', comment_id='c9'):
+        return dict(schema_version=1, operation='revert-record', operation_id=operation_id,
+                    task=TASK, contribution='c1', integration_commit=self.MERGE,
+                    revert_commit='f' * 40, reason='Re-merge dropped the change',
+                    operator='operator')
+
+    def journal_entry(self):
+        return w.revert_journal_entry(w.JOURNAL_REVERT, self.payload(), 'c9', 'operator',
+                                      task=TASK, contribution='c1',
+                                      integration_commit=self.MERGE, revert_commit='f' * 40)
+
+    def write_entry(self, entry=None, name=None):
+        entry = entry or self.entry
+        directory = self.root / 'projects' / 'trial' / w.JOURNAL_DIR
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / (name or (entry['sha256'] + '.json'))
+        path.write_text(json.dumps(entry), encoding='utf-8')
+        return path
+
+    def test_backup_and_restore_round_trip_the_host_revert_journal(self):
+        self.write_entry()
+        (self.root / 'backups').mkdir()
+        (self.root / 'projects' / 'other').mkdir()
+        with patch.object(admin, 'run_bd', return_value='synced'):
+            admin.backup_project(self.root, 'trial')
+        bundle = json.loads((self.root / 'backups' / 'trial.coordination.json').read_text(encoding='utf-8'))
+        name = w.JOURNAL_DIR + '/' + self.entry['sha256'] + '.json'
+        self.assertIn(name, bundle['files'])
+        self.assertEqual(bundle['files'][name], self.entry)
+        admin.restore_coordination(self.root, 'trial', 'other')
+        restored = self.root / 'projects' / 'other' / name
+        self.assertTrue(restored.is_file())
+        self.assertEqual(json.loads(restored.read_text(encoding='utf-8')), self.entry)
+
+    def test_backup_refuses_a_malformed_or_misnamed_journal_entry(self):
+        broken = dict(self.entry)
+        broken['payload'] = dict(self.entry['payload'], reason='different bytes')
+        self.write_entry(broken)
+        (self.root / 'backups').mkdir()
+        with patch.object(admin, 'run_bd', return_value='synced'):
+            with self.assertRaisesRegex(ValueError, 'hash does not match'):
+                admin.backup_project(self.root, 'trial')
+
+    def test_validate_coordination_files_checks_the_journal_shape_and_path(self):
+        good = {w.JOURNAL_DIR + '/' + self.entry['sha256'] + '.json': self.entry}
+        admin.validate_coordination_files(good)
+        wrong_path = {w.JOURNAL_DIR + '/' + '0' * 64 + '.json': self.entry}
+        with self.assertRaisesRegex(ValueError, 'path mismatch'):
+            admin.validate_coordination_files(wrong_path)
+        with self.assertRaisesRegex(ValueError, 'Invalid coordination backup path'):
+            admin.validate_coordination_files({w.JOURNAL_DIR + '/not-a-hash.json': self.entry})
+        with self.assertRaisesRegex(ValueError, 'journal'):
+            admin.validate_coordination_files({w.JOURNAL_DIR + '/' + self.entry['sha256'] + '.json':
+                                               dict(self.entry, sha256='0' * 64)})
+
+    def test_backup_refuses_a_symlinked_revert_journal(self):
+        target = self.root / 'elsewhere'
+        target.mkdir()
+        journal = self.root / 'projects' / 'trial' / w.JOURNAL_DIR
+        try:
+            journal.symlink_to(target, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest('symlinks unavailable')
+        (self.root / 'backups').mkdir()
+        with patch.object(admin, 'run_bd', return_value='synced'):
+            with self.assertRaisesRegex(ValueError, 'symlink'):
+                admin.backup_project(self.root, 'trial')
+
+    def test_restore_refuses_a_journal_entry_that_does_not_match_its_name(self):
+        name = w.JOURNAL_DIR + '/' + '0' * 64 + '.json'
+        (self.root / 'backups').mkdir()
+        (self.root / 'backups' / 'trial').mkdir()
+        (self.root / 'backups' / 'trial.coordination.json').write_text(
+            json.dumps({'schema_version': 1, 'status': 'complete', 'operators': ['operator'],
+                        'files': {name: self.entry}}), encoding='utf-8')
+        (self.root / 'projects' / 'other').mkdir()
+        with self.assertRaisesRegex(ValueError, 'path mismatch'):
+            admin.restore_coordination(self.root, 'trial', 'other')
+        self.assertFalse((self.root / 'projects' / 'other' / w.JOURNAL_DIR).exists())
 
 
 if __name__ == '__main__':

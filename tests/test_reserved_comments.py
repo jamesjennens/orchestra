@@ -105,6 +105,14 @@ class ReservedPrefixTests(unittest.TestCase):
         self.assertIn('Kind: requirement-revision-v1\n', PREFIXES)
         self.assertIn('Kind: plan-registration.\n', PREFIXES)
 
+    def test_voidable_kinds_match_the_owning_modules(self):
+        """``recovery`` repeats the prefixes instead of importing them cyclically."""
+        from recovery import KIND_PREFIXES
+        from review_workflow import PREFIX as REVIEW, REVERT_PREFIX as REVERT
+        self.assertEqual(KIND_PREFIXES['contribution-review'], REVIEW)
+        # Voiding a revert record is the retraction path (kittrial-5bb.52 item 2).
+        self.assertEqual(KIND_PREFIXES['integration-revert'], REVERT)
+
     def test_oversized_invalid_json_with_reserved_prefix_rejected(self):
         body = REVIEW_PREFIX + '{not valid json' * 5000
         self.assertGreater(len(body), 8000)

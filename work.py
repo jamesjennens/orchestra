@@ -141,11 +141,22 @@ class Parser(argparse.ArgumentParser):
         hint=next((text for flag,text in MISTAKEN_FLAGS.items() if flag in message),None)
         raise ValueError(message+('; hint: '+hint if hint else ''))
 
-def workflow(issue,scopes=None,operators=None,reverts=None):
+def workflow(issue,scopes=None,operators=None,reverts=None,journal=None,invalid_reverts=None):
     from review_state import project as reviewed
-    return reviewed(issue,scopes,operators,reverts)
+    return reviewed(issue,scopes,operators,reverts,journal,invalid_reverts)
 
-def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes=None):
+def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes=None, journal=None):
+    """One page of the work queue.
+
+    ``reverts`` and ``scopes`` are PER TASK: each is a mapping of task id to that
+    task's validated host-issued revert records / lifecycle integration scopes.
+    ``None`` (the normal case) means the page resolves each task itself, once:
+    ``scopes`` comes from the lifecycle evidence and ``reverts`` from
+    ``review_state.reverts_by_task``, which reads the host
+    ``.integration-reverts/`` journal under ``journal`` a single time for the whole
+    page (kittrial-5bb.52 P3: the arguments used to be applied to every row and
+    the per-task revert scan was O(rows) and repeated per row).
+    """
     if help_requested(args):return help_payload('work')
     parser=Parser(add_help=False)
     group=parser.add_mutually_exclusive_group();group.add_argument('--mine',action='store_true');group.add_argument('--owner')
@@ -157,6 +168,10 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
     if not WORK_LIMIT_MIN<=a.limit<=WORK_LIMIT_MAX or a.offset<WORK_OFFSET_MIN or not WORK_LIMIT_MIN<=a.handoff_limit<=WORK_LIMIT_MAX or a.handoff_offset<WORK_OFFSET_MIN:
         raise ValueError('Invalid work page: --limit and --handoff-limit must be %d..%d; '
                          '--offset and --handoff-offset must be >= %d' % (WORK_LIMIT_MIN,WORK_LIMIT_MAX,WORK_OFFSET_MIN))
+    if reverts is not None and not isinstance(reverts,dict):
+        raise ValueError('reverts must be a mapping of task id to that task\'s validated revert records')
+    if scopes is not None and not isinstance(scopes,dict):
+        raise ValueError('scopes must be a mapping of task id to that task\'s integration scopes')
     owner=actor if a.mine else a.owner
     journal_requests=[];journal_errors=[]
     if request_dir and request_dir.is_dir():
@@ -171,24 +186,24 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
             except (OSError,json.JSONDecodeError,ValueError) as exc:
                 journal_errors.append({'path':request_file.name,'error':str(exc)[:300]})
     facts={r['id']:r for r in project_facts(rows)};evidence={r['id']:r['scopes'] for r in integration_evidence(rows)};items=[]
-    # `reverts`/`scopes` (the validated operator revert records and the lifecycle
-    # integration evidence, both already read by the caller) are optional: a direct
-    # caller that omits them gets exactly the pre-existing queue, and the shared
-    # projection falls back to reading the scopes itself.
-    from review_state import reverts_for, scopes_for
+    from review_state import is_integration_warning, reverts_by_task
+    if reverts is None:
+        revert_map,revert_problems=reverts_by_task(rows,operators,journal)
+    else:
+        revert_map,revert_problems=reverts,{}
     for row in rows:
         if row.get('issue_type') in ('event','gate','merge-slot'):continue
         if owner is not None and row.get('assignee')!=owner:continue
-        task_reverts=reverts if reverts is not None else reverts_for(rows,row['id'],operators)
-        task_scopes=evidence.get(row['id']) if scopes is None else scopes
-        try:review=workflow(row,task_scopes,operators=operators,reverts=task_reverts);state=review['review_state'];error=None
+        task_reverts=revert_map.get(row['id'],[])
+        task_scopes=evidence.get(row['id']) if scopes is None else scopes.get(row['id'])
+        try:review=workflow(row,task_scopes,operators=operators,reverts=task_reverts,journal=journal,
+                            invalid_reverts=revert_problems.get(row['id']));state=review['review_state'];error=None
         except ValueError as e:review={};state='error';error=str(e)[:300]
-        # The integration disagreement signal (kittrial-5bb.52): the owner decision
-        # keeps any-pass-wins, so a newer scope that disagrees with the reported
-        # fact is surfaced here instead of silently changing the answer.
-        from review_state import disagreement_warnings
+        # The integration overlay's warnings (kittrial-5bb.52): the owner decision
+        # keeps any-pass-wins, and a host-issued revert is always surfaced, so both
+        # the disagreement and the revert warning travel with the row.
         disagreements=review.get('integration_disagreements') or []
-        integration_warnings=disagreement_warnings(disagreements)
+        integration_warnings=[w for w in review.get('warnings') or [] if is_integration_warning(w)]
         fact=facts.get(row['id'],{}).get('facts',{})
         if row.get('status')=='closed' and state not in ('changes-requested','awaiting-review','awaiting-integration','legacy-review-ready','error'):continue
         if a.state and a.state!=state:continue
@@ -232,7 +247,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
     return result
 
 def execute(path,actor,action,args,attachments,run,operators=None):
-    # Help is recognised anywhere it is a standalone token and never touches the
+    # Help is recognised anywhere as a standalone token and never touches the
     # native export, the coordination lock or an attachment.
     if help_requested(args):
         return help_payload(action)
@@ -241,7 +256,7 @@ def execute(path,actor,action,args,attachments,run,operators=None):
         args=[token for token in args if token!='--json']
     if action=='work':
         rows=[json.loads(line) for line in run(['export','--all']).splitlines() if line.strip()]
-        return queue(rows,actor,args,path/'.handoff-requests', operators=operators)
+        return queue(rows,actor,args,path/'.handoff-requests', operators=operators, journal=path)
     if len(args) not in (1,2):raise ValueError('Use review TASK [--file payload.json] or handoff TASK --file payload.json')
     task=args[0]
     if action=='review' and len(args)==1:
@@ -249,7 +264,7 @@ def execute(path,actor,action,args,attachments,run,operators=None):
         rows=[json.loads(line) for line in run(['export','--all']).splitlines() if line.strip()]
         issue=task_row(rows,task)
         from review_state import scopes_for
-        return workflow(issue,scopes_for(rows,task),operators=operators)
+        return workflow(issue,scopes_for(rows,task),operators=operators,journal=path)
     if len(args)!=2 or not args[1].startswith('@attachment:'):raise ValueError('A JSON file attachment is required')
     item=attachments.get(args[1].partition(':')[2],{})
     if not isinstance(item,dict) or item.get('flag') not in ('--file','-f') or not isinstance(item.get('text'),str):raise ValueError('Invalid attachment')
@@ -266,7 +281,7 @@ def execute(path,actor,action,args,attachments,run,operators=None):
         return handoff(path,actor,payload,run)
     from review_workflow import execute as review
     rows=[json.loads(line) for line in run(['export','--all']).splitlines() if line.strip()]
-    result=review(rows,task,actor,payload,run, operators=operators)
+    result=review(rows,task,actor,payload,run, operators=operators, journal=path)
     if payload.get('operation')=='request-changes':
         # Retry repairs a label update interrupted after the durable review comment.
         run(['update',task,'--remove-label','review-ready','--json'])

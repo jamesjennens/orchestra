@@ -43,7 +43,9 @@ the optional ``follows`` relation instead of being forced to declare that it
 """
 import json
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -691,19 +693,61 @@ def revert_payload(operation_id='revert-1', contribution='1', integration_commit
 
 
 class IntegrationRevertTests(FollowOnChainTests):
-    """The (a) warning and (b) revert record for the shared integration projection."""
+    """The (a) warning and (b) host-issued revert record for the shared projection.
+
+    A revert comment alone is attribution, not authority: on the SSH endpoint the
+    stored native author is whatever the caller declared, so the reader honours a
+    revert only when the host-issued ``.integration-reverts/`` journal carries the
+    matching entry for that comment (review item ``forged-pre-deploy-reverts``).
+    """
+
+    def setUp(self):
+        super().setUp()
+        try:
+            self.journal = Path(tempfile.mkdtemp())
+        except OSError as exc:  # confined environments may forbid temp directories
+            self.skipTest('temporary directory unavailable: ' + str(exc))
+        self.addCleanup(shutil.rmtree, self.journal, ignore_errors=True)
 
     def tearDown(self):
         os.environ.pop('ORCHESTRA_OPERATORS', None)
 
     # -- fixtures ----------------------------------------------------------
-    def append_revert(self, payload, author=OPERATOR):
-        """Append a revert comment exactly as the operator CLI would."""
+    def append_comment(self, payload, author=OPERATOR):
+        """Append the native revert comment exactly as the operator CLI would."""
         cid = str(len(self.issue['comments']) + 1)
         body = REVERT_PREFIX + canonical_bytes(payload).decode()
         self.issue['comments'].append(dict(id=cid, text=body, author=author,
                                            created_at='2026-09-16T00:00:00Z'))
         return cid
+
+    def host_journal(self, payload, comment_id, actor=OPERATOR):
+        """Write the host-issued journal entry for one native revert comment."""
+        payload = dict(payload)
+        payload.setdefault('operator', actor)
+        entry = w.revert_journal_entry(w.JOURNAL_REVERT, payload, comment_id, actor,
+                                       task=payload.get('task', self.issue['id']),
+                                       contribution=payload['contribution'],
+                                       integration_commit=payload['integration_commit'],
+                                       revert_commit=payload['revert_commit'])
+        w.publish_revert_journal(self.journal, entry)
+        return entry
+
+    def append_revert(self, payload, author=OPERATOR, journaled=True):
+        """A native revert comment, host-journaled unless ``journaled`` is False."""
+        cid = self.append_comment(payload, author)
+        if journaled:
+            self.host_journal(payload, cid, author)
+        return cid
+
+    def operator_run(self, actor=OPERATOR):
+        """A native run callable that attributes the comment to ``actor``."""
+        def run(args):
+            cid = str(len(self.issue['comments']) + 1)
+            self.issue['comments'].append(dict(id=cid, text=args[3], author=actor,
+                                               created_at='2026-09-16T00:00:00Z'))
+            return json.dumps({'id': cid})
+        return run
 
     def operator_revert(self, payload=None, actor=OPERATOR):
         """Run the operator write path with the deployment allowlist configured."""
@@ -711,28 +755,39 @@ class IntegrationRevertTests(FollowOnChainTests):
         payload = payload if payload is not None else revert_payload(task=self.issue['id'])
         if payload.get('task') != self.issue['id']:
             payload = dict(payload, task=self.issue['id'])
+        return w.apply_revert(self.rows, self.issue['id'], actor, payload, self.operator_run(actor),
+                              operator=True, operators=[OPERATOR], journal=self.journal)
 
-        def run(args):
-            cid = str(len(self.issue['comments']) + 1)
-            self.issue['comments'].append(dict(id=cid, text=args[3], author=actor,
-                                               created_at='2026-09-16T00:00:00Z'))
-            return json.dumps({'id': cid})
+    def journal_entries(self):
+        directory = self.journal / w.JOURNAL_DIR
+        return sorted(directory.glob('*.json')) if directory.is_dir() else []
 
-        return w.apply_revert(self.rows, self.issue['id'], actor, payload, run,
-                              operator=True, operators=[OPERATOR])
-
-    def reviewed(self, operators=None):
+    def reviewed(self, operators=None, journal=...):
         """The shared projection with the operator allowlist the host supplies."""
         from review_state import project as reviewed
         return reviewed(self.issue, self.scopes(),
-                        [OPERATOR] if operators is None else operators)
+                        [OPERATOR] if operators is None else operators,
+                        None, self.journal if journal is ... else journal)
+
+    def send(self, p, actor='worker'):
+        self.actor = actor
+        return w.execute(self.rows, 'task-1', actor, p, self.run_native,
+                         operators=[OPERATOR], journal=self.journal)
+
+    def shared(self):
+        from review_state import project as reviewed, scopes_for
+        return reviewed(self.issue, scopes_for(self.rows, 'task-1'), [OPERATOR], None, self.journal)
 
     def scopes(self):
         from review_state import scopes_for
         return scopes_for(self.rows, self.issue['id'])
 
     def warning_lines(self, state):
-        return [w for w in state['warnings'] if w.startswith('Integration fact disagreement')]
+        from review_state import is_integration_warning
+        return [x for x in state['warnings'] if is_integration_warning(x)]
+
+    def revert_warnings(self, state):
+        return [x for x in self.warning_lines(state) if x.startswith('Integration revert')]
 
     # -- (a) the disagreement warning --------------------------------------
     def test_current_contribution_warns_when_the_newest_scope_disagrees(self):
@@ -860,12 +915,14 @@ class IntegrationRevertTests(FollowOnChainTests):
     def test_record_whose_author_is_not_an_operator_is_ignored(self):
         self.integration_case()
         self.append_revert(revert_payload(task=self.issue['id']), author='worker')
-        reverts, invalid = w.revert_records(self.issue, [OPERATOR])
+        reverts, invalid = w.revert_records(self.issue, [OPERATOR], self.journal)
         self.assertEqual(reverts, [])
         self.assertEqual(len(invalid), 1)
         state = self.reviewed()
         self.assertEqual(state['integration']['fact'], 'passed')
         self.assertFalse(state['integration']['reverted'])
+        self.assertTrue(any('Integration revert record(s) ignored' in line
+                            for line in self.warning_lines(state)))
 
     def test_revert_removes_the_named_integration_commit(self):
         first = self.integration_case()
@@ -916,14 +973,46 @@ class IntegrationRevertTests(FollowOnChainTests):
     def test_later_passed_fact_with_another_integration_commit_reintegrates(self):
         self.integration_case()
         self.operator_revert()
-        self.assertEqual(self.reviewed()['integration']['fact'], 'reverted')
+        state = self.reviewed()
+        self.assertEqual(state['integration']['fact'], 'reverted')
+        self.assertEqual(state['integration']['reverted_commits'], [MERGE_1])
         # The explicit re-integration evidence: a NEW passing scope/commit.
         self.record_lifecycle(COMMIT_1, MERGE_2, scope_op='scope-2')
-        block = self.reviewed()['integration']
+        state = self.reviewed()
+        block = state['integration']
         self.assertEqual(block['fact'], 'passed')
-        self.assertFalse(block['reverted'])
         self.assertEqual(block['integration_commit'], MERGE_2)
+        # The revert is still ON RECORD and still visible: the reverted commit stays
+        # named, together with the different commit that re-integrated the work.
+        self.assertTrue(block['reverted'])
+        self.assertEqual(block['reverted_commits'], [MERGE_1])
         self.assertEqual(self.shared()['review_state'], 'integrated')
+        lines = self.revert_warnings(state)
+        self.assertEqual(len(lines), 1)
+        self.assertIn(MERGE_1, lines[0])
+        self.assertIn(MERGE_2, lines[0])
+        self.assertNotIn('any-pass-wins is retained by owner decision', lines[0])
+
+    def test_brief_bounds_the_embedded_revert_list(self):
+        first = self.integration_case()
+        for index in range(briefing.REVERT_BRIEF_LIMIT + 2):
+            merge = '%040x' % (index + 1)
+            self.record_lifecycle(COMMIT_1, merge, scope_op='brief-scope-%d' % index)
+            self.operator_revert(revert_payload(operation_id='revert-%d' % index, contribution=first,
+                                                integration_commit=merge))
+        result = briefing.brief(self.rows, 'proj', 'task-1', operators=[OPERATOR],
+                                journal=self.journal)
+        review = result['review']
+        self.assertEqual(review['reverts_total'], briefing.REVERT_BRIEF_LIMIT + 2)
+        self.assertEqual(len(review['reverts']), briefing.REVERT_BRIEF_LIMIT)
+        self.assertEqual(review['reverts_more'], 'review task-1')
+        self.assertEqual({r['contribution'] for r in review['reverts']}, {first})
+        # The compact read points at the full read instead of embedding everything.
+        self.assertIn('reverts', json.dumps(briefing.format_brief(result)))
+        listed = [line for line in briefing.format_brief(result).splitlines()
+                  if line.startswith('Review/contribution: ')]
+        self.assertEqual(len(listed), 1)
+        self.assertNotIn('revert-0', listed[0])
 
     def test_reverting_a_prior_contribution_is_reported_by_the_follow_on(self):
         first = self.integration_case()
@@ -956,21 +1045,62 @@ class IntegrationRevertTests(FollowOnChainTests):
         self.assertEqual(len(self.issue['comments']), before + 1)
 
     def test_revert_of_one_of_two_passing_scopes_refuses_that_base(self):
+        """S2 from the review: reverting the newest pass must not be silent.
+
+        Two passes (MERGE_1 then MERGE_2); the operator reverts MERGE_2, so
+        any-pass-wins keeps the work integrated through MERGE_1. The revert used to
+        read ``reverted:false`` with no warning at all.
+        """
         first = self.integration_case()
         self.record_lifecycle(COMMIT_1, MERGE_2, scope_op='scope-2')
         self.operator_revert(revert_payload(contribution=first, integration_commit=MERGE_2))
-        block = self.reviewed()['integration']
+        state = self.reviewed()
+        block = state['integration']
         # Any-pass-wins keeps the work integrated through the OTHER, unreverted
         # scope, and the reported base moves back to that surviving pass.
         self.assertEqual(block['fact'], 'passed')
         self.assertEqual(block['integration_commit'], MERGE_1)
         self.assertEqual(block['newest_scope']['integration_commit'], MERGE_2)
+        # ... and the removed commit is reported on the read, with a warning that
+        # names it and the surviving pass distinctly.
+        self.assertTrue(block['reverted'])
+        self.assertEqual(block['reverted_commits'], [MERGE_2])
+        entries = [d for d in state['integration_disagreements'] if d['kind'] == 'reverted']
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]['reverted_commits'], [MERGE_2])
+        lines = self.revert_warnings(state)
+        self.assertEqual(len(lines), 1)
+        self.assertIn(MERGE_2, lines[0])
+        self.assertIn(MERGE_1, lines[0])
         before = len(self.issue['comments'])
         with self.assertRaisesRegex(ValueError, 'must equal the prior integration commit'):
             self.send(self.contribution(COMMIT_2, base=MERGE_2, supersedes=None, follows=first))
         self.assertEqual(len(self.issue['comments']), before)
         self.send(self.contribution(COMMIT_2, base=MERGE_1, supersedes=None, follows=first))
         self.assertEqual(len(self.issue['comments']), before + 1)
+
+    def test_reverting_a_pass_with_a_newer_failed_scope_is_not_silent(self):
+        """S3 from the review: pass, then a newer FAILED scope, then revert the pass.
+
+        The projection reports ``failed`` (the newest matching scope), which used to
+        leave ``reverted:false`` and no trace of the removed pass at all.
+        """
+        first = self.integration_case()
+        self.record_lifecycle(COMMIT_1, MERGE_2, scope_op='scope-2', value='failed')
+        self.operator_revert(revert_payload(contribution=first, integration_commit=MERGE_1))
+        state = self.reviewed()
+        block = state['integration']
+        self.assertEqual(block['fact'], 'failed')
+        self.assertTrue(block['reverted'])
+        self.assertEqual(block['reverted_commits'], [MERGE_1])
+        entries = [d for d in state['integration_disagreements'] if d['kind'] == 'reverted']
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]['fact'], 'failed')
+        self.assertEqual(entries[0]['newest_fact'], 'failed')
+        lines = self.revert_warnings(state)
+        self.assertEqual(len(lines), 1)
+        self.assertIn(MERGE_1, lines[0])
+        self.assertIn(MERGE_2, lines[0])
 
     def test_old_chain_reader_ignores_the_new_record(self):
         """Rollback compatibility: an old kit only knows the chain prefix.
@@ -985,6 +1115,28 @@ class IntegrationRevertTests(FollowOnChainTests):
         self.assertEqual([p['operation'] for p, _ in ordered], ['contribute', 'approve'])
         self.assertEqual(w.project(self.issue)['contribution']['comment_id'], first)
 
+    def test_project_journal_entries_for_another_task_are_invisible(self):
+        """One journal per project: another task's records must not leak or warn."""
+        self.integration_case()
+        other_payload = dict(revert_payload(task='other-task', contribution='1'), operator=OPERATOR)
+        entry = w.revert_journal_entry(w.JOURNAL_REVERT, other_payload, 'other-c1', OPERATOR,
+                                       task='other-task', contribution='1',
+                                       integration_commit=MERGE_1, revert_commit='b' * 40)
+        w.publish_revert_journal(self.journal, entry)
+        # Reading THIS task: the other task's entry is neither honoured nor reported.
+        self.assertEqual(w.revert_records(self.issue, [OPERATOR], self.journal), ([], []))
+        state = self.reviewed()
+        self.assertEqual(state['integration']['fact'], 'passed')
+        self.assertEqual(self.warning_lines(state), [])
+        # The other task's own read still honours its own host-issued record.
+        other_comment = dict(id='other-c1',
+                             text=REVERT_PREFIX + canonical_bytes(other_payload).decode(),
+                             author=OPERATOR, created_at='2026-09-16T00:00:00Z')
+        other_issue = dict(self.issue, id='other-task', comments=[other_comment])
+        honoured, invalid = w.revert_records(other_issue, [OPERATOR], self.journal)
+        self.assertEqual([r['comment_id'] for r in honoured], ['other-c1'])
+        self.assertEqual(invalid, [])
+
     def test_revert_record_does_not_change_any_existing_record_schema(self):
         self.assertEqual(w.EXTRA['approve'], {'contribution', 'summary'})
         self.assertEqual(w.EXTRA['contribute'],
@@ -998,7 +1150,235 @@ class IntegrationRevertTests(FollowOnChainTests):
         self.issue['comments'].append(dict(id=cid, text=REVERT_PREFIX + '{not json',
                                            author=OPERATOR, created_at='2026-09-16T00:00:00Z'))
         self.assertEqual(self.reviewed()['integration']['fact'], 'passed')
-        self.assertEqual(w.revert_records(self.issue, [OPERATOR])[1], [cid])
+        self.assertEqual(w.revert_records(self.issue, [OPERATOR], self.journal)[1], [cid])
+
+    # -- (c) the host-issued journal (review item forged-pre-deploy-reverts) --
+    def test_bare_revert_comment_without_a_host_entry_is_never_honoured(self):
+        """The P1 probe: a valid revert comment with a self-declared operator author.
+
+        The old kit wrote this through the raw endpoint (``actor=op`` plus a raw
+        comment) and the reader honoured it, closing the follows gate. The reader
+        now requires the host journal entry, so the forged record changes nothing.
+        """
+        first = self.integration_case()
+        cid = self.append_comment(revert_payload(contribution=first), author=OPERATOR)
+        reverts, invalid = w.revert_records(self.issue, [OPERATOR], self.journal)
+        self.assertEqual(reverts, [])
+        self.assertIn(cid, invalid)
+        state = self.reviewed()
+        self.assertEqual(state['integration']['fact'], 'passed')
+        self.assertFalse(state['integration']['reverted'])
+        self.assertEqual(state['integration_disagreements'], [])
+        self.assertTrue(any('Integration revert record(s) ignored' in line
+                            for line in self.warning_lines(state)))
+        # The follows gate stays open: the forged revert cannot close it.
+        before = len(self.issue['comments'])
+        self.send(self.contribution(COMMIT_2, base=MERGE_1, supersedes=None, follows=first))
+        self.assertEqual(len(self.issue['comments']), before + 1)
+
+    def test_host_issued_revert_record_still_reverts_and_writes_its_journal_entry(self):
+        first = self.integration_case()
+        receipt = self.operator_revert(revert_payload(contribution=first))
+        entries = self.journal_entries()
+        self.assertEqual(len(entries), 1)
+        entry = json.loads(entries[0].read_text(encoding='utf-8'))
+        self.assertEqual(entries[0].name, entry['sha256'] + '.json')
+        self.assertEqual(w.validate_revert_journal_entry(entry, entries[0].name), entry)
+        self.assertEqual(entry['comment_id'], receipt['comment_id'])
+        self.assertEqual((entry['task'], entry['contribution'], entry['integration_commit']),
+                         ('task-1', first, MERGE_1))
+        self.assertEqual(entry['operator'], OPERATOR)
+        reverts, invalid = w.revert_records(self.issue, [OPERATOR], self.journal)
+        self.assertEqual([r['comment_id'] for r in reverts], [receipt['comment_id']])
+        self.assertEqual(invalid, [])
+        self.assertEqual(self.reviewed()['integration']['fact'], 'reverted')
+
+    def test_journal_entry_that_does_not_bind_the_comment_payload_is_ignored(self):
+        first = self.integration_case()
+        cid = self.append_comment(revert_payload(contribution=first), author=OPERATOR)
+        # A journal entry for the SAME comment id but different bound bytes (a
+        # second contribution) must not authorize this comment.
+        other = revert_payload(operation_id='revert-other', contribution=first,
+                               integration_commit=MERGE_2)
+        self.host_journal(other, cid)
+        reverts, invalid = w.revert_records(self.issue, [OPERATOR], self.journal)
+        self.assertEqual(reverts, [])
+        self.assertIn(cid, invalid)
+        self.assertEqual(self.reviewed()['integration']['fact'], 'passed')
+
+    def test_journal_without_the_native_comment_is_surfaced_not_silent(self):
+        """A restore that lost the revert comment must not silently un-revert."""
+        first = self.integration_case()
+        receipt = self.operator_revert(revert_payload(contribution=first))
+        self.issue['comments'] = [c for c in self.issue['comments']
+                                  if str(c['id']) != receipt['comment_id']]
+        state = self.reviewed()
+        self.assertEqual(state['integration']['fact'], 'passed')
+        self.assertTrue(any('Integration revert record(s) ignored' in line
+                            for line in self.warning_lines(state)))
+
+    def test_absent_journal_directory_trusts_no_revert(self):
+        first = self.integration_case()
+        self.operator_revert(revert_payload(contribution=first))
+        # The same native records, read on a host with no journal directory: the
+        # revert is not trusted (fail-closed) and the read says so.
+        state = self.reviewed(journal=None)
+        self.assertEqual(state['integration']['fact'], 'passed')
+        self.assertFalse(state['integration']['reverted'])
+        self.assertTrue(any('Integration revert record(s) ignored' in line
+                            for line in self.warning_lines(state)))
+
+    def test_revert_record_refuses_when_the_host_journal_is_unusable(self):
+        first = self.integration_case()
+        before = len(self.issue['comments'])
+        with self.assertRaisesRegex(ValueError, 'requires the project directory'):
+            self.operator_revert_with_journal(revert_payload(contribution=first), None)
+        self.assertEqual(len(self.issue['comments']), before)
+        # A symlinked JOURNAL PATH is refused before the native write too.
+        project = self.journal.parent / (self.journal.name + '-project')
+        project.mkdir()
+        journal = project / w.JOURNAL_DIR
+        try:
+            journal.symlink_to(self.journal, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest('symlinks unavailable')
+        with self.assertRaisesRegex(ValueError, 'symlink'):
+            self.operator_revert_with_journal(revert_payload(contribution=first), project)
+        self.assertEqual(len(self.issue['comments']), before)
+
+    def operator_revert_with_journal(self, payload, journal):
+        os.environ['ORCHESTRA_OPERATORS'] = OPERATOR
+        return w.apply_revert(self.rows, self.issue['id'], OPERATOR, payload, self.operator_run(),
+                              operator=True, operators=[OPERATOR], journal=journal)
+
+    def test_interrupted_revert_write_is_reconciled_by_the_journal_retry(self):
+        """Native comment written, journal entry not: the retry persists the entry.
+
+        This is the crash window between the two writes. The first attempt's comment
+        is inert; re-running the same operation id must not write a second comment.
+        """
+        first = self.integration_case()
+        payload = revert_payload(contribution=first)
+        payload.setdefault('operator', OPERATOR)
+        cid = self.append_comment(payload, OPERATOR)
+        self.assertEqual(self.reviewed()['integration']['fact'], 'passed')
+        receipt = self.operator_revert(payload)
+        self.assertTrue(receipt['reconciled'])
+        self.assertEqual(receipt['comment_id'], cid)
+        self.assertEqual(len(self.issue['comments']), 3)
+        self.assertEqual(self.reviewed()['integration']['fact'], 'reverted')
+        self.assertEqual(len(self.journal_entries()), 1)
+
+    # -- (d) retraction (review item retraction-and-same-commit) --------------
+    def void_payload(self, target, original, operation_id='void-revert-1', actor=OPERATOR):
+        return dict(schema_version=1, operation='void-record', operation_id=operation_id,
+                    task=self.issue['id'], target=target, target_kind='integration-revert',
+                    target_sha256=w.recovery.digest(original), original=original,
+                    reason='mistaken revert', disposition='void', operator=actor)
+
+    def retract(self, revert_comment_id, operation_id='void-revert-1'):
+        original = next(c['text'] for c in self.issue['comments']
+                        if str(c['id']) == revert_comment_id)
+        payload = self.void_payload(revert_comment_id, original, operation_id)
+        before = len(self.issue['comments'])
+        receipt = w.apply_void(self.rows, self.issue['id'], OPERATOR, payload, self.operator_run(),
+                               operator=True, operators=[OPERATOR], journal=self.journal)
+        self.assertEqual(len(self.issue['comments']),
+                         before if receipt.get('reconciled') else before + 1)
+        return receipt
+
+    def test_void_record_retracts_a_host_issued_revert(self):
+        first = self.integration_case()
+        receipt = self.operator_revert(revert_payload(contribution=first))
+        self.assertEqual(self.reviewed()['integration']['fact'], 'reverted')
+        self.retract(receipt['comment_id'])
+        state = self.reviewed()
+        self.assertEqual(state['integration']['fact'], 'passed')
+        self.assertFalse(state['integration']['reverted'])
+        self.assertEqual(state['integration']['reverted_commits'], [])
+        reverts, _ = w.revert_records(self.issue, [OPERATOR], self.journal)
+        self.assertEqual(reverts, [])
+        # The retraction itself is visible as an applied void recovery naming the
+        # revert it removed, so nothing about it is silent either.
+        applied = [r for r in state['recoveries'] if r['applied']]
+        self.assertEqual([(r['target'], r['target_kind']) for r in applied],
+                         [(receipt['comment_id'], 'integration-revert')])
+        # The retraction is host-issued: its own journal entry is required.
+        retractions = [json.loads(path.read_text(encoding='utf-8'))
+                       for path in self.journal_entries()
+                       if json.loads(path.read_text(encoding='utf-8'))['kind']
+                       == w.JOURNAL_RETRACTION]
+        self.assertEqual(len(retractions), 1)
+        self.assertEqual(retractions[0]['target_revert_comment_id'], receipt['comment_id'])
+
+    def test_retraction_is_retried_idempotently(self):
+        first = self.integration_case()
+        receipt = self.operator_revert(revert_payload(contribution=first))
+        self.retract(receipt['comment_id'])
+        before = len(self.issue['comments'])
+        retried = self.retract(receipt['comment_id'])
+        self.assertTrue(retried['reconciled'])
+        self.assertEqual(len(self.issue['comments']), before)
+        self.assertEqual(self.reviewed()['integration']['fact'], 'passed')
+
+    def test_unverifiable_retraction_leaves_the_revert_in_force(self):
+        """A bare void comment cannot un-revert: the retraction must be host-issued."""
+        first = self.integration_case()
+        receipt = self.operator_revert(revert_payload(contribution=first))
+        original = next(c['text'] for c in self.issue['comments']
+                        if str(c['id']) == receipt['comment_id'])
+        payload = self.void_payload(receipt['comment_id'], original)
+        # The void comment is written natively (as a forged raw write would be) but
+        # no host retraction entry exists.
+        cid = str(len(self.issue['comments']) + 1)
+        self.issue['comments'].append(dict(id=cid, text=w.recovery.PREFIX + canonical_bytes(payload).decode(),
+                                           author=OPERATOR, created_at='2026-09-16T00:00:00Z'))
+        state = self.reviewed()
+        self.assertEqual(state['integration']['fact'], 'reverted')
+        self.assertTrue(state['integration']['reverted'])
+        self.assertTrue(any('Integration revert record(s) ignored' in line
+                            for line in self.warning_lines(state)))
+
+    def test_void_of_a_bare_revert_comment_is_refused(self):
+        """A forged revert cannot be retracted: there is nothing host-issued there."""
+        first = self.integration_case()
+        cid = self.append_comment(revert_payload(contribution=first), author=OPERATOR)
+        original = next(c['text'] for c in self.issue['comments'] if str(c['id']) == cid)
+        payload = self.void_payload(cid, original)
+        before = len(self.issue['comments'])
+        with self.assertRaisesRegex(ValueError, 'not a host-issued integration revert record'):
+            w.apply_void(self.rows, self.issue['id'], OPERATOR, payload, self.run_native,
+                         operator=True, operators=[OPERATOR], journal=self.journal)
+        self.assertEqual(len(self.issue['comments']), before)
+
+    def test_same_commit_repass_after_a_retraction_does_not_need_a_new_commit(self):
+        """The retraction path clears a mistaken revert without a new commit."""
+        first = self.integration_case()
+        receipt = self.operator_revert(revert_payload(contribution=first))
+        # A same-commit pass recorded AFTER the revert does not clear it (5bb.44).
+        self.record_lifecycle(COMMIT_1, MERGE_1, scope_op='scope-1-again')
+        self.assertEqual(self.reviewed()['integration']['fact'], 'reverted')
+        self.retract(receipt['comment_id'])
+        state = self.reviewed()
+        self.assertEqual(state['integration']['fact'], 'passed')
+        self.assertEqual(state['integration']['integration_commit'], MERGE_1)
+        # The unchanged different-commit rule: a rollback-then-redeploy of the SAME
+        # commit is a same-commit pass, so it is the retraction that re-integrates.
+        before = len(self.issue['comments'])
+        self.send(self.contribution(COMMIT_2, base=MERGE_1, supersedes=None, follows=first))
+        self.assertEqual(len(self.issue['comments']), before + 1)
+
+    def test_void_of_a_revert_is_refused_without_the_host_journal(self):
+        first = self.integration_case()
+        receipt = self.operator_revert(revert_payload(contribution=first))
+        original = next(c['text'] for c in self.issue['comments']
+                        if str(c['id']) == receipt['comment_id'])
+        payload = self.void_payload(receipt['comment_id'], original)
+        before = len(self.issue['comments'])
+        with self.assertRaisesRegex(ValueError, 'not a host-issued integration revert record'):
+            w.apply_void(self.rows, self.issue['id'], OPERATOR, payload, self.run_native,
+                         operator=True, operators=[OPERATOR])
+        self.assertEqual(len(self.issue['comments']), before)
 
 
 if __name__ == '__main__':

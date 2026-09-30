@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import briefing
 import render
@@ -141,6 +142,52 @@ class WorkQueueTests(unittest.TestCase):
             self.assertEqual(item['pending_handoff_total'],3)
             self.assertEqual(len(item['pending_handoff_requests']),1)
             self.assertEqual(item['pending_handoff_next_offset'],1)
+
+
+class WorkQueueRevertScopeTests(unittest.TestCase):
+    """kittrial-5bb.52 P3: the queue's reverts/scopes inputs are PER TASK.
+
+    They used to apply to every row, and each row re-scanned every task's native
+    comments (``reverts_for`` was O(rows) per task, computed twice per row).
+    """
+
+    def test_reverts_and_scopes_must_be_per_task_mappings(self):
+        data=reviewed_rows()
+        with self.assertRaisesRegex(ValueError,'reverts must be a mapping'):
+            work.queue(data,'alice/session',['--mine'],reverts=[])
+        with self.assertRaisesRegex(ValueError,'scopes must be a mapping'):
+            work.queue(data,'alice/session',['--mine'],scopes=[])
+
+    def test_an_explicit_reverts_mapping_is_used_for_its_own_task_only(self):
+        data=reviewed_rows()
+        other=copy.deepcopy(data[0]);other.update(id='aaa-task',comments=[],labels=[])
+        data.append(other)
+        from review_state import reverts_for
+        scopes={TASK:[]}
+        # The supplied maps are consulted per task id; a task absent from the map
+        # gets an empty list rather than another task's records.
+        page=work.queue(data,'alice/session',['--mine'],reverts={TASK:[]},scopes=scopes)
+        self.assertEqual(sorted(item['task'] for item in page['items']),['aaa-task',TASK])
+        for item in page['items']:
+            self.assertEqual(item['integration_disagreements'],[])
+        self.assertEqual(reverts_for(data,TASK),[])
+
+    def test_reverts_for_every_task_are_resolved_once_per_page(self):
+        """One reader call for the whole page, not one per row and task."""
+        data=reviewed_rows()
+        other=copy.deepcopy(data[0]);other.update(id='aaa-task',comments=[],labels=[])
+        data.append(other)
+        import review_state
+        calls=[]
+        real=review_state.reverts_by_task
+        def counting(rows,operators=None,journal=None):
+            calls.append(list(rows))
+            return real(rows,operators,journal)
+        with patch.object(review_state,'reverts_by_task',side_effect=counting):
+            page=work.queue(data,'alice/session',['--mine'])
+        self.assertEqual(len(calls),1)
+        self.assertEqual(len(calls[0]),len(data))
+        self.assertEqual(sorted(item['task'] for item in page['items']),['aaa-task',TASK])
 
 
 if __name__=='__main__':unittest.main()

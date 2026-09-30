@@ -1571,6 +1571,35 @@ class ReviewQueueWarningsTests(unittest.TestCase):
                                   'total': 2, 'next_offset': None})
         self.assertEqual(page.review_queue('proj')['warnings'], [WARNING])
 
+    def test_revert_warning_travels_like_the_disagreement_warning(self):
+        """kittrial-5bb.52 item 3: a revert is surfaced on the HTTP reads too.
+
+        The canonical ``work`` row already carries the revert flag, its
+        ``reverted_commits`` and the revert warning; the HTTP queue/states/brief
+        reads forward them unchanged. The office WEB UI templates do not render the
+        warnings list yet -- that remains kittrial-5bb.20 slice 2 (documented in
+        docs/REVIEWS.md), not a claim made here.
+        """
+        warning = ('Integration revert for the current contribution: an operator revert removed '
+                   'integration commit ' + MERGE_1 + ', and no other passing scope remains, so the '
+                   'contribution reads reverted under scope {source_commit=%s}' % MERGE_1)
+        evidence = dict(INTEGRATION, fact='reverted', newest_fact='reverted', reverted=True,
+                        reverted_commits=[MERGE_1], reverted_total=1)
+        entry = {'kind': 'reverted', 'contribution': 'c1', 'relation': None,
+                 'fact': 'reverted', 'newest_fact': 'reverted',
+                 'scope': INTEGRATION['scope'], 'newest_scope': INTEGRATION['newest_scope'],
+                 'reverted_commits': [MERGE_1], 'reverted_total': 1}
+        row = work_row(warnings=(warning,))
+        row['integration'] = evidence
+        row['integration_disagreements'] = [entry]
+        page = backend(work_page={'items': [row], 'total': 1, 'next_offset': None})
+        result = page.review_queue('proj')
+        self.assertTrue(result['items'][0]['integration']['reverted'])
+        self.assertEqual(result['items'][0]['integration']['reverted_commits'], [MERGE_1])
+        self.assertEqual(result['items'][0]['integration_warnings'], [warning])
+        self.assertEqual(result['warnings'], [warning])
+        self.assertEqual(page.review_states('proj')['warnings'], [warning])
+
 
 class QueueItemShapeTests(unittest.TestCase):
     def test_additive_fields_default_to_empty(self):

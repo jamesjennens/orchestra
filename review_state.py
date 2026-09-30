@@ -34,16 +34,34 @@ the any-pass-wins rule above is applied unchanged.
 Two admission rules narrow the passing scopes before any-pass-wins is applied,
 and neither switches the rule to newest-wins:
 
-* an explicit, operator-audited REVERT record (`Kind: integration-revert-v1`)
-  removes ONE recorded integration commit from the passing set, so the
-  contribution reads as not integrated for that commit; a later
+* an explicit, host-issued REVERT record (`Kind: integration-revert-v1`, honoured
+  only when the `.integration-reverts/` journal entry the coordination host wrote
+  matches the native comment) removes ONE recorded integration commit from the
+  passing set, so the contribution reads as not integrated for that commit; a later
   ``integrated=passed`` recording a DIFFERENT ``integration_commit`` is not
-  affected and re-integrates the work. ``integration.reverted`` reports this;
+  affected and re-integrates the work. ``integration.reverted`` reports that a
+  revert is on record for this contribution and ``integration.reverted_commits``
+  names the commits it removed -- including when another pass still governs (S2) or
+  the newest matching scope records a failure (S3), so a revert is never silent;
 * the owner decision on kittrial-5bb.32 (comment 01a0eea4) is to KEEP
   any-pass-wins. The conflict it can still produce -- a newer matching scope
   whose value differs from the reported one -- is not silently resolved; it is
   surfaced by ``integration_disagreements`` and by a warning on every read.
 """
+
+
+#: Warning prefixes this module adds to a read's ``warnings`` list for the
+#: integration overlay. ``brief`` and ``work`` use the predicate below to carry
+#: them into their own warning surfaces without matching strings by hand.
+INTEGRATION_WARNING_PREFIXES = ('Integration fact disagreement', 'Integration revert')
+#: Bound on the ``integration.reverted_commits`` list a read embeds; the
+#: untruncated count stays available as ``integration.reverted_total``.
+REVERTED_COMMITS_LIMIT = 5
+
+
+def is_integration_warning(value):
+    """True for one of this module's integration-overlay warning lines."""
+    return isinstance(value, str) and value.startswith(INTEGRATION_WARNING_PREFIXES)
 
 
 def integration(contribution, scopes, reverts=None):
@@ -64,9 +82,17 @@ def integration(contribution, scopes, reverts=None):
     named by a revert for this contribution no longer counts as a passing scope,
     so the any-pass-wins answer is "not integrated for that commit" while every
     other scope keeps its meaning. A pass recorded afterwards under a different
-    integration commit is untouched and re-integrates the work. ``reverted``
-    reports whether any named commit was removed; ``fact`` is ``reverted`` when
-    nothing passes and the reported scope is a reverted one.
+    integration commit is untouched and re-integrates the work.
+
+    ``reverted`` reports whether ANY revert record removes an
+    ``integration_commit`` this contribution recorded -- it is NOT the same
+    question as ``fact``, which is the effective answer. Both are reported so the
+    revert stays visible when another, older pass still governs (``fact='passed'``
+    with an ``integration_commit`` the revert did not name) or when the newest
+    matching scope records a failure (``fact='failed'``). ``reverted_commits``
+    names the removed commits (bounded to ``REVERTED_COMMITS_LIMIT``, with
+    ``reverted_total`` the untruncated count) and ``fact`` is ``reverted`` only
+    when nothing passes and the reported scope is one a revert removed.
     """
     commit=str((contribution or {}).get('commit') or '')
     cid=str((contribution or {}).get('comment_id') or '')
@@ -93,6 +119,8 @@ def integration(contribution, scopes, reverts=None):
         value=(chosen.get('integrated') or {}).get('value','unknown')
     else:
         value='unknown'
+    removed=sorted({str((entry.get('scope') or {}).get('integration_commit'))
+                    for entry in matching if is_reverted(entry)})
     return {'fact':value,
             'scope':chosen.get('scope') if chosen else None,
             'scope_token':chosen.get('scope_token') if chosen else None,
@@ -102,28 +130,36 @@ def integration(contribution, scopes, reverts=None):
             'matches_contribution':bool(matching),
             'newest_fact':(newest.get('integrated') or {}).get('value','unknown') if newest else 'unknown',
             'newest_scope_token':newest.get('scope_token') if newest else None,
-            'reverted':reverted_fact}
+            # True whenever a host-issued revert removes a commit this
+            # contribution recorded, whatever `fact` reports. `fact` stays the
+            # effective answer; this flag is what keeps the revert visible.
+            'reverted':bool(removed),
+            'reverted_commits':removed[:REVERTED_COMMITS_LIMIT],
+            'reverted_total':len(removed)}
 
 
 def integration_disagreements(result):
-    """Machine-readable any-pass-wins conflicts for one effective projection.
+    """Machine-readable integration conflicts for one effective projection.
 
-    An entry is reported whenever, for the CURRENT contribution or any
-    ``prior_contributions`` entry, ``integration.newest_fact`` differs from
-    ``integration.fact``: the newest matching scope disagrees with the scope the
-    any-pass-wins rule reports. Both facts and both scopes are named, so a reader
-    can see what conflicted without re-deriving the rule. The owner decision on
-    kittrial-5bb.32 is to keep any-pass-wins, so this is deliberately a signal,
-    not a state change. ``kind`` distinguishes the two causes:
+    One entry is reported per contribution (the CURRENT one and every
+    ``prior_contributions`` entry) that has something to say:
 
-    * ``newest-scope-disagrees`` -- a newer matching scope records a different
-      value (typically ``integrated=failed``) while an older pass still governs;
-    * ``reverted`` -- an operator reverted the reported integration commit, so
-      the reported fact is ``reverted``. A later pass under a different
-      integration commit clears it.
+    * ``reverted`` -- a host-issued operator revert removed one of the
+      contribution's recorded integration commits. Reported in EVERY case, because
+      a revert that removes the reported pass (``fact='reverted'``), that leaves an
+      older pass governing (``fact='passed'``) or that leaves the newest scope
+      recording a failure (``fact='failed'``) is equally invisible otherwise. The
+      entry names ``reverted_commits``, the reported ``fact``/``scope`` and the
+      ``newest_fact``/``newest_scope`` so a reader can see the revert and the
+      surviving evidence together;
+    * ``newest-scope-disagrees`` -- no revert is in play and a newer matching scope
+      records a different value (typically ``integrated=failed``) while an older
+      pass still governs by any-pass-wins.
 
-    Returns an empty list for a result that carries no integration block (a raw
-    workflow projection) and for a prior entry without one.
+    The owner decision on kittrial-5bb.32 is to keep any-pass-wins, so this is
+    deliberately a signal, not a state change. Returns an empty list for a result
+    that carries no integration block (a raw workflow projection) and for a prior
+    entry without one.
     """
     found=[]
     def block(current, comment_id, relation):
@@ -133,9 +169,18 @@ def integration_disagreements(result):
         if not isinstance(evidence, dict):
             return
         fact, newest=evidence.get('fact'), evidence.get('newest_fact')
+        reverted_commits=list(evidence.get('reverted_commits') or [])
+        if reverted_commits:
+            found.append({'kind':'reverted',
+                          'contribution':comment_id,'relation':relation,
+                          'fact':fact,'newest_fact':newest,
+                          'scope':evidence.get('scope'),'newest_scope':evidence.get('newest_scope'),
+                          'reverted_commits':reverted_commits,
+                          'reverted_total':evidence.get('reverted_total',len(reverted_commits))})
+            return
         if fact==newest or fact is None or newest is None:
             return
-        found.append({'kind':'reverted' if evidence.get('reverted') else 'newest-scope-disagrees',
+        found.append({'kind':'newest-scope-disagrees',
                       'contribution':comment_id,'relation':relation,
                       'fact':fact,'newest_fact':newest,
                       'scope':evidence.get('scope'),'newest_scope':evidence.get('newest_scope')})
@@ -148,18 +193,53 @@ def integration_disagreements(result):
 
 
 def disagreement_warnings(disagreements):
-    """Human-readable one-line warnings for ``integration_disagreements`` entries."""
+    """Human-readable one-line warnings for ``integration_disagreements`` entries.
+
+    The wording is kind-specific (kittrial-5bb.52 review item ``smaller``): a revert
+    warning names the reverted commit(s) and the reported scope ONCE each with
+    revert-appropriate wording, and never says "any-pass-wins is retained by owner
+    decision" as if nothing had been removed.
+    """
     lines=[]
     for item in disagreements:
-        where=('the current contribution' if item.get('contribution') is None else
-               'contribution ' + str(item.get('contribution')) +
-               (' (relation: ' + item['relation'] + ')' if item.get('relation') else ''))
+        where=_contribution_text(item)
+        if item.get('kind')=='reverted':
+            lines.append(_revert_warning(item, where))
+            continue
         lines.append('Integration fact disagreement for ' + where + ': the any-pass-wins fact is ' +
                      str(item.get('fact')) + ' under scope ' + _scope_text(item.get('scope')) +
                      ' but the newest matching scope records ' + str(item.get('newest_fact')) +
                      ' under scope ' + _scope_text(item.get('newest_scope')) +
                      '; any-pass-wins is retained by owner decision, so both facts and scopes are named here')
     return lines
+
+
+def _contribution_text(item):
+    if item.get('contribution') is None:
+        return 'the current contribution'
+    return ('contribution ' + str(item.get('contribution')) +
+            (' (relation: ' + item['relation'] + ')' if item.get('relation') else ''))
+
+
+def _revert_warning(item, where):
+    commits=', '.join(str(commit) for commit in item.get('reverted_commits') or []) or 'unknown'
+    total=item.get('reverted_total') or len(item.get('reverted_commits') or [])
+    more='' if total<=len(item.get('reverted_commits') or []) else ' (+%d more)'%(total-len(item['reverted_commits']))
+    fact=item.get('fact')
+    base=('Integration revert for ' + where + ': an operator revert removed integration commit ' + commits
+          + more + ' for this contribution')
+    if fact=='reverted':
+        return (base + ', and no other passing scope remains, so the contribution reads reverted under scope '
+                + _scope_text(item.get('scope')) + '; a pass recorded under a DIFFERENT integration_commit '
+                're-integrates the work, while a pass under the reverted commit itself does not clear it')
+    if fact=='passed':
+        return (base + '; the contribution reads passed under scope ' + _scope_text(item.get('scope'))
+                + ', which is not one of the reverted commits, so the unreverted pass still governs'
+                + ' (the newest matching scope records ' + str(item.get('newest_fact')) + ' under scope '
+                + _scope_text(item.get('newest_scope')) + ')')
+    return (base + '; the contribution reads ' + str(fact) + ' under scope '
+            + _scope_text(item.get('scope')) + ', and the newest matching scope records '
+            + str(item.get('newest_fact')) + ' under scope ' + _scope_text(item.get('newest_scope')))
 
 
 def _scope_text(scope):
@@ -184,12 +264,14 @@ def effective(result, scopes=None, workflow_state=None):
     re-implementing the rule. The answer is only added when the raw result
     carries the key, which keeps direct callers of this function working.
 
-    The answer also consults ``result['reverts']`` (validated operator revert
-    records, supplied by the workflow projection; empty when absent), and every
-    ``newest_fact``/``fact`` disagreement it finds is reported additively as
-    ``integration_disagreements`` plus one warning on the existing ``warnings``
-    list, so the owner decision to keep any-pass-wins stays visible on every read
-    instead of being silently resolved.
+    The answer also consults ``result['reverts']`` (host-issued operator revert
+    records, supplied by the workflow projection; empty when absent). Every
+    contribution carrying a revert is reported additively as
+    ``integration_disagreements`` (kind ``reverted``), together with its
+    ``reverted_commits``, and every ``newest_fact``/``fact`` disagreement with no
+    revert in play is reported as kind ``newest-scope-disagrees``; each gets one
+    warning on the existing ``warnings`` list, so the owner decision to keep
+    any-pass-wins stays visible and a revert is never silent on any read.
     """
     reverts=result.get('reverts') or []
     evidence=integration(result.get('contribution'),scopes,reverts)
@@ -221,23 +303,46 @@ def scopes_for(rows, task):
     return next((r['scopes'] for r in integration_evidence(rows) if r['id']==task),[])
 
 
-def reverts_for(rows, task, operators=None):
-    """The validated operator revert records for one task (empty when absent).
+def reverts_for(rows, task, operators=None, journal=None, host=None):
+    """The host-issued operator revert records for one task (empty when absent).
 
     Thin, import-safe bridge to ``review_workflow.revert_records`` so callers that
     only hold raw native rows (``work``, the HTTP adapters) can hand the shared
-    projection the same reverts ``review``/``brief`` see. An unconfigured operator
-    allowlist authorizes nobody, so an unaudited record is ignored here exactly as
-    it is there; a reader never fails because of one.
+    projection the same reverts ``review``/``brief`` see. ``journal`` is the project
+    directory holding ``.integration-reverts/``; without it (or without a matching
+    entry in it) no revert is trusted. ``host`` is an already-parsed journal triple
+    for a caller that reads many tasks at once (``reverts_by_task``). An
+    unconfigured operator allowlist authorizes nobody, so an unaudited record is
+    ignored here exactly as it is there; a reader never fails because of one.
     """
     from review_workflow import revert_records
     issue=next((r for r in rows if r.get('id')==task and r.get('issue_type')!='event'),None)
     if issue is None:
         return []
-    return revert_records(issue,operators)[0]
+    return revert_records(issue,operators,journal,host=host)[0]
 
 
-def project(issue, scopes=None, operators=None, reverts=None):
+def reverts_by_task(rows, operators=None, journal=None):
+    """``(reverts, invalid)`` maps for every task in one page (kittrial-5bb.52 P3).
+
+    The host journal is read ONCE for the whole page and each task's comments are
+    scanned once, so the work queue no longer re-scans every row once per task
+    (``reverts_for`` was O(rows) per task) and never computes the same task's
+    reverts twice per row.
+    """
+    from review_workflow import host_revert_journal, revert_records
+    host=host_revert_journal(journal)
+    reverts={};invalid={}
+    for row in rows:
+        task=row.get('id')
+        if not isinstance(task,str) or row.get('issue_type')=='event' or task in reverts:
+            continue
+        found,problems=revert_records(row,operators,journal,host=host)
+        reverts[task]=found;invalid[task]=problems
+    return reverts,invalid
+
+
+def project(issue, scopes=None, operators=None, reverts=None, journal=None, invalid_reverts=None):
     """Raw workflow state plus the effective, integration-aware review state.
 
     ``operators`` is the void-record operator authority the caller already
@@ -246,15 +351,14 @@ def project(issue, scopes=None, operators=None, reverts=None):
     only applied when its author is on that same allowlist. It adds no new state
     and defaults to None, which keeps the pre-existing host fallback intact.
 
-    ``reverts`` is the optional validated operator revert list; when omitted the
-    raw workflow projection reads it from the same issue under the same operator
-    authority, so every caller gets the audited revert projection without
-    threading it manually.
+    ``journal`` is the project directory holding the host-issued
+    ``.integration-reverts/`` journal; ``reverts`` is the optional validated revert
+    list for THIS issue. A caller that resolved every task's reverts once per page
+    (``work.queue``) passes both ``reverts`` and ``invalid_reverts``, so the raw
+    projection does not scan the same issue a second time.
     """
     from review_workflow import project as workflow
-    result=workflow(issue, operators)
-    if reverts is not None:
-        result=dict(result,reverts=list(reverts))
+    result=workflow(issue, operators, journal, reverts, invalid_reverts)
     raw=result['review_state']
     if raw=='none' and 'review-ready' in (issue.get('labels') or []):
         result=dict(result,review_state='legacy-review-ready')
