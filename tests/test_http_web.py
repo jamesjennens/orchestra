@@ -409,9 +409,22 @@ class BriefRouteCase(TeamHarness):
                                   bundle_sha256=None)
         self.assertEqual(201, revised.status, revised.data)
         brief = self.request('GET', self.path('/tasks/%s/brief' % self.task), token=self.olive).data
-        self.assertEqual('awaiting-review', brief['review']['state'])
+        # As canonically, the revision alone does not resolve the requests: they stay
+        # open until the contributor responds to each one (slice 2a).
+        self.assertEqual('changes-requested', brief['review']['state'])
         self.assertEqual(2, brief['review']['contribution']['revision'])
         self.assertEqual('contrib/paginate', brief['review']['contribution']['branch'])
+        self.assertEqual({'open'}, {r['status'] for r in brief['review']['requests']})
+        self.assertEqual(2, brief['review']['open_requests'])
+        responded = self.review(self.carl, 'respond',
+                                contribution=brief['review']['contribution']['id'],
+                                previous=brief['review']['latest_id'],
+                                resolutions=[{'request': r['request'], 'item': r['id'],
+                                              'reason': 'Done', 'evidence': 'revision 2'}
+                                             for r in brief['review']['requests']])
+        self.assertEqual(201, responded.status, responded.data)
+        brief = self.request('GET', self.path('/tasks/%s/brief' % self.task), token=self.olive).data
+        self.assertEqual('awaiting-review', brief['review']['state'])
         self.assertEqual({'resolved'}, {r['status'] for r in brief['review']['requests']})
         self.assertEqual(0, brief['review']['open_requests'])
 
@@ -450,6 +463,142 @@ class BriefRouteCase(TeamHarness):
                                            token=self.vera).status)
         self.assertEqual(403, self.review(self.vera, 'request-changes', items=['x']).status)
         self.assertEqual(403, self.review(self.carl, 'approve').status)
+
+
+class RespondRouteCase(TeamHarness):
+    """The review respond step on the in-process backend (slice 2a item 3).
+
+    Mirrors the canonical rule: a requested change stays open until the task's
+    assignee records a ``respond`` resolution for it, even after a newer revision.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.claim(self.carl)
+        self.assertEqual(201, self.contribute(self.carl).status)
+        brief = self.brief()
+        asked = self.review(self.olive, 'request-changes',
+                            contribution=brief['review']['contribution']['id'],
+                            items=[{'id': 'item-1', 'text': 'Handle an empty page'},
+                                   {'id': 'item-2', 'text': 'Add a test'}])
+        self.assertEqual(201, asked.status, asked.data)
+
+    def brief(self, token=None):
+        response = self.request('GET', self.path('/tasks/%s/brief' % self.task),
+                                token=token or self.carl)
+        self.assertEqual(200, response.status, response.data)
+        return response.data
+
+    def respond(self, token, brief, requests, reason='Fixed', evidence='revision 2', **extra):
+        body = {'contribution': brief['review']['contribution']['id'],
+                'previous': brief['review']['latest_id'],
+                'resolutions': [{'request': r['request'], 'item': r['id'], 'reason': reason,
+                                 'evidence': evidence} for r in requests]}
+        body.update(extra)
+        return self.review(token, 'respond', **body)
+
+    def revise(self):
+        revised = self.contribute(self.carl, commit='d' * 40)
+        self.assertEqual(201, revised.status, revised.data)
+        return self.brief()
+
+    def test_revision_keeps_requests_open_until_the_contributor_responds(self):
+        brief = self.revise()
+        self.assertEqual('changes-requested', brief['review']['state'])
+        self.assertEqual(['open', 'open'], [r['status'] for r in brief['review']['requests']])
+        # Approval waits for the response, as canonically.
+        refused = self.review(self.olive, 'approve',
+                              contribution=brief['review']['contribution']['id'])
+        self.assertEqual(409, refused.status, refused.data)
+        # A partial response resolves exactly the named item.
+        first = self.respond(self.carl, brief, brief['review']['requests'][:1],
+                             reason='Empty page shows a hint')
+        self.assertEqual(201, first.status, first.data)
+        brief = self.brief()
+        self.assertEqual('changes-requested', brief['review']['state'])
+        self.assertEqual(['resolved', 'open'], [r['status'] for r in brief['review']['requests']])
+        self.assertEqual('Empty page shows a hint', brief['review']['requests'][0]['resolution'])
+        self.assertEqual(1, brief['review']['open_requests'])
+        queue = self.request('GET', self.path('/queue'), token=self.carl).data
+        self.assertEqual(['item-2'], queue['items'][0]['pending_request_ids'])
+        second = self.respond(self.carl, brief, brief['review']['requests'][1:])
+        self.assertEqual(201, second.status, second.data)
+        brief = self.brief()
+        self.assertEqual('awaiting-review', brief['review']['state'])
+        self.assertEqual(0, brief['review']['open_requests'])
+        self.assertEqual('owner', brief['task']['next_action']['who'])
+        history = self.request('GET', self.path('/tasks/%s/history' % self.task),
+                               token=self.carl).data
+        self.assertIn('respond', [e['action'] for e in history['items']])
+        approved = self.review(self.olive, 'approve',
+                               contribution=brief['review']['contribution']['id'])
+        self.assertEqual(201, approved.status, approved.data)
+
+    def test_respond_before_a_revision_is_allowed(self):
+        brief = self.brief()
+        done = self.respond(self.carl, brief, brief['review']['requests'],
+                            reason='Not needed: already handled', evidence='see summary')
+        self.assertEqual(201, done.status, done.data)
+        self.assertEqual('awaiting-review', self.brief()['review']['state'])
+
+    def test_only_the_assignee_may_respond(self):
+        brief = self.revise()
+        for token, status in ((self.olive, 403), (self.vera, 403), (self.otto, 404)):
+            refused = self.respond(token, brief, brief['review']['requests'])
+            self.assertEqual(status, refused.status, refused.data)
+        after = self.brief()
+        self.assertEqual('changes-requested', after['review']['state'])
+        self.assertEqual(2, after['review']['open_requests'])
+
+    def test_bad_resolutions_are_refused_and_change_nothing(self):
+        brief = self.revise()
+        open_items = brief['review']['requests']
+        cases = [
+            ({'resolutions': []}, 422),
+            ({'resolutions': [{'request': open_items[0]['request'], 'item': 'item-9',
+                               'reason': 'x', 'evidence': 'y'}]}, 409),
+            ({'resolutions': [{'request': open_items[0]['request'], 'item': 'item-1',
+                               'reason': 'x'}]}, 422),
+            ({'resolutions': [{'request': open_items[0]['request'], 'item': 'item-1',
+                               'reason': ' ', 'evidence': 'y'}]}, 422),
+            ({'contribution': 'con_stale'}, 409),
+        ]
+        for extra, status in cases:
+            refused = self.respond(self.carl, brief, open_items, **extra)
+            self.assertEqual(status, refused.status, (extra, refused.data))
+        twice = self.respond(self.carl, brief, open_items[:1] * 2)
+        self.assertEqual(422, twice.status, twice.data)
+        after = self.brief()
+        self.assertEqual(2, after['review']['open_requests'])
+        self.assertEqual(brief['review']['latest_id'], after['review']['latest_id'])
+        # Once resolved, an item cannot be resolved again.
+        self.assertEqual(201, self.respond(self.carl, after, open_items[:1]).status)
+        again = self.respond(self.carl, self.brief(), open_items[:1])
+        self.assertEqual(409, again.status, again.data)
+
+    def test_an_exact_retry_replays_the_response(self):
+        brief = self.revise()
+        body = {'operation': 'respond', 'contribution': brief['review']['contribution']['id'],
+                'previous': brief['review']['latest_id'],
+                'resolutions': [{'request': r['request'], 'item': r['id'], 'reason': 'Fixed',
+                                 'evidence': 'revision 2'} for r in brief['review']['requests']]}
+        path = self.path('/tasks/%s/reviews' % self.task)
+        first = self.request('POST', path, body, token=self.carl, key='respond-key-0001')
+        self.assertEqual(201, first.status, first.data)
+        replay = self.request('POST', path, body, token=self.carl, key='respond-key-0001')
+        self.assertEqual(first.data['review']['id'], replay.data['review']['id'])
+        self.assertEqual('awaiting-review', self.brief()['review']['state'])
+
+    def test_requests_recorded_before_the_respond_step_keep_the_revision_rule(self):
+        # Disposable state written before slice 2a has no needs_respond flag: a later
+        # revision still resolves those requests, so older state reads as before.
+        records = self.backend.state['contributions'][self.task]
+        for record in records:
+            record.pop('needs_respond', None)
+        brief = self.revise()
+        self.assertEqual('awaiting-review', brief['review']['state'])
+        self.assertEqual({'resolved'}, {r['status'] for r in brief['review']['requests']})
+        self.assertEqual('Addressed in revision 2', brief['review']['requests'][0]['resolution'])
 
 
 class QueueRouteCase(TeamHarness):
@@ -693,6 +842,48 @@ class CanonicalBindingReadCase(EndpointCase):
                          brief['review']['requests'][0]['contribution'])
         self.assertNotEqual(brief['review']['contribution']['id'],
                             brief['review']['requests'][0]['contribution'])
+
+        # The respond step (slice 2a): only the assignee may record it, through the
+        # same reviews route, naming the request record and item the brief gives.
+        admin = self.admin_token()
+        blair_id = self.create_account(admin, 'blair', 'blair-password-1')
+        self.assertEqual(200, self.request('PUT', '/v1/projects/%s/members/%s'
+                                           % (project, blair_id), {'role': 'owner'},
+                                           token=admin).status)
+        blair = self.login('blair', 'blair-password-1')[0]
+        pending = brief['review']['requests'][0]
+        self.assertTrue(pending['request'])
+        respond = {'operation': 'respond', 'schema_version': 1,
+                   'operation_id': 'op-respond-2',
+                   'contribution': brief['review']['contribution']['id'],
+                   'previous': brief['review']['latest_id'],
+                   'resolutions': [{'request': pending['request'], 'item': pending['id'],
+                                    'reason': 'Empty page shows a hint',
+                                    'evidence': 'revision 2, commit ' + 'd' * 40}]}
+        path = '/v1/projects/%s/tasks/%s/reviews' % (project, task)
+        refused = self.request('POST', path, respond, token=blair)
+        self.assertEqual(403, refused.status, refused.data)
+        wrong = dict(respond, operation_id='op-respond-bad',
+                     resolutions=[dict(respond['resolutions'][0], item='item-9')])
+        refused = self.request('POST', path, wrong, token=alex)
+        self.assertEqual(422, refused.status, refused.data)
+        self.assertIn('unresolved', json.dumps(refused.data))
+        responded = self.request('POST', path, respond, token=alex, key='web-respond-0001')
+        self.assertEqual(201, responded.status, responded.data)
+        replay = self.request('POST', path, respond, token=alex, key='web-respond-0001')
+        self.assertEqual(responded.data, replay.data)
+        brief = self.request('GET', '/v1/projects/%s/tasks/%s/brief' % (project, task),
+                             token=alex).data
+        self.assertEqual('awaiting-review', brief['review']['state'])
+        self.assertEqual([], brief['review']['requests'])
+        self.assertEqual(0, brief['review']['open_requests'])
+        approved = self.request(
+            'POST', path, {'operation': 'approve', 'schema_version': 1,
+                           'operation_id': 'op-approve-2',
+                           'contribution': brief['review']['contribution']['id'],
+                           'previous': brief['review']['latest_id'], 'summary': 'ok'},
+            token=blair)
+        self.assertEqual(201, approved.status, approved.data)
 
     def test_task_list_carries_the_canonical_review_state(self):
         alex, project = self.setup_project()
@@ -1032,6 +1223,16 @@ class AgentPromptRouteCase(TeamHarness):
         self.assertIn('copyButton(p.label, p.text', work)
         self.assertIn("'Add one on My agents'", work)
         self.assertIn('agentPromptPanel(ctx, data)', work)
+        self.assertIn("'Grant one on My agents'", work)
+        agents = (WEB / 'js' / 'views' / 'agents.js').read_text(encoding='utf-8')
+        self.assertIn('ctx.api.updateAgent(agent.id, { projects: chosen })', agents)
+
+    def test_the_task_page_offers_the_respond_step(self):
+        task = (WEB / 'js' / 'views' / 'task.js').read_text(encoding='utf-8')
+        self.assertIn("operation: 'respond'", task)
+        self.assertIn('resolutions.push({ request: open[i].request, item: open[i].id', task)
+        self.assertIn('respondPrompt = tid', task)
+        self.assertNotIn('cannot record responses yet', task)
 
 
 class AgentSecretFileClashCase(TeamHarness):

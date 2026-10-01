@@ -506,7 +506,10 @@ class InProcessBackend:
                       'actor': payload.get('actor') or principal.actor,
                       'created_at': now_iso(self.service._now())}
             contributions.append(record)
-            task['review_state'] = 'awaiting-review'
+            # Like the canonical projection, a new revision does not resolve requests
+            # that need a respond record: they stay open until the contributor responds.
+            task['review_state'] = ('changes-requested' if self._requests(contributions, True)
+                                    else 'awaiting-review')
             task['version'] += 1
             self._event(project_id, task['id'], 'contribution', principal, record['actor'])
             return {'contribution': record, 'task_version': task['version']}
@@ -519,19 +522,108 @@ class InProcessBackend:
         if named is not None and named != current[-1]['id']:
             raise conflict('A newer contribution arrived; reread the task before reviewing',
                            {'current_contribution': current[-1]['id']})
-        items = self._review_items(payload.get('items')) if operation == 'request-changes' \
-            else []
+        actor = payload.get('actor') or principal.actor
+        items, resolutions = [], []
+        if operation == 'request-changes':
+            items = self._review_items(payload.get('items'))
+        elif operation == 'respond':
+            # Canonical rule (review_workflow.execute): only the current assignee may
+            # respond, and every resolution must name a still-open request item.
+            if not task.get('assignee') or actor != task['assignee']:
+                raise forbidden('Only the task assignee may respond to requested changes')
+            resolutions = self._resolutions(payload.get('resolutions'),
+                                            self._requests(contributions, True))
+        elif operation == 'approve' and self._requests(contributions, True):
+            raise conflict('Cannot approve while requested changes remain unresolved')
         record = {'id': 'rev_' + secrets.token_hex(6), 'task_id': task['id'], 'kind': operation,
                   'contribution_id': current[-1]['id'],
                   'summary': (payload.get('summary') or '')[:1200],
                   'items': items,
-                  'actor': payload.get('actor') or principal.actor,
+                  'actor': actor,
                   'created_at': now_iso(self.service._now())}
+        if operation == 'request-changes':
+            # Marks the request as following the canonical respond rule. Requests
+            # recorded before the respond step existed carry no flag and keep the old
+            # rule (a later revision resolves them), so older disposable state reads
+            # the same as before.
+            record['needs_respond'] = True
+        if operation == 'respond':
+            record['resolutions'] = resolutions
         contributions.append(record)
-        task['review_state'] = 'changes-requested' if operation == 'request-changes' else 'approved'
+        if operation == 'approve':
+            task['review_state'] = 'approved'
+        else:
+            task['review_state'] = ('changes-requested' if self._requests(contributions, True)
+                                    else 'awaiting-review')
         task['version'] += 1
         self._event(project_id, task['id'], operation, principal, record['actor'])
         return {'review': record, 'task_version': task['version']}
+
+    @staticmethod
+    def _requests(records, open_only=False):
+        """Every requested-change item with its status, in record order.
+
+        A request recorded with ``needs_respond`` stays open until a ``respond``
+        record resolves it (the canonical rule), whatever revisions arrive meanwhile.
+        A legacy request without the flag is resolved by the next revision.
+        """
+        contributions = [r for r in records if r['kind'] == 'contribution']
+        resolved = {}
+        for record in records:
+            if record['kind'] == 'respond':
+                for item in record.get('resolutions') or []:
+                    resolved[(item['request'], item['item'])] = dict(item, at=record['created_at'],
+                                                                     author=record['actor'])
+        found = []
+        for position, record in enumerate(records):
+            if record['kind'] != 'request-changes':
+                continue
+            later = [r for r in records[position + 1:] if r['kind'] == 'contribution']
+            items = record.get('items') or (
+                [{'id': 'item-1', 'text': record['summary']}] if record.get('summary') else [])
+            for item in items:
+                entry = {'id': item['id'], 'request': record['id'], 'text': item['text'],
+                         'contribution': record['contribution_id'], 'author': record['actor'],
+                         'at': record['created_at'], 'status': 'open', 'resolution': None}
+                answer = resolved.get((record['id'], item['id']))
+                if answer is not None:
+                    entry.update(status='resolved', resolution=answer['reason'],
+                                 evidence=answer['evidence'], resolved_at=answer['at'],
+                                 resolved_by=answer['author'])
+                elif not record.get('needs_respond') and later:
+                    entry.update(status='resolved', resolution='Addressed in revision %d'
+                                 % (contributions.index(later[0]) + 1))
+                found.append(entry)
+        return [r for r in found if r['status'] == 'open'] if open_only else found
+
+    @staticmethod
+    def _resolutions(raw, open_requests):
+        """Validate a respond's resolutions the way ``review_workflow.validate`` does."""
+        if not isinstance(raw, list) or not 1 <= len(raw) <= 20:
+            raise invalid('A response needs 1-20 resolutions')
+        pending = {(r['request'], r['id']) for r in open_requests}
+        seen, clean = set(), []
+        for item in raw:
+            if not isinstance(item, dict) or set(item) != {'request', 'item', 'reason',
+                                                           'evidence'}:
+                raise invalid('Each resolution needs exactly request, item, reason and evidence')
+            for field in ('request', 'item'):
+                if not isinstance(item[field], str) or not SAFE_ID.fullmatch(item[field]):
+                    raise invalid('Resolution %s must be an id' % field)
+            for field in ('reason', 'evidence'):
+                if not isinstance(item[field], str) or not item[field].strip() or \
+                        len(item[field]) > 1000 or '\x00' in item[field]:
+                    raise invalid('Resolution %s must be 1-1000 characters' % field)
+            key = (item['request'], item['item'])
+            if key in seen:
+                raise invalid('Duplicate resolution')
+            if key not in pending:
+                raise conflict('A resolution must name a still-open requested change; reread '
+                               'the task')
+            seen.add(key)
+            clean.append({'request': item['request'], 'item': item['item'],
+                          'reason': item['reason'].strip(), 'evidence': item['evidence'].strip()})
+        return clean
 
     @staticmethod
     def _review_items(raw):
@@ -600,26 +692,13 @@ class InProcessBackend:
     def _review_view(self, task):
         """The task's review chain, projected like ``review_workflow.projection``.
 
-        A requested change is open until a later revision arrives (the disposable
-        backend has no separate ``respond`` record).
+        A requested change is open until the contributor's ``respond`` record resolves
+        it, as canonically; a newer revision alone does not (``_requests`` keeps the
+        old revision-resolves rule only for requests recorded before the respond step).
         """
         records = self.state.get('contributions', {}).get(task['id'], [])
         contributions = [r for r in records if r['kind'] == 'contribution']
-        requests = []
-        for position, record in enumerate(records):
-            if record['kind'] != 'request-changes':
-                continue
-            later = [r for r in records[position + 1:] if r['kind'] == 'contribution']
-            items = record.get('items') or (
-                [{'id': 'item-1', 'text': record['summary']}] if record.get('summary') else [])
-            for item in items:
-                resolved = later[0] if later else None
-                requests.append({
-                    'id': item['id'], 'request': record['id'], 'text': item['text'],
-                    'contribution': record['contribution_id'], 'author': record['actor'],
-                    'at': record['created_at'], 'status': 'resolved' if resolved else 'open',
-                    'resolution': ('Addressed in revision %d' % (contributions.index(resolved) + 1))
-                    if resolved else None})
+        requests = self._requests(records)
         contribution = None
         if contributions:
             current = contributions[-1]
@@ -2463,6 +2542,17 @@ class ApiHandler(BaseHTTPRequestHandler):
             payload['actor'] = self.service.bind_actor(ctx.principal, payload.get('actor'))
 
         def add():
+            if payload.get('operation') == 'respond':
+                # Only the task's assignee (the contributor of the current revision)
+                # may respond to requested changes. Both backends enforce it at the
+                # write too; checking here gives the caller a clear 403 instead of the
+                # canonical validator's generic refusal. It runs inside the mutation, so
+                # an exact retry still replays a committed response.
+                task = self.backend.get_task(ctx.params['pid'], ctx.params['tid'])
+                actor = payload.get('actor') or ctx.principal.actor or ctx.principal.user_id
+                if not isinstance(task, dict) or not task.get('assignee') or \
+                        task['assignee'] != actor:
+                    raise forbidden('Only the task assignee may respond to requested changes')
             result = self.backend.invoke('reviews.add', ctx.principal, ctx.params['pid'],
                                          payload, ctx.idempotency_key,
                                          target=ctx.route_target, authorize=ctx.authorize,

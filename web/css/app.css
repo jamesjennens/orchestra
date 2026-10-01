@@ -236,6 +236,9 @@ td .sub { color: var(--muted); font-size: var(--t-xs); margin-top: 2px; }
 .event-head { display: flex; gap: 8px; flex-wrap: wrap; align-items: baseline; }
 .event-body { margin-top: 4px; color: var(--ink-2); font-size: var(--t-sm); }
 .request-list { margin: 6px 0 0; padding-left: 18px; font-size: var(--t-sm); display: flex; flex-direction: column; gap: 6px; }
+form.respond { border-top: 1px solid var(--line); padding-top: 12px; margin-top: 4px; }
+.respond-item { display: flex; flex-direction: column; gap: 6px; }
+.respond-item .check { align-items: flex-start; }
 .open-items { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 8px; }
 .open-items li { border: 1px solid var(--line); border-radius: var(--radius); padding: 8px 10px; font-size: var(--t-sm); }
 .tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--line); }

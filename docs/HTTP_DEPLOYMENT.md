@@ -755,12 +755,22 @@ the pilot phase, not part of this service.
   canonical binding the `work` projection gives counts but not pending request ids or
   review times, so those lines say "read the task brief" and "wait time unknown", and
   the blocked class is empty (see `endpoint-blocked-signal`).
-- **Review respond step (slice 2).** Canonically a requested change stays open until
+- **Review respond step (slice 2a).** Canonically a requested change stays open until
   the contributor records a `respond` resolution for it, even after a newer revision
-  arrives. The web interface cannot record responses yet; the task page says the
-  requests are still open instead of implying the new revision resolved them.
-  Contributors respond with their worker tools. (The disposable in-process backend
-  has no respond record and treats a newer revision as resolving the requests.)
+  arrives. The task page shows the task's assignee each open request with a "Resolved"
+  tick and a short note, plus shared evidence (by default the current revision and
+  commit), and records one `respond` through `POST /v1/projects/{id}/tasks/{task}/reviews`
+  with `{operation: "respond", contribution, previous, resolutions: [{request, item,
+  reason, evidence}]}` (the brief's `requests[].request` and `requests[].id`). After a
+  revision is delivered while requests are open, the page leads with this step. Only
+  the task's assignee may respond (`403` otherwise; the route checks it and the
+  canonical validator enforces it again at the write), and approval waits until no
+  request is open. The canonical brief lists at most five open requests; the page
+  says how many more there are, and they appear once the first ones are answered.
+  The disposable in-process backend now follows the same rule: a request it records
+  carries `needs_respond` and stays open across revisions until a `respond` resolves
+  it. Requests recorded in older disposable state, without that flag, keep the old
+  rule (the next revision resolves them).
 - **Account lookup residual risk.** `GET /v1/accounts/lookup` answers exact usernames
   for a project administrator, and any account may create a project and so become
   one; an account holder can therefore still test whether a given username exists.
