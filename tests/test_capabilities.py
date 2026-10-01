@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -725,19 +726,49 @@ def run_tool(*args):
 
 
 class NestingGuardTests(Checkout):
-    """CPython 3.10 crashes (no RecursionError) converting a very deep expression."""
+    """CPython 3.10 crashes (no RecursionError) converting a very deep expression, so
+    parsing runs on a big worker stack, with a per-line guard as the fallback."""
 
     def index_in_child(self):
         run = run_tool('index', '--repo', str(self.root), '--source', 'ast')
         self.assertEqual(run.returncode, 0, run.stderr[-500:])
         return json.loads(run.stdout)
 
-    def test_a_long_operator_chain_is_skipped_not_parsed(self):
-        write(self.root, 'pkg/deep.py', 'x = ' + '+'.join(['1'] * 200_000) + '\n')
+    def test_deep_chains_parse_on_the_worker_stack(self):
+        # 300k levels crash a 3.10 main thread (8 MB on Linux, less on Windows); the
+        # worker stack parses them, in a child process so a regression fails one test.
+        write(self.root, 'pkg/deep.py', 'x = ' + '+'.join(['1'] * 300_000) + '\n')
+        write(self.root, 'pkg/attrs.py', 'x = a' + '.b' * 300_000 + '\n')
         result = self.index_in_child()
-        self.assertEqual(result['index']['skipped'].get('too-complex'), 1)
-        self.assertFalse(any(row['file'] == 'pkg/deep.py' for row in result['entries']))
-        self.assertTrue(any(row['id'] == 'pkg/core.py::Engine' for row in result['entries']))
+        self.assertNotIn('too-complex', result['index']['skipped'])
+        files = {row['file'] for row in result['entries']}
+        self.assertIn('pkg/core.py', files)
+        if sys.version_info < (3, 11):
+            # 3.10 has no C recursion check: only the worker stack lets these parse.
+            self.assertTrue({'pkg/deep.py', 'pkg/attrs.py'} <= files)
+        else:
+            # 3.11+ raises RecursionError (caught as parse-error) instead of crashing.
+            parsed = {'pkg/deep.py', 'pkg/attrs.py'} & files
+            self.assertEqual(result['index']['skipped'].get('parse-error', 0), 2 - len(parsed))
+
+    def test_resolve_parses_deep_files_on_the_worker_stack(self):
+        write(self.root, 'pkg/deep.py', 'def f():\n    return ' + '+'.join(['1'] * 300_000) + '\n')
+        run = run_tool('resolve', 'pkg/deep.py::f', '--repo', str(self.root))
+        self.assertEqual(run.returncode, 0, run.stderr[-500:])
+        row = json.loads(run.stdout)['results'][0]
+        if sys.version_info < (3, 11):
+            self.assertEqual((row['resolved'], row['kind']), (True, 'function'))
+        else:
+            self.assertIn((row['resolved'], row['reason']), {(True, None), (None, 'parse-error')})
+
+    def test_dot_heavy_files_are_not_tokenized_on_the_worker_stack(self):
+        lines = ''.join('VALUE_%d = "a.b.c.d.e.f.g.h.i.j" + x.y.z(1.5, 2.5)\n' % n for n in range(4000))
+        write(self.root, 'pkg/dotty.py', lines)
+        self.assertGreater(len(capabilities.NESTING.findall(lines.encode())), capabilities.NESTING_MAX)
+        with patch.object(capabilities, '_deepest_logical_line', side_effect=AssertionError('tokenized')):
+            code, result, _, stderr = call('index', '--repo', str(self.root), '--source', 'ast')
+        self.assertEqual(code, 0, stderr)
+        self.assertIn('pkg/dotty.py', {row['file'] for row in result['entries']})
 
     def test_deep_chains_hidden_in_fstrings_brackets_and_keywords_are_caught(self):
         terms = capabilities.NESTING_MAX + 10
@@ -751,18 +782,40 @@ class NestingGuardTests(Checkout):
             with self.assertRaises(capabilities.TooComplex, msg=name):
                 capabilities.parse_python(source.encode('utf-8'), name + '.py')
 
+    def test_tokenize_pass_returns_as_soon_as_a_line_passes_the_limit(self):
+        data = ('x = ' + '+'.join(['1'] * 50_000) + '\n').encode()
+        self.assertEqual(capabilities._deepest_logical_line(data, 100), 101)
+
     def test_many_ordinary_lines_are_still_parsed(self):
         source = ''.join('value_%d = a.b(c[1] + 2 - 3) if not d else e\n' % n for n in range(3000))
         self.assertGreater(len(capabilities.NESTING.findall(source.encode())), capabilities.NESTING_MAX)
         tree = capabilities.parse_python(source.encode('utf-8'), 'ok.py')
         self.assertEqual(len(tree.body), 3000)
 
-    def test_resolve_reports_too_complex(self):
-        write(self.root, 'pkg/deep.py', 'def f():\n    return ' + '+'.join(['1'] * 200_000) + '\n')
-        run = run_tool('resolve', 'pkg/deep.py::f', '--repo', str(self.root))
-        self.assertEqual(run.returncode, 0, run.stderr[-500:])
-        row = json.loads(run.stdout)['results'][0]
-        self.assertEqual((row['resolved'], row['reason']), (None, 'too-complex'))
+    def test_fallback_guard_spends_a_bounded_tokenize_budget(self):
+        body = ''.join('value_%d = a.b(c[1] + 2 - 3) if not d else e\n' % n for n in range(3000))
+        write(self.root, 'pkg/first.py', body)
+        write(self.root, 'pkg/second.py', body)
+        with patch.object(capabilities.threading, 'stack_size', side_effect=ValueError('refused')), \
+                patch.object(capabilities, 'TOKENIZE_BUDGET_BYTES', len(body) + 10):
+            code, result, _, stderr = call('index', '--repo', str(self.root), '--source', 'ast')
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(result['index']['skipped'].get('too-complex'), 1)
+        files = {row['file'] for row in result['entries']}
+        self.assertEqual(len({'pkg/first.py', 'pkg/second.py'} & files), 1)
+        self.assertTrue(any('tokenize budget was spent' in warning for warning in result['warnings']))
+        self.assertIn('tokenize budget', stderr)
+
+    def test_a_worker_that_cannot_start_falls_back_to_the_guard(self):
+        write(self.root, 'pkg/deep.py', 'x = ' + '+'.join(['1'] * 300_000) + '\n')
+        before = threading.stack_size()
+        with patch.object(capabilities, '_start_worker', side_effect=RuntimeError("can't start new thread")):
+            code, result, _, stderr = call('index', '--repo', str(self.root), '--source', 'ast')
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(threading.stack_size(), before)
+        self.assertEqual(result['index']['skipped'].get('too-complex'), 1)
+        self.assertTrue(any('nest too deeply' in warning for warning in result['warnings']))
+        self.assertIn('pkg/core.py', {row['file'] for row in result['entries']})
 
 
 class MarkdownCostTests(unittest.TestCase):
@@ -845,6 +898,7 @@ class EntryCapTests(Checkout):
         self.assertEqual(sum(1 for row in result['entries'] if row['file'] == 'docs/MANY.md'),
                          capabilities.HEADINGS_PER_FILE_MAX)
         self.assertEqual(result['index']['skipped']['heading-limit'], 500)
+        self.assertIn('skipped 500 heading(s) beyond 2000 per Markdown file', result['warnings'])
         code, resolved, _, _ = call('resolve', 'docs/MANY.md#h2499', '--repo', str(self.root))
         self.assertTrue(resolved['results'][0]['resolved'])
 
@@ -853,6 +907,7 @@ class EntryCapTests(Checkout):
         with patch.object(capabilities, 'DEFINITIONS_PER_FILE_MAX', 30):
             result = self.index()
         self.assertEqual(result['index']['skipped']['definition-limit'], 10)
+        self.assertIn('skipped 10 definition(s) beyond 30 per Python file', result['warnings'])
         with patch.object(capabilities, 'ENTRIES_MAX', 12):
             result = self.index()
         self.assertEqual(result['index']['entries'], 12)

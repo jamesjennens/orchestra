@@ -42,6 +42,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import tokenize
 import unicodedata
 from pathlib import Path
@@ -61,7 +62,11 @@ GRAPH_LINKS_MAX = 2_000_000
 GRAPH_LABEL_MAX = 1000
 FILES_MAX = 20_000
 FILE_BYTES_MAX = 2_000_000
-NESTING_MAX = 5_000
+PARSE_STACK_BYTES = (512 * 1024 * 1024, 255 * 1024 * 1024)  # Windows refuses 256 MB and above
+PARSE_STACK_BYTES_PER_LEVEL = 512
+NESTING_MAX_BIG_STACK = 1_000_000
+NESTING_MAX = 2_000 if os.name == 'nt' else 5_000
+TOKENIZE_BUDGET_BYTES = 16_000_000
 LINE_TEXT_MAX = 2_000
 HEADING_LINE_MAX = 1_000
 SUMMARY_SCAN_LINES = 40
@@ -389,9 +394,22 @@ def walk(node):
                 stack.append(value)
 
 
+def statements(body):
+    """Every statement, at any depth, without visiting expressions: imports are
+    statements, so this finds them all at a fraction of a full walk's cost."""
+    stack = list(body)
+    while stack:
+        node = stack.pop()
+        yield node
+        for field in ('body', 'orelse', 'finalbody', 'handlers', 'cases'):
+            value = getattr(node, field, None)
+            if isinstance(value, list):
+                stack.extend(child for child in value if isinstance(child, ast.AST))
+
+
 def import_aliases(tree, module, package):
     aliases = {}
-    for node in walk(tree):
+    for node in statements(tree.body):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.asname:
@@ -434,7 +452,16 @@ def references(node, everything):
 
 
 class TooComplex(ValueError):
-    """Source whose expressions could nest deeper than NESTING_MAX."""
+    """Source whose expressions could nest deeper than this run can parse safely."""
+
+
+# Per-run parse state: the worker stack granted (0 for none), and how many
+# bytes the fallback guard may still tokenize. run() resets it.
+_parse = {'stack_bytes': 0, 'tokenize_left': TOKENIZE_BUDGET_BYTES, 'budget_spent': False}
+
+
+def _reset_parse_state():
+    _parse.update(stack_bytes=0, tokenize_left=TOKENIZE_BUDGET_BYTES, budget_spent=False)
 
 
 # Characters and keywords that can each add one level to an expression tree. Brackets
@@ -447,9 +474,10 @@ NESTING_OPS = frozenset({'+', '-', '*', '/', '//', '%', '@', '&', '|', '^', '~',
 NESTING_WORDS = frozenset({'not', 'if', 'lambda', 'await', 'yield'})
 
 
-def _deepest_logical_line(data):
+def _deepest_logical_line(data, limit):
     """The most nesting-capable tokens in any one logical line, counting operators
-    inside f-strings (a single STRING token before Python 3.12)."""
+    inside f-strings (a single STRING token before Python 3.12). Returns as soon as
+    one line passes `limit`, so a hostile file costs no more than that line."""
     deepest = current = 0
     for token in tokenize.tokenize(io.BytesIO(data).readline):
         if token.type in (tokenize.NEWLINE, tokenize.ENDMARKER):
@@ -460,26 +488,110 @@ def _deepest_logical_line(data):
             current += 1
         elif token.type == tokenize.STRING and 'f' in token.string.split('"')[0].split("'")[0].lower():
             current += len(NESTING.findall(token.string.encode('utf-8', 'replace')))
+        if current > limit:
+            return current
     return max(deepest, current)
 
 
 def parse_python(data, rel):
-    """ast.parse, refusing source that could nest deeper than NESTING_MAX.
+    """ast.parse that cannot crash the interpreter.
 
-    CPython 3.10 turns a deeply nested expression (for example a 200,000-term `1+1+...`
-    in an 800 KB file) into Python objects with unchecked C recursion and crashes the
-    whole process instead of raising RecursionError, so one hostile file would kill
-    every lookup. A cheap count over the whole file clears ordinary source; only a
-    file above it is tokenized to find its deepest logical line.
+    CPython 3.10 converts a deeply nested expression (a long `1+1+...`, `a.b.b...`,
+    `f()()...` or `a[0][0]...` chain) to Python objects with unchecked C recursion and
+    crashes the process instead of raising RecursionError. On koopa's 3.10 a
+    1,000,000-level chain needs 64-128 MB of C stack, and a file under FILE_BYTES_MAX
+    holds at most about that many levels. So run() parses on a worker thread with a
+    512 MB stack (255 MB where the platform allows no more, as on Windows), and trusts
+    it for up to stack / PARSE_STACK_BYTES_PER_LEVEL levels: 4x the measured need.
+    Ordinary files, dot-heavy ones included, are parsed directly; only a file almost
+    entirely made of nesting characters is ever tokenized. If no such thread could be
+    made, the fallback is the per-logical-line guard: a cheap whole-file count, then
+    an exact tokenize pass (early return, 16 MB per-run budget) against NESTING_MAX.
+    Python 3.11 and later raise RecursionError instead of crashing, which is caught.
     """
-    if len(NESTING.findall(data)) > NESTING_MAX:
+    if _parse['stack_bytes']:
+        limit = min(NESTING_MAX_BIG_STACK, _parse['stack_bytes'] // PARSE_STACK_BYTES_PER_LEVEL)
+    else:
+        limit = NESTING_MAX
+    if len(NESTING.findall(data)) > limit:
+        if _parse['tokenize_left'] < len(data):
+            _parse['budget_spent'] = True
+            raise TooComplex('the per-run tokenize budget is spent')
+        _parse['tokenize_left'] -= len(data)
         try:
-            deepest = _deepest_logical_line(data)
+            deepest = _deepest_logical_line(data, limit)
         except (tokenize.TokenError, SyntaxError, UnicodeDecodeError, ValueError):
             raise SyntaxError('cannot tokenize') from None
-        if deepest > NESTING_MAX:
-            raise TooComplex('a logical line nests more than %d levels' % NESTING_MAX)
+        if deepest > limit:
+            raise TooComplex('a logical line nests more than %d levels' % limit)
     return ast.parse(data, filename=rel)
+
+
+def parse_warnings(skipped):
+    """Warnings for files and entries a run left out, so a cap is never silent."""
+    found = []
+    if skipped.get('too-complex'):
+        found.append('skipped %d Python file(s) that could nest too deeply to parse safely%s'
+                     % (skipped['too-complex'],
+                        ' (the per-run tokenize budget was spent)' if _parse['budget_spent'] else ''))
+    if skipped.get('heading-limit'):
+        found.append('skipped %d heading(s) beyond %d per Markdown file'
+                     % (skipped['heading-limit'], HEADINGS_PER_FILE_MAX))
+    if skipped.get('definition-limit'):
+        found.append('skipped %d definition(s) beyond %d per Python file'
+                     % (skipped['definition-limit'], DEFINITIONS_PER_FILE_MAX))
+    return found
+
+
+def _grant_parse_stack():
+    """Set the largest allowed worker stack; (previous, granted) or None if refused."""
+    for size in PARSE_STACK_BYTES:
+        try:
+            return threading.stack_size(size), size
+        except (ValueError, RuntimeError, OverflowError):
+            continue
+    return None
+
+
+def _start_worker(target):
+    worker = threading.Thread(target=target, name='capability-parse', daemon=True)
+    worker.start()
+    return worker
+
+
+def with_parse_stack(function):
+    """Run function() on a worker thread with a big stack (see parse_python).
+
+    Falls back to the calling thread, with the stricter per-line guard, when the
+    platform refuses every stack size or cannot start the thread (32-bit builds,
+    strict overcommit). The default stack size is restored for every later thread.
+    """
+    box = {}
+
+    def target():
+        try:
+            box['value'] = function()
+        except BaseException as exc:  # re-raised on the calling thread
+            box['error'] = exc
+
+    granted = _grant_parse_stack()
+    worker = None
+    if granted is not None:
+        previous, size = granted
+        _parse['stack_bytes'] = size
+        try:
+            worker = _start_worker(target)
+        except (RuntimeError, MemoryError):
+            worker = None
+        finally:
+            threading.stack_size(previous)
+    if worker is None:
+        _parse['stack_bytes'] = 0
+        return function()
+    worker.join()
+    if 'error' in box:
+        raise box['error']
+    return box['value']
 
 
 def index_python(rel, data, index, facts):
@@ -877,6 +989,7 @@ def build_index(repo, source='auto', graph_arg=None, max_mb=GRAPH_MB_DEFAULT):
             index_markdown(rel, data, index)
     if not use_graph:
         link_python(index, facts)
+    index.warnings.extend(parse_warnings(index.skipped))
     return index
 
 
@@ -1198,7 +1311,9 @@ def execute(args):
         summary = {'resolved': sum(1 for row in results if row['resolved'] is True),
                    'missing': sum(1 for row in results if row['resolved'] is False),
                    'unknown': sum(1 for row in results if row['resolved'] is None)}
-        warnings = index.warnings if index else []
+        warnings = list(index.warnings) if index else []
+        if _parse['budget_spent'] and not index:
+            warnings.append('the per-run tokenize budget was spent; some pointers read too-complex')
         payload = {'schema': RESOLVE_SCHEMA, 'contract': CONTRACT_VERSION, 'trust': TRUST,
                    'results': results, 'summary': summary,
                    'index': index.describe() if index else {
@@ -1229,10 +1344,13 @@ def execute(args):
 def run(args):
     """(returncode, stdout, stderr) in the CLI contract's shape: JSON on stdout only on
     success; a refusal is `ValueError: ...` on stderr with exit code 2."""
+    _reset_parse_state()
     try:
-        payload, warnings = execute(list(args))
+        payload, warnings = with_parse_stack(lambda: execute(list(args)))
     except ValueError as exc:
         return 2, '', 'ValueError: %s\n' % exc
+    finally:
+        _reset_parse_state()
     stderr = ''.join('warning: %s\n' % warning for warning in warnings)
     # ASCII JSON: every non-ASCII character, including the line and paragraph separators
     # some readers treat as line breaks, travels as a \u escape.
