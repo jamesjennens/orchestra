@@ -186,7 +186,9 @@ issuance returns `200` metadata with `secret_available:false`; it never re-deliv
 the secret. Revoke and reissue instead.
 
 A credential is bound to one project and to its `scopes` list (`read`, `tasks`,
-`checkpoints`, `reviews`, `feedback`). It may always read the project it is scoped
+`checkpoints`, `reviews`, `feedback`, `proposals`). `proposals` is recognised so that
+a credential issued for the requirements-gathering design can be read here. It
+grants nothing until that design's proposal routes exist. It may always read the project it is scoped
 to; a write route requires the matching scope. No credential can administer
 accounts or projects, issue or revoke credentials, or approve a review, whatever
 the role of the account that issued it. Issuing a credential never lends the

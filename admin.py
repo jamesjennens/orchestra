@@ -896,11 +896,35 @@ def backup_lock(root,name):
         fcntl.flock(lock,fcntl.LOCK_EX)
         yield
 
+# The idempotency journals of the accepted record designs (kittrial-5bb.64, the
+# shared slice 0): .41 `.reference-requests`, .58 `.proposal-requests` and .60
+# `.capability-requests`. No writer exists in this kit, but a backup taken by a
+# later slice must restore here (a rollback target), so each is whitelisted,
+# backed up, and validated with its frozen receipt schema before any write.
+RECORD_JOURNALS=('.reference-requests','.proposal-requests','.capability-requests')
+
+def validate_record_receipt(name,record):
+    """Frozen slice-0 receipt schema for one record-journal entry.
+
+    The schema is requirement_records.validate_receipt's (.41 10.3, .58 8.4, .60 9):
+    a 64-hex `sha256`, a known `status`, optional nonempty `actor`/`id`, an optional
+    `revision >= 1` and an optional bound `acceptance`. It is a validated minimum,
+    not a closed set: unknown keys (.58's `operation`, .60's batch `operation_id` and
+    `key`) are read, never refused. .58 additionally freezes `operation` as a
+    nonempty string when present.
+    """
+    from requirement_records import validate_receipt
+    validate_receipt(record)
+    if name.startswith('.proposal-requests/') and 'operation' in record and (
+            not isinstance(record['operation'],str) or not record['operation'].strip()):
+        raise ValueError('Invalid proposal receipt operation')
+    return record
+
 def validate_coordination_files(files):
     if not isinstance(files,dict):raise ValueError('Invalid coordination files map')
     for name,record in files.items():
         quarantine = isinstance(name,str) and re.fullmatch(r'\.feedback\.jsonl\.(?:[a-f0-9]{16}|[a-f0-9]{64})\.incomplete',name)
-        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-backfills|\.integration-reverts)/[a-f0-9]{64}\.json',name)
+        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-backfills|\.integration-reverts|\.reference-requests|\.proposal-requests|\.capability-requests)/[a-f0-9]{64}\.json',name)
         if name not in ('.merge-context.json','ONBOARDING.md','.sessions.json','.feedback.jsonl') and not quarantine and not journal:raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
         if name=='.sessions.json':
@@ -925,6 +949,8 @@ def validate_coordination_files(files):
         if name.startswith('.requirement-backfills/'):
             from requirement_records import validate_receipt
             validate_receipt(record,backfill=True)
+        if name.startswith(tuple(journal+'/' for journal in RECORD_JOURNALS)):
+            validate_record_receipt(name,record)
         if name.startswith('.integration-reverts/'):
             # The host-issued revert journal (kittrial-5bb.52 P1). Its record shape
             # and its <sha256>.json path/hash binding are validated by the reader's
@@ -1315,6 +1341,14 @@ def backup_project(root,name):
         for record in revert_journal.glob('*.json'):
             if record.is_symlink():raise ValueError('Integration revert journal entry must not be a symlink')
             files['.integration-reverts/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
+        # The record journals (kittrial-5bb.64). This kit writes none, but after a
+        # rollback from a later slice they exist and must round-trip.
+        for journal in RECORD_JOURNALS:
+            folder=path/journal
+            if folder.is_symlink():raise ValueError('Record journal %s must not be a symlink'%journal)
+            for record in folder.glob('*.json'):
+                if record.is_symlink():raise ValueError('Record journal receipt must not be a symlink')
+                files[journal+'/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
         if (path/'ONBOARDING.md').exists() or (path/'ONBOARDING.md').is_symlink():
             from onboarding import read_document, PROJECT_LIMIT
             files['ONBOARDING.md']={'text':read_document(path,'ONBOARDING.md',PROJECT_LIMIT)}
@@ -2060,6 +2094,8 @@ def restore_coordination(root,source,destination,restore_operators=False):
         elif name.startswith('.integration-reverts/'):
             from review_workflow import validate_revert_journal_entry
             validate_revert_journal_entry(record,name.partition('/')[2])
+        elif name.startswith(tuple(journal+'/' for journal in RECORD_JOURNALS)):
+            validate_record_receipt(name,record)
     for name,record in files.items():
         target=project_dir(root,destination)/name
         target.parent.mkdir(exist_ok=True)

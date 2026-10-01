@@ -191,8 +191,11 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         revert_map,revert_problems=reverts_by_task(rows,operators,journal)
     else:
         revert_map,revert_problems=reverts,{}
+    from reserved_comments import is_record_anchor
     for row in rows:
         if row.get('issue_type') in ('event','gate','merge-slot'):continue
+        # Record anchors (kittrial-5bb.64) are never work, whatever their status.
+        if is_record_anchor(row):continue
         if owner is not None and row.get('assignee')!=owner:continue
         task_reverts=revert_map.get(row['id'],[])
         task_scopes=evidence.get(row['id']) if scopes is None else scopes.get(row['id'])

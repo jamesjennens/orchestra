@@ -334,6 +334,10 @@ SCOPE_CAPABILITIES = {
     'checkpoints': frozenset({CAP_CHECKPOINTS}),
     'reviews': frozenset({CAP_REVIEWS}),
     'feedback': frozenset({CAP_FEEDBACK}),
+    # .58's agent-proposal scope (kittrial-5bb.64, slice 0): recognised so a slice-1b
+    # credential can be issued and read on this kit, but it grants nothing until a
+    # proposal route exists (.58 8.5, hazard 3).
+    'proposals': frozenset(),
 }
 CREDENTIAL_SCOPES = tuple(sorted(SCOPE_CAPABILITIES))
 

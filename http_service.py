@@ -32,6 +32,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import agent_prompts
+from reserved_comments import hide_records, is_record_anchor
 from http_auth import (AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CAP_APPROVE,
                        CAP_CHECKPOINTS, CAP_FEEDBACK,
                        CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_READ, CAP_REVIEWS,
@@ -672,7 +673,9 @@ class InProcessBackend:
         """
         tasks = [t for t in self.state['tasks'].values() if t['project_id'] == project_id]
         tasks.sort(key=lambda t: t['id'])
-        return {'items': [dict(t) for t in tasks], 'total': len(tasks)}
+        # Record anchors never reach a task surface (kittrial-5bb.64).
+        tasks = hide_records([dict(t) for t in tasks])
+        return {'items': tasks, 'total': len(tasks)}
 
     def list_tasks(self, project_id, limit, offset):
         snapshot = self.read_tasks(project_id)
@@ -1106,7 +1109,11 @@ class EndpointBackend:
         rows = self._run('bd', project_id, self.actor_namespace + '/read',
                          ['list', '--all', '--limit', '0', '--json'])
         rows = rows if isinstance(rows, list) else rows.get('items', [])
-        rows = self._in_project(rows, project_id)
+        # Record anchors (references, proposals, settings, capabilities) are filtered
+        # at this one seam, so the task list with its Closed/All tabs and `q` search,
+        # agent attention and every other snapshot reader never shows them
+        # (kittrial-5bb.64; the shared hidden-surface list).
+        rows = hide_records(self._in_project(rows, project_id))
         return {'items': rows, 'total': len(rows)}
 
     def list_tasks(self, project_id, limit, offset):
@@ -2539,8 +2546,16 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')')
     def tasks_get(self, ctx):
         self._project(ctx, CAP_READ)
-        return 200, self._task_views([self.backend.get_task(ctx.params['pid'],
-                                                             ctx.params['tid'])])[0]
+        row = self.backend.get_task(ctx.params['pid'], ctx.params['tid'])
+        self._refuse_record_anchor(row)
+        return 200, self._task_views([row])[0]
+
+    @staticmethod
+    def _refuse_record_anchor(row):
+        """A record anchor is not a task: the task, brief and history routes answer
+        404 for it, never its row or raw record comments (kittrial-5bb.64)."""
+        if is_record_anchor(row):
+            raise not_found('Task not found')
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/brief')
     def tasks_brief(self, ctx):
@@ -2552,6 +2567,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._project(ctx, CAP_READ)
         pid, tid = ctx.params['pid'], ctx.params['tid']
         brief = self.backend.task_brief(pid, tid)
+        self._refuse_record_anchor(brief.get('task'))
         review = brief['review']
         checkpoint = brief.get('checkpoint')
         contribution = review.get('contribution')
@@ -2642,6 +2658,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/history')
     def tasks_history(self, ctx):
         self._project(ctx, CAP_READ)
+        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
         limit, state = self._page(ctx, ctx.query)
         result = self.backend.task_history(ctx.params['pid'], ctx.params['tid'], limit,
                                            state['o'], canonical=state['x'])

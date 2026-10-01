@@ -97,6 +97,30 @@ read-before-write: raw `create`/`update` label writes are refused, a raw
 forged with `update X --add-label requirement:accepted`, inherited from an
 accepted parent, or stripped by replacing a record's labels.
 
+The accepted reference catalog, requirements-gathering and capability-index designs
+have their names reserved before any of their writers exist (the shared slice 0).
+Raw writes of these record kinds are refused the same way, naming the operation
+that will write them:
+- `Kind: reference-entry-v1` and `Kind: reference-acceptance-v1`;
+- `Kind: requirement-proposal-v1`, `Kind: proposal-disposition-v1` and
+  `Kind: contribution-settings-v1`;
+- `Kind: capability-entry-v1`, `Kind: capability-acceptance-v1`,
+  `Kind: capability-verification-v1` and `Kind: capability-alias-v1`.
+
+The labels are reserved as well:
+- exact: `reference`, `proposal`, `contribution-settings`, `capability`;
+- prefixes: `reference:`, `reference-key:`, `proposal:`, `proposal-key:`,
+  `capability:`, `capability-key:`.
+
+A row carrying one of those exact labels is a record anchor, not a task. It never
+appears in:
+- `work`;
+- the generated views, including `views/issues.jsonl`;
+- the HTTP task list, queue or My work;
+- agent prompts.
+
+The task, brief and history routes answer 404 for it.
+
 Contributors draft requirement records with the dedicated
 `requirement_records.py draft|revise` operation
 ([native integration](REQUIREMENTS_INTEGRATION.md#draft-or-revise-a-requirement-record-in-one-step))

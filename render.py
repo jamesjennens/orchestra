@@ -14,6 +14,11 @@ def write(path,text):
 
 def render(rows,dest,operators=None):
     dest=Path(dest)
+    # The shared hidden-surface rule (kittrial-5bb.64): reference, proposal, settings
+    # and capability anchors and their record comments never reach CURRENT.md, the
+    # issue pages, the journals or views/issues.jsonl.
+    from reserved_comments import hide_records
+    rows=hide_records(rows)
     stamp=datetime.now(timezone.utc).isoformat(timespec='seconds')
     banner=f'Exported {stamp}. Query Beads for current state. Do not hand-edit generated files.\n\n'
     valid=re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,160}')

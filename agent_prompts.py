@@ -103,7 +103,12 @@ def classify(project, capabilities, items, actor, blocked, now, names=None):
     can_work = CAP_TASKS in capabilities
     out = {'review': [], 'integrate': [], 'blocked': [], 'unclaimed': [], 'stale': [],
            'changes': [], 'working': [], 'delivered': [], 'claimable': [], 'status': []}
+    from reserved_comments import is_record_anchor
     for item in items:
+        if is_record_anchor(item):
+            # The queues are filtered upstream (kittrial-5bb.64); a labelled row that
+            # reaches here anyway is still never offered to an agent.
+            continue
         item = dict(item, assignee_name=names.get(item.get('assignee'), item.get('assignee')))
         state = item.get('review_state') or 'none'
         mine = item.get('assignee') == actor
