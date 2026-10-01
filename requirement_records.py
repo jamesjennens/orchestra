@@ -495,7 +495,7 @@ def _require_selectable(row, payload, operator, existing):
     require_typed(row, payload, allow_untyped=allow_untyped)
 
 
-def _result(payload, task, revision, record, created, reconciled, bound):
+def _result(payload, task, revision, record, created, reconciled, bound, comment_id=None):
     result = {'id': task, 'kind': payload['kind'], 'revision': revision,
               'acceptance_state': payload['acceptance_state'],
               'labels': sorted(controlled(payload['kind'], payload['acceptance_state'])),

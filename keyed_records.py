@@ -488,11 +488,15 @@ def apply_native(payload, actor, run, project, spec, operator=False, operators=N
             run(['comments', 'add', task, evidence_body, '--json'])
         except (ValueError, OSError) as refusal:
             raise uncertain(str(refusal), 'acceptance evidence', spec) from None
+    body = spec.revision_comment(record)
+    comment_id = next((comment.get('id') for comment in row.get('comments') or []
+                       if isinstance(comment, dict) and comment.get('text') == body), None)
     if revision not in existing:
         try:
-            run(['comments', 'add', task, spec.revision_comment(record), '--json'])
+            raw = run(['comments', 'add', task, body, '--json'])
         except (ValueError, OSError) as refusal:
             raise uncertain(str(refusal), 'revision comment', spec) from None
+        comment_id = _comment_id(raw)
     spec.apply_labels(run, task, row.get('labels') or [], payload, record)
     complete = {'sha256': digest, 'status': 'complete', 'actor': actor, 'id': task,
                 'operation': payload['operation'], 'revision': revision}
@@ -500,7 +504,17 @@ def apply_native(payload, actor, run, project, spec, operator=False, operators=N
         complete['acceptance'] = bound
         complete['acceptance_record'] = True
     atomic(receipt, complete)
-    return spec.result(payload, task, revision, record, created, reconciled, bound)
+    return spec.result(payload, task, revision, record, created, reconciled, bound, comment_id)
+
+
+def _comment_id(raw):
+    """The id bd reports for a comment it just added, or None."""
+    try:
+        reply = json.loads(raw) if isinstance(raw, str) else None
+    except ValueError:
+        return None
+    reply = reply[0] if isinstance(reply, list) and reply else reply
+    return reply.get('id') if isinstance(reply, dict) and isinstance(reply.get('id'), str) else None
 
 
 def reconcile(project, operation_id, actor, reason, disposition, run, spec, issue_id=None,
