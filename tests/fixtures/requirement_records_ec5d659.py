@@ -1,3 +1,9 @@
+# FROZEN COPY - do not edit. This is requirement_records.py exactly as it was at
+# main ec5d659 (`git show ec5d659:requirement_records.py`), before the keyed-record
+# core extraction (kittrial-5bb.66). tests/test_keyed_records_bytes.py drives this
+# copy and the extracted core through identical scenarios and asserts byte-identical
+# native writes, revision/acceptance comment bytes and receipt bytes, in both
+# directions (.41 design section 12.1).
 """Contributor-level requirement draft/revise records with controlled labels.
 
 One locked native operation creates or selects a requirement (or BRD narrative)
@@ -64,14 +70,12 @@ import json
 import time
 from pathlib import Path
 
-import keyed_records as core
 from coordination import atomic, identifier
 from export_requirements import (ACCEPTANCE_PREFIX, REVISION_PREFIX, parse_json,
                                  revision_comment)
-from keyed_records import (ACCEPTANCE_EVIDENCE_FIELDS, RECEIPT_STATUSES,
-                           RECONCILE_RELEASABLE, bind_acceptance, bound_acceptance,
-                           find, latest_revision, read_rows, validate_receipt)
-from requirements import canonical_bytes, content_hash, load_json
+from recovery import configured_operators
+from requirements import (ACCEPTANCE_FIELDS, SHA256_TEXT, canonical_bytes,
+                          content_hash, load_json)
 
 OPERATIONS = ('draft', 'revise')
 KIND_TYPE_LABEL = {'requirement': 'requirement', 'brd-section': 'brd-section'}
@@ -81,29 +85,131 @@ CONTROLLED_LABELS = frozenset(KIND_TYPE_LABEL.values()) | frozenset(STATE_LABEL.
 FIELDS = {'schema_version', 'operation_id', 'operation', 'kind', 'task', 'parent',
           'title', 'key', 'description', 'revision', 'acceptance_state',
           'acceptance'}
+ACCEPTANCE_EVIDENCE_FIELDS = tuple(name for name in ACCEPTANCE_FIELDS
+                                   if name != 'manifest_sha256')
 BACKFILL_FIELDS = {'schema_version', 'operation_id', 'records'}
 BACKFILL_RECORD_FIELDS = {'task', 'kind', 'acceptance_state', 'evidence'}
 JOURNAL = '.requirement-requests'
 BACKFILL_JOURNAL = '.requirement-backfills'
+RECONCILE_RELEASABLE = ('failed', 'released')
+RECEIPT_STATUSES = ('pending', 'complete', 'failed', 'released')
 
 
 def _refuse_injected_labels(payload, where='requirement payload'):
     """Fail closed on caller-supplied labels before any other validation."""
-    core.refuse_injected_labels(payload, where)
-    if isinstance(payload, dict) and 'decided_by' in payload:
+    if not isinstance(payload, dict):
+        return
+    if 'labels' in payload or 'add_labels' in payload:
+        raise ValueError('Labels are controlled by the %s; arbitrary label writes are refused. '
+                         'The operation derives the type/state labels from kind and acceptance_state.' % where)
+    if 'decided_by' in payload:
         raise ValueError('decided_by is proposed in kittrial-pth.25 (change-proposal, not accepted) and '
                          'is refused rather than written as an unvalidated revision field.')
 
 
-_text = core.text
-_positive_int = core.positive_int
-_checked_fields = core.checked_fields
-_validate_acceptance_shape = core.validate_acceptance_shape
+def _text(value, where):
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(where + ' must be a nonempty string')
+    return value
 
 
 def _require_configured_operator(actor, operators, action):
-    """The deployment operator allowlist check (keyed_records.require_configured_operator)."""
-    core.require_configured_operator(actor, operators, action)
+    """Refuse an actor outside the deployment operator allowlist before any write.
+
+    `admin.py requirement-apply`/`requirement-backfill` read the authority set
+    from `deployment.private.json` with `operators(root, strict=True)` and supply
+    it here, exactly as `void-record` does: an empty authority authorizes nobody,
+    and the shell-only `ORCHESTRA_OPERATORS` value that disagrees is refused by
+    the strict read before this point. The check runs before the receipt journal
+    directory or any native read/write, so a refused actor reserves nothing.
+
+    The default `operators=None` is the direct library/contributor path and keeps
+    the documented shell boundary. The admin CLI always supplies the set, so the
+    operator route cannot skip the check; the HTTP contributor route
+    (`operator=False`) never calls this.
+    """
+    if operators is None:
+        return
+    authority = configured_operators(operators)
+    if not authority:
+        raise ValueError('No operator allowlist is configured on the coordination host; add the acting '
+                         'operator to deployment.private.json before you ' + action)
+    if actor not in authority:
+        raise ValueError('Actor ' + str(actor) + ' is not a server-side configured operator; only a '
+                         'configured operator may ' + action)
+
+
+def _positive_int(value, where):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(where + ' must be a positive integer (not boolean)')
+    return value
+
+
+def _checked_fields(payload, allowed, where):
+    extra = sorted(set(payload) - set(allowed))
+    if extra:
+        raise ValueError('%s has unknown field(s): %s' % (where, ', '.join(extra)))
+
+
+def _validate_acceptance_shape(acceptance):
+    """Structural check for caller-supplied F3 acceptance evidence.
+
+    The content hash is not caller-supplied: the command binds the acceptance
+    object to the exact revision content hash it is about to write, stored as
+    `record_sha256` (not `manifest_sha256`, which names a whole publication
+    manifest and cannot exist when one record is accepted).
+    """
+    if not isinstance(acceptance, dict):
+        raise ValueError('acceptance must be an object naming owners, approvers, policy, '
+                         'decision_id and evidence')
+    extra = sorted(set(acceptance) - set(ACCEPTANCE_EVIDENCE_FIELDS))
+    if extra:
+        raise ValueError('acceptance has unknown field(s): %s (record_sha256 is bound by the command)'
+                         % ', '.join(extra))
+    for name in ACCEPTANCE_EVIDENCE_FIELDS:
+        if name not in acceptance:
+            raise ValueError('acceptance is missing field ' + name)
+    return acceptance
+
+
+def bound_acceptance(acceptance):
+    """Validate one record-level F3 decision bound to a revision content hash."""
+    if not isinstance(acceptance, dict):
+        raise ValueError('invalid acceptance evidence: acceptance must be an object')
+    extra = sorted(set(acceptance) - set(ACCEPTANCE_EVIDENCE_FIELDS) - {'record_sha256'})
+    if extra:
+        raise ValueError('invalid acceptance evidence: unknown field(s) ' + ', '.join(extra))
+    digest = acceptance.get('record_sha256')
+    if not isinstance(digest, str) or not SHA256_TEXT.match(digest):
+        raise ValueError('invalid acceptance evidence: record_sha256 must be the accepted '
+                         'revision content hash')
+    for name in ACCEPTANCE_EVIDENCE_FIELDS:
+        if name not in acceptance:
+            raise ValueError('invalid acceptance evidence: missing field ' + name)
+    from requirements import _validate_acceptance
+    full = {name: acceptance[name] for name in ACCEPTANCE_EVIDENCE_FIELDS}
+    full['manifest_sha256'] = digest
+    try:
+        _validate_acceptance(full, {'sha256': digest})
+    except ValueError as exc:
+        raise ValueError('invalid acceptance evidence: %s' % exc) from None
+    return acceptance
+
+
+def bind_acceptance(acceptance, record):
+    """Bind F3 evidence to the exact revision content hash via the contract validator.
+
+    The contract validator checks owners/approvers/policy/decision/evidence and
+    that the bound hash matches the accepted content. The stored object names
+    the binding `record_sha256`, because the thing being accepted here is one
+    requirement revision, not a publication manifest. Use
+    `publication_acceptance` to rebind it to a manifest for `publish_brd`.
+    """
+    _validate_acceptance_shape(acceptance)
+    bound = dict(acceptance)
+    bound['record_sha256'] = record['sha256']
+    bound_acceptance(bound)
+    return bound
 
 
 def publication_acceptance(acceptance, manifest):
@@ -248,12 +354,33 @@ def controlled(kind, acceptance_state):
     return {KIND_TYPE_LABEL[kind], STATE_LABEL[acceptance_state]}
 
 
+def read_rows(run):
+    return [json.loads(line) for line in run(['export', '--all']).splitlines() if line.strip()]
+
+
+def find(rows, task):
+    return next((row for row in rows if row.get('id') == task), None)
+
+
 def _journal(project, name):
-    return core.journal_dir(project, name)
+    journal = Path(project) / name
+    if journal.is_symlink():
+        raise ValueError('Refusing %s: the path is a symlink; no native write was attempted.' % name)
+    try:
+        journal.mkdir(exist_ok=True)
+    except OSError as exc:
+        raise ValueError('Cannot create %s: %s' % (name, exc))
+    if not journal.is_dir():
+        raise ValueError('%s is not a directory; refusing to write a receipt.' % name)
+    return journal
 
 
 def _receipt_path(journal, identity):
-    return core.receipt_path(journal, identity, 'requirement')
+    receipt = journal / (identity + '.json')
+    if receipt.is_symlink():
+        raise ValueError('Refusing requirement receipt %s: it is a symlink; no native write was attempted.'
+                         % receipt.name)
+    return receipt
 
 
 def existing_revisions(row):
@@ -264,8 +391,28 @@ def existing_revisions(row):
     is accepted only when it is exactly what a legitimate writer could post.
     """
     from reserved_comments import parse_requirement_record
-    return core.existing_ledger(row, REVISION_PREFIX, parse_requirement_record,
-                                'requirement', 'revision', 'revision')
+    found = {}
+    task = row.get('id')
+    for comment in row.get('comments') or []:
+        if not isinstance(comment, dict):
+            raise ValueError('malformed comment on requirement record ' + str(task))
+        text = comment.get('text')
+        if not isinstance(text, str) or not text.startswith(REVISION_PREFIX):
+            continue
+        record = parse_requirement_record(text)
+        if record is None:
+            raise ValueError('malformed requirement revision comment on ' + str(task))
+        if record.get('id') != task:
+            raise ValueError('requirement revision comment on %s belongs to another record' % (task,))
+        prior = found.get(record['revision'])
+        if prior is not None and prior != record:
+            raise ValueError('conflicting content for one id/revision: ' + str(task))
+        found[record['revision']] = record
+    return found
+
+
+def latest_revision(existing):
+    return existing[max(existing)] if existing else None
 
 
 def existing_acceptances(row):
@@ -277,8 +424,24 @@ def existing_acceptances(row):
     the operator's acceptance.
     """
     from reserved_comments import parse_acceptance_record
-    return core.existing_ledger(row, ACCEPTANCE_PREFIX, parse_acceptance_record,
-                                'requirement', 'acceptance', 'revision')
+    found = {}
+    task = row.get('id')
+    for comment in row.get('comments') or []:
+        if not isinstance(comment, dict):
+            raise ValueError('malformed comment on requirement record ' + str(task))
+        text = comment.get('text')
+        if not isinstance(text, str) or not text.startswith(ACCEPTANCE_PREFIX):
+            continue
+        record = parse_acceptance_record(text)
+        if record is None:
+            raise ValueError('malformed requirement acceptance comment on ' + str(task))
+        if record.get('id') != task:
+            raise ValueError('requirement acceptance comment on %s belongs to another record' % (task,))
+        prior = found.get(record['revision'])
+        if prior is not None and prior != record:
+            raise ValueError('conflicting acceptance evidence for one revision on ' + str(task))
+        found[record['revision']] = record
+    return found
 
 
 def acceptance_evidence(bound, task, revision, acceptance_state, actor, at=None):
@@ -318,6 +481,40 @@ def _acceptance_body(record):
     if parse_acceptance_record(body) != record:
         raise ValueError('Refusing to write acceptance evidence that does not pass its own schema')
     return body
+
+
+def validate_receipt(record, backfill=False):
+    """Structural check for one requirement journal receipt (backup/restore path).
+
+    The journals are the operator's recovery cache; a backup must not carry a
+    malformed one, or a restore would resurrect an unreadable receipt.
+    """
+    if not isinstance(record, dict):
+        raise ValueError('Invalid requirement receipt')
+    digest = record.get('sha256')
+    if not isinstance(digest, str) or not SHA256_TEXT.match(digest):
+        raise ValueError('Invalid requirement receipt content hash')
+    if record.get('status') not in RECEIPT_STATUSES:
+        raise ValueError('Invalid requirement receipt status')
+    actor = record.get('actor')
+    if actor is not None and (not isinstance(actor, str) or not actor.strip()):
+        raise ValueError('Invalid requirement receipt actor')
+    if backfill:
+        records = record.get('records')
+        if not isinstance(records, list) or not records or any(
+                not isinstance(value, str) or not value.strip() for value in records):
+            raise ValueError('Invalid requirement backfill receipt records')
+    else:
+        issue = record.get('id')
+        if issue is not None and (not isinstance(issue, str) or not issue.strip()):
+            raise ValueError('Invalid requirement receipt record id')
+        revision = record.get('revision')
+        if revision is not None and (isinstance(revision, bool)
+                                     or not isinstance(revision, int) or revision < 1):
+            raise ValueError('Invalid requirement receipt revision')
+    if record.get('acceptance') is not None:
+        bound_acceptance(record['acceptance'])
+    return record
 
 
 def existing_kind(row):
@@ -388,7 +585,17 @@ def requirement_record(payload, task, revision):
 
 
 def apply_controlled_labels(run, task, current, kind, acceptance_state):
-    return core.apply_controlled_labels(run, task, current, SPEC, controlled(kind, acceptance_state))
+    desired = controlled(kind, acceptance_state)
+    present = set(current or [])
+    changed = False
+    for label in sorted(CONTROLLED_LABELS - desired):
+        if label in present:
+            run(['update', task, '--remove-label', label, '--json'])
+            changed = True
+    for label in sorted(desired - present):
+        run(['update', task, '--add-label', label, '--json'])
+        changed = True
+    return changed
 
 
 def _check_revision(payload, revision, existing, record, task):
@@ -460,84 +667,29 @@ def _check_acceptance(payload, existing, record, operator, row):
     return None
 
 
-_prior_state = core.prior_state
+def _prior_state(prior, digest, actor):
+    """Classify an existing receipt for this operation ID.
+
+    Returns 'none', 'same' (identical retry) or 'reusable' (operator released or
+    marked failed). A conflict raises before any native write.
+    """
+    if not isinstance(prior, dict):
+        return 'none'
+    if prior.get('actor') and prior['actor'] != actor:
+        raise ValueError('Operation ID already used by actor %r; use a new operation ID or have the operator '
+                         'reconcile it.' % (prior['actor'],))
+    if prior.get('status') in RECONCILE_RELEASABLE:
+        return 'reusable'
+    if prior.get('sha256') == digest:
+        return 'same'
+    raise ValueError('Operation ID already used for different content; use a new operation ID or have the '
+                     'operator reconcile it.')
 
 
 def _uncertain(message, action):
-    return core.uncertain(message, action, SPEC)
-
-
-def _refuse_before_journal(payload, operator):
-    if not operator and payload['acceptance_state'] == 'accepted':
-        raise ValueError('Contributors may only draft requirement records; accepting a record is '
-                         'owner/operator-only and requires F3 acceptance evidence. Use a draft revision, or ask '
-                         'the operator to accept it with admin.py requirement-apply.')
-    if not operator and payload.get('acceptance') is not None:
-        # Fail closed BEFORE the journal directory or any native read/write, so
-        # a refused contributor acceptance reserves and writes nothing at all.
-        raise ValueError('A contributor draft must not carry an acceptance object: drafts are unaccepted '
-                         'by definition, and F3 acceptance evidence is owner/operator-only '
-                         '(admin.py requirement-apply).')
-
-
-def _create_args(payload, request_label, content_label):
-    # A new accepted record starts as draft until its F3 evidence and accepted
-    # revision have both been written.
-    labels = sorted(controlled(payload['kind'], 'draft') | {request_label, content_label})
-    return ['create', '--title', payload['title'], '--parent', payload['parent'],
-            '--description', payload['description'], '--type', 'task',
-            '--no-inherit-labels', '--labels', ','.join(labels), '--json']
-
-
-def _require_selectable(row, payload, operator, existing):
-    allow_untyped = (operator and payload['operation'] == 'draft'
-                     and payload['acceptance_state'] == 'accepted' and not existing)
-    require_typed(row, payload, allow_untyped=allow_untyped)
-
-
-def _result(payload, task, revision, record, created, reconciled, bound):
-    result = {'id': task, 'kind': payload['kind'], 'revision': revision,
-              'acceptance_state': payload['acceptance_state'],
-              'labels': sorted(controlled(payload['kind'], payload['acceptance_state'])),
-              'created': created, 'reconciled': reconciled}
-    if bound is not None:
-        result['acceptance'] = bound
-    return result
-
-
-SPEC = core.RecordSpec(
-    kind='requirement', noun='requirement', type_labels=TYPE_LABELS, state_labels=STATE_LABEL,
-    revision_prefix=REVISION_PREFIX, acceptance_prefix=ACCEPTANCE_PREFIX, journal=JOURNAL,
-    key_regex=None, fields=FIELDS, allow_accepted_first_revision=True, supports_retire=False,
-    accept_action='accept a requirement record', apply_command='admin.py requirement-apply',
-    reconcile_command='admin.py requirement-reconcile',
-    validate=lambda payload, operator: validate_payload(payload, operator=operator),
-    refuse_before_journal=_refuse_before_journal,
-    explicit_task=lambda payload: payload.get('task'),
-    read_rows=read_rows,
-    resolve_task=lambda rows, payload, operator: None,
-    check_key_unique=lambda rows, payload, task: check_key_unique(rows, payload, task),
-    create_revision=lambda payload: payload.get('revision', 1),
-    create_args=_create_args,
-    after_create=lambda run, task: None,
-    prepare_row=lambda run, row: None,
-    existing_revisions=lambda row: existing_revisions(row),
-    require_selectable=_require_selectable,
-    build_record=lambda payload, task, existing: (
-        payload.get('revision', 1), requirement_record(payload, task, payload.get('revision', 1))),
-    require_bound_key=lambda task, payload, existing: require_bound_key(task, payload, existing),
-    check_revision=lambda payload, revision, existing, record, task: _check_revision(
-        payload, revision, existing, record, task),
-    check_acceptance=lambda payload, existing, record, operator, row: _check_acceptance(
-        payload, existing, record, operator, row),
-    acceptance_evidence=lambda bound, task, revision, record, actor: acceptance_evidence(
-        bound, task, revision, record['acceptance_state'], actor),
-    existing_acceptances=lambda row: existing_acceptances(row),
-    revision_comment=revision_comment,
-    apply_labels=lambda run, task, current, payload, record: apply_controlled_labels(
-        run, task, current, payload['kind'], payload['acceptance_state']),
-    result=_result,
-)
+    return ValueError('%s The native %s did not confirm; the outcome is uncertain, so this operation ID stays '
+                      'pending. Inspect native state and complete it with admin.py requirement-reconcile before '
+                      'retrying.' % (message, action))
 
 
 def apply_native(payload, actor, run, project, operator=False, operators=None):
@@ -557,11 +709,155 @@ def apply_native(payload, actor, run, project, operator=False, operators=None):
     `operators` is the deployment operator allowlist (kittrial-5bb.65). The
     admin CLI supplies `operators(root, strict=True)`; an actor outside it is
     refused before any journal or native write, exactly as `void-record` does.
-    The steps are the shared keyed-record core's (keyed_records.apply_native)
-    with this module's REQUIREMENT spec.
     """
-    return core.apply_native(payload, actor, run, project, SPEC, operator=operator,
-                             operators=operators)
+    if operator:
+        _require_configured_operator(actor, operators, 'accept a requirement record')
+    validate_payload(payload, operator=operator)
+    if not operator and payload['acceptance_state'] == 'accepted':
+        raise ValueError('Contributors may only draft requirement records; accepting a record is '
+                         'owner/operator-only and requires F3 acceptance evidence. Use a draft revision, or ask '
+                         'the operator to accept it with admin.py requirement-apply.')
+    if not operator and payload.get('acceptance') is not None:
+        # Fail closed BEFORE the journal directory or any native read/write, so
+        # a refused contributor acceptance reserves and writes nothing at all.
+        raise ValueError('A contributor draft must not carry an acceptance object: drafts are unaccepted '
+                         'by definition, and F3 acceptance evidence is owner/operator-only '
+                         '(admin.py requirement-apply).')
+    revision = payload.get('revision', 1)
+    identity = content_hash({'operation_id': payload['operation_id']})
+    digest = content_hash({'actor': actor, 'payload': payload})
+    journal = _journal(project, JOURNAL)
+    receipt = _receipt_path(journal, identity)
+    prior = load_json(receipt) if receipt.exists() else None
+    state = _prior_state(prior, digest, actor)
+    reusable = state == 'reusable'
+    reconciled = state == 'same'
+    if prior is not None and prior.get('id') and payload.get('task') and not reusable \
+            and prior['id'] != payload['task']:
+        raise ValueError('Operation ID already used for a different record')
+    rows = read_rows(run)
+    created = False
+    task = (prior.get('id') if prior and not reusable and prior.get('id') else None) or payload.get('task')
+    # Key uniqueness is checked against the pre-write export so a duplicate key
+    # is refused with zero native writes (the created record would otherwise be
+    # written first and rejected after the fact).
+    check_key_unique(rows, payload, task)
+    if task is None:
+        request_label = 'request:' + identity
+        matches = [row for row in rows if request_label in (row.get('labels') or [])]
+        if len(matches) > 1:
+            raise ValueError('Duplicate native requirement records; operator reconciliation required')
+        if matches:
+            if 'request-content:' + digest not in (matches[0].get('labels') or []):
+                raise ValueError('Native requirement content mismatch')
+            task = matches[0]['id']
+            reconciled = True
+        else:
+            if prior is not None and not reusable:
+                raise ValueError('Reserved requirement request has no visible record; outcome uncertain. '
+                                 'Operator must reconcile before any new request; do not allocate another ID.')
+            # A new accepted record starts as draft until its F3 evidence and
+            # accepted revision have both been written.
+            labels = sorted(controlled(payload['kind'], 'draft')
+                            | {request_label, 'request-content:' + digest})
+            args = ['create', '--title', payload['title'], '--parent', payload['parent'],
+                    '--description', payload['description'], '--type', 'task',
+                    '--no-inherit-labels', '--labels', ','.join(labels), '--json']
+            # Preflight the identical create natively BEFORE any receipt or
+            # native mutation: a bad parent or invalid description is refused
+            # here, so a refusal reserves nothing and cannot burn the ID.
+            run(args + ['--dry-run'])
+            atomic(receipt, {'sha256': digest, 'status': 'pending', 'actor': actor,
+                             'operation': payload['operation'], 'revision': revision})
+            try:
+                raw = run(args)
+            except (ValueError, OSError) as refusal:
+                raise _uncertain(str(refusal), 'create') from None
+            try:
+                issue = json.loads(raw)
+            except (TypeError, ValueError):
+                issue = None
+            if not isinstance(issue, dict) or not issue.get('id'):
+                raise _uncertain('Create response was not a record.', 'create')
+            task = issue['id']
+            created = True
+            atomic(receipt, {'sha256': digest, 'status': 'pending', 'actor': actor, 'id': task,
+                             'created': True, 'operation': payload['operation'], 'revision': revision})
+            rows = read_rows(run)
+    row = find(rows, task)
+    if row is None:
+        if prior is not None:
+            raise ValueError('Recorded native requirement record %s is not visible; outcome uncertain. '
+                             'Operator must reconcile this operation ID.' % task)
+        raise ValueError('Unknown requirement record: ' + task)
+    existing = existing_revisions(row)
+    if not created:
+        allow_untyped = (operator and payload['operation'] == 'draft'
+                         and payload['acceptance_state'] == 'accepted' and not existing)
+        require_typed(row, payload, allow_untyped=allow_untyped)
+        if prior is not None and prior.get('created') \
+                and 'request-content:' + digest not in (row.get('labels') or []):
+            raise ValueError('Native requirement content mismatch')
+    record = requirement_record(payload, task, revision)
+    require_bound_key(task, payload, existing)
+    _check_revision(payload, revision, existing, record, task)
+    bound = _check_acceptance(payload, existing, record, operator, row)
+    # Durable F3 acceptance evidence: a second reserved machine record bound to
+    # the revision hash. Planned before any write so a conflicting decision is
+    # refused with zero native writes, and skipped when this exact decision is
+    # already recorded, so an idempotent retry adds nothing.
+    evidence_body = None
+    if bound is not None:
+        evidence_record, candidate = acceptance_evidence(
+            bound, task, revision, payload['acceptance_state'], actor)
+        prior_evidence = existing_acceptances(row).get(revision)
+        if prior_evidence is not None:
+            if (prior_evidence.get('record_sha256') != evidence_record['record_sha256']
+                    or prior_evidence.get('decision') != evidence_record['decision']):
+                raise ValueError('Revision %d on %s already carries different acceptance evidence; '
+                                 'operator reconciliation required before the decision can be '
+                                 'rewritten.' % (revision, task))
+            evidence_body = None
+        else:
+            evidence_body = candidate
+    if prior is None or prior.get('status') != 'complete' or created:
+        # A pending receipt is written only immediately before a real native
+        # write, so every refusal above reserves nothing.
+        atomic(receipt, {'sha256': digest, 'status': 'pending', 'actor': actor, 'id': task,
+                         'created': created, 'operation': payload['operation'], 'revision': revision})
+    # Durable acceptance evidence is written BEFORE the accepted revision
+    # comment and the accepted state label (kittrial-pth.26 rev3 review
+    # p3-ordering-backfill-docs). Both the `requirement-accepted` state label and
+    # an accepted `requirement-revision-v1` comment make the kit read the record
+    # as accepted, so writing either first left a crash window in which the
+    # record read as accepted with no acceptance-v1 record. With the evidence
+    # first, an uncertain evidence write leaves the record reading as draft (the
+    # revision comment and label follow) and the pending receipt is completed by
+    # retry or admin.py requirement-reconcile.
+    if evidence_body is not None:
+        try:
+            run(['comments', 'add', task, evidence_body, '--json'])
+        except (ValueError, OSError) as refusal:
+            raise _uncertain(str(refusal), 'acceptance evidence') from None
+    if revision not in existing:
+        try:
+            run(['comments', 'add', task, revision_comment(record), '--json'])
+        except (ValueError, OSError) as refusal:
+            raise _uncertain(str(refusal), 'revision comment') from None
+    apply_controlled_labels(run, task, row.get('labels') or [], payload['kind'], payload['acceptance_state'])
+    complete = {'sha256': digest, 'status': 'complete', 'actor': actor, 'id': task,
+                'operation': payload['operation'], 'revision': revision}
+    if bound is not None:
+        complete['acceptance'] = bound
+        complete['acceptance_record'] = True
+    atomic(receipt, complete)
+    result = {'id': task, 'kind': payload['kind'], 'revision': revision,
+              'acceptance_state': payload['acceptance_state'],
+              'labels': sorted(controlled(payload['kind'], payload['acceptance_state'])),
+              'created': created, 'reconciled': reconciled}
+    if bound is not None:
+        result['acceptance'] = bound
+    return result
 
 
 def backfill(payload, actor, run, project, operators=None):
@@ -655,8 +951,93 @@ def reconcile(project, operation_id, actor, reason, disposition, run, issue_id=N
       can be resubmitted.
     * Repeating an identical reconciliation is idempotent.
     """
-    return core.reconcile(project, operation_id, actor, reason, disposition, run, SPEC,
-                          issue_id=issue_id)
+    identifier(operation_id)
+    identifier(actor)
+    if disposition not in ('failed', 'released', 'complete'):
+        raise ValueError('Disposition must be failed, released or complete')
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError('A reconciliation reason is required')
+    if disposition == 'complete' and not issue_id:
+        raise ValueError('A complete disposition requires an explicit --issue-id naming the native record to confirm')
+    if issue_id is not None and disposition != 'complete':
+        raise ValueError('An issue ID applies only to a complete disposition')
+    if issue_id is not None and (not isinstance(issue_id, str) or not issue_id.strip()):
+        raise ValueError('Invalid issue ID')
+    journal = _journal(project, JOURNAL)
+    identity = content_hash({'operation_id': operation_id})
+    receipt = _receipt_path(journal, identity)
+    if not receipt.exists():
+        raise ValueError('No requirement operation receipt exists for that operation ID')
+    prior = load_json(receipt)
+    if not isinstance(prior, dict) or not isinstance(prior.get('status'), str):
+        raise ValueError('Malformed requirement receipt; inspect before reconciling')
+    at = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    audit = prior.get('reconciliation') or {}
+    if prior['status'] in RECONCILE_RELEASABLE:
+        same = (audit.get('actor') == actor and audit.get('reason') == reason
+                and audit.get('disposition') == disposition)
+        if same:
+            return {'operation_id': operation_id, 'status': prior['status'], 'reconciled': False,
+                    'already': True, 'reconciliation': audit}
+        raise ValueError('Reconciliation conflict: operation %s is already %s by actor %r (reason %r); the '
+                         'recorded audit is kept.' % (operation_id, prior['status'], audit.get('actor'),
+                                                      audit.get('reason')))
+    if prior['status'] == 'complete':
+        same = (audit.get('actor') == actor and audit.get('reason') == reason
+                and audit.get('disposition') == 'complete' and prior.get('id') == issue_id)
+        if same:
+            return {'operation_id': operation_id, 'status': 'complete', 'reconciled': False,
+                    'already': True, 'id': prior.get('id'), 'reconciliation': audit}
+        raise ValueError('Reconciliation conflict: operation %s is already complete by actor %r (reason %r, '
+                         'id %r); the recorded audit is kept.' % (operation_id, audit.get('actor'),
+                                                                  audit.get('reason'), prior.get('id')))
+    if prior['status'] != 'pending':
+        raise ValueError('Requirement operation is not pending; nothing to reconcile')
+    rows = read_rows(run)
+    found = [row for row in rows if 'request:' + identity in (row.get('labels') or [])]
+    if len(found) > 1:
+        raise ValueError('Duplicate native request records; manual operator reconciliation required')
+    if disposition == 'complete':
+        if prior.get('id') and prior['id'] != issue_id:
+            raise ValueError('--issue-id %s does not match the receipt record %s' % (issue_id, prior['id']))
+        if found and found[0].get('id') != issue_id:
+            raise ValueError('--issue-id %s does not match the labelled native record %s'
+                             % (issue_id, found[0].get('id')))
+        if not found and not prior.get('id'):
+            raise ValueError('No labelled native record exists for this request; completion needs one, so use '
+                             '--disposition failed or released')
+        row = find(rows, issue_id)
+        if row is None:
+            raise ValueError('Could not confirm native record %s; refusing to complete an unconfirmed receipt'
+                             % issue_id)
+        audit = {'actor': actor, 'reason': reason, 'disposition': 'complete', 'at': at,
+                 'completed_from': 'native', 'issue': {'id': issue_id, 'title': row.get('title')}}
+        updated = {'sha256': prior.get('sha256'), 'status': 'complete', 'actor': prior.get('actor') or actor,
+                   'id': issue_id, 'reconciliation': audit}
+        for name in ('operation', 'revision', 'created', 'acceptance'):
+            if name in prior:
+                updated[name] = prior[name]
+        atomic(receipt, updated)
+        return {'operation_id': operation_id, 'status': 'complete', 'reconciled': True, 'id': issue_id,
+                'issue': audit['issue'], 'reconciliation': audit}
+    if prior.get('id'):
+        raise ValueError('The receipt records native record %s; releasing would discard the binding, so '
+                         'complete it with --disposition complete --issue-id instead.' % prior['id'])
+    if found:
+        raise ValueError('A native record already carries request:%s; complete the receipt instead of '
+                         'releasing it.' % identity)
+    audit = {'actor': actor, 'reason': reason, 'disposition': disposition, 'at': at}
+    updated = {'sha256': prior.get('sha256'), 'status': disposition, 'actor': prior.get('actor'),
+               'reconciliation': audit}
+    for name in ('operation', 'revision', 'error'):
+        if name in prior:
+            updated[name] = prior[name]
+    if 'error' not in updated:
+        updated['error'] = ('Released by the operator after confirming no native record was created.'
+                            if disposition == 'released' else
+                            'Marked failed by the operator after confirming no native record was created.')
+    atomic(receipt, updated)
+    return {'operation_id': operation_id, 'status': disposition, 'reconciled': True, 'reconciliation': audit}
 
 
 def _cli_payload(path, operation):
