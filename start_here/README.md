@@ -41,17 +41,20 @@ worker or agent lane to run them, and do not put another person's actor in
 
 | Command | Purpose | Authority it needs |
 | --- | --- | --- |
-| `requirement-apply PROJECT --actor ACTOR --file record.json` | write an accepted requirement revision, or move an accepted record back to draft | the payload's `acceptance` object (named owners/approvers, policy, decision id, evidence) |
-| `requirement-backfill PROJECT --actor ACTOR --file backfill.json` | add the controlled requirement type/state labels to records created before this route | an `evidence` pointer for an entry that becomes `accepted` |
+| `requirement-apply PROJECT --actor ACTOR --file record.json` | write an accepted requirement revision, or move an accepted record back to draft | the payload's `acceptance` object (named owners/approvers, policy, decision id, evidence) and the deployment operator allowlist |
+| `requirement-backfill PROJECT --actor ACTOR --file backfill.json` | add the controlled requirement type/state labels to records created before this route | an `evidence` pointer for an entry that becomes `accepted`, and the deployment operator allowlist |
 | `requirement-reconcile PROJECT --operation-id ID --actor ACTOR --disposition ...` | finish a requirement operation whose real write was uncertain | confirmation of the native record state |
 | `void-record PROJECT --actor OPERATOR --file void.json` | void a malformed or stale contribution-review record | the deployment operator allowlist (`operators` in `deployment.private.json`) |
 | `handoff PROJECT --actor ACTOR --file handoff.json` | transfer a claim when the current owner cannot act | an owner decision/evidence pointer in the payload's `approval` |
 
 All five are shell-trusted: access to the service account's shell is the
-boundary. Only `void-record` also checks the deployment operator allowlist, and a
-deployment that configures no operators authorizes nobody. Use the identity of
-the person actually running the command as `--actor`; the owner decision is named
-in the payload, never by reusing the owner's actor.
+boundary. `requirement-apply`, `requirement-backfill` and `void-record` also check
+the deployment operator allowlist, and a deployment that configures no operators
+authorizes nobody: an unlisted `--actor` is refused before any write and a
+shell-only `ORCHESTRA_OPERATORS` value that disagrees with the configuration is
+refused. Use the identity of the person actually running the command as
+`--actor`; the owner decision is named in the payload, never by reusing the
+owner's actor.
 
 Validate a payload before writing. The commands are fail-closed and refuse before
 any native write, but the same validator can be run with no native read or write

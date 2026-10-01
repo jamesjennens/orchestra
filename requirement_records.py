@@ -67,6 +67,7 @@ from pathlib import Path
 from coordination import atomic, identifier
 from export_requirements import (ACCEPTANCE_PREFIX, REVISION_PREFIX, parse_json,
                                  revision_comment)
+from recovery import configured_operators
 from requirements import (ACCEPTANCE_FIELDS, SHA256_TEXT, canonical_bytes,
                           content_hash, load_json)
 
@@ -104,6 +105,32 @@ def _text(value, where):
     if not isinstance(value, str) or not value.strip():
         raise ValueError(where + ' must be a nonempty string')
     return value
+
+
+def _require_configured_operator(actor, operators, action):
+    """Refuse an actor outside the deployment operator allowlist before any write.
+
+    `admin.py requirement-apply`/`requirement-backfill` read the authority set
+    from `deployment.private.json` with `operators(root, strict=True)` and supply
+    it here, exactly as `void-record` does: an empty authority authorizes nobody,
+    and the shell-only `ORCHESTRA_OPERATORS` value that disagrees is refused by
+    the strict read before this point. The check runs before the receipt journal
+    directory or any native read/write, so a refused actor reserves nothing.
+
+    The default `operators=None` is the direct library/contributor path and keeps
+    the documented shell boundary. The admin CLI always supplies the set, so the
+    operator route cannot skip the check; the HTTP contributor route
+    (`operator=False`) never calls this.
+    """
+    if operators is None:
+        return
+    authority = configured_operators(operators)
+    if not authority:
+        raise ValueError('No operator allowlist is configured on the coordination host; add the acting '
+                         'operator to deployment.private.json before you ' + action)
+    if actor not in authority:
+        raise ValueError('Actor ' + str(actor) + ' is not a server-side configured operator; only a '
+                         'configured operator may ' + action)
 
 
 def _positive_int(value, where):
@@ -659,7 +686,7 @@ def _uncertain(message, action):
                       'retrying.' % (message, action))
 
 
-def apply_native(payload, actor, run, project, operator=False):
+def apply_native(payload, actor, run, project, operator=False, operators=None):
     """Caller holds the canonical project lock; run(argv) invokes pinned bd.
 
     `operator=True` is the owner/operator route (admin.py requirement-apply);
@@ -672,7 +699,13 @@ def apply_native(payload, actor, run, project, operator=False):
     written before the accepted revision comment and the state label, so a
     failed evidence write leaves the record reading as draft rather than
     accepted without evidence.
+
+    `operators` is the deployment operator allowlist (kittrial-5bb.65). The
+    admin CLI supplies `operators(root, strict=True)`; an actor outside it is
+    refused before any journal or native write, exactly as `void-record` does.
     """
+    if operator:
+        _require_configured_operator(actor, operators, 'accept a requirement record')
     validate_payload(payload, operator=operator)
     if not operator and payload['acceptance_state'] == 'accepted':
         raise ValueError('Contributors may only draft requirement records; accepting a record is '
@@ -821,14 +854,19 @@ def apply_native(payload, actor, run, project, operator=False):
     return result
 
 
-def backfill(payload, actor, run, project):
+def backfill(payload, actor, run, project, operators=None):
     """Operator-only: apply controlled labels to existing records, no revision comment.
 
     Backfilling a record to `requirement:accepted` also writes the durable
     `requirement-acceptance-v1` evidence record (bound to the latest revision
     when the record has one), so the operator's evidence is visible on the
     record itself and survives a restore, not only in `.requirement-backfills`.
+
+    `operators` is the deployment operator allowlist (kittrial-5bb.65). The
+    admin CLI supplies `operators(root, strict=True)`; an actor outside it is
+    refused before any journal or native write.
     """
+    _require_configured_operator(actor, operators, 'backfill requirement records')
     validate_backfill(payload)
     identity = content_hash({'operation_id': payload['operation_id']})
     digest = content_hash({'actor': actor, 'payload': payload})

@@ -52,18 +52,27 @@ history](#malformed-structured-history) (`void-record`).
 
 | Command | Purpose | Authority it needs |
 | --- | --- | --- |
-| `requirement-apply PROJECT --actor ACTOR --file record.json` | write an accepted requirement revision, or move an accepted record back to draft | the payload's `acceptance` object (named owners/approvers, policy, decision id, evidence) |
-| `requirement-backfill PROJECT --actor ACTOR --file backfill.json` | add the controlled requirement type/state labels to records created before this route | an `evidence` pointer for an entry that becomes `accepted` |
+| `requirement-apply PROJECT --actor ACTOR --file record.json` | write an accepted requirement revision, or move an accepted record back to draft | the payload's `acceptance` object (named owners/approvers, policy, decision id, evidence) and the deployment operator allowlist |
+| `requirement-backfill PROJECT --actor ACTOR --file backfill.json` | add the controlled requirement type/state labels to records created before this route | an `evidence` pointer for an entry that becomes `accepted`, and the deployment operator allowlist |
 | `requirement-reconcile PROJECT --operation-id ID --actor ACTOR --disposition ...` | finish a requirement operation whose real write was uncertain | confirmation of the native record state |
 | `void-record PROJECT --actor OPERATOR --file void.json` | void a malformed or stale contribution-review record | the deployment operator allowlist (`operators` in `deployment.private.json`) |
 | `handoff PROJECT --actor ACTOR --file handoff.json` | transfer a claim when the current owner cannot act | an owner decision/evidence pointer in the payload's `approval` |
 
 All five are shell-trusted: access to the service account's shell is the boundary.
-Only `void-record` also checks the deployment operator allowlist, so a deployment
-that configures no operators authorizes nobody; `operators add/remove/list`
-maintain that list (see the removal and restore policy below). Use the identity of
-the person actually running the command as `--actor`; the owner decision is named
-in the payload, never by reusing the owner's actor.
+`requirement-apply`, `requirement-backfill` and `void-record` also check the
+deployment operator allowlist (`operators` in `deployment.private.json`), so a
+deployment that configures no operators authorizes nobody and an unlisted
+`--actor` is refused before any native or journal write. The allowlist is read
+strictly: a shell-only `ORCHESTRA_OPERATORS` value that disagrees with the
+deployment configuration is refused rather than honoured in one place and
+ignored in the other. `operators add/remove/list` maintain that list (see the
+removal and restore policy below). Before the `requirement-apply`/
+`requirement-backfill` check ships, enrol every actor that accepts requirements
+today (starting with `james`) with `admin.py operators add` on each installation
+and confirm with `operators list`; an empty or short list is a deploy blocker,
+not a warning. Use the identity of the person actually running the command as
+`--actor`; the owner decision is named in the payload, never by reusing the
+owner's actor.
 
 Validate a payload before writing. Each command is fail-closed and refuses before
 any native write, and the same validator can be run with no native read or write

@@ -202,6 +202,17 @@ Acceptance without evidence, a contributor acceptance attempt, a contributor
 acceptance object on a draft, and contributor demotion are all refused before any
 native write.
 
+`requirement-apply` also checks the deployment operator allowlist, exactly as
+`void-record` does (`kittrial-5bb.65`): `--actor` must be in the `operators` list
+of `deployment.private.json`, an empty or absent list authorizes nobody, and an
+unlisted actor is refused before any journal directory, receipt or native
+write. The allowlist is read strictly, so a shell-only `ORCHESTRA_OPERATORS`
+value that disagrees with the deployment configuration is refused rather than
+honoured by the CLI and ignored by the endpoint. Enrol every actor that accepts
+requirements (starting with `james`) with `admin.py operators add` and confirm
+with `admin.py operators list` before deploying this check; an empty list is a
+deploy blocker.
+
 The operator acceptance is **durable on the record**: beside the
 `requirement-revision-v1` comment the command writes one
 `Kind: requirement-acceptance-v1` record bound to that revision. The evidence
@@ -245,8 +256,10 @@ python admin.py --root /path/to/runtime requirement-backfill example \
 A record backfilled to `requirement:accepted` needs an `evidence` field
 (a nonempty decision/evidence pointer); a draft entry must not carry one. The
 command is idempotent: an identical repeated run reports `changed: false`.
-Unknown records, duplicate entries and caller-supplied labels are refused before
-any native write. Accepting by backfill also writes the durable
+`requirement-backfill` checks the deployment operator allowlist like
+`requirement-apply` and `void-record`: an unlisted `--actor` is refused before
+any write. Unknown records, duplicate entries and caller-supplied labels are
+refused before any native write. Accepting by backfill also writes the durable
 `Kind: requirement-acceptance-v1` evidence record (with `source`
 `requirement-backfill`), bound to the record's latest revision when it has one,
 so the evidence is visible on the record and not only in `.requirement-backfills/`.
