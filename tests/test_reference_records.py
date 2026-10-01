@@ -239,6 +239,9 @@ class ProposeAndReviseTests(ReferenceCase):
         before = len(self.native.writes())
         with self.assertRaisesRegex(ValueError, 'collides'):
             self.propose(operation_id='other-4', key='calendar.trading.x')
+        # Revising the colliding key finds no entry of its own.
+        with self.assertRaisesRegex(ValueError, 'Unknown reference key calendar.trading.x'):
+            self.revise(operation_id='other-5', key='calendar.trading.x', expected_sha256=self.sha(1))
         self.assertEqual(len(self.native.writes()), before)
 
     def test_field_refusals_write_nothing(self):

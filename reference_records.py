@@ -503,6 +503,9 @@ def _resolve_task(rows, payload, operator):
         raise ValueError('Reference key %s is held by anchor %s, which has no revision record yet (an '
                          'interrupted propose); re-run that propose with its operation_id, or ask the operator '
                          'to reconcile it.' % (payload['key'], row['id']))
+    if payload['key'] not in {record['key'] for record in existing_revisions(row).values()}:
+        # The lookup label is shared with a different key (a.b-c and a.b.c).
+        raise ValueError('Unknown reference key %s; use ref list to see the catalog.' % payload['key'])
     return row['id']
 
 
