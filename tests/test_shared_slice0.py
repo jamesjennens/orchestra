@@ -354,24 +354,71 @@ class SurfaceTests(unittest.TestCase):
         self.assertEqual(listed & ANCHOR_IDS, set())
         self.assertIn('kit-1', listed)
 
-    def test_the_endpoint_backend_read_seam_fetches_comments_only_for_labelled_rows(self):
-        listed = [{key: value for key, value in row.items() if key != 'comments'} for row in self.rows]
-        comments = {row['id']: row['comments'] for row in self.rows}
-        reads = []
+    def seam(self, listed, anchors_reply):
+        """An EndpointBackend read seam over a fake list read and anchors reply."""
+        calls = []
 
-        def run(action, project, actor, argv):
-            if argv[0] == 'comments':
-                reads.append(argv[1])
-                return comments[argv[1]]
-            return listed
+        def endpoint(action, project, actor, argv):
+            calls.append((action, list(argv)))
+            reply = anchors_reply(argv)
+            return reply if isinstance(reply, dict) and 'returncode' in reply else \
+                {'returncode': 0, 'stdout': json.dumps(reply), 'stderr': ''}
 
-        fake = types.SimpleNamespace(actor_namespace='http', _run=run,
+        fake = types.SimpleNamespace(actor_namespace='http', _endpoint=endpoint,
+                                     _checked=http_service.EndpointBackend._checked,
+                                     _run=lambda action, project, actor, argv:
+                                         calls.append((action, list(argv[:1]))) or listed,
                                      _in_project=lambda rows, project: rows)
-        fake._with_record_comments = lambda project, rows: \
-            http_service.EndpointBackend._with_record_comments(fake, project, rows)
+        fake._without_record_anchors = lambda project, rows: \
+            http_service.EndpointBackend._without_record_anchors(fake, project, rows)
+        return fake, calls
+
+    def test_the_endpoint_backend_read_seam_asks_for_anchors_once_per_snapshot(self):
+        listed = [{key: value for key, value in row.items() if key != 'comments'} for row in self.rows]
+        answer = lambda argv: {'schema_version': 1, 'anchors': rc.record_anchor_ids(
+            [row for row in self.rows if row['id'] in argv])}
+        fake, calls = self.seam(listed, answer)
         snapshot = http_service.EndpointBackend.read_tasks(fake, 'kittrial')
         self.assertEqual([row['id'] for row in snapshot['items']], VISIBLE_IDS)
-        self.assertEqual(sorted(reads), ['kit-2', 'kit-3', 'kit-4', 'kit-5', 'kit-6', 'kit-7', 'kit-8'])
+        # One anchors read, naming just the labelled rows (few of them: no export).
+        labelled = [row['id'] for row in listed if rc.carries_record_label(row)]
+        self.assertEqual(calls, [('bd', ['list']), ('anchors', labelled)])
+        # A snapshot with no labelled row costs no anchors read at all.
+        plain = [row for row in listed if not rc.carries_record_label(row)]
+        fake, calls = self.seam(plain, answer)
+        self.assertEqual([r['id'] for r in http_service.EndpointBackend.read_tasks(fake, 'kittrial')['items']],
+                         ['kit-1'])
+        self.assertEqual(calls, [('bd', ['list'])])
+
+    def test_above_the_id_cap_the_anchors_read_is_one_export(self):
+        many = [{'id': 'kit-%d' % (100 + index), 'labels': ['proposal'], 'status': 'open'}
+                for index in range(rc.ANCHOR_READ_IDS_MAX + 1)]
+        for rows, expected in ((many[:-1], [row['id'] for row in many[:-1]]), (many, [])):
+            fake, calls = self.seam(rows, lambda argv: {'schema_version': 1, 'anchors': ['kit-100']})
+            shown = http_service.EndpointBackend.read_tasks(fake, 'kittrial')['items']
+            self.assertEqual(calls[1], ('anchors', expected))
+            self.assertEqual(len(shown), len(rows) - 1)
+
+    def test_a_malformed_anchors_answer_fails_the_list_closed(self):
+        listed = [{key: value for key, value in row.items() if key != 'comments'} for row in self.rows]
+        for answer in ({'anchors': 'kit-2'}, {'anchors': [2]}, ['kit-2'], None,
+                       {'returncode': 2, 'stdout': '', 'stderr': 'ValueError: bad\n'},
+                       {'returncode': 1, 'stdout': '', 'stderr': 'boom\n'}):
+            fake, _ = self.seam(listed, lambda argv, answer=answer: answer)
+            with self.assertRaises(http_service.HttpError):
+                http_service.EndpointBackend.read_tasks(fake, 'kittrial')
+
+    def test_an_endpoint_older_than_the_service_is_named(self):
+        listed = [{key: value for key, value in row.items() if key != 'comments'} for row in self.rows]
+        fake, _ = self.seam(listed, lambda argv: {'returncode': 2, 'stdout': '',
+                                                   'stderr': 'ValueError: Unknown action\n'})
+        with self.assertRaises(http_service.HttpError) as raised:
+            http_service.EndpointBackend.read_tasks(fake, 'kittrial')
+        self.assertEqual(raised.exception.status, 501)
+        self.assertIn('older than this HTTP service', raised.exception.message)
+
+    def test_record_anchor_ids_is_the_surface_predicate(self):
+        self.assertEqual(rc.record_anchor_ids(self.rows), sorted(ANCHOR_IDS))
 
 
 try:
@@ -470,6 +517,189 @@ class EndpointLabelGuardTests(unittest.TestCase):
         for args in (['update', 'pp-2', '--set-labels', 'ops'],
                      ['update', 'pp-2', '--remove-label', 'proposal']):
             self.guard(ordinary, args)
+
+
+@unittest.skipIf(endpoint is None, 'endpoint imports fcntl (POSIX-only)')
+class EndpointAnchorsActionTests(unittest.TestCase):
+    """kittrial-5bb.71: the read-only anchors action answers a snapshot from one export."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix='slice0-anchors-')
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        (self.root / 'bin').mkdir()
+        (self.root / 'bin' / 'bd').write_text('', encoding='utf-8')
+        (self.root / 'deployment.private.json').write_text(
+            '{"password": "x", "unit": "none", "port": "1"}', encoding='utf-8')
+        path = self.root / 'projects' / 'pp'
+        (path / '.beads').mkdir(parents=True)
+        (path / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+
+    def execute(self, rows, args=None, show=None, **request_extra):
+        calls = []
+
+        def run(argv, **kwargs):
+            command = list(argv[argv.index('--sandbox') + 1:])
+            calls.append(command)
+            if 'show' in command:
+                return show(command) if show else types.SimpleNamespace(
+                    returncode=0, stderr='',
+                    stdout=json.dumps([row for row in rows if row['id'] in command]))
+            text = ''.join(json.dumps(row) + '\n' for row in rows)
+            return types.SimpleNamespace(returncode=0, stdout=text, stderr='')
+        request = dict({'project': 'pp', 'actor': 'http/read', 'action': 'anchors'}, **request_extra)
+        if args is not None:
+            request['args'] = args
+        with patch.object(endpoint.native.subprocess, 'run', run), \
+                patch.object(endpoint.fcntl, 'flock', side_effect=AssertionError('no lock')), \
+                patch.object(endpoint, 'run_guarded', side_effect=AssertionError('no journal')):
+            reply = endpoint.execute(self.root, request)
+        return reply, calls
+
+    def test_one_export_gives_the_anchor_ids_by_the_surface_predicate(self):
+        rows = rows_as_a_later_slice_writes_them()
+        reply, calls = self.execute(rows, operation_id='ssh-op-0001')
+        self.assertEqual(reply['returncode'], 0, reply)
+        self.assertEqual(json.loads(reply['stdout']),
+                         {'schema_version': 1, 'anchors': rc.record_anchor_ids(rows)})
+        self.assertEqual(rc.record_anchor_ids(rows), sorted(ANCHOR_IDS))
+        self.assertEqual([call[-2:] for call in calls], [['export', '--all']])
+
+    def test_named_rows_are_read_in_one_show_with_comments(self):
+        rows = rows_as_a_later_slice_writes_them()
+        labelled = [row['id'] for row in rows if rc.carries_record_label(row)]
+        reply, calls = self.execute(rows, args=labelled)
+        self.assertEqual(json.loads(reply['stdout'])['anchors'], sorted(ANCHOR_IDS))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][-(len(labelled) + 3):], ['show', *labelled, '--json', '--include-comments'])
+
+    def test_rows_deleted_after_the_list_are_simply_not_anchors(self):
+        gone = lambda command: types.SimpleNamespace(
+            returncode=1, stderr='Error fetching pp-9: no issue found matching "pp-9"\n',
+            stdout=json.dumps({'error': 'no issues found matching the provided IDs', 'schema_version': 1}))
+        reply, _ = self.execute([], args=['pp-9'], show=gone)
+        self.assertEqual(json.loads(reply['stdout'])['anchors'], [])
+        # Any other failure still fails closed.
+        broken = lambda command: types.SimpleNamespace(returncode=1, stdout='', stderr='database locked\n')
+        with self.assertRaises(ValueError):
+            self.execute([], args=['pp-9'], show=broken)
+
+    def test_anchors_takes_at_most_the_cap_of_distinct_task_ids(self):
+        for args in (['pp-%d' % index for index in range(rc.ANCHOR_READ_IDS_MAX + 1)],
+                     ['pp-1', 'pp-1'], ['--all'], [''], ['pp 1'], 'pp-1', [1]):
+            with self.subTest(args=args), self.assertRaisesRegex(ValueError, 'distinct task ids'):
+                self.execute([], args=args)
+
+
+try:
+    from test_http_review_fixes import STUB, EndpointCase
+except Exception:  # pragma: no cover - harness import problems surface in its own module
+    EndpointCase = None
+
+
+if EndpointCase is not None:
+    class CountingEndpointBackend(http_service.EndpointBackend):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.calls = []
+
+        def _endpoint(self, action, project, actor, args, *rest, **kwargs):
+            self.calls.append((action, tuple(args) if action == 'anchors' else tuple(args[:1])))
+            reply = super()._endpoint(action, project, actor, args, *rest, **kwargs)
+            if action == 'bd' and args[:1] in (['list'], ['show']) and reply.get('returncode') == 0:
+                # Real `bd list`/`bd show` print no comments (the stub's rows carry
+                # them), so the anchors read is what must hide the anchors here.
+                rows = json.loads(reply['stdout'])
+                strip = lambda row: {k: v for k, v in row.items() if k != 'comments'}
+                rows = [strip(row) for row in rows] if isinstance(rows, list) else strip(rows)
+                reply = dict(reply, stdout=json.dumps(rows))
+            return reply
+
+
+@unittest.skipIf(EndpointCase is None, 'canonical stub harness unavailable')
+class AnchorReadCostTests(EndpointCase if EndpointCase else unittest.TestCase):
+    """kittrial-5bb.71: one anchors read per snapshot, however many labelled rows."""
+
+    def make_backend(self):
+        self.canonical_root = self.tmp / 'canonical'
+        return CountingEndpointBackend(sys.executable, str(STUB), str(self.canonical_root),
+                                       service=self.service)
+
+    def seed(self, changes):
+        path = self.canonical_root / 'canonical.json'
+        state = json.loads(path.read_text(encoding='utf-8'))
+        for row in state['rows']:
+            if row['id'] in changes:
+                row.update(changes[row['id']])
+        path.write_text(json.dumps(state), encoding='utf-8')
+
+    def test_a_list_with_many_labelled_rows_costs_one_anchors_read(self):
+        alex, project = self.setup_project()
+        ids = []
+        for index in range(14):
+            created = self.create_task(alex, project, 'task %d' % index)
+            self.assertEqual(201, created.status, created.data)
+            ids.append(created.data['id'])
+        kinds = [('reference', 'Kind: reference-entry-v1\n{}'),
+                 ('proposal', 'Kind: requirement-proposal-v1\n{}'),
+                 ('contribution-settings', 'Kind: contribution-settings-v1\n{}'),
+                 ('capability', 'Kind: capability-entry-v1\n{}')]
+        changes = {}
+        for index, task in enumerate(ids[:8]):
+            label, text = kinds[index % 4]
+            changes[task] = {'labels': [label], 'status': 'closed',
+                             'comments': [{'id': str(100 + index), 'text': text,
+                                           'created_at': '2026-01-01T00:00:00Z'}]}
+        for task in ids[8:12]:
+            changes[task] = {'labels': [kinds[0][0] if task == ids[8] else 'proposal']}
+        self.seed(changes)
+        self.backend.calls = []
+        listed = self.request('GET', '/v1/projects/%s/tasks?limit=100' % project, token=alex)
+        self.assertEqual(200, listed.status, listed.data)
+        self.assertEqual({item['id'] for item in listed.data['items']}, set(ids[8:]))
+        actions = [call[0] for call in self.backend.calls]
+        self.assertEqual(actions.count('anchors'), 1)
+        # Few labelled rows: the one read names exactly them (bd show, no export).
+        named = [call[1] for call in self.backend.calls if call[0] == 'anchors']
+        self.assertEqual(sorted(named[0]), sorted(ids[:12]))
+        self.assertNotIn(('bd', ('comments',)), self.backend.calls)
+        self.assertEqual(sorted(actions), sorted(['bd', 'work', 'anchors']))
+        # The single-task route reads one row's comments, once, and refuses the anchor.
+        self.backend.calls = []
+        refused = self.request('GET', '/v1/projects/%s/tasks/%s' % (project, ids[0]), token=alex)
+        self.assertEqual(404, refused.status, refused.data)
+        self.assertEqual(self.backend.calls.count(('bd', ('comments',))), 1)
+
+    def test_more_labelled_rows_than_the_cap_cost_one_export_read(self):
+        alex, project = self.setup_project()
+        anchor = self.create_task(alex, project, 'anchor').data['id']
+        path = self.canonical_root / 'canonical.json'
+        state = json.loads(path.read_text(encoding='utf-8'))
+        for row in state['rows']:
+            if row['id'] == anchor:
+                row.update(labels=['capability'], status='closed', comments=[
+                    {'id': '900', 'text': 'Kind: capability-entry-v1\n{}', 'created_at': '2026-01-01T00:00:00Z'}])
+        extra = ['kittrial-5bb.%d' % (9000 + index) for index in range(rc.ANCHOR_READ_IDS_MAX)]
+        state['rows'].extend({'id': task, 'title': 'labelled', 'description': '', 'status': 'open',
+                              'assignee': None, 'issue_type': 'task', 'comments': [],
+                              'labels': ['proposal'], 'dependencies': [],
+                              'created_at': '2026-01-01T00:00:00Z'} for task in extra)
+        path.write_text(json.dumps(state), encoding='utf-8')
+        self.backend.calls = []
+        listed = self.request('GET', '/v1/projects/%s/tasks?limit=100' % project, token=alex)
+        self.assertEqual(200, listed.status, listed.data)
+        self.assertEqual(listed.data['total'], len(extra))
+        self.assertNotIn(anchor, {item['id'] for item in listed.data['items']})
+        self.assertEqual([call for call in self.backend.calls if call[0] == 'anchors'], [('anchors', ())])
+
+    def test_a_list_without_labelled_rows_makes_no_anchors_read(self):
+        alex, project = self.setup_project()
+        for index in range(3):
+            self.assertEqual(201, self.create_task(alex, project, 'plain %d' % index).status)
+        self.backend.calls = []
+        listed = self.request('GET', '/v1/projects/%s/tasks' % project, token=alex)
+        self.assertEqual(200, listed.status, listed.data)
+        self.assertEqual(sorted(call[0] for call in self.backend.calls), ['bd', 'work'])
 
 
 class ScopeAndConfigTests(unittest.TestCase):

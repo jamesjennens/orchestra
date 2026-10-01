@@ -906,6 +906,21 @@ def record_comment_kind(text):
     return (kind, version, 'supported' if supported else 'unsupported')
 
 
+# The HTTP list asks for the anchors among at most this many labelled rows by id,
+# in one `bd show --include-comments`; above it, one `bd export --all` is the cheaper
+# read (kittrial-5bb.71 review 01a0f8b5, `scale-and-lock`).
+ANCHOR_READ_IDS_MAX = 50
+
+
+def record_anchor_ids(rows):
+    """The sorted ids of the record anchors among full rows (with comments), by the
+    same predicate every surface uses. One export answers a whole snapshot, so a
+    reader that listed rows without comments pays one read, not one per labelled row
+    (kittrial-5bb.71)."""
+    return sorted(str(row['id']) for row in rows
+                  if isinstance(row, dict) and row.get('id') is not None and is_record_anchor(row))
+
+
 def hide_records(rows):
     """The rows a surface may show: record anchors dropped, and record comments
     removed from every other row (copied, never mutated in place)."""

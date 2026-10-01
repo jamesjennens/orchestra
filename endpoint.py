@@ -150,6 +150,36 @@ def execute(root,request,authority_config=None,require_authority=False):
     if action in ('onboard','docs'):
         from onboarding import execute as onboard
         return {'returncode':0,'stdout':onboard(Path(__file__).resolve().parent,path,name,actor,action,request.get('args',[]),endpoint=Path(__file__).resolve()),'stderr':''}
+    if action=='anchors':
+        # Read-only (kittrial-5bb.71): which rows are record anchors, by the predicate
+        # every surface uses (reserved_comments.is_record_anchor), in ONE native read:
+        # with task ids (at most ANCHOR_READ_IDS_MAX) only those rows, labels and
+        # comments, through `bd show --include-comments`; with none, the whole
+        # snapshot through `bd export --all`. Like refresh's export it takes no
+        # coordination lock and writes no operation-journal row (it is not
+        # run_guarded), so it never waits on a writer or makes one wait. One bd
+        # command is one read; a row a concurrent writer has labelled but not yet
+        # recorded reads as an ordinary row, exactly like one whose writer crashed.
+        from reserved_comments import ANCHOR_READ_IDS_MAX, record_anchor_ids
+        ids=request.get('args') or []
+        if (not isinstance(ids,list) or len(ids)>ANCHOR_READ_IDS_MAX or len(set(ids))!=len(ids)
+                or any(not isinstance(x,str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,160}',x) for x in ids)):
+            raise ValueError('anchors takes no arguments, or at most %d distinct task ids'%ANCHOR_READ_IDS_MAX)
+        if ids:
+            completed=native.run(native.argv(root,path,actor,['show',*ids,'--json','--include-comments']),environment(root))
+            try:missing=completed.returncode==1 and json.loads(completed.stdout).get('error')=='no issues found matching the provided IDs'
+            except (ValueError,AttributeError):missing=False
+            if missing:
+                # Every listed row was deleted after the list: none is an anchor.
+                rows,warnings=[],completed.stderr or ''
+            else:
+                stdout,warnings=native.split(completed)
+                rows=json.loads(stdout or '[]')
+                rows=[r for r in (rows if isinstance(rows,list) else [rows]) if isinstance(r,dict) and r.get('id') in ids]
+        else:
+            stdout,warnings=native.split(native.run(native.argv(root,path,actor,['export','--all']),environment(root)))
+            rows=[json.loads(line) for line in stdout.splitlines() if line.strip()]
+        return {'returncode':0,'stdout':json.dumps({'schema_version':1,'anchors':record_anchor_ids(rows)})+'\n','stderr':warnings}
     if action in ('brief','history','checkpoint'):
         from briefing import execute as briefing_execute
         args=request.get('args',[])

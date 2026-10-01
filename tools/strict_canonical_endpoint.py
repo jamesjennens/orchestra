@@ -154,6 +154,12 @@ class Canonical:
             row = self._mutate(change)
             return 0, json.dumps(row), ''
         if command == 'comments':
+            if rest[:1] != ['add'] and len(rest) >= 1:
+                # `bd comments TASK --json`: the task's comments, as bd prints them.
+                row = next((r for r in self.rows() if r['id'] == rest[0]), None)
+                if row is None:
+                    return 2, '', 'task not found'
+                return 0, json.dumps(row.get('comments') or []), ''
             if rest[:1] != ['add'] or len(rest) < 3:
                 return 2, '', 'unsupported comments form'
             task, text = rest[1], rest[2]
@@ -245,6 +251,20 @@ def dispatch(canonical, request, tmp, run=None):
         items = {k: dict(v, path=str(Path(tmp) / k)) for k, v in attachments.items()}
         result = work_execute(canonical.path, actor, action, args, items, run)
         return envelope(0, json.dumps(result, ensure_ascii=False) + '\n')
+    if action == 'anchors':
+        # endpoint.py's read-only anchors action (kittrial-5bb.71): the anchors among
+        # the given task ids (bd show --include-comments there), or the snapshot.
+        try:
+            from reserved_comments import ANCHOR_READ_IDS_MAX, record_anchor_ids
+        except ImportError:  # a revision that predates the action
+            raise ValueError('Unknown action')
+        if len(args) > ANCHOR_READ_IDS_MAX or len(set(args)) != len(args):
+            raise ValueError('anchors takes no arguments, or at most %d distinct task ids'
+                             % ANCHOR_READ_IDS_MAX)
+        rows = [json.loads(line) for line in run(['export', '--all']).splitlines() if line.strip()]
+        if args:
+            rows = [row for row in rows if row.get('id') in args]
+        return envelope(0, json.dumps({'schema_version': 1, 'anchors': record_anchor_ids(rows)}) + '\n')
     if action == 'lifecycle':
         from lifecycle import apply_native
         payload = json.loads(args[0]) if args and isinstance(args[0], str) else None
