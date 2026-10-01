@@ -1113,16 +1113,35 @@ class EndpointBackend:
         # at this one seam, so the task list with its Closed/All tabs and `q` search,
         # agent attention and every other snapshot reader never shows them
         # (kittrial-5bb.64; the shared hidden-surface list).
-        rows = hide_records(self._with_record_comments(project_id,
-                                                       self._in_project(rows, project_id)))
+        rows = hide_records(self._without_record_anchors(project_id,
+                                                         self._in_project(rows, project_id)))
         return {'items': rows, 'total': len(rows)}
+
+    def _without_record_anchors(self, project_id, rows):
+        """Drop the record anchors from a listed snapshot with ONE canonical read.
+
+        ``bd list`` returns no comments, and a row is an anchor only when it also
+        holds a v1 record comment, so the endpoint's read-only ``anchors`` action
+        answers the whole snapshot from one export (kittrial-5bb.71). A snapshot with
+        no row carrying a record type label needs no extra read at all. A failed or
+        malformed answer fails the list closed rather than showing anchors.
+        """
+        if not any(isinstance(row, dict) and carries_record_label(row) for row in rows):
+            return rows
+        reply = self._run('anchors', project_id, self.actor_namespace + '/read', [])
+        anchors = reply.get('anchors') if isinstance(reply, dict) else None
+        if not isinstance(anchors, list) or not all(isinstance(item, str) for item in anchors):
+            raise uncertain('Canonical anchors read returned an unexpected shape')
+        hidden = set(anchors)
+        return [row for row in rows if not (isinstance(row, dict) and str(row.get('id')) in hidden)]
 
     def _with_record_comments(self, project_id, rows):
         """Give rows carrying a record type label their comments.
 
-        ``bd list`` and ``bd show`` return no comments, and a row is a record anchor
-        only when it also holds a v1 record comment (reserved_comments.is_record_anchor),
-        so only those few labelled rows cost one extra ``comments`` read.
+        Used for the single row of :meth:`get_task` (``bd show`` returns no comments,
+        and a row is a record anchor only when it also holds a v1 record comment):
+        at most one extra ``comments`` read per request. Lists use
+        :meth:`_without_record_anchors` instead, one read per snapshot.
         """
         out = []
         for row in rows:
