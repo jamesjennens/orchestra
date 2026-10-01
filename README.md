@@ -47,6 +47,8 @@ Subsequent work on an existing job normally gets another task. A replacement wor
 
 The `refresh` command builds current summaries, complete issue pages and daily journals with backlinks for later annotations. Beads is authoritative; Markdown is a dated projection. Refresh is an explicit step in the working agreement, not a transaction with the preceding update. A failed refresh can be repeated safely.
 
+The `views/jobs/` and `views/journal/` folders are generated and owned by refresh. Refresh removes any `.md` file there that it did not write, including one you made by hand, so keep your own notes elsewhere. It never prunes through a `jobs` or `journal` folder that is a symlink or resolves outside `views`: it leaves that folder's files alone and names it under `prune_skipped` in its output.
+
 ## Scope of the pilot
 
 This is an independent community kit built around Beads and Dolt, not an official distribution of either project. It is published under the [MIT license](LICENSE) at [jamesjennens/orchestra](https://github.com/jamesjennens/orchestra). The tested scope and pending workplace validation are explicit in the plan. Contributions use the [contribution guide](CONTRIBUTING.md). Upstream dependencies retain their own licenses.
