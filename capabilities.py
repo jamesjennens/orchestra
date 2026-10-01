@@ -64,7 +64,7 @@ FILES_MAX = 20_000
 FILE_BYTES_MAX = 2_000_000
 PARSE_STACK_BYTES = (512 * 1024 * 1024, 255 * 1024 * 1024)  # Windows refuses 256 MB and above
 PARSE_STACK_BYTES_PER_LEVEL = 512
-NESTING_MAX_BIG_STACK = 1_000_000
+NESTING_MAX_BIG_STACK = 50_000
 NESTING_MAX = 2_000 if os.name == 'nt' else 5_000
 TOKENIZE_BUDGET_BYTES = 16_000_000
 LINE_TEXT_MAX = 2_000
@@ -468,10 +468,82 @@ def _reset_parse_state():
 # and displays cannot nest past the tokenizer's 200-level limit, and indentation stops
 # at 100, so long chains of these within one logical line are the only way to build a
 # very deep tree.
-NESTING = re.compile(rb'[-+*/%@&|^~.(\[]|\b(?:not|if|lambda|await|yield)\b')
+NESTING = re.compile(rb'[-+*/%@&|^~.<>(\[]|\b(?:not|if|lambda|await|yield)\b')
 NESTING_OPS = frozenset({'+', '-', '*', '/', '//', '%', '@', '&', '|', '^', '~', '**', '<<', '>>',
                          '.', '(', '['})
 NESTING_WORDS = frozenset({'not', 'if', 'lambda', 'await', 'yield'})
+
+
+def _skip_string(data, start):
+    """The index just past the string literal that starts at `start` (a quote byte).
+
+    Triple quotes and backslash escapes are honoured. An unterminated single-line
+    string conservatively swallows the rest of the file: that can only join logical
+    lines, never split one."""
+    quote = data[start]
+    triple = data[start:start + 3] == bytes([quote]) * 3
+    end = start + (3 if triple else 1)
+    size = len(data)
+    while end < size:
+        char = data[end]
+        if char == 0x5C:  # a backslash escapes the next byte
+            end += 2
+            continue
+        if triple:
+            if data[end:end + 3] == bytes([quote]) * 3:
+                return end + 3
+            end += 1
+        elif char == quote:
+            return end + 1
+        elif char == 0x0A:  # an unterminated single-line string: stay conservative
+            return size
+        else:
+            end += 1
+    return size
+
+
+def _logical_line_peak(data, limit):
+    """A cheap upper bound on the nesting-capable tokens in any one logical line.
+
+    One byte scan: comments and string literals are skipped for bracket tracking, a
+    newline ends a logical line only at bracket depth zero with no backslash
+    continuation, and `NESTING` counts the tokens in each such chunk. Counting the raw
+    bytes (string and comment text included) can only make the bound larger, and a
+    chunk never ends before the true logical line does, so a peak at or below `limit`
+    proves that no logical line nests more than `limit`. Returns as soon as one chunk
+    passes it."""
+    size = len(data)
+    position = start = depth = peak = 0
+    while position < size:
+        char = data[position]
+        if char == 0x23:  # '#': a comment runs to the end of the line
+            found = data.find(b'\n', position)
+            position = size if found < 0 else found
+            continue
+        if char in (0x27, 0x22):  # a string literal
+            position = _skip_string(data, position)
+            continue
+        if char in (0x28, 0x5B, 0x7B):  # ( [ {
+            depth += 1
+        elif char in (0x29, 0x5D, 0x7D):  # ) ] }
+            if depth:
+                depth -= 1
+        elif char == 0x0A:  # a newline ends the logical line only at depth zero
+            continued = position and (data[position - 1] == 0x5C or (
+                data[position - 1] == 0x0D and position > 1 and data[position - 2] == 0x5C))
+            if depth == 0 and not continued:
+                count = len(NESTING.findall(data[start:position + 1]))
+                if count > peak:
+                    peak = count
+                    if peak > limit:
+                        return peak
+                start = position + 1
+        position += 1
+    if start < size:
+        count = len(NESTING.findall(data[start:size]))
+        if count > peak:
+            peak = count
+    return peak
 
 
 def _deepest_logical_line(data, limit):
@@ -497,23 +569,26 @@ def parse_python(data, rel):
     """ast.parse that cannot crash the interpreter.
 
     CPython 3.10 converts a deeply nested expression (a long `1+1+...`, `a.b.b...`,
-    `f()()...` or `a[0][0]...` chain) to Python objects with unchecked C recursion and
-    crashes the process instead of raising RecursionError. On koopa's 3.10 a
-    1,000,000-level chain needs 64-128 MB of C stack, and a file under FILE_BYTES_MAX
-    holds at most about that many levels. So run() parses on a worker thread with a
-    512 MB stack (255 MB where the platform allows no more, as on Windows), and trusts
-    it for up to stack / PARSE_STACK_BYTES_PER_LEVEL levels: 4x the measured need.
-    Ordinary files, dot-heavy ones included, are parsed directly; only a file almost
-    entirely made of nesting characters is ever tokenized. If no such thread could be
-    made, the fallback is the per-logical-line guard: a cheap whole-file count, then
-    an exact tokenize pass (early return, 16 MB per-run budget) against NESTING_MAX.
-    Python 3.11 and later raise RecursionError instead of crashing, which is caught.
+    `f()()...`, `a[0][0]...` or `1<<1<<...` chain) to Python objects with unchecked C
+    recursion and crashes the process instead of raising RecursionError. run() parses on
+    a worker thread with a 512 MB stack (255 MB where the platform allows no more, as on
+    Windows), and trusts it for at most NESTING_MAX_BIG_STACK levels: 50,000 levels need
+    about 25 MB of C stack, so one hostile file cannot commit hundreds of MB.
+
+    A cheap per-logical-line pre-count (`_logical_line_peak`: one byte scan, no
+    tokenizer) decides whether the exact tokenize pass is needed. Ordinary files,
+    dot-heavy ones included, are parsed directly even when a whole-file count would be
+    large; only a file whose logical line may out-nest the limit is tokenized. If no
+    worker thread could be made, the fallback guard on the calling thread uses
+    NESTING_MAX (5,000, or 2,000 on Windows): the same pre-count, then an exact tokenize
+    pass (early return, 16 MB per-run budget) against NESTING_MAX. Python 3.11 and later
+    raise RecursionError instead of crashing, which is caught.
     """
     if _parse['stack_bytes']:
         limit = min(NESTING_MAX_BIG_STACK, _parse['stack_bytes'] // PARSE_STACK_BYTES_PER_LEVEL)
     else:
         limit = NESTING_MAX
-    if len(NESTING.findall(data)) > limit:
+    if _logical_line_peak(data, limit) > limit:
         if _parse['tokenize_left'] < len(data):
             _parse['budget_spent'] = True
             raise TooComplex('the per-run tokenize budget is spent')
@@ -534,6 +609,9 @@ def parse_warnings(skipped):
         found.append('skipped %d Python file(s) that could nest too deeply to parse safely%s'
                      % (skipped['too-complex'],
                         ' (the per-run tokenize budget was spent)' if _parse['budget_spent'] else ''))
+    if skipped.get('parse-error'):
+        found.append('skipped %d Python file(s) that could not be parsed'
+                     % skipped['parse-error'])
     if skipped.get('heading-limit'):
         found.append('skipped %d heading(s) beyond %d per Markdown file'
                      % (skipped['heading-limit'], HEADINGS_PER_FILE_MAX))
@@ -541,16 +619,6 @@ def parse_warnings(skipped):
         found.append('skipped %d definition(s) beyond %d per Python file'
                      % (skipped['definition-limit'], DEFINITIONS_PER_FILE_MAX))
     return found
-
-
-def _grant_parse_stack():
-    """Set the largest allowed worker stack; (previous, granted) or None if refused."""
-    for size in PARSE_STACK_BYTES:
-        try:
-            return threading.stack_size(size), size
-        except (ValueError, RuntimeError, OverflowError):
-            continue
-    return None
 
 
 def _start_worker(target):
@@ -562,9 +630,11 @@ def _start_worker(target):
 def with_parse_stack(function):
     """Run function() on a worker thread with a big stack (see parse_python).
 
-    Falls back to the calling thread, with the stricter per-line guard, when the
-    platform refuses every stack size or cannot start the thread (32-bit builds,
-    strict overcommit). The default stack size is restored for every later thread.
+    Every allowed stack size is tried in turn (512 MB, then 255 MB): a size the platform
+    will not grant is skipped, and one it grants but cannot start a thread with is
+    retried at the next size. Only when no worker can be started does the run fall back
+    to the calling thread with the stricter guard (32-bit builds, strict overcommit).
+    The default stack size is restored for every later thread.
     """
     box = {}
 
@@ -574,10 +644,11 @@ def with_parse_stack(function):
         except BaseException as exc:  # re-raised on the calling thread
             box['error'] = exc
 
-    granted = _grant_parse_stack()
-    worker = None
-    if granted is not None:
-        previous, size = granted
+    for size in PARSE_STACK_BYTES:
+        try:
+            previous = threading.stack_size(size)
+        except (ValueError, RuntimeError, OverflowError):
+            continue
         _parse['stack_bytes'] = size
         try:
             worker = _start_worker(target)
@@ -585,13 +656,14 @@ def with_parse_stack(function):
             worker = None
         finally:
             threading.stack_size(previous)
-    if worker is None:
-        _parse['stack_bytes'] = 0
-        return function()
-    worker.join()
-    if 'error' in box:
-        raise box['error']
-    return box['value']
+        if worker is None:
+            continue
+        worker.join()
+        if 'error' in box:
+            raise box['error']
+        return box['value']
+    _parse['stack_bytes'] = 0
+    return function()
 
 
 def index_python(rel, data, index, facts):
