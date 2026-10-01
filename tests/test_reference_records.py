@@ -525,5 +525,47 @@ class ReadIsolationTests(ReferenceCase):
                          ['unset', 'expired', 'due-soon', 'due-soon', 'ok'])
 
 
+class WorkAndBriefIntegrationTests(ReferenceCase):
+    """`work` and `brief` read the export they already take; reference rows are attention, never work."""
+
+    def setUp(self):
+        super().setUp()
+        self.propose(review_by='2026-10-10')
+        self.accept(1, self.sha(1))
+        self.propose(operation_id='b-1', key='feed.units', owner='person:bob', review_by=None, tags=['data'])
+        self.native.seed('task-1', labels=['calendar'])
+        self.native.row('task-1')['assignee'] = 'alice'
+
+    def export(self, argv):
+        assert argv == ['export', '--all']
+        return '\n'.join(json.dumps(row) for row in self.native.rows) + '\n'
+
+    def work(self, actor, *args):
+        import work
+        return work.execute(self.project, actor, 'work', list(args), {}, self.export, operators=[OPERATOR])
+
+    def test_work_carries_counts_for_everyone_and_items_for_an_approver(self):
+        worker = self.work('alice', '--mine')
+        self.assertEqual([item['task'] for item in worker['items']], ['task-1'])
+        block = worker['attention']['reference_review']
+        self.assertEqual({k: block[k] for k in ('due_soon', 'unset', 'total')}, {'due_soon': 1, 'unset': 1, 'total': 2})
+        self.assertEqual(block['items'], [])
+        approver = self.work(OPERATOR)['attention']['reference_review']
+        self.assertEqual([item['key'] for item in approver['items']], ['calendar.trading'])
+        self.assertNotIn('ref-1', [item['task'] for item in self.work(OPERATOR)['items']])
+        with self.assertRaisesRegex(ValueError, '--ref-limit'):
+            self.work('alice', '--ref-limit', '0')
+        import work
+        self.assertIn('--ref-limit', work.help_payload('work')['usage'])
+
+    def test_brief_shows_tagged_and_due_entries_with_trust(self):
+        import briefing
+        result = briefing.brief(self.native.rows, 'p', 'task-1', operators=[OPERATOR])
+        self.assertEqual([(item['key'], item['due'], item['trust']) for item in result['attention']],
+                         [('calendar.trading', 'due-soon', 'accepted')])
+        self.assertNotIn('Charts derive', json.dumps(result['attention']))
+        self.assertIn('Reference review [due-soon, accepted]', briefing.format_brief(result))
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -192,7 +192,11 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None):
     # The host-issued revert list is bounded the same way the prior-contribution
     # chain is; the untruncated count stays available beside the slice.
     reverts=review.get('reverts') or []
-    return {'task':task,'title':clip(issue.get('title'),200),'owner':clip(issue.get('assignee') or 'unassigned',96),'status':issue.get('status'),
+    # Reference catalog review-by attention (.41 7.1): at most 3 trust-marked items,
+    # server-derived text only; it never touches the checkpoint item vocabulary.
+    from reference_records import brief_attention
+    attention=brief_attention(rows,issue,operators)
+    return {**attention,'task':task,'title':clip(issue.get('title'),200),'owner':clip(issue.get('assignee') or 'unassigned',96),'status':issue.get('status'),
             'activity_cursor':activity_cursor(data),'checkpoint':None if p is None else {'comment_id':str(c['id']),'author':clip(c.get('author'),96),'timestamp':c.get('created_at'),'source_commit':p['source_commit'],'branch':p['branch'],'incorporated_activity_cursor':p['activity_cursor'],
                 'newer_activity':p['activity_cursor']!=activity_cursor(snapshot(rows,project,task,str(c['id'])))},
             'intent':clip(p['intent'] if p else issue.get('description'),600),'acceptance':clip(p['acceptance'] if p else issue.get('acceptance_criteria'),1000),
@@ -295,6 +299,10 @@ def format_brief(result):
     lines += ['Native dependencies: '+json.dumps(result['dependencies'],ensure_ascii=False), 'Lifecycle: '+', '.join(k+'='+v['value'] for k,v in result['lifecycle'].items()),
               'Lifecycle scope: '+json.dumps(result['lifecycle_scope'],ensure_ascii=False),'Current activity cursor: '+result['activity_cursor'],
               'Evidence: '+json.dumps(result['evidence'],ensure_ascii=False),*result['warnings']]
+    for item in result.get('attention') or []:
+        lines.append('Reference review [%s, %s]: %s (%s)'%(item['due'],item['trust'],item['text'],item['source']))
+    if result.get('attention_more'):
+        lines.append('More reference attention: %d (ref list --due expired)'%result['attention_more'])
     return '\n'.join(lines)+'\n'
 
 def help_limits(action):
@@ -314,7 +322,10 @@ def help_limits(action):
 def help_notes(action):
     if action=='brief':
         return ['Unresolved items come from the latest valid checkpoint; a missing checkpoint means unknown, not zero.',
-                '--limit/--offset are not brief options; use --items-limit/--items-offset.']
+                '--limit/--offset are not brief options; use --items-limit/--items-offset.',
+                'attention lists at most 3 reference-review items (entries tagged with the task\'s labels, '
+                'then expired and due-soon), expired first, each with trust; attention_total and '
+                'attention_more count the rest. Reading changes nothing.']
     if action=='history':
         return ['Pages are snapshot-bound; pass next_cursor back to continue the same snapshot.']
     return ['A JSON file attachment is required; payload.task must equal TASK.',

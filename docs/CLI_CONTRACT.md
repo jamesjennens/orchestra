@@ -176,6 +176,27 @@ record's comment ID**, not a Git SHA and not `latest_comment_id`), `commit`,
 `integrated`; `workflow_state` keeps the raw workflow state. See
 [REVIEWS.md](REVIEWS.md) for their meaning.
 
+`work` also returns an additive `attention.reference_review` block. It is computed
+over the whole project, whatever the task filters, from the export `work` already
+reads.
+
+- **Counts, always:**
+  - `expired` and `due_soon`, for accepted reference entries;
+  - `unset`, for draft-only entries;
+  - `acceptance_inert`, for entries whose accepting operator is no longer on the
+    allowlist;
+  - `malformed`;
+  - `total`.
+- **`items`** are returned only to an approver, which on the SSH route means an actor
+  on the deployment operator allowlist.
+  - Each item has `key`, `review_by`, `due`, `owner`, `state` and `revision`, plus
+    `inert_operator` on an inert entry.
+  - Inert entries come first, then expired, then due-soon.
+  - Items are paged by `--ref-limit` (1..100) and `--ref-offset`.
+- **Other callers** get `items: []` with `truncated: true` and a `coverage` note.
+  - An entry owner sees their own entries with `ref list --owner IDENTITY`.
+  - Draft entries are listed by `ref list --state draft-only`.
+
 `show TASK --json` returns native issue rows. `comments TASK --json` returns native
 comment rows. In raw rows a task's `assignee` is a plain string; in briefing/history
 views identity and authorship become excerpt objects (below).
@@ -194,6 +215,18 @@ objects**:
 a bare string; treat `omitted_chars > 0` as "read `show`/`history` for the full value".
 Opaque cursor fields (`activity_cursor`, `next_cursor`) are never excerpted: they are
 complete tokens.
+
+`brief` adds an `attention` array of at most 3 `reference-review` items, plus
+`attention_total` and `attention_more`.
+
+- **Selection:** entries tagged with one of the task's labels, plus expired and
+  due-soon entries, with expired first.
+- **Each item** has `key`, `due`, `review_by`, `trust` (`accepted`), `title` (an
+  excerpt object), `text` and `source` (`ref get KEY`).
+- **`text`** is server-derived from the key, the due class and the date. It never
+  includes the entry's statement.
+- **Separate from open items.** These items are not checkpoint items, and reading a
+  brief changes nothing.
 
 `brief` decodes unresolved items as `open_items[]` with `id`, `kind`, `text`, `source`;
 `history` pages entries with `entry_id`, `body`, `body_offset`, `body_total_chars` and
@@ -466,6 +499,8 @@ a clear refusal, not a wrong read.
 | `work` | `--limit`, `--handoff-limit` | 1..100 |
 | `work` | `--offset`, `--handoff-offset` | >= 0 |
 | `work` | `--state` | one of the documented review states |
+| `work` | `--ref-limit` / `--ref-offset` | 1..100 (default 20) / >= 0 |
+| `brief` | `attention` | at most 3 items |
 | `brief` | `--items-offset` | >= 0 |
 | `brief` | `--items-limit` | 1..10 |
 | `history` | `--limit` | 1..20 |
