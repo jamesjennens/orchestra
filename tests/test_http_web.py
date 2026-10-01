@@ -997,6 +997,27 @@ class AgentPromptRouteCase(TeamHarness):
         prompts, _ = self.prompts(self.otto)
         self.assertEqual([], prompts)
 
+    def test_an_agent_with_no_projects_gets_a_grant_note_not_a_status_summary(self):
+        created = self.request('POST', '/v1/agents', {'name': 'idle-bot'}, token=self.carl)
+        self.assertEqual(201, created.status, created.data)
+        self.claim(self.carl)
+        prompts, _ = self.prompts(self.carl)
+        self.assertEqual([('idle-bot', 'empty')], [(p['agent_name'], p['kind']) for p in prompts])
+        text = prompts[0]['text']
+        self.assertEqual('Copy note for idle-bot', prompts[0]['label'])
+        self.assertIn('This agent has no projects yet.', text)
+        self.assertIn('My agents', text)
+        self.assertNotIn('can only view', text)
+        self.assertNotIn('- task ', text)
+        self.assertEqual(0, prompts[0]['items'])
+        # Granting a project turns it into an action prompt.
+        aid = created.data['agent']['id']
+        granted = self.request('PATCH', '/v1/agents/%s' % aid, {'projects': [self.project]},
+                               token=self.carl)
+        self.assertEqual(200, granted.status, granted.data)
+        prompts, _ = self.prompts(self.carl)
+        self.assertEqual('action', prompts[0]['kind'])
+
     def test_only_own_agents_get_prompts(self):
         self.agent(self.carl, 'carl-worker')
         prompts, _ = self.prompts(self.olive)

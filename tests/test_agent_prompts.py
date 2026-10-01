@@ -175,6 +175,22 @@ class PromptCase(unittest.TestCase):
         text = result['text']
         self.assertLess(text.index('READ-ONLY projects'), text.index('task b1'))
 
+    def test_no_projects_gives_a_grant_note_without_an_action_list(self):
+        for agent, reason in ((AGENT, 'This agent has no projects yet.'),
+                              (dict(AGENT, projects=['p9']),
+                               'None of the projects granted to this agent can be opened')):
+            result = prompt([], agent=agent)
+            self.assertEqual('empty', result['kind'])
+            self.assertEqual('Copy note for olive-coord', result['label'])
+            self.assertEqual(0, result['items'])
+            text = result['text']
+            self.assertIn('NO PROJECTS YET.', text)
+            self.assertIn(reason, text)
+            self.assertIn('grant this agent a project on the My agents page', text)
+            for absent in ('can only view', 'READ-ONLY', 'Before you act', '- task ',
+                           '/v1/agents/me/next'):
+                self.assertNotIn(absent, text)
+
     def test_nothing_to_do(self):
         self.assertIn('Nothing needs action right now.',
                       prompt([classify(WORKER, [row('t1', 'awaiting-review', OTHER)])])['text'])

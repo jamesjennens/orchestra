@@ -47,15 +47,20 @@ export async function home(ctx) {
 // "Copy prompt for my agent": one button per agent the person owns. The server builds
 // each prompt from this same My work data (ids, states and actions it derives; titles
 // only as sanitised labels; never a secret). A person who can only view gets a
-// read-only status summary instead.
+// read-only status summary instead, and an agent with no projects gets only a short
+// "no projects yet" note (kind "empty") pointing its owner at My agents.
+const PROMPT_WHAT = { status: 'Status summary', empty: 'Note' };
 export function agentPromptPanel(ctx, data) {
   const prompts = data.agent_prompts || [];
+  const idle = prompts.filter((p) => p.kind === 'empty');
   const body = prompts.length
     ? h('div', { class: 'panel-body stack' },
       h('p', { class: 'small muted' }, 'Paste into the agent’s chat in its folder. The agent first checks its own list in Orchestra and reports any difference to you before acting.'),
-      h('div', { class: 'copy-row' }, prompts.map((p) => copyButton(p.label, p.text, { ariaLabel: p.label, what: p.kind === 'status' ? 'Status summary' : 'Prompt' }))),
-      h('p', { class: 'small muted' }, prompts.map((p) => `${p.agent_name}: ${p.items} item(s)${p.omitted ? ` (+${p.omitted} more)` : ''}`).join(' · '),
-        data.generated_at ? [' · snapshot ', time(data.generated_at)] : null))
+      h('div', { class: 'copy-row' }, prompts.map((p) => copyButton(p.label, p.text, { ariaLabel: p.label, what: PROMPT_WHAT[p.kind] || 'Prompt' }))),
+      h('p', { class: 'small muted' }, prompts.filter((p) => p.kind !== 'empty').map((p) => `${p.agent_name}: ${p.items} item(s)${p.omitted ? ` (+${p.omitted} more)` : ''}`).join(' · '),
+        data.generated_at ? [' · snapshot ', time(data.generated_at)] : null),
+      idle.length ? h('p', { class: 'small muted' }, `${idle.map((p) => p.agent_name).join(', ')}: no projects yet. `,
+        h('a', { href: ctx.href('/agents') }, 'Grant one on My agents'), ' to give it work.') : null)
     : h('div', { class: 'panel-body' }, h('p', { class: 'small muted' }, 'You have no agents yet. ',
       h('a', { href: ctx.href('/agents') }, 'Add one on My agents'), ' to copy a prompt with this work for it.'));
   return h('section', { class: 'panel', 'aria-labelledby': 'h-agent-prompts' },

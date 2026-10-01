@@ -737,7 +737,10 @@ the pilot phase, not part of this service.
   with no recorded activity for 72 hours or more; workers: changes requested with the
   pending request item ids where the backend knows them, their claimed and delivered
   tasks, claimable tasks; viewers: a read-only status summary that tells the agent not
-  to change anything). At most 25 items, then "and N more". Every prompt carries its
+  to change anything; an agent with no granted project, or none its owner can still
+  open, gets only a short "no projects yet; grant one on My agents" note, `kind:
+  "empty"`, with no action list). My agents has a "Grant a project" form per agent.
+  At most 25 items, then "and N more". Every prompt carries its
   snapshot time, tells the agent to fetch its own list first (`/v1/agents/me/next`
   with `curl -K` and its per-agent file) and, for items that concern the owner rather
   than the agent, to compare with `/v1/projects/<id>/queue` and
