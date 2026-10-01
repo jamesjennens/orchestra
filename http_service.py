@@ -32,7 +32,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import agent_prompts
-from reserved_comments import carries_record_label, hide_records, is_record_anchor
+from reserved_comments import (ANCHOR_READ_IDS_MAX, carries_record_label, hide_records,
+                               is_record_anchor)
 from http_auth import (AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CAP_APPROVE,
                        CAP_CHECKPOINTS, CAP_FEEDBACK,
                        CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_READ, CAP_REVIEWS,
@@ -926,6 +927,11 @@ class EndpointBackend:
         reply = self._endpoint(action, project, actor, args, attachments,
                                operation_id=operation_id, authority=authority,
                                require_authority=require_authority, route=route)
+        return self._checked(reply)
+
+    @staticmethod
+    def _checked(reply):
+        """The payload of one canonical reply, or the HttpError its return code means."""
         code = reply.get('returncode') if isinstance(reply, dict) else None
         stderr = (reply.get('stderr') or '') if isinstance(reply, dict) else ''
         stdout = (reply.get('stdout') or '') if isinstance(reply, dict) else ''
@@ -1122,13 +1128,24 @@ class EndpointBackend:
 
         ``bd list`` returns no comments, and a row is an anchor only when it also
         holds a v1 record comment, so the endpoint's read-only ``anchors`` action
-        answers the whole snapshot from one export (kittrial-5bb.71). A snapshot with
-        no row carrying a record type label needs no extra read at all. A failed or
-        malformed answer fails the list closed rather than showing anchors.
+        answers the snapshot in one native read (kittrial-5bb.71): just the labelled
+        rows' labels and comments when there are at most ``ANCHOR_READ_IDS_MAX`` of
+        them, otherwise one export. The read takes no coordination lock. A snapshot
+        with no row carrying a record type label needs no extra read at all. A failed
+        or malformed answer fails the list closed rather than showing anchors.
         """
-        if not any(isinstance(row, dict) and carries_record_label(row) for row in rows):
+        labelled = [str(row.get('id')) for row in rows
+                    if isinstance(row, dict) and carries_record_label(row)]
+        if not labelled:
             return rows
-        reply = self._run('anchors', project_id, self.actor_namespace + '/read', [])
+        args = labelled if len(labelled) <= ANCHOR_READ_IDS_MAX else []
+        reply = self._endpoint('anchors', project_id, self.actor_namespace + '/read', args)
+        if isinstance(reply, dict) and reply.get('returncode') == 2 and \
+                'Unknown action' in (reply.get('stderr') or ''):
+            # An endpoint from an older kit than this HTTP service.
+            raise not_implemented('The canonical endpoint is older than this HTTP service '
+                                  'and has no anchors read; install the same kit for both')
+        reply = self._checked(reply)
         anchors = reply.get('anchors') if isinstance(reply, dict) else None
         if not isinstance(anchors, list) or not all(isinstance(item, str) for item in anchors):
             raise uncertain('Canonical anchors read returned an unexpected shape')
