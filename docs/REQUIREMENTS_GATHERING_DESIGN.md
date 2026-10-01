@@ -1,6 +1,6 @@
 # Contributed requirement proposals - design proposal
 
-Status: **proposal, revision 3. Not implemented, not accepted.** This document
+Status: **proposal, revision 4. Not implemented, not accepted.** This document
 changes no code. It proposes a record kind, a lifecycle and authority model, a
 coordinator input queue, an escalation path, attribution and statistics, a
 "my contributions" read, client commands, HTTP routes, backup/rollback coverage
@@ -49,16 +49,33 @@ Revision 3 (2026-09-30) answers the coordinator's five review items on revision
    `(priority, project, task)`, exactly as `_agent_attention` builds and sorts
    them (`http_service.py:2113-2121`, `:2222-2223`), with only the bounded
    `label` and the route `token` added.
-5. **tagged unions before v1 freezes** (P2, for kittrial-5bb.60):
+5. **tagged unions, frozen before v1** (P2, for kittrial-5bb.60):
    `requirement-proposal-v1.target` and
    `proposal-disposition-v1.incorporation` are tagged unions discriminated by
-   `kind` (`{"kind": "requirement", ...}`), so the capability index adds
-   `alias`/`capability` **variants** rather than a `-v2` kind or a parallel
-   record; a non-`requirement` incorporation carries **zero** weight, because it
-   has no `requirement_id` for the per-requirement cap to bound (3.3, 3.4, 6.2,
-   6.5). This is option (b); option (a), a separate alias record kind with its
-   own prefix, labels and slice-0 step, is rejected as the more expensive answer
-   to the same need.
+   `kind` (`{"kind": "requirement", ...}`). The `kind` discriminator is kept and
+   frozen with v1 because it is harmless and keeps a non-requirement item
+   representable, but it is not the capability index's storage: kittrial-5bb.60
+   keeps aliases in its **own** record kind (`capability-alias-v1`), and in this
+   design's slice-3 queue those items are a **read view** (`kind: alias` /
+   `kind: capability`) whose outcome is recorded by capability operations - fold
+   or reject - never by `proposal-disposition-v1`. A non-`requirement`
+   incorporation carries **zero** weight and never enters `incorporated_weight`,
+   because it has no `requirement_id` for the per-requirement cap to bound (3.3,
+   3.4, 6.2, 6.5, 9.2). The two designs state this in the same words.
+
+Revision 4 (2026-10-01) answers the coordinator's single `align-with-60` item on
+revision 3 (commit `18ac3ef`). It is a wording alignment with the kittrial-5bb.60
+capability-index design: the `kind` discriminator on `target` and `incorporation`
+is kept frozen (it is harmless), but this text no longer claims .60's aliases and
+capability drafts are tagged-union **variants** and no longer rejects a separate
+record kind. .60 keeps aliases in its own `capability-alias-v1` records; here
+they are slice-3 **read-view** items (`kind: alias` / `kind: capability`) settled
+by capability operations, never by `proposal-disposition-v1`, carrying **zero**
+weight and never entering `incorporated_weight` (3.3, 3.4, 6.2, 6.5, 9.2, 11).
+The shared hidden-surface list grows to **ten** with `refresh`'s
+`views/issues.jsonl` (`activity.py:4`), and 4.1 now records .60's `verifiers`
+deployment list beside the operator allowlist so one slice 0 serves `.41`, `.58`
+and `.60` (3.2, 8.5).
 
 Nothing here is implemented: there is no `proposal` command, no
 `requirement-proposal` record kind, no disposition ledger, no queue block and no
@@ -205,7 +222,10 @@ records: the HTTP task list reads the whole project (`read_tasks` is
 `bd list --all --limit 0 --json`, `http_service.py:1006-1018`), and
 `GET /tasks/{id}`, `/history` and `/brief` apply no record-kind filter
 (`http_service.py:2359-2395`, `:2451-2469`). The tolerant reader's explicit
-filter list is in 8.5, and slice 0 must ship it before any writer exists.
+filter list is in 8.5 - the shared **ten**-surface list
+(`docs/REFERENCE_CATALOG_DESIGN.md` §6.0's nine plus `refresh`'s
+`views/issues.jsonl`, `activity.py:4`) - and slice 0 must ship it before any
+writer exists.
 
 Why one anchor per proposal rather than one running comment thread per project:
 per-entry labels enable the queue and the `proposal get` route; per-entry
@@ -260,7 +280,7 @@ Field rules:
 | `revision` | positive integer; `1` at submit, `+1` on each submitter revision while the proposal is `needs-info` or `submitted`. |
 | `submitter` | durable `account:<uid>` or `person:<name>` (4.2). Refused if it is, or contains, a session actor. On HTTP it is bound server-side to the authenticated principal; it is never taken from the payload. |
 | `submitted_by_agent` | `null`, or `{"agent_id": "agent-0003", "on_behalf_of": "account:u-0001"}` where `on_behalf_of` equals `submitter` and is bound server-side from the agent record. Attribution, not authority. |
-| `target` | optional **tagged union** discriminated by `kind`, closed in v1 to the requirement family: `{"kind":"requirement","requirement_key":"..."}`, `{"kind":"requirement-area","area":"<slug>"}`, or `{"kind":"requirement-new"}`. The union is tagged from the first frozen version (3.8) so kittrial-5bb.60 adds `{"kind":"alias",...}` and `{"kind":"capability",...}` **variants** rather than a `-v2` kind or a parallel record; a `kind` outside the closed v1 set is refused. A `requirement` target's key is validated to resolve to an existing requirement record (`requirements.REQUIREMENT_FIELDS` identity) at write time; an unresolvable key is refused by name, never silently dropped. |
+| `target` | optional **tagged union** discriminated by `kind`, closed in v1 to the requirement family: `{"kind":"requirement","requirement_key":"..."}`, `{"kind":"requirement-area","area":"<slug>"}`, or `{"kind":"requirement-new"}`. The union is tagged from the first frozen version (3.8) so a non-requirement target is representable without changing the ledger; a `kind` outside the closed v1 set is refused. kittrial-5bb.60 does not add a v1 `target` kind: it keeps aliases in its own `capability-alias-v1` records and reaches this queue only as a read-view item (9.2). A `requirement` target's key is validated to resolve to an existing requirement record (`requirements.REQUIREMENT_FIELDS` identity) at write time; an unresolvable key is refused by name, never silently dropped. |
 | `text` | nonempty, <= 4000 characters. The proposal itself. Untrusted text (8.7). |
 | `rationale` | <= 4000 characters; optional at submit, required before a coordinator may mark it `incorporated` (5.4). |
 | `evidence` | 0..20 links, each <= 2000 characters, the same shape as the feedback journal's evidence list (`feedback.py:17-18`, `:138-141`). A `repo:` entry is `path@<40-hex commit>` and is a pointer only; the server never reads a repository path. |
@@ -325,7 +345,7 @@ Field rules and per-state requirements:
 | `duplicate_of` | required for `duplicate-of`; must name an existing proposal key that is not itself. |
 | `escalation` | required for `escalated-to-owner`: `{"question": "...", "owner_identity": "account:u-0002", "due_by": "YYYY-MM-DD"\|null}`. `owner_identity` is the coordinator's named decider; the route verifies it is a durable identity and a project owner. |
 | `decision` | required when `role` is `owner` (both the `approved` and the owner `rejected` disposition): `{"decision_id": "<native decision issue id>"}`, naming an existing native `decision` issue validated against `templates/DECISION.md`. The choice itself is `to_state`; the object never carries a requirement id, because the owner does not handle requirement ids (5.4). |
-| `incorporation` | required for `incorporated`: a **tagged union** discriminated by `kind`, whose only v1 variant is `{"kind":"requirement", ...}` and carries the linked requirement `{requirement_id, requirement_revision, requirement_sha256}`, the linked revision's `acceptance_state`, the F3 `decision_id` when accepted, the BRD `manifest_baseline`/`manifest_sha256` when the revision has been published, and the offline `change_classification` when the incorporation changed an accepted baseline (3.9). The `kind` discriminator is frozen with v1 so kittrial-5bb.60's alias/capability incorporations are a variant, not a second record kind (3.8); a non-`requirement` incorporation carries **zero** weight in statistics (6.2). Written by the coordinator on the `approved -> incorporated` transition, never by the owner. |
+| `incorporation` | required for `incorporated`: a **tagged union** discriminated by `kind`, whose only v1 variant is `{"kind":"requirement", ...}` and carries the linked requirement `{requirement_id, requirement_revision, requirement_sha256}`, the linked revision's `acceptance_state`, the F3 `decision_id` when accepted, the BRD `manifest_baseline`/`manifest_sha256` when the revision has been published, and the offline `change_classification` when the incorporation changed an accepted baseline (3.9). The `kind` discriminator is frozen with v1; a non-`requirement` incorporation carries **zero** weight in statistics (6.2) and never enters `incorporated_weight` (6.2). kittrial-5bb.60 keeps aliases in its own `capability-alias-v1` records and settles them through capability operations, so they never become `incorporation` values here (9.2). Written by the coordinator on the `approved -> incorporated` transition, never by the owner. |
 | `at` | ISO-8601 UTC, stamped by the command. |
 | `sha256` | content hash of every other field. |
 
@@ -577,13 +597,13 @@ The field sets are closed, so a new field is a new kind version:
 
 - **A new proposal *family* is not a new field or a new kind.** `target` and
   `incorporation` are tagged unions (§§3.3, 3.4) whose `kind` discriminator is
-  frozen with v1 and whose only v1 variant is `requirement`. kittrial-5bb.60's
-  alias and capability proposals therefore add `{"kind":"alias", ...}` and
-  `{"kind":"capability", ...}` **variants** to the same two fields - a small
-  reader widening in the style of slice 3's `kind: reference` - instead of a
-  `-v2` record kind, a parallel kind, or a rewrite of the disposition ledger.
-  That is the whole reason the union is tagged before slice 1a freezes v1, and it
-  costs one discriminator field now;
+  frozen with v1 and whose only v1 variant is `requirement`. The tag is kept so a
+  non-requirement item is representable without rewriting the disposition ledger;
+  it is not how kittrial-5bb.60 stores aliases. That slice keeps aliases in its
+  own `capability-alias-v1` records and reaches this queue only as a read-view
+  `kind: alias` / `kind: capability` item, settled by capability operations
+  rather than `proposal-disposition-v1` (9.2). The union is still tagged before
+  slice 1a freezes v1, and it costs one discriminator field now;
 - a new proposal field means `Kind: requirement-proposal-v2` with its own closed
   field set and validator; dispositions likewise;
 - a reader that meets an unknown `N` marks that one proposal `unsupported`,
@@ -658,6 +678,16 @@ must either add a second allowlisted operator or take owner decisions through
 HTTP, where two `CAP_APPROVE` members satisfy the same rule. A project with no
 configured operator authorizes nobody on the SSH owner route - the same
 fail-closed rule as `void-record` (`docs/OPERATIONS.md:166`).
+
+**Deployment authority lists, shared with the siblings.** The SSH authority is
+the deployment operator allowlist (`admin.operators`, `deployment.private.json`).
+kittrial-5bb.60 adds a second list beside it, the `verifiers` list
+(`admin.py verifiers add|remove|list`, empty by default, in
+`deployment.private.json`), which authorizes capability verification passes;
+older kits ignore the extra key, so it is not a rollback hazard. The shared
+slice 0 must recognize `.41`'s, `.58`'s and `.60`'s reserved prefixes, labels,
+credential scopes and filter list together, so one slice 0 serves all three
+designs.
 
 ### 4.2 Durable contributor identity
 
@@ -1035,7 +1065,7 @@ Per contributor (keyed by durable identity):
 | --- | --- |
 | `submitted` | total proposals whose `submitter` is this identity (all revisions collapsed) |
 | `outcomes` | counts of the terminal and open states: `under_review`, `incorporated`, `rejected`, `duplicate`, `escalated`, `needs_info`; plus `stale`, a **derived subset flag** (an open proposal past `stale_days`), so it overlaps the open states and is not summed into `submitted` |
-| `incorporated_weight` | sum over incorporated proposals, reading the linked requirement revision's **live** `acceptance_state` at read time (not the snapshot the disposition recorded): **1.0** when that revision is `accepted` today, **0.5** when it is still `draft`, **0** otherwise, so a later demotion or rejection of the revision drops the credit at the next read. The sum is capped per `(submitter, requirement_id)` over a **rolling 90-day window** at **1.0**, so neither N proposals on one revision nor a chain of new revisions of the same requirement multiplies the credit for one idea. An incorporation whose tagged-union `kind` is not `requirement` (kittrial-5bb.60's alias/capability variants, 3.4) carries **zero** weight and is left out of this sum entirely: it has no `requirement_id` for the cap to bound, so any non-zero weight would be a cheap farming route (6.5). A separate, separately-capped alias metric would be a .60 decision, not a v1 field. |
+| `incorporated_weight` | sum over incorporated proposals, reading the linked requirement revision's **live** `acceptance_state` at read time (not the snapshot the disposition recorded): **1.0** when that revision is `accepted` today, **0.5** when it is still `draft`, **0** otherwise, so a later demotion or rejection of the revision drops the credit at the next read. The sum is capped per `(submitter, requirement_id)` over a **rolling 90-day window** at **1.0**, so neither N proposals on one revision nor a chain of new revisions of the same requirement multiplies the credit for one idea. An incorporation whose tagged-union `kind` is not `requirement` carries **zero** weight and is left out of this sum entirely: it has no `requirement_id` for the cap to bound, so any non-zero weight would be a cheap farming route (6.5). kittrial-5bb.60's aliases and capability drafts are read-view items settled by capability operations, never `proposal-disposition-v1` incorporations, so they never enter this sum either (9.2). A separate, separately-capped alias metric is a .60 decision, not a v1 field. |
 | `identity` | `verified` or `unverified` (4.2). Unverified contributions are excluded from this per-contributor table and from the scoreboard, and appear only in project totals. |
 | `time_to_disposition_days` | for terminal proposals, the median and mean of `disposition.at - first_revision.created_at`, in whole days; `null` when there are none |
 | `recent_activity` | proposals submitted and dispositions received in the last 30 days |
@@ -1109,7 +1139,7 @@ Two consequences of reading the **live** state:
 | --- | --- |
 | **Duplicate farming** (submit the same idea repeatedly) | `duplicate-of` dispositions are neutral: `0` weight and not counted as `rejected`, so copying earns nothing and the submitter is not punished for a coordinator's dedup. A proposal that is a duplicate of already-accepted content is recorded `rejected` with a reason naming the requirement, so the vocabulary stays small. |
 | **Splitting one idea into many** | The per-requirement cap (6.2) means incorporated proposals on one requirement id earn at most `1.0` in a rolling 90 days, however many revisions are cut. A `split-suspect` warning is raised to coordinators when one submitter has more than 3 incorporated proposals on one requirement id within 90 days, or more than 5 in one target area in 30 days. |
-| **Alias farming** (kittrial-5bb.60) | An alias/capability incorporation has no `requirement_id`, so the per-requirement cap cannot bound it. v1 therefore gives every non-`requirement` tagged-union incorporation **zero** weight and keeps it off the scoreboard entirely (3.4, 6.2): alias volume can never earn requirement credit. If .60 wants an alias metric, it adds its own capped counter and its own farming rule as part of that slice, against the frozen tagged-union `kind` discriminator rather than a new record kind. |
+| **Alias farming** (kittrial-5bb.60) | An alias has no `requirement_id`, so the per-requirement cap cannot bound it. v1 gives every non-`requirement` item **zero** weight and keeps it off the scoreboard entirely (3.4, 6.2); .60's aliases and capability drafts are read-view queue items settled by capability operations, never `proposal-disposition-v1` incorporations, so they never enter `incorporated_weight` (9.2). Alias volume can never earn requirement credit. If .60 wants an alias metric, it adds its own capped counter and its own farming rule in its own record kind as part of that slice. |
 | **Self-scoring by coordinators** | A coordinator may never record a disposition on a proposal whose `submitter` is their own durable identity; the write is refused. The comparison uses the server-bound or operator-mapped identity on both sides (4.2), so on SSH the check genuinely fires instead of comparing an allowlist actor string with a durable identity; an unmapped caller is refused. A self-submitted proposal that needs a decision is escalated, and the owner (a different actor) decides. |
 | **Identity spoofing on SSH** (submitting as someone else) | The statistic key is the operator-maintained actor-to-person map, not the declared string (4.2). An unmapped declaration is `unverified`: it is triaged normally but earns no score and is never ranked, so there is nothing to steal. A mapped actor is accountable for what its actor string submits. |
 | **Reciprocal dispositions** (A triages B's, B triages A's) | A `disposition-pair` warning is raised to the owner when two actors dispose each other's proposals more than 5 times in 30 days. It is a warning, not a block: repeated legitimate collaboration exists. |
@@ -1433,7 +1463,12 @@ kit, a proposal anchor is an ordinary closed task and the kit has no filter:
   `proposal-key:` or `contribution-settings`, so raw forging of the comment
   prefix and the labels is allowed again;
 - a disposition written by the new kit reads as prose, and the older kit neither
-  checks the operator allowlist for it nor treats it as authority.
+  checks the operator allowlist for it nor treats it as authority;
+- `refresh` also writes `views/issues.jsonl` (`activity.py:4`), a snapshot that
+  carries anchors and their raw record comments; a pre-slice-0 kit renders it,
+  so it is the **tenth** surface of the shared hidden-surface list -
+  `docs/REFERENCE_CATALOG_DESIGN.md` §6.0's nine plus this one - and slice 0's
+  filter must cover it too.
 
 **Hazard 3 - the credential scope.** A `proposals` scope is a value in an agent
 credential's `scopes` list, and the documented scope list is fixed
@@ -1451,11 +1486,11 @@ proposal deployment may roll back to:
 
 | Release | Contents | Writes |
 | --- | --- | --- |
-| Slice 0 - tolerant reader | reserve `Kind: requirement-proposal-v1`, `Kind: proposal-disposition-v1` and `Kind: contribution-settings-v1`, and the labels `proposal`, `proposal:`, `proposal-key:`, `contribution-settings` (3.7); whitelist `.proposal-requests/` in `admin.py:903` **and ship the frozen receipt schema with its validator**; recognize and ignore the `proposals` credential scope; filter proposal and settings anchors and their comments out of every surface named in hazard 2, with `GET /tasks/{id}`, `/history` and `/brief` returning 404 (or a pointer to the proposal route) for an anchor id; mark an unknown `Kind: requirement-proposal-vN` `unsupported` per proposal | **none anywhere** |
+| Slice 0 - tolerant reader | reserve `Kind: requirement-proposal-v1`, `Kind: proposal-disposition-v1` and `Kind: contribution-settings-v1`, and the labels `proposal`, `proposal:`, `proposal-key:`, `contribution-settings` (3.7); whitelist `.proposal-requests/` in `admin.py:903` **and ship the frozen receipt schema with its validator**; recognize and ignore the `proposals` credential scope; filter proposal and settings anchors and their comments out of all ten surfaces of the shared hidden-surface list (`docs/REFERENCE_CATALOG_DESIGN.md` §6.0's nine plus `refresh`'s `views/issues.jsonl`, `activity.py:4`; hazard 2), with `GET /tasks/{id}`, `/history` and `/brief` returning 404 (or a pointer to the proposal route) for an anchor id; mark an unknown `Kind: requirement-proposal-vN` `unsupported` per proposal | **none anywhere** |
 | Slice 1a - SSH records, queue and work/brief (no HTTP) | closed anchors; the proposal records module on the shared core; `proposal submit\|revise\|get\|list\|mine` over the endpoint/CLI; the state machine including `approved`; dispositions and the operator-allowlist authority split with the actor-to-person map; owner `decide` (`approved`/`rejected`); incorporation reusing `requirement_records`/`requirement-apply`; the `work`/`brief` queue block. **It depends on the owner's answer to 12.2**: if the answer is to make `requirement-apply` check the allowlist, that change lands here (or immediately before it) and the slice is reviewed with it; if the answer is to keep the shell boundary, 3.6's shell-only statement stands as the documented authority | proposal records and the actor map in the settings record only |
 | Slice 1b - HTTP and web | `POST`/`GET /v1/projects/{pid}/proposals` and the detail route; `POST .../dispositions`; `GET /v1/me/contributions` and `POST /v1/me/contributions/visibility`; the `proposals` credential scope wired to `CAP_PROPOSALS`; the web Reviews proposal queue and detail panel, the My contributions panel, the propose form and the promote-from-feedback action | no new native kind; HTTP and web surfaces over 1a |
 | Slice 2 - statistics, scoreboard and settings | `proposal stats`; `contributions/summary`; the scoreboard panel over verified identities; the `contribution-settings-v1` fields and the self-service hide; the anti-gaming warnings; the agent scoreboard markers | the settings record only |
-| Slice 3 - one queue, two kinds (after both slice 1s) | reference drafts appear in `attention.proposal_queue`, `proposal list` and the Reviews panel as `kind: reference`, incorporating as `reference-apply`; the `_agent_attention`-shaped block is shared with `docs/REFERENCE_CATALOG_DESIGN.md`, and that document's JSON is aligned at the same time (9.2) | nothing new - a read/route widening only |
+| Slice 3 - one queue, the shared kinds (after both slice 1s) | reference drafts appear in `attention.proposal_queue`, `proposal list` and the Reviews panel as `kind: reference`, incorporating as `reference-apply`; kittrial-5bb.60's `capability-alias-v1` records appear the same way as read-view `kind: alias` / `kind: capability` items settled by capability operations (9.2); the `_agent_attention`-shaped block is shared with `docs/REFERENCE_CATALOG_DESIGN.md`, and that document's JSON is aligned at the same time (9.2) | nothing new - a read/route widening only |
 
 Rolling slices 1a/1b back to slice 0 is safe: proposals exist, but slice 0 hides
 them from every surface, refuses raw writes into their namespace, recognizes
@@ -1650,6 +1685,10 @@ rather than proposing a parallel `proposal_records.py`:
   its "incorporate" means `reference-apply` exactly as a requirement proposal's
   means `requirement_records`/`requirement-apply`. Until then each design's
   queue holds its own kind, and this document says so plainly (5.1, 5.2, 5.3).
+  The same read-view rule covers kittrial-5bb.60: its `capability-alias-v1`
+  records appear here as `kind: "alias"` / `kind: "capability"` items, settled
+  by capability operations rather than `proposal-disposition-v1`, and carry
+  **zero** weight (6.2, 6.5, 9.2).
   Nothing about the record kinds, the reserved labels or the disposition ledger
   changes when the two kinds share the queue: the queue is a read view and
   `kind` is the one new item field. `docs/REFERENCE_CATALOG_DESIGN.md` is
@@ -1795,8 +1834,9 @@ with the reference catalog, after both slice 1s have landed.
   the durable-identity and session-refusal rule, the state machine of 3.5
   including `approved`, and the derived fields. **v1 freezes the tagged unions**:
   `target` and `incorporation` ship with their `kind` discriminator and the
-  `requirement` variant only (3.3, 3.4, 3.8), so `kittrial-5bb.60` adds
-  `alias`/`capability` variants instead of a `-v2` kind;
+  `requirement` variant only (3.3, 3.4, 3.8); `kittrial-5bb.60` keeps aliases in
+  its own `capability-alias-v1` records and reaches this queue only as a
+  read-view `kind: alias` / `kind: capability` item (9.2);
 - the `proposal` client action and endpoint branch (8.1), plus
   `docs/CLI_CONTRACT.md` additions;
 - dispositions and the operator-allowlist authority split, including the
@@ -1867,12 +1907,14 @@ accepting an incorporation as the source of the offline `change` object (3.9); a
 real notification channel; and a dedicated "requirements gathering project" mode
 that disables task creation (12.14).
 
-**kittrial-5bb.60 - the capability index - adds variants, not kinds.** Alias and
-capability proposals add `{"kind":"alias", ...}` /
-`{"kind":"capability", ...}` variants to the already-frozen tagged unions of 3.3
-and 3.4, appear in the queue exactly as slice 3's `kind: reference` widening does,
-and carry **zero** weight in v1 statistics (6.2, 6.5). That slice owns any
-separate, separately-capped alias metric; it must not be retrofitted into the v1
+**kittrial-5bb.60 - the capability index - keeps aliases in its own records.**
+Alias and capability items live in .60's own `capability-alias-v1` record kind,
+settled by capability operations (fold or reject), not by
+`proposal-disposition-v1`. In this design's slice-3 queue they appear only as a
+**read view** (`kind: alias` / `kind: capability`), exactly as slice 3's
+`kind: reference` widening is a read view, and they carry **zero** weight and
+never enter `incorporated_weight` (6.2, 6.5, 9.2). That slice owns any separate,
+separately-capped alias metric; it must not be retrofitted into the v1
 weight.
 
 ## 12. Owner questions, with recommended answers
