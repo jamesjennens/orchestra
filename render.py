@@ -101,4 +101,13 @@ def render(rows,dest,operators=None):
     write(dest/'issues.jsonl',''.join(json.dumps(r,ensure_ascii=False)+'\n' for r in rows))
     write(dest/'CURRENT.md',''.join(current))
     write(dest/'COORDINATION.md',''.join(current))
-    return {'issues':len(rows),'comments':len(entries),'generated_at':stamp}
+    # Pages a previous refresh wrote for rows (or journal days) that are no longer
+    # rendered - a hidden record anchor, a day whose only entries were record
+    # comments, or an issue that no longer exists - would otherwise keep serving
+    # their old bodies through `view` (kittrial-5bb.64 review item `stale-views`).
+    pruned=0
+    for page in sorted((dest/'jobs').glob('*.md')):
+        if page.stem not in ids:page.unlink();pruned+=1
+    for page in sorted((dest/'journal').glob('*.md')):
+        if page.name!='INDEX.md' and page.stem not in daily:page.unlink();pruned+=1
+    return {'issues':len(rows),'comments':len(entries),'generated_at':stamp,'pruned':pruned}

@@ -53,8 +53,12 @@ def task_row(rows,task):
     return found[0]
 
 def snapshot(rows,project,task,exclude=None):
+    from reserved_comments import is_record_comment
     issue=task_row(rows,task)
-    selected=[dict(issue,comments=[c for c in (issue.get('comments') or []) if str(c['id'])!=exclude])]
+    # Reference/proposal/settings/capability record comments never reach a history,
+    # brief or checkpoint read, on an anchor or on any other task (kittrial-5bb.64).
+    selected=[dict(issue,comments=[c for c in (issue.get('comments') or [])
+                                   if str(c['id'])!=exclude and not is_record_comment(c.get('text'))])]
     selected.extend(r for r in rows if r.get('issue_type')=='event' and r['id']!=task and any(d.get('type')=='parent-child' and d.get('depends_on_id')==task for d in (r.get('dependencies') or [])))
     entries=build_entries(selected)
     # Titles live in task state; history carries immutable entry content, not a

@@ -41,13 +41,16 @@ PREFIX_WRITERS = {
     'Kind: capability-verification-v1\n': 'capability check --record',
     'Kind: capability-alias-v1\n': 'capability propose-alias|alias-reject',
 }
-RESERVED_LABELS = ['reference', 'reference:accepted', 'reference-key:calendar-trading',
-                   'proposal', 'proposal:incorporated', 'proposal-key:p-0123456789ab',
-                   'contribution-settings', 'capability', 'capability:accepted',
-                   'capability-key:review-structured-contribution']
-ORDINARY_LABELS = ['references', 'referenced:x', 'proposals', 'proposal-keys',
-                   'contribution-settings-old', 'contributions', 'capabilities',
-                   'capability-keys', 'Capability', 'ops']
+RESERVED_LABELS = ['reference:accepted', 'reference-key:calendar-trading',
+                   'proposal:incorporated', 'proposal-key:p-0123456789ab',
+                   'capability:accepted', 'capability-key:review-structured-contribution']
+# The exact record type labels are ordinary labels on an ordinary task (a project may
+# use them already: live jjbp-j03.20 carries `proposal`); only a real anchor's are
+# protected, by the endpoint guard.
+TYPE_LABELS = ['reference', 'proposal', 'contribution-settings', 'capability']
+ORDINARY_LABELS = TYPE_LABELS + ['references', 'referenced:x', 'proposals', 'proposal-keys',
+                                 'contribution-settings-old', 'contributions', 'capabilities',
+                                 'capability-keys', 'Capability', 'ops']
 JOURNALS = ('.reference-requests', '.proposal-requests', '.capability-requests')
 
 
@@ -100,10 +103,21 @@ def rows_as_a_later_slice_writes_them():
                        'created_at': '2026-10-01T14:00:00Z'},
                       {'id': 8, 'text': 'Kind: capability-entry-v9\n{"future": true}',
                        'created_at': '2026-10-01T14:01:00Z'}]},
+        # A project's own use of the words (the jjbp-j03.20 case): ordinary tasks.
+        {'id': 'kit-6', 'title': 'Suggestion triage', 'status': 'open', 'issue_type': 'task',
+         'labels': ['proposal'], 'comments': []},
+        {'id': 'kit-7', 'title': 'Capability planning', 'status': 'open', 'issue_type': 'task',
+         'labels': ['capability'], 'comments': [
+             {'id': 9, 'text': 'Plain prose about capabilities.', 'created_at': '2026-10-01T15:00:00Z'}]},
+        # The wrong family is not evidence: a `reference` label needs a reference record.
+        {'id': 'kit-8', 'title': 'Mislabelled', 'status': 'open', 'issue_type': 'task',
+         'labels': ['reference'], 'comments': [
+             {'id': 10, 'text': 'Kind: capability-entry-v1\n{}', 'created_at': '2026-10-01T16:00:00Z'}]},
     ]
 
 
 ANCHOR_IDS = {'kit-2', 'kit-3', 'kit-4', 'kit-5'}
+VISIBLE_IDS = ['kit-1', 'kit-6', 'kit-7', 'kit-8']
 RECORD_MARKERS = ('Kind: reference-', 'Kind: requirement-proposal-', 'Kind: proposal-disposition-',
                   'Kind: contribution-settings-', 'Kind: capability-')
 
@@ -125,17 +139,22 @@ class GuardTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         rc.check_comment_body(lookalike, 'positional', actor='alice', task='kit-1')
 
-    def test_prose_and_unreserved_versions_are_not_refused(self):
+    def test_every_version_of_each_kind_is_reserved_and_prose_is_not(self):
         rc.check_comment_body('We discussed Kind: capability-entry-v1 today.', 'positional',
                               actor='alice', task='kit-1')
-        # Only v1 is reserved (.58 3.8); a newer version is still a record comment, hidden
-        # from every surface, and classified unsupported for the later readers.
-        rc.check_comment_body('Kind: capability-entry-v2\n{}', 'positional', actor='alice', task='kit-1')
+        for prefix in PREFIX_WRITERS:
+            for version in ('v2', 'v7', 'v123'):
+                body = prefix.replace('v1\n', version + '\n') + '{}'
+                with self.subTest(body=body):
+                    with self.assertRaisesRegex(ValueError, 'Refusing raw'):
+                        rc.check_comment_body(body, 'positional', actor='alice', task='kit-1')
         self.assertTrue(rc.is_record_comment('Kind: capability-entry-v2\n{}'))
         self.assertEqual(rc.record_comment_kind('Kind: capability-entry-v2\n{}'),
                          ('capability-entry', 2, 'unsupported'))
         self.assertEqual(rc.record_comment_kind('Kind: reference-entry-v1\n{}'),
-                         ('reference-entry', 1, 'reserved'))
+                         ('reference-entry', 1, 'supported'))
+        self.assertEqual(rc.record_comment_kind('Kind: capability-gizmo-v1\n{}'),
+                         ('capability-gizmo', 1, 'unsupported'))
         self.assertIsNone(rc.record_comment_kind('Kind: requirement-revision-v1\n{}'))
 
     def test_reserved_labels_and_their_neighbours(self):
@@ -143,6 +162,23 @@ class GuardTests(unittest.TestCase):
             self.assertEqual(rc.reserved_label(label), label, label)
         for label in ORDINARY_LABELS:
             self.assertIsNone(rc.reserved_label(label), label)
+
+    def test_type_labels_are_writable_on_ordinary_tasks(self):
+        for label in TYPE_LABELS:
+            for args in (['update', 'kit-6', '--add-label', label],
+                         ['update', 'kit-6', '--remove-label', label],
+                         ['create', '--title', 't', '--labels', label]):
+                self.assertIsNone(rc.reserved_label_in_args(args), args)
+
+    def test_an_anchor_needs_its_label_and_a_v1_record_of_the_same_family(self):
+        rows = {row['id']: row for row in rows_as_a_later_slice_writes_them()}
+        self.assertEqual({rid for rid, row in rows.items() if rc.is_record_anchor(row)}, ANCHOR_IDS)
+        # request:/request-content: are not evidence: create-child writes them too.
+        self.assertFalse(rc.is_record_anchor({'labels': ['proposal', 'request:' + 'a' * 64],
+                                              'comments': []}))
+        # A row read without comments is never assumed to be an anchor.
+        self.assertFalse(rc.is_record_anchor({'labels': ['capability']}))
+        self.assertTrue(rc.carries_record_label({'labels': ['capability']}))
 
     def test_every_label_writing_spelling_is_refused(self):
         for label in RESERVED_LABELS:
@@ -254,7 +290,7 @@ class SurfaceTests(unittest.TestCase):
 
     def test_work_and_work_mine_never_list_an_anchor(self):
         listed = work.queue(self.rows, 'session-x', [])
-        self.assertEqual([item['task'] for item in listed['items']], ['kit-1'])
+        self.assertEqual(sorted(item['task'] for item in listed['items']), VISIBLE_IDS)
         mine = work.queue(self.rows, 'session-x', ['--mine'])
         self.assertEqual(mine['items'], [])
 
@@ -265,8 +301,9 @@ class SurfaceTests(unittest.TestCase):
             texts = {path.relative_to(views).as_posix(): path.read_text(encoding='utf-8')
                      for path in views.rglob('*') if path.is_file()}
             issues = [json.loads(line) for line in texts['issues.jsonl'].splitlines()]
-            self.assertEqual([row['id'] for row in issues], ['kit-1'])
+            self.assertEqual([row['id'] for row in issues], VISIBLE_IDS)
             self.assertEqual([c['id'] for c in issues[0]['comments']], [1])
+            self.assertEqual(issues[3]['comments'], [])
             for name, text in texts.items():
                 for anchor in ANCHOR_IDS:
                     self.assertNotIn(anchor, text, name)
@@ -279,7 +316,34 @@ class SurfaceTests(unittest.TestCase):
         before = json.dumps(self.rows, sort_keys=True)
         shown = rc.hide_records(self.rows)
         self.assertEqual(json.dumps(self.rows, sort_keys=True), before)
-        self.assertEqual([row['id'] for row in shown], ['kit-1'])
+        self.assertEqual([row['id'] for row in shown], VISIBLE_IDS)
+
+    def test_refresh_prunes_pages_it_no_longer_renders(self):
+        with tempfile.TemporaryDirectory() as temp:
+            views = Path(temp) / 'views'
+            stale = {'jobs/kit-2.md': 'Kind: reference-entry-v1\n{"stale": true}',
+                     'jobs/gone-1.md': 'an issue that no longer exists',
+                     'journal/2026-01-01.md': 'Kind: capability-alias-v1\n{}'}
+            for name, text in stale.items():
+                (views / name).parent.mkdir(parents=True, exist_ok=True)
+                (views / name).write_text(text, encoding='utf-8')
+            result = render(self.rows, views)
+            self.assertEqual(result['pruned'], 3)
+            for name in stale:
+                self.assertFalse((views / name).exists(), name)
+            self.assertEqual(sorted(p.stem for p in (views / 'jobs').glob('*.md')), VISIBLE_IDS)
+            self.assertTrue((views / 'journal' / 'INDEX.md').exists())
+
+    def test_history_brief_and_checkpoint_snapshots_drop_record_comments(self):
+        import briefing
+        for task in ('kit-1', 'kit-5'):
+            data = briefing.snapshot(self.rows, 'kit', task)
+            bodies = [entry['body'] for entry in data['entries']]
+            self.assertFalse(any(body.startswith(RECORD_MARKERS) for body in bodies), task)
+            page = briefing.history_page(data, 'kit', task, limit=20)
+            self.assertFalse(any(e['body'].startswith(RECORD_MARKERS) for e in page['entries']))
+        self.assertEqual([e['body'] for e in briefing.snapshot(self.rows, 'kit', 'kit-1')['entries']],
+                         ['A normal journal entry.'])
 
     def test_agent_prompts_skip_a_labelled_anchor(self):
         items = [dict(row, review_state='awaiting-review') for row in self.rows]
@@ -290,13 +354,24 @@ class SurfaceTests(unittest.TestCase):
         self.assertEqual(listed & ANCHOR_IDS, set())
         self.assertIn('kit-1', listed)
 
-    def test_the_endpoint_backend_read_seam_drops_anchors(self):
-        fake = types.SimpleNamespace(actor_namespace='http',
-                                     _run=lambda *args: self.rows,
+    def test_the_endpoint_backend_read_seam_fetches_comments_only_for_labelled_rows(self):
+        listed = [{key: value for key, value in row.items() if key != 'comments'} for row in self.rows]
+        comments = {row['id']: row['comments'] for row in self.rows}
+        reads = []
+
+        def run(action, project, actor, argv):
+            if argv[0] == 'comments':
+                reads.append(argv[1])
+                return comments[argv[1]]
+            return listed
+
+        fake = types.SimpleNamespace(actor_namespace='http', _run=run,
                                      _in_project=lambda rows, project: rows)
+        fake._with_record_comments = lambda project, rows: \
+            http_service.EndpointBackend._with_record_comments(fake, project, rows)
         snapshot = http_service.EndpointBackend.read_tasks(fake, 'kittrial')
-        self.assertEqual([row['id'] for row in snapshot['items']], ['kit-1'])
-        self.assertEqual(snapshot['total'], 1)
+        self.assertEqual([row['id'] for row in snapshot['items']], VISIBLE_IDS)
+        self.assertEqual(sorted(reads), ['kit-2', 'kit-3', 'kit-4', 'kit-5', 'kit-6', 'kit-7', 'kit-8'])
 
 
 try:
@@ -319,7 +394,11 @@ class HttpSurfaceTests(ServerHarness if ServerHarness else unittest.TestCase):
         tasks = self.backend.state['tasks']
         tasks[reference]['labels'] = ['reference', 'reference:accepted']
         tasks[reference]['status'] = 'closed'
+        tasks[reference]['comments'] = [{'id': 1, 'text': 'Kind: reference-entry-v1\n{}'}]
         tasks[capability]['labels'] = ['capability', 'capability:draft']
+        tasks[capability]['comments'] = [{'id': 2, 'text': 'Kind: capability-entry-v1\n{}'}]
+        # The project's own `proposal` label on an ordinary task stays visible.
+        tasks[ordinary]['labels'] = ['proposal']
         for query in ('', '?status=closed', '?status=active', '?q=anchor'):
             listed = self.request('GET', '/v1/projects/%s/tasks%s' % (project, query), token=token)
             self.assertEqual(200, listed.status, listed.data)
@@ -337,6 +416,60 @@ class HttpSurfaceTests(ServerHarness if ServerHarness else unittest.TestCase):
             response = self.request('GET', '/v1/projects/%s/tasks/%s%s' % (project, ordinary, suffix),
                                     token=token)
             self.assertEqual(200, response.status, (suffix, response.data))
+        listed = self.request('GET', '/v1/projects/%s/tasks' % project, token=token)
+        self.assertIn(ordinary, {item['id'] for item in listed.data['items']})
+        for method, suffix, body in (('PATCH', '', {'title': 'renamed'}),
+                                     ('POST', '/claim', {}),
+                                     ('POST', '/checkpoints', {'summary': 'x'}),
+                                     ('POST', '/reviews', {'operation': 'contribute'})):
+            response = self.request(method, '/v1/projects/%s/tasks/%s%s' % (project, capability, suffix),
+                                    body, token=token, key='slice0-anchor-write-%s-%s' % (method, suffix.strip('/') or 'task'))
+            self.assertEqual(404, response.status, (method, suffix, response.data))
+        self.assertEqual(tasks[capability]['title'], 'capability anchor')
+
+
+try:
+    import endpoint
+except ImportError:  # endpoint imports fcntl (POSIX-only)
+    endpoint = None
+
+
+@unittest.skipIf(endpoint is None, 'endpoint imports fcntl (POSIX-only)')
+class EndpointLabelGuardTests(unittest.TestCase):
+    """A real anchor's labels cannot be replaced or removed; an ordinary task's can."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix='slice0-guard-')
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        (self.root / 'bin').mkdir()
+        (self.root / 'bin' / 'bd').write_text('', encoding='utf-8')
+        (self.root / 'deployment.private.json').write_text(
+            '{"password": "x", "unit": "none", "port": "1"}', encoding='utf-8')
+        self.path = self.root / 'projects' / 'pp'
+        self.path.mkdir(parents=True)
+
+    def guard(self, row, args):
+        def run(argv, **kwargs):
+            payload = row['comments'] if 'comments' in argv else [
+                {key: value for key, value in row.items() if key != 'comments'}]
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr='')
+        with patch.object(endpoint.subprocess, 'run', run):
+            endpoint._guard_reserved_labels(self.root, self.path, args, 'worker')
+
+    def test_replacing_or_removing_labels_on_a_real_anchor_is_refused(self):
+        anchor = {'id': 'pp-1', 'labels': ['contribution-settings'],
+                  'comments': [{'id': 1, 'text': 'Kind: contribution-settings-v1\n{}'}]}
+        for args in (['update', 'pp-1', '--set-labels', 'ops'],
+                     ['update', 'pp-1', '--remove-label', 'contribution-settings']):
+            with self.assertRaisesRegex(ValueError, 'record anchor'):
+                self.guard(anchor, args)
+
+    def test_an_ordinary_task_with_a_type_label_stays_editable(self):
+        ordinary = {'id': 'pp-2', 'labels': ['proposal'], 'comments': []}
+        for args in (['update', 'pp-2', '--set-labels', 'ops'],
+                     ['update', 'pp-2', '--remove-label', 'proposal']):
+            self.guard(ordinary, args)
 
 
 class ScopeAndConfigTests(unittest.TestCase):

@@ -122,9 +122,14 @@ Session registrations in `.sessions.json` are included in the coordination sidec
 - **Validation:** it validates every receipt with the frozen schema (a 64-hex `sha256`, a known `status`, and optional `actor`, `id`, `revision` and `acceptance`; unknown keys are kept). A malformed receipt refuses the backup before the native sync, and refuses the restore before its first write.
 - **Restore:** it restores them with the project.
 
-This kit is therefore the oldest one a deployment may roll back to once any of those records exist. A kit from before this release refuses the whole restore of a backup that contains them.
+Restore compatibility, exactly:
+- **Backups containing the journals:** a backup with any of the three journal paths restores only with `admin.py` at this kit or later. It can run from a checkout.
+- **Older kits:** a kit at `7f8b646` or earlier refuses the whole restore of such a backup, before writing anything.
+- **Older backups:** this kit restores `7f8b646` backups normally. Those backups carry none of the journals, so at most idempotency receipts are missing.
 
-Before deploying it, check that no existing task already carries one of the record labels it reserves: `reference`, `proposal`, `contribution-settings` or `capability`. Run `bd list --label NAME --all --json` for each label on every installation. Any task that does is hidden from task views from then on.
+This kit is therefore the oldest one a deployment may roll back to once any of those records exist.
+
+A row is hidden as a record anchor only when it carries one of the labels `reference`, `proposal`, `contribution-settings` or `capability` **and** a v1 record comment of the same family. A project's own task that merely uses one of those words as a label (for example jjbp-j03.20's `proposal`) stays visible and editable.
 
 The deployment configuration may also carry a `verifiers` list for the capability index. This kit keeps it unchanged and gives it no authority.
 

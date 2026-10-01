@@ -21,8 +21,8 @@ import native
 from render import render
 from lifecycle import apply_native
 from version import report
-from reserved_comments import (check_raw_request, comment_target,
-                               first_reserved_label, label_guard_request,
+from reserved_comments import (carries_record_label, check_raw_request, comment_target,
+                               first_reserved_label, is_record_anchor, label_guard_request,
                                operator_only_in_args, raw_file_flag_in_args,
                                reserved_label_in_args, unresolved_bd_flags)
 from http_authority import AuthorityConfig, NativeRunner, journal_path, run_guarded
@@ -61,6 +61,15 @@ def _native_labels(root,path,actor,task):
     rid,labels=next(iter(matched.items()))
     return rid,labels
 
+def _native_comments(root,path,actor,task):
+    """The comments of one canonical issue, for the record-anchor check."""
+    p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,'comments',task,'--json'],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=60)
+    if p.returncode:raise ValueError('Could not read the comments of %s before the label write, so the record-anchor guard cannot verify it; refusing.'%(task,))
+    try:rows=json.loads(p.stdout)
+    except ValueError:raise ValueError('Could not parse the comments of %s before the label write; refusing.'%(task,))
+    if not isinstance(rows,list):raise ValueError('Unexpected comment read for %s; refusing the label write.'%(task,))
+    return rows
+
 def _guard_reserved_labels(root,path,args,actor):
     """Read-before-write guard for the reserved label namespace.
 
@@ -87,6 +96,15 @@ def _guard_reserved_labels(root,path,args,actor):
         label=first_reserved_label(list(labels))
         if label is not None:
             raise ValueError('Refusing to replace labels on %s: it currently holds the reserved label %s, which only coordination.py and requirement_records.py may write. Replacing or removing it would silently drop the coordination namespace or an operator acceptance; use the coordination workflow (coordination.py) or the requirement command (requirement_records.py draft|revise, admin.py requirement-apply); --add-label remains available for ordinary labels.'%(canonical,label))
+        # A record type label (reference/proposal/contribution-settings/capability) is
+        # an ordinary label on an ordinary task, but on a real record anchor - one that
+        # also holds a v1 record of the same family - its labels belong to the record
+        # operations (kittrial-5bb.64): replacing or removing them is refused.
+        row={'labels':sorted(labels)}
+        if carries_record_label(row):
+            row['comments']=_native_comments(root,path,actor,canonical)
+            if is_record_anchor(row):
+                raise ValueError('Refusing to replace labels on %s: it is a reference/proposal/settings/capability record anchor, whose labels only its record operations may change. --add-label remains available for ordinary labels.'%(canonical,))
 
 def execute(root,request,authority_config=None,require_authority=False):
     name=request['project'];path=project_dir(root,name)

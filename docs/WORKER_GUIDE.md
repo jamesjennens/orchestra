@@ -99,27 +99,39 @@ accepted parent, or stripped by replacing a record's labels.
 
 The accepted reference catalog, requirements-gathering and capability-index designs
 have their names reserved before any of their writers exist (the shared slice 0).
-Raw writes of these record kinds are refused the same way, naming the operation
-that will write them:
-- `Kind: reference-entry-v1` and `Kind: reference-acceptance-v1`;
-- `Kind: requirement-proposal-v1`, `Kind: proposal-disposition-v1` and
-  `Kind: contribution-settings-v1`;
-- `Kind: capability-entry-v1`, `Kind: capability-acceptance-v1`,
-  `Kind: capability-verification-v1` and `Kind: capability-alias-v1`.
+Raw writes of these record kinds are refused the same way, in every version
+(`-v1`, `-v2`, ...), naming the operation that will write them:
+- `Kind: reference-entry-vN` and `Kind: reference-acceptance-vN`;
+- `Kind: requirement-proposal-vN`, `Kind: proposal-disposition-vN` and
+  `Kind: contribution-settings-vN`;
+- `Kind: capability-entry-vN`, `Kind: capability-acceptance-vN`,
+  `Kind: capability-verification-vN` and `Kind: capability-alias-vN`.
 
-The labels are reserved as well:
-- exact: `reference`, `proposal`, `contribution-settings`, `capability`;
-- prefixes: `reference:`, `reference-key:`, `proposal:`, `proposal-key:`,
-  `capability:`, `capability-key:`.
+The label prefixes `reference:`, `reference-key:`, `proposal:`, `proposal-key:`,
+`capability:` and `capability-key:` are reserved like `requirement:`.
 
-A row carrying one of those exact labels is a record anchor, not a task. It never
-appears in:
+The exact labels `reference`, `proposal`, `contribution-settings` and `capability`
+stay ordinary labels on ordinary tasks. A project may use them, and you may add or
+remove them.
+
+A **record anchor** is a row that carries one of those labels **and** a v1 record
+comment of the same family. The record comment is what proves it is an anchor; the
+label alone is not enough, and neither are `request:` labels. An anchor's labels
+cannot be replaced or removed. It never appears in:
 - `work`;
-- the generated views, including `views/issues.jsonl`;
+- the generated views, including `views/issues.jsonl`, and stale pages are pruned
+  on refresh;
 - the HTTP task list, queue or My work;
 - agent prompts.
 
-The task, brief and history routes answer 404 for it.
+The HTTP task, brief and history routes, and the HTTP write routes (PATCH, claim,
+checkpoints, reviews), answer 404 for it. Record comments never appear in a
+`history`, `brief` or checkpoint snapshot, on any task.
+
+The raw `bd` passthrough is unchanged:
+- `update`, `close` and `reopen` of an anchor, and prose comments on it, still
+  reach it;
+- the writer slices own those writes.
 
 Contributors draft requirement records with the dedicated
 `requirement_records.py draft|revise` operation
