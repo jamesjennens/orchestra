@@ -133,8 +133,8 @@ Session registrations in `.sessions.json` are included in the coordination sidec
 
 Restore compatibility, exactly:
 - **Backups containing the journals:** a backup with any of the three journal paths restores only with `admin.py` at this kit or later. It can run from a checkout.
-- **Older kits:** a kit at `7f8b646` or earlier refuses the whole restore of such a backup, before writing anything.
-- **Older backups:** this kit restores `7f8b646` backups normally. Those backups carry none of the journals, so at most idempotency receipts are missing.
+- **Older kits:** any kit older than this one refuses the whole restore of such a backup, before writing anything.
+- **Older backups:** this kit restores backups made by older kits normally. Those backups carry none of the journals, so at most idempotency receipts are missing.
 
 This kit is therefore the oldest one a deployment may roll back to once any of those records exist.
 

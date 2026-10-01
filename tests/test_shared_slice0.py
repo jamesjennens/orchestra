@@ -334,6 +334,82 @@ class SurfaceTests(unittest.TestCase):
             self.assertEqual(sorted(p.stem for p in (views / 'jobs').glob('*.md')), VISIBLE_IDS)
             self.assertTrue((views / 'journal' / 'INDEX.md').exists())
 
+    def test_refresh_owns_jobs_and_journal_and_removes_hand_made_pages(self):
+        with tempfile.TemporaryDirectory() as temp:
+            views = Path(temp) / 'views'
+            (views / 'jobs').mkdir(parents=True)
+            (views / 'jobs' / 'my-notes.md').write_text('hand-made', encoding='utf-8')
+            (views / 'jobs' / 'README.txt').write_text('not a page', encoding='utf-8')
+            (views / 'notes.md').write_text('top level', encoding='utf-8')
+            (views / 'jobs' / 'folder.md').mkdir()
+            result = render(self.rows, views)
+            self.assertEqual(result['pruned'], 1)
+            self.assertNotIn('prune_skipped', result)
+            self.assertFalse((views / 'jobs' / 'my-notes.md').exists())
+            # Only *.md pages in the generated folders are pruned; a real directory
+            # that matches the pattern is left alone and refresh still succeeds.
+            self.assertTrue((views / 'jobs' / 'README.txt').exists())
+            self.assertTrue((views / 'notes.md').exists())
+            self.assertTrue((views / 'jobs' / 'folder.md').is_dir())
+
+    def symlink(self, link, target, directory):
+        try:
+            os.symlink(target, link, target_is_directory=directory)
+        except (OSError, NotImplementedError):
+            self.skipTest('cannot create symlinks here')
+
+    def test_refresh_never_prunes_through_a_symlinked_jobs_or_journal_folder(self):
+        # kittrial-5bb.72 (e64r2-prune.log): a symlinked jobs/ deleted precious.md
+        # in its target, outside views.
+        for folder in ('jobs', 'journal'):
+            with self.subTest(folder=folder), tempfile.TemporaryDirectory() as temp:
+                views = Path(temp) / 'views'
+                views.mkdir()
+                outside = Path(temp) / 'outside'
+                outside.mkdir()
+                for name in ('precious.md', '2026-01-01.md', 'gone-1.md'):
+                    (outside / name).write_text('keep me', encoding='utf-8')
+                self.symlink(views / folder, outside, True)
+                result = render(self.rows, views)
+                self.assertEqual(result['prune_skipped'], [folder])
+                self.assertEqual(result['pruned'], 0)
+                for name in ('precious.md', '2026-01-01.md', 'gone-1.md'):
+                    self.assertEqual((outside / name).read_text(encoding='utf-8'), 'keep me')
+
+    def test_refresh_never_prunes_a_folder_that_resolves_outside_views(self):
+        # A Windows junction needs no symlink privilege, and before Python 3.12
+        # Path.is_symlink() is False for it, yet it resolves outside views.
+        try:
+            import _winapi
+            create_junction = _winapi.CreateJunction
+        except (ImportError, AttributeError):
+            self.skipTest('directory junctions are Windows-only (POSIX is covered by the symlink case)')
+        with tempfile.TemporaryDirectory() as temp:
+            views = Path(temp) / 'views'
+            views.mkdir()
+            outside = Path(temp) / 'outside'
+            outside.mkdir()
+            (outside / 'precious.md').write_text('keep me', encoding='utf-8')
+            create_junction(str(outside), str(views / 'jobs'))
+            try:
+                result = render(self.rows, views)
+                self.assertEqual(result['prune_skipped'], ['jobs'])
+                self.assertEqual((outside / 'precious.md').read_text(encoding='utf-8'), 'keep me')
+            finally:
+                os.rmdir(views / 'jobs')  # removes the junction, never its target
+
+    def test_a_symlinked_page_is_removed_as_a_link_and_its_target_kept(self):
+        with tempfile.TemporaryDirectory() as temp:
+            views = Path(temp) / 'views'
+            (views / 'jobs').mkdir(parents=True)
+            target = Path(temp) / 'target.md'
+            target.write_text('keep me', encoding='utf-8')
+            self.symlink(views / 'jobs' / 'gone-1.md', target, False)
+            result = render(self.rows, views)
+            self.assertEqual(result['pruned'], 1)
+            self.assertFalse(os.path.lexists(views / 'jobs' / 'gone-1.md'))
+            self.assertEqual(target.read_text(encoding='utf-8'), 'keep me')
+
     def test_history_brief_and_checkpoint_snapshots_drop_record_comments(self):
         import briefing
         for task in ('kit-1', 'kit-5'):

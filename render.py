@@ -105,9 +105,21 @@ def render(rows,dest,operators=None):
     # rendered - a hidden record anchor, a day whose only entries were record
     # comments, or an issue that no longer exists - would otherwise keep serving
     # their old bodies through `view` (kittrial-5bb.64 review item `stale-views`).
-    pruned=0
-    for page in sorted((dest/'jobs').glob('*.md')):
+    # jobs/ and journal/ are generated folders owned by refresh, so a hand-made .md
+    # there is removed too. Pruning never follows a folder that is a symlink or
+    # resolves outside views (the rule `view` applies): it skips and reports it
+    # instead of deleting files elsewhere (kittrial-5bb.72). A symlinked page is
+    # removed as a link only; a real directory named *.md is left alone.
+    pruned=0;skipped=[]
+    viewroot=dest.resolve()
+    def pages(folder):
+        if folder.is_symlink() or not folder.resolve().is_relative_to(viewroot):
+            skipped.append(folder.name);return []
+        return [p for p in sorted(folder.glob('*.md')) if p.is_symlink() or not p.is_dir()]
+    for page in pages(dest/'jobs'):
         if page.stem not in ids:page.unlink();pruned+=1
-    for page in sorted((dest/'journal').glob('*.md')):
+    for page in pages(dest/'journal'):
         if page.name!='INDEX.md' and page.stem not in daily:page.unlink();pruned+=1
-    return {'issues':len(rows),'comments':len(entries),'generated_at':stamp,'pruned':pruned}
+    result={'issues':len(rows),'comments':len(entries),'generated_at':stamp,'pruned':pruned}
+    if skipped:result['prune_skipped']=skipped
+    return result
