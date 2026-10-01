@@ -234,8 +234,13 @@ complete tokens.
 
 ## `capability`: client-side code and design lookup
 
-`capability` is answered by the client itself and is read-only:
-- it never contacts the endpoint;
+`capability lookup`, `resolve` and `index` are answered by the client itself and are
+read-only. The capability **records** commands (`find`, `get`, `list`, `propose`,
+`revise` and `propose-alias`) go to the endpoint and need `--config` and
+`--project`; see [capability records](#capability-records-the-index-on-the-endpoint)
+below. The local commands:
+- never contact the endpoint (`lookup` adds the endpoint's records only when you pass
+  `--config` and `--project`);
 - it writes nothing: no Beads record, no cache file, no `__pycache__` beside the client,
   and no refresh of Git's index (every Git call runs with `--no-optional-locks`, so it
   never races the caller's own `git add` or `commit`);
@@ -374,6 +379,92 @@ paragraph separators, is written as a `\u` escape.
 
 Recorded capability records, alias proposals and a recorded drift check are designed
 separately. The entry shape and pointer syntax here are what they are meant to feed.
+
+## Capability records: the index on the endpoint
+
+The capability index records what a part of the system is for: its name, summary,
+aliases, requirement links, design anchors, owner, and where its code and tests live
+([design](CAPABILITY_INDEX_DESIGN.md), slice 1a). Records live in Beads. Meaning is
+accepted by an operator. Location is checked against a checkout, which is slice 1b
+(`capability check --record`); until then, reads report no verification.
+
+```sh
+b capability find "merge slot" --limit 5 --json
+b capability get review.structured-contribution --json
+b capability list --state draft-only --json
+b capability propose --file capability.json --json
+b capability propose-alias merge.slot "single integrator" --evidence coordination.py::merge_acquire
+```
+
+**Reading.** `find`, `get` and `list` are read-only. They take no coordination lock and
+read only the capability-labelled rows, as `ref` does.
+
+- **`find PHRASE`** returns `{found, match_type, records, total_records, candidates,
+  hint, coverage}`.
+  - The phrase is at most 200 characters, and `--limit` is 1..20 (default 5).
+  - **Exact matches** come only from a key, a name, or an accepted alias.
+  - A **pending alias**, or an alias in an unaccepted draft, only lifts its capability
+    among the candidates (`score`).
+  - Every record carries `trust: accepted|draft`, and pending aliases carry
+    `alias_state: proposed` with the submitter's `person` and `identity`.
+  - A miss suggests `propose-alias` or `propose`.
+- **`get KEY`** returns the record shape of `ref get`: `state`, `record`, `acceptance`,
+  `acceptance_inert`, `proposed`, `aliases_pending`, `replaces` (derived), `resolved`
+  (the successor of a retired key), `warnings` and `coverage`. `name` and `summary` are
+  excerpt objects.
+- **`list`** returns one row per key. It takes `--tag`, `--owner`,
+  `--state draft-only|accepted|superseded|all`, `--limit` and `--offset`.
+- **Failures stay per entry.** A malformed or unsupported entry fails only itself. A
+  malformed alias record is a warning on its entry.
+
+**`capability lookup` with `--config` and `--project`** runs the local code lookup,
+unchanged, then one endpoint `find`. It adds these fields to `capability-lookup-v1`:
+- `records`: the exact records and candidates, each with `match: exact|candidate` and
+  every `code`, `tests` and `anchors` pointer resolved live against your checkout
+  (`{pointer, live: resolved|missing|unknown}`);
+- `records_found`, `records_hint` and `records_coverage`.
+
+If the endpoint cannot answer, the local result is still returned, with
+`records_warning`.
+
+**Writing.**
+- **`propose` and `revise`** take a closed JSON payload:
+  - `key`: lowercase dotted.
+  - `name`: at most 120 characters.
+  - `summary`: at most 1,200 characters. It is untrusted text.
+  - `aliases`: at most 32 phrases, each at most 80 printable characters.
+  - `requirements`: at most 16 `{key, revision?}` links. Each must name an existing
+    requirement record (and revision).
+  - `anchors`: at most 16 `file.md#anchor` pointers.
+  - `code`: at most 32 `file::Qualified.name` pointers.
+  - `tests`: at most 32 test pointers or files. All pointers are repo-relative, with no
+    `..`, absolute path, drive or backslash, and at most 400 characters.
+  - `owner`: `account:<uid>` or `person:<name>`. A session actor is refused. A draft
+    needs no owner; an accepted capability needs one.
+  - `tags`: at most 8.
+  - `status` and `verified_at` are derived, never stored.
+  - The rules on `revision`, `expected_sha256`, retries and interrupted proposes are
+    those of `ref`.
+- **`propose-alias KEY "PHRASE" [--evidence POINTER]`** adds a pending alias. It is
+  only a candidate until an operator folds it into the next accepted revision's
+  `aliases`, or rejects it.
+  - A phrase that is another capability's key, name or accepted alias is refused.
+  - An identical pending proposal is returned, not written twice.
+- **Pending-alias caps** are keyed on the resolved person:
+  - 3 per capability and 50 per project for a verified person;
+  - one shared pool of 1 per capability and 10 per project for all unverified
+    proposers;
+  - 20 per capability overall.
+- **Interim attribution:**
+  - In slice 1a only an actor on the deployment operator allowlist is a verified
+    person (`operator:<actor>`), read from the alias comment's stored native author.
+  - Everyone else is `unverified`.
+  - SSH attribution beyond operators arrives with kittrial-5bb.68.
+  - `submitted_by_agent` is `false` until then.
+
+Acceptance, retirement and alias rejection are operator commands
+([operations](OPERATIONS.md#operator-commands)). There is no demotion in slice 1a: the
+design's "demote" (section 4) is covered by retiring the key for now.
 
 ## `ref`: the reference catalog
 
@@ -539,6 +630,12 @@ a clear refusal, not a wrong read.
 | `ref` | `tags` / `review_by` | <= 12 slugs of <= 32 characters / at most 24 months ahead |
 | `ref` | `authority.url` | `https`, no userinfo, <= 2,048 characters |
 | `ref` | due-soon window | 30 days (fixed in slice 1) |
+| `capability find` | phrase / `--limit` | <= 200 characters / 1..20 (default 5) |
+| `capability list` | `--limit` / `--offset` | 1..100 (default 20) / >= 0 |
+| `capability` record | `name` / `summary` / `aliases` | <= 120 / <= 1,200 characters / <= 32 phrases of <= 80 |
+| `capability` record | `code` / `tests` / `anchors` / `requirements` / `tags` | <= 32 / 32 / 16 / 16 / 8, pointers <= 400 characters |
+| `capability propose-alias` | pending aliases | person 3 per capability and 50 per project; unverified pool 1 and 10; 20 per capability |
+| `admin.py capability-apply` | batch items | 1..100 |
 
 Out-of-range values fail with a nonzero exit code and an error that names the option or
 field **and** the limit, for example:

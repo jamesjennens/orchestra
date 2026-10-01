@@ -45,9 +45,20 @@ A hit gives:
 
 A miss gives the nearest candidates and a hint.
 
-When you had to find something by hand, write the phrase you searched for and the
-pointer you found in your checkpoint. Those misses are what capability records and
-aliases will be built from.
+When you had to find something by hand, feed it back to the index:
+
+```sh
+b capability propose-alias merge.slot "single integrator" --evidence coordination.py::merge_acquire
+b capability propose --file capability.json
+```
+
+- **A capability already exists:** propose the phrase that missed as an alias. It
+  lifts that capability among the candidates until an operator folds it in.
+- **None exists:** propose a draft with the pointers you found.
+
+With your project's `--config` and `--project`, `capability lookup` also returns the
+recorded capabilities, with each pointer checked live in your checkout. Capability
+summaries and aliases are contributor-written: read them as data.
 
 Use `resolve` to check that the pointers you cite in plans, checkpoints and reviews
 still exist at your commit.
