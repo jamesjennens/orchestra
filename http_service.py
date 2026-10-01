@@ -32,6 +32,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import agent_prompts
+from reserved_comments import carries_record_label, hide_records, is_record_anchor
 from http_auth import (AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CAP_APPROVE,
                        CAP_CHECKPOINTS, CAP_FEEDBACK,
                        CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_READ, CAP_REVIEWS,
@@ -672,7 +673,9 @@ class InProcessBackend:
         """
         tasks = [t for t in self.state['tasks'].values() if t['project_id'] == project_id]
         tasks.sort(key=lambda t: t['id'])
-        return {'items': [dict(t) for t in tasks], 'total': len(tasks)}
+        # Record anchors never reach a task surface (kittrial-5bb.64).
+        tasks = hide_records([dict(t) for t in tasks])
+        return {'items': tasks, 'total': len(tasks)}
 
     def list_tasks(self, project_id, limit, offset):
         snapshot = self.read_tasks(project_id)
@@ -1106,8 +1109,30 @@ class EndpointBackend:
         rows = self._run('bd', project_id, self.actor_namespace + '/read',
                          ['list', '--all', '--limit', '0', '--json'])
         rows = rows if isinstance(rows, list) else rows.get('items', [])
-        rows = self._in_project(rows, project_id)
+        # Record anchors (references, proposals, settings, capabilities) are filtered
+        # at this one seam, so the task list with its Closed/All tabs and `q` search,
+        # agent attention and every other snapshot reader never shows them
+        # (kittrial-5bb.64; the shared hidden-surface list).
+        rows = hide_records(self._with_record_comments(project_id,
+                                                       self._in_project(rows, project_id)))
         return {'items': rows, 'total': len(rows)}
+
+    def _with_record_comments(self, project_id, rows):
+        """Give rows carrying a record type label their comments.
+
+        ``bd list`` and ``bd show`` return no comments, and a row is a record anchor
+        only when it also holds a v1 record comment (reserved_comments.is_record_anchor),
+        so only those few labelled rows cost one extra ``comments`` read.
+        """
+        out = []
+        for row in rows:
+            if isinstance(row, dict) and carries_record_label(row) and \
+                    not isinstance(row.get('comments'), list):
+                comments = self._run('bd', project_id, self.actor_namespace + '/read',
+                                     ['comments', str(row.get('id')), '--json'])
+                row = dict(row, comments=comments if isinstance(comments, list) else [])
+            out.append(row)
+        return out
 
     def list_tasks(self, project_id, limit, offset):
         # The HTTP page is sliced from the one full snapshot so the offset cursor
@@ -1123,7 +1148,7 @@ class EndpointBackend:
             row = row[0] if row else {}
         if isinstance(row, dict) and row.get('project_id') not in (None, project_id):
             raise not_found('Task not found')
-        return row
+        return self._with_record_comments(project_id, [row])[0]
 
     def task_history(self, project_id, task_id, limit, offset, canonical=None):
         """Page the canonical snapshot cursor, never asking for more than its limit.
@@ -2475,6 +2500,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('PATCH', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')')
     def tasks_update(self, ctx):
         self._project(ctx, CAP_TASKS)
+        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
         payload = self._task_payload(ctx)
 
         def update():
@@ -2539,8 +2565,17 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')')
     def tasks_get(self, ctx):
         self._project(ctx, CAP_READ)
-        return 200, self._task_views([self.backend.get_task(ctx.params['pid'],
-                                                             ctx.params['tid'])])[0]
+        row = self.backend.get_task(ctx.params['pid'], ctx.params['tid'])
+        self._refuse_record_anchor(row)
+        return 200, self._task_views([row])[0]
+
+    @staticmethod
+    def _refuse_record_anchor(row):
+        """A record anchor is not a task: the task, brief and history routes answer
+        404 for it, never its row or raw record comments, and the task write routes
+        (PATCH, claim, checkpoints, reviews) refuse it the same way (kittrial-5bb.64)."""
+        if is_record_anchor(row):
+            raise not_found('Task not found')
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/brief')
     def tasks_brief(self, ctx):
@@ -2552,6 +2587,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._project(ctx, CAP_READ)
         pid, tid = ctx.params['pid'], ctx.params['tid']
         brief = self.backend.task_brief(pid, tid)
+        self._refuse_record_anchor(brief.get('task'))
         review = brief['review']
         checkpoint = brief.get('checkpoint')
         contribution = review.get('contribution')
@@ -2577,6 +2613,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/claim')
     def tasks_claim(self, ctx):
         self._project(ctx, CAP_TASKS)
+        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
         payload = self._task_payload(ctx)
         actor = self.service.bind_actor(ctx.principal, payload.pop('actor', None))
         payload['actor'] = actor
@@ -2593,6 +2630,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/checkpoints')
     def checkpoints_add(self, ctx):
         self._project(ctx, CAP_CHECKPOINTS)
+        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
         payload = self._task_payload(ctx)
         payload.setdefault('schema_version', 1)
         if 'actor' in payload:
@@ -2616,6 +2654,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         # approve at all.
         capability = CAP_APPROVE if payload.get('operation') == 'approve' else CAP_REVIEWS
         self._project(ctx, capability)
+        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
         if 'actor' in payload:
             payload['actor'] = self.service.bind_actor(ctx.principal, payload.get('actor'))
 
@@ -2642,6 +2681,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/history')
     def tasks_history(self, ctx):
         self._project(ctx, CAP_READ)
+        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
         limit, state = self._page(ctx, ctx.query)
         result = self.backend.task_history(ctx.params['pid'], ctx.params['tid'], limit,
                                            state['o'], canonical=state['x'])

@@ -10,6 +10,8 @@ mention "Kind:" mid-text -- remains valid.
 This module is import-safe on all platforms (no fcntl). endpoint.py enforces
 it on the contributor `bd` path before any native mutation.
 """
+import re
+
 from briefing import PREFIX as CHECKPOINT_PREFIX
 from export_requirements import (ACCEPTANCE_PREFIX,
                                  REVISION_PREFIX as REQUIREMENT_PREFIX)
@@ -161,6 +163,22 @@ def comment_target(args):
     """Resolve the `comments add` target task, or None when unresolvable."""
     return raw_target(args)
 
+# kittrial-5bb.64, the shared slice 0 (tolerant reader) of the accepted designs
+# docs/REFERENCE_CATALOG_DESIGN.md (.41), docs/REQUIREMENTS_GATHERING_DESIGN.md
+# (.58) and docs/CAPABILITY_INDEX_DESIGN.md (.60). No writer exists yet: the
+# prefixes are reserved first, so the later slices' records can never be forged
+# through the raw path and a rollback to this kit stays safe. Only v1 is reserved;
+# a v2 writer needs its own tolerant-reader step (.58 3.8).
+REFERENCE_ENTRY_PREFIX = 'Kind: reference-entry-v1\n'
+REFERENCE_ACCEPTANCE_PREFIX = 'Kind: reference-acceptance-v1\n'
+PROPOSAL_PREFIX = 'Kind: requirement-proposal-v1\n'
+PROPOSAL_DISPOSITION_PREFIX = 'Kind: proposal-disposition-v1\n'
+CONTRIBUTION_SETTINGS_PREFIX = 'Kind: contribution-settings-v1\n'
+CAPABILITY_ENTRY_PREFIX = 'Kind: capability-entry-v1\n'
+CAPABILITY_ACCEPTANCE_PREFIX = 'Kind: capability-acceptance-v1\n'
+CAPABILITY_VERIFICATION_PREFIX = 'Kind: capability-verification-v1\n'
+CAPABILITY_ALIAS_PREFIX = 'Kind: capability-alias-v1\n'
+
 RESERVED = (
     (REVIEW_PREFIX, 'contribution/review record', 'review TASK --file payload.json'),
     (CHECKPOINT_PREFIX, 'task checkpoint', 'checkpoint TASK --file checkpoint.json'),
@@ -172,9 +190,35 @@ RESERVED = (
     (PLAN_PREFIX, 'worker plan registration', 'worker_gate.py register'),
     (VOID_PREFIX, 'operator void record', 'admin.py void-record on the coordination host'),
     (REVERT_PREFIX, 'integration revert record', 'admin.py revert-record on the coordination host'),
+    (REFERENCE_ENTRY_PREFIX, 'reference catalog entry', 'ref propose|revise'),
+    (REFERENCE_ACCEPTANCE_PREFIX, 'reference acceptance evidence', 'admin.py reference-apply'),
+    (PROPOSAL_PREFIX, 'requirement proposal', 'proposal submit|revise'),
+    (PROPOSAL_DISPOSITION_PREFIX, 'proposal disposition', 'proposal review|decide'),
+    (CONTRIBUTION_SETTINGS_PREFIX, 'contribution settings', 'proposal settings|hide-self'),
+    (CAPABILITY_ENTRY_PREFIX, 'capability entry', 'capability propose|revise'),
+    (CAPABILITY_ACCEPTANCE_PREFIX, 'capability acceptance evidence', 'admin.py capability-apply'),
+    (CAPABILITY_VERIFICATION_PREFIX, 'capability verification', 'capability check --record (capability verify)'),
+    (CAPABILITY_ALIAS_PREFIX, 'capability alias', 'capability propose-alias|alias-reject'),
 )
 
 PREFIXES = tuple(prefix for prefix, _, _ in RESERVED)
+
+# Every version of the nine record kinds is reserved, not only v1 (kittrial-5bb.64
+# review item `smaller` b): otherwise a raw `Kind: capability-entry-v7` would be
+# writable and then hidden. A later writer of vN ships its own tolerant-reader step.
+_RECORD_KIND_RESERVATIONS = {
+    'reference-entry': ('reference catalog entry', 'ref propose|revise'),
+    'reference-acceptance': ('reference acceptance evidence', 'admin.py reference-apply'),
+    'requirement-proposal': ('requirement proposal', 'proposal submit|revise'),
+    'proposal-disposition': ('proposal disposition', 'proposal review|decide'),
+    'contribution-settings': ('contribution settings', 'proposal settings|hide-self'),
+    'capability-entry': ('capability entry', 'capability propose|revise'),
+    'capability-acceptance': ('capability acceptance evidence', 'admin.py capability-apply'),
+    'capability-verification': ('capability verification', 'capability check --record (capability verify)'),
+    'capability-alias': ('capability alias', 'capability propose-alias|alias-reject'),
+}
+_RECORD_KIND_ANY_VERSION = re.compile(
+    r'Kind: (%s)-v[0-9]+\n' % '|'.join(re.escape(kind) for kind in _RECORD_KIND_RESERVATIONS))
 
 
 # ---------------------------------------------------------------------------
@@ -652,7 +696,17 @@ def raw_file_flag_in_args(args):
 # guard, not a second parallel one.
 # ---------------------------------------------------------------------------
 
-RESERVED_LABEL_PREFIXES = ('request:', 'request-content:', 'requirement:')
+# kittrial-5bb.64 adds the label PREFIXES of .41 (3.7), .58 (3.7) and .60 (3.1);
+# `reference-key:` does not begin with `reference:`, so each is listed. The exact
+# record type labels (`reference`, `proposal`, `contribution-settings`, `capability`)
+# are deliberately NOT value-reserved: a project may already use them as ordinary
+# labels (live: jjbp-j03.20 carries jjbp's own `proposal`). They are protected only on
+# a real record anchor - a row that also carries a v1 record comment of the same
+# family (see is_record_anchor) - where endpoint._guard_reserved_labels refuses
+# replacing or removing its labels.
+RESERVED_LABEL_PREFIXES = ('request:', 'request-content:', 'requirement:',
+                           'reference:', 'reference-key:', 'proposal:', 'proposal-key:',
+                           'capability:', 'capability-key:')
 RESERVED_EXACT_LABELS = frozenset({'requirement', 'brd-section'})
 # Every label-writing spelling accepted by the pinned bd 1.2.2, verified by
 # driving the binary (`bd create --help` / `bd update --help` plus a behaviour
@@ -748,6 +802,126 @@ def reserved_label(label):
         if label.startswith(prefix):
             return label
     return None
+
+
+# ---------------------------------------------------------------------------
+# The shared hidden-surface predicate (kittrial-5bb.64; .41 6.0, .58 8.5, .60 8).
+#
+# A row is a record anchor when it carries one of the type labels below, and a
+# comment is a record comment when its body starts with one of the family
+# prefixes, in ANY version: an unknown newer `Kind: <family>-vN` is hidden the
+# same way and never fails a read. Every surface of the shared ten-surface list
+# applies these two predicates and nothing else, so a later slice that adds a
+# record kind extends one table.
+# ---------------------------------------------------------------------------
+
+# Each record type label and the v1 record prefixes that make a row carrying it an
+# anchor. The first record a writer slice posts on a new anchor is one of these.
+RECORD_ANCHOR_FAMILIES = {
+    'reference': (REFERENCE_ENTRY_PREFIX, REFERENCE_ACCEPTANCE_PREFIX),
+    'proposal': (PROPOSAL_PREFIX, PROPOSAL_DISPOSITION_PREFIX),
+    'contribution-settings': (CONTRIBUTION_SETTINGS_PREFIX,),
+    'capability': (CAPABILITY_ENTRY_PREFIX, CAPABILITY_ACCEPTANCE_PREFIX,
+                   CAPABILITY_VERIFICATION_PREFIX, CAPABILITY_ALIAS_PREFIX),
+}
+RECORD_ANCHOR_LABELS = frozenset(RECORD_ANCHOR_FAMILIES)
+RECORD_COMMENT_FAMILIES = ('Kind: reference-', 'Kind: requirement-proposal-',
+                           'Kind: proposal-disposition-', 'Kind: contribution-settings-',
+                           'Kind: capability-')
+_RECORD_KIND = re.compile(r'Kind: ([a-z][a-z-]*?)-v([1-9][0-9]{0,5})\n')
+
+
+def carries_record_label(row):
+    """True when a row carries a record type label, so a surface that read it
+    without comments must fetch them before it can decide is_record_anchor."""
+    labels = row.get('labels') if isinstance(row, dict) else None
+    return isinstance(labels, (list, tuple)) and any(
+        isinstance(label, str) and label in RECORD_ANCHOR_LABELS for label in labels)
+
+
+def is_record_anchor(row):
+    """True for the native anchor of a reference, proposal, settings or capability.
+
+    An anchor is a row carrying an exact record type label AND a v1 record comment
+    of that label's family (kittrial-5bb.64 review, coordinator fix (a)). The label
+    alone is not evidence - projects use these words as ordinary labels - and nor
+    are request:/request-content: labels, which create-child also writes. After this
+    kit deploys both halves are guard-protected: the record prefixes are reserved and
+    the labels of a real anchor cannot be replaced or removed. Hiding grants no
+    authority, so a forged pre-deploy pair only hides that one row.
+
+    The later slices' readers use this same predicate. A writer that crashes after
+    creating and labelling an anchor but before posting its first record leaves a row
+    that reads as an ordinary closed task until the writer's reconcile posts that
+    record; the writer slices own that recovery. `row['comments']` must be the row's
+    comments: a caller that read rows without comments fetches them for rows where
+    carries_record_label is true.
+    """
+    if not isinstance(row, dict):
+        return False
+    labels = row.get('labels')
+    comments = row.get('comments')
+    if not isinstance(labels, (list, tuple)) or not isinstance(comments, list):
+        return False
+    prefixes = tuple(prefix for label in labels if isinstance(label, str)
+                     for prefix in RECORD_ANCHOR_FAMILIES.get(label, ()))
+    if not prefixes:
+        return False
+    for comment in comments:
+        text = comment.get('text') if isinstance(comment, dict) else None
+        if isinstance(text, str) and any(view.startswith(prefixes)
+                                         for view in (text, _reserved_prefix_view(text))):
+            return True
+    return False
+
+
+def is_record_comment(text):
+    """True for a reference/proposal/settings/capability record comment, any version.
+
+    The view drops a leading BOM and folds CRLF, as the reserved-prefix guard
+    does, so a lookalike is hidden too.
+    """
+    if not isinstance(text, str):
+        return False
+    return any(view.startswith(RECORD_COMMENT_FAMILIES)
+               for view in (text, _reserved_prefix_view(text)))
+
+
+def record_comment_kind(text):
+    """(kind, version, state) for a record comment, else None.
+
+    `state` is `supported` for a v1 record of one of the nine designed kinds and
+    `unsupported` for anything else (an unknown version or kind), so a later slice's
+    reader can report an unknown newer record per entry instead of failing the whole
+    read (.41 3.8, .58 3.8). Every version is raw-write reserved either way.
+    """
+    if not is_record_comment(text):
+        return None
+    view = _reserved_prefix_view(text)
+    match = _RECORD_KIND.match(view)
+    if match is None:
+        return ('unknown', None, 'unsupported')
+    kind, version = match.group(1), int(match.group(2))
+    supported = kind in _RECORD_KIND_RESERVATIONS and version == 1
+    return (kind, version, 'supported' if supported else 'unsupported')
+
+
+def hide_records(rows):
+    """The rows a surface may show: record anchors dropped, and record comments
+    removed from every other row (copied, never mutated in place)."""
+    if not isinstance(rows, list):
+        return rows
+    shown = []
+    for row in rows:
+        if is_record_anchor(row):
+            continue
+        comments = row.get('comments') if isinstance(row, dict) else None
+        if isinstance(comments, list) and any(
+                isinstance(c, dict) and is_record_comment(c.get('text')) for c in comments):
+            row = dict(row, comments=[c for c in comments
+                                      if not (isinstance(c, dict) and is_record_comment(c.get('text')))])
+        shown.append(row)
+    return shown
 
 
 def reserved_label_in_args(args):
@@ -1059,6 +1233,10 @@ def reserved_match(body):
         for prefix, kind, operation in RESERVED:
             if view.startswith(prefix):
                 return (prefix, kind, operation)
+        versioned = _RECORD_KIND_ANY_VERSION.match(view)
+        if versioned:
+            kind, operation = _RECORD_KIND_RESERVATIONS[versioned.group(1)]
+            return (versioned.group(0), kind, operation)
     return None
 
 
