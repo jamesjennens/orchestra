@@ -278,7 +278,8 @@ function respondForm(ctx, pid, tid, contribution, review, open, delivered) {
     } catch { return; }
     if (status.hidden) { ctx.setDirty(false); ctx.render(); }
   });
-  if (prompted) queueMicrotask(() => { form.scrollIntoView({ block: 'start' }); const first = form.querySelector('#rn-0'); if (first) first.focus(); });
+  // After the page render has scrolled to the top and focused the title.
+  if (prompted) setTimeout(() => { form.scrollIntoView({ block: 'start' }); const first = form.querySelector('#rn-0'); if (first) first.focus(); });
   return form;
 }
 
