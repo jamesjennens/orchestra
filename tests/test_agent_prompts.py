@@ -135,6 +135,13 @@ class PromptCase(unittest.TestCase):
         self.assertIn('pending request items: item-1, item-2', text)
         self.assertIn('read the task brief for the pending request items', text)
 
+    def test_a_partial_id_list_says_how_many_more(self):
+        item = dict(row('t1', 'changes-requested', ME, pending=['a1', 'a2', 'a3', 'a4', 'a5']),
+                    open_requests=7, pending_request_ids_complete=False)
+        text = prompt([classify(WORKER, [item])])['text']
+        self.assertIn('pending request items: a1, a2, a3, a4, a5 (5 of 7; read the task brief '
+                      'for the rest)', text)
+
     def test_grouped_by_project(self):
         first = classify(OWNER, [row('a1', 'awaiting-review', OTHER)],
                          project={'id': 'p1', 'name': 'Alpha', 'role': 'owner'})
@@ -174,6 +181,22 @@ class PromptCase(unittest.TestCase):
         self.assertEqual('action', result['kind'])
         text = result['text']
         self.assertLess(text.index('READ-ONLY projects'), text.index('task b1'))
+
+    def test_no_projects_gives_a_grant_note_without_an_action_list(self):
+        for agent, reason in ((AGENT, 'This agent has no projects yet.'),
+                              (dict(AGENT, projects=['p9']),
+                               'None of the projects granted to this agent can be opened')):
+            result = prompt([], agent=agent)
+            self.assertEqual('empty', result['kind'])
+            self.assertEqual('Copy note for olive-coord', result['label'])
+            self.assertEqual(0, result['items'])
+            text = result['text']
+            self.assertIn('NO PROJECTS YET.', text)
+            self.assertIn(reason, text)
+            self.assertIn('grant this agent a project on the My agents page', text)
+            for absent in ('can only view', 'READ-ONLY', 'Before you act', '- task ',
+                           '/v1/agents/me/next'):
+                self.assertNotIn(absent, text)
 
     def test_nothing_to_do(self):
         self.assertIn('Nothing needs action right now.',

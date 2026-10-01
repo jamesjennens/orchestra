@@ -66,6 +66,10 @@ AGENT_CLAIMABLE_LIMIT = MAX_PAGE
 #: Bound on the projects one ``GET /v1/me/work`` read walks (the caller's own
 #: memberships, each read once). Reaching it reports ``truncated``.
 ME_WORK_MAX_PROJECTS = 50
+#: Bound on the per-task detail reads one ``GET /v1/me/work`` adds on a backend whose
+#: queue lacks request ids, review times and checkpoint state (the canonical binding:
+#: one ``brief`` subprocess per task, cached per principal like the queue).
+ME_WORK_DETAIL_MAX = 10
 #: Size bound on the per-server short-lived read cache used by ``GET /v1/me/work``
 #: (entries are keyed per principal and project; see ``READ_CACHE_SECONDS``).
 READ_CACHE_MAX_ENTRIES = 2048
@@ -506,7 +510,10 @@ class InProcessBackend:
                       'actor': payload.get('actor') or principal.actor,
                       'created_at': now_iso(self.service._now())}
             contributions.append(record)
-            task['review_state'] = 'awaiting-review'
+            # Like the canonical projection, a new revision does not resolve requests
+            # that need a respond record: they stay open until the contributor responds.
+            task['review_state'] = ('changes-requested' if self._requests(contributions, True)
+                                    else 'awaiting-review')
             task['version'] += 1
             self._event(project_id, task['id'], 'contribution', principal, record['actor'])
             return {'contribution': record, 'task_version': task['version']}
@@ -519,19 +526,108 @@ class InProcessBackend:
         if named is not None and named != current[-1]['id']:
             raise conflict('A newer contribution arrived; reread the task before reviewing',
                            {'current_contribution': current[-1]['id']})
-        items = self._review_items(payload.get('items')) if operation == 'request-changes' \
-            else []
+        actor = payload.get('actor') or principal.actor
+        items, resolutions = [], []
+        if operation == 'request-changes':
+            items = self._review_items(payload.get('items'))
+        elif operation == 'respond':
+            # Canonical rule (review_workflow.execute): only the current assignee may
+            # respond, and every resolution must name a still-open request item.
+            if not task.get('assignee') or actor != task['assignee']:
+                raise forbidden('Only the task assignee may respond to requested changes')
+            resolutions = self._resolutions(payload.get('resolutions'),
+                                            self._requests(contributions, True))
+        elif operation == 'approve' and self._requests(contributions, True):
+            raise conflict('Cannot approve while requested changes remain unresolved')
         record = {'id': 'rev_' + secrets.token_hex(6), 'task_id': task['id'], 'kind': operation,
                   'contribution_id': current[-1]['id'],
                   'summary': (payload.get('summary') or '')[:1200],
                   'items': items,
-                  'actor': payload.get('actor') or principal.actor,
+                  'actor': actor,
                   'created_at': now_iso(self.service._now())}
+        if operation == 'request-changes':
+            # Marks the request as following the canonical respond rule. Requests
+            # recorded before the respond step existed carry no flag and keep the old
+            # rule (a later revision resolves them), so older disposable state reads
+            # the same as before.
+            record['needs_respond'] = True
+        if operation == 'respond':
+            record['resolutions'] = resolutions
         contributions.append(record)
-        task['review_state'] = 'changes-requested' if operation == 'request-changes' else 'approved'
+        if operation == 'approve':
+            task['review_state'] = 'approved'
+        else:
+            task['review_state'] = ('changes-requested' if self._requests(contributions, True)
+                                    else 'awaiting-review')
         task['version'] += 1
         self._event(project_id, task['id'], operation, principal, record['actor'])
         return {'review': record, 'task_version': task['version']}
+
+    @staticmethod
+    def _requests(records, open_only=False):
+        """Every requested-change item with its status, in record order.
+
+        A request recorded with ``needs_respond`` stays open until a ``respond``
+        record resolves it (the canonical rule), whatever revisions arrive meanwhile.
+        A legacy request without the flag is resolved by the next revision.
+        """
+        contributions = [r for r in records if r['kind'] == 'contribution']
+        resolved = {}
+        for record in records:
+            if record['kind'] == 'respond':
+                for item in record.get('resolutions') or []:
+                    resolved[(item['request'], item['item'])] = dict(item, at=record['created_at'],
+                                                                     author=record['actor'])
+        found = []
+        for position, record in enumerate(records):
+            if record['kind'] != 'request-changes':
+                continue
+            later = [r for r in records[position + 1:] if r['kind'] == 'contribution']
+            items = record.get('items') or (
+                [{'id': 'item-1', 'text': record['summary']}] if record.get('summary') else [])
+            for item in items:
+                entry = {'id': item['id'], 'request': record['id'], 'text': item['text'],
+                         'contribution': record['contribution_id'], 'author': record['actor'],
+                         'at': record['created_at'], 'status': 'open', 'resolution': None}
+                answer = resolved.get((record['id'], item['id']))
+                if answer is not None:
+                    entry.update(status='resolved', resolution=answer['reason'],
+                                 evidence=answer['evidence'], resolved_at=answer['at'],
+                                 resolved_by=answer['author'])
+                elif not record.get('needs_respond') and later:
+                    entry.update(status='resolved', resolution='Addressed in revision %d'
+                                 % (contributions.index(later[0]) + 1))
+                found.append(entry)
+        return [r for r in found if r['status'] == 'open'] if open_only else found
+
+    @staticmethod
+    def _resolutions(raw, open_requests):
+        """Validate a respond's resolutions the way ``review_workflow.validate`` does."""
+        if not isinstance(raw, list) or not 1 <= len(raw) <= 20:
+            raise invalid('A response needs 1-20 resolutions')
+        pending = {(r['request'], r['id']) for r in open_requests}
+        seen, clean = set(), []
+        for item in raw:
+            if not isinstance(item, dict) or set(item) != {'request', 'item', 'reason',
+                                                           'evidence'}:
+                raise invalid('Each resolution needs exactly request, item, reason and evidence')
+            for field in ('request', 'item'):
+                if not isinstance(item[field], str) or not SAFE_ID.fullmatch(item[field]):
+                    raise invalid('Resolution %s must be an id' % field)
+            for field in ('reason', 'evidence'):
+                if not isinstance(item[field], str) or not item[field].strip() or \
+                        len(item[field]) > 1000 or '\x00' in item[field]:
+                    raise invalid('Resolution %s must be 1-1000 characters' % field)
+            key = (item['request'], item['item'])
+            if key in seen:
+                raise invalid('Duplicate resolution')
+            if key not in pending:
+                raise conflict('A resolution must name a still-open requested change; reread '
+                               'the task')
+            seen.add(key)
+            clean.append({'request': item['request'], 'item': item['item'],
+                          'reason': item['reason'].strip(), 'evidence': item['evidence'].strip()})
+        return clean
 
     @staticmethod
     def _review_items(raw):
@@ -600,26 +696,13 @@ class InProcessBackend:
     def _review_view(self, task):
         """The task's review chain, projected like ``review_workflow.projection``.
 
-        A requested change is open until a later revision arrives (the disposable
-        backend has no separate ``respond`` record).
+        A requested change is open until the contributor's ``respond`` record resolves
+        it, as canonically; a newer revision alone does not (``_requests`` keeps the
+        old revision-resolves rule only for requests recorded before the respond step).
         """
         records = self.state.get('contributions', {}).get(task['id'], [])
         contributions = [r for r in records if r['kind'] == 'contribution']
-        requests = []
-        for position, record in enumerate(records):
-            if record['kind'] != 'request-changes':
-                continue
-            later = [r for r in records[position + 1:] if r['kind'] == 'contribution']
-            items = record.get('items') or (
-                [{'id': 'item-1', 'text': record['summary']}] if record.get('summary') else [])
-            for item in items:
-                resolved = later[0] if later else None
-                requests.append({
-                    'id': item['id'], 'request': record['id'], 'text': item['text'],
-                    'contribution': record['contribution_id'], 'author': record['actor'],
-                    'at': record['created_at'], 'status': 'resolved' if resolved else 'open',
-                    'resolution': ('Addressed in revision %d' % (contributions.index(resolved) + 1))
-                    if resolved else None})
+        requests = self._requests(records)
         contribution = None
         if contributions:
             current = contributions[-1]
@@ -700,7 +783,8 @@ def queue_item(project_id, task, review_state, contribution, open_requests,
 
     ``pending_request_ids`` and ``waiting_since`` (time of the latest review record)
     are filled where the backend knows them; the canonical ``work`` projection
-    reports only a count of pending items, so there they stay empty/``None``.
+    reports only a count of pending items, so there they stay empty/``None`` here and
+    ``GET /v1/me/work`` fills a bounded number of rows from ``task_detail``.
 
     ``integration`` and ``integration_warnings`` are additive (kittrial-5bb.52):
     the canonical backend passes the ``work`` row's integration block and its
@@ -1086,6 +1170,47 @@ class EndpointBackend:
     #: requests with a count); the page links to ``history`` for the rest.
     BRIEF_ITEMS = 10
 
+    def task_detail(self, project_id, task_id):
+        """What the ``work`` queue row lacks, from ONE canonical ``brief`` read.
+
+        Used by ``GET /v1/me/work`` for at most ``ME_WORK_DETAIL_MAX`` rows per
+        request. Returns the pending request item ids (the brief lists at most five;
+        ``pending_request_ids_complete`` says whether that is all of them), the time
+        the current wait began (newest pending request for changes-requested, the
+        current revision's delivery for awaiting-review; ``None`` otherwise), the
+        current revision number and ``blocked`` (the latest checkpoint lists
+        unresolved items).
+        """
+        data = self._run('brief', project_id, self.actor_namespace + '/read',
+                         [str(task_id), '--json', '--items-limit', '1'])
+        if not isinstance(data, dict):
+            raise uncertain('Canonical brief returned an unexpected shape')
+        review = data.get('review') or {}
+        pending = [p for p in review.get('pending_requests') or [] if isinstance(p, dict)]
+        ids = [p['item'] for p in pending if isinstance(p.get('item'), str)]
+        state = review.get('review_state')
+        current = review.get('contribution') if isinstance(review.get('contribution'), dict) \
+            else None
+        since = None
+        if state == 'changes-requested':
+            stamps = [p.get('timestamp') for p in pending
+                      if agent_prompts.parse_time(p.get('timestamp'))]
+            since = max(stamps, key=agent_prompts.parse_time) if stamps else None
+        elif state in ('awaiting-review', 'legacy-review-ready') and current:
+            since = current.get('timestamp')
+        unresolved = (data.get('unresolved') or {}).get('total')
+        detail = {'pending_request_ids': ids,
+                  'pending_request_ids_complete': len(ids) >= (review.get('pending_total')
+                                                               or len(ids)),
+                  'waiting_since': since,
+                  'blocked': bool(data.get('checkpoint')) and bool(unresolved)}
+        if current:
+            detail['contribution'] = {
+                'id': current.get('comment_id'), 'commit': current.get('commit'),
+                'revision': (review.get('prior_contributions_total') or 0) + 1,
+                'at': current.get('timestamp')}
+        return detail
+
     def task_brief(self, project_id, task_id):
         """Map the canonical ``brief --json`` read onto the task page's shape.
 
@@ -1348,7 +1473,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         # Per-request agent read cache. An HTTP/1.1 keep-alive connection reuses this
         # handler instance, so the cache is reset for every request and never outlives it.
         self._agent_task_cache = {}
-        self._queue_cache = {}
+        self._request_reads = {}
         try:
             parsed = urlsplit(self.path)
             path = parsed.path
@@ -1695,23 +1820,40 @@ class ApiHandler(BaseHTTPRequestHandler):
 
         Authorization is never cached: callers re-check live authority first.
         """
-        cache = getattr(self, '_queue_cache', None)
-        if cache is None:
-            cache = self._queue_cache = {}
-        if project_id in cache:
-            return cache[project_id]
+        return self._cached_read('queue', project_id,
+                                 lambda: self.backend.review_queue(project_id), shared)
+
+    def _cached_read(self, kind, project_id, load, shared=False):
+        """One canonical read per request, optionally reused across requests.
+
+        Within a request a read of ``(kind, project_id)`` happens once. With ``shared``
+        and a backend ``READ_CACHE_SECONDS`` above zero, the result is also kept in the
+        server's small read cache for that long, keyed by the *principal* (user id and
+        credential id, so an agent never sees its owner's entry or the reverse), the
+        project and the read kind. Callers re-check live authority before every read;
+        authorization is never cached. The principal's own successful write drops its
+        entries for that project (:meth:`_forget_cached_reads`). The cache is bounded
+        to :data:`READ_CACHE_MAX_ENTRIES` entries.
+        """
+        memo = getattr(self, '_request_reads', None)
+        if memo is None:
+            memo = self._request_reads = {}
+        if (kind, project_id) in memo:
+            return memo[(kind, project_id)]
         ttl = getattr(self.backend, 'READ_CACHE_SECONDS', 0) if shared else 0
-        key = (getattr(self._principal, 'user_id', None), project_id)
+        principal = self._principal
+        key = (getattr(principal, 'user_id', None), getattr(principal, 'credential_id', None)
+               or '-', project_id, kind)
         now = time.monotonic()
-        if ttl:
+        if ttl and self.read_cache is not None:
             with self.read_cache_lock:
                 hit = self.read_cache.get(key)
             if hit is not None and hit[0] > now:
-                cache[project_id] = hit[1]
+                memo[(kind, project_id)] = hit[1]
                 return hit[1]
-        result = self.backend.review_queue(project_id)
-        cache[project_id] = result
-        if ttl:
+        result = load()
+        memo[(kind, project_id)] = result
+        if ttl and self.read_cache is not None:
             with self.read_cache_lock:
                 if len(self.read_cache) >= READ_CACHE_MAX_ENTRIES:
                     for stale in [k for k, v in self.read_cache.items() if v[0] <= now] or \
@@ -1721,27 +1863,33 @@ class ApiHandler(BaseHTTPRequestHandler):
         return result
 
     def _forget_cached_reads(self, principal, project_id):
-        """Drop the principal's cached ``/v1/me/work`` reads after its own write.
+        """Drop the principal's cached reads after its own successful write.
 
-        The project's entry goes (all of them when the write had no project), so the
-        author sees their own claim, delivery or review at once; other principals'
-        entries still expire on their short TTL.
+        The project's entries go (all of them when the write had no project), for
+        every credential of the same user, so the author sees their own claim,
+        delivery or review at once; other users' entries still expire on their short
+        TTL. The current request's own memo is dropped too.
         """
+        memo = getattr(self, '_request_reads', None)
+        if memo:
+            for key in [k for k in memo if project_id is None or k[1] == project_id]:
+                memo.pop(key, None)
         cache = getattr(self, 'read_cache', None)
         if cache is None or principal is None:
             return
         with self.read_cache_lock:
             for key in [k for k in cache if k[0] == principal.user_id and
-                        (project_id is None or k[1] == project_id)]:
+                        (project_id is None or k[2] == project_id)]:
                 cache.pop(key, None)
 
-    def _with_review_states(self, project_id, rows):
+    def _with_review_states(self, project_id, rows, shared=False):
         """Give every row its review state (``None`` when unknown). Returns completeness."""
         if all(isinstance(r, dict) and 'review_state' in r for r in rows):
             return True
         # A backend whose states come from its queue projection reuses this request's
-        # queue read instead of paying for a second one.
-        queue = self._review_queue(project_id) \
+        # queue read (and, with ``shared``, the principal's short-lived cached one)
+        # instead of paying for a second one.
+        queue = self._review_queue(project_id, shared=shared) \
             if getattr(self.backend, 'REVIEW_STATES_FROM_QUEUE', False) else None
         read = self.backend.review_states(project_id, queue=queue)
         states = read['states']
@@ -2343,15 +2491,24 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._project(ctx, CAP_READ)
         limit, state = self._page(ctx, ctx.query)
         filters = self._task_filters(ctx.query)
+        # The full snapshot and the review states come from the principal's short
+        # read cache (see _cached_read): on the canonical binding one page otherwise
+        # costs a ``bd list`` plus up to QUEUE_MAX_PAGES ``work`` reads. Rows are copied
+        # because the review state is merged into them below.
+        snapshot = self._cached_read('tasks', ctx.params['pid'],
+                                     lambda: self.backend.read_tasks(ctx.params['pid']),
+                                     shared=True)
+        rows = [dict(t) if isinstance(t, dict) else t for t in snapshot.get('items') or []]
         if filters:
-            rows = [t for t in self.backend.read_tasks(ctx.params['pid']).get('items') or []
-                    if isinstance(t, dict)]
-            complete = self._with_review_states(ctx.params['pid'], rows)
+            rows = [t for t in rows if isinstance(t, dict)]
+            complete = self._with_review_states(ctx.params['pid'], rows, shared=True)
             rows = [t for t in rows if task_matches(t, filters)]
             result = {'items': rows[state['o']:state['o'] + limit], 'total': len(rows)}
         else:
-            result = self.backend.list_tasks(ctx.params['pid'], limit, state['o'])
-            complete = self._with_review_states(ctx.params['pid'], result['items'])
+            result = {'items': rows[state['o']:state['o'] + limit],
+                      'total': snapshot.get('total', len(rows))}
+            complete = self._with_review_states(ctx.params['pid'], result['items'],
+                                                shared=True)
         result['items'] = self._task_views(result['items'])
         # False when some rows' review state is unknown (``review_state: null``): the
         # bounded canonical projection did not cover them, or they are closed tasks
@@ -2463,6 +2620,17 @@ class ApiHandler(BaseHTTPRequestHandler):
             payload['actor'] = self.service.bind_actor(ctx.principal, payload.get('actor'))
 
         def add():
+            if payload.get('operation') == 'respond':
+                # Only the task's assignee (the contributor of the current revision)
+                # may respond to requested changes. Both backends enforce it at the
+                # write too; checking here gives the caller a clear 403 instead of the
+                # canonical validator's generic refusal. It runs inside the mutation, so
+                # an exact retry still replays a committed response.
+                task = self.backend.get_task(ctx.params['pid'], ctx.params['tid'])
+                actor = payload.get('actor') or ctx.principal.actor or ctx.principal.user_id
+                if not isinstance(task, dict) or not task.get('assignee') or \
+                        task['assignee'] != actor:
+                    raise forbidden('Only the task assignee may respond to requested changes')
             result = self.backend.invoke('reviews.add', ctx.principal, ctx.params['pid'],
                                          payload, ctx.idempotency_key,
                                          target=ctx.route_target, authorize=ctx.authorize,
@@ -2535,6 +2703,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         generated_at = now_iso(self.service._now())
         now = agent_prompts.parse_time(generated_at)
         blocked = self._agent_blocked_tasks()
+        reads = []
         for project in projects[:ME_WORK_MAX_PROJECTS]:
             capabilities = self.service.capabilities_for(principal, project['id'])
             if CAP_READ not in capabilities:
@@ -2545,11 +2714,21 @@ class ApiHandler(BaseHTTPRequestHandler):
                 unavailable.append({'project': project['id'], 'reason': error.code})
                 continue
             truncated = truncated or not read.get('complete')
-            names = self.service.actor_names([i.get('assignee') for i in read['items']])
-            classified.append(agent_prompts.classify(project, capabilities, read['items'],
+            reads.append((project, capabilities, read))
+        details = self._me_work_details(reads, actor)
+        for project, capabilities, read in reads:
+            items = [dict(item, **details[(project['id'], item.get('id'))])
+                     if (project['id'], item.get('id')) in details else item
+                     for item in read['items']]
+            blocked |= {pid_tid[1] for pid_tid, detail in details.items()
+                        if pid_tid[0] == project['id'] and detail.get('blocked')}
+            names = self.service.actor_names([i.get('assignee') for i in items])
+            classified.append(agent_prompts.classify(project, capabilities, items,
                                                      actor, blocked, now, names))
-            for item in read['items']:
+            for item in items:
                 row = dict(item, project_name=project['name'])
+                if item.get('id') in blocked and item.get('status') != 'closed':
+                    row['blocked'] = True
                 if item.get('assignee') == actor and item.get('status') != 'closed':
                     assigned.append(row)
                 if CAP_APPROVE in capabilities and item['review_state'] in (
@@ -2579,6 +2758,56 @@ class ApiHandler(BaseHTTPRequestHandler):
                      'agents': agents, 'agent_prompts': prompts,
                      'truncated': truncated, 'unavailable': unavailable,
                      'generated_at': generated_at}
+
+    def _me_work_details(self, reads, actor):
+        """Fill the canonical queue's gaps for the rows that matter most, within a bound.
+
+        The canonical ``work`` projection gives a review state and a count of pending
+        request items per task, but no request item ids, no review times and no
+        checkpoint state. A backend that offers ``task_detail`` (the canonical binding:
+        one ``brief`` read per task) is asked for at most :data:`ME_WORK_DETAIL_MAX`
+        tasks per request, highest value first: the caller's own changes-requested
+        tasks (pending item ids), contributions awaiting the caller's review (wait
+        time), the caller's own claimed tasks, then other claimed tasks where the
+        caller approves (blocked). Each detail is cached per principal like the queue
+        (``READ_CACHE_SECONDS``). Rows past the bound keep "read the task brief" and
+        "wait time unknown", and are simply not marked blocked.
+        """
+        if not hasattr(self.backend, 'task_detail'):
+            return {}
+        ranked = []
+        for order, (project, capabilities, read) in enumerate(reads):
+            approver = CAP_APPROVE in capabilities
+            for item in read['items']:
+                if item.get('status') == 'closed' or not item.get('id'):
+                    continue
+                state = item.get('review_state')
+                mine = item.get('assignee') == actor
+                if state == 'changes-requested' and mine:
+                    rank = 0
+                elif state in ('awaiting-review', 'legacy-review-ready') and approver:
+                    rank = 1
+                elif state in (None, 'none') and mine:
+                    rank = 2
+                elif state in (None, 'none') and approver and item.get('assignee'):
+                    rank = 3
+                else:
+                    continue
+                ranked.append((rank, order, str(item['id']), project['id']))
+        ranked.sort()
+        details = {}
+        for _, _, task_id, project_id in ranked[:ME_WORK_DETAIL_MAX]:
+            try:
+                detail = self._cached_read(
+                    'detail:' + task_id, project_id,
+                    lambda p=project_id, t=task_id: self.backend.task_detail(p, t),
+                    shared=True)
+            except HttpError:
+                continue
+            if isinstance(detail, dict):
+                details[(project_id, task_id)] = {k: v for k, v in detail.items()
+                                                  if v is not None}
+        return details
 
     # -- feedback and audit ----------------------------------------------------
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/feedback')

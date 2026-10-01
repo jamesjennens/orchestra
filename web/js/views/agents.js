@@ -92,7 +92,7 @@ export async function list(ctx) {
   async function load() {
     let data;
     try { data = await ctx.api.agents(); } catch (error) { host.replaceChildren(errorState(error, load)); return; }
-    host.replaceChildren(data.items.length ? h('div', { class: 'agent-grid' }, data.items.map((a) => h('div', { class: 'stack' }, agentCard(ctx, a), editFolder(a)))) :
+    host.replaceChildren(data.items.length ? h('div', { class: 'agent-grid' }, data.items.map((a) => h('div', { class: 'stack' }, agentCard(ctx, a), editFolder(a), manages(ctx, a) ? editProjects(a) : null))) :
       h('div', { class: 'panel' }, empty('No agents yet', 'Add an agent for each assistant you run — for example a GitHub Copilot chat working in its own folder.')));
   }
   function editFolder(agent) {
@@ -109,9 +109,37 @@ export async function list(ctx) {
     details.append(h('summary', null, 'Change folder'), form);
     return details;
   }
+  // Grant or withdraw projects. An agent with none gets only a "no projects yet" note
+  // on My work, so this is where that note sends its owner. The server applies the
+  // whole change or none of it, and refuses a project the agent's owner cannot open.
+  function editProjects(agent) {
+    const granted = new Set((agent.projects || []).map((p) => (typeof p === 'string' ? p : p.id)));
+    const choices = grantable();
+    const details = h('details', { class: 'deliver', open: granted.size ? null : true });
+    const form = h('form', { class: 'form', novalidate: true },
+      h('fieldset', { class: 'checks' }, h('legend', null, 'Projects it can work on'),
+        choices.length ? choices.map((p) => h('label', { class: 'check', for: `gp-${agent.id}-${p.id}` },
+          h('input', { type: 'checkbox', id: `gp-${agent.id}-${p.id}`, name: 'project', value: p.id, checked: granted.has(p.id) ? true : null }), p.name)) :
+          h('p', { class: 'small muted' }, 'You need contributor access to a project first.')),
+      h('div', null, h('button', { type: 'submit' }, 'Save projects')));
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      // Keep grants this page cannot show (e.g. a project hidden from this list).
+      const shown = new Set(choices.map((p) => p.id));
+      const chosen = [...granted].filter((id) => !shown.has(id))
+        .concat([...form.querySelectorAll('input[name=project]:checked')].map((i) => i.value));
+      const saved = await act(form.querySelector('button'), () => ctx.api.updateAgent(agent.id, { projects: chosen }), { success: 'Projects saved' }).catch(() => null);
+      if (saved) load();
+    });
+    details.append(h('summary', null, granted.size ? 'Change projects' : 'Grant a project (none yet)'), form);
+    return details;
+  }
   load();
 
-  const projects = ctx.projects.filter((p) => !p.archived && ['owner', 'contributor', 'superuser'].includes(p.role));
+  function grantable() {
+    return ctx.projects.filter((p) => !p.archived && ['owner', 'contributor', 'superuser'].includes(p.role));
+  }
+  const projects = grantable();
   const form = h('form', { class: 'form', novalidate: true },
     h('div', { class: 'form-row' },
       field({ id: 'a-name', label: 'Agent name', hint: 'How colleagues will see it, e.g. “Kestrel”.', required: true, maxlength: 40 }),

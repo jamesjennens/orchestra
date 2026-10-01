@@ -10,7 +10,9 @@ lists what needs doing in each of the person's projects, tailored by their role 
   tasks (with the pending request ids), their claimed tasks, their delivered work
   awaiting review, and tasks they could claim;
 * viewers: no actions at all. A person who can only view gets a read-only status
-  summary instead, which tells the agent not to change anything.
+  summary instead, which tells the agent not to change anything;
+* an agent with no project (none granted, or none its owner can still open) gets only a
+  short note telling its owner to grant one on My agents, with no action list.
 
 Everything in a prompt is server-derived (ids, states, actions, times). Task titles are
 written by other people, so they appear only as short quoted labels with control
@@ -158,6 +160,9 @@ def _assignee(item):
 
 def _requests(item):
     ids = [token(i) for i in item.get('pending_request_ids') or []]
+    if ids and item.get('pending_request_ids_complete') is False:
+        return 'pending request items: %s (%d of %s; read the task brief for the rest)' % (
+            ', '.join(ids), len(ids), item.get('open_requests') or 'more')
     if ids:
         return 'pending request items: %s' % ', '.join(ids)
     count = item.get('open_requests')
@@ -241,6 +246,32 @@ ACTION_CLASSES = ('changes', 'review', 'integrate', 'blocked', 'stale', 'unclaim
                   'working', 'delivered', 'claimable')
 
 
+def _empty_prompt(agent, owner_name, generated_at, secret_file):
+    """The prompt for an agent with no project it can work in: no action list at all.
+
+    Either nothing is granted yet, or every granted project is one the owner can no
+    longer open (removed, archived, unreadable right now); both get the same "grant one
+    on My agents" note, worded for which of the two it is.
+    """
+    reason = ('None of the projects granted to this agent can be opened by your owner '
+              'right now.' if agent.get('projects') else 'This agent has no projects yet.')
+    text = '\n'.join([
+        'You are the Orchestra agent %s (agent id %s), working for %s.' % (
+            label(agent.get('name')), token(agent.get('id')), label(owner_name)),
+        'This note was written at %s (UTC) from your owner\'s "My work" page.' % generated_at,
+        '',
+        'NO PROJECTS YET. %s There is nothing for you to do in Orchestra.' % reason,
+        'Tell your owner to grant this agent a project on the My agents page in Orchestra '
+        '(Edit, then tick a project), and then to copy a new prompt for you from My work.',
+        'Do not claim, edit, review, deliver, checkpoint or comment on anything until then.',
+        'Never ask for, print, copy or write your secret. It stays in %s (%s on '
+        'macOS/Linux).' % (secret_file['windows'], secret_file['posix']),
+    ])
+    return {'agent_id': agent.get('id'), 'agent_name': agent.get('name'), 'kind': 'empty',
+            'label': 'Copy note for %s' % agent.get('name'),
+            'items': 0, 'omitted': 0, 'generated_at': generated_at, 'text': text}
+
+
 def build_prompt(agent, owner_name, projects, generated_at, server):
     """One agent's prompt: an action prompt, or a read-only status summary for a
     person who can only view every project."""
@@ -248,8 +279,10 @@ def build_prompt(agent, owner_name, projects, generated_at, server):
     secret_file = agent_secret_file(agent.get('name'))
     acting = [p for p in projects if p['can_approve'] or p['can_work']]
     viewing = [p for p in projects if not (p['can_approve'] or p['can_work'])]
-    kind = 'action' if acting else 'status'
+    kind = 'action' if acting else 'status' if viewing else 'empty'
     name = label(agent.get('name'))
+    if kind == 'empty':
+        return _empty_prompt(agent, owner_name, generated_at, secret_file)
     compare = (
         'on Windows (PowerShell) curl.exe -fsS -K "%s" <url>, on macOS/Linux curl -fsS -K %s '
         '<url>' % (secret_file['windows_powershell'], secret_file['posix']))

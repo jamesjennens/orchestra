@@ -91,18 +91,19 @@ export async function detail(ctx, { pid, tid }) {
         h('span', { class: 'chip ' + (r.status === 'open' ? 'warn' : 'ok') }, r.status === 'open' ? 'Open' : 'Resolved'), ' ', r.text,
         r.resolution ? h('div', { class: 'small muted' }, 'Resolution: ', r.resolution) : null))));
   }
-  // Canonically a requested change stays open until the contributor records a response
-  // for it (the review "respond" step), even after a newer revision arrives. The web
-  // interface cannot record responses yet (slice 2), so it says so instead of implying
-  // the new revision resolved them.
+  // A requested change stays open until the contributor records a response for it (the
+  // review "respond" step), even after a newer revision arrives. The assignee responds
+  // here; everyone else is told who the requests are waiting on.
   const carried = c ? openRequests.filter((r) => r.contribution && r.contribution !== c.id) : [];
-  if (carried.length) {
+  const responder = mine && writer && c && openRequests.length > 0;
+  if (carried.length && !responder) {
     reviewBody.append(h('div', { class: 'banner', role: 'note' },
       `Revision ${c.revision} arrived, but ${carried.length} requested change(s) from an earlier revision are still open. `,
-      'Each stays open until the contributor records a response for it with their worker tools; the web interface cannot record responses yet.'));
+      `Each stays open until ${t.assignee_name || 'the assignee'} responds to it.`));
   }
   if (owner && c && review.state === 'awaiting-review' && !project.archived) reviewBody.append(reviewActions(ctx, pid, tid, c, review));
-  if (mine && writer && ['none', 'changes-requested'].includes(review.state) && t.status !== 'closed') reviewBody.append(deliverForm(ctx, pid, tid, c, openRequests.length, review));
+  if (responder) reviewBody.append(respondForm(ctx, pid, tid, c, review, openRequests, carried.length > 0));
+  if (mine && writer && ['none', 'changes-requested'].includes(review.state) && t.status !== 'closed') reviewBody.append(deliverForm(ctx, pid, tid, c, openRequests.length, review, carried.length > 0));
   const reviewPanel = h('section', { class: 'panel', 'aria-labelledby': 'review-h' },
     h('div', { class: 'panel-head' }, h('h2', { class: 'small', id: 'review-h' }, 'Contribution & review'), reviewChip(review.state)), reviewBody);
 
@@ -224,10 +225,70 @@ function reviewActions(ctx, pid, tid, contribution, review) {
   return form;
 }
 
-function deliverForm(ctx, pid, tid, previous, openCount, review) {
-  const details = h('details', { class: 'deliver', open: openCount > 0 || undefined });
+// Set after a revision is delivered while requests are still open, so the re-rendered
+// page leads with the respond step for exactly that task.
+let respondPrompt = null;
+
+// The review "respond" step: the assignee marks each open requested change resolved
+// with a short note. It is one canonical ``respond`` record naming the request record
+// and item of each resolution, plus shared evidence (by default the current revision).
+function respondForm(ctx, pid, tid, contribution, review, open, delivered) {
+  const prompted = respondPrompt === tid;
+  respondPrompt = null;
+  const status = h('div', { class: 'banner crit', role: 'alert', hidden: true });
+  const more = (review.open_requests || 0) - open.length;
+  const evidence = `Revision ${contribution.revision}, commit ${contribution.commit}${contribution.branch ? ` on ${contribution.branch}` : ''}`;
+  const rows = open.map((r, i) => h('li', { class: 'respond-item' },
+    h('label', { class: 'check', for: `rs-${i}` }, h('input', { type: 'checkbox', id: `rs-${i}`, name: `rs-${i}`, checked: true }), ' Resolved: ', h('span', null, r.text)),
+    field({ id: `rn-${i}`, label: 'Note for the reviewer', maxlength: 1000, placeholder: 'What you changed, or why no change is needed' })));
+  const form = h('form', { class: 'form respond', novalidate: true, 'aria-labelledby': 'respond-h' },
+    h('h3', { class: 'small', id: 'respond-h' }, 'Respond to the requested changes'),
+    h('div', { class: 'banner' + (prompted ? ' info' : ''), role: prompted ? 'status' : 'note' },
+      delivered ? `You delivered revision ${contribution.revision}. The ${open.length} request(s) below stay open until you respond: mark each one resolved with a short note.`
+        : 'Deliver a revision that addresses these first, or mark a request resolved now if it needs no change. Each stays open until you respond.'),
+    status,
+    h('ol', { class: 'request-list' }, rows),
+    more > 0 ? h('p', { class: 'small muted' }, `${more} more open request(s) are not shown; respond to these first, then the rest appear.`) : null,
+    field({ id: 'r-evidence', label: 'Evidence', value: evidence, maxlength: 1000, hint: 'Where the reviewer can check the resolutions. Defaults to the current revision.' }),
+    h('div', null, h('button', { type: 'submit', class: 'primary' }, 'Record response')));
+  form.addEventListener('input', () => ctx.setDirty(true));
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const v = formValues(form);
+    const proof = (v['r-evidence'] || '').trim();
+    if (!proof) return setFieldError(form, 'r-evidence', 'Say where the reviewer can check this.');
+    setFieldError(form, 'r-evidence', '');
+    const resolutions = [];
+    for (let i = 0; i < open.length; i += 1) {
+      if (!form.querySelector(`#rs-${i}`).checked) continue;
+      const note = (v[`rn-${i}`] || '').trim();
+      if (!note) return setFieldError(form, `rn-${i}`, 'Add a short note, or untick this request.');
+      setFieldError(form, `rn-${i}`, '');
+      resolutions.push({ request: open[i].request, item: open[i].id, reason: note, evidence: proof });
+    }
+    if (!resolutions.length) { status.replaceChildren('Tick at least one request to resolve.'); status.hidden = false; return; }
+    status.hidden = true;
+    const body = { operation: 'respond', contribution: contribution.id, previous: review.latest_id ?? null, resolutions };
+    try {
+      await act(form.querySelector('button[type=submit]'), () => ctx.api.review(pid, tid, body), { success: resolutions.length === 1 ? 'Response recorded' : `${resolutions.length} responses recorded`, onError: (error) => {
+        if (error.status !== 409) return false;
+        status.replaceChildren('The task changed since you opened it (a newer revision or review, or a request already resolved). ', h('button', { type: 'button', class: 'link', onclick: () => { ctx.setDirty(false); ctx.render(); } }, 'Reload to see it'), '.');
+        status.hidden = false; return true;
+      } });
+    } catch { return; }
+    if (status.hidden) { ctx.setDirty(false); ctx.render(); }
+  });
+  // After the page render has scrolled to the top and focused the title.
+  if (prompted) setTimeout(() => { form.scrollIntoView({ block: 'start' }); const first = form.querySelector('#rn-0'); if (first) first.focus(); });
+  return form;
+}
+
+function deliverForm(ctx, pid, tid, previous, openCount, review, delivered) {
+  // Once a revision answering the open requests is in, the respond step leads and this
+  // form stays folded away.
+  const details = h('details', { class: 'deliver', open: (openCount > 0 && !delivered) || undefined });
   const form = h('form', { class: 'form', novalidate: true },
-    openCount ? h('p', { class: 'small muted' }, `This revision should address the ${openCount} open request(s) above.`) : null,
+    openCount ? h('p', { class: 'small muted' }, `This revision should address the ${openCount} open request(s) above. After delivering it, respond to each request.`) : null,
     h('div', { class: 'form-row' },
       field({ id: 'd-repository', label: 'Repository', value: previous && previous.repository ? previous.repository : '', placeholder: 'git@host:team/repo.git', hint: 'Where the reviewer fetches your branch.' }),
       field({ id: 'd-branch', label: 'Branch', value: previous && previous.branch ? previous.branch : '', placeholder: 'contrib/…' })),
@@ -258,8 +319,11 @@ function deliverForm(ctx, pid, tid, previous, openCount, review) {
       delivery: { kind: 'remote', remote: repository, branch },
       supersedes: previous ? previous.id ?? null : null, previous: review.latest_id ?? null,
     };
-    const done = await act(form.querySelector('button[type=submit]'), () => ctx.api.review(pid, tid, body), { success: 'Delivered for review' }).catch(() => null);
-    if (done) ctx.render();
+    const done = await act(form.querySelector('button[type=submit]'), () => ctx.api.review(pid, tid, body), { success: openCount ? 'Delivered. Now respond to the open request(s).' : 'Delivered for review' }).catch(() => null);
+    if (done) {
+      if (openCount) respondPrompt = tid;
+      ctx.render();
+    }
   });
   details.append(h('summary', null, previous ? 'Deliver a revision' : 'Deliver your contribution'), form);
   return details;
