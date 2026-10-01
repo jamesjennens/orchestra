@@ -236,13 +236,28 @@ current directory, widened to its Git top level.
   GitHub-style anchors (repeated headings get `-1`, `-2`, ...).
 - **Files:** with Git, tracked plus untracked-but-not-ignored files. Without Git, a walk
   that skips hidden and dependency directories.
-- **Skipped files** are counted in `index.skipped` by reason:
-  - `parse-error`;
-  - `too-complex`: a logical line that could nest more than 5,000 levels. CPython 3.10
-    crashes, rather than raising, on such input, so the file is never parsed;
+- **Skipped files** are counted in `index.skipped` by reason, and each count of
+  `too-complex`, `heading-limit` or `definition-limit` also adds one line to `warnings`:
+  - `parse-error`, which includes Python 3.11+ raising RecursionError on extremely
+    deep expressions;
+  - `too-complex`: a file that could nest more deeply than the run can parse safely
+    (see "Parsing deep Python" below);
   - `file-too-large`;
   - `unsafe-path`;
   - `unreadable`, including a link out of the checkout.
+- **Parsing deep Python.** CPython 3.10 crashes, rather than raising, when it converts
+  a very deep expression, such as a long `1+1+...`, `a.b.b...` or `f()()...` chain.
+  - Parsing therefore runs on a worker thread with a 512 MB stack, or 255 MB where the
+    platform allows no more (Windows). That is at least 4x what the deepest file under
+    the 2 MB cap needs.
+  - Ordinary files, dot-heavy ones included, are parsed directly. Only a file with more
+    than about 500,000 nesting-capable characters is tokenized first.
+  - If no such thread can be started, the run falls back to a per-logical-line guard
+    on the calling thread:
+    - the limit is 5,000 levels, or 2,000 on Windows;
+    - tokenizing stops at the first line over the limit;
+    - each run tokenizes at most 16 MB; files beyond that budget are skipped as
+      `too-complex`, with a warning.
 
 A **pointer** is `file::Qualified.name` for code
 (`http_auth.py::Service._refresh_authority`), `file.md#anchor` for a heading, or a bare
@@ -372,8 +387,8 @@ a clear refusal, not a wrong read.
 | `capability resolve` | pointers | 1..100, each <= 400 characters |
 | `capability` | `--max-graph-mb` | 1..512 (default 64); at most 500,000 nodes and 2,000,000 links |
 | `capability` | indexed files | first 20,000 files; files over 2 MB skipped; 256 MB in total |
-| `capability` | entries | 200,000 in total; 2,000 headings per Markdown file and 5,000 definitions per Python file (the rest counted as `entry-limit`, `heading-limit`, `definition-limit`); `resolve` still reads a whole file |
-| `capability` | Python nesting | a file with a logical line of more than 5,000 nesting-capable tokens is skipped (`too-complex`) |
+| `capability` | entries | 200,000 in total; 2,000 headings per Markdown file and 5,000 definitions per Python file (the rest counted as `entry-limit`, `heading-limit`, `definition-limit`, each with a warning); `resolve` still reads a whole file |
+| `capability` | Python nesting | parsed on a 512 MB (Windows: 255 MB) worker stack, trusted to stack / 512 bytes levels; fallback guard 5,000 levels per logical line (Windows: 2,000) with a 16 MB per-run tokenize budget (`too-complex`) |
 | `capability` | Markdown | heading lines over 1,000 characters are text; a summary is looked for in the 40 lines after its heading |
 | `capability` | entry `aliases` / `tests` / `related` | first 8 shown; `tests_total` / `related_total` count all |
 | `capability` | entry `name` / `summary` | excerpt objects of <= 120 / <= 200 characters |
