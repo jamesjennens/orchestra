@@ -1,6 +1,6 @@
 # Capability index - design proposal
 
-Status: **proposal, revision 2. Not implemented, not accepted.** This document
+Status: **proposal, revision 2.1. Not implemented, not accepted.** This document
 changes no code. It proposes a `capability` record kind on the shared keyed-record
 core, an authority split, a recorded drift check, aliases, lookup and the slices to
 build them. The project owner accepts it together with the reference catalog
@@ -11,7 +11,18 @@ build them. The project owner accepts it together with the reference catalog
   - the reference catalog design, `docs/REFERENCE_CATALOG_DESIGN.md` at `d32d400`, cited
     as **.41 §x**. Its own header says "revision 3"; the coordinator calls it rev 2.1.
   - the requirements-gathering design, `docs/REQUIREMENTS_GATHERING_DESIGN.md` at
-    `057c7fa` (rev 2), cited as **.58 §x**.
+    `18ac3ef`, cited as **.58 §x**. Its own header says "revision 3"; the coordinator
+    calls it rev 2.1. Revision 2 of this document cited the earlier `057c7fa`.
+
+## Revision 2.1 changes (review 01a0f7a2)
+
+| Review item | Change | Where |
+| --- | --- | --- |
+| alias-model-confirmed | The coordinator settled the clash with .58 in favour of this design's model: `capability-alias-v1` is its own record kind, settled by capability operations and never by `proposal-disposition-v1`. In .58's queue it is display-only, with zero weight; .58 drops its "variant, not a second kind" claim. All .58 citations now point to `18ac3ef`. | header, §6 |
+| later-means-server-order | "Later" means later in native comment order, never by the client-stamped `checked_at`. Open failure reports are capped per resolved person. | §5.1, §5.2 |
+| caps-by-person | Alias caps are keyed on the resolved person (.58 §4.2), not the session actor. All unverified actors share one stricter pool per project. | §6 |
+| verifiers-list-details | The `verifiers` list is spelled out: `recovery.identity` validation, the strict environment-versus-file refusal, removal with `--confirm-revoke`, a sidecar copy re-granted only by `--restore-verifiers`, and an OPERATIONS.md row. §9 is corrected: `deployment.private.json` is not in the backup. Q8 now recommends keeping the list empty. | §5.2, §9, §10, §12 |
+| smaller | "Integrated" honours kittrial-5bb.52's revert and retraction records. One shared slice-0 filter list is set out, and one authority list. Attention `actions` follow .58 §5.1's `_agent_action` mirror. | §5.2, §8, §10 |
 - **Builds on:** the read-only lookup delivered separately as kittrial-5bb.61
   (`capabilities.py`, cited as **.61**). That lookup ships on its own and does not
   wait for this design.
@@ -157,11 +168,13 @@ block, written by the operation and never by the caller:
 
 - **`person`** is resolved through .58's actor-to-person map
   (`contributions.actor_map` in the `contribution-settings-v1` record, .58 §8.3).
-  Over HTTP it is the authenticated account.
+  The map has two entry shapes (.58 §4.2): an exact actor, or a person-level namespace
+  matched against the session registry's `name`. Over HTTP it is the authenticated
+  account.
 - **`identity`** is `verified` when the server bound the person, meaning an HTTP
   account or a mapped SSH actor. It is `unverified` otherwise.
-- **`submitted_by_agent`** is `true` for an agent credential (.58 §3.6) or an actor
-  mapped as an agent.
+- **`submitted_by_agent`** is `true` for an agent credential or an actor mapped as an
+  agent (.58 §7.2).
 
 Trust decisions (§5.2) and attention routing use `actor` and `person`, never text from
 the payload.
@@ -234,6 +247,20 @@ The endpoint validates the closed shape and binds the record to the revision's e
 `record_sha256`. Idempotency is per `(key, revision, commit, actor)`, so one author
 cannot pre-empt another's record at the same commit.
 
+`checked_at` is stamped by the client and is shown for information only. Every
+ordering decision below uses **native order**: the position of the record's comment
+in the anchor's native comment sequence, or the server's `created_at` when two
+records must be compared across anchors. A record stamped with a future `checked_at`
+therefore gains nothing.
+
+Failing reports are bounded at write:
+- each resolved person may hold at most **10 open failing reports per project**, where
+  "open" means not yet cleared by a trusted pass (§5.2);
+- all `unverified` actors together share **one pool of 5 per project**.
+
+The excess is refused, and the refusal names the cap. A failure from a trusted verifier
+is never capped.
+
 The endpoint **cannot** know whether the commit exists, or whether the pointers
 really resolve there. Everything a reader concludes rests on who wrote the record,
 which is §5.2.
@@ -242,19 +269,42 @@ which is §5.2.
 
 A verifier is **trusted** when the record's native author is either:
 - on the deployment's operator allowlist (`admin.operators`); or
-- on a new `verifiers` list beside it in `deployment.private.json`, which an operator
-  maintains with `admin.py verifiers add|remove|list`. The list is empty by default.
+- on a new `verifiers` list beside it in `deployment.private.json`. The list is empty
+  by default.
+
+The `verifiers` list reuses the operator allowlist's machinery exactly (admin.py on
+`ec42eee`):
+
+| Point | Rule |
+| --- | --- |
+| commands | an operator runs `admin.py verifiers add\|remove\|list ACTOR` on the coordination host; no client or endpoint route writes the list |
+| identities | each entry passes `recovery.identity`, which forbids `:`, so an `account:` value can never be a verifier; a stored string is normalised like `stored_operators` |
+| one authority source | `admin.verifiers(root, strict=True)` refuses a host command when a shell `ORCHESTRA_VERIFIERS` disagrees with the file, exactly like `operators(root, strict=True)`; the environment is never an authority source |
+| revocation | `verifiers remove ACTOR` requires `--confirm-revoke`. Afterwards every verification that actor wrote reads `reported`, and any drift that only their passes had cleared reappears. Re-adding the actor restores them. The refusal text names what will change, as `operators remove` does |
+| backup | each project sidecar carries a `verifiers` field beside `operators` (admin.py:1356-1363), for information only. Older kits ignore the unknown key (admin.py:1969-1985) |
+| restore | `restore-new` never re-grants the list on its own; only an explicit `--restore-verifiers` does, like `--restore-operators`. Without the flag, restored trusted verifications read `reported`, and the restore report names the missing verifiers |
+| documentation | slice 1b adds `verifiers add/remove/list` to the "Operator commands" table in `docs/OPERATIONS.md`, with this policy |
+
+This makes the list a **second deployment-wide authority surface**. It is narrow: it
+only marks verifications trusted, and grants nothing else. It is named in the shared
+authority list in §8 so that a reader of .41 or .58 does not assume the operator
+allowlist is the only one.
 
 A revision's `verification` is derived from its records, in this order:
 
 1. **`drifted`:** at least one verification for this revision failed, from anyone,
-   and no later **trusted** pass at an **integrated commit** has cleared it.
+   and no **trusted** pass at an **integrated commit** that comes after it in native
+   order (never by `checked_at`) has cleared it.
    - An integrated commit is one that some trusted lifecycle fact in this project
-     records as an `integration_commit` with `integrated=passed`, using the same
-     projection `review` and `work` use.
-   - A contributor's failing report is therefore enough to raise drift. That is the
-     safe direction: it can cause noise, but not silence.
-2. **`verified`:** the newest trusted verification for this revision passed.
+     records as an `integration_commit` with `integrated=passed`. The test uses the
+     same projection `review` and `work` use, **including kittrial-5bb.52's revert
+     and retraction records**: a commit in `integration.reverted_commits` is not
+     integrated, so a reverted integration never clears drift. A retraction that
+     re-applies the integration makes it count again.
+   - A contributor's failing report is therefore enough to raise drift, within the
+     caps of §5.1. That is the safe direction: it can cause noise, but not silence.
+2. **`verified`:** the newest trusted verification for this revision, in native
+   order, passed.
    `verified_at` is `{commit, checked_at, person}` from that record, and reads say
    whether the commit is integrated.
 3. **`reported`:** there are passing reports, but none from a trusted verifier. Reads
@@ -296,9 +346,16 @@ b capability propose-alias KEY "reserved label guard" [--evidence POINTER]
 - **Bounds:** `alias` is at most 80 characters, printable, and has no control, format
   or separator character other than the ASCII space. Its normalised form must be
   nonempty.
-- **Caps:** a proposal is refused once the author has 3 pending aliases on this
-  capability or 50 in the project, or once the capability has 20 pending aliases.
-  "Pending" means neither folded nor rejected.
+- **Caps,** keyed on the resolved **person** (§3.3, .58 §4.2) and never on the session
+  actor, which is new every session. "Pending" means neither folded nor rejected.
+
+  | Who | Pending aliases allowed |
+  | --- | --- |
+  | a resolved person (`identity: verified`) | 3 per capability and 50 per project |
+  | all `unverified` actors together, as one shared pool | 1 per capability and 10 per project |
+  | any one capability, from everyone | 20 |
+
+  The excess is refused, and the refusal names the cap.
 - **Effect while pending:** only as a candidate. A phrase that equals a pending alias
   lifts that capability among lookup **candidates**, with the alias shown as
   `alias_state: "proposed"` and its submitter. It is **never** an exact match. Only
@@ -312,16 +369,24 @@ b capability propose-alias KEY "reserved label guard" [--evidence POINTER]
 - **Rejecting:** an operator writes `action: "reject"` with a reason, using
   `capability alias-reject`. Lookup then ignores the proposal.
 - **Attention:** `alias_pending` appears in attention (§8).
+- **Record model (settled by the coordinator, review 01a0f7a2):** an alias is its own
+  record kind, `capability-alias-v1`, on the capability's anchor. It is not a
+  `proposal-disposition-v1` incorporation variant, which is .58's option (b). An alias
+  is a small fact about one capability. Option (b) would create a closed native anchor
+  and a disposition ledger for every alias, which is heavy at the volume the loop
+  below produces.
+  - .58 keeps its frozen `kind` discriminators on `target` and `incorporation`
+    (.58 §3.3, §3.4, §3.8), which is harmless.
+  - .58 drops its claim that alias and capability items "are a variant, not a second
+    record kind", and its rejection of a separate alias kind.
 - **The .58 queue (from .58 slice 3):**
-  - Alias and capability proposals appear there as read-view items of `kind: alias`
-    and `kind: capability`.
+  - Alias and capability proposals appear there as **display-only** read-view items
+    of `kind: alias` and `kind: capability`. "The queue is a read view" (.58 §9.2).
   - Their outcome is recorded by `capability` fold or reject, or by `capability-apply`,
-    never by `proposal-disposition-v1`. The records stay the same, and the queue is "a
-    read view" (.58 §5.1).
-  - These items carry **zero** `incorporated_weight` and earn no scoreboard credit.
-    They have no `requirement_id`, so .58's per-requirement cap could not bound alias
-    farming otherwise.
-  - The coordinator aligns .58's text to say the same.
+    never by `proposal-disposition-v1`.
+  - These items carry **zero** `incorporated_weight` and earn no scoreboard credit
+    (.58 §6.2). They have no `requirement_id`, so .58's per-requirement cap could not
+    bound alias farming otherwise.
 
 **The loop** that makes the index self-documenting:
 
@@ -370,22 +435,39 @@ aliases and verification reports.
 
 ## 8. Hidden surfaces, attention, HTTP
 
-- **Hidden surfaces:** the `capability` label and `Kind: capability-` comments join
-  .41's filter (.41 §6.0). A capability anchor is never a task in:
-  - `work`, the queue, My work or prompts;
-  - `render.py` task pages;
-  - `/tasks/{id}`, `/history` or `/brief`;
-  - **`views/issues.jsonl`**, which `refresh` also writes (activity.py:4) with
-    anchors and raw record comments.
+- **Hidden surfaces: one shared slice-0 filter list.** The `capability` label and
+  `Kind: capability-` comments join the same filter as `reference` and `proposal`
+  rows. The coordinator is asking .41 and .58 to adopt this exact list, so the one
+  shared slice 0 has one list:
+  1. `work` and `work --mine`;
+  2. `GET /v1/projects/{pid}/tasks`, including the Closed/All tabs and `q`;
+  3. `/queue`;
+  4. `/v1/me/work`;
+  5. `agent_prompts.classify` (agent prompts);
+  6. `render.py` task pages and journals;
+  7. `GET /tasks/{id}`;
+  8. `/history`;
+  9. `/brief`;
+  10. **`views/issues.jsonl`**, which `refresh` also writes (activity.py:4) with
+      anchors and raw record comments. None of the three designs listed it until now.
 
-  None of the three designs listed `views/issues.jsonl`. It becomes the tenth surface
-  of the shared slice-0 filter, for references and proposals too.
+  Surfaces 7–9 return 404, or a pointer to the kind's own read (`ref get`,
+  `proposal get`, `capability get`), as .41 §6.0 does.
+- **Shared authority list.** Deployment-wide authority is:
+  - the operator allowlist, for voids, reverts and acceptances;
+  - **the `verifiers` list**, which only marks verifications trusted (§5.2).
+
+  Shell access remains the boundary for the shell-trusted commands. .41's and .58's
+  authority text should name both lists.
 - **`work`:** gains `attention.capability_index`, in the `_agent_attention` shape
   (`state, summary, counts, actions, truncated, computed_at`) plus `items` and
   `next_offset`. It deliberately does not use .41's flat block (.58 §5.1).
   - Counts: `drifted`, `reported_only`, `alias_pending` and `draft_pending`.
-  - Items go only to the capability owner and to operators. The `actions` item shape
-    follows the resolution of .58's R2-4.
+  - Items go only to the capability owner and to operators.
+  - Each action is built like `_agent_action`: it has the identifying keys `priority`,
+    `kind`, `project`, `task` and `reason`, plus `links`, and is sorted by `(priority,
+    project, task)`. `task` holds the capability anchor id, and `label` is a bounded
+    excerpt. This mirrors .58 §5.1, so a reader of agent attention can read this block.
 - **`brief`:** shows at most 3 accepted capabilities whose `tags` match the task's
   labels, trust-marked, with the same deterministic selection as .41 §7.
 - **HTTP (slice 2):** `GET /v1/projects/{pid}/capabilities` and `/capabilities/{key}`
@@ -401,10 +483,14 @@ aliases and verification reports.
   fails on them.
 - **Records:** the records themselves are native comments on closed anchors, so
   native backups cover them.
-- **Verifiers list:** it lives in `deployment.private.json`, which is backed up and
-  restored with the operator list. On a restore without operators, the same
-  inert-acceptance reading applies to verifications as .41 §4 applies to acceptances:
-  trusted verifications read `reported`.
+- **Verifiers list (corrected in 2.1):** `deployment.private.json` is **not** in the
+  coordination backup. As with operators (admin.py:1356-1363), each project sidecar
+  carries a `verifiers` field **for information**.
+  - `restore-new` re-grants the list only with an explicit `--restore-verifiers`.
+  - Without that flag, restored verifications from verifiers missing on the
+    destination read `reported`, and the restore report names the missing verifiers.
+    This is the same inert reading .41 §4 applies to acceptances after a restore
+    without `--restore-operators`.
 - **Rollback floor:** slice 0 is the oldest kit a deployment may roll back to once
   any capability record exists (.41 §10.3).
 
@@ -428,7 +514,8 @@ aliases and verification reports.
 1b. **Drift and view.** This slice adds:
    - `capability check --repo [--record]`;
    - the `capability verify` endpoint action;
-   - `admin.py verifiers`;
+   - `admin.py verifiers`, with the sidecar field, `--restore-verifiers` and the
+     `docs/OPERATIONS.md` "Operator commands" row;
    - the trust derivation of §5.2;
    - `views/CAPABILITIES.md` in `refresh`;
    - `work`/`brief` attention.
@@ -437,14 +524,14 @@ aliases and verification reports.
 
 **Build order across the three designs, as the review sets it:**
 1. .61, which is independent.
-2. One shared slice 0 for .41, .58 and .60.
-3. .41 slice 1. The core extraction is preceded by the `requirement-apply` allowlist
-   change, with `james` enrolled first.
-4. .60 slice 1a.
-5. .58 slice 1a.
-6. .60 slice 1b.
-7. .41 slice 2, .58 slice 1b and the rest.
-8. .58 slice 3: one queue with `reference`, `alias` and `capability` kinds.
+2. One shared slice 0 for .41, .58 and .60, with the ten-surface filter list of §8.
+3. The `requirement-apply` allowlist check, with `james` enrolled first.
+4. .41 slice 1: the core.
+5. .60 slice 1a.
+6. .58 slice 1a.
+7. .60 slice 1b, with the verifiers.
+8. .41 slice 2 and .58 slice 1b.
+9. .58 slice 3: one queue with `reference`, `alias` and `capability` read-view kinds.
 
 **Later, optional:** `capability suggest` drafts proposals from the .61 index or
 graphify communities, to bootstrap a project's index. It never auto-accepts, and its
@@ -494,6 +581,9 @@ others.
 6. **Build order?** **As in §10:** .61 now, then the shared slice 0, then .41 slice 1,
    then .60 slice 1a ahead of .58.
 7. **Should `capability suggest` exist?** **Later.** It never auto-accepts.
-8. **Who are the CI verifiers?** *(New.)* **A deployment-level `verifiers` list beside
-   `operators`, maintained by an operator and empty by default.** Only operators
-   verify until the owner names a CI actor.
+8. **Who are the CI verifiers?** *(New; recommendation refined in 2.1.)* **Keep the
+   `verifiers` list empty for now.** The coordinator's integration step runs
+   `capability check --record` at the integrated commit as an allowlisted operator.
+   GitHub runners cannot reach the coordination host in this deployment, so a real CI
+   verifier would itself be a host-side step. The list exists, with the operator-list
+   rules of §5.2, for when one is named.
