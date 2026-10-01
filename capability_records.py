@@ -914,7 +914,7 @@ WRITE_COMMANDS = CONTRIBUTOR_OPERATIONS + ('propose-alias',)
 
 def read(args, run, operators):
     """`capability get|list|find|--help`: read-only, one label-filtered read, no lock."""
-    if not args or args[0] in ('--help', '-h', 'help'):
+    if not args or args[0] == 'help' or any(token in ('--help', '-h') for token in args):
         return help_payload()
     command, rest = args[0], args[1:]
     if command == 'get':
