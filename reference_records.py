@@ -11,8 +11,9 @@ separate `Kind: reference-acceptance-v1` evidence comment bound to the accepted
 revision's content hash (docs/REFERENCE_CATALOG_DESIGN.md, the .41 design;
 kittrial-5bb.66 is its slice 1).
 
-Writes go through the shared keyed-record core (keyed_records.py) with this
-module's REFERENCE spec:
+Writes go through the shared keyed-record core (keyed_records.py) and the shared
+closed-anchor entry layer (keyed_entries.py, kittrial-5bb.67) with this module's
+REFERENCE kind:
 
 - `propose` (contributor) creates the closed anchor and revision 1 as a draft;
 - `revise` (contributor) appends the next draft revision, compare-and-swap on
@@ -54,20 +55,21 @@ deferred to slice 2 with its configuration store).
 import calendar
 import json
 import re
-import subprocess
 import time
 from datetime import date, timedelta
 from urllib.parse import urlsplit
 
+import keyed_entries
 import keyed_records as core
 from briefing import clip
-from coordination import identifier
 from export_requirements import parse_json
+from keyed_entries import (ACCEPTANCE_RECORD_FIELDS, CATALOG_SHOW_MAX, CONTRIBUTOR_OPERATIONS,
+                           COVERAGE_IDS, NATIVE_FAILURES, OPERATOR_OPERATIONS, SHOW_CHUNK,
+                           WRITTEN_BY_THE_OPERATION, all_missing)
 from recovery import configured_operators
 from requirements import SHA256_TEXT, canonical_bytes, content_hash
 from reserved_comments import (REFERENCE_ACCEPTANCE_PREFIX as ACCEPTANCE_PREFIX,
-                               REFERENCE_ENTRY_PREFIX as ENTRY_PREFIX, is_record_anchor,
-                               record_comment_kind)
+                               REFERENCE_ENTRY_PREFIX as ENTRY_PREFIX)
 
 TYPE_LABEL = 'reference'
 STATE_LABEL = {'draft': 'reference:draft', 'accepted': 'reference:accepted',
@@ -98,34 +100,12 @@ DUE_SOON_DAYS = 30
 REVIEW_BY_MAX_MONTHS = 24
 ENTRY_FIELDS = ('schema_version', 'key', 'revision', 'title', 'statement', 'authority', 'owner',
                 'review_by', 'tags', 'decisions', 'acceptance_state', 'successor', 'origin', 'sha256')
-ACCEPTANCE_RECORD_FIELDS = ('schema_version', 'source', 'id', 'key', 'revision', 'record_sha256',
-                            'acceptance_state', 'decision', 'operator', 'at', 'sha256')
 CONTENT_FIELDS = ('key', 'title', 'statement', 'authority', 'owner', 'review_by', 'tags', 'decisions')
-PROPOSE_FIELDS = frozenset(('schema_version', 'operation_id', 'operation', 'revision',
-                            'expected_sha256') + CONTENT_FIELDS)
-ACCEPT_FIELDS = frozenset(('schema_version', 'operation_id', 'operation', 'key', 'revision',
-                           'record_sha256', 'acceptance_state', 'acceptance'))
-DIRECT_FIELDS = PROPOSE_FIELDS | {'acceptance_state', 'acceptance'}
-CONTRIBUTOR_OPERATIONS = ('propose', 'revise')
-OPERATOR_OPERATIONS = ('accept', 'draft')
-WRITTEN_BY_THE_OPERATION = ('acceptance_state', 'successor', 'sha256', 'acceptance', 'labels')
 LIST_LIMIT_MAX = 100
-COVERAGE_IDS = 10
-SHOW_CHUNK = 50
-# The whole-catalog read uses one `bd show --include-comments` up to this many
-# entries and one `bd export --all` above it (kittrial-5bb.66 review 01a0fbfd): on
-# real bd a show costs about 45 ms per id (2.2 s per 50), so past a couple of dozen
-# entries one export of the project is the cheaper read, as kittrial-5bb.71 found for
-# the anchors read.
-CATALOG_SHOW_MAX = 20
 ANCHOR_TITLE = 'Reference %s'
 ANCHOR_DESCRIPTION = ('Reference catalog entry %s. Read it with `ref get %s`; its record comments are '
                       'authoritative. This anchor is not a work item.')
 DUE_ORDER = {'expired': 0, 'due-soon': 1, 'unset': 2, 'ok': 3}
-
-
-def key_label(key):
-    return KEY_LABEL + key.replace('.', '-')
 
 
 def today():
@@ -273,137 +253,21 @@ def parse_entry(body):
     return record
 
 
-def parse_acceptance(body):
-    """The `reference-acceptance-v1` evidence iff it passes its full schema."""
-    if not isinstance(body, str) or not body.startswith(ACCEPTANCE_PREFIX):
-        return None
-    rest = body[len(ACCEPTANCE_PREFIX):]
-    try:
-        record = parse_json(rest)
-        if not isinstance(record, dict) or set(record) != set(ACCEPTANCE_RECORD_FIELDS):
-            return None
-        if type(record['schema_version']) is not int or record['schema_version'] != 1:
-            return None
-        if record['source'] != 'reference-apply':
-            return None
-        if not isinstance(record['id'], str) or not ISSUE_ID.fullmatch(record['id']):
-            return None
-        valid_key(record['key'])
-        core.positive_int(record['revision'], 'revision')
-        if not isinstance(record['record_sha256'], str) or not SHA256_TEXT.match(record['record_sha256']):
-            return None
-        if record['acceptance_state'] not in ('accepted', 'superseded'):
-            return None
-        decision = record['decision']
-        if not isinstance(decision, dict) or set(decision) != set(core.ACCEPTANCE_EVIDENCE_FIELDS):
-            return None
-        core.bound_acceptance(dict(decision, record_sha256=record['record_sha256']))
-        identifier(record['operator'])
-        if not isinstance(record['at'], str) or not record['at'].strip():
-            return None
-        if content_hash(record) != record['sha256'] or canonical_bytes(record).decode('utf-8') != rest:
-            return None
-    except (ValueError, TypeError, KeyError, UnicodeDecodeError):
-        return None
-    return record
-
-
-def entry_comment(record):
-    body = ENTRY_PREFIX + canonical_bytes(record).decode('utf-8')
-    if parse_entry(body) != record:
-        raise ValueError('Refusing to write a reference revision that does not pass its own schema')
-    return body
-
-
-def acceptance_evidence(bound, task, revision, record, actor, at=None):
-    """The durable `reference-acceptance-v1` record bound to one revision hash."""
-    decision = {name: bound[name] for name in core.ACCEPTANCE_EVIDENCE_FIELDS}
-    evidence = {'schema_version': 1, 'source': 'reference-apply', 'id': task, 'key': record['key'],
-                'revision': revision, 'record_sha256': bound['record_sha256'],
-                'acceptance_state': record['acceptance_state'], 'decision': decision,
-                'operator': actor, 'at': at or core.now()}
-    evidence['sha256'] = content_hash(evidence)
-    body = ACCEPTANCE_PREFIX + canonical_bytes(evidence).decode('utf-8')
-    if parse_acceptance(body) != evidence:
-        raise ValueError('Refusing to write acceptance evidence that does not pass its own schema')
-    return evidence, body
-
-
 # -- payloads ------------------------------------------------------------------------------
 
-def validate_payload(payload, operator=False):
-    if not isinstance(payload, dict):
-        raise ValueError('reference payload must be an object')
-    core.refuse_injected_labels(payload, 'reference operation')
-    operation = payload.get('operation')
-    allowed_operations = OPERATOR_OPERATIONS if operator else CONTRIBUTOR_OPERATIONS
-    if operation not in allowed_operations:
-        raise ValueError('operation must be one of ' + ', '.join(allowed_operations))
-    if not operator:
-        supplied = [name for name in WRITTEN_BY_THE_OPERATION if name in payload]
-        if supplied:
-            raise ValueError('%s %s written by the operation, never caller-supplied; acceptance is the '
-                             'operator route (admin.py reference-apply).'
-                             % (', '.join(supplied), 'is' if len(supplied) == 1 else 'are'))
-    fields = {'propose': PROPOSE_FIELDS, 'revise': PROPOSE_FIELDS, 'accept': ACCEPT_FIELDS,
-              'draft': DIRECT_FIELDS}[operation]
-    core.checked_fields(payload, fields, 'reference payload')
-    if type(payload.get('schema_version')) is not int or payload['schema_version'] != 1:
-        raise ValueError('schema_version must be the integer 1')
-    if 'operation_id' not in payload:
-        raise ValueError('reference payload is missing field operation_id')
-    identifier(payload['operation_id'])
-    if 'key' not in payload:
-        raise ValueError('reference payload is missing field key')
-    valid_key(payload['key'])
-    if operation == 'accept':
-        for name in ('revision', 'record_sha256', 'acceptance_state', 'acceptance'):
-            if name not in payload:
-                raise ValueError('reference-apply needs ' + name)
-        core.positive_int(payload['revision'], 'revision')
-        if not isinstance(payload['record_sha256'], str) or not SHA256_TEXT.match(payload['record_sha256']):
-            raise ValueError('record_sha256 must be the content hash of the revision being accepted')
-    else:
-        for name in ('title', 'statement', 'authority', 'owner'):
-            if name not in payload:
-                raise ValueError('reference payload is missing field ' + name)
-        _bounded_text(payload['title'], 'title', TITLE_MAX)
-        _bounded_text(payload['statement'], 'statement', STATEMENT_MAX)
-        valid_authority(payload['authority'])
-        valid_owner(payload['owner'])
-        if payload.get('review_by') is not None:
-            _date(payload['review_by'], 'review_by')
-        valid_tags(payload.get('tags', []))
-        valid_decisions(payload.get('decisions', []))
-        revision = payload.get('revision', 1 if operation != 'revise' else None)
-        if operation == 'revise':
-            if revision is None:
-                raise ValueError('revise needs the next revision number')
-            core.positive_int(revision, 'revision')
-            if revision < 2:
-                raise ValueError('revise writes revision 2 or later; use propose for revision 1')
-            digest = payload.get('expected_sha256')
-            if not isinstance(digest, str) or not SHA256_TEXT.match(digest):
-                raise ValueError('revise needs expected_sha256, the content hash of the newest revision '
-                                 'it replaces')
-        else:
-            if revision != 1:
-                raise ValueError('%s creates revision 1; use revise for later revisions' % operation)
-            if payload.get('expected_sha256') is not None:
-                raise ValueError('%s creates a new entry, so expected_sha256 must be null' % operation)
-    if operator:
-        if payload.get('acceptance_state') != 'accepted':
-            raise ValueError('reference-apply writes an accepted revision (acceptance_state must be accepted)')
-        core.validate_acceptance_shape(payload.get('acceptance'))
-        core.bound_acceptance(dict(payload['acceptance'], record_sha256='0' * 64))
-    if operation != 'accept':
-        # Every content rule, including the date rules, is checked here, BEFORE the
-        # anchor is created: a refusal after the create would leave an anchor with no
-        # record. (An acceptance's content is the reviewed draft's; it is checked
-        # before its writes, on an anchor that already exists.)
-        state = 'accepted' if operation == 'draft' else 'draft'
-        _write_time_rules(entry_record(payload, payload.get('revision', 1), state))
-    return payload
+def _validate_content(payload):
+    """The reference content fields of a propose, revise or direct payload."""
+    for name in ('title', 'statement', 'authority', 'owner'):
+        if name not in payload:
+            raise ValueError('reference payload is missing field ' + name)
+    _bounded_text(payload['title'], 'title', TITLE_MAX)
+    _bounded_text(payload['statement'], 'statement', STATEMENT_MAX)
+    valid_authority(payload['authority'])
+    valid_owner(payload['owner'])
+    if payload.get('review_by') is not None:
+        _date(payload['review_by'], 'review_by')
+    valid_tags(payload.get('tags', []))
+    valid_decisions(payload.get('decisions', []))
 
 
 def _write_time_rules(record):
@@ -440,293 +304,6 @@ def entry_record(payload, revision, acceptance_state, origin=None):
     return record
 
 
-# -- native reads ----------------------------------------------------------------------------
-
-def _listed_ids(run, extra):
-    listed = json.loads(run(['list', '--label', TYPE_LABEL, *extra, '--all', '--limit', '0', '--json']) or '[]')
-    return [row['id'] for row in listed or [] if isinstance(row, dict) and isinstance(row.get('id'), str)]
-
-
-def _shown(run, ids):
-    """The named rows with their comments, in one `bd show --include-comments`."""
-    if not ids:
-        return []
-    try:
-        shown = json.loads(run(['show', *ids, '--json', '--include-comments']) or '[]')
-    except NATIVE_FAILURES as error:
-        if all_missing(error):
-            return []   # every named row was deleted after the list
-        raise
-    shown = shown if isinstance(shown, list) else [shown]
-    return [row for row in shown if isinstance(row, dict) and row.get('id') in ids]
-
-
-def read_rows(run):
-    """The whole catalog: every reference-labelled row with its comments, in two native reads.
-
-    One label-filtered `bd list` (no comments), then one `bd show --include-comments`
-    when there are at most CATALOG_SHOW_MAX entries, or one `bd export --all` above
-    that. `ref list` and reconcile use it; `ref get` and the writes never do (they
-    read by key label, `read_key_rows`).
-    """
-    ids = _listed_ids(run, [])
-    if len(ids) <= CATALOG_SHOW_MAX:
-        return _shown(run, ids)
-    wanted = set(ids)
-    exported = (json.loads(line) for line in run(['export', '--all']).splitlines() if line.strip())
-    return [row for row in exported if isinstance(row, dict) and row.get('id') in wanted]
-
-
-def read_key_rows(run, key, operation_id=None):
-    """Only the rows one key can touch: its lookup label, plus this operation's request label.
-
-    One `bd list` (reference AND (key label OR request label)) and one `bd show` of the
-    one or two rows it names. This is the whole preflight read of a propose, revise or
-    accept, and the read of `ref get`: its cost does not grow with the catalog.
-    """
-    labels = [key_label(key)]
-    if operation_id is not None:
-        labels.append('request:' + content_hash({'operation_id': operation_id}))
-    return _shown(run, _listed_ids(run, ['--label-any', ','.join(labels)]))
-
-
-# A native read failure: the endpoint's runner raises ValueError, admin's run_bd
-# raises CalledProcessError.
-NATIVE_FAILURES = (ValueError, OSError, subprocess.CalledProcessError)
-
-
-def all_missing(error):
-    """bd 1.2.2 `show` fails only when every id is missing ("no issue(s) found ...")."""
-    text = ' '.join(str(part) for part in (error, getattr(error, 'stderr', ''), getattr(error, 'stdout', ''))
-                    if part)
-    return 'no issue' in text and 'found' in text
-
-
-def _key_labels(row):
-    return [label for label in row.get('labels') or [] if isinstance(label, str) and label.startswith(KEY_LABEL)]
-
-
-def _entry_belongs(record, row):
-    return key_label(record['key']) in _key_labels(row)
-
-
-def existing_revisions(row):
-    return core.existing_ledger(row, ENTRY_PREFIX, parse_entry, 'reference', 'revision', 'revision',
-                                belongs=_entry_belongs)
-
-
-def existing_acceptances(row):
-    return core.existing_ledger(row, ACCEPTANCE_PREFIX, parse_acceptance, 'reference', 'acceptance',
-                                'revision', belongs=lambda record, row: record['id'] == row.get('id')
-                                and key_label(record['key']) in _key_labels(row))
-
-
-def anchor_for(rows, key):
-    """(row, status) for a key: status is `entry`, `incomplete` or None."""
-    label = key_label(key)
-    for row in rows:
-        if TYPE_LABEL not in (row.get('labels') or []) or label not in _key_labels(row):
-            continue
-        if not is_record_anchor(row):
-            return row, 'incomplete'
-        return row, 'entry'
-    return None, None
-
-
-# -- spec hooks ------------------------------------------------------------------------------
-
-def _resolve_task(rows, payload, operator):
-    if payload['operation'] in ('propose', 'draft'):
-        return None
-    row, status = anchor_for(rows, payload['key'])
-    if row is None:
-        raise ValueError('Unknown reference key %s; use ref list to see the catalog, or ref propose to '
-                         'create it.' % payload['key'])
-    if status == 'incomplete':
-        raise ValueError('Reference key %s is held by anchor %s, which has no revision record yet (an '
-                         'interrupted propose); re-run that propose with its operation_id, or ask the operator '
-                         'to reconcile it.' % (payload['key'], row['id']))
-    if payload['key'] not in {record['key'] for record in existing_revisions(row).values()}:
-        # The lookup label is shared with a different key (a.b-c and a.b.c).
-        raise ValueError('Unknown reference key %s; use ref list to see the catalog.' % payload['key'])
-    return row['id']
-
-
-def _check_key_unique(rows, payload, task):
-    if task is not None:
-        return
-    label = key_label(payload['key'])
-    request = 'request:' + content_hash({'operation_id': payload['operation_id']})
-    for row in rows:
-        if TYPE_LABEL not in (row.get('labels') or []) or label not in _key_labels(row):
-            continue
-        if request in (row.get('labels') or []):
-            continue   # this operation's own interrupted anchor; the retry finishes it
-        if not is_record_anchor(row):
-            raise ValueError('Reference key %s is held by anchor %s, which has no revision record yet (an '
-                             'interrupted propose by another operation); that operation must be re-run with '
-                             'its operation_id, or reconciled by the operator.' % (payload['key'], row['id']))
-        revisions = existing_revisions(row)
-        keys = {record['key'] for record in revisions.values()}
-        if payload['key'] in keys or not keys:
-            raise ValueError('Reference key %s already exists (%s); use ref revise.' % (payload['key'], row['id']))
-        raise ValueError('Reference key %s collides with existing key %s (both use the lookup label %s); '
-                         'choose a different key.' % (payload['key'], sorted(keys)[0], label))
-
-
-def _create_args(payload, request_label, content_label):
-    labels = sorted({TYPE_LABEL, STATE_LABEL['draft'], key_label(payload['key']), request_label,
-                     content_label})
-    return ['create', '--title', ANCHOR_TITLE % payload['key'],
-            '--description', ANCHOR_DESCRIPTION % (payload['key'], payload['key']), '--type', 'task',
-            '--no-inherit-labels', '--labels', ','.join(labels), '--json']
-
-
-def _close(run, task):
-    run(['close', task, '--reason', 'reference catalog anchor (not a work item)', '--json'])
-
-
-def _prepare_row(run, row):
-    """Close an anchor whose create committed but whose close did not (a retry)."""
-    if row.get('status') != 'closed':
-        _close(run, row['id'])
-
-
-def _require_selectable(row, payload, operator, existing):
-    if TYPE_LABEL not in (row.get('labels') or []) or key_label(payload['key']) not in _key_labels(row):
-        raise ValueError('Record %s is not the reference anchor for key %s' % (row.get('id'), payload['key']))
-    unsupported = [kind for kind in (record_comment_kind(comment.get('text'))
-                                     for comment in row.get('comments') or [] if isinstance(comment, dict))
-                   if kind and kind[0].startswith('reference-') and kind[2] == 'unsupported']
-    if unsupported:
-        raise ValueError('Reference %s carries a record kind this kit does not support (%s-v%s); an operator '
-                         'must handle it with a kit that does.' % (payload['key'], unsupported[0][0],
-                                                                   unsupported[0][1]))
-
-
-def _build_record(payload, task, existing):
-    operation = payload['operation']
-    if operation == 'propose':
-        record = entry_record(payload, 1, 'draft')
-    elif operation == 'draft':
-        record = entry_record(payload, 1, 'accepted')
-    elif operation == 'revise':
-        record = entry_record(payload, payload['revision'], 'draft')
-    else:
-        reviewed = existing.get(payload['revision'])
-        if reviewed is None:
-            raise ValueError('Reference %s has no revision %d to accept' % (payload['key'], payload['revision']))
-        record = {name: value for name, value in reviewed.items() if name != 'sha256'}
-        record.update(revision=payload['revision'] + 1, acceptance_state='accepted', successor=None)
-        record['sha256'] = content_hash(record)
-        validate_entry(record)
-    _write_time_rules(record)
-    return record['revision'], record
-
-
-def _require_bound_key(task, payload, existing):
-    keys = {record['key'] for record in existing.values()}
-    if len(keys) > 1:
-        raise ValueError('Reference anchor %s has conflicting keys across revisions; operator reconciliation '
-                         'required' % task)
-    if keys and keys != {payload['key']}:
-        raise ValueError('Reference anchor %s is keyed %s; a key swap is refused' % (task, next(iter(keys))))
-
-
-def _check_revision(payload, revision, existing, record, task):
-    operation = payload['operation']
-    newest = max(existing) if existing else None
-    if revision in existing:
-        if existing[revision] == record:
-            return   # an identical retry of a completed write
-        if operation == 'accept':
-            raise ValueError('Revision %d of %s is not the newest (revision %d exists); review the newest '
-                             'revision and accept that one' % (payload['revision'], payload['key'], newest))
-        raise ValueError('revision %d of %s already exists with different content' % (revision, payload['key']))
-    if operation in ('propose', 'draft'):
-        if newest is not None:
-            raise ValueError('Reference key %s already exists; use ref revise' % payload['key'])
-        return
-    if operation == 'revise':
-        if revision != newest + 1:
-            raise ValueError('revise must write revision %d of %s (requested %d)'
-                             % (newest + 1, payload['key'], revision))
-        if existing[newest]['sha256'] != payload['expected_sha256']:
-            raise ValueError('expected_sha256 does not match revision %d of %s; re-read it with ref get and '
-                             'revise from the current content' % (newest, payload['key']))
-        return
-    # accept: the reviewed revision must still be the newest, with the reviewed hash.
-    if newest != payload['revision']:
-        raise ValueError('Revision %d of %s is not the newest (revision %d exists); review the newest revision '
-                         'and accept that one' % (payload['revision'], payload['key'], newest))
-    if existing[payload['revision']]['sha256'] != payload['record_sha256']:
-        raise ValueError('record_sha256 does not match revision %d of %s' % (payload['revision'], payload['key']))
-
-
-def _check_acceptance(payload, existing, record, operator, row):
-    if not operator:
-        return None
-    return core.bind_acceptance(payload['acceptance'], record)
-
-
-def _apply_labels(run, task, current, payload, record):
-    accepted = record['acceptance_state'] == 'accepted' or STATE_LABEL['accepted'] in (current or [])
-    desired = {TYPE_LABEL, STATE_LABEL['accepted' if accepted else 'draft']}
-    core.apply_controlled_labels(run, task, current, SPEC, desired)
-
-
-def _result(payload, task, revision, record, created, reconciled, bound, comment_id=None):
-    result = {'key': payload['key'], 'revision': revision, 'native_id': task,
-              'record_comment_id': comment_id, 'state': record['acceptance_state'],
-              'created': created, 'reconciled': reconciled}
-    if bound is not None:
-        result['acceptance'] = bound
-    return result
-
-
-def _refuse_before_journal(payload, operator):
-    return None
-
-
-def _create_revision(payload):
-    if payload['operation'] == 'accept':
-        return payload['revision'] + 1
-    return payload.get('revision', 1)
-
-
-SPEC = core.RecordSpec(
-    kind='reference', noun='reference', type_labels={TYPE_LABEL}, state_labels=STATE_LABEL,
-    revision_prefix=ENTRY_PREFIX, acceptance_prefix=ACCEPTANCE_PREFIX, journal=JOURNAL, key_regex=KEY,
-    fields=PROPOSE_FIELDS, allow_accepted_first_revision=True, supports_retire=False,
-    accept_action='accept a reference entry', apply_command='admin.py reference-apply',
-    reconcile_command='admin.py reference-reconcile',
-    validate=lambda payload, operator: validate_payload(payload, operator=operator),
-    refuse_before_journal=_refuse_before_journal,
-    explicit_task=lambda payload: None,
-    read_rows=lambda run, payload=None: read_rows(run) if payload is None else read_key_rows(
-        run, payload['key'], payload['operation_id']),
-    read_created=lambda run, task, payload: _shown(run, [task]),
-    resolve_task=_resolve_task,
-    check_key_unique=_check_key_unique,
-    create_revision=_create_revision,
-    create_args=_create_args,
-    after_create=_close,
-    prepare_row=_prepare_row,
-    existing_revisions=existing_revisions,
-    require_selectable=_require_selectable,
-    build_record=_build_record,
-    require_bound_key=_require_bound_key,
-    check_revision=_check_revision,
-    check_acceptance=_check_acceptance,
-    acceptance_evidence=lambda bound, task, revision, record, actor: acceptance_evidence(
-        bound, task, revision, record, actor),
-    existing_acceptances=existing_acceptances,
-    revision_comment=entry_comment,
-    apply_labels=_apply_labels,
-    result=_result,
-)
-
-
 def check_decisions(payload, run):
     """Every cited decision resolves to an issue typed `decision` or labelled `decision`."""
     wanted = list(payload.get('decisions') or [])
@@ -744,6 +321,37 @@ def check_decisions(payload, run):
                          'labelled decision' % ', '.join(bad))
 
 
+KIND = keyed_entries.AnchoredKind(
+    noun='reference', title='Reference', command='ref', type_label=TYPE_LABEL, state_labels=STATE_LABEL,
+    key_prefix=KEY_LABEL, family='reference-', entry_prefix=ENTRY_PREFIX, acceptance_prefix=ACCEPTANCE_PREFIX,
+    journal=JOURNAL, source='reference-apply', accept_action='accept a reference entry',
+    apply_command='admin.py reference-apply', reconcile_command='admin.py reference-reconcile',
+    anchor_title=ANCHOR_TITLE, anchor_description=ANCHOR_DESCRIPTION,
+    close_reason='reference catalog anchor (not a work item)',
+    valid_key=lambda value, where='key': valid_key(value, where), parse_entry=lambda body: parse_entry(body),
+    validate_entry=lambda record: validate_entry(record),
+    entry_record=lambda payload, revision, state: entry_record(payload, revision, state),
+    validate_content=_validate_content, write_time_rules=lambda record: _write_time_rules(record),
+    content_fields=CONTENT_FIELDS, pre_write=lambda payload, run: check_decisions(payload, run),
+)
+SPEC = KIND.spec
+PROPOSE_FIELDS, ACCEPT_FIELDS, DIRECT_FIELDS = KIND.propose_fields, KIND.accept_fields, KIND.direct_fields
+key_label = KIND.key_label
+read_rows = KIND.read_rows
+read_key_rows = KIND.read_key_rows
+existing_revisions = KIND.existing_revisions
+existing_acceptances = KIND.existing_acceptances
+anchor_for = KIND.anchor_for
+parse_acceptance = KIND.parse_acceptance
+entry_comment = KIND.entry_comment
+acceptance_evidence = KIND.acceptance_evidence
+write_payload = KIND.write_payload
+
+
+def validate_payload(payload, operator=False):
+    return KIND.validate_payload(payload, operator=operator)
+
+
 def apply_native(payload, actor, run, project, operator=False, operators=None):
     """Caller holds the canonical project lock; run(argv) invokes pinned bd.
 
@@ -752,23 +360,12 @@ def apply_native(payload, actor, run, project, operator=False, operators=None):
     a direct accepted revision 1, with F3 evidence; `operators` is the deployment
     allowlist, checked before any journal or native read.
     """
-    if operator:
-        core.require_configured_operator(actor, operators, SPEC.accept_action)
-    validate_payload(payload, operator=operator)
-    check_decisions(payload, run)
-    return core.apply_native(payload, actor, run, project, SPEC, operator=operator, operators=operators)
-
-
-def _confirm_anchor(row):
-    if not is_record_anchor(row):
-        raise ValueError('Anchor %s has no reference revision record yet; re-run the original ref propose '
-                         'with the same operation_id to finish it, then reconcile.' % row.get('id'))
+    return KIND.apply_native(payload, actor, run, project, operator=operator, operators=operators)
 
 
 def reconcile(project, operation_id, actor, reason, disposition, run, issue_id=None):
     """Operator-only: resolve a stuck `.reference-requests/` receipt from native state."""
-    return core.reconcile(project, operation_id, actor, reason, disposition, run, SPEC,
-                          issue_id=issue_id, confirm=_confirm_anchor)
+    return KIND.reconcile(project, operation_id, actor, reason, disposition, run, issue_id=issue_id)
 
 
 # -- the catalog as readers see it ---------------------------------------------------------------
@@ -786,115 +383,18 @@ def due(review_by, current=None):
 
 
 def entry_view(row, operators, current=None):
-    """One anchor as readers see it. Never raises: a bad entry reads malformed."""
-    current = current or today()
-    view = {'key': None, 'native_id': row.get('id'), 'state': None, 'record': None,
-            'record_comment_id': None, 'acceptance': None, 'acceptance_inert': False,
-            'inert_operator': None, 'proposed': None, 'proposed_comment_id': None,
-            'due': 'unset', 'warnings': []}
-    try:
-        revisions, acceptances = {}, {}
-        for comment in row.get('comments') or []:
-            body = comment.get('text') if isinstance(comment, dict) else None
-            kind = record_comment_kind(body)
-            if not kind or not kind[0].startswith('reference-'):
-                continue
-            if kind[2] == 'unsupported':
-                view.update(state='unsupported')
-                view['warnings'].append({'code': 'unsupported-record',
-                                         'detail': '%s-v%s is newer than this kit' % (kind[0], kind[1])})
-                return view
-            if kind[0] == 'reference-entry':
-                record = parse_entry(body)
-                if record is None or not _entry_belongs(record, row):
-                    raise ValueError('malformed reference revision')
-                prior = revisions.get(record['revision'])
-                if prior is not None and prior[0] != record:
-                    raise ValueError('conflicting content for one revision')
-                revisions[record['revision']] = (record, comment.get('id'))
-            else:
-                record = parse_acceptance(body)
-                if record is None or record['id'] != row.get('id'):
-                    raise ValueError('malformed reference acceptance evidence')
-                acceptances.setdefault(record['revision'], []).append((record, comment.get('author')))
-        if not revisions:
-            raise ValueError('no reference revision record')
-        keys = {record['key'] for record, _ in revisions.values()}
-        if len(keys) != 1:
-            raise ValueError('conflicting keys across revisions')
-        view['key'] = next(iter(keys))
-        allowlist = configured_operators(operators if operators is not None else ())
-        chosen = inert = None
-        for number in sorted(revisions, reverse=True):
-            record, comment_id = revisions[number]
-            if record['acceptance_state'] == 'draft':
-                continue
-            evidence = [(item, author) for item, author in acceptances.get(number, [])
-                        if item['record_sha256'] == record['sha256']
-                        and item['acceptance_state'] == record['acceptance_state'] and item['key'] == record['key']]
-            if not evidence:
-                view['warnings'].append({'code': 'accepted-without-evidence',
-                                         'detail': 'revision %d reads accepted but has no acceptance evidence'
-                                                   % number})
-                continue
-            live = [(item, author) for item, author in evidence
-                    if author == item['operator'] and author in allowlist]
-            if live:
-                chosen = (number, live[0][0])
-                break
-            if inert is None:
-                inert = (number, evidence[0][1] or evidence[0][0]['operator'])
-        if chosen is not None:
-            number, item = chosen
-            record, comment_id = revisions[number]
-            view.update(record=record, record_comment_id=comment_id, state=record['acceptance_state'],
-                        due=due(record['review_by'], current),
-                        acceptance=dict(item['decision'], record_sha256=item['record_sha256'],
-                                        operator=item['operator'], at=item['at']))
-        else:
-            view['state'] = 'draft-only'
-        if inert is not None and (chosen is None or inert[0] > chosen[0]):
-            view.update(acceptance_inert=True, inert_operator=inert[1])
-            view['warnings'].append({'code': 'acceptance-inert',
-                                     'detail': 'revision %d carries acceptance evidence written by %s, who is '
-                                               'not on the deployment operator allowlist' % inert})
-        floor = chosen[0] if chosen is not None else 0
-        drafts = [number for number, (record, _) in revisions.items()
-                  if record['acceptance_state'] == 'draft' and number > floor]
-        if drafts:
-            record, comment_id = revisions[max(drafts)]
-            view.update(proposed=record, proposed_comment_id=comment_id)
-    except (ValueError, TypeError, KeyError, AttributeError) as error:
-        view.update(state='malformed', record=None, acceptance=None, proposed=None)
-        view['warnings'].append({'code': 'malformed', 'detail': str(error)[:200]})
+    """One anchor as readers see it, plus its review-by class. Never raises: a bad entry reads malformed."""
+    view = KIND.entry_view(row, operators)
+    view['due'] = due(view['record']['review_by'], current) if view['record'] is not None else 'unset'
     return view
 
 
 def catalog(rows, operators, current=None):
     """(entries, incomplete ids) over reference-labelled rows; ordinary labelled tasks are skipped."""
-    entries, incomplete = [], []
-    for row in rows:
-        if not isinstance(row, dict) or TYPE_LABEL not in (row.get('labels') or []):
-            continue
-        if not is_record_anchor(row):
-            if _key_labels(row):
-                incomplete.append(row.get('id'))
-            continue
-        entries.append(entry_view(row, operators, current))
-    return entries, incomplete
+    return KIND.catalog(rows, operators, view=lambda row, operators: entry_view(row, operators, current))
 
 
-def _coverage(entries, incomplete, base):
-    notes = [base]
-    for state in ('malformed', 'unsupported'):
-        ids = [entry['native_id'] for entry in entries if entry['state'] == state]
-        if ids:
-            notes.append('%d entr%s skipped as %s (%s)' % (len(ids), 'y' if len(ids) == 1 else 'ies', state,
-                                                           ', '.join(ids[:COVERAGE_IDS])))
-    if incomplete:
-        notes.append('%d incomplete anchor%s with no record yet (%s)' % (
-            len(incomplete), '' if len(incomplete) == 1 else 's', ', '.join(incomplete[:COVERAGE_IDS])))
-    return '; '.join(notes)
+_coverage = KIND.coverage
 
 
 def _record_view(record):
@@ -913,26 +413,7 @@ def get(rows, key, operators, current=None):
     A malformed or unsupported entry is returned with that state (its key is known only
     from the label); an anchor with no record yet, or an unknown key, is a refusal.
     """
-    valid_key(key)
-    label = key_label(key)
-    incomplete = []
-    entry = None
-    for row in rows:
-        if not isinstance(row, dict) or TYPE_LABEL not in (row.get('labels') or []) \
-                or label not in _key_labels(row):
-            continue
-        if not is_record_anchor(row):
-            incomplete.append(row.get('id'))
-            continue
-        view = entry_view(row, operators, current)
-        if view['key'] in (key, None):
-            entry = view
-            break
-    if entry is None:
-        if incomplete:
-            raise ValueError('Reference key %s has no revision record yet (incomplete anchor %s); re-run its '
-                             'propose or ask the operator to reconcile it' % (key, incomplete[0]))
-        raise ValueError('Unknown reference key %s; use ref list to see the catalog' % key)
+    entry = KIND.find_entry(rows, key, operators, view=lambda row, operators: entry_view(row, operators, current))
     return {'schema_version': 1, 'key': key, 'state': entry['state'], 'native_id': entry['native_id'],
             'record': _record_view(entry['record']), 'record_comment_id': entry['record_comment_id'],
             'acceptance': entry['acceptance'], 'acceptance_inert': entry['acceptance_inert'],
@@ -1123,21 +604,3 @@ def read(args, run, operators):
     if command == 'list':
         return list_entries(read_rows(run), parse_list_options(rest), operators)
     raise ValueError('ref: unknown command %s; use get, list, propose or revise' % command)
-
-
-def write_payload(args, attachments):
-    """The payload of `ref propose|revise --file entry.json` (the client's attachment transport)."""
-    command, rest = args[0], [token for token in args[1:] if token != '--json']
-    if command not in CONTRIBUTOR_OPERATIONS:
-        raise ValueError('ref: unknown command %s' % command)
-    if len(rest) != 1 or not rest[0].startswith('@attachment:'):
-        raise ValueError('ref %s takes --file entry.json' % command)
-    item = (attachments or {}).get(rest[0].partition(':')[2])
-    if not isinstance(item, dict) or item.get('flag') not in ('--file', '-f') or not isinstance(item.get('text'), str):
-        raise ValueError('ref %s takes --file entry.json' % command)
-    payload = parse_json(item['text'])
-    if not isinstance(payload, dict):
-        raise ValueError('reference payload must be an object')
-    if 'operation' in payload:
-        raise ValueError('the payload must not set operation; use the propose or revise command')
-    return dict(payload, operation=command)
