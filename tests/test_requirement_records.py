@@ -1,4 +1,6 @@
+import contextlib
 import copy
+import io
 import json
 import os
 import sys
@@ -6,9 +8,10 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import admin
 import client
 import requirement_records as rr
 import reserved_comments
@@ -984,6 +987,116 @@ class RequirementRecordTests(unittest.TestCase):
         self.assertEqual(seen['payload']['operation'], 'draft')
         self.assertEqual(seen['actor'], 'alice')
         self.assertFalse(seen['operator'])
+
+
+class RequirementOperatorAllowlistTests(unittest.TestCase):
+    """kittrial-5bb.65: the operator CLI routes check the deployment allowlist.
+
+    `admin.py requirement-apply`/`requirement-backfill` must read the same
+    `deployment.private.json` operators list `void-record` enforces (with the
+    strict environment-vs-file refusal) and refuse an unlisted `--actor` before
+    any write. A listed actor still succeeds.
+    """
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        project = self.root / 'projects' / 'trial'
+        project.mkdir(parents=True)
+        (project / '.beads').mkdir()
+        (project / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+        self.project = project
+        (self.root / 'deployment.private.json').write_text(
+            json.dumps({'password': 'x', 'unit': 'none', 'operators': ['operator']}), encoding='utf-8')
+        self.native = Native()
+        self.native.actor = 'operator'
+        self.native.seed('job-1')
+        self.native.seed('req-1')
+        env = patch.dict(os.environ, {'ORCHESTRA_OPERATORS': ''})
+        env.start()
+        self.addCleanup(env.stop)
+        self.flock = Mock()
+        self.patcher = patch.dict(sys.modules,
+                                  {'fcntl': types.SimpleNamespace(flock=self.flock, LOCK_EX=2)})
+        self.patcher.start()
+        self.addCleanup(self.patcher.stop)
+
+    def run_native(self, root, name, args):
+        return self.native(args[2:] if args[:1] == ['--actor'] else args)
+
+    def invoke(self, command, payload, actor='operator'):
+        path = self.root / (command + '.json')
+        path.write_text(json.dumps(payload), encoding='utf-8')
+        argv = ['admin.py', '--root', str(self.root), command, 'trial', '--actor', actor,
+                '--file', str(path)]
+        with patch.object(sys, 'argv', argv), \
+                patch.object(admin, 'root_path', return_value=self.root), \
+                patch.object(admin, 'run_bd', side_effect=self.run_native), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            admin.main()
+        return json.loads(out.getvalue())
+
+    def draft(self):
+        return dict(schema_version=1, operation_id='op-1', operation='draft',
+                    kind='requirement', title='R01: Intent', key='R01',
+                    description='Statement of intent.', acceptance_state='draft',
+                    parent='job-1')
+
+    def backfill(self):
+        return dict(schema_version=1, operation_id='bf-1', records=[
+            dict(task='req-1', kind='requirement', acceptance_state='draft')])
+
+    def test_apply_refuses_an_unlisted_actor_before_any_write(self):
+        with self.assertRaisesRegex(ValueError, 'not a server-side configured operator'):
+            self.invoke('requirement-apply', self.draft(), actor='rogue')
+        self.assertEqual(self.native.writes(), [])
+        self.assertFalse((self.project / '.requirement-requests').exists())
+
+    def test_apply_allows_a_listed_actor(self):
+        result = self.invoke('requirement-apply', self.draft(), actor='operator')
+        self.assertTrue(result['created'])
+        self.assertIn('requirement:draft', self.native.row(result['id'])['labels'])
+
+    def test_backfill_refuses_an_unlisted_actor_before_any_write(self):
+        with self.assertRaisesRegex(ValueError, 'not a server-side configured operator'):
+            self.invoke('requirement-backfill', self.backfill(), actor='rogue')
+        self.assertEqual(self.native.writes(), [])
+        self.assertFalse((self.project / '.requirement-backfills').exists())
+
+    def test_backfill_allows_a_listed_actor(self):
+        result = self.invoke('requirement-backfill', self.backfill(), actor='operator')
+        self.assertTrue(result['changed'])
+        self.assertIn('requirement:draft', self.native.row('req-1')['labels'])
+
+    def test_apply_refuses_when_no_allowlist_is_configured(self):
+        (self.root / 'deployment.private.json').write_text(
+            json.dumps({'password': 'x', 'unit': 'none'}), encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'No operator allowlist'):
+            self.invoke('requirement-apply', self.draft(), actor='operator')
+        self.assertEqual(self.native.writes(), [])
+        self.assertFalse((self.project / '.requirement-requests').exists())
+
+    def test_apply_refuses_a_shell_allowlist_that_disagrees_with_the_file(self):
+        # `ORCHESTRA_OPERATORS` is not an authority source; a value that differs
+        # from the deployment configuration is refused before any write, exactly
+        # as void-record does with operators(root, strict=True).
+        with patch.dict(os.environ, {'ORCHESTRA_OPERATORS': 'rogue'}):
+            with self.assertRaisesRegex(ValueError, 'ORCHESTRA_OPERATORS'):
+                self.invoke('requirement-apply', self.draft(), actor='operator')
+        self.assertEqual(self.native.writes(), [])
+        self.assertFalse((self.project / '.requirement-requests').exists())
+
+    def test_library_refuses_an_unlisted_actor_before_any_write(self):
+        with self.assertRaisesRegex(ValueError, 'not a server-side configured operator'):
+            rr.apply_native(self.draft(), 'rogue', self.native, self.project,
+                            operator=True, operators=frozenset({'operator'}))
+        with self.assertRaisesRegex(ValueError, 'not a server-side configured operator'):
+            rr.backfill(self.backfill(), 'rogue', self.native, self.project,
+                        operators=frozenset({'operator'}))
+        self.assertEqual(self.native.writes(), [])
+        self.assertFalse((self.project / '.requirement-requests').exists())
+        self.assertFalse((self.project / '.requirement-backfills').exists())
 
 
 if __name__ == '__main__':

@@ -2293,20 +2293,22 @@ def main():
         path=project_dir(root,args.project)
         if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
         payload=json.loads(Path(args.file).read_text(encoding='utf-8-sig'))
+        authority=operators(root,strict=True)
         def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            print(json.dumps(backfill(payload,args.actor,run,path)))
+            print(json.dumps(backfill(payload,args.actor,run,path,operators=authority)))
     elif args.command=='requirement-apply':
         import fcntl
         from requirement_records import apply_native
         path=project_dir(root,args.project)
         if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
         payload=json.loads(Path(args.file).read_text(encoding='utf-8-sig'))
+        authority=operators(root,strict=True)
         def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            print(json.dumps(apply_native(payload,args.actor,run,path,operator=True)))
+            print(json.dumps(apply_native(payload,args.actor,run,path,operator=True,operators=authority)))
     elif args.command=='requirement-reconcile':
         import fcntl
         from requirement_records import reconcile
