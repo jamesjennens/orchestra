@@ -42,6 +42,7 @@ deferred to slice 2 with its configuration store).
 import calendar
 import json
 import re
+import subprocess
 import time
 from datetime import date, timedelta
 from urllib.parse import urlsplit
@@ -437,13 +438,25 @@ def read_rows(run):
         chunk = ids[start:start + SHOW_CHUNK]
         try:
             shown = json.loads(run(['show', *chunk, '--json', '--include-comments']) or '[]')
-        except ValueError as error:
-            if 'no issues found' in str(error):
+        except NATIVE_FAILURES as error:
+            if all_missing(error):
                 continue   # every row of the chunk was deleted after the list
             raise
         shown = shown if isinstance(shown, list) else [shown]
         rows.extend(row for row in shown if isinstance(row, dict) and row.get('id') in chunk)
     return rows
+
+
+# A native read failure: the endpoint's runner raises ValueError, admin's run_bd
+# raises CalledProcessError.
+NATIVE_FAILURES = (ValueError, OSError, subprocess.CalledProcessError)
+
+
+def all_missing(error):
+    """bd 1.2.2 `show` fails only when every id is missing ("no issue(s) found ...")."""
+    text = ' '.join(str(part) for part in (error, getattr(error, 'stderr', ''), getattr(error, 'stdout', ''))
+                    if part)
+    return 'no issue' in text and 'found' in text
 
 
 def _key_labels(row):
@@ -673,7 +686,9 @@ def check_decisions(payload, run):
         return
     try:
         shown = json.loads(run(['show', *wanted, '--json']) or '[]')
-    except ValueError:
+    except NATIVE_FAILURES as error:
+        if not all_missing(error):
+            raise
         shown = []
     shown = shown if isinstance(shown, list) else [shown]
     found = {row.get('id'): row for row in shown if isinstance(row, dict)}

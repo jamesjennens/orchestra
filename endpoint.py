@@ -180,6 +180,32 @@ def execute(root,request,authority_config=None,require_authority=False):
             stdout,warnings=native.split(native.run(native.argv(root,path,actor,['export','--all']),environment(root)))
             rows=[json.loads(line) for line in stdout.splitlines() if line.strip()]
         return {'returncode':0,'stdout':json.dumps({'schema_version':1,'anchors':record_anchor_ids(rows)})+'\n','stderr':warnings}
+    if action=='ref':
+        # The reference catalog (.41 slice 1, kittrial-5bb.66). Reads (get, list, help)
+        # are one label-filtered `bd list` plus `bd show --include-comments`, take no
+        # coordination lock and are not run_guarded (like the anchors read); propose
+        # and revise are writes, under the lock and the operation journal.
+        import reference_records
+        args=request.get('args',[])
+        if not isinstance(args,list) or any(not isinstance(x,str) or '\0' in x for x in args):raise ValueError('Expected argument list')
+        run_warnings=[]
+        def run(argv):
+            stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warnings:run_warnings.append(warnings)
+            return stdout
+        if not args or args[0] not in reference_records.CONTRIBUTOR_OPERATIONS:
+            result=reference_records.read(args,run,configured_operators(root))
+            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
+        payload=reference_records.write_payload(args,request.get('attachments',{}))
+        runner=NativeRunner(run)
+        def ref_effect():
+            result=reference_records.apply_native(payload,actor,runner,path)
+            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            return run_guarded(request,journal_path(path),ref_effect,
+                               authority_config=authority_config,
+                               require_authority=require_authority,runner=runner)
     if action in ('brief','history','checkpoint'):
         from briefing import execute as briefing_execute
         args=request.get('args',[])

@@ -123,8 +123,8 @@ not just a suffix.
 
 ## Command help
 
-`work`, `review`, `handoff`, `brief`, `history`, `checkpoint` and `capability` answer
-`-h`/`--help` on stdout with exit code `0`:
+`work`, `review`, `handoff`, `brief`, `history`, `checkpoint`, `capability` and `ref`
+answer `-h`/`--help` on stdout with exit code `0`:
 
 ```sh
 b work --help
@@ -135,6 +135,7 @@ b history --help
 b checkpoint --help
 b capability --help
 b capability lookup --help
+b ref --help
 ```
 
 Help recognition is uniform: `-h`/`--help` is honoured wherever it appears as a
@@ -341,6 +342,102 @@ paragraph separators, is written as a `\u` escape.
 Recorded capability records, alias proposals and a recorded drift check are designed
 separately. The entry shape and pointer syntax here are what they are meant to feed.
 
+## `ref`: the reference catalog
+
+The reference catalog holds operational facts and their authority: what is
+authoritative for X, where it lives, and when it must be checked again. It is
+described in [the reference catalog design](REFERENCE_CATALOG_DESIGN.md); slice 1
+ships the commands below.
+
+```sh
+b ref get calendar.trading --json
+b ref list --tag data --state accepted --due expired --limit 20 --json
+b ref propose --file entry.json --json
+b ref revise --file entry.json --json
+```
+
+**Reading.** `ref get` and `ref list` are read-only. They take no coordination lock and
+read only the reference-labelled rows: one `bd list --label reference` plus one
+`bd show --include-comments` per 50 rows.
+
+- **`ref get KEY`** returns these fields:
+  - `key`, `state` and `native_id`.
+  - `record`: the newest accepted revision. Its `title` and `statement` are excerpt
+    objects.
+  - `record_comment_id`.
+  - `acceptance`: the F3 decision. Its `operator` is the allowlisted actor taken from
+    the evidence comment's **native author**.
+  - `acceptance_inert` and `inert_operator`.
+  - `proposed`: the newest draft after `record`, with `proposed_comment_id`.
+  - `due`: `ok`, `due-soon`, `expired` or `unset`.
+  - `replaces` (`[]` in slice 1) and `resolved` (`null`).
+  - `warnings`, `trust` and `coverage`.
+- **`ref get` states:**
+  - `state` is `accepted`, `draft-only`, `malformed` or `unsupported`.
+  - A `draft-only` entry is **not** authoritative.
+  - An unknown key, or a key whose anchor has no record yet, exits nonzero and names
+    the key.
+- **`ref list`** returns `{total, items, next_offset, coverage}`, one row per key.
+  - Rows are ordered expired, due-soon, unset, then ok, and by key within each.
+  - Each row has `key`, `title` (at most 200 characters), `state`, `owner`,
+    `review_by`, `proposed_review_by`, `due`, `tags`, `revision`, `native_id` and
+    `acceptance_inert`.
+  - Options: `--tag` (repeatable; all tags must match), `--owner IDENTITY`,
+    `--state draft-only|accepted|superseded|all`, `--due expired|due-soon|unset`,
+    `--limit` and `--offset`.
+- **Failures stay per entry.** A malformed entry, an unsupported newer record kind
+  (`Kind: reference-entry-v2`), or an anchor left without its record by an interrupted
+  propose fails only itself.
+  - `coverage` names such entries, with at most 10 anchor ids.
+  - A read never fails the whole catalog.
+
+**Writing.** `ref propose` and `ref revise` take a closed JSON payload. The command
+sets `operation`.
+
+```json
+{"schema_version": 1, "operation_id": "alex-ref-1", "key": "calendar.trading",
+ "title": "Trading calendar authority",
+ "statement": "Charts derive holidays and early closes from the pinned calendar module.",
+ "authority": {"type": "repo-path", "path": "src/example/calendar.py",
+               "commit": "0000000000000000000000000000000000000000", "anchor": "HOLIDAYS"},
+ "owner": "account:u-0001", "review_by": "2027-01-15", "tags": ["calendar", "data"],
+ "decisions": [], "revision": 1, "expected_sha256": null}
+```
+
+- **Fields:**
+  - `key`: lowercase dotted, at most 80 characters.
+  - `title`: at most 200 characters.
+  - `statement`: at most 2,000 characters. It is untrusted text, and it never
+    appears in an error.
+  - `authority`: a `repo-path` (a relative path with no `..`, an optional 40-hex
+    `commit` and an optional `anchor`) or a `url` (`https` only, no userinfo, with a
+    `retrieved` date no later than today).
+  - `owner`: `account:<uid>` or `person:<name>`. A session actor is refused.
+  - `review_by`: a real date at most 24 months ahead.
+  - `tags`: at most 12 lowercase slugs.
+  - `decisions`: each must be an issue of type `decision` or labelled `decision`.
+- **Caller-written fields are refused.** `acceptance_state`, `successor`, `sha256`,
+  `acceptance` and `labels` are written by the operation.
+- **`propose`** creates the entry's native anchor, closes it and posts revision 1 as a
+  draft.
+  - A duplicate key is refused before any write.
+  - So is a key whose lookup label collides with another key's, such as `a.b-c` and
+    `a.b.c`.
+- **`revise`** is compare-and-swap.
+  - `revision` must be the next number, and `expected_sha256` the newest revision's
+    `sha256`.
+  - On an accepted entry it adds a draft. The accepted revision is unchanged until an
+    operator accepts the draft.
+- **The result** is `{key, revision, native_id, record_comment_id, state, created,
+  reconciled}`.
+- **Retries.** `operation_id` makes a retry idempotent.
+  - A retry also finishes an anchor that an interrupted propose left without its
+    record.
+  - A different operation proposing that key is refused until then.
+
+Acceptance is not a client command. It is the operator's
+`admin.py reference-apply` ([operations](OPERATIONS.md#operator-commands)).
+
 ## IDs and cursor roles
 
 - **Native task ID**: `task`/`items[].task`/the positional argument to `show`, `brief`,
@@ -392,6 +489,11 @@ a clear refusal, not a wrong read.
 | `capability` | Markdown | heading lines over 1,000 characters are text; a summary is looked for in the 40 lines after its heading |
 | `capability` | entry `aliases` / `tests` / `related` | first 8 shown; `tests_total` / `related_total` count all |
 | `capability` | entry `name` / `summary` | excerpt objects of <= 120 / <= 200 characters |
+| `ref list` | `--limit` / `--offset` | 1..100 (default 20) / >= 0 |
+| `ref` | `key` / `title` / `statement` | <= 80 / <= 200 / <= 2,000 characters |
+| `ref` | `tags` / `review_by` | <= 12 slugs of <= 32 characters / at most 24 months ahead |
+| `ref` | `authority.url` | `https`, no userinfo, <= 2,048 characters |
+| `ref` | due-soon window | 30 days (fixed in slice 1) |
 
 Out-of-range values fail with a nonzero exit code and an error that names the option or
 field **and** the limit, for example:
