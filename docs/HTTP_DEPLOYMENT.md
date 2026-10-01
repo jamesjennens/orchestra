@@ -726,8 +726,20 @@ the pilot phase, not part of this service.
   write drops their cached reads of that project, so their action shows at once.
   Authority is never cached:
   each project is re-authorized on every request, so a removed member loses it at
-  once; only the task data may be up to 20 seconds old on My work. The queue, brief
-  and task list always read fresh.
+  once; only the task data may be up to 20 seconds old on My work. My work then adds
+  at most `ME_WORK_DETAIL_MAX` (10) canonical `brief` reads per request, one per task,
+  for the rows the `work` projection leaves blank (see "Agent prompts on My work"),
+  cached the same way.
+  The cache key is the principal (user id and credential id, so an agent never reads
+  its owner's entry or the reverse), the project and the read kind.
+- **Task list cost.** On the canonical binding one task-list page needs the project's
+  `bd list` snapshot plus the review states from the bounded `work` walk (up to 11
+  subprocess reads). Both are reused by the same principal for the same 20 seconds
+  (one cache shared with My work), so paging, filtering and reloading cost nothing
+  more until the entry expires; the principal's own successful write (claim, deliver,
+  review, edit, membership change) drops their entries for that project at once, and
+  another person's write shows up within 20 seconds. The queue and brief always read
+  fresh.
 - **Agent prompts on My work.** `GET /v1/me/work` also returns `agent_prompts`: one
   copyable prompt per agent the caller owns, built by `agent_prompts.py` from the same
   queue data, limited to the projects that agent is granted, grouped by project and
@@ -752,9 +764,16 @@ the pilot phase, not part of this service.
   through only if they look like ids. The server address in a prompt is `--public-url`,
   or the `<ORCHESTRA_SERVER_URL>` placeholder when none is set; it never comes from the
   request's `Host` header. No prompt contains or asks for a secret. On the
-  canonical binding the `work` projection gives counts but not pending request ids or
-  review times, so those lines say "read the task brief" and "wait time unknown", and
-  the blocked class is empty (see `endpoint-blocked-signal`).
+  canonical binding the `work` projection gives counts but not pending request ids,
+  review times or checkpoint state. My work fills them from one canonical `brief` read
+  per task (`EndpointBackend.task_detail`) for at most `ME_WORK_DETAIL_MAX` (10) tasks
+  per request, highest value first: the caller's own changes-requested tasks (pending
+  request item ids; the brief lists up to five, and the prompt says "5 of N" when there
+  are more), contributions awaiting the caller's review (waiting since the revision
+  was delivered), the caller's own claimed tasks and then other claimed tasks where the
+  caller approves (blocked when the latest checkpoint lists unresolved items). Rows past
+  the bound still say "read the task brief" and "wait time unknown" and are not marked
+  blocked. My work rows show "Blocked" and the open request ids where known.
 - **Review respond step (slice 2a).** Canonically a requested change stays open until
   the contributor records a `respond` resolution for it, even after a newer revision
   arrives. The task page shows the task's assignee each open request with a "Resolved"
@@ -791,7 +810,10 @@ the pilot phase, not part of this service.
   over `--backend endpoint` that one signal is **absent rather than wrong** while
   changes-requested, claimable and awaiting-review are unaffected. Mirroring
   checkpoints into the endpoint backend is deliberately not attempted in this
-  revision (it is the open checkpoint item `endpoint-blocked-signal`).
+  revision (it is the open checkpoint item `endpoint-blocked-signal`). My work and
+  its agent prompts (slice 2a) read the blocked signal from the bounded per-task
+  `brief` reads described above instead; the agent's own `/v1/agents/me/next` and
+  agent cards still lack it on the canonical binding.
 - Administrative audit coverage is partial: login outcomes, authorization
   denials and every successful idempotent mutation are recorded; a per-field
   before/after administrative trail is not implemented.

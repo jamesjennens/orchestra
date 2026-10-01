@@ -160,6 +160,9 @@ def _assignee(item):
 
 def _requests(item):
     ids = [token(i) for i in item.get('pending_request_ids') or []]
+    if ids and item.get('pending_request_ids_complete') is False:
+        return 'pending request items: %s (%d of %s; read the task brief for the rest)' % (
+            ', '.join(ids), len(ids), item.get('open_requests') or 'more')
     if ids:
         return 'pending request items: %s' % ', '.join(ids)
     count = item.get('open_requests')

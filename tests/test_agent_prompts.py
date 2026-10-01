@@ -135,6 +135,13 @@ class PromptCase(unittest.TestCase):
         self.assertIn('pending request items: item-1, item-2', text)
         self.assertIn('read the task brief for the pending request items', text)
 
+    def test_a_partial_id_list_says_how_many_more(self):
+        item = dict(row('t1', 'changes-requested', ME, pending=['a1', 'a2', 'a3', 'a4', 'a5']),
+                    open_requests=7, pending_request_ids_complete=False)
+        text = prompt([classify(WORKER, [item])])['text']
+        self.assertIn('pending request items: a1, a2, a3, a4, a5 (5 of 7; read the task brief '
+                      'for the rest)', text)
+
     def test_grouped_by_project(self):
         first = classify(OWNER, [row('a1', 'awaiting-review', OTHER)],
                          project={'id': 'p1', 'name': 'Alpha', 'role': 'owner'})

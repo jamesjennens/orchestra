@@ -14,8 +14,11 @@ function workTable(ctx, rows, { showProject = true, emptyTitle, emptyBody }) {
         h('td', null, h('a', { class: 'title', href }, t.title), h('div', { class: 'sub' }, t.priority != null ? [priority(t.priority), ' · '] : null, h('span', { class: 'mono' }, t.id))),
         showProject ? h('td', { class: 'hide-narrow' }, t.project_name || '') : null,
         h('td', null, t.review_state && t.review_state !== 'none' ? reviewChip(t.review_state) : statusChip(t.status)),
-        h('td', null, t.next_action ? t.next_action.text : h('span', { class: 'muted' }, '—')),
-        h('td', { class: 'hide-narrow muted' }, t.updated_at ? time(t.updated_at) : ''));
+        h('td', null, t.next_action ? t.next_action.text : h('span', { class: 'muted' }, '—'),
+          t.blocked ? [' ', h('span', { class: 'chip crit', title: 'The latest checkpoint lists unresolved items' }, 'Blocked')] : null,
+          t.pending_request_ids && t.pending_request_ids.length ? h('div', { class: 'sub' }, 'Open requests: ', t.pending_request_ids.join(', ')) : null),
+        // Canonical queue rows carry no update time; the review wait start is shown instead.
+        h('td', { class: 'hide-narrow muted' }, t.updated_at ? time(t.updated_at) : t.waiting_since ? time(t.waiting_since) : ''));
     }))));
 }
 
@@ -57,8 +60,8 @@ export function agentPromptPanel(ctx, data) {
     ? h('div', { class: 'panel-body stack' },
       h('p', { class: 'small muted' }, 'Paste into the agent’s chat in its folder. The agent first checks its own list in Orchestra and reports any difference to you before acting.'),
       h('div', { class: 'copy-row' }, prompts.map((p) => copyButton(p.label, p.text, { ariaLabel: p.label, what: PROMPT_WHAT[p.kind] || 'Prompt' }))),
-      h('p', { class: 'small muted' }, prompts.filter((p) => p.kind !== 'empty').map((p) => `${p.agent_name}: ${p.items} item(s)${p.omitted ? ` (+${p.omitted} more)` : ''}`).join(' · '),
-        data.generated_at ? [' · snapshot ', time(data.generated_at)] : null),
+      prompts.length > idle.length ? h('p', { class: 'small muted' }, prompts.filter((p) => p.kind !== 'empty').map((p) => `${p.agent_name}: ${p.items} item(s)${p.omitted ? ` (+${p.omitted} more)` : ''}`).join(' · '),
+        data.generated_at ? [' · snapshot ', time(data.generated_at)] : null) : null,
       idle.length ? h('p', { class: 'small muted' }, `${idle.map((p) => p.agent_name).join(', ')}: no projects yet. `,
         h('a', { href: ctx.href('/agents') }, 'Grant one on My agents'), ' to give it work.') : null)
     : h('div', { class: 'panel-body' }, h('p', { class: 'small muted' }, 'You have no agents yet. ',

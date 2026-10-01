@@ -1443,6 +1443,111 @@ class MyWorkCacheCase(TeamHarness):
         self.assertEqual(reads + 2, self.backend.queue_reads)
 
 
+class CountingSnapshotBackend(CountingQueueBackend):
+    """Counts full task snapshots too, and hides the in-process review state so the
+    task list has to merge it from the queue, as on the canonical binding."""
+
+    REVIEW_STATES_FROM_QUEUE = True
+
+    def __init__(self, service):
+        super().__init__(service)
+        self.snapshot_reads = 0
+
+    def read_tasks(self, project_id):
+        self.snapshot_reads += 1
+        snapshot = super().read_tasks(project_id)
+        return {'items': [{k: v for k, v in t.items() if k != 'review_state'}
+                          for t in snapshot['items']], 'total': snapshot['total']}
+
+    def review_states(self, project_id, queue=None):
+        queue = queue if queue is not None else self.review_queue(project_id)
+        return {'states': {i['id']: i['review_state'] for i in queue['items']},
+                'complete': True}
+
+    def review_queue(self, project_id):
+        self.queue_reads += 1
+        items = []
+        for task in InProcessBackend.read_tasks(self, project_id)['items']:
+            review = self._review_view(task)
+            items.append({'id': task['id'], 'review_state': review['state'],
+                          'assignee': task.get('assignee'), 'status': task.get('status'),
+                          'title': task.get('title')})
+        return {'items': items, 'complete': True, 'warnings': []}
+
+
+class TaskListCacheCase(TeamHarness):
+    """Slice 2a item 5: the task list reuses one principal's reads for a short time."""
+
+    def setUp(self):
+        super().setUp()
+        self._stop_server()
+        self.backend = CountingSnapshotBackend(self.service)
+        self.httpd = create_server(self.service, self.backend, host='127.0.0.1', port=0)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    def reads(self):
+        return self.backend.snapshot_reads, self.backend.queue_reads
+
+    def listing(self, token, query=''):
+        response = self.request('GET', self.path('/tasks' + query), token=token)
+        self.assertEqual(200, response.status, response.data)
+        return response.data
+
+    def test_repeat_pages_reuse_one_read_per_principal(self):
+        first = self.listing(self.olive)
+        self.assertEqual((1, 1), self.reads())
+        self.assertEqual('none', first['items'][0]['review_state'])
+        again = self.listing(self.olive)
+        self.listing(self.olive, '?status=active')
+        self.assertEqual((1, 1), self.reads())
+        self.assertEqual(first['items'], again['items'])
+        # Another person never gets olive's entry: their first page reads afresh.
+        self.listing(self.carl)
+        self.assertEqual((2, 2), self.reads())
+        # Neither does olive's own agent (a different principal of the same user).
+        created = self.request('POST', '/v1/agents', {'name': 'olive-bot',
+                                                      'projects': [self.project]},
+                               token=self.olive)
+        self.assertEqual(201, created.status, created.data)
+        agent = created.data['credential']['secret']
+        self.assertEqual(self.reads(), (2, 2))
+        self.listing(agent)
+        self.assertEqual((3, 3), self.reads())
+        self.listing(agent)
+        self.assertEqual((3, 3), self.reads())
+
+    def test_the_callers_own_write_drops_the_entry(self):
+        self.listing(self.carl)
+        self.claim(self.carl)
+        rows = {t['id']: t for t in self.listing(self.carl)['items']}
+        self.assertEqual('carl', rows[self.task]['assignee_name'])
+        self.assertEqual((2, 2), self.reads())
+        self.assertEqual(201, self.contribute(self.carl).status)
+        rows = {t['id']: t for t in self.listing(self.carl)['items']}
+        self.assertEqual('awaiting-review', rows[self.task]['review_state'])
+        self.assertEqual((3, 3), self.reads())
+
+    def test_someone_elses_write_waits_for_the_short_expiry(self):
+        self.listing(self.carl)
+        added = self.create_task(self.olive, self.project, 'Second').data['id']
+        stale = self.listing(self.carl)
+        self.assertNotIn(added, [t['id'] for t in stale['items']])
+        cache = self.httpd.RequestHandlerClass.read_cache
+        for key in list(cache):
+            cache[key] = (0, cache[key][1])
+        fresh = self.listing(self.carl)
+        self.assertIn(added, [t['id'] for t in fresh['items']])
+
+    def test_authority_is_never_cached(self):
+        self.listing(self.carl)
+        removed = self.request('DELETE', self.path('/members/%s' % self.ids['carl']),
+                               token=self.olive)
+        self.assertEqual(200, removed.status, removed.data)
+        self.assertEqual(404, self.request('GET', self.path('/tasks'), token=self.carl).status)
+
+
 
 class AgentSetupDialogCase(unittest.TestCase):
     """The agent setup dialog never puts the one-time secret in a file or a prompt.
@@ -1710,6 +1815,7 @@ console.log(JSON.stringify({
 # ============================================================================
 
 from http_service import EndpointBackend, queue_item  # noqa: E402
+import http_service  # noqa: E402
 import types  # noqa: E402
 
 MERGE_1 = 'e' * 40
@@ -1866,6 +1972,134 @@ class TaskBriefWarningsTests(unittest.TestCase):
         data = self._brief(warnings=[], integration_disagreements=[])
         self.assertEqual(data['review']['warnings'], [])
         self.assertEqual(data['review']['integration_disagreements'], [])
+
+
+class CountingEndpointBackend(EndpointBackend):
+    """The canonical binding, counting endpoint subprocesses by action."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.calls = []
+
+    def _endpoint(self, action, project, actor, args, *rest, **kwargs):
+        self.calls.append(action)
+        return super()._endpoint(action, project, actor, args, *rest, **kwargs)
+
+
+class CanonicalReadCostCase(EndpointCase):
+    """Slice 2a items 4 and 5 over the strict canonical stub."""
+
+    def make_backend(self):
+        import test_http_review_fixes as fixes
+        self.canonical_root = self.tmp / 'canonical'
+        return CountingEndpointBackend(sys.executable, str(fixes.STUB),
+                                       str(self.canonical_root), service=self.service)
+
+    def post(self, token, path, body, status=201):
+        response = self.request('POST', path, body, token=token)
+        self.assertEqual(status, response.status, response.data)
+        return response.data
+
+    def test_task_list_pages_reuse_the_principals_reads_until_its_own_write(self):
+        alex, project = self.setup_project()
+        for index in range(3):
+            self.create_task(alex, project, 'task %d' % index)
+        self.backend.calls = []
+        path = '/v1/projects/%s/tasks' % project
+        first = self.request('GET', path + '?limit=2', token=alex)
+        self.assertEqual(200, first.status, first.data)
+        self.assertEqual(['bd', 'work'], self.backend.calls)
+        # The next page and a filtered view reuse the same two reads.
+        second = self.request('GET', path + '?limit=2&cursor=' + first.data['next_cursor'],
+                              token=alex)
+        self.assertEqual(200, second.status, second.data)
+        self.request('GET', path + '?status=active', token=alex)
+        self.assertEqual(['bd', 'work'], self.backend.calls)
+        self.assertEqual(3, len(first.data['items']) + len(second.data['items']))
+        # Alex's own write drops the entry: the next page reads afresh and shows it.
+        created = self.create_task(alex, project, 'task 3').data['id']
+        self.backend.calls = []
+        fresh = self.request('GET', path, token=alex).data
+        self.assertIn(created, [t['id'] for t in fresh['items']])
+        self.assertEqual(['bd', 'work'], self.backend.calls)
+
+    def test_my_work_and_prompts_fill_ids_waits_and_blocked_from_the_brief(self):
+        alex, project = self.setup_project()
+        admin = self.admin_token()
+        blair_id = self.create_account(admin, 'blair', 'blair-password-1')
+        self.assertEqual(200, self.request('PUT', '/v1/projects/%s/members/%s'
+                                           % (project, blair_id), {'role': 'contributor'},
+                                           token=alex).status)
+        blair = self.login('blair', 'blair-password-1')[0]
+        agent = self.request('POST', '/v1/agents', {'name': 'alex-bot', 'projects': [project]},
+                             token=alex)
+        self.assertEqual(201, agent.status, agent.data)
+        base = '/v1/projects/%s/tasks/' % project
+        # A: alex's own task with two requested changes.
+        changed = self.create_task(alex, project, 'changed').data['id']
+        self.post(alex, base + changed + '/claim', {}, status=200)
+        self.contribute(alex, project, changed)
+        review = self.request('GET', base + changed + '/brief', token=alex).data['review']
+        self.post(alex, base + changed + '/reviews',
+                  {'operation': 'request-changes', 'schema_version': 1,
+                   'operation_id': 'op-ask-a', 'contribution': review['contribution']['id'],
+                   'previous': review['latest_id'],
+                   'items': [{'id': 'item-1', 'text': 'one'}, {'id': 'item-2', 'text': 'two'}]})
+        # B: alex's own claimed task whose latest checkpoint has an unresolved item.
+        stuck = self.create_task(alex, project, 'stuck').data['id']
+        self.post(alex, base + stuck + '/claim', {}, status=200)
+        history = self.request('GET', base + stuck + '/history?limit=5', token=alex).data
+        self.post(alex, base + stuck + '/checkpoints',
+                  {'schema_version': 1, 'previous': None,
+                   'activity_cursor': history['activity_cursor'], 'source_commit': COMMIT,
+                   'branch': 'contrib/stuck', 'intent': 'i', 'acceptance': 'a',
+                   'summary': 'waiting on a decision', 'next_action': 'ask',
+                   'open_items': [{'id': 'q1', 'kind': 'blocker', 'text': 'Which API?',
+                                   'source': 'design'}], 'resolved': []})
+        # C: blair's delivery awaiting alex's review.
+        waiting = self.create_task(alex, project, 'waiting').data['id']
+        self.post(blair, base + waiting + '/claim', {}, status=200)
+        self.contribute(blair, project, waiting)
+
+        self.backend.calls = []
+        work = self.request('GET', '/v1/me/work', token=alex)
+        self.assertEqual(200, work.status, work.data)
+        # One queue walk plus one brief per enriched row (3 here, bound 10).
+        self.assertEqual(1, self.backend.calls.count('work'))
+        self.assertEqual(3, self.backend.calls.count('brief'))
+        rows = {t['id']: t for t in work.data['assigned'] + work.data['to_review']}
+        self.assertEqual(['item-1', 'item-2'], rows[changed]['pending_request_ids'])
+        self.assertTrue(rows[changed]['waiting_since'])
+        self.assertTrue(rows[stuck].get('blocked'))
+        self.assertFalse(rows[changed].get('blocked'))
+        self.assertTrue(rows[waiting]['waiting_since'])
+        self.assertEqual(1, rows[waiting]['contribution']['revision'])
+        text = work.data['agent_prompts'][0]['text']
+        line = [l for l in text.splitlines() if l.startswith('- task %s ' % changed)][0]
+        self.assertIn('pending request items: item-1, item-2', line)
+        self.assertNotIn('wait time unknown', line)
+        lines = [l for l in text.splitlines() if l.startswith('- task %s ' % stuck)]
+        self.assertTrue(any('BLOCKED' in l for l in lines), text)
+        self.assertIn('Blocked:', text)
+        line = [l for l in text.splitlines() if l.startswith('- task %s ' % waiting)][0]
+        self.assertNotIn('wait time unknown', line)
+        # A repeat read within the short cache walks no queue and reads no brief again
+        # (the agent cards' attention still reads its one task snapshot per request).
+        self.backend.calls = []
+        self.request('GET', '/v1/me/work', token=alex)
+        self.assertEqual(['bd'], self.backend.calls)
+
+    def test_detail_reads_are_bounded(self):
+        alex, project = self.setup_project()
+        base = '/v1/projects/%s/tasks/' % project
+        for index in range(http_service.ME_WORK_DETAIL_MAX + 3):
+            task = self.create_task(alex, project, 'claimed %d' % index).data['id']
+            self.post(alex, base + task + '/claim', {}, status=200)
+        self.backend.calls = []
+        work = self.request('GET', '/v1/me/work', token=alex)
+        self.assertEqual(200, work.status, work.data)
+        self.assertEqual(http_service.ME_WORK_DETAIL_MAX, self.backend.calls.count('brief'))
+        self.assertEqual(http_service.ME_WORK_DETAIL_MAX + 3, len(work.data['assigned']))
 
 
 if __name__ == '__main__':
