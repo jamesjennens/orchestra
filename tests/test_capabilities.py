@@ -831,6 +831,35 @@ class ReadOnlyAndOutputTests(Checkout):
         self.assertEqual(sorted(path.name for path in alone.iterdir()), ['capabilities.py', 'client.py'])
 
 
+class EntryCapTests(Checkout):
+    """One hostile file cannot flood the index (memory and output stay bounded)."""
+
+    def index(self):
+        code, result, _, stderr = call('index', '--repo', str(self.root), '--source', 'ast')
+        self.assertEqual(code, 0, stderr)
+        return result
+
+    def test_headings_per_file_are_capped(self):
+        write(self.root, 'docs/MANY.md', ''.join('# h%d\n' % n for n in range(2_500)))
+        result = self.index()
+        self.assertEqual(sum(1 for row in result['entries'] if row['file'] == 'docs/MANY.md'),
+                         capabilities.HEADINGS_PER_FILE_MAX)
+        self.assertEqual(result['index']['skipped']['heading-limit'], 500)
+        code, resolved, _, _ = call('resolve', 'docs/MANY.md#h2499', '--repo', str(self.root))
+        self.assertTrue(resolved['results'][0]['resolved'])
+
+    def test_definitions_per_file_and_total_entries_are_capped(self):
+        write(self.root, 'pkg/many.py', ''.join('def f%d():\n    pass\n' % n for n in range(40)))
+        with patch.object(capabilities, 'DEFINITIONS_PER_FILE_MAX', 30):
+            result = self.index()
+        self.assertEqual(result['index']['skipped']['definition-limit'], 10)
+        with patch.object(capabilities, 'ENTRIES_MAX', 12):
+            result = self.index()
+        self.assertEqual(result['index']['entries'], 12)
+        self.assertGreater(result['index']['skipped']['entry-limit'], 0)
+        self.assertEqual(result['warnings'], ['indexed the first 12 entries only'])
+
+
 @unittest.skipUnless(GIT, 'git is not installed')
 class GitIndexTests(Checkout):
     def test_lookup_never_rewrites_the_git_index(self):

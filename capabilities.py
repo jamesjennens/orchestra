@@ -65,6 +65,9 @@ NESTING_MAX = 5_000
 LINE_TEXT_MAX = 2_000
 HEADING_LINE_MAX = 1_000
 SUMMARY_SCAN_LINES = 40
+ENTRIES_MAX = 200_000
+HEADINGS_PER_FILE_MAX = 2_000
+DEFINITIONS_PER_FILE_MAX = 5_000
 TOTAL_BYTES_MAX = 256_000_000
 LIMIT_MIN, LIMIT_MAX, LIMIT_DEFAULT = 1, 20, 5
 PHRASE_MAX = 200
@@ -255,6 +258,11 @@ class Index:
     def add(self, entry):
         if entry['id'] in self.by_id:
             self.skip('duplicate-pointer')
+            return None
+        if len(self.entries) >= ENTRIES_MAX:
+            if 'entry-limit' not in self.skipped:
+                self.warnings.append('indexed the first %d entries only' % ENTRIES_MAX)
+            self.skip('entry-limit')
             return None
         self.by_id[entry['id']] = entry
         self.entries.append(entry)
@@ -494,6 +502,9 @@ def index_python(rel, data, index, facts):
     aliases = import_aliases(tree, module, package)
     facts['files'][rel] = {'module': module, 'aliases': aliases, 'entry': module_entry}
     test = is_test(rel)
+    if len(found) > DEFINITIONS_PER_FILE_MAX:
+        index.skip('definition-limit', len(found) - DEFINITIONS_PER_FILE_MAX)
+        found = found[:DEFINITIONS_PER_FILE_MAX]
     for qualname, kind, node in found:
         name = qualname.rsplit('.', 1)[-1]
         dotted = '%s.%s' % (module, qualname) if module else qualname
@@ -656,7 +667,11 @@ def markdown_headings(data):
 
 
 def index_markdown(rel, data, index):
-    for number, _, title, anchor, end, summary in markdown_headings(data):
+    headings = markdown_headings(data)
+    if len(headings) > HEADINGS_PER_FILE_MAX:
+        index.skip('heading-limit', len(headings) - HEADINGS_PER_FILE_MAX)
+        headings = headings[:HEADINGS_PER_FILE_MAX]
+    for number, _, title, anchor, end, summary in headings:
         index.add(entry('%s#%s' % (rel, anchor), 'doc-section', title, anchor, rel, number, end,
                         summary, 'markdown', [title, anchor.replace('-', ' ')]))
 

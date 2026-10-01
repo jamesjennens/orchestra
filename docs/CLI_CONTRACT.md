@@ -372,6 +372,7 @@ a clear refusal, not a wrong read.
 | `capability resolve` | pointers | 1..100, each <= 400 characters |
 | `capability` | `--max-graph-mb` | 1..512 (default 64); at most 500,000 nodes and 2,000,000 links |
 | `capability` | indexed files | first 20,000 files; files over 2 MB skipped; 256 MB in total |
+| `capability` | entries | 200,000 in total; 2,000 headings per Markdown file and 5,000 definitions per Python file (the rest counted as `entry-limit`, `heading-limit`, `definition-limit`); `resolve` still reads a whole file |
 | `capability` | Python nesting | a file with a logical line of more than 5,000 nesting-capable tokens is skipped (`too-complex`) |
 | `capability` | Markdown | heading lines over 1,000 characters are text; a summary is looked for in the 40 lines after its heading |
 | `capability` | entry `aliases` / `tests` / `related` | first 8 shown; `tests_total` / `related_total` count all |
