@@ -423,6 +423,11 @@ read only the reference-labelled rows: one `bd list --label reference` plus one
   propose fails only itself.
   - `coverage` names such entries, with at most 10 anchor ids.
   - A read never fails the whole catalog.
+  - **No repair yet.** The design (section 3.7) names the operator's `void-record` as
+    the repair for a malformed entry, but that is not available yet:
+    `recovery.KIND_PREFIXES` does not list the reference record kinds, so a reference
+    comment cannot be voided. Until a follow-up adds them, a malformed entry stays
+    isolated as `malformed`.
 
 **Writing.** `ref propose` and `ref revise` take a closed JSON payload. The command
 sets `operation`.

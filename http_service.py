@@ -1139,14 +1139,7 @@ class EndpointBackend:
         if code == 2 and missing and ('Unknown reference key' in stderr
                                       or 'no revision record yet' in stderr):
             raise not_found('Reference not found')
-        if code == 124:
-            raise uncertain('Canonical command timed out; outcome may be unknown')
-        if code:
-            detail = stderr.strip().splitlines()[-1][:200] if stderr.strip() else None
-            if code == 2:
-                raise invalid('Canonical command rejected the request', detail)
-            raise uncertain('Canonical command failed; outcome may be unknown')
-        payload = _canonical_payload((reply.get('stdout') or '') if isinstance(reply, dict) else '')
+        payload = self._checked(reply)
         if not isinstance(payload, dict):
             raise uncertain('Canonical reference read returned an unexpected shape')
         return payload

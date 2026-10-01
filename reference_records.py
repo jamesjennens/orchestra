@@ -35,6 +35,10 @@ equals the evidence `operator` and is on the live deployment operator allowlist;
 otherwise the entry reads `draft-only` with `acceptance_inert: true` and raises an
 `acceptance-inert` attention item to approvers.
 
+A malformed entry stays `malformed`: the .41 design's repair through the operator's
+`void-record` (section 3.7) is a follow-up, because `recovery.KIND_PREFIXES` does
+not list the reference record kinds yet.
+
 Statements are untrusted text: they never enter an error message, and excerpts
 carry `trust`. The due-soon window is fixed at 30 days (a per-project setting is
 deferred to slice 2 with its configuration store).
