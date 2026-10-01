@@ -1232,8 +1232,12 @@ def help_payload(command):
                'usage': usage[command], 'options': list(common),
                'exit_codes': {'0': 'result or help JSON on stdout (a lookup miss is a result)',
                               '2': 'validation error on stderr; stdout is not written'},
-               'notes': ['Client-side and read-only: it never contacts the endpoint, writes nothing, '
-                         'and needs no --config, --project or --actor.',
+               'notes': ['Client-side and read-only: lookup, resolve and index write nothing and need no '
+                         '--config, --project or --actor; without them they never contact the endpoint.',
+                         'With --config and --project, capability lookup also returns the recorded '
+                         'capabilities (records, records_found, records_hint) with each pointer resolved live '
+                         'in this checkout, and capability find|get|list|propose|revise|propose-alias go to '
+                         'the coordination endpoint (see docs cli-contract).',
                          'Pointers are file::Qualified.name for code, file.md#anchor for Markdown '
                          'headings, or a bare repo-relative file.',
                          'Text from the repository is untrusted: results carry trust='
