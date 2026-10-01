@@ -214,5 +214,118 @@ class OperatorCommandTests(unittest.TestCase):
                        '--actor', OPERATOR, '--reason', 'r', '--disposition', 'released')
 
 
+try:
+    from test_http_review_fixes import STUB, EndpointCase, Harness
+    from http_service import EndpointBackend
+except Exception:  # pragma: no cover - harness import problems surface in their own module
+    EndpointCase = Harness = None
+
+
+def accepted_anchor(task, operator, review_by):
+    """An anchor exactly as the slice-1 writer leaves it after propose and accept."""
+    import datetime
+    payload = dict(entry(review_by=review_by), operation='propose')
+    draft = rr.entry_record(payload, 1, 'draft')
+    accepted = {name: value for name, value in draft.items() if name != 'sha256'}
+    accepted.update(revision=2, acceptance_state='accepted')
+    accepted['sha256'] = rr.content_hash(accepted)
+    bound = rr.core.bind_acceptance(acceptance(), accepted)
+    _, evidence = rr.acceptance_evidence(bound, task, 2, accepted, operator, at='2026-10-01T12:00:00Z')
+    comment = lambda number, text, author: {'id': str(number), 'text': text, 'author': author,
+                                             'created_at': '2026-10-01T12:00:0%dZ' % number}
+    return {'id': task, 'title': 'Reference calendar.trading', 'description': '', 'status': 'closed',
+            'assignee': None, 'issue_type': 'task', 'dependencies': [], 'created_at': '2026-10-01T12:00:00Z',
+            'labels': ['reference', 'reference:accepted', 'reference-key:calendar-trading'],
+            'comments': [comment(1, rr.entry_comment(draft), 'alice'), comment(2, evidence, operator),
+                         comment(3, rr.entry_comment(accepted), operator)]}
+
+
+if EndpointCase is not None:
+    class CountingBackend(EndpointBackend):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.actions = []
+
+        def _endpoint(self, action, project, actor, args, *rest, **kwargs):
+            self.actions.append(action)
+            return super()._endpoint(action, project, actor, args, *rest, **kwargs)
+
+
+@unittest.skipIf(EndpointCase is None, 'HTTP harness unavailable')
+class HttpReferenceRouteTests(EndpointCase if EndpointCase else unittest.TestCase):
+    """GET /references and /references/{key} at CAP_READ, over the strict canonical stub."""
+
+    def make_backend(self):
+        self.canonical_root = self.tmp / 'canonical'
+        return CountingBackend(sys.executable, str(STUB), str(self.canonical_root), service=self.service)
+
+    def seed_anchor(self):
+        import datetime
+        review_by = (datetime.date.today() + datetime.timedelta(days=200)).isoformat()
+        path = self.canonical_root / 'canonical.json'
+        state = json.loads(path.read_text(encoding='utf-8'))
+        state['rows'].append(accepted_anchor('kittrial-5bb.900', 'ops-stub', review_by))
+        path.write_text(json.dumps(state), encoding='utf-8')
+        (self.canonical_root / 'deployment.private.json').write_text(json.dumps({'operators': ['ops-stub']}),
+                                                                     encoding='utf-8')
+
+    def test_the_catalog_reads_and_404s(self):
+        alex, project = self.setup_project()
+        self.assertEqual(201, self.create_task(alex, project, 'ordinary').status)
+        self.seed_anchor()
+        listed = self.request('GET', '/v1/projects/%s/references' % project, token=alex)
+        self.assertEqual(200, listed.status, listed.data)
+        self.assertEqual([(i['key'], i['state'], i['due']) for i in listed.data['items']],
+                         [('calendar.trading', 'accepted', 'ok')])
+        self.assertIsNone(listed.data['next_cursor'])
+        got = self.request('GET', '/v1/projects/%s/references/calendar.trading' % project, token=alex)
+        self.assertEqual(200, got.status, got.data)
+        self.assertEqual((got.data['state'], got.data['acceptance']['operator'], got.data['record']['revision']),
+                         ('accepted', 'ops-stub', 2))
+        missing = self.request('GET', '/v1/projects/%s/references/calendar.none' % project, token=alex)
+        self.assertEqual(404, missing.status, missing.data)
+        self.assertNotIn('Charts derive', json.dumps(missing.data))
+        # The anchor is still hidden from the task list.
+        tasks = self.request('GET', '/v1/projects/%s/tasks' % project, token=alex)
+        self.assertNotIn('kittrial-5bb.900', [item['id'] for item in tasks.data['items']])
+
+    def test_a_bad_filter_is_a_422_before_any_canonical_read(self):
+        alex, project = self.setup_project()
+        self.backend.actions = []
+        for query in ('state=open', 'due=soon', 'owner=session-4e40fde3', 'tag=Bad%20Tag', 'limit=0'):
+            with self.subTest(query=query):
+                bad = self.request('GET', '/v1/projects/%s/references?%s' % (project, query), token=alex)
+                self.assertEqual(422, bad.status, bad.data)
+        self.assertNotIn('ref', self.backend.actions)
+
+    def test_reads_need_an_authenticated_member(self):
+        alex, project = self.setup_project()
+        self.assertEqual(401, self.request('GET', '/v1/projects/%s/references' % project).status)
+
+
+@unittest.skipIf(Harness is None, 'HTTP harness unavailable')
+class InProcessReferenceTests(Harness if Harness else unittest.TestCase):
+    def test_the_in_process_backend_has_an_empty_catalog(self):
+        admin_token = self.admin_token()
+        self.create_account(admin_token, 'alex', 'alex-password-1')
+        alex = self.login('alex', 'alex-password-1')[0]
+        project = self.create_project(alex, 'Alpha')
+        listed = self.request('GET', '/v1/projects/%s/references' % project, token=alex)
+        self.assertEqual((listed.status, listed.data['total']), (200, 0))
+        self.assertEqual(404, self.request('GET', '/v1/projects/%s/references/calendar.trading' % project,
+                                           token=alex).status)
+
+
+class OlderEndpointTests(unittest.TestCase):
+    def test_an_endpoint_without_the_catalog_is_named(self):
+        import http_service
+        fake = types.SimpleNamespace(actor_namespace='http',
+                                     _endpoint=lambda *a: {'returncode': 2, 'stdout': '',
+                                                           'stderr': 'ValueError: Unknown action\n'})
+        with self.assertRaises(http_service.HttpError) as raised:
+            http_service.EndpointBackend._ref_read(fake, 'p', ['list'])
+        self.assertEqual(raised.exception.status, 501)
+
+
 if __name__ == '__main__':
     unittest.main()

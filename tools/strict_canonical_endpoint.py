@@ -275,6 +275,34 @@ def dispatch(canonical, request, tmp, run=None):
         payload = json.loads(args[0]) if args and isinstance(args[0], str) else None
         result = coordinate(payload, actor, run, canonical.path)
         return envelope(0, json.dumps(result, ensure_ascii=False) + '\n')
+    if action == 'ref':
+        # endpoint.py's reference catalog reads (kittrial-5bb.66) over the emulated rows:
+        # `bd list --label` (no comments) and `bd show IDS --include-comments`.
+        try:
+            import reference_records
+        except ImportError:  # a revision that predates the catalog
+            raise ValueError('Unknown action')
+        if args and args[0] in reference_records.CONTRIBUTOR_OPERATIONS:
+            raise ValueError('the canonical stub serves reference reads only')
+        rows = [json.loads(line) for line in run(['export', '--all']).splitlines() if line.strip()]
+
+        def ref_run(argv):
+            if argv[0] == 'list':
+                label = argv[argv.index('--label') + 1]
+                return json.dumps([{key: value for key, value in row.items() if key != 'comments'}
+                                   for row in rows if label in (row.get('labels') or [])])
+            if argv[0] == 'show':
+                ids = [token for token in argv[1:] if not token.startswith('--')]
+                found = [row for row in rows if row.get('id') in ids]
+                if not found:
+                    raise ValueError('no issues found matching the provided IDs')
+                return json.dumps(found)
+            raise ValueError('unsupported native read')
+        config = canonical.root / 'deployment.private.json'
+        operators = json.loads(config.read_text(encoding='utf-8')).get('operators') or [] \
+            if config.is_file() else []
+        result = reference_records.read(args, ref_run, operators)
+        return envelope(0, json.dumps(result, ensure_ascii=False) + '\n')
     raise ValueError('Unknown action')
 
 
