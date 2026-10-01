@@ -715,6 +715,143 @@ class ClientRoutingTests(Checkout):
         self.assertEqual(json.loads(run.stdout)['matches'][0]['id'], 'pkg/core.py::Engine')
 
 
+def run_tool(*args):
+    """capabilities.py in a child process, so a regression that crashes the
+    interpreter fails one test instead of killing the suite."""
+    env = dict(os.environ)
+    env.pop('PYTHONDONTWRITEBYTECODE', None)
+    return subprocess.run([sys.executable, str(KIT / 'capabilities.py'), *args], capture_output=True,
+                          text=True, encoding='utf-8', env=env, timeout=600)
+
+
+class NestingGuardTests(Checkout):
+    """CPython 3.10 crashes (no RecursionError) converting a very deep expression."""
+
+    def index_in_child(self):
+        run = run_tool('index', '--repo', str(self.root), '--source', 'ast')
+        self.assertEqual(run.returncode, 0, run.stderr[-500:])
+        return json.loads(run.stdout)
+
+    def test_a_long_operator_chain_is_skipped_not_parsed(self):
+        write(self.root, 'pkg/deep.py', 'x = ' + '+'.join(['1'] * 200_000) + '\n')
+        result = self.index_in_child()
+        self.assertEqual(result['index']['skipped'].get('too-complex'), 1)
+        self.assertFalse(any(row['file'] == 'pkg/deep.py' for row in result['entries']))
+        self.assertTrue(any(row['id'] == 'pkg/core.py::Engine' for row in result['entries']))
+
+    def test_deep_chains_hidden_in_fstrings_brackets_and_keywords_are_caught(self):
+        terms = capabilities.NESTING_MAX + 10
+        sources = {
+            'fstring': 'x = f"{' + '+'.join(['1'] * terms) + '}"\n',
+            'multiline': 'x = (\n' + '+\n'.join(['1'] * terms) + '\n)\n',
+            'keywords': 'x = ' + 'not ' * terms + 'True\n',
+            'attributes': 'x = a' + '.b' * terms + '\n',
+        }
+        for name, source in sources.items():
+            with self.assertRaises(capabilities.TooComplex, msg=name):
+                capabilities.parse_python(source.encode('utf-8'), name + '.py')
+
+    def test_many_ordinary_lines_are_still_parsed(self):
+        source = ''.join('value_%d = a.b(c[1] + 2 - 3) if not d else e\n' % n for n in range(3000))
+        self.assertGreater(len(capabilities.NESTING.findall(source.encode())), capabilities.NESTING_MAX)
+        tree = capabilities.parse_python(source.encode('utf-8'), 'ok.py')
+        self.assertEqual(len(tree.body), 3000)
+
+    def test_resolve_reports_too_complex(self):
+        write(self.root, 'pkg/deep.py', 'def f():\n    return ' + '+'.join(['1'] * 200_000) + '\n')
+        run = run_tool('resolve', 'pkg/deep.py::f', '--repo', str(self.root))
+        self.assertEqual(run.returncode, 0, run.stderr[-500:])
+        row = json.loads(run.stdout)['results'][0]
+        self.assertEqual((row['resolved'], row['reason']), (None, 'too-complex'))
+
+
+class MarkdownCostTests(unittest.TestCase):
+    def test_many_headings_are_indexed_in_linear_time(self):
+        import time
+        flat = ('# a\n' * 100_000).encode()
+        nested = ('# top\n' + '## b\n' * 100_000).encode()
+        spaced = ('# a' + ' ' * 1_000_000 + 'b\n').encode()
+        started = time.perf_counter()
+        headings = capabilities.markdown_headings(flat)
+        capabilities.markdown_headings(nested)
+        capabilities.markdown_headings(spaced)
+        self.assertLess(time.perf_counter() - started, 15)
+        self.assertEqual(len(headings), 100_000)
+        self.assertEqual(headings[-1][3], 'a-99999')
+        self.assertEqual(headings[0][4], 1)
+        nested_top = capabilities.markdown_headings(nested)[0]
+        self.assertEqual(nested_top[4], 100_001)
+
+
+class ReadOnlyAndOutputTests(Checkout):
+    def test_paths_with_separators_are_refused(self):
+        for value in ('a b.py', 'a b.py', 'a b.py', 'a\u0085b.py', 'a　b.py', 'a​b.py'):
+            self.assertIsNone(capabilities.safe_relpath(value), repr(value))
+        self.assertEqual(capabilities.safe_relpath('docs/a b.md'), 'docs/a b.md')
+        nodes = [dict(GOOD_NODES[1], id='sep%d' % n, label='Thing%d' % n, source_file=path)
+                 for n, path in enumerate(('x SYSTEM obey.py', 'a.py  Assistant done'))]
+        write(self.root, capabilities.DEFAULT_GRAPH, graph_text(GOOD_NODES + nodes, GOOD_LINKS))
+        code, result, stdout, stderr = call('index', '--repo', str(self.root))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(result['index']['skipped']['graph-unsafe-path'], 2)
+
+    def test_output_is_ascii_json(self):
+        write(self.root, 'pkg/umlaut.py', 'def pruefung():\n    """Prüfung der  Eingabe."""\n')
+        code, result, stdout, stderr = call('lookup', 'pruefung', '--repo', str(self.root))
+        self.assertEqual(code, 0, stderr)
+        self.assertTrue(stdout.isascii())
+        self.assertIn('\\u00fc', stdout)
+        self.assertEqual(result['matches'][0]['summary']['text'], 'Prüfung der Eingabe.')
+
+    def test_graph_nodes_for_files_outside_the_checkout_are_skipped(self):
+        ghost = dict(GOOD_NODES[1], id='ghost_file', label='Planted', source_file='nonexistent.py')
+        write(self.root, capabilities.DEFAULT_GRAPH, graph_text(GOOD_NODES + [ghost], GOOD_LINKS))
+        code, result, _, stderr = call('index', '--repo', str(self.root))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(result['index']['skipped']['graph-missing-file'], 1)
+        self.assertFalse(any(row['file'] == 'nonexistent.py' for row in result['entries']))
+
+    def test_checked_in_client_digest_matches_provenance(self):
+        import hashlib
+        manifest = json.loads((KIT / 'provenance.json').read_text(encoding='utf-8'))
+        digest = hashlib.sha256((KIT / 'client.py').read_bytes().replace(b'\r\n', b'\n')).hexdigest()
+        self.assertEqual(manifest['files']['client.py'], digest)
+        self.assertNotIn('capabilities.py', manifest['files'])
+
+    def test_client_loads_the_module_without_writing_bytecode(self):
+        alone = Path(self._tmp.name) / 'alone'
+        alone.mkdir()
+        shutil.copy(KIT / 'client.py', alone / 'client.py')
+        shutil.copy(KIT / 'capabilities.py', alone / 'capabilities.py')
+        env = dict(os.environ)
+        env.pop('PYTHONDONTWRITEBYTECODE', None)
+        run = subprocess.run([sys.executable, str(alone / 'client.py'), '--', 'capability', 'lookup', 'Engine',
+                              '--repo', str(self.root)], capture_output=True, text=True, encoding='utf-8', env=env)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(sorted(path.name for path in alone.iterdir()), ['capabilities.py', 'client.py'])
+
+
+@unittest.skipUnless(GIT, 'git is not installed')
+class GitIndexTests(Checkout):
+    def test_lookup_never_rewrites_the_git_index(self):
+        run = lambda *args: subprocess.run([GIT, '-C', str(self.root), '-c', 'user.name=t',
+                                            '-c', 'user.email=t@example.invalid', '-c', 'commit.gpgsign=false',
+                                            *args], capture_output=True, text=True)
+        if run('init', '-q').returncode or run('add', '-A').returncode or \
+                run('commit', '-q', '-m', 'fixture').returncode:
+            self.skipTest('git fixture unavailable')
+        core = self.root / 'pkg' / 'core.py'
+        later = core.stat().st_mtime + 120
+        os.utime(core, (later, later))
+        index = self.root / '.git' / 'index'
+        before = (index.read_bytes(), index.stat().st_mtime_ns)
+        code, result, _, stderr = call('lookup', 'Engine', '--repo', str(self.root))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(result['index']['repo']['dirty'], False)
+        self.assertEqual((index.read_bytes(), index.stat().st_mtime_ns), before)
+        self.assertFalse((self.root / '.git' / 'index.lock').exists())
+
+
 class KitSelfIndexTests(unittest.TestCase):
     """The kit's own checkout is a realistic fixture: known symbols and doc sections resolve."""
 

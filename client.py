@@ -164,7 +164,13 @@ def _capability(args,out):
         return 2
     spec = importlib.util.spec_from_file_location('orchestra_capabilities', module_path)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # Loading must not leave __pycache__ beside the client: the lookup writes nothing.
+    write_bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = write_bytecode
     code,stdout,stderr = module.run(args)
     if out:
         # Same client-owned capture as the endpoint actions: UTF-8, LF, no BOM,

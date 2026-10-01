@@ -202,12 +202,19 @@ complete tokens.
 
 `capability` is answered by the client itself and is read-only:
 - it never contacts the endpoint;
-- it writes nothing: no Beads record, no cache file;
+- it writes nothing: no Beads record, no cache file, no `__pycache__` beside the client,
+  and no refresh of Git's index (every Git call runs with `--no-optional-locks`, so it
+  never races the caller's own `git add` or `commit`);
 - it needs no `--config`, `--project` or `--actor`.
 
 The client loads `capabilities.py` from its own directory by path. A standalone
 client copied without that file refuses with exit `2`; copy `capabilities.py` from
 the same kit next to it. The module also runs on its own as `python capabilities.py ...`.
+
+`capabilities.py` is **not** covered by `provenance.json`: `--version` and onboarding
+parity vouch for `client.py`, `version.py` and `VERSION` only. Whoever can write the
+client's directory can change what `capability` runs, just as they could change
+`client.py` there, so keep that directory writable by its owner only.
 
 ```sh
 b capability lookup "reserved label guard"
@@ -229,6 +236,13 @@ current directory, widened to its Git top level.
   GitHub-style anchors (repeated headings get `-1`, `-2`, ...).
 - **Files:** with Git, tracked plus untracked-but-not-ignored files. Without Git, a walk
   that skips hidden and dependency directories.
+- **Skipped files** are counted in `index.skipped` by reason:
+  - `parse-error`;
+  - `too-complex`: a logical line that could nest more than 5,000 levels. CPython 3.10
+    crashes, rather than raising, on such input, so the file is never parsed;
+  - `file-too-large`;
+  - `unsafe-path`;
+  - `unreadable`, including a link out of the checkout.
 
 A **pointer** is `file::Qualified.name` for code
 (`http_auth.py::Service._refresh_authority`), `file.md#anchor` for a heading, or a bare
@@ -279,11 +293,13 @@ punctuation.
 - `resolved`: `true`, `false`, or `null` when this version cannot check that kind of pointer;
 - `basis`: `ast`, `markdown`, `graph` or `file`;
 - `reason`, when not resolved: `invalid-pointer`, `file-missing`, `symbol-missing`,
-  `anchor-missing`, `unsupported-file-type`, `parse-error`, `file-too-large` or `unreadable`.
+  `anchor-missing`, `unsupported-file-type`, `parse-error`, `too-complex`, `file-too-large`
+  or `unreadable`.
 
 A missing pointer is a result, not an error, so check `summary.missing`. Unsafe pointers
-(absolute, drive-qualified, `..`, backslash, control characters) are refused as
-`invalid-pointer` without reading anything.
+are refused as `invalid-pointer` without reading anything. A pointer is unsafe when it is
+absolute or drive-qualified, contains `..`, a backslash, or a control or format character,
+or contains any separator other than the ASCII space (a line or paragraph separator, NBSP).
 
 **Untrusted content.** The repository author or the graph generator wrote everything
 this command returns.
@@ -293,8 +309,9 @@ this command returns.
 - `graph.json` is parsed defensively:
   - its size is bounded by `--max-graph-mb`, and its node and link counts are bounded too;
   - it must be UTF-8 (a BOM is tolerated), and NaN, Infinity and deep nesting are refused;
-  - only clean repo-relative POSIX paths are accepted, and the default graph must not
-    resolve outside the checkout;
+  - only clean repo-relative POSIX paths are accepted, with the same rules as pointers, and
+    the default graph must not resolve outside the checkout;
+  - a node whose file is not in the checkout is skipped (`graph-missing-file`);
   - malformed nodes and links are skipped and counted in `index.skipped`;
   - nothing in it is executed.
 - With `--source auto`, a refused graph falls back to `ast` with a warning. With an
@@ -303,7 +320,8 @@ this command returns.
   `index.graph.stale: true`, with a warning.
 
 Warnings appear in `warnings` and on stderr as `warning: ...` lines. Stdout carries only
-the JSON result.
+the JSON result. That JSON is ASCII: every non-ASCII character, including line and
+paragraph separators, is written as a `\u` escape.
 
 Recorded capability records, alias proposals and a recorded drift check are designed
 separately. The entry shape and pointer syntax here are what they are meant to feed.
@@ -354,6 +372,8 @@ a clear refusal, not a wrong read.
 | `capability resolve` | pointers | 1..100, each <= 400 characters |
 | `capability` | `--max-graph-mb` | 1..512 (default 64); at most 500,000 nodes and 2,000,000 links |
 | `capability` | indexed files | first 20,000 files; files over 2 MB skipped; 256 MB in total |
+| `capability` | Python nesting | a file with a logical line of more than 5,000 nesting-capable tokens is skipped (`too-complex`) |
+| `capability` | Markdown | heading lines over 1,000 characters are text; a summary is looked for in the 40 lines after its heading |
 | `capability` | entry `aliases` / `tests` / `related` | first 8 shown; `tests_total` / `related_total` count all |
 | `capability` | entry `name` / `summary` | excerpt objects of <= 120 / <= 200 characters |
 

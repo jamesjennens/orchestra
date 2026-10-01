@@ -8,7 +8,8 @@ phrase, with a short summary, the tests that reference it and related symbols. A
 miss returns the nearest candidates and a hint instead of an empty answer.
 
 The index is built on demand from the checkout and nothing is written anywhere: no
-Beads record, no server call, no cache file. Sources:
+Beads record, no server call, no cache file, and no refresh of Git's index (every Git
+call runs with optional locks off). Sources:
 
 * ``ast``: Python modules, classes, functions and methods from the standard-library
   parser. Calls between them and the tests that reference them are resolved from
@@ -35,11 +36,13 @@ the one those records are meant to feed.
 import argparse
 import ast
 import difflib
+import io
 import json
 import os
 import re
 import subprocess
 import sys
+import tokenize
 import unicodedata
 from pathlib import Path
 
@@ -58,6 +61,10 @@ GRAPH_LINKS_MAX = 2_000_000
 GRAPH_LABEL_MAX = 1000
 FILES_MAX = 20_000
 FILE_BYTES_MAX = 2_000_000
+NESTING_MAX = 5_000
+LINE_TEXT_MAX = 2_000
+HEADING_LINE_MAX = 1_000
+SUMMARY_SCAN_LINES = 40
 TOTAL_BYTES_MAX = 256_000_000
 LIMIT_MIN, LIMIT_MAX, LIMIT_DEFAULT = 1, 20, 5
 PHRASE_MAX = 200
@@ -139,12 +146,13 @@ def stems(text):
 
 def safe_relpath(value):
     """A clean repo-relative POSIX path, or None: never absolute, never `..`, never a
-    backslash, drive letter, empty segment or control character."""
+    backslash, drive letter, empty segment, control or format character, or any
+    separator other than the ASCII space (no line or paragraph separator, no NBSP)."""
     if not isinstance(value, str) or not value or len(value) > POINTER_MAX:
         return None
     if '\\' in value or re.match(r'[A-Za-z]:', value) or value.startswith('/'):
         return None
-    if any(unicodedata.category(ch)[0] == 'C' for ch in value):
+    if any(unicodedata.category(ch)[0] in 'CZ' and ch != ' ' for ch in value):
         return None
     if any(part in ('', '.', '..') for part in value.split('/')):
         return None
@@ -186,9 +194,12 @@ def slug(title):
 # ---------------------------------------------------------------- repository
 
 def _git(root, args):
+    # `git status` refreshes and rewrites .git/index under an optional lock, which can
+    # race the caller's own `git add`/`commit`; a read-only lookup never takes it.
+    env = dict(os.environ, GIT_OPTIONAL_LOCKS='0')
     try:
-        run = subprocess.run(['git', '-C', str(root), *args], capture_output=True, timeout=30,
-                             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        run = subprocess.run(['git', '--no-optional-locks', '-C', str(root), *args], capture_output=True,
+                             timeout=30, env=env, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return None
     return run.stdout if run.returncode == 0 else None
@@ -342,7 +353,7 @@ def first_line(docstring):
         return None
     for line in docstring.strip().split('\n'):
         if line.strip():
-            return line.strip()
+            return line.strip()[:LINE_TEXT_MAX]
     return None
 
 
@@ -414,10 +425,62 @@ def references(node, everything):
     return calls, names
 
 
+class TooComplex(ValueError):
+    """Source whose expressions could nest deeper than NESTING_MAX."""
+
+
+# Characters and keywords that can each add one level to an expression tree. Brackets
+# and displays cannot nest past the tokenizer's 200-level limit, and indentation stops
+# at 100, so long chains of these within one logical line are the only way to build a
+# very deep tree.
+NESTING = re.compile(rb'[-+*/%@&|^~.(\[]|\b(?:not|if|lambda|await|yield)\b')
+NESTING_OPS = frozenset({'+', '-', '*', '/', '//', '%', '@', '&', '|', '^', '~', '**', '<<', '>>',
+                         '.', '(', '['})
+NESTING_WORDS = frozenset({'not', 'if', 'lambda', 'await', 'yield'})
+
+
+def _deepest_logical_line(data):
+    """The most nesting-capable tokens in any one logical line, counting operators
+    inside f-strings (a single STRING token before Python 3.12)."""
+    deepest = current = 0
+    for token in tokenize.tokenize(io.BytesIO(data).readline):
+        if token.type in (tokenize.NEWLINE, tokenize.ENDMARKER):
+            deepest, current = max(deepest, current), 0
+        elif token.type == tokenize.OP and token.string in NESTING_OPS:
+            current += 1
+        elif token.type == tokenize.NAME and token.string in NESTING_WORDS:
+            current += 1
+        elif token.type == tokenize.STRING and 'f' in token.string.split('"')[0].split("'")[0].lower():
+            current += len(NESTING.findall(token.string.encode('utf-8', 'replace')))
+    return max(deepest, current)
+
+
+def parse_python(data, rel):
+    """ast.parse, refusing source that could nest deeper than NESTING_MAX.
+
+    CPython 3.10 turns a deeply nested expression (for example a 200,000-term `1+1+...`
+    in an 800 KB file) into Python objects with unchecked C recursion and crashes the
+    whole process instead of raising RecursionError, so one hostile file would kill
+    every lookup. A cheap count over the whole file clears ordinary source; only a
+    file above it is tokenized to find its deepest logical line.
+    """
+    if len(NESTING.findall(data)) > NESTING_MAX:
+        try:
+            deepest = _deepest_logical_line(data)
+        except (tokenize.TokenError, SyntaxError, UnicodeDecodeError, ValueError):
+            raise SyntaxError('cannot tokenize') from None
+        if deepest > NESTING_MAX:
+            raise TooComplex('a logical line nests more than %d levels' % NESTING_MAX)
+    return ast.parse(data, filename=rel)
+
+
 def index_python(rel, data, index, facts):
     try:
-        tree = ast.parse(data, filename=rel)
+        tree = parse_python(data, rel)
         found = list(definitions(tree.body))
+    except TooComplex:
+        index.skip('too-complex')
+        return
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         index.skip('parse-error')
         return
@@ -530,8 +593,15 @@ def link_python(index, facts):
 
 def markdown_headings(data):
     """(line, level, title, anchor, end_line, summary) for each heading outside code
-    fences, with GitHub-style anchors (duplicates get -1, -2...)."""
+    fences, with GitHub-style anchors (duplicates get -1, -2...).
+
+    Linear in the file: section ends come from one pass with a stack of open headings,
+    a heading line longer than HEADING_LINE_MAX is treated as text, and a summary is
+    looked for in at most SUMMARY_SCAN_LINES lines after its heading.
+    """
     lines = [line.rstrip('\r') for line in data.decode('utf-8-sig', 'replace').split('\n')]
+    if len(lines) > 1 and lines[-1] == '':
+        lines.pop()  # the final newline ends the last line; it does not start another
     fence = None
     found = []
     for number, line in enumerate(lines, 1):
@@ -543,10 +613,16 @@ def markdown_headings(data):
             elif token[0] == fence[0] and len(token) >= len(fence):
                 fence = None
             continue
-        if fence is None:
+        if fence is None and len(line) <= HEADING_LINE_MAX:
             heading = HEADING.match(line)
             if heading:
                 found.append((number, len(heading.group(1)), heading.group(2)))
+    ends = [len(lines)] * len(found)
+    open_headings = []
+    for position, (number, level, _) in enumerate(found):
+        while open_headings and found[open_headings[-1]][1] >= level:
+            ends[open_headings.pop()] = number - 1
+        open_headings.append(position)
     seen = {}
     result = []
     for position, (number, level, raw) in enumerate(found):
@@ -557,10 +633,10 @@ def markdown_headings(data):
         count = seen.get(base, 0)
         seen[base] = count + 1
         anchor = base if count == 0 else '%s-%d' % (base, count)
-        end = next((later - 1 for later, depth, _ in found[position + 1:] if depth <= level), len(lines))
+        end = ends[position]
         summary = None
         inside = None
-        for text in lines[number:end]:
+        for text in lines[number:min(end, number + SUMMARY_SCAN_LINES)]:
             marker = FENCE.match(text)
             if marker:
                 token = marker.group(1)
@@ -570,9 +646,10 @@ def markdown_headings(data):
                     inside = None
                 continue
             text = text.strip()
-            if inside or not text or text.startswith(('|', '<!--')) or HEADING.match(text):
+            if inside or not text or text.startswith(('|', '<!--')) or (
+                    len(text) <= HEADING_LINE_MAX and HEADING.match(text)):
                 continue
-            summary = re.sub(r'^(?:[-*+]|\d+\.|>)\s+', '', text)
+            summary = re.sub(r'^(?:[-*+]|\d+\.|>)\s+', '', text[:LINE_TEXT_MAX])
             break
         result.append((number, level, title, anchor, end, summary))
     return result
@@ -626,7 +703,10 @@ def read_graph(path, max_bytes):
 
 
 def index_graph(nodes, links, index):
-    """Add graphify code nodes as entries; every malformed item is counted and skipped."""
+    """Add graphify code nodes as entries; every malformed item is counted and skipped,
+    and so is a node whose file is not in this checkout (a graph claim about code the
+    reader cannot open is noise, or a stale or planted pointer)."""
+    present = {}
     raw = {}
     for node in nodes:
         if not isinstance(node, dict):
@@ -673,6 +753,11 @@ def index_graph(nodes, links, index):
         rel = safe_relpath(source_file)
         if rel is None:
             index.skip('graph-unsafe-path')
+            continue
+        if rel not in present:
+            present[rel] = contained_file(index.repo['root'], rel) is not None
+        if not present[rel]:
+            index.skip('graph-missing-file')
             continue
         label = node.get('label')
         if not isinstance(label, str) or len(label) > GRAPH_LABEL_MAX or not clean(label):
@@ -854,8 +939,11 @@ def resolve_pointer(repo, pointer, graph_index=None):
             if full.stat().st_size > FILE_BYTES_MAX:
                 result.update(resolved=None, reason='file-too-large')
                 return result
-            tree = ast.parse(full.read_bytes(), filename=rel)
+            tree = parse_python(full.read_bytes(), rel)
             found = {qualname: (kind, node) for qualname, kind, node in definitions(tree.body)}
+        except TooComplex:
+            result.update(resolved=None, reason='too-complex')
+            return result
         except (OSError, SyntaxError, ValueError, RecursionError, MemoryError):
             result.update(resolved=None, reason='parse-error')
             return result
@@ -1131,7 +1219,9 @@ def run(args):
     except ValueError as exc:
         return 2, '', 'ValueError: %s\n' % exc
     stderr = ''.join('warning: %s\n' % warning for warning in warnings)
-    return 0, json.dumps(payload, ensure_ascii=False, indent=2) + '\n', stderr
+    # ASCII JSON: every non-ASCII character, including the line and paragraph separators
+    # some readers treat as line breaks, travels as a \u escape.
+    return 0, json.dumps(payload, ensure_ascii=True, indent=2) + '\n', stderr
 
 
 def main(argv=None):
