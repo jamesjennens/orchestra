@@ -568,6 +568,85 @@ class AgentPrivacyTests(AgentHarness):
         self.assertNotIn('secret"', json.dumps(superuser.data))
 
 
+class AgentUpdateAtomicityTests(AgentHarness):
+    """A refused PATCH leaves the agent record exactly as it was (slice 2a item 1).
+
+    Fields used to be applied one by one, name first, so a later failure left a
+    half-applied record behind - including a rename, which also renames the owner's
+    secret file.
+    """
+
+    def setUp(self):
+        super().setUp()
+        admin = self.admin_token()
+        self.create_account(admin, 'alex', 'alex-password-1')
+        self.create_account(admin, 'blair', 'blair-password-1')
+        self.alex = self.login('alex', 'alex-password-1')[0]
+        self.blair = self.login('blair', 'blair-password-1')[0]
+        self.project = self.create_project(self.alex, 'Alpha')
+        self.ungranted = self.create_project(self.blair, 'Bravo')
+        self.agent_id, self.secret, _ = self.agent_secret(
+            self.alex, name='Kestrel', tool='Copilot', machine='desk-01', notes='pilot',
+            projects=[self.project])
+        self.agent_secret(self.alex, name='Osprey')
+
+    def record(self):
+        response = self.request('GET', '/v1/agents/%s' % self.agent_id, token=self.alex)
+        self.assertEqual(200, response.status, response.data)
+        return {k: response.data.get(k) for k in
+                ('name', 'tool', 'machine', 'notes', 'working_directory', 'projects',
+                 'enabled', 'setup_secret_file')}
+
+    def assert_refused_unchanged(self, payload, status):
+        before = self.record()
+        stored_before = json.dumps(self.service.state['agents'][self.agent_id],
+                                   sort_keys=True)
+        response = self.request('PATCH', '/v1/agents/%s' % self.agent_id, payload,
+                                token=self.alex)
+        self.assertEqual(status, response.status, response.data)
+        self.assertEqual(before, self.record())
+        self.assertEqual(stored_before,
+                         json.dumps(self.service.state['agents'][self.agent_id],
+                                    sort_keys=True))
+        # The persisted document agrees with the live record.
+        on_disk = json.loads((self.tmp_path / 'state.json').read_text(encoding='utf-8'))
+        self.assertEqual('Kestrel', on_disk['agents'][self.agent_id]['name'])
+        # The agent still works with its credential.
+        self.assertEqual(200, self.request('GET', '/v1/agents/me', token=self.secret).status)
+
+    def test_rename_with_an_ungranted_project_is_not_half_applied(self):
+        self.assert_refused_unchanged({'name': 'Kestrel Two',
+                                       'projects': [self.ungranted]}, 404)
+
+    def test_rename_with_an_overlong_working_directory_is_not_half_applied(self):
+        self.assert_refused_unchanged({'name': 'Kestrel Two', 'tool': 'Cline',
+                                       'working_directory': 'x' * 5000}, 422)
+
+    def test_rename_with_an_invalid_later_field_is_not_half_applied(self):
+        self.assert_refused_unchanged({'name': 'Kestrel Two', 'notes': 'bad\x01note'}, 422)
+
+    def test_disable_with_an_invalid_grant_revokes_nothing(self):
+        self.assert_refused_unchanged({'enabled': False, 'projects': 'not-a-list'}, 422)
+        self.assertTrue(self.service.state['agents'][self.agent_id]['enabled'])
+
+    def test_clashing_rename_changes_nothing(self):
+        self.assert_refused_unchanged({'name': 'osprey', 'tool': 'Cline'}, 409)
+
+    def test_invalid_name_changes_nothing(self):
+        self.assert_refused_unchanged({'name': '!!!', 'tool': 'Cline',
+                                       'projects': []}, 422)
+
+    def test_a_valid_change_applies_every_field_together(self):
+        response = self.request('PATCH', '/v1/agents/%s' % self.agent_id,
+                                {'name': 'Kestrel Two', 'tool': 'Cline', 'projects': []},
+                                token=self.alex)
+        self.assertEqual(200, response.status, response.data)
+        after = self.record()
+        self.assertEqual('Kestrel Two', after['name'])
+        self.assertEqual('Cline', after['tool'])
+        self.assertEqual([], after['projects'])
+
+
 class ProjectOwnerAgentTests(AgentHarness):
     """Owner decision 4: a project owner/admin sees and revokes agents in it.
 

@@ -2072,23 +2072,28 @@ class Service:
         with self.store.lock:
             self._refresh_authority(principal)
             agent = self._agent_owned(principal, agent_id)
+            # Validate every field first and apply nothing until all of them pass, so a
+            # refused change (an ungranted project, an over-long field, a clashing name)
+            # leaves the live record exactly as it was. A rename in particular must not
+            # stick on its own: it also renames the owner's secret file.
+            changes = {}
             if 'name' in payload and payload.get('name') is not None:
                 new_name = self._agent_name(payload.get('name'))
                 self._check_agent_file_name(agent['owner'], new_name, exclude_id=agent['id'])
-                agent['name'] = new_name
+                changes['name'] = new_name
             for field, limit in (('tool', AGENT_TOOL_MAX), ('machine', AGENT_MACHINE_MAX),
                                  ('notes', AGENT_NOTES_MAX),
                                  ('working_directory', AGENT_DIRECTORY_MAX)):
                 if field in payload:
-                    agent[field] = self._agent_text(payload.get(field), field, limit)
+                    changes[field] = self._agent_text(payload.get(field), field, limit)
             if 'projects' in payload:
-                agent['projects'] = self._agent_projects(principal, payload.get('projects'),
-                                                         owner_id=agent['owner'])
+                changes['projects'] = self._agent_projects(
+                    principal, payload.get('projects'), owner_id=agent['owner'])
             if 'enabled' in payload and payload.get('enabled') is not None:
-                enabled = bool(payload.get('enabled'))
-                agent['enabled'] = enabled
-                if not enabled:
-                    self._revoke_agent_credentials(agent)
+                changes['enabled'] = bool(payload.get('enabled'))
+            agent.update(changes)
+            if changes.get('enabled') is False:
+                self._revoke_agent_credentials(agent)
             self.store.save()
             return self.agent_view(agent, principal)
 
