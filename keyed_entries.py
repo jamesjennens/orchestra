@@ -62,6 +62,21 @@ ACCEPTANCE_RECORD_FIELDS = ('schema_version', 'source', 'id', 'key', 'revision',
 NATIVE_FAILURES = (ValueError, OSError, subprocess.CalledProcessError)
 
 
+def read_labelled(run, label):
+    """The rows carrying `label`, with their comments, in two native reads.
+
+    One label-filtered `bd list` (no comments), then one `bd show --include-comments`
+    when there are at most CATALOG_SHOW_MAX rows, or one `bd export --all` above that.
+    """
+    listed = json.loads(run(['list', '--label', label, '--all', '--limit', '0', '--json']) or '[]')
+    ids = [row['id'] for row in listed or [] if isinstance(row, dict) and isinstance(row.get('id'), str)]
+    if len(ids) <= CATALOG_SHOW_MAX:
+        return AnchoredKind.shown(run, ids)
+    wanted = set(ids)
+    exported = (json.loads(line) for line in run(['export', '--all']).splitlines() if line.strip())
+    return [row for row in exported if isinstance(row, dict) and row.get('id') in wanted]
+
+
 def all_missing(error):
     """bd 1.2.2 `show` fails only when every id is missing ("no issue(s) found ...")."""
     text = ' '.join(str(part) for part in (error, getattr(error, 'stderr', ''), getattr(error, 'stdout', ''))
@@ -90,7 +105,7 @@ class AnchoredKind:
     """
 
     def __init__(self, **values):
-        defaults = {'pre_write': lambda payload, run: None, 'extra_records': {}}
+        defaults = {'pre_write': lambda payload, run: None, 'extra_records': {}, 'supports_retire': False}
         defaults.update(values)
         self.__dict__.update(defaults)
         self.propose_fields = frozenset(('schema_version', 'operation_id', 'operation', 'revision',
@@ -98,6 +113,8 @@ class AnchoredKind:
         self.accept_fields = frozenset(('schema_version', 'operation_id', 'operation', 'key', 'revision',
                                         'record_sha256', 'acceptance_state', 'acceptance'))
         self.direct_fields = self.propose_fields | {'acceptance_state', 'acceptance'}
+        self.retire_fields = self.accept_fields | {'successor'}
+        self.operator_operations = OPERATOR_OPERATIONS + (('retire',) if self.supports_retire else ())
         self.spec = core.RecordSpec(
             kind=self.noun, noun=self.noun, type_labels={self.type_label}, state_labels=self.state_labels,
             revision_prefix=self.entry_prefix, acceptance_prefix=self.acceptance_prefix, journal=self.journal,
@@ -162,19 +179,12 @@ class AnchoredKind:
         return [row for row in shown if isinstance(row, dict) and row.get('id') in ids]
 
     def read_rows(self, run):
-        """The whole catalog: every labelled row with its comments, in two native reads.
+        """The whole catalog: every labelled row with its comments (`read_labelled`).
 
-        One label-filtered `bd list` (no comments), then one `bd show --include-comments`
-        when there are at most CATALOG_SHOW_MAX entries, or one `bd export --all` above
-        that. `list` and reconcile use it; `get` and the writes never do (they read by
-        key label, `read_key_rows`).
+        `list` and reconcile use it; `get` and the writes never do (they read by key
+        label, `read_key_rows`).
         """
-        ids = self.listed_ids(run, [])
-        if len(ids) <= CATALOG_SHOW_MAX:
-            return self.shown(run, ids)
-        wanted = set(ids)
-        exported = (json.loads(line) for line in run(['export', '--all']).splitlines() if line.strip())
-        return [row for row in exported if isinstance(row, dict) and row.get('id') in wanted]
+        return read_labelled(run, self.type_label)
 
     def read_key_rows(self, run, key, operation_id=None):
         """Only the rows one key can touch: its lookup label, plus this operation's request label.
@@ -270,7 +280,7 @@ class AnchoredKind:
             raise ValueError('%s payload must be an object' % self.noun)
         core.refuse_injected_labels(payload, '%s operation' % self.noun)
         operation = payload.get('operation')
-        allowed_operations = OPERATOR_OPERATIONS if operator else CONTRIBUTOR_OPERATIONS
+        allowed_operations = self.operator_operations if operator else CONTRIBUTOR_OPERATIONS
         if operation not in allowed_operations:
             raise ValueError('operation must be one of ' + ', '.join(allowed_operations))
         if not operator:
@@ -280,7 +290,7 @@ class AnchoredKind:
                                  'operator route (%s).'
                                  % (', '.join(supplied), 'is' if len(supplied) == 1 else 'are', self.apply_command))
         fields = {'propose': self.propose_fields, 'revise': self.propose_fields, 'accept': self.accept_fields,
-                  'draft': self.direct_fields}[operation]
+                  'draft': self.direct_fields, 'retire': self.retire_fields}[operation]
         core.checked_fields(payload, fields, '%s payload' % self.noun)
         if type(payload.get('schema_version')) is not int or payload['schema_version'] != 1:
             raise ValueError('schema_version must be the integer 1')
@@ -290,7 +300,13 @@ class AnchoredKind:
         if 'key' not in payload:
             raise ValueError('%s payload is missing field key' % self.noun)
         self.valid_key(payload['key'])
-        if operation == 'accept':
+        if operation == 'retire':
+            if 'successor' not in payload:
+                raise ValueError('retire needs successor, the key that replaces this one')
+            self.valid_key(payload['successor'], 'successor')
+            if payload['successor'] == payload['key']:
+                raise ValueError('a key cannot be its own successor')
+        if operation in ('accept', 'retire'):
             for name in ('revision', 'record_sha256', 'acceptance_state', 'acceptance'):
                 if name not in payload:
                     raise ValueError('%s needs %s' % (self.apply_command.split()[-1], name))
@@ -315,13 +331,18 @@ class AnchoredKind:
                     raise ValueError('%s creates revision 1; use revise for later revisions' % operation)
                 if payload.get('expected_sha256') is not None:
                     raise ValueError('%s creates a new entry, so expected_sha256 must be null' % operation)
-        if operator:
+        if operator and operation == 'retire':
+            if payload.get('acceptance_state') != 'superseded':
+                raise ValueError('retire writes a superseded revision (acceptance_state must be superseded)')
+            core.validate_acceptance_shape(payload.get('acceptance'))
+            core.bound_acceptance(dict(payload['acceptance'], record_sha256='0' * 64))
+        elif operator:
             if payload.get('acceptance_state') != 'accepted':
                 raise ValueError('%s writes an accepted revision (acceptance_state must be accepted)'
                                  % self.apply_command.split()[-1])
             core.validate_acceptance_shape(payload.get('acceptance'))
             core.bound_acceptance(dict(payload['acceptance'], record_sha256='0' * 64))
-        if operation != 'accept':
+        if operation not in ('accept', 'retire'):
             # Every content rule, including the date rules, is checked here, BEFORE the
             # anchor is created: a refusal after the create would leave an anchor with no
             # record. (An acceptance's content is the reviewed draft's; it is checked
@@ -409,9 +430,14 @@ class AnchoredKind:
         else:
             reviewed = existing.get(payload['revision'])
             if reviewed is None:
-                raise ValueError('%s %s has no revision %d to accept' % (self.title, payload['key'], payload['revision']))
+                raise ValueError('%s %s has no revision %d to %s' % (self.title, payload['key'], payload['revision'],
+                                                                     operation))
             record = {name: value for name, value in reviewed.items() if name != 'sha256'}
-            record.update(revision=payload['revision'] + 1, acceptance_state='accepted', successor=None)
+            if operation == 'retire':
+                record.update(revision=payload['revision'] + 1, acceptance_state='superseded',
+                              successor=payload['successor'])
+            else:
+                record.update(revision=payload['revision'] + 1, acceptance_state='accepted', successor=None)
             record['sha256'] = content_hash(record)
             self.validate_entry(record)
         self.write_time_rules(record)
@@ -431,7 +457,7 @@ class AnchoredKind:
         if revision in existing:
             if existing[revision] == record:
                 return   # an identical retry of a completed write
-            if operation == 'accept':
+            if operation in ('accept', 'retire'):
                 raise ValueError('Revision %d of %s is not the newest (revision %d exists); review the newest '
                                  'revision and accept that one' % (payload['revision'], payload['key'], newest))
             raise ValueError('revision %d of %s already exists with different content' % (revision, payload['key']))
@@ -439,6 +465,8 @@ class AnchoredKind:
             if newest is not None:
                 raise ValueError('%s key %s already exists; use %s revise' % (self.title, payload['key'], self.command))
             return
+        if any(item['acceptance_state'] == 'superseded' for item in existing.values()):
+            raise ValueError('%s %s is retired; propose a new key instead' % (self.title, payload['key']))
         if operation == 'revise':
             if revision != newest + 1:
                 raise ValueError('revise must write revision %d of %s (requested %d)'
@@ -460,6 +488,10 @@ class AnchoredKind:
         return core.bind_acceptance(payload['acceptance'], record)
 
     def apply_labels(self, run, task, current, payload, record):
+        if record['acceptance_state'] == 'superseded':
+            desired = {self.type_label, self.state_labels['superseded']}
+            core.apply_controlled_labels(run, task, current, self.spec, desired)
+            return
         accepted = record['acceptance_state'] == 'accepted' or self.state_labels['accepted'] in (current or [])
         desired = {self.type_label, self.state_labels['accepted' if accepted else 'draft']}
         core.apply_controlled_labels(run, task, current, self.spec, desired)
@@ -473,7 +505,7 @@ class AnchoredKind:
         return result
 
     def create_revision(self, payload):
-        if payload['operation'] == 'accept':
+        if payload['operation'] in ('accept', 'retire'):
             return payload['revision'] + 1
         return payload.get('revision', 1)
 
