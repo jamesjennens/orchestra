@@ -391,6 +391,9 @@ class EndpointDispatchTests(unittest.TestCase):
         self.assertEqual((self.locks.call_count, self.guarded), (2, ['capability', 'capability']))
         self.locks.reset_mock()
         self.guarded.clear()
+        flocked = []
+        self.locks.side_effect = lambda handle, flags: flocked.append(
+            os.fstat(handle) if isinstance(handle, int) else None)
         self.assertEqual(self.execute(['get', 'review.structured-contribution'])['state'], 'draft-only')
         self.assertEqual(self.execute(['list'])['total'], 1)
         self.assertEqual(self.execute(['find', 'reserved label guard'])['candidates'][0]['key'],
@@ -405,6 +408,8 @@ class EndpointDispatchTests(unittest.TestCase):
         self.assertLessEqual(len(telemetry), 1)
         self.assertTrue(all(call.args[1] & self.endpoint.fcntl.LOCK_NB for call in telemetry))
         self.assertEqual((self.project / '.capability-misses.lock').exists(), bool(telemetry))
+        if telemetry:   # the descriptor flocked is the miss-log lock file itself
+            self.assertTrue(os.path.samestat(flocked[-1], os.stat(self.project / '.capability-misses.lock')))
 
     def test_verify_is_a_locked_guarded_write_that_is_never_verified(self):
         payload = {k: v for k, v in entry().items() if k != 'operation'}

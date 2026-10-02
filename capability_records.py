@@ -878,7 +878,7 @@ def _exact_phrases(entry):
 
 
 def exact_index(rows, operators):
-    """{normalised phrase: [{key, trust}]}: every phrase `find` would now match exactly.
+    """{normalised phrase: [{key, trust, state}]}: every phrase `find` would now match exactly.
 
     The same rule as `find` (`_exact_phrases`), over every readable entry, accepted
     records first. `capability misses` uses it to mark the misses that now resolve.
@@ -891,7 +891,8 @@ def exact_index(rows, operators):
         for phrase in sorted(names | accepted_aliases):
             if phrase:
                 index.setdefault(phrase, []).append({'key': entry['key'],
-                                                     'trust': 'accepted' if entry['record'] else 'draft'})
+                                                     'trust': 'accepted' if entry['record'] else 'draft',
+                                                     'state': entry['state']})
     return index
 
 

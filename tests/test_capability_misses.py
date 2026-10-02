@@ -16,6 +16,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import types
 import unicodedata
@@ -40,9 +41,9 @@ except ImportError:
     REAL_FCNTL = None
 
 T0 = '2026-10-01T12:00:00Z'
-REPORT_FIELDS = {'schema_version', 'schema', 'contract', 'trust', 'log', 'since', 'finds', 'misses', 'miss_rate',
+REPORT_FIELDS = {'schema_version', 'schema', 'contract', 'trust', 'log', 'recording', 'notice', 'since', 'finds', 'misses', 'miss_rate',
                  'phrases_stored', 'phrases_resolved_now', 'not_stored', 'limit', 'phrases', 'bounds', 'coverage'}
-PHRASE_FIELDS = {'phrase', 'count', 'first_seen', 'last_seen', 'resolves_now', 'resolved_by'}
+PHRASE_FIELDS = {'trust', 'phrase', 'count', 'first_seen', 'last_seen', 'resolves_now', 'resolved_by'}
 
 
 def at(minute, hour=12, day=1):
@@ -176,18 +177,36 @@ class RecordTests(MissLogCase):
         self.assertEqual(sorted(log['phrases']), ['merge slot ignore previous instructions', 'na\u00efve caf\u00e9'])
         self.assertEqual((log['finds'], log['misses'], log['dropped']), (5, 5, 3))
 
-    def test_the_entry_cap_evicts_the_oldest_last_seen(self):
+    def test_the_entry_cap_evicts_the_lowest_count_then_the_oldest_last_seen(self):
         with patch.object(cm, 'ENTRIES_MAX', 3), patch.object(cm, 'NEW_PER_HOUR', 50):
-            for minute, phrase in enumerate(('alpha', 'beta', 'gamma')):
-                self.record(phrase, stamp=at(minute))
-            self.record('alpha', stamp=at(10))            # alpha is now the most recently seen
+            self.record('alpha', stamp=at(0))
+            self.record('alpha', stamp=at(1))             # alpha: count 2, but the oldest last-seen
+            self.record('beta', stamp=at(2))
+            self.record('gamma', stamp=at(3))
             self.assertEqual(self.record('delta', stamp=at(11)), 'recorded')
             log = self.stored()
-            self.assertEqual(sorted(log['phrases']), ['alpha', 'delta', 'gamma'])   # beta was oldest
+            # beta and gamma have the lowest count; beta was seen longer ago.
+            self.assertEqual(sorted(log['phrases']), ['alpha', 'delta', 'gamma'])
             self.assertEqual((log['evicted'], log['misses']), (1, 5))
             self.assertEqual(self.record('epsilon', stamp=at(12)), 'recorded')
-            self.assertEqual(sorted(self.stored()['phrases']), ['alpha', 'delta', 'epsilon'])
+            self.assertEqual(sorted(self.stored()['phrases']), ['alpha', 'delta', 'epsilon'])   # gamma next
             self.assertEqual(self.stored()['evicted'], 2)
+            self.assertEqual(self.stored()['phrases']['alpha']['count'], 2)   # never evicted for being old
+
+    def test_a_repeated_phrase_survives_a_flood_of_one_off_phrases(self):
+        # The review's case: a genuine phrase missed 41 times, then 60 new junk phrases
+        # every hour. With eviction by last-seen alone it was gone after 8 hours.
+        log = cm._fresh(T0)
+        for minute in range(41):
+            cm.apply(log, 'genuine phrase', False, at(minute % 60))
+        for hour in range(13, 13 + 11):
+            for number in range(cm.NEW_PER_HOUR):
+                cm.apply(log, 'junk %d %d' % (hour, number), False, at(number % 60, hour=hour % 24,
+                                                                        day=1 + hour // 24))
+        self.assertEqual(len(log['phrases']), cm.ENTRIES_MAX)
+        self.assertGreater(log['evicted'], 0)
+        self.assertEqual(log['phrases']['genuine phrase']['count'], 41)
+        self.assertTrue(cm._valid(log))
 
     def test_the_real_cap_holds(self):
         with patch.object(cm, 'NEW_PER_HOUR', 10 ** 6):
@@ -285,11 +304,58 @@ class RecordTests(MissLogCase):
         before = self.file.read_bytes()
         self.fcntl.calls.clear()
         self.fcntl.busy = True
-        with patch.object(cm.time, 'sleep', side_effect=AssertionError('waited')):
+        slept = []
+        with patch.object(cm.time, 'sleep', side_effect=slept.append):
             self.assertEqual(self.record('reserved label guard'), 'busy')
-        self.assertEqual(len(self.fcntl.calls), 1)   # one attempt, no retry
+        # A few non-blocking attempts, never more than ~10 ms of waiting in total.
+        self.assertEqual(len(self.fcntl.calls), cm.LOCK_ATTEMPTS)
+        self.assertEqual(len(slept), cm.LOCK_ATTEMPTS - 1)
+        self.assertLessEqual(sum(slept), cm.LOCK_WAIT_SECONDS)
+        self.assertTrue(all(flags & FakeFcntl.LOCK_NB for _, flags in self.fcntl.calls))
         self.assertEqual(self.file.read_bytes(), before)
         self.assertFalse((self.project / cm.TEMP_NAME).exists())
+
+    def test_a_lock_freed_during_the_retry_window_is_taken(self):
+        real = self.fcntl.flock
+        attempts = []
+
+        def flock(descriptor, flags):
+            attempts.append(flags)
+            if len(attempts) < 3:
+                raise BlockingIOError(11, 'Resource temporarily unavailable')
+            return real(descriptor, flags)
+        self.fcntl.flock = flock
+        self.assertEqual(self.record('merge slot'), 'recorded')
+        self.assertEqual(len(attempts), 3)
+
+    def test_the_retry_wait_is_bounded_in_real_time(self):
+        self.fcntl.busy = True
+        started = time.monotonic()
+        self.assertEqual(self.record('merge slot'), 'busy')
+        self.assertLess(time.monotonic() - started, 0.5)   # the bound is 10 ms; generous for slow CI
+
+    def test_the_lock_is_never_opened_through_a_symlink(self):
+        opened = []
+        real = os.open
+
+        def spy(path, flags, *rest, **kwargs):
+            opened.append((Path(path).name, flags))
+            return real(path, flags, *rest, **kwargs)
+        with patch.object(cm.os, 'open', side_effect=spy):
+            self.record('merge slot')
+            cm.clear(self.project)
+        lock_flags = [flags for name, flags in opened if name == cm.LOCK_NAME]
+        self.assertEqual(len(lock_flags), 2)
+        if hasattr(os, 'O_NOFOLLOW'):
+            self.assertTrue(all(flags & os.O_NOFOLLOW for flags in lock_flags))
+        outside = self.project / 'elsewhere.lock'
+        (self.project / cm.LOCK_NAME).unlink()
+        try:
+            (self.project / cm.LOCK_NAME).symlink_to(outside)
+        except (OSError, NotImplementedError):
+            return
+        self.assertEqual(self.record('reserved label guard'), 'error')
+        self.assertFalse(outside.exists())   # never created through the link
 
     def test_the_only_lock_is_a_non_blocking_one_on_its_own_file(self):
         (self.project / '.coordination.lock').write_text('', encoding='utf-8')
@@ -379,13 +445,31 @@ class RealLockTests(unittest.TestCase):
         REAL_FCNTL.flock(handle, REAL_FCNTL.LOCK_EX | REAL_FCNTL.LOCK_NB)   # raises if it is held
         return handle
 
+    def within(self, seconds, function, *args):
+        """function(*args) in a daemon thread; fail (never hang) if it takes too long."""
+        result, raised = [], []
+
+        def call():
+            try:
+                result.append(function(*args))
+            except BaseException as error:   # re-raised in the test thread
+                raised.append(error)
+        worker = threading.Thread(target=call, daemon=True)
+        worker.start()
+        worker.join(seconds)
+        if worker.is_alive():
+            self.fail('%s blocked for more than %s s' % (function.__name__, seconds))
+        if raised:
+            raise raised[0]
+        return result[0]
+
     def test_a_held_miss_lock_is_skipped_at_once(self):
         self.assertEqual(cm.record_find(self.project, 'merge slot', False, T0), 'recorded')
         before = (self.project / cm.FILE_NAME).read_bytes()
         holder = self.hold(cm.LOCK_NAME)
         started = time.monotonic()
-        self.assertEqual(cm.record_find(self.project, 'reserved label guard', False, T0), 'busy')
-        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(self.within(2.0, cm.record_find, self.project, 'reserved label guard', False, T0), 'busy')
+        self.assertLess(time.monotonic() - started, 0.5)
         self.assertEqual((self.project / cm.FILE_NAME).read_bytes(), before)
         holder.close()
         self.assertEqual(cm.record_find(self.project, 'reserved label guard', False, T0), 'recorded')
@@ -393,8 +477,8 @@ class RealLockTests(unittest.TestCase):
     def test_a_held_coordination_lock_does_not_stop_recording_or_reading(self):
         self.hold('.coordination.lock')   # a writer is in its critical section
         started = time.monotonic()
-        self.assertEqual(cm.record_find(self.project, 'merge slot', False, T0), 'recorded')
-        self.assertEqual(cm.report(self.project, dict)['misses'], 1)
+        self.assertEqual(self.within(2.0, cm.record_find, self.project, 'merge slot', False, T0), 'recorded')
+        self.assertEqual(self.within(2.0, cm.report, self.project, dict)['misses'], 1)
         self.assertLess(time.monotonic() - started, 1.0)
 
     def test_recording_does_not_hold_its_lock_afterwards(self):
@@ -404,14 +488,14 @@ class RealLockTests(unittest.TestCase):
     def test_reading_takes_no_lock(self):
         cm.record_find(self.project, 'merge slot', False, T0)
         self.hold(cm.LOCK_NAME)
-        self.assertEqual(cm.report(self.project, dict)['phrases'][0]['phrase'], 'merge slot')
+        self.assertEqual(self.within(2.0, cm.report, self.project, dict)['phrases'][0]['phrase'], 'merge slot')
 
     def test_clear_waits_briefly_then_refuses(self):
         cm.record_find(self.project, 'merge slot', False, T0)
         holder = self.hold(cm.LOCK_NAME)
         with patch.object(cm, 'CLEAR_WAIT_SECONDS', 0.1):
             with self.assertRaisesRegex(ValueError, 'busy'):
-                cm.clear(self.project)
+                self.within(2.0, cm.clear, self.project)
         self.assertTrue((self.project / cm.FILE_NAME).exists())
         holder.close()
         self.assertTrue(cm.clear(self.project)['cleared'])
@@ -424,9 +508,13 @@ class ReportTests(MissLogCase):
                                                    ('single integrator', False), ('x' * 100, False))):
             self.record(phrase, found, at(minute))
         before = self.file.read_bytes()
-        index = {'single integrator': [{'key': 'merge.slot', 'trust': 'accepted'}]}
+        index = {'single integrator': [{'key': 'merge.slot', 'trust': 'accepted', 'state': 'accepted'}]}
         report = cm.report(self.project, lambda: index)
         self.assertEqual(set(report), REPORT_FIELDS)
+        names = list(report)
+        self.assertEqual(names.index('notice') + 1, names.index('phrases'))   # the notice comes first
+        self.assertIn('not votes', report['notice'])
+        self.assertEqual(report['recording'], 'ok')
         self.assertEqual({name: report[name] for name in (
             'schema_version', 'schema', 'contract', 'trust', 'log', 'since', 'finds', 'misses', 'miss_rate',
             'phrases_stored', 'phrases_resolved_now', 'not_stored', 'limit', 'bounds')}, {
@@ -437,12 +525,14 @@ class ReportTests(MissLogCase):
             'bounds': {'phrases': 500, 'new_phrases_per_hour': 60, 'phrase_characters': 80}})
         # Most missed first; ties by the most recently seen.
         self.assertEqual(report['phrases'], [
-            {'phrase': 'merge slot', 'count': 2, 'first_seen': at(0), 'last_seen': at(1), 'resolves_now': False,
-             'resolved_by': []},
-            {'phrase': 'single integrator', 'count': 1, 'first_seen': at(4), 'last_seen': at(4),
-             'resolves_now': True, 'resolved_by': [{'key': 'merge.slot', 'trust': 'accepted'}]},
-            {'phrase': 'reserved label guard', 'count': 1, 'first_seen': at(2), 'last_seen': at(2),
-             'resolves_now': False, 'resolved_by': []}])
+            {'trust': 'untrusted-text', 'phrase': 'merge slot', 'count': 2, 'first_seen': at(0),
+             'last_seen': at(1), 'resolves_now': False, 'resolved_by': []},
+            {'trust': 'untrusted-text', 'phrase': 'single integrator', 'count': 1, 'first_seen': at(4),
+             'last_seen': at(4), 'resolves_now': True,
+             'resolved_by': [{'key': 'merge.slot', 'trust': 'accepted', 'state': 'accepted'}]},
+            {'trust': 'untrusted-text', 'phrase': 'reserved label guard', 'count': 1, 'first_seen': at(2),
+             'last_seen': at(2), 'resolves_now': False, 'resolved_by': []}])
+        self.assertEqual(list(report['phrases'][0])[0], 'trust')   # each row is marked before its text
         self.assertTrue(all(set(row) == PHRASE_FIELDS for row in report['phrases']))
         self.assertEqual([row['phrase'] for row in cm.report(self.project, lambda: index, 1)['phrases']],
                          ['merge slot'])
@@ -473,17 +563,76 @@ class ReportTests(MissLogCase):
 
     def test_clear(self):
         self.assertEqual(cm.clear(self.project), {'schema_version': 1, 'cleared': False, 'log': 'absent',
-                                                  'finds': None, 'misses': None, 'phrases': None})
+                                                  'finds': None, 'misses': None, 'phrases': None,
+                                                  'repaired': {}})
         self.record('merge slot')
         self.record('review workflow', found=True)
         (self.project / cm.TEMP_NAME).write_text('stale', encoding='utf-8')
         self.assertEqual(cm.clear(self.project), {'schema_version': 1, 'cleared': True, 'log': 'ok', 'finds': 2,
-                                                  'misses': 1, 'phrases': 1})
+                                                  'misses': 1, 'phrases': 1, 'repaired': {}})
         self.assertEqual(os.listdir(self.project), [cm.LOCK_NAME])
         self.assertEqual(self.record('merge slot', stamp=at(5)), 'recorded')
         self.assertEqual(self.stored()['started'], at(5))   # a new window
         self.file.write_text('{corrupt', encoding='utf-8')
         self.assertEqual(cm.clear(self.project)['cleared'], True)
+
+    def stuck(self, name, kind):
+        path = self.project / name
+        if path.exists() or path.is_symlink():
+            path.unlink()
+        if kind == 'directory':
+            path.mkdir()
+            (path / 'inside').write_text('x', encoding='utf-8')
+        else:
+            try:
+                path.symlink_to(self.project / ('target-of-' + name.strip('.')))
+            except (OSError, NotImplementedError):
+                self.skipTest('symlinks unavailable')
+
+    def test_stuck_states_are_reported_and_clear_repairs_them(self):
+        cases = ((cm.LOCK_NAME, 'directory', 'lock-unusable'), (cm.LOCK_NAME, 'symlink', 'lock-unusable'),
+                 (cm.FILE_NAME, 'directory', 'log-unwritable'), (cm.TEMP_NAME, 'directory', 'log-unwritable'))
+        for name, kind, recording in cases:
+            with self.subTest(name=name, kind=kind):
+                self.record('merge slot')
+                self.stuck(name, kind)
+                self.assertEqual(self.record('reserved label guard'), 'error')   # every recording fails
+                report = cm.report(self.project, dict)
+                self.assertEqual(report['recording'], recording)
+                cleared = cm.clear(self.project)
+                self.assertEqual(cleared['repaired'], {name: kind})
+                self.assertFalse(any(path.name.startswith('target-of') for path in self.project.iterdir()))
+                self.assertEqual(cm.report(self.project, dict)['recording'], 'ok')
+                self.assertEqual(self.record('merge slot'), 'recorded')
+                self.assertEqual(self.stored()['finds'], 1)
+                cm.clear(self.project)
+
+    def test_clear_removes_a_link_without_following_it(self):
+        target = self.project / 'precious.json'
+        target.write_text('keep me', encoding='utf-8')
+        try:
+            self.file.symlink_to(target)
+        except (OSError, NotImplementedError):
+            self.skipTest('symlinks unavailable')
+        self.assertEqual(cm.clear(self.project)['repaired'], {cm.FILE_NAME: 'symlink'})
+        self.assertEqual(target.read_text(encoding='utf-8'), 'keep me')
+        self.assertFalse(self.file.is_symlink())
+
+    @unittest.skipIf(os.name == 'nt' or (hasattr(os, 'geteuid') and os.geteuid() == 0), 'POSIX modes, not root')
+    def test_a_read_only_lock_still_works_and_an_unopenable_one_is_repaired(self):
+        self.record('merge slot')
+        lock = self.project / cm.LOCK_NAME
+        os.chmod(lock, 0o400)
+        self.assertEqual(self.record('merge slot'), 'counted')   # flock needs no write access
+        os.chmod(lock, 0)
+        self.assertEqual(self.record('merge slot'), 'error')
+        self.assertEqual(cm.report(self.project, dict)['recording'], 'lock-unusable')
+        self.assertEqual(cm.clear(self.project)['repaired'], {cm.LOCK_NAME: 'file'})
+        self.assertEqual(self.record('merge slot'), 'recorded')
+
+    def test_unsupported_platform_is_reported(self):
+        with patch.object(cm, 'fcntl', None):
+            self.assertEqual(cm.report(self.project, dict)['recording'], 'unsupported')
 
 
 class EndpointTests(MissLogCase):
@@ -637,8 +786,9 @@ class EndpointTests(MissLogCase):
         self.assertEqual(set(empty_index), REPORT_FIELDS)
         self.assertEqual((empty_index['finds'], empty_index['misses'], empty_index['miss_rate'],
                           empty_index['phrases_resolved_now']), (5, 5, 1.0, 0))
-        self.assertEqual(empty_index['phrases'][0], {'phrase': 'merge slot', 'count': 2, 'first_seen': T0,
-                                                     'last_seen': T0, 'resolves_now': False, 'resolved_by': []})
+        self.assertEqual(empty_index['phrases'][0], {'trust': 'untrusted-text', 'phrase': 'merge slot', 'count': 2,
+                                                     'first_seen': T0, 'last_seen': T0, 'resolves_now': False,
+                                                     'resolved_by': []})
         # The index improves: an accepted record with an alias, and a draft with a matching name.
         self.accept('merge.slot', 'Merge slot', ['single integrator'], 'a1')
         self.propose('guard.reserved-labels', 'Reserved label guard', 'p1')
@@ -652,9 +802,10 @@ class EndpointTests(MissLogCase):
         self.assertTrue(all(call[0] in ('list', 'show', 'export') for call in self.native.calls), self.native.calls)
         marks = {row['phrase']: (row['resolves_now'], row['resolved_by']) for row in report['phrases']}
         self.assertEqual(marks, {
-            'merge slot': (True, [{'key': 'merge.slot', 'trust': 'accepted'}]),
-            'single integrator': (True, [{'key': 'merge.slot', 'trust': 'accepted'}]),
-            'reserved label guard': (True, [{'key': 'guard.reserved-labels', 'trust': 'draft'}]),
+            'merge slot': (True, [{'key': 'merge.slot', 'trust': 'accepted', 'state': 'accepted'}]),
+            'single integrator': (True, [{'key': 'merge.slot', 'trust': 'accepted', 'state': 'accepted'}]),
+            'reserved label guard': (True, [{'key': 'guard.reserved-labels', 'trust': 'draft',
+                                             'state': 'draft-only'}]),
             'review loop': (False, [])})
         self.assertEqual((report['phrases_resolved_now'], report['limit'], report['misses']), (3, 10, 5))
         # The flag is `find`'s own exact rule: it agrees with a find made now.
@@ -664,6 +815,20 @@ class EndpointTests(MissLogCase):
         self.assertEqual(self.file.read_bytes(), before)   # checking recorded nothing
         self.assertEqual(self.reply(['misses', '--limit', '0'])['returncode'], 2)
         self.assertEqual(self.reply(['misses', 'extra'])['returncode'], 2)
+
+    def test_a_retired_key_is_marked_superseded(self):
+        self.assertFalse(self.execute(['find', 'old slot'])['found'])
+        self.accept('old.slot', 'Old slot', [], 'a1')
+        self.accept('new.slot', 'New slot', [], 'a2')
+        row, _ = cr.anchor_for(cr.read_rows(self.native), 'old.slot')
+        self.native.actor = OPERATOR
+        cr.apply_native({'schema_version': 1, 'operation_id': 'retire-1', 'operation': 'retire', 'key': 'old.slot',
+                         'revision': 1, 'record_sha256': cr.existing_revisions(row)[1]['sha256'],
+                         'successor': 'new.slot', 'acceptance_state': 'superseded', 'acceptance': acceptance()},
+                        OPERATOR, self.native, self.project, operator=True, operators=[OPERATOR])
+        row = self.execute(['misses'])['phrases'][0]
+        self.assertEqual((row['phrase'], row['resolves_now']), ('old slot', True))
+        self.assertEqual([(item['key'], item['state']) for item in row['resolved_by']], [('old.slot', 'superseded')])
 
     def test_misses_on_an_empty_log_reads_no_records(self):
         report = self.execute(['misses'])
@@ -702,7 +867,7 @@ class OperatorClearTests(MissLogCase):
         self.record('review workflow', found=True)
         self.assertEqual(self.admin('capability-misses-clear', 'trial'),
                          {'schema_version': 1, 'project': 'trial', 'cleared': True, 'log': 'ok', 'finds': 2,
-                          'misses': 1, 'phrases': 1})
+                          'misses': 1, 'phrases': 1, 'repaired': {}})
         self.assertFalse(self.file.exists())
         self.assertEqual(self.admin('capability-misses-clear', 'trial')['cleared'], False)
         self.assertEqual(sorted(os.listdir(self.project)), ['.beads', cm.LOCK_NAME])
