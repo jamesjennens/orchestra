@@ -806,9 +806,10 @@ class ClientRoutingTests(unittest.TestCase):
         self.assertIn('--config', err)
 
     def test_every_existing_command_is_routed_as_before(self):
-        self.assertEqual(client.CAPABILITY_ENDPOINT[:6],
-                         ('find', 'get', 'list', 'propose', 'revise', 'propose-alias'))
-        self.assertEqual(client.CAPABILITY_ENDPOINT[6:], ('misses',))
+        # Main's endpoint subcommands (kittrial-5bb.67 and .69), unchanged, then `misses`.
+        self.assertEqual(client.CAPABILITY_ENDPOINT[:-1],
+                         ('find', 'get', 'list', 'propose', 'revise', 'propose-alias', 'verify'))
+        self.assertEqual(client.CAPABILITY_ENDPOINT[-1], 'misses')
         expected = (
             (('capability', 'find', 'merge slot'), ('capability', ['find', 'merge slot'], None)),
             (('capability', 'find', 'merge slot', '--limit', '3'),

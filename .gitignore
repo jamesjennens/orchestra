@@ -9,3 +9,5 @@ client.*.private.json
 .merge-context.json
 *.coordination.json
 *.cursor.json
+# Optional graphify output read by `capability lookup`; generated, never committed.
+graphify-out/

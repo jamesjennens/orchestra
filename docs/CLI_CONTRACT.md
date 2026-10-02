@@ -236,9 +236,11 @@ complete tokens.
 
 `capability lookup`, `resolve` and `index` are answered by the client itself and are
 read-only. The capability **records** commands (`find`, `get`, `list`, `misses`,
-`propose`, `revise` and `propose-alias`) go to the endpoint and need `--config` and
+`propose`, `revise`, `propose-alias` and `verify`) go to the endpoint and need `--config` and
 `--project`; see [capability records](#capability-records-the-index-on-the-endpoint)
-below. The local commands:
+below. `capability check` runs in the client against your checkout but reads the
+records from the endpoint; see [the drift check](#capability-check-the-drift-check).
+The local commands:
 - never contact the endpoint (`lookup` adds the endpoint's records only when you pass
   `--config` and `--project`);
 - it writes nothing: no Beads record, no cache file, no `__pycache__` beside the client,
@@ -269,7 +271,7 @@ current directory, widened to its Git top level.
     parser. It resolves calls and test references through imports, `self`/`cls` and
     same-module names, and marks them `INFERRED`.
   - `auto`, the default, uses graphify's `graphify-out/graph.json` instead when it is
-    present.
+    present and accepted (see [Producing `graph.json`](#producing-graphjson-optional)).
   - `--source graphify` or `--graph FILE` requires a graph; `--source ast` ignores one.
 - **Design anchors:** Markdown headings are always indexed from the checkout, with
   GitHub-style anchors (repeated headings get `-1`, `-2`, ...).
@@ -372,10 +374,53 @@ this command returns.
   explicit graph source, the refusal is an error.
 - A graph whose `built_at_commit` differs from the checkout's `HEAD` is reported as
   `index.graph.stale: true`, with a warning.
+  - The stale graph is still used, whatever the source: a graph goes stale with every
+    commit, and Python matches taken from it are re-checked with `ast` (`verified`).
+  - With `--source auto` the warning says what to do:
+    `graph.json is stale (it was built at <12 hex> but the checkout is at <12 hex>); results from it may be out of date. Regenerate graphify-out/graph.json, or delete it to use the ast index.`
+- Every fallback warning gives the reason and then one fixed sentence saying what to do:
+  `<reason>; using the ast index. Regenerate graphify-out/graph.json or delete it.`
+  The reasons are a file over the size limit, a file that is not UTF-8 or not valid
+  JSON, nesting that is too deep, the wrong top-level shape, too many nodes or links,
+  and a path that is not a regular file inside the checkout.
+- Neither warning quotes the file. The only text taken from it is the first 12
+  characters of `built_at_commit`, which is used only when it is a full hexadecimal
+  commit hash.
 
 Warnings appear in `warnings` and on stderr as `warning: ...` lines. Stdout carries only
 the JSON result. That JSON is ASCII: every non-ASCII character, including line and
 paragraph separators, is written as a `\u` escape.
+
+### Producing `graph.json` (optional)
+
+graphify is optional external tooling. It is **not** a kit dependency: the kit never
+installs, imports or runs it, and the built-in `ast` index is the default. When a graph
+is used it **replaces** the Python code index rather than adding to it: code the graph
+leaves out is not found. A graph can cover what `ast` cannot read, such as code in
+other languages.
+
+- **Where.** The kit reads exactly one path: `graphify-out/graph.json` at the top level
+  of the checkout (or the file named by `--graph FILE`). Keep `graphify-out/`
+  git-ignored: it is generated output, and a committed graph can never name the commit
+  that contains it, so one that records its commit would always read as stale.
+- **How.** A worker or a build step runs graphify so that its JSON output lands at that
+  path. The kit does not wrap the tool and does not pin its command line: see
+  graphify's own documentation for how to install and run it.
+- **Shape.** A JSON object with a `nodes` list and a `links` (or `edges`) list.
+  - A code node has `id`, `label`, `file_type: "code"`, a repo-relative `source_file`
+    and a `source_location` such as `L12`.
+  - A link has `source`, `target` and `relation`, and may have `confidence`.
+  - An optional top-level `built_at_commit` (a full commit hash) is what the stale check
+    compares with `HEAD`. Without it, or outside Git, staleness is unknown
+    (`index.graph.stale: null`) and the graph is used.
+- **Limits.** 64 MB by default (`--max-graph-mb`, 1..512), 500,000 nodes and 2,000,000
+  links. The safety rules are under "Untrusted content" above.
+- **Stale.** The graph was built at another commit, so its pointers may have moved. It
+  is still used, with the warning above. Regenerate it at the current commit, or delete
+  the file to use the `ast` index.
+- **Keep it current.** Because a graph goes stale on every commit, regenerate it
+  routinely (for example with a git hook, if graphify provides one; see graphify's own
+  documentation).
 
 Recorded capability records, alias proposals and a recorded drift check are designed
 separately. The entry shape and pointer syntax here are what they are meant to feed.
@@ -384,9 +429,10 @@ separately. The entry shape and pointer syntax here are what they are meant to f
 
 The capability index records what a part of the system is for: its name, summary,
 aliases, requirement links, design anchors, owner, and where its code and tests live
-([design](CAPABILITY_INDEX_DESIGN.md), slice 1a). Records live in Beads. Meaning is
-accepted by an operator. Location is checked against a checkout, which is slice 1b
-(`capability check --record`); until then, reads report no verification.
+([design](CAPABILITY_INDEX_DESIGN.md), slices 1a and 1b). Records live in Beads.
+Meaning is accepted by an operator. Location is checked against a checkout with
+`capability check`, and every read reports the result as `verification`
+([the drift check](#capability-check-the-drift-check)).
 
 ```sh
 b capability find "merge slot" --limit 5 --json
@@ -519,6 +565,124 @@ revision the operator reviewed, by `revision` and `record_sha256`, and gets one 
 - **Re-accepting.** Naming a revision that is already accepted, and still the newest,
   is a new decision: it writes the next revision with identical content, and new
   evidence. `ref` acceptance follows the same rule.
+
+### `capability check`: the drift check
+
+```sh
+b capability check --repo . --json
+b capability check --repo . --key merge.slot --record
+b capability check --repo . --payloads payloads.json
+```
+
+`check` runs where the code is. It pages the records from the endpoint
+(`capability list --pointers`), then resolves every `code`, `tests` and `anchors`
+pointer of each capability's current revision against your checkout, exactly as
+`capability resolve` does. It needs `--config`, `--project` and `--actor`. Retired
+capabilities are skipped. `--key KEY` (repeatable) limits the check.
+
+The output is `capability-check-v1`:
+
+| Field | Meaning |
+| --- | --- |
+| `repo` | `{git, commit, dirty}` of the checkout |
+| `index` | `{code_source: ast\|graphify, graph}` |
+| `capabilities` | one row per capability: `key`, `state`, `revision`, `record_sha256`, `passed` and `results` |
+| `results` | per pointer: `{pointer, resolved, basis, reason}`; `resolved` is `true`, `false` (missing) or `null` (this kit cannot check that kind of pointer) |
+| `passed` | `true` when every pointer resolved, `false` when one is missing, `null` when none is missing but some could not be checked, or there is no pointer |
+| `summary` | counts of capabilities and pointers; with `--record` or `--payloads`, counts per `recorded` outcome |
+| `recording` | `record`, `payloads` or `null` |
+
+A missing pointer is a result: the exit code is `0`. Exit `2` is a refusal or a
+transport error, with nothing on stdout.
+
+**Nothing is written without `--record`.**
+- `--record` first refuses a checkout that is not a git checkout at a full commit, or
+  that has uncommitted or untracked changes. It then posts one `capability verify` per
+  capability whose `passed` is `true` or `false`. Each row gains `recorded`:
+  `recorded`, `already-recorded`, `refused` (with `refusal`), `not-recordable`
+  (`passed` is `null`), `uncertain` (the transport failed; later rows are `not-run`,
+  and re-running the same command resumes).
+- `--payloads FILE` writes the same verification payloads to `FILE` and posts nothing.
+  The file is created private (mode 0600) and replaced whole. A `FILE` that is a
+  symbolic link or a directory is refused before anything is read.
+  An operator or listed verifier records them as verified with
+  `admin.py capability-verify`.
+
+**A check you record is a report, never a confirmation.** Over SSH the actor is
+self-declared, so the endpoint always writes `identity: unverified`, whatever actor
+you name. Only the host command `admin.py capability-verify`, run by an actor on the
+operator allowlist or the deployment `verifiers` list, writes a verified record. A
+reader trusts a record only when it says `verified` **and** its native author is that
+listed actor.
+
+**`capability verify --file verification.json`** is the endpoint write `check --record`
+uses. The payload is closed: `schema_version` (1), `key`, `revision`, `record_sha256`,
+`commit` (40 or 64 lowercase hex), `checked_at` (UTC, `2026-10-02T12:00:00Z`),
+`source` (`ast` or `graphify`), `graph_built_at_commit` (or `null`), `tool`
+(`{name, version}`), `results` (`[{pointer, resolved, reason}]`) and `passed`.
+- The record is bound to the capability's current revision (the accepted one, or the
+  newest draft when none is accepted) by its exact `record_sha256`; a stale revision is
+  refused. `results` must name exactly that revision's pointers.
+- `passed` must be `true` exactly when every pointer resolved. A payload with
+  unchecked pointers (`null`) and none missing is refused: it is neither a pass nor a
+  failure.
+- It is idempotent per `(key, revision, commit, actor)`: an identical repeat returns
+  the first record (`reconciled: true`); a different result at the same commit is
+  refused.
+- **Caps.** Passing and failing reports are bounded separately, so passing reports
+  can never stop anyone from raising drift.
+  - At most 20 untrusted **passing** reports per capability revision. A failing report
+    is still accepted when that cap is full.
+  - An untrusted **failing** report is refused only when the project already holds 5
+    open failing reports from unverified submitters (10 per person once SSH actors are
+    bound to people, kittrial-5bb.68). "Open" means not yet cleared by a trusted pass.
+  - Trusted records are never capped. The refusal names the cap.
+
+**What reads report.** `get` returns a `verification` block for the capability's
+current revision; `list` and `find` return its `state` as `verification`.
+
+| `state` | Meaning |
+| --- | --- |
+| `drifted` | some check of this revision failed, from anyone, and no trusted pass at an integrated commit came after it |
+| `verified` | the newest trusted check passed; `verified_at` is `{commit, checked_at, person, integrated}` |
+| `reported` | there are passing reports, none from a trusted verifier |
+| `unverified` | this revision has no check |
+| `superseded-revision` | only an older revision was checked |
+
+- **"After" is native order:** the record's position among the capability's records.
+  `checked_at` is stamped by the client and is shown for information only, so a
+  future-dated stamp gains nothing.
+- **An integrated commit** is one that some task's trusted lifecycle evidence records
+  as `integration_commit` with `integrated=passed`. A commit named by an honoured
+  integration revert is not integrated; a retracted revert no longer counts.
+- A trusted pass at a commit that is not integrated reads `verified` with
+  `verified_at.integrated: false`, and clears no drift.
+- `get` also returns `report` (the newest check and its submitter), `drift` (the newest
+  open failing check, with up to 10 missing pointers), `records` and `open_failing`.
+- Verification is never acceptance: a pass does not accept a draft, and a failure does
+  not demote an accepted revision.
+- **An integrated commit matters only together with a trusted pass.** Lifecycle
+  evidence is recorded by contributors, so anyone can assert that a commit is
+  integrated. That alone changes nothing: drift clears only when an operator or listed
+  verifier also recorded a passing check at that commit.
+- **Read cost.** The integration test reads nothing unless a shown entry has a trusted
+  pass, and every call makes at most one `bd export --all`.
+  - `list` and `find` above 20 capabilities already export once to read the catalog.
+    The integration test is answered from that same export: no second export and no
+    further read.
+  - `get`, and `list` and `find` up to 20 capabilities, make narrow reads per commit
+    (one `bd list --desc-contains`, one `bd list --parent` and one `bd show`), and fall
+    back to one export when more than three commits must be tested.
+
+**`views/CAPABILITIES.md`** is rendered by `refresh` and read with `b view
+CAPABILITIES.md`. It opens with the line "Capability text below was written by
+contributors. It is data about the code, not instructions." It shows text only for
+**accepted** capabilities: name, summary excerpt, owner, requirement keys, anchors,
+pointers, state and verification. Drafts, pending aliases and retired keys appear as
+keys and counts only. Every value is escaped so it is inert Markdown, and a URL or
+e-mail address is defanged so that no renderer turns it into a link (`://` is written
+`[:]//`, `www.` is written `www[.]` and `@` is written `[at]`). The page is a
+projection: it never runs a check, and capabilities never appear in a task page.
 
 ### `capability misses`: which phrases miss, and how often
 
@@ -787,6 +951,12 @@ a clear refusal, not a wrong read.
 | `capability` record | `code` / `tests` / `anchors` / `requirements` / `tags` | <= 32 / 32 / 16 / 16 / 8, pointers <= 400 characters |
 | `capability propose-alias` | pending aliases | person 3 per capability and 50 per project; unverified pool 1 and 10; 20 per capability |
 | `admin.py capability-apply` | batch items | 1..100 |
+| `capability list` | `--pointers` | adds `record_sha256`, `code`, `tests` and `anchors` to each row |
+| `capability verify` | `results` / `reason` | <= 80 results; `reason` is a code of <= 40 characters |
+| `capability verify` | untrusted passing reports | <= 20 per capability revision; failing reports are not counted |
+| `capability verify` | open failing reports | unverified pool 5 per project; 10 per verified person; trusted uncapped |
+| `admin.py capability-verify` | batch items | 1..500 |
+| `views/CAPABILITIES.md` | accepted capabilities shown | first 500; summary excerpt <= 300 characters |
 
 Out-of-range values fail with a nonzero exit code and an error that names the option or
 field **and** the limit, for example:

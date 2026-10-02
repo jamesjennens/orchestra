@@ -17,10 +17,12 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -32,6 +34,64 @@ from test_http_review_fixes import CONTRIBUTION, EndpointCase
 from test_http_service import (BASE, BUNDLE, COMMIT, Response, ServerHarness, unique_dir)
 
 WEB = DEFAULT_WEB_ROOT
+
+# One bound for every test that runs the browser modules under Node. The work itself
+# takes well under a second; the bound only has to cover starting Node and loading an
+# ES module on a cold hosted runner (first launch of node.exe on a fresh Windows
+# machine, with antivirus scanning and a cold disk cache, has exceeded the former 60
+# seconds once in CI). 120 seconds is double the bound that proved too tight and still
+# far below the job limit, so a Node that really hangs is reported within two minutes.
+NODE_SUBPROCESS_TIMEOUT_SECONDS = 120
+
+
+def run_node_module(case, node, script, *args):
+    """Run ``script`` as an ES module under ``node`` and return the completed process.
+
+    A timeout says nothing about the module under test, so it is reported as a failure
+    of the environment, by name, rather than as a ``TimeoutExpired`` traceback. It is a
+    failure and not a skip: with Node installed these checks are expected to run, and a
+    skip would let a run pass without them.
+    """
+    try:
+        return subprocess.run([node, '--input-type=module', '-e', script, *args],
+                              capture_output=True, text=True,
+                              timeout=NODE_SUBPROCESS_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as error:
+        partial = error.stderr
+    # Raised outside the handler so the report is this message alone, not a chained
+    # ``TimeoutExpired`` traceback that reads like a crash in the test.
+    case.fail('environment timeout, not a product failure: the Node subprocess timed out '
+              'after %d seconds on this runner before the module under test reported a '
+              'result (node: %s; stderr so far: %r)'
+              % (NODE_SUBPROCESS_TIMEOUT_SECONDS, node, partial))
+
+
+class NodeSubprocessTimeoutCase(unittest.TestCase):
+    """The helper itself, without Node: one bound, and a timeout named as the runner's."""
+
+    def test_every_node_run_uses_the_one_bound(self):
+        source = Path(__file__).read_text(encoding='utf-8')
+        self.assertEqual(1, source.count('subprocess.' + 'run('))
+        self.assertGreaterEqual(NODE_SUBPROCESS_TIMEOUT_SECONDS, 120)
+        done = subprocess.CompletedProcess(['node'], 0, '{}', '')
+        with mock.patch('subprocess.run', return_value=done) as run:
+            self.assertIs(done, run_node_module(self, 'node', 'x', 'file:///m.js', 'arg'))
+        run.assert_called_once_with(['node', '--input-type=module', '-e', 'x', 'file:///m.js', 'arg'],
+                                    capture_output=True, text=True,
+                                    timeout=NODE_SUBPROCESS_TIMEOUT_SECONDS)
+
+    def test_a_timeout_is_reported_as_the_environment(self):
+        expired = subprocess.TimeoutExpired(['node'], NODE_SUBPROCESS_TIMEOUT_SECONDS,
+                                            stderr='partial')
+        with mock.patch('subprocess.run', side_effect=expired):
+            with self.assertRaises(self.failureException) as raised:
+                run_node_module(self, 'node', 'x')
+        message = str(raised.exception)
+        self.assertIn('environment timeout, not a product failure', message)
+        self.assertIn('Node subprocess timed out after %d seconds on this runner'
+                      % NODE_SUBPROCESS_TIMEOUT_SECONDS, message)
+        self.assertIn('partial', message)
+        self.assertIsNone(raised.exception.__context__)
 
 
 class StaticHarness(ServerHarness):
@@ -987,13 +1047,10 @@ class RouteTableCase(unittest.TestCase):
         node = shutil.which('node')
         if not node:
             self.skipTest('node is not installed; the Python checks above still apply')
-        import subprocess
         script = ("import(process.argv[1]).then((r) => console.log(JSON.stringify(["
                   "r.matchRoute('/p/kittrial/t/kittrial-5bb.20'), r.projectOf('/p/a.b/reviews'),"
                   "r.matchRoute('/p/x/t/../y')])))")
-        out = subprocess.run([node, '--input-type=module', '-e', script,
-                              self.ROUTES_JS.as_uri()], capture_output=True, text=True,
-                             timeout=60)
+        out = run_node_module(self, node, script, self.ROUTES_JS.as_uri())
         self.assertEqual(0, out.returncode, out.stderr)
         task, project, bad = json.loads(out.stdout)
         self.assertEqual({'name': 'task', 'params': {'pid': 'kittrial',
@@ -1686,12 +1743,10 @@ class AgentSetupDialogCase(unittest.TestCase):
         node = shutil.which('node')
         if not node:
             self.skipTest('node is not installed; the JS slug is compared where it is')
-        import subprocess
         script = ("const m = await import(process.argv[1]);"
                   "console.log(JSON.stringify(JSON.parse(process.argv[2]).map((n) => "
                   "[m.slug(n), m.secretFile(n)])))")
-        out = subprocess.run([node, '--input-type=module', '-e', script, self.SETUP_JS.as_uri(),
-                              json.dumps(names)], capture_output=True, text=True, timeout=60)
+        out = run_node_module(self, node, script, self.SETUP_JS.as_uri(), json.dumps(names))
         self.assertEqual(0, out.returncode, out.stderr)
         for name, (slug, file) in zip(names, json.loads(out.stdout)):
             server = agent_secret_file(name)
@@ -1739,7 +1794,6 @@ class AgentSetupDialogCase(unittest.TestCase):
         node = shutil.which('node')
         if not node:
             self.skipTest('node is not installed; the static checks above still apply')
-        import subprocess
         script = r"""
 const m = await import(process.argv[1]);
 const created = { agent: { id: 'agent_1', name: 'Kestrel', owner_display_name: 'Olive',
@@ -1776,8 +1830,7 @@ console.log(JSON.stringify({
            m.gitignoreAppend('x\n.orchestra/\n'), m.gitignoreAppend('.orchestra-old\n')],
 }));
 """
-        out = subprocess.run([node, '--input-type=module', '-e', script, self.SETUP_JS.as_uri()],
-                             capture_output=True, text=True, timeout=60)
+        out = run_node_module(self, node, script, self.SETUP_JS.as_uri())
         self.assertEqual(0, out.returncode, out.stderr)
         result = json.loads(out.stdout)
         self.assertEqual(0, result['leaks'])

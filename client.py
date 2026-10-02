@@ -148,10 +148,11 @@ def request(config,project,actor,args,action='bd',path=None):
     try:return json.loads(p.stdout)
     except json.JSONDecodeError:raise RuntimeError('Invalid endpoint response; inspect state before retrying.') from None
 
-# Capability subcommands answered by the coordination endpoint (.60 slice 1a, and the
-# lookup-miss log `misses`, kittrial-5bb.77); lookup, resolve and index stay in the
-# client and never need a config.
-CAPABILITY_ENDPOINT = ('find', 'get', 'list', 'propose', 'revise', 'propose-alias', 'misses')
+# Capability subcommands answered by the coordination endpoint (.60 slices 1a/1b, and the
+# lookup-miss log `misses`, kittrial-5bb.77); lookup, resolve and index stay in the client
+# and never need a config. `check` runs in the client too, but reads the records (and
+# with --record posts `verify`) through the endpoint.
+CAPABILITY_ENDPOINT = ('find', 'get', 'list', 'propose', 'revise', 'propose-alias', 'verify', 'misses')
 
 def _capabilities_module():
     """capabilities.py from this client's own directory, loaded by path, or None.
@@ -258,6 +259,181 @@ def _capability_lookup(args,config,project,actor,out):
     payload['records_coverage'] = found.get('coverage')
     return _emit(0,json.dumps(payload,ensure_ascii=True,indent=2)+'\n',stderr,out)
 
+def _capability_check(args,config,project,actor,out):
+    """`capability check --repo PATH [--key KEY]... [--record | --payloads FILE]` (.60 section 5.1).
+
+    Runs where the code is. The recorded capabilities are paged from the endpoint
+    (`capability list --pointers`), and every `code`, `tests` and `anchors` pointer of
+    each one's current revision is resolved against the caller's checkout with the
+    local resolver. Output is `capability-check-v1`; a missing pointer is a result, not
+    an error. Nothing is written without `--record`.
+
+    `--record` posts one `capability verify` per capability. It first refuses a checkout
+    that is not at a full commit or has uncommitted or untracked changes. That refusal
+    is a convenience only: what a reader concludes rests on who wrote the record, and a
+    record posted here is always an unverified report. `--payloads FILE` writes the
+    same payloads to a file and posts nothing, for `admin.py capability-verify`.
+    """
+    module = _capabilities_module()
+    if module is None:
+        return _capability(['lookup'],out)
+    if any(token in ('--help','-h') for token in args):
+        return _emit(0,json.dumps({'schema_version':1,'contract':module.CONTRACT_VERSION,'command':'capability check',
+            'usage':'capability check [--repo PATH] [--key KEY]... [--source auto|ast|graphify] [--graph FILE] '
+                    '[--max-graph-mb N] [--record | --payloads FILE]',
+            'notes':['Needs --config, --project and --actor: the records are read from the endpoint.',
+                     'Nothing is written without --record. A check recorded here is an unverified report; '
+                     'an operator or listed verifier records a verified one with admin.py capability-verify '
+                     'from a --payloads file.'],
+            'output':{'schema':'capability-check-v1'},
+            'exit_codes':{'0':'result or help JSON on stdout (a missing pointer is a result)',
+                          '2':'validation/transport error on stderr; stdout is not written'}},indent=2)+'\n','',out)
+    try:
+        parser = module._Parser(prog='capability check',add_help=False)
+        parser.add_argument('--repo',default='.');parser.add_argument('--key',action='append',default=[])
+        parser.add_argument('--source',default='auto');parser.add_argument('--graph')
+        parser.add_argument('--max-graph-mb',type=int,default=module.GRAPH_MB_DEFAULT)
+        parser.add_argument('--record',action='store_true');parser.add_argument('--payloads')
+        parser.add_argument('--json',action='store_true')
+        options = parser.parse_args(args)
+        if options.record and options.payloads:
+            raise ValueError('use --record or --payloads FILE, not both')
+        if options.payloads and (Path(options.payloads).is_symlink() or Path(options.payloads).is_dir()):
+            raise ValueError('--payloads: refusing to write through a symbolic link or onto a directory')
+        repo = module.open_repo(options.repo)
+        writing = options.record or options.payloads
+        if writing:
+            status = module._git(repo['root'],['status','--porcelain']) if repo['commit'] else None
+            if not repo['git'] or not repo['commit'] or status is None:
+                raise ValueError('a check is recorded only from a git checkout at a full commit')
+            if status.strip():
+                raise ValueError('a check is recorded only from a clean checkout: commit or remove the '
+                                 'uncommitted and untracked changes first')
+        items = [];offset = 0
+        while offset is not None:
+            result = request(config,project,actor,['list','--state','all','--limit','100','--offset',str(offset),
+                                                    '--pointers'],'capability')
+            if result['returncode']:
+                raise ValueError('capability records unavailable: %s'
+                                 % ((result.get('stderr') or '').strip().splitlines() or ['endpoint refused'])[-1][:300])
+            page = json.loads(result['stdout'])
+            items.extend(page.get('items') or []);offset = page.get('next_offset')
+        if any('record_sha256' not in item for item in items):
+            raise ValueError('the endpoint kit does not support capability check (it predates capability '
+                             'list --pointers)')
+        unknown = sorted(set(options.key)-{item['key'] for item in items})
+        if unknown:
+            raise ValueError('unknown capability key(s): %s' % ', '.join(unknown[:5]))
+        chosen = [item for item in items if item['state'] in ('accepted','draft-only')
+                  and (not options.key or item['key'] in options.key)]
+        source = 'graphify' if options.graph is not None and options.source == 'auto' else options.source
+
+        def resolve_all():
+            pointers = [pointer for item in chosen for name in ('code','tests','anchors') for pointer in item[name]]
+            needs_graph = any(module.split_pointer(pointer)[1] == '::'
+                              and not module.split_pointer(pointer)[0].endswith('.py') for pointer in pointers)
+            available = source == 'graphify' or module.contained_file(repo['root'],module.DEFAULT_GRAPH) is not None
+            index = module.build_index(repo,source,options.graph,options.max_graph_mb) \
+                if needs_graph and source != 'ast' and available else None
+            checked = []
+            for item in chosen:
+                results = []
+                for pointer in dict.fromkeys(item['code']+item['tests']+item['anchors']):
+                    row = module.resolve_pointer(repo,pointer,index)
+                    results.append({'pointer':pointer,'resolved':row['resolved'],'basis':row['basis'],
+                                    'reason':row['reason']})
+                values = [row['resolved'] for row in results]
+                passed = False if False in values else (True if values and all(v is True for v in values) else None)
+                checked.append({'key':item['key'],'state':item['state'],'revision':item['revision'],
+                                'record_sha256':item['record_sha256'],'passed':passed,'results':results})
+            return checked,index
+        module._reset_parse_state()
+        try:
+            checked,index = module.with_parse_stack(resolve_all)
+        finally:
+            module._reset_parse_state()
+    except ValueError as error:
+        sys.stderr.write('ValueError: %s\n' % error);return 2
+    graphed = index is not None and index.code_source == 'graphify'
+    stamp = __import__('time').strftime('%Y-%m-%dT%H:%M:%SZ',__import__('time').gmtime())
+    payloads = {}
+    if writing:
+        for row in checked:
+            if row['passed'] is None:
+                row['recorded'] = 'not-recordable'
+                continue
+            built = (index.graph or {}).get('built_at_commit') if graphed else None
+            payloads[row['key']] = {
+                'schema_version':1,'key':row['key'],'revision':row['revision'],'record_sha256':row['record_sha256'],
+                'commit':repo['commit'],'checked_at':stamp,'source':'graphify' if graphed else 'ast',
+                'graph_built_at_commit':built if isinstance(built,str) and re.fullmatch(r'[0-9a-f]{7,64}',built) else None,
+                'tool':{'name':'orchestra-capability-check','version':str(report(Path(__file__).resolve().parent,'client')['version'])[:40]},
+                'results':[{'pointer':r['pointer'],'resolved':r['resolved'],'reason':r['reason']} for r in row['results']],
+                'passed':row['passed']}
+    warnings = list(index.warnings) if index is not None else []
+    if options.payloads:
+        # Written to a new private (0600) file beside the target and moved into place, so
+        # the write never follows a link and never leaves a half-written or shared file.
+        import os,tempfile
+        target = Path(options.payloads)
+        try:
+            if target.is_symlink():
+                raise OSError('refusing to write through a symbolic link')
+            handle,name = tempfile.mkstemp(prefix='.'+target.name+'.',suffix='.tmp',dir=str(target.parent or '.'))
+            try:
+                with os.fdopen(handle,'w',encoding='utf-8',newline='') as stream:
+                    stream.write(json.dumps({'schema_version':1,'items':list(payloads.values())},ensure_ascii=True,indent=2)+'\n')
+                os.replace(name,str(target))
+            except BaseException:
+                try:os.unlink(name)
+                except OSError:pass
+                raise
+        except OSError as error:
+            sys.stderr.write('ValueError: --payloads: %s\n' % error);return 2
+        for row in checked:
+            row.setdefault('recorded','payload-written')
+    elif options.record:
+        import os,tempfile
+        stopped = None
+        for row in checked:
+            if row['key'] not in payloads:continue
+            if stopped:
+                row['recorded'] = 'not-run';continue
+            handle,name = tempfile.mkstemp(suffix='.json')
+            try:
+                with os.fdopen(handle,'w',encoding='utf-8',newline='') as target:
+                    target.write(json.dumps(payloads[row['key']]))
+                result = request(config,project,actor,['verify','--file',name],'capability')
+                if result['returncode']:
+                    row['recorded'] = 'refused'
+                    row['refusal'] = ((result.get('stderr') or '').strip().splitlines() or ['endpoint refused'])[-1][:300]
+                else:
+                    answer = json.loads(result['stdout'])
+                    row['recorded'] = 'already-recorded' if answer.get('reconciled') else 'recorded'
+                    row['identity'] = answer.get('identity')
+            except (RuntimeError,ValueError,OSError) as error:
+                row['recorded'] = 'uncertain';stopped = str(error)[:300]
+            finally:
+                try:os.unlink(name)
+                except OSError:pass
+        if stopped:
+            warnings.append('recording stopped: %s; re-run the same command to resume' % stopped)
+    flat = [r['resolved'] for row in checked for r in row['results']]
+    summary = {'capabilities':len(checked),'passed':sum(1 for row in checked if row['passed'] is True),
+               'failed':sum(1 for row in checked if row['passed'] is False),
+               'unknown':sum(1 for row in checked if row['passed'] is None),
+               'pointers':{'resolved':flat.count(True),'missing':flat.count(False),'unknown':flat.count(None)}}
+    if writing:
+        summary['recorded'] = {name:sum(1 for row in checked if row.get('recorded') == name)
+                               for name in sorted({row.get('recorded') for row in checked if row.get('recorded')})}
+    payload = {'schema':'capability-check-v1','contract':module.CONTRACT_VERSION,'trust':module.TRUST,
+               'repo':{'git':repo['git'],'commit':repo['commit'],'dirty':repo['dirty']},
+               'index':{'code_source':'graphify' if graphed else 'ast','graph':index.graph if index is not None else None},
+               'capabilities':checked,'summary':summary,'recording':'record' if options.record else
+               ('payloads' if options.payloads else None),'warnings':warnings}
+    return _emit(0,json.dumps(payload,ensure_ascii=True,indent=2)+'\n',
+                 ''.join('warning: %s\n' % warning for warning in warnings),out)
+
 def main():
     p=argparse.ArgumentParser();p.add_argument('--version',action='store_true')
     p.add_argument('--config');p.add_argument('--project');p.add_argument('--actor')
@@ -270,6 +446,11 @@ def main():
     if args[:1]==['capability'] and not (len(args)>1 and args[1] in CAPABILITY_ENDPOINT):
         if len(args)>1 and args[1]=='lookup' and a.config and a.project:
             return _capability_lookup(args[2:],json.loads(Path(a.config).read_text()),a.project,a.actor,a.out)
+        if len(args)>1 and args[1]=='check':
+            if (not a.config or not a.project) and not any(token in ('--help','-h') for token in args):
+                p.error('the following arguments are required: --config, --project')
+            return _capability_check(args[2:],json.loads(Path(a.config).read_text()) if a.config else None,
+                                     a.project,a.actor,a.out)
         return _capability(args[1:],a.out)
     if not a.config or not a.project:
         p.error('the following arguments are required: --config, --project')

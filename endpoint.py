@@ -16,7 +16,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from admin import environment,project_dir,root_path,operators as configured_operators
+from admin import environment,project_dir,root_path,operators as configured_operators,verifiers as configured_verifiers
 import native
 from render import render
 from lifecycle import apply_native
@@ -207,11 +207,13 @@ def execute(root,request,authority_config=None,require_authority=False):
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
     if action=='capability':
-        # The capability index (.60 slice 1a, kittrial-5bb.67). get, list, find and help
-        # are reads (one label-filtered bd list plus bd show; no lock, not run_guarded);
-        # misses is a read of the lookup-miss log (capability_misses), which find feeds;
-        # propose, revise and propose-alias are writes, under the lock and the journal.
-        # lookup, resolve and index never reach the endpoint: they run in the client.
+        # The capability index (.60 slices 1a and 1b, kittrial-5bb.67/.69). get, list, find
+        # and help are reads (one label-filtered bd list plus bd show; no lock, not
+        # run_guarded); misses is a read of the lookup-miss log (capability_misses, kittrial-
+        # 5bb.77), which find feeds; propose, revise, propose-alias and verify are writes,
+        # under the lock and the journal. lookup, resolve, index and check run in the client.
+        # A verification written here is always `unverified`; the deployment verifiers list
+        # only decides how host-written (`admin.py capability-verify`) records are read.
         import capability_records
         args=request.get('args',[])
         if not isinstance(args,list) or any(not isinstance(x,str) or '\0' in x for x in args):raise ValueError('Expected argument list')
@@ -228,9 +230,10 @@ def execute(root,request,authority_config=None,require_authority=False):
                 # phrases are untrusted text.
                 import capability_misses
                 limit=capability_misses.options(args[1:])['limit']
-                result=capability_misses.report(path,lambda:capability_records.exact_index(capability_records.read_rows(run),configured_operators(root)),limit)
+                result=capability_misses.report(path,lambda:capability_records.exact_index(capability_records.read_catalog(run)[0],configured_operators(root)),limit)
                 return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=True)+'\n','stderr':''.join(run_warnings)}
-            result=capability_records.read(args,run,configured_operators(root))
+            result=capability_records.read(args,run,configured_operators(root),
+                                           verifiers=configured_verifiers(root),journal=path)
             if args[:1]==['find'] and isinstance(result,dict) and isinstance(result.get('found'),bool):
                 # Telemetry (kittrial-5bb.77): count the find and, with no exact match, its
                 # normalised phrase. Its own non-blocking lock file, never .coordination.lock;
@@ -243,7 +246,8 @@ def execute(root,request,authority_config=None,require_authority=False):
         operators=configured_operators(root)
         runner=NativeRunner(run)
         def capability_effect():
-            result=capability_records.write(args,request.get('attachments',{}),actor,runner,path,operators)
+            result=capability_records.write(args,request.get('attachments',{}),actor,runner,path,operators,
+                                            verifiers=configured_verifiers(root))
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
@@ -312,7 +316,7 @@ def execute(root,request,authority_config=None,require_authority=False):
             p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','export','--all'],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
             if p.returncode:return {'returncode':p.returncode,'stdout':p.stdout,'stderr':p.stderr}
             rows=[json.loads(line) for line in p.stdout.splitlines() if line.strip()]
-            return {'returncode':0,'stdout':json.dumps(render(rows,path/'views',configured_operators(root)))+'\n','stderr':p.stderr}
+            return {'returncode':0,'stdout':json.dumps(render(rows,path/'views',configured_operators(root),configured_verifiers(root)))+'\n','stderr':p.stderr}
     if action!='bd':raise ValueError('Unknown action')
     args=request.get('args',[])
     if not isinstance(args,list) or not args or any(not isinstance(a,str) or '\0' in a for a in args):raise ValueError('Expected argument list')
