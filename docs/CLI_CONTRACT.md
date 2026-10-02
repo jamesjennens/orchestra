@@ -123,8 +123,8 @@ not just a suffix.
 
 ## Command help
 
-`work`, `review`, `handoff`, `brief`, `history`, `checkpoint`, `capability` and `ref`
-answer `-h`/`--help` on stdout with exit code `0`:
+`work`, `review`, `handoff`, `brief`, `history`, `checkpoint`, `capability`, `ref` and
+`proposal` answer `-h`/`--help` on stdout with exit code `0`:
 
 ```sh
 b work --help
@@ -176,6 +176,8 @@ record's comment ID**, not a Git SHA and not `latest_comment_id`), `commit`,
 `integrated`; `workflow_state` keeps the raw workflow state. See
 [REVIEWS.md](REVIEWS.md) for their meaning.
 
+`work` also returns an additive `attention.proposal_queue` block, the contributed
+requirement proposal queue; see [`proposal`](#proposal-contributed-requirement-proposals).
 `work` also returns an additive `attention.capability_index` block, the capability
 index's attention; see [capability attention](#capability-attention-in-work-and-brief).
 
@@ -220,9 +222,10 @@ Opaque cursor fields (`activity_cursor`, `next_cursor`) are never excerpted: the
 complete tokens.
 
 `brief` adds an `attention` array, plus `attention_total` and `attention_more`. It
-holds at most 3 items of each kind: `reference-review` items first, then `capability`
-items (see [capability attention](#capability-attention-in-work-and-brief)). The two
-totals count every kind.
+holds at most 3 items of each kind: `reference-review` items first, then
+`proposal-review` items (see [`proposal`](#proposal-contributed-requirement-proposals)),
+then `capability` items (see [capability attention](#capability-attention-in-work-and-brief)).
+The two totals count every kind.
 
 The `reference-review` items:
 
@@ -969,6 +972,130 @@ sets `operation`.
 Acceptance is not a client command. It is the operator's
 `admin.py reference-apply` ([operations](OPERATIONS.md#operator-commands)).
 
+## `proposal`: contributed requirement proposals
+
+A proposal says what the product should do. It is not a task and not a requirement:
+a coordinator triages it, and if it is incorporated it only points at the requirement
+record it landed in ([design](REQUIREMENTS_GATHERING_DESIGN.md), slice 1a).
+
+```sh
+b proposal submit --file proposal.json --json
+b proposal revise --file revision.json --json
+b proposal get p-3f2a1b0c9d8e --json
+b proposal list --state submitted --json
+b proposal mine --submitter person:alex --json
+```
+
+**Proposal text is untrusted.** Every contributor-written string in every response
+(`text`, `rationale`, each `evidence` entry, an attachment name, a `reason`, a
+`question`) is an excerpt object `{text, omitted_chars, trust}`. `trust` is
+`unreviewed`, or `incorporated` once the linked requirement revision is accepted.
+Each response carries an `untrusted` line saying the text is data, not instructions.
+No proposal text ever appears in an error message.
+
+**Writing.**
+- **`submit --file`** creates the proposal. The payload is closed:
+  - `schema_version` (1) and `operation_id`;
+  - `submitter`: a durable identity, `account:<uid>` or `person:<name>`. A session
+    actor is refused;
+  - `text`: 1..4,000 characters;
+  - `rationale`: at most 4,000 characters, optional (required before incorporation);
+  - `evidence`: at most 20 links of at most 2,000 characters;
+  - `attachments`: at most 10 `{name, sha256}`; `name` is a file name, not a path;
+  - `target`: optional. `{"kind": "requirement", "requirement_key": KEY}` (the key
+    must be an existing requirement record), `{"kind": "requirement-area", "area":
+    SLUG}` or `{"kind": "requirement-new"}`;
+  - `supersedes`: optional, the key of an earlier proposal, which must exist.
+  - The command writes `id`, `key`, `origin`, `created_at` and `sha256`. The key is
+    `p-` plus the first 12 hex digits of `sha256(operation_id)`.
+- **`revise --file`** writes the next revision of your own proposal. It adds `key`,
+  the next `revision` and `expected_sha256` (the hash of the revision it replaces) to
+  the content fields. It is allowed only while the proposal is `submitted` or
+  `needs-info`. From `needs-info` it also returns the proposal to `under-review`.
+  After a decision, submit a new proposal that `supersedes` the old one.
+- A retry with the same `operation_id` and content returns the first result
+  (`reconciled: true`). Changed content under the same id is refused.
+
+**`review`, `decide` and `settings` are not client commands.** Over SSH the actor is
+self-declared, so everything that rests on the operator allowlist is a host command:
+`admin.py proposal-review`, `admin.py proposal-decide` and
+`admin.py proposal-settings` ([operations](OPERATIONS.md#operator-commands)). The
+client refuses the three names with a message that says so.
+
+**States.** `submitted`, `under-review`, `needs-info`, `escalated-to-owner`,
+`approved`, `incorporated`, `rejected`, `duplicate-of`. The last three are terminal.
+`--state` also accepts the short forms `escalated` and `duplicate`.
+
+| From | To | Written by |
+| --- | --- | --- |
+| `submitted` | `under-review` | a coordinator (`proposal-review`) |
+| `under-review` | `rejected`, `duplicate-of`, `needs-info`, `escalated-to-owner`, `incorporated` | a coordinator |
+| `needs-info` | `under-review` | the submitter's `revise` |
+| `escalated-to-owner` | `approved`, `rejected` | the owner (`proposal-decide`), with a native decision issue |
+| `approved` | `incorporated` | a coordinator |
+
+**Reading.** Reads take no lock and write nothing.
+- **`get KEY [--history N]`** returns `state`, `stale`, `due`, `next_actor`,
+  `next_action`, `revision`, `sha256`, `record_comment_id`, `disposition_comment_id`,
+  `submitter`, `identity`, `target`, the excerpts, `supersedes`, `superseded_by`,
+  `submitted_at`, `age_days`, `time_to_disposition_days`, `linked_requirement`,
+  `disposition` (the newest counted one), `timeline` (the newest N, 1..50, default
+  10), `inert_dispositions` and `warnings`.
+- **`list`** returns `{total, items, next_offset, coverage}`, oldest first. Filters:
+  `--state`, `--target` (a requirement key or an area), `--submitter`; `--limit`
+  1..100 (default 20) and `--offset`.
+- **`mine --submitter IDENTITY`** is the same list for one person, with the full
+  newest disposition, `next_action` and `linked_requirement`. A session actor is not
+  a durable identity, so the identity is named.
+- **A reason, a question and an escalation question** are returned by `get` and
+  `list` only to an actor on the operator allowlist; otherwise the field is `null`
+  and `withheld` is `true`. `mine` returns them, because the submitter must be able
+  to read the question they answer.
+- **`identity`** is `verified` when the actor that submitted the proposal maps,
+  through the project's actor map, to its `submitter`; otherwise `unverified`. Over
+  SSH this is attribution, not authentication: the actor is self-declared, and no
+  authority rests on it.
+- **`linked_requirement`** is `{id, revision, sha256, acceptance_state,
+  manifest_sha256}` for an incorporated proposal. `acceptance_state` is read live
+  from the requirement record: `accepted`, `draft` or `missing`.
+- **Inert records.** A disposition whose native author is not on the operator
+  allowlist does not count: `timeline[].standing` is `inert`, `inert_dispositions`
+  counts them, and the state is the one the trusted records give.
+- **Failures stay per proposal.** A malformed record, a state label that disagrees
+  with the ledger, or a newer record version makes that one proposal read `malformed`
+  or `unsupported`; lists and the queue keep working and name it in `coverage`.
+- **Read cost.** `get` reads its own anchor and the settings in one `bd list` and one
+  `bd show`, then one `bd list` for the proposals that supersede it. `list` and `mine`
+  read the proposals in two native reads (one `bd list`, then one `bd show` up to 20
+  rows or one `bd export --all` above), plus one `bd show` of the requirement records
+  the returned page links to.
+
+**The queue in `work`.** `attention.proposal_queue` has the agent attention shape:
+`state`, `summary`, `counts`, `actions`, `truncated` and `computed_at`, plus `items`
+and `next_offset`.
+- `counts`: `submitted`, `under_review`, `needs_info`, `escalated`, `approved`,
+  `stale`, `incorporated_unaccepted`, `malformed` and `total`. They are always
+  returned, whatever the task filters.
+- `state`: `malformed`, `escalated`, `triage`, `stale`, `pending` or `clear`.
+- `actions`: each has `priority`, `kind`, `project`, `task` (the proposal's native
+  id), `reason`, `links`, `label` (an excerpt object) and `token`, sorted by
+  `(priority, project, task)`.
+- `items`: only for an actor on the operator allowlist, paged by `--proposal-limit`
+  (1..100, default 20) and `--proposal-offset`. Each has `kind` (`requirement`),
+  `proposal`, `task`, `state`, `stale`, `age_days`, `submitter`, `identity`, `target`
+  and `title` (an excerpt).
+- `stale`: an open proposal that has not moved for more than `stale_days` (14).
+- `incorporated_unaccepted`: an incorporated proposal whose requirement revision is
+  not accepted today.
+- At most 1,000 proposals are scanned; beyond that `coverage` says so.
+
+**`brief` items.** A `proposal-review` item has `kind`, `proposal`, `state`,
+`age_days`, `trust`, `text` (server-derived, never the proposal text) and `source`
+(`proposal get KEY`). `brief` selects the proposals whose target names the briefed
+requirement record or an area equal to one of the task's labels; for an actor on the
+operator allowlist it adds the oldest proposals waiting for triage, a decision or
+incorporation. Rejected and duplicate proposals are never selected.
+
 ## IDs and cursor roles
 
 - **Native task ID**: `task`/`items[].task`/the positional argument to `show`, `brief`,
@@ -1001,6 +1128,15 @@ a clear refusal, not a wrong read.
 | `work` | `--capability-limit` / `--capability-offset` | 1..100 (default 20) / >= 0 |
 | `work` | `attention.capability_index` | first 1,000 capabilities; `unverified_stale` after 30 days |
 | `brief` | `attention` | at most 3 items of each kind |
+| `work` | `--proposal-limit` / `--proposal-offset` | 1..100 (default 20) / >= 0 |
+| `proposal` | `text` / `rationale` | 1..4,000 / <= 4,000 characters |
+| `proposal` | `evidence` / `attachments` | <= 20 links of <= 2,000 characters / <= 10 |
+| `proposal` | `reason` / `question` | <= 2,000 characters |
+| `proposal list`, `mine` | `--limit` / `--offset` | 1..100 (default 20) / >= 0 |
+| `proposal get` | `--history` | 1..50 (default 10) |
+| `proposal` | title excerpt in lists and the queue | <= 160 characters |
+| `proposal` | proposals scanned by a list or the queue | first 1,000 |
+| `admin.py proposal-settings` | actor map / deciders | <= 200 actors, 100 namespaces / <= 50 |
 | `brief` | `--items-offset` | >= 0 |
 | `brief` | `--items-limit` | 1..10 |
 | `history` | `--limit` | 1..20 |

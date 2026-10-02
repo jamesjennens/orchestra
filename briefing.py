@@ -156,7 +156,7 @@ def clip(value,limit):
     value=str(value or '')
     return {'text':value[:limit],'omitted_chars':max(0,len(value)-limit)}
 
-def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifiers=None):
+def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifiers=None,actor=None):
     if type(offset) is not int or offset<BRIEF_ITEM_OFFSET_MIN or type(limit) is not int or not BRIEF_ITEM_LIMIT_MIN<=limit<=BRIEF_ITEM_LIMIT_MAX:
         raise ValueError('Invalid unresolved-item page: --items-offset must be >= %d and --items-limit must be %d..%d' % (BRIEF_ITEM_OFFSET_MIN,BRIEF_ITEM_LIMIT_MIN,BRIEF_ITEM_LIMIT_MAX))
     issue=task_row(rows,task);current,invalid=checkpoints(issue)
@@ -196,6 +196,13 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     # server-derived text only; it never touches the checkpoint item vocabulary.
     from reference_records import brief_attention
     attention=brief_attention(rows,issue,operators)
+    # Contributed requirement proposals (.58 5.2): up to 3 more items of their own kind,
+    # after the reference items; the totals count both kinds.
+    from proposal_records import brief_attention as proposal_attention
+    proposals=proposal_attention(rows,issue,actor,operators,project=journal)
+    attention={'attention':attention['attention']+proposals['attention'],
+               'attention_total':attention['attention_total']+proposals['attention_total'],
+               'attention_more':((attention['attention_more'] or 0)+(proposals['attention_more'] or 0)) or None}
     # Capability index (.60 section 8, kittrial-5bb.76): up to 3 more items of their own
     # kind, after the other kinds; the totals count every kind.
     from capability_records import brief_attention as capability_attention
@@ -307,12 +314,14 @@ def format_brief(result):
               'Lifecycle scope: '+json.dumps(result['lifecycle_scope'],ensure_ascii=False),'Current activity cursor: '+result['activity_cursor'],
               'Evidence: '+json.dumps(result['evidence'],ensure_ascii=False),*result['warnings']]
     for item in result.get('attention') or []:
-        if item.get('kind')=='capability':
+        if item.get('kind')=='proposal-review':
+            lines.append('Proposal review [%s, %s]: %s (%s)'%(item['state'],item['trust'],item['text'],item['source']))
+        elif item.get('kind')=='capability':
             lines.append('Capability [%s, %s]: %s (%s)'%(item['verification'],item['trust'],item['text'],item['source']))
         else:
             lines.append('Reference review [%s, %s]: %s (%s)'%(item['due'],item['trust'],item['text'],item['source']))
     if result.get('attention_more'):
-        lines.append('More attention: %d (ref list --due expired; capability list)'%result['attention_more'])
+        lines.append('More attention: %d (ref list --due expired; proposal list; capability list)'%result['attention_more'])
     return '\n'.join(lines)+'\n'
 
 def help_limits(action):
@@ -334,9 +343,11 @@ def help_notes(action):
         return ['Unresolved items come from the latest valid checkpoint; a missing checkpoint means unknown, not zero.',
                 '--limit/--offset are not brief options; use --items-limit/--items-offset.',
                 'attention lists at most 3 reference-review items (entries tagged with the task\'s labels, '
-                'then expired and due-soon), expired first, then at most 3 capability items (accepted '
-                'capabilities tagged with one of the task\'s labels, drifted first), each with trust; '
-                'attention_total and attention_more count every kind. Reading changes nothing.']
+                'then expired and due-soon), expired first, then at most 3 proposal-review items (proposals '
+                'that target this requirement record or one of the task\'s area labels, then, for an operator, '
+                'the oldest waiting ones), then at most 3 capability items (accepted capabilities tagged with '
+                'one of the task\'s labels, drifted first), each with trust; attention_total and '
+                'attention_more count every kind. Reading changes nothing.']
     if action=='history':
         return ['Pages are snapshot-bound; pass next_cursor back to continue the same snapshot.']
     return ['A JSON file attachment is required; payload.task must equal TASK.',
@@ -375,7 +386,7 @@ def execute(root,path,project,actor,action,args,attachments,run,operators=None,v
         rows=[json.loads(x) for x in run(['export','--all']).splitlines() if x.strip()]
         if action=='brief':
             result=brief(rows,project,a.task,a.items_offset,a.items_limit,operators=operators,journal=path,
-                         verifiers=verifiers)
+                         verifiers=verifiers,actor=actor)
             return json.dumps(result,ensure_ascii=False,indent=2)+'\n' if a.json else format_brief(result)
         data=snapshot(rows,project,a.task);digest=content_hash(data);cache.mkdir(exist_ok=True)
         file=cache/(digest+'.json')

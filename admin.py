@@ -2350,13 +2350,24 @@ def main():
     a.add_argument('project')
     a=sub.add_parser('reference-apply',help='accept a reference catalog entry (operator allowlist, F3 evidence)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
-    for name in ('reference-reconcile','capability-reconcile','record-reconcile'):
+    a=sub.add_parser('proposal-review',help='record a coordinator disposition on a requirement proposal (operator allowlist)')
+    a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('proposal-decide',help='record the owner decision on an escalated requirement proposal (operator allowlist)')
+    a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('proposal-settings',help='read or change the contribution settings: the actor map and the owner deciders (operator allowlist)')
+    a.add_argument('project');a.add_argument('--actor',required=True)
+    a.add_argument('--map-actor',dest='map_actor',metavar='ACTOR',help='map a session actor to a person, with --to')
+    a.add_argument('--namespace',metavar='NAME',help='map a session name (and NAME/..., NAME-...) to a person, with --to')
+    a.add_argument('--to',metavar='IDENTITY',help='account:<uid> or person:<name>')
+    a.add_argument('--unmap-actor',dest='unmap_actor',metavar='ACTOR');a.add_argument('--unmap-namespace',dest='unmap_namespace',metavar='NAME')
+    a.add_argument('--add-decider',dest='add_decider',metavar='IDENTITY');a.add_argument('--remove-decider',dest='remove_decider',metavar='IDENTITY')
+    for name in ('reference-reconcile','capability-reconcile','proposal-reconcile','record-reconcile'):
         a=sub.add_parser(name);a.add_argument('project');a.add_argument('--operation-id',required=True)
         a.add_argument('--actor',required=True);a.add_argument('--reason',required=True)
         a.add_argument('--disposition',choices=['failed','released','complete'],default='released')
         a.add_argument('--issue-id',dest='issue_id',default=None,
                        help='with --disposition complete, the exact native record to confirm')
-        if name=='record-reconcile':a.add_argument('--kind',choices=['requirement','reference','capability'],required=True)
+        if name=='record-reconcile':a.add_argument('--kind',choices=['requirement','reference','capability','proposal'],required=True)
     a=sub.add_parser('void-record');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('revert-record');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('operators');a.add_argument('action',choices=['list','add','remove']);a.add_argument('actor',nargs='?')
@@ -2570,11 +2581,32 @@ def main():
                 yield
         print(json.dumps(capability_verification.verify_batch(payload,args.actor,run,operators=authority,
                                                               verifiers=listed,journal=path,lock=held)))
-    elif args.command in ('reference-reconcile','capability-reconcile','record-reconcile'):
+    elif args.command in ('proposal-review','proposal-decide','proposal-settings'):
+        # Requirement proposals (.58 slice 1a, kittrial-5bb.68). Everything that rests on
+        # the operator allowlist is a host command, because over SSH the actor is
+        # self-declared: the allowlist is read strictly here and checked before any read.
         import fcntl
-        kind={'reference-reconcile':'reference','capability-reconcile':'capability'}.get(args.command) or args.kind
+        import proposal_records
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        authority=operators(root,strict=True)
+        def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            if args.command=='proposal-settings':
+                changes={name:getattr(args,name) for name in proposal_records.SETTINGS_CHANGES}
+                result=proposal_records.change_settings(changes,args.actor,run,operators=authority)
+            else:
+                payload=json.loads(Path(args.file).read_text(encoding='utf-8-sig'))
+                result=proposal_records.dispose(payload,args.actor,run,path,operators=authority,
+                                                route='decide' if args.command=='proposal-decide' else 'review')
+        print(json.dumps(result))
+    elif args.command in ('reference-reconcile','capability-reconcile','proposal-reconcile','record-reconcile'):
+        import fcntl
+        kind={'reference-reconcile':'reference','capability-reconcile':'capability','proposal-reconcile':'proposal'}.get(args.command) or args.kind
         if kind=='reference':from reference_records import reconcile as record_reconcile
         elif kind=='capability':from capability_records import reconcile as record_reconcile
+        elif kind=='proposal':from proposal_records import reconcile as record_reconcile
         else:from requirement_records import reconcile as record_reconcile
         path=project_dir(root,args.project)
         if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')

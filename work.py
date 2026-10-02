@@ -25,7 +25,7 @@ HELP_TOKENS = ('-h', '--help')
 VALUE_OPTIONS = {'--owner', '--state', '--limit', '--offset', '--handoff-limit',
                  '--handoff-offset', '--file', '-f', '--items-offset', '--items-limit',
                  '--since', '--cursor', '--body-budget', '--ref-limit', '--ref-offset',
-                 '--capability-limit', '--capability-offset'}
+                 '--proposal-limit', '--proposal-offset', '--capability-limit', '--capability-offset'}
 
 def help_requested(args):
     """True when args ask for help; side-effect free for every command."""
@@ -59,6 +59,8 @@ def help_payload(action='work'):
             'handoff-offset': '>= %d' % WORK_OFFSET_MIN,
             'ref-limit': '%d..%d' % (WORK_LIMIT_MIN, WORK_LIMIT_MAX),
             'ref-offset': '>= %d' % WORK_OFFSET_MIN,
+            'proposal-limit': '%d..%d' % (WORK_LIMIT_MIN, WORK_LIMIT_MAX),
+            'proposal-offset': '>= %d' % WORK_OFFSET_MIN,
             'capability-limit': '%d..%d' % (WORK_LIMIT_MIN, WORK_LIMIT_MAX),
             'capability-offset': '>= %d' % WORK_OFFSET_MIN,
         }
@@ -68,7 +70,12 @@ def help_payload(action='work'):
                          'due_soon, unset = draft-only entries, acceptance_inert, malformed, total), always; '
                          'items only for an approver (an actor on the deployment operator allowlist), '
                          'paged by --ref-limit/--ref-offset; task filters never hide it. '
-                         'attention.capability_index: the capability index in the agent attention shape '
+                         'attention.proposal_queue: the contributed requirement proposal queue, in the agent '
+                         'attention shape (state, summary, counts, actions, truncated, computed_at) plus items '
+                         'and next_offset; counts always, items only for an actor on the deployment operator '
+                         'allowlist, paged by --proposal-limit/--proposal-offset; proposal text appears only as '
+                         'a bounded excerpt with trust. '
+                         'attention.capability_index:the capability index in the agent attention shape '
                          '(state, summary, counts, actions, truncated, computed_at) plus items and next_offset; '
                          'counts (drifted, reported_only, unverified_stale, alias_pending, draft_pending, '
                          'malformed, total) always, items only for an actor on the deployment operator '
@@ -113,6 +120,8 @@ def help_options(action):
             {'flag': '--handoff-offset N', 'description': 'pending handoff offset >= %d (default 0)' % WORK_OFFSET_MIN},
             {'flag': '--ref-limit N', 'description': 'reference attention items per page %d..%d (default 20)' % (WORK_LIMIT_MIN, WORK_LIMIT_MAX)},
             {'flag': '--ref-offset N', 'description': 'reference attention offset >= %d (default 0)' % WORK_OFFSET_MIN},
+            {'flag': '--proposal-limit N', 'description': 'proposal queue items per page %d..%d (default 20)' % (WORK_LIMIT_MIN, WORK_LIMIT_MAX)},
+            {'flag': '--proposal-offset N', 'description': 'proposal queue offset >= %d (default 0)' % WORK_OFFSET_MIN},
             {'flag': '--capability-limit N', 'description': 'capability attention items per page %d..%d (default 20)' % (WORK_LIMIT_MIN, WORK_LIMIT_MAX)},
             {'flag': '--capability-offset N', 'description': 'capability attention offset >= %d (default 0)' % WORK_OFFSET_MIN},
             *common,
@@ -187,12 +196,16 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
     parser.add_argument('--limit',type=int,default=20);parser.add_argument('--offset',type=int,default=0)
     parser.add_argument('--handoff-limit',type=int,default=20);parser.add_argument('--handoff-offset',type=int,default=0)
     parser.add_argument('--ref-limit',type=int,default=20);parser.add_argument('--ref-offset',type=int,default=0)
+    parser.add_argument('--proposal-limit',type=int,default=20);parser.add_argument('--proposal-offset',type=int,default=0)
     parser.add_argument('--capability-limit',type=int,default=20);parser.add_argument('--capability-offset',type=int,default=0)
     parser.add_argument('--json',action='store_true')  # output is always JSON; accepted for consistency
     a=parser.parse_args(args)
     if not WORK_LIMIT_MIN<=a.limit<=WORK_LIMIT_MAX or a.offset<WORK_OFFSET_MIN or not WORK_LIMIT_MIN<=a.handoff_limit<=WORK_LIMIT_MAX or a.handoff_offset<WORK_OFFSET_MIN:
         raise ValueError('Invalid work page: --limit and --handoff-limit must be %d..%d; '
                          '--offset and --handoff-offset must be >= %d' % (WORK_LIMIT_MIN,WORK_LIMIT_MAX,WORK_OFFSET_MIN))
+    if not WORK_LIMIT_MIN<=a.proposal_limit<=WORK_LIMIT_MAX or a.proposal_offset<WORK_OFFSET_MIN:
+        raise ValueError('Invalid work page: --proposal-limit must be %d..%d and --proposal-offset >= %d'
+                         % (WORK_LIMIT_MIN,WORK_LIMIT_MAX,WORK_OFFSET_MIN))
     if not WORK_LIMIT_MIN<=a.capability_limit<=WORK_LIMIT_MAX or a.capability_offset<WORK_OFFSET_MIN:
         raise ValueError('Invalid work page: --capability-limit must be %d..%d and --capability-offset >= %d'
                          % (WORK_LIMIT_MIN,WORK_LIMIT_MAX,WORK_OFFSET_MIN))
@@ -284,6 +297,12 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         from reference_records import work_attention
         result['attention']={'reference_review':work_attention(rows,actor,operators,limit=a.ref_limit,
                                                                offset=a.ref_offset)}
+        # The contributed requirement proposal queue (.58 5.1, kittrial-5bb.68): also
+        # project-wide, from the same export, and one bad proposal never fails the queue.
+        from proposal_records import work_attention as proposal_attention
+        result['attention']['proposal_queue']=proposal_attention(
+            rows,actor,operators,journal.name if journal is not None else '',project=journal,
+            limit=a.proposal_limit,offset=a.proposal_offset)
         # The capability index (.60 section 8, kittrial-5bb.76): also project-wide and
         # from the same export, trust derivation included; one bad entry never fails it.
         from capability_records import work_attention as capability_attention
