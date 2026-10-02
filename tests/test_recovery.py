@@ -389,6 +389,22 @@ class ReviewRecoveryTests(unittest.TestCase):
     def test_record_kind_prefix_matches_the_owning_module(self):
         self.assertEqual(recovery.KIND_PREFIXES['contribution-review'], w.PREFIX)
 
+    def test_keyed_kind_prefixes_match_the_reserved_record_kinds(self):
+        # kittrial-5bb.74: recovery repeats the keyed prefixes, which reserved_comments
+        # reserves; the proposal kinds (kittrial-5bb.68) are not void targets yet.
+        import reserved_comments as r
+        self.assertEqual(recovery.KEYED_KIND_PREFIXES, {
+            'reference-entry': r.REFERENCE_ENTRY_PREFIX, 'reference-acceptance': r.REFERENCE_ACCEPTANCE_PREFIX,
+            'capability-entry': r.CAPABILITY_ENTRY_PREFIX,
+            'capability-acceptance': r.CAPABILITY_ACCEPTANCE_PREFIX,
+            'capability-verification': r.CAPABILITY_VERIFICATION_PREFIX,
+            'capability-alias': r.CAPABILITY_ALIAS_PREFIX})
+        self.assertEqual(recovery.PROPOSAL_KIND_PREFIXES, {})
+        for kind in ('requirement-proposal', 'proposal-disposition', 'contribution-settings'):
+            self.assertNotIn(kind, recovery.KIND_PREFIXES)
+        self.assertEqual(set(recovery.KIND_PREFIXES),
+                         set(recovery.REVIEW_KIND_PREFIXES) | set(recovery.KEYED_KIND_PREFIXES))
+
 
 class AdminVoidRecordTests(unittest.TestCase):
     def setUp(self):

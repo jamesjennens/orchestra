@@ -28,6 +28,13 @@ cannot reorder or reconcile history. The owning module additionally lets a void
 target an `integration-revert` record, to retract an operator revert; a revert is
 not part of the contribution chain, so it is not protected by it, and the owning
 module refuses to retract a revert the host did not issue.
+
+The same void repairs a keyed record on a closed reference or capability anchor
+(kittrial-5bb.74; .41 section 3.7): its target kinds are KEYED_KIND_PREFIXES, and
+`keyed_entries.AnchoredKind` is the owning module. Its readers and writers drop a
+comment an applied void names, under this module's trust rule (`records`), and a
+void of a record the entry reads is refused there, exactly as a void of the
+current contribution chain is refused here.
 """
 import hashlib
 import json
@@ -45,8 +52,26 @@ DISPOSITIONS = ('void',)
 # host did not issue, and it requires the retraction to be host-journaled before
 # the native write. The prefix is repeated here rather than imported because
 # review_workflow imports this module; test_recovery pins the two together.
-KIND_PREFIXES = {'contribution-review': 'Kind: contribution-review-v1\n',
-                 'integration-revert': 'Kind: integration-revert-v1\n'}
+REVIEW_KIND_PREFIXES = {'contribution-review': 'Kind: contribution-review-v1\n',
+                        'integration-revert': 'Kind: integration-revert-v1\n'}
+# Keyed-record kinds on closed anchors (kittrial-5bb.74). The owning module is
+# keyed_entries.AnchoredKind: a kind belongs to the anchor kind whose record family
+# (`reference-`, `capability-`) it starts with. The prefixes are repeated rather
+# than imported because reserved_comments imports this module; test_recovery pins
+# them to reserved_comments.
+KEYED_KIND_PREFIXES = {'reference-entry': 'Kind: reference-entry-v1\n',
+                       'reference-acceptance': 'Kind: reference-acceptance-v1\n',
+                       'capability-entry': 'Kind: capability-entry-v1\n',
+                       'capability-acceptance': 'Kind: capability-acceptance-v1\n',
+                       'capability-verification': 'Kind: capability-verification-v1\n',
+                       'capability-alias': 'Kind: capability-alias-v1\n'}
+# Extension point for the proposal kinds of kittrial-5bb.68 (`requirement-proposal`,
+# `proposal-disposition`, `contribution-settings`). They are listed here, with the
+# prefixes reserved_comments already reserves, only together with a reader that
+# drops voided comments the way AnchoredKind does. Until then a void naming one is
+# refused as an unsupported target kind, so no void is written that no reader honours.
+PROPOSAL_KIND_PREFIXES = {}
+KIND_PREFIXES = dict(REVIEW_KIND_PREFIXES, **KEYED_KIND_PREFIXES, **PROPOSAL_KIND_PREFIXES)
 FIELDS = {'schema_version', 'operation', 'operation_id', 'task', 'target', 'target_kind',
           'target_sha256', 'original', 'reason', 'disposition', 'operator'}
 ORIGINAL_LIMIT = 60000
@@ -139,6 +164,51 @@ def validate(p, task):
 def preserves(raw, p):
     """True when the void payload still carries the target's exact current bytes."""
     return raw == p['original'] and digest(raw) == p['target_sha256']
+
+
+def authorize(actor, operators):
+    """Refuse an issuing actor outside the server-side operator allowlist, before any read.
+
+    Shared by every owning module's void write (review_workflow.apply_void and
+    keyed_entries.AnchoredKind.apply_void). An unconfigured allowlist authorizes nobody.
+    """
+    text(actor, 'actor', 300)
+    authority = configured_operators(operators)
+    if not authority:
+        raise ValueError('No operator allowlist is configured on the coordination host; add the acting '
+                         'operator to deployment.private.json before recording a void')
+    if actor not in authority:
+        raise ValueError('Actor ' + actor + ' is not a server-side configured operator; only a configured '
+                         'operator may record a void')
+
+
+def bound(payload, actor, task):
+    """The payload to write: bound to its issuing operator and validated for `task`."""
+    if not isinstance(payload, dict):
+        raise ValueError('Invalid operator void record')
+    payload = dict(payload)
+    payload.setdefault('operator', actor)
+    if payload['operator'] != actor:
+        raise ValueError('Void record operator must match the issuing actor')
+    validate(payload, task)
+    return payload
+
+
+def earlier(voids, payload, actor):
+    """The identical void already written, as (payload, comment), or None.
+
+    `voids` are the valid voids `records` read on the task. A retry of the same
+    operation is idempotent; the same operation ID with a different payload or actor,
+    or a second void of one target, is refused before any native write.
+    """
+    for p, c in voids:
+        if p['operation_id'] == payload['operation_id']:
+            if p == payload and c.get('author') == actor:
+                return p, c
+            raise ValueError('Void operation ID already used with different payload or actor')
+        if p['target'] == payload['target']:
+            raise ValueError('Another operator void record already targets ' + p['target'])
+    return None
 
 
 def target_text(issue, target):

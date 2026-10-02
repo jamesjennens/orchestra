@@ -421,33 +421,17 @@ def apply_void(rows, task, actor, payload, run, operator=False, operators=None, 
     if not operator:
         raise ValueError('Operator void records are not authorized over the contributor review transport; '
                          'an operator must use admin.py void-record on the coordination host')
-    text(actor, 'actor', 300)
-    authority = recovery.configured_operators(operators)
-    if not authority:
-        raise ValueError('No operator allowlist is configured on the coordination host; add the acting '
-                         'operator to deployment.private.json before recording a void')
-    if actor not in authority:
-        raise ValueError('Actor ' + actor + ' is not a server-side configured operator; only a configured '
-                         'operator may record a void')
-    if not isinstance(payload, dict):
-        raise ValueError('Invalid operator void record')
-    payload = dict(payload)
-    payload.setdefault('operator', actor)
-    if payload['operator'] != actor:
-        raise ValueError('Void record operator must match the issuing actor')
-    recovery.validate(payload, task)
+    recovery.authorize(actor, operators)
+    payload = recovery.bound(payload, actor, task)
     matches = [r for r in rows if r.get('id') == task]
     if len(matches) != 1 or matches[0].get('issue_type') == 'event':
         raise ValueError('Task missing, duplicated or is an event')
     issue = matches[0]; voids, targets, _ = recovery.records(issue, operators)
-    for p, c in voids:
-        if p['operation_id'] == payload['operation_id']:
-            if p == payload and c.get('author') == actor:
-                persisted_retraction(issue, p, str(c['id']), actor, operators, journal)
-                return dict(comment_id=str(c['id']), reconciled=True, target=p['target'])
-            raise ValueError('Void operation ID already used with different payload or actor')
-        if p['target'] == payload['target']:
-            raise ValueError('Another operator void record already targets ' + p['target'])
+    prior = recovery.earlier(voids, payload, actor)
+    if prior is not None:
+        p, c = prior
+        persisted_retraction(issue, p, str(c['id']), actor, operators, journal)
+        return dict(comment_id=str(c['id']), reconciled=True, target=p['target'])
     check_void(issue, payload, set(targets))
     return _write_void(issue, payload, actor, run, operators, journal)
 
