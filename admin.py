@@ -2576,6 +2576,7 @@ def main():
                                               args.disposition,run,issue_id=args.issue_id)))
     elif args.command=='void-record':
         import fcntl
+        from recovery import KEYED_KIND_PREFIXES
         from review_workflow import apply_void
         path=project_dir(root,args.project)
         payload=json.loads(Path(args.file).read_text(encoding='utf-8-sig'))
@@ -2584,6 +2585,15 @@ def main():
         def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
+            if payload.get('target_kind') in KEYED_KIND_PREFIXES:
+                # A record on a reference or capability anchor (kittrial-5bb.74): the anchor's
+                # kind owns the void and reads only that anchor.
+                import capability_records,reference_records
+                kind=next((k for k in (reference_records.KIND,capability_records.KIND)
+                           if payload['target_kind'].startswith(k.family)),None)
+                if kind is None:raise ValueError('Unsupported operator void target kind')
+                print(json.dumps(kind.apply_void(payload,args.actor,run,authority)))
+                return
             rows=[json.loads(line) for line in run_bd(root,args.project,['export','--all']).splitlines() if line.strip()]
             print(json.dumps(apply_void(rows,payload['task'],args.actor,payload,run,operator=True,
                                         operators=authority,journal=path)))

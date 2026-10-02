@@ -264,12 +264,13 @@ def _validate_content(payload):
     valid_tags(payload.get('tags', []))
 
 
-def _pre_write(payload, run):
+def _pre_write(payload, run, operators=None):
     """Reads before the journal: requirement links, and a retirement's successor."""
     if payload['operation'] in ('propose', 'revise', 'draft'):
         check_requirements(payload.get('requirements') or [], run)
     if payload['operation'] == 'retire':
-        check_successor(payload['key'], payload['successor'], read_key_and_retired(run, payload['successor']))
+        check_successor(payload['key'], payload['successor'], read_key_and_retired(run, payload['successor']),
+                        operators)
 
 
 def check_requirements(links, run):
@@ -292,11 +293,17 @@ def check_requirements(links, run):
                          'revision, when given)' % ', '.join(bad))
 
 
-def newest_revisions(rows):
-    """key -> the newest revision record of every readable anchor, whatever its acceptance."""
+def newest_revisions(rows, operators=None):
+    """key -> the newest revision record of every readable anchor, whatever its acceptance.
+
+    Each anchor is read as `KIND.live_row` sees it, without the comments applied
+    operator voids name (`operators` is the deployment allowlist)."""
     newest = {}
     for row in rows:
-        if not isinstance(row, dict) or not is_record_anchor(row) or TYPE_LABEL not in (row.get('labels') or []):
+        if not isinstance(row, dict) or TYPE_LABEL not in (row.get('labels') or []):
+            continue
+        row = KIND.live_row(row, operators)[0]
+        if not is_record_anchor(row):
             continue
         try:
             revisions = KIND.existing_revisions(row)
@@ -320,9 +327,9 @@ def read_key_and_retired(run, key):
     return rows + KIND.shown(run, retired)
 
 
-def check_successor(key, successor, rows):
+def check_successor(key, successor, rows, operators=None):
     """The successor is an existing capability, and following successors never returns to `key`."""
-    newest = newest_revisions(rows)
+    newest = newest_revisions(rows, operators)
     if successor not in newest:
         raise ValueError('Unknown successor capability %s' % successor)
     seen, current = {key}, successor
@@ -465,8 +472,9 @@ KIND = keyed_entries.AnchoredKind(
     validate_entry=lambda record: validate_entry(record),
     entry_record=lambda payload, revision, state: entry_record(payload, revision, state),
     validate_content=_validate_content, write_time_rules=lambda record: None,
-    content_fields=CONTENT_FIELDS, pre_write=lambda payload, run: _pre_write(payload, run),
+    content_fields=CONTENT_FIELDS, pre_write=lambda payload, run, operators: _pre_write(payload, run, operators),
     extra_records={'capability-alias': _read_alias, 'capability-verification': verification.read_record},
+    extra_parsers={'capability-alias': parse_alias, 'capability-verification': verification.parse},
     supports_retire=True,
 )
 SPEC = KIND.spec
@@ -729,7 +737,7 @@ def entry_view(row, operators):
         view.update(aliases_pending=[], aliases_rejected=set(), newest=None, verification_records=[])
     else:
         view['aliases_pending'], view['aliases_rejected'] = alias_state(view, operators)
-        revisions = KIND.existing_revisions(row)
+        revisions = KIND.existing_revisions(KIND.live_row(row, operators)[0])
         view['newest'] = revisions[max(revisions)] if revisions else None
         view.setdefault('verification_records', [])
     view.pop('alias_records', None)
@@ -1148,4 +1156,4 @@ def write(args, attachments, actor, run, project, operators, verifiers=None):
             raise ValueError('use capability propose-alias KEY "PHRASE" [--evidence POINTER]')
         return propose_alias(rest[0], rest[1], actor, run, operators, evidence=evidence)
     payload = write_payload(args, attachments)
-    return apply_native(payload, actor, run, project)
+    return apply_native(payload, actor, run, project, operators=operators)

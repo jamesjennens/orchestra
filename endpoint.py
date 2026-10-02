@@ -199,7 +199,7 @@ def execute(root,request,authority_config=None,require_authority=False):
         payload=reference_records.write_payload(args,request.get('attachments',{}))
         runner=NativeRunner(run)
         def ref_effect():
-            result=reference_records.apply_native(payload,actor,runner,path)
+            result=reference_records.apply_native(payload,actor,runner,path,operators=configured_operators(root))
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)

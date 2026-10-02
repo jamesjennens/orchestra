@@ -380,6 +380,11 @@ def history(issue, operators=None, journal=None, reverts=None, invalid_reverts=N
     including when surviving records still reference a voided revision.
     """
     voids, targets, invalid = recovery.records(issue, operators)
+    # A valid void of a keyed record (kittrial-5bb.74) belongs to the anchor's kind
+    # (keyed_entries), which applies or reports it; it is no part of a review history.
+    voids = [(p, c) for p, c in voids if p['target_kind'] in recovery.REVIEW_KIND_PREFIXES]
+    targets = {target: entry for target, entry in targets.items()
+               if entry[0]['target_kind'] in recovery.REVIEW_KIND_PREFIXES}
     applied = {}
     refused = []
     for p, c in voids:

@@ -30,13 +30,22 @@ and gives it:
 - the reader view: an acceptance counts only while its evidence comment's stored
   native author equals the evidence `operator` and is on the live deployment
   operator allowlist, otherwise it is inert (named, never silent); every entry fails
-  alone (`malformed`, `unsupported`).
+  alone (`malformed`, `unsupported`);
+- operator voids (kittrial-5bb.74, the .41 design's section 3.7 repair): `admin.py
+  void-record` with a target kind of this kind's family appends a `record-void-v1`
+  comment (`apply_void`), and every read and write of the kind sees the anchor as
+  `live_row` does, without the comments applied voids name. Validity is
+  `recovery.records`, the review voids' own trust rule; a void of a record the entry
+  reads is refused, so a void repairs a malformed, foreign or conflicting record and
+  never withdraws one.
 """
+import copy
 import json
 import re
 import subprocess
 
 import keyed_records as core
+import recovery
 from coordination import identifier
 from export_requirements import parse_json
 from recovery import configured_operators
@@ -98,14 +107,17 @@ class AnchoredKind:
     `entry_record(payload, revision, state)`, `validate_content(payload)` (the
     kind's content fields, called for propose/revise/draft), `write_time_rules(record)`
     (date rules, checked before any write), `content_fields` (the payload content
-    names), `pre_write(payload, run)` (extra reads before the journal, e.g. link
-    checks), and `extra_records` (a mapping of further record kinds on the anchor to
+    names), `pre_write(payload, run, operators)` (extra reads before the journal, e.g.
+    link checks), `extra_records` (a mapping of further record kinds on the anchor to
     a reader `(view, body, comment) -> None` that may raise to mark the entry
-    malformed).
+    malformed) and `extra_parsers` (the same kinds to their strict parser
+    `body -> record or None`, which `void_refusal` uses to tell a well-formed record
+    from a malformed one).
     """
 
     def __init__(self, **values):
-        defaults = {'pre_write': lambda payload, run: None, 'extra_records': {}, 'supports_retire': False}
+        defaults = {'pre_write': lambda payload, run, operators: None, 'extra_records': {}, 'extra_parsers': {},
+                    'supports_retire': False}
         defaults.update(values)
         self.__dict__.update(defaults)
         self.propose_fields = frozenset(('schema_version', 'operation_id', 'operation', 'revision',
@@ -272,6 +284,111 @@ class AnchoredKind:
         if self.parse_acceptance(body) != evidence:
             raise ValueError('Refusing to write acceptance evidence that does not pass its own schema')
         return evidence, body
+
+    # -- operator voids (kittrial-5bb.74) ------------------------------------------------------
+
+    def record_slot(self, kind, comment, row):
+        """The place one record comment holds in the entry, or None when the entry cannot read it.
+
+        A revision holds `('revision', N)` and acceptance evidence `('acceptance', N)`;
+        an alias or verification record holds a place of its own. A comment that fails
+        its kind's strict parser, or that belongs to another anchor or key, holds none.
+        """
+        body = comment.get('text')
+        if kind == self.family + 'entry':
+            record = self.parse_entry(body)
+            if record is None or not self.entry_belongs(record, row):
+                return None
+            return ('revision', record['revision'])
+        if kind == self.family + 'acceptance':
+            record = self.parse_acceptance(body)
+            if record is None or record['id'] != row.get('id') \
+                    or self.key_label(record['key']) not in self.key_labels(row):
+                return None
+            return ('acceptance', record['revision'])
+        parse = self.extra_parsers.get(kind)
+        if parse is not None and parse(body) is None:
+            return None
+        return ('record', str(comment.get('id')))
+
+    def void_refusal(self, row, payload, dropped=()):
+        """Why a valid void of a comment on this anchor does not apply, else None.
+
+        `dropped` are the comments earlier applied voids already name. A void applies to
+        a comment of one of this kind's record kinds that the entry cannot read
+        (malformed, or another anchor's or key's), or whose place another live comment
+        also holds (a conflicting or duplicated revision or acceptance). A record the
+        entry reads is the ledger itself, so a void of it is refused: withdrawing an entry
+        is a new revision or a retirement, which keeps revision numbers monotonic for the
+        writer and for an older kit.
+        """
+        kind = payload['target_kind']
+        if not kind.startswith(self.family):
+            return 'it targets a %s record, not a %s record' % (kind, self.noun)
+        prefix = recovery.KIND_PREFIXES[kind]
+        comments = [comment for comment in row.get('comments') or []
+                    if isinstance(comment, dict) and str(comment.get('id')) not in dropped]
+        target = next((comment for comment in comments if str(comment.get('id')) == payload['target']), None)
+        if target is None:
+            return 'its target %s is not on the anchor' % payload['target']
+        slot = self.record_slot(kind, target, row)
+        if slot is None:
+            return None
+        for comment in comments:
+            if comment is not target and isinstance(comment.get('text'), str) \
+                    and comment['text'].startswith(prefix) and self.record_slot(kind, comment, row) == slot:
+                return None
+        return ('record %s is a well-formed %s record the entry reads; a void repairs a malformed, foreign or '
+                'conflicting record and never withdraws one' % (payload['target'], kind))
+
+    def live_row(self, row, operators):
+        """(row, notes): the anchor as this kind's readers and writers see it.
+
+        A comment an applied operator void names is left out. Whether a void is valid is
+        `recovery.records`, the trust rule review voids use: an exact record whose stored
+        native author is the payload's operator and on the deployment allowlist
+        (`operators`; None authorizes nobody), which follows its target in native order
+        and preserves the target's exact bytes. A valid void then applies unless
+        `void_refusal` refuses it. Nothing is deleted: the row returned is a copy, and the
+        void and its target stay in native history, so the anchor stays hidden on every
+        surface (`reserved_comments.is_record_anchor` reads the stored row). `notes` are
+        entry warnings: `record-voided`, `void-refused` and `void-invalid`. Never raises.
+        """
+        comments = row.get('comments') if isinstance(row, dict) else None
+        if not isinstance(comments, list) or not any(
+                isinstance(comment, dict) and isinstance(comment.get('text'), str)
+                and comment['text'].startswith(recovery.PREFIX) for comment in comments):
+            return row, []
+        try:
+            voids, _, invalid = recovery.records(row, operators if operators is not None else ())
+        except (AttributeError, TypeError, KeyError):
+            return row, [{'code': 'void-invalid', 'detail': 'the void records on this anchor cannot be read'}]
+        notes = [{'code': 'void-invalid',
+                  'detail': 'void record %s is not applied: it is malformed, stale, out of order or not written by a '
+                            'configured operator' % comment_id} for comment_id in invalid]
+        dropped = set()
+        for payload, comment in voids:
+            reason = self.void_refusal(row, payload, dropped)
+            if reason is not None:
+                notes.append({'code': 'void-refused',
+                              'detail': 'void record %s is not applied: %s' % (comment.get('id'), reason)})
+                continue
+            dropped.add(payload['target'])
+            notes.append({'code': 'record-voided',
+                          'detail': '%s record %s is voided by operator %s (void record %s)'
+                                    % (payload['target_kind'], payload['target'], payload['operator'],
+                                       comment.get('id'))})
+        if not dropped:
+            return row, notes
+        return dict(row, comments=[comment for comment in comments
+                                   if not (isinstance(comment, dict) and str(comment.get('id')) in dropped)]), notes
+
+    def live_rows(self, rows, operators):
+        return [self.live_row(row, operators)[0] if isinstance(row, dict) else row for row in rows]
+
+    def has_live_record(self, row, operators):
+        """Whether the anchor still holds a record once applied voids are left out."""
+        return is_record_anchor(self.live_row(row, operators)[0])
 
     # -- payloads ------------------------------------------------------------------------------
 
@@ -512,11 +629,70 @@ class AnchoredKind:
     # -- write entry points ----------------------------------------------------------------------
 
     def apply_native(self, payload, actor, run, project, operator=False, operators=None):
+        """`operators` is the deployment allowlist. On the operator route it authorizes the
+        actor; on both routes it decides which operator voids apply, so the endpoint
+        supplies it to contributor writes too (it authorizes nothing there)."""
         if operator:
             core.require_configured_operator(actor, operators, self.spec.accept_action)
         self.validate_payload(payload, operator=operator)
-        self.pre_write(payload, run)
-        return core.apply_native(payload, actor, run, project, self.spec, operator=operator, operators=operators)
+        self.pre_write(payload, run, operators)
+        return core.apply_native(payload, actor, run, project, self.write_spec(operators), operator=operator,
+                                 operators=operators)
+
+    def write_spec(self, operators):
+        """The kind's spec for one write, whose reads see each row as `live_row` does.
+
+        The writer then agrees with the readers: a comment an applied operator void names
+        takes no part in compare-and-swap, the key checks or the acceptance ledger.
+        """
+        spec = copy.copy(self.spec)
+        spec.read_rows = lambda run, payload=None: self.live_rows(self.spec.read_rows(run, payload), operators)
+        spec.read_created = lambda run, task, payload: self.live_rows(self.spec.read_created(run, task, payload),
+                                                                      operators)
+        return spec
+
+    def apply_void(self, payload, actor, run, operators):
+        """`admin.py void-record` for a record on this kind's anchor `payload['task']`.
+
+        Host route only, exactly like a review void: the actor must be on the deployment
+        operator allowlist before any read (`recovery.authorize`), the payload is bound to
+        that actor, and an identical retry is idempotent while a reused operation ID or a
+        second void of one target is refused (`recovery.earlier`). The target must be a
+        comment of the declared kind, one of this kind's, on this kind's anchor, with its
+        exact bytes preserved, and `void_refusal` must not refuse it. The void is one
+        appended native comment. Like a contribution-review void it needs no host
+        journal: its own native record is all a reader checks, and a new sidecar path
+        would make a backup unrestorable by an older kit.
+        """
+        recovery.authorize(actor, operators)
+        payload = recovery.bound(payload, actor, payload.get('task') if isinstance(payload, dict) else None)
+        if not payload['target_kind'].startswith(self.family):
+            raise ValueError('Operator void target kind %s is not a %s record kind' % (payload['target_kind'],
+                                                                                    self.noun))
+        rows = self.shown(run, [payload['task']])
+        if len(rows) != 1 or rows[0].get('issue_type') == 'event':
+            raise ValueError('Task missing, duplicated or is an event')
+        row = rows[0]
+        if self.type_label not in (row.get('labels') or []) or not self.key_labels(row):
+            raise ValueError('%s is not a %s anchor; a %s void targets a record on one'
+                             % (row.get('id'), self.noun, payload['target_kind']))
+        prior = recovery.earlier(recovery.records(row, operators)[0], payload, actor)
+        if prior is not None:
+            return dict(comment_id=str(prior[1]['id']), reconciled=True, target=prior[0]['target'])
+        raw = recovery.target_text(row, payload['target'])
+        if not raw.startswith(recovery.KIND_PREFIXES[payload['target_kind']]):
+            raise ValueError('Operator void target is not a %s record: %s' % (payload['target_kind'],
+                                                                              payload['target']))
+        if not recovery.preserves(raw, payload):
+            raise ValueError('Operator void record must preserve the exact current bytes of ' + payload['target'])
+        live, _ = self.live_row(row, operators)
+        dropped = {str(comment.get('id')) for comment in row.get('comments') or [] if isinstance(comment, dict)} - \
+            {str(comment.get('id')) for comment in live.get('comments') or [] if isinstance(comment, dict)}
+        reason = self.void_refusal(row, payload, dropped)
+        if reason is not None:
+            raise ValueError('Operator void refused for %s: %s' % (payload['target'], reason))
+        raw = run(['comments', 'add', row['id'], recovery.PREFIX + canonical_bytes(payload).decode('utf-8'), '--json'])
+        return dict(comment_id=core._comment_id(raw), reconciled=False, target=payload['target'])
 
     def confirm_anchor(self, row):
         if not is_record_anchor(row):
@@ -531,7 +707,7 @@ class AnchoredKind:
     # -- the reader view ------------------------------------------------------------------------
 
     def entry_view(self, row, operators):
-        """One anchor as readers see it. Never raises: a bad entry reads malformed.
+        """One anchor as readers see it, through `live_row`. Never raises: a bad entry reads malformed.
 
         The kind adds its own fields (a reference's `due`) to the returned view; records
         of `extra_records` kinds are passed to their readers in native order.
@@ -539,6 +715,8 @@ class AnchoredKind:
         view = {'key': None, 'native_id': row.get('id'), 'state': None, 'record': None,
                 'record_comment_id': None, 'acceptance': None, 'acceptance_inert': False,
                 'inert_operator': None, 'proposed': None, 'proposed_comment_id': None, 'warnings': []}
+        row, notes = self.live_row(row, operators)
+        view['warnings'].extend(notes)
         try:
             revisions, acceptances, extras = {}, {}, []
             for comment in row.get('comments') or []:
@@ -620,13 +798,18 @@ class AnchoredKind:
         return view
 
     def catalog(self, rows, operators, view=None):
-        """(entries, incomplete ids) over the kind's labelled rows; ordinary labelled tasks are skipped."""
+        """(entries, incomplete ids) over the kind's labelled rows; ordinary labelled tasks are skipped.
+
+        An anchor whose every record an applied operator void names holds no live record,
+        so it is reported as incomplete, exactly like an anchor whose propose stopped
+        before its first record.
+        """
         view = view or self.entry_view
         entries, incomplete = [], []
         for row in rows:
             if not isinstance(row, dict) or self.type_label not in (row.get('labels') or []):
                 continue
-            if not is_record_anchor(row):
+            if not self.has_live_record(row, operators):
                 if self.key_labels(row):
                     incomplete.append(row.get('id'))
                 continue
@@ -647,7 +830,7 @@ class AnchoredKind:
             if not isinstance(row, dict) or self.type_label not in (row.get('labels') or []) \
                     or label not in self.key_labels(row):
                 continue
-            if not is_record_anchor(row):
+            if not self.has_live_record(row, operators):
                 incomplete.append(row.get('id'))
                 continue
             entry = view(row, operators)

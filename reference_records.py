@@ -44,9 +44,10 @@ Reads cost what they touch: `ref get` and every write read only their own key (o
 `bd list` by lookup label, one `bd show`); only `ref list` and reconcile read the
 catalog, with one `bd show` up to CATALOG_SHOW_MAX entries and one export above.
 
-A malformed entry stays `malformed`: the .41 design's repair through the operator's
-`void-record` (section 3.7) is a follow-up, because `recovery.KIND_PREFIXES` does
-not list the reference record kinds yet.
+A malformed entry reads `malformed` until the operator repairs it with `void-record`
+(the .41 design's section 3.7; kittrial-5bb.74): `keyed_entries` leaves out a comment an
+applied void names, on every read and write, and refuses a void of a record the entry
+reads.
 
 Statements are untrusted text: they never enter an error message, and excerpts
 carry `trust`. The due-soon window is fixed at 30 days (a per-project setting is
@@ -332,7 +333,7 @@ KIND = keyed_entries.AnchoredKind(
     validate_entry=lambda record: validate_entry(record),
     entry_record=lambda payload, revision, state: entry_record(payload, revision, state),
     validate_content=_validate_content, write_time_rules=lambda record: _write_time_rules(record),
-    content_fields=CONTENT_FIELDS, pre_write=lambda payload, run: check_decisions(payload, run),
+    content_fields=CONTENT_FIELDS, pre_write=lambda payload, run, operators: check_decisions(payload, run),
 )
 SPEC = KIND.spec
 PROPOSE_FIELDS, ACCEPT_FIELDS, DIRECT_FIELDS = KIND.propose_fields, KIND.accept_fields, KIND.direct_fields
@@ -358,7 +359,8 @@ def apply_native(payload, actor, run, project, operator=False, operators=None):
     The contributor route (`operator=False`) proposes and revises drafts. The operator
     route (`admin.py reference-apply`) accepts the newest draft it reviewed, or writes
     a direct accepted revision 1, with F3 evidence; `operators` is the deployment
-    allowlist, checked before any journal or native read.
+    allowlist, checked before any journal or native read on that route. On both routes
+    it decides which operator voids apply (the endpoint supplies it to contributors).
     """
     return KIND.apply_native(payload, actor, run, project, operator=operator, operators=operators)
 
