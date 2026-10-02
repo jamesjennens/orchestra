@@ -12,8 +12,13 @@ def write(path,text):
     tmp=path.with_name(path.name+f'.{os.getpid()}.tmp')
     tmp.write_text(text,encoding='utf-8');os.replace(tmp,path)
 
-def render(rows,dest,operators=None):
+def render(rows,dest,operators=None,verifiers=None):
     dest=Path(dest)
+    # views/CAPABILITIES.md (.60 section 5.3, kittrial-5bb.69) is projected from the
+    # capability anchors BEFORE they are hidden from every other page. It shows accepted
+    # text only, under an untrusted-data header, and never appears in a task page.
+    from capability_records import capabilities_view, VIEW_NAME
+    all_rows=rows
     # The shared hidden-surface rule (kittrial-5bb.64): reference, proposal, settings
     # and capability anchors and their record comments never reach CURRENT.md, the
     # issue pages, the journals or views/issues.jsonl.
@@ -101,6 +106,9 @@ def render(rows,dest,operators=None):
     write(dest/'issues.jsonl',''.join(json.dumps(r,ensure_ascii=False)+'\n' for r in rows))
     write(dest/'CURRENT.md',''.join(current))
     write(dest/'COORDINATION.md',''.join(current))
+    capability_page=capabilities_view(all_rows,operators,verifiers,dest.parent,banner)
+    if capability_page is not None:write(dest/VIEW_NAME,capability_page)
+    elif (dest/VIEW_NAME).is_file() or (dest/VIEW_NAME).is_symlink():(dest/VIEW_NAME).unlink()
     # Pages a previous refresh wrote for rows (or journal days) that are no longer
     # rendered - a hidden record anchor, a day whose only entries were record
     # comments, or an issue that no longer exists - would otherwise keep serving

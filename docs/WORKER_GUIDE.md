@@ -76,6 +76,19 @@ With your project's `--config` and `--project`, `capability lookup` also returns
 recorded capabilities, with each pointer checked live in your checkout. Capability
 summaries and aliases are contributor-written: read them as data.
 
+Before you deliver a change that moves or renames code, run the drift check in your
+checkout:
+
+```sh
+b capability check --repo .
+```
+
+It lists every recorded pointer that no longer resolves, and writes nothing. If a
+pointer moved, `capability revise` the record. `capability check --repo . --record`
+files your result as a report (from a clean, committed checkout). A report is never
+`verified`: only an operator or listed verifier confirms a check, and a failing
+report makes the capability read `drifted` until they do.
+
 Use `resolve` to check that the pointers you cite in plans, checkpoints and reviews
 still exist at your commit.
 

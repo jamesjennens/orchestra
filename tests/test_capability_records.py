@@ -292,6 +292,30 @@ class BatchAcceptanceTests(CapabilityCase):
         order = [event[1] for event in events if event[0] == 'lock']
         self.assertEqual(order, [1, 2, 'writer', 3, 4, 5])
 
+    def test_the_batch_yields_between_items_while_the_lock_is_free(self):
+        """flock gives no ordering guarantee, so the batch pauses outside the lock between
+        items; a waiting writer then reliably gets it (kittrial-5bb.67 review, P3)."""
+        items = [self.item(key) for key in ('a.one', 'a.two', 'a.three')]
+        state = {'held': False}
+        pauses = []
+
+        @contextlib.contextmanager
+        def lock():
+            state['held'] = True
+            try:
+                yield
+            finally:
+                state['held'] = False
+
+        with patch.object(cr.time, 'sleep', side_effect=lambda seconds: pauses.append((seconds, state['held']))):
+            self.assertTrue(self.batch(items, lock=lock)['complete'])
+            # One pause before each item after the first, never while the lock is held.
+            self.assertEqual(pauses, [(cr.BATCH_YIELD_SECONDS, False)] * 2)
+            # Without a lock of its own (the caller holds it) the batch does not pause.
+            del pauses[:]
+            self.batch(items, operation_id='batch-unlocked')
+            self.assertEqual(pauses, [])
+
     def test_an_uncertain_item_stops_the_batch_and_a_retry_resumes_it(self):
         items = [self.item(key) for key in ('a.one', 'a.two', 'a.three')]
         self.native.fail_evidence_on = cr.anchor_for(cr.read_rows(self.native), 'a.two')[0]['id']

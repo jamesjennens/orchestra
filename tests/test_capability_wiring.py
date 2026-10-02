@@ -1,10 +1,13 @@
-"""The capability client split, endpoint dispatch and operator commands (kittrial-5bb.67).
+"""The capability client split, endpoint dispatch and operator commands (kittrial-5bb.67/.69).
 
 client.py: `capability lookup|resolve|index` stay local and need no config (the .61
 behaviour, pinned by tests/test_capabilities.py); `capability find|get|list|propose|
 revise|propose-alias` go to the endpoint; `capability lookup` with --config/--project
 adds the endpoint's records with live pointer resolution. The endpoint's capability
 reads take no lock and no journal; its writes are locked and run_guarded.
+`capability check` (slice 1b) runs in the client: it pages the records from the
+endpoint, resolves their pointers in the caller's checkout, and writes nothing
+without `--record`.
 """
 import contextlib
 import io
@@ -29,7 +32,7 @@ from test_reference_records import OPERATOR, TODAY, acceptance
 from test_reference_wiring import _endpoint_module
 
 
-class ClientSplitTests(unittest.TestCase):
+class ClientCase(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
@@ -59,6 +62,8 @@ class ClientSplitTests(unittest.TestCase):
                 code = stop.code
         return code, out.getvalue(), err.getvalue(), calls
 
+
+class ClientSplitTests(ClientCase):
     def test_lookup_resolve_and_index_stay_local(self):
         for argv in (('capability', 'lookup', 'execute', '--repo', str(self.repo)),
                      ('capability', 'resolve', 'review_workflow.py::execute', '--repo', str(self.repo)),
@@ -111,6 +116,220 @@ class ClientSplitTests(unittest.TestCase):
         self.assertEqual((code, payload['records']), (0, []))
         self.assertIn('records unavailable', payload['records_warning'])
         self.assertTrue(payload['found'])
+
+
+def list_item(key, state='accepted', code=('review_workflow.py::execute',), tests=(), anchors=(), revision=1):
+    return {'key': key, 'name': key, 'state': state, 'trust': 'accepted' if state == 'accepted' else 'draft',
+            'owner': 'person:james', 'tags': [], 'revision': revision, 'native_id': 'cap-' + key,
+            'aliases_pending': 0, 'acceptance_inert': False, 'verification': 'unverified',
+            'record_sha256': 'c' * 64, 'code': list(code), 'tests': list(tests), 'anchors': list(anchors)}
+
+
+class ClientCheckTests(ClientCase):
+    """`capability check --repo PATH [--key KEY]... [--record | --payloads FILE]` (.60 section 5.1)."""
+
+    ITEMS = [list_item('review.flow', code=['review_workflow.py::execute'], anchors=['README.md#usage']),
+             list_item('review.gone', state='draft-only', code=['review_workflow.py::missing']),
+             list_item('other.lang', code=['src/thing.rs::run']),
+             list_item('old.retired', state='superseded')]
+
+    def setUp(self):
+        super().setUp()
+        (self.repo / 'README.md').write_text('# Usage\n\nText.\n', encoding='utf-8')
+        # A pointer into a language the local resolver cannot parse reads `unknown` (no graph here).
+        (self.repo / 'src').mkdir()
+        (self.repo / 'src' / 'thing.rs').write_text('fn run() {}\n', encoding='utf-8')
+        self.verified = []
+
+    def endpoint(self, items=None, refuse=()):
+        items = self.ITEMS if items is None else items
+
+        def reply(action, args):
+            if args[0] == 'list':
+                offset = int(args[args.index('--offset') + 1])
+                page = items[offset:offset + 2]          # two per page: the client must follow next_offset
+                return {'returncode': 0, 'stderr': '', 'stdout': json.dumps(
+                    {'items': page, 'total': len(items),
+                     'next_offset': offset + 2 if offset + 2 < len(items) else None})}
+            payload = json.loads(Path(args[args.index('--file') + 1]).read_text(encoding='utf-8'))
+            self.verified.append(payload)
+            if payload['key'] in refuse:
+                return {'returncode': 2, 'stdout': '', 'stderr': 'ValueError: the pool is full\n'}
+            return {'returncode': 0, 'stderr': '', 'stdout': json.dumps(
+                {'key': payload['key'], 'reconciled': False, 'identity': 'unverified'})}
+        return reply
+
+    def git(self, *argv):
+        done = subprocess.run(['git', '-C', str(self.repo), '-c', 'user.name=t', '-c', 'user.email=t@example.invalid',
+                               '-c', 'commit.gpgsign=false', *argv], capture_output=True, text=True)
+        if done.returncode:
+            self.skipTest('git is not usable here: ' + done.stderr[-200:])
+        return done.stdout.strip()
+
+    def commit(self):
+        try:
+            self.git('init', '-q')
+        except OSError as error:
+            self.skipTest('git is not installed: ' + str(error))
+        self.git('add', '-A')
+        self.git('commit', '-q', '-m', 'fixture')
+        return self.git('rev-parse', 'HEAD')
+
+    def check(self, *argv, **options):
+        return self.main('capability', 'check', '--repo', str(self.repo), *argv,
+                         request=options.pop('request', None) or self.endpoint(**options))
+
+    def test_check_needs_a_config_and_help_does_not(self):
+        code, _, err, calls = self.main('capability', 'check', '--repo', str(self.repo), config=False)
+        self.assertEqual((code, calls), (2, []))
+        self.assertIn('--config', err)
+        code, out, _, calls = self.main('capability', 'check', '--help', config=False)
+        self.assertEqual((code, calls, json.loads(out)['output']['schema']), (0, [], 'capability-check-v1'))
+
+    def test_check_resolves_every_pointer_and_writes_nothing(self):
+        code, out, _, calls = self.check()
+        self.assertEqual(code, 0)                         # a missing pointer is a result, not an error
+        self.assertEqual([args[0] for _, args in calls], ['list', 'list'])
+        self.assertTrue(all('--pointers' in args for _, args in calls))
+        payload = json.loads(out)
+        self.assertEqual((payload['schema'], payload['contract'], payload['recording']),
+                         ('capability-check-v1', 'cli-contract-v1', None))
+        rows = {row['key']: row for row in payload['capabilities']}
+        self.assertEqual(sorted(rows), ['other.lang', 'review.flow', 'review.gone'])   # the retired key is skipped
+        self.assertEqual([(r['pointer'], r['resolved'], r['basis'], r['reason']) for r in rows['review.flow']['results']],
+                         [('review_workflow.py::execute', True, 'ast', None),
+                          ('README.md#usage', True, 'markdown', None)])
+        self.assertEqual((rows['review.flow']['passed'], rows['review.gone']['passed'], rows['other.lang']['passed']),
+                         (True, False, None))
+        self.assertEqual(rows['review.gone']['results'][0]['reason'], 'symbol-missing')
+        self.assertEqual(rows['other.lang']['results'][0]['reason'], 'unsupported-file-type')
+        self.assertEqual(payload['summary'], {'capabilities': 3, 'passed': 1, 'failed': 1, 'unknown': 1,
+                                              'pointers': {'resolved': 2, 'missing': 1, 'unknown': 1}})
+        self.assertNotIn('recorded', rows['review.flow'])
+        self.assertEqual(self.verified, [])
+
+    def test_key_filters_and_refusals(self):
+        code, out, _, _ = self.check('--key', 'review.flow')
+        self.assertEqual([row['key'] for row in json.loads(out)['capabilities']], ['review.flow'])
+        code, out, err, _ = self.check('--key', 'no.such')
+        self.assertEqual((code, out), (2, ''))
+        self.assertIn('unknown capability key', err)
+        code, _, err, _ = self.check('--record', '--payloads', 'x.json')
+        self.assertEqual(code, 2)
+        self.assertIn('not both', err)
+        stale = [{name: value for name, value in item.items() if name != 'record_sha256'} for item in self.ITEMS]
+        code, _, err, _ = self.check(items=stale)
+        self.assertEqual(code, 2)
+        self.assertIn('does not support capability check', err)
+
+        def refuse(action, args):
+            return {'returncode': 2, 'stdout': '', 'stderr': 'ValueError: unknown command list\n'}
+        code, _, err, _ = self.check(request=refuse)
+        self.assertEqual(code, 2)
+        self.assertIn('capability records unavailable', err)
+
+    def test_record_refuses_a_checkout_that_is_not_a_clean_full_commit(self):
+        code, _, err, calls = self.check('--record')
+        self.assertEqual((code, calls), (2, []))
+        self.assertIn('git checkout at a full commit', err)
+        self.commit()
+        (self.repo / 'review_workflow.py').write_text('def execute():\n    return 2\n', encoding='utf-8')
+        code, _, err, calls = self.check('--record')
+        self.assertEqual((code, calls), (2, []))
+        self.assertIn('clean checkout', err)
+        self.git('checkout', '-q', '--', 'review_workflow.py')
+        (self.repo / 'scratch.py').write_text('def missing():\n    return 1\n', encoding='utf-8')
+        code, _, err, calls = self.check('--payloads', str(self.root / 'p.json'))
+        self.assertEqual((code, calls), (2, []))          # an untracked file could make a pointer resolve
+        self.assertIn('untracked', err)
+        self.assertEqual(self.verified, [])
+
+    def test_record_posts_one_verification_per_capability_at_head(self):
+        head = self.commit()
+        code, out, _, calls = self.check('--record', refuse=('review.gone',))
+        self.assertEqual(code, 0)
+        self.assertEqual([args[0] for _, args in calls], ['list', 'list', 'verify', 'verify'])
+        payload = json.loads(out)
+        rows = {row['key']: row for row in payload['capabilities']}
+        self.assertEqual((rows['review.flow']['recorded'], rows['review.flow']['identity']),
+                         ('recorded', 'unverified'))
+        self.assertEqual((rows['review.gone']['recorded'], rows['review.gone']['refusal']),
+                         ('refused', 'ValueError: the pool is full'))
+        self.assertEqual(rows['other.lang']['recorded'], 'not-recordable')
+        self.assertEqual(payload['summary']['recorded'], {'not-recordable': 1, 'recorded': 1, 'refused': 1})
+        sent = {item['key']: item for item in self.verified}
+        self.assertEqual(sorted(sent), ['review.flow', 'review.gone'])
+        flow = sent['review.flow']
+        self.assertEqual(set(flow), {'schema_version', 'key', 'revision', 'record_sha256', 'commit', 'checked_at',
+                                     'source', 'graph_built_at_commit', 'tool', 'results', 'passed'})
+        self.assertEqual((flow['commit'], flow['passed'], flow['source'], flow['record_sha256']),
+                         (head, True, 'ast', 'c' * 64))
+        self.assertEqual(flow['results'], [{'pointer': 'review_workflow.py::execute', 'resolved': True, 'reason': None},
+                                           {'pointer': 'README.md#usage', 'resolved': True, 'reason': None}])
+        self.assertEqual((sent['review.gone']['passed'], sent['review.gone']['results'][0]['reason']),
+                         (False, 'symbol-missing'))
+        # The payload the client builds is exactly what the endpoint's validator accepts.
+        import capability_verification
+        capability_verification.validate_payload(dict(flow, key='review.flow'))
+
+    def test_payloads_writes_a_file_for_the_host_command_and_posts_nothing(self):
+        self.commit()
+        target = self.root / 'payloads.json'
+        code, out, _, calls = self.check('--payloads', str(target))
+        self.assertEqual(code, 0)
+        self.assertEqual([args[0] for _, args in calls], ['list', 'list'])
+        written = json.loads(target.read_text(encoding='utf-8'))
+        self.assertEqual((written['schema_version'], [item['key'] for item in written['items']]),
+                         (1, ['review.flow', 'review.gone']))
+        import capability_verification
+        self.assertEqual(len(capability_verification.validate_batch(written)), 2)
+        self.assertEqual(json.loads(out)['recording'], 'payloads')
+
+    def test_the_payloads_file_is_private_and_replaced_whole(self):
+        """Review 01a0fe9e `smaller` (a)."""
+        self.commit()
+        target = self.root / 'payloads.json'
+        target.write_text('an older file\n', encoding='utf-8')
+        code, _, _, _ = self.check('--payloads', str(target))
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(target.read_text(encoding='utf-8'))['schema_version'], 1)
+        self.assertEqual([path.name for path in self.root.glob('.payloads.json.*')], [])   # no temporary left
+        if os.name == 'posix':
+            import stat
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+        code, _, err, calls = self.check('--payloads', str(self.repo))
+        self.assertEqual((code, calls), (2, []))
+        self.assertIn('symbolic link or onto a directory', err)
+
+    def test_the_payloads_file_is_never_written_through_a_symbolic_link(self):
+        self.commit()
+        victim = self.root / 'victim.txt'
+        victim.write_text('keep me\n', encoding='utf-8')
+        link = self.root / 'link.json'
+        try:
+            os.symlink(victim, link)
+        except (OSError, NotImplementedError):
+            self.skipTest('cannot create symlinks here')
+        code, _, err, calls = self.check('--payloads', str(link))
+        self.assertEqual((code, calls), (2, []))          # refused before any endpoint call
+        self.assertIn('symbolic link', err)
+        self.assertEqual(victim.read_text(encoding='utf-8'), 'keep me\n')
+        self.assertTrue(link.is_symlink())
+
+    def test_a_transport_failure_stops_recording_and_says_how_to_resume(self):
+        self.commit()
+        listing = self.endpoint()
+
+        def flaky(action, args):
+            if args[0] == 'verify':
+                raise RuntimeError('SSH failed (255); outcome may be uncertain.')
+            return listing(action, args)
+        code, out, err, _ = self.check('--record', request=flaky)
+        payload = json.loads(out)
+        self.assertEqual(code, 0)
+        self.assertEqual([row.get('recorded') for row in payload['capabilities']],
+                         ['uncertain', 'not-run', 'not-recordable'])
+        self.assertIn('re-run the same command', err)
 
 
 class EndpointDispatchTests(unittest.TestCase):
@@ -177,6 +396,30 @@ class EndpointDispatchTests(unittest.TestCase):
         self.assertEqual(self.execute(['find', 'reserved label guard'])['candidates'][0]['key'],
                          'review.structured-contribution')
         self.assertEqual(self.execute(['find', '--help'])['action'], 'capability')
+        self.assertEqual((self.locks.call_count, self.guarded), (0, []))
+
+    def test_verify_is_a_locked_guarded_write_that_is_never_verified(self):
+        payload = {k: v for k, v in entry().items() if k != 'operation'}
+        self.execute(['propose', '@attachment:0'], {'0': {'flag': '--file', 'text': json.dumps(payload)}})
+        item = self.execute(['list', '--pointers'])['items'][0]
+        check = {'schema_version': 1, 'key': item['key'], 'revision': item['revision'],
+                 'record_sha256': item['record_sha256'], 'commit': '1' * 40, 'checked_at': '2026-10-01T12:00:00Z',
+                 'source': 'ast', 'graph_built_at_commit': None,
+                 'tool': {'name': 'orchestra-capability-check', 'version': '0.1.0'},
+                 'results': [{'pointer': pointer, 'resolved': True, 'reason': None}
+                             for pointer in item['code'] + item['tests'] + item['anchors']], 'passed': True}
+        self.locks.reset_mock()
+        self.guarded.clear()
+        # The caller names the allowlisted operator as its actor: still an unverified report.
+        done = self.execute(['verify', '@attachment:0'], {'0': {'flag': '--file', 'text': json.dumps(check)}},
+                            actor=OPERATOR)
+        self.assertEqual((done['identity'], done['passed'], done['reconciled']), ('unverified', True, False))
+        self.assertEqual((self.locks.call_count, self.guarded), (1, ['capability']))
+        self.locks.reset_mock()
+        self.guarded.clear()
+        view = self.execute(['get', item['key']])
+        self.assertEqual((view['verification']['state'], view['verification']['verified_at']), ('reported', None))
+        self.assertEqual(self.execute(['list'])['items'][0]['verification'], 'reported')
         self.assertEqual((self.locks.call_count, self.guarded), (0, []))
 
 
