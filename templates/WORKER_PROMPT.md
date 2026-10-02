@@ -67,7 +67,7 @@ self-contained plan before editing. Follow any additional launch gate. Do not
 claim another task until this one has been delivered.
 
 Check the capability record before searching the checkout by hand:
-1. Run `capability lookup "<phrase>"` with your `--config` and `--project`, so the
+1. Run `capability lookup "<phrase>"` with your `--config`, `--project` and `--actor`, so the
    recorded capabilities are included. An exact record marked `trust: accepted`, with
    pointers that are `live: resolved`, is the answer.
 2. On a miss, use the code `candidates` it returned, then search the checkout.
