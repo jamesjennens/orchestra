@@ -55,6 +55,9 @@ history](#malformed-structured-history) (`void-record`).
 | `requirement-apply PROJECT --actor ACTOR --file record.json` | write an accepted requirement revision, or move an accepted record back to draft | the payload's `acceptance` object (named owners/approvers, policy, decision id, evidence) and the deployment operator allowlist |
 | `requirement-backfill PROJECT --actor ACTOR --file backfill.json` | add the controlled requirement type/state labels to records created before this route | an `evidence` pointer for an entry that becomes `accepted`, and the deployment operator allowlist |
 | `requirement-reconcile PROJECT --operation-id ID --actor ACTOR --disposition ...` | finish a requirement operation whose real write was uncertain | confirmation of the native record state |
+| `reference-apply PROJECT --actor OPERATOR --file acceptance.json` | accept a reference catalog entry: the payload names the newest draft `revision` and its `record_sha256`, and the command writes the next revision as accepted, after the F3 evidence (`operation: "draft"` with full content writes a direct accepted revision 1) | the deployment operator allowlist, checked before any write, and F3 evidence (`acceptance`: owners, approvers, policy, decision id, evidence) |
+| `reference-reconcile PROJECT --operation-id ID --actor ACTOR --reason TEXT --disposition ...` | finish a reference operation whose real write was uncertain; `complete` needs `--issue-id` and refuses an anchor that has no revision record yet (re-run the original `ref propose` with its `operation_id` first) | confirmation of the native record state |
+| `record-reconcile PROJECT --kind requirement\|reference ...` | the same reconcile for either record kind | as above |
 | `void-record PROJECT --actor OPERATOR --file void.json` | void a malformed or stale contribution-review record | the deployment operator allowlist (`operators` in `deployment.private.json`) |
 | `handoff PROJECT --actor ACTOR --file handoff.json` | transfer a claim when the current owner cannot act | an owner decision/evidence pointer in the payload's `approval` |
 
@@ -137,6 +140,30 @@ Restore compatibility, exactly:
 - **Older backups:** this kit restores backups made by older kits normally. Those backups carry none of the journals, so at most idempotency receipts are missing.
 
 This kit is therefore the oldest one a deployment may roll back to once any of those records exist.
+
+**Acceptance evidence trusts the comment's native author.** A reference entry reads
+accepted when its acceptance evidence comment was written by an actor on the operator
+allowlist. Over SSH a comment's author is the actor the caller declared, so what stops
+a contributor writing such a comment is the reserved-prefix guard (the shared slice 0),
+not the author field.
+
+- **Residual risk.** A `Kind: reference-acceptance-v1` comment written on a kit older
+  than the shared slice 0, or during a rollback below it, under an operator's actor
+  name, would read as a real acceptance. The same applies to the other record kinds.
+- **Why acceptance is not bound to the host receipt.** Reading an accepted entry must
+  not depend on a local journal: a restore may lose `.reference-requests/`, and the
+  evidence comment has to remain the authority.
+- **Before the first use of the catalog on an installation,** and after any rollback
+  below the shared slice 0, scan each project for record comments that no writer of
+  this kit made. Save `bd export --all` for the project as `export.jsonl`, then run:
+
+  ```sh
+  python3 -c "import json,sys;K=('Kind: reference-','Kind: requirement-proposal-','Kind: proposal-disposition-','Kind: contribution-settings-','Kind: capability-');[print(r['id'],c.get('id'),c.get('author'),c['text'].splitlines()[0]) for r in map(json.loads,sys.stdin) for c in r.get('comments') or [] if isinstance(c.get('text'),str) and c['text'].startswith(K)]" < export.jsonl
+  ```
+
+  It prints nothing on a project that has never used the catalog. Any line it prints
+  on such a project is a comment to void or investigate before you rely on the catalog.
+  The coordinator ran this scan on all seven live projects on 2026-10-02 and found none.
 
 A row is hidden as a record anchor only when it carries one of the labels `reference`, `proposal`, `contribution-settings` or `capability` **and** a v1 record comment of the same family. A project's own task that merely uses one of those words as a label (for example jjbp-j03.20's `proposal`) stays visible and editable.
 

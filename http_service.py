@@ -85,6 +85,8 @@ ATTACHMENT_MEDIA_TYPES = ('text/plain', 'text/markdown')
 # hyphens and dots (``kittrial-5bb.19``), which the original ``[A-Za-z0-9_]+``
 # rejected. The first character must be alphanumeric, so ``.``/``..`` never match.
 ID = r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}'
+# A reference catalog key (reference_records.KEY): lowercase and dotted.
+REFERENCE_KEY = r'[a-z][a-z0-9]*(?:\.[a-z0-9][a-z0-9-]*)+'
 SAFE_ID = re.compile(r'^' + ID + r'$')
 REQUEST_ID = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
 IDEMPOTENCY_KEY = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$')
@@ -664,6 +666,15 @@ class InProcessBackend:
         return {'feedback': record}
 
     # -- reads (no canonical mutation) ----------------------------------------
+    def references(self, project_id, options):
+        """The reference catalog (.41 slice 1): the in-process backend holds no native
+        records, so its catalog is honestly empty."""
+        return {'schema_version': 1, 'total': 0, 'items': [], 'next_offset': None,
+                'coverage': 'the in-process backend holds no native reference records'}
+
+    def reference(self, project_id, key):
+        raise not_found('Reference not found')
+
     def read_tasks(self, project_id):
         """One full canonical snapshot of every in-project row.
 
@@ -1103,6 +1114,35 @@ class EndpointBackend:
         """
         return [row for row in rows
                 if not isinstance(row, dict) or row.get('project_id') in (None, project_id)]
+
+    def references(self, project_id, options):
+        """One page of the reference catalog through the endpoint's read-only `ref list`."""
+        args = ['list', '--limit', str(options['limit']), '--offset', str(options['offset'])]
+        for tag in options.get('tags') or []:
+            args += ['--tag', tag]
+        for name in ('owner', 'state', 'due'):
+            if options.get(name):
+                args += ['--' + name, options[name]]
+        return self._ref_read(project_id, args)
+
+    def reference(self, project_id, key):
+        """One entry through `ref get`; an unknown or unfinished key is a 404."""
+        return self._ref_read(project_id, ['get', key], missing=True)
+
+    def _ref_read(self, project_id, args, missing=False):
+        reply = self._endpoint('ref', project_id, self.actor_namespace + '/read', args)
+        code = reply.get('returncode') if isinstance(reply, dict) else None
+        stderr = (reply.get('stderr') or '') if isinstance(reply, dict) else ''
+        if code == 2 and 'Unknown action' in stderr:
+            raise not_implemented('The canonical endpoint is older than this HTTP service and has '
+                                  'no reference catalog; install the same kit for both')
+        if code == 2 and missing and ('Unknown reference key' in stderr
+                                      or 'no revision record yet' in stderr):
+            raise not_found('Reference not found')
+        payload = self._checked(reply)
+        if not isinstance(payload, dict):
+            raise uncertain('Canonical reference read returned an unexpected shape')
+        return payload
 
     def read_tasks(self, project_id):
         """One full canonical read of a project: the single-read seam.
@@ -2612,6 +2652,38 @@ class ApiHandler(BaseHTTPRequestHandler):
         (PATCH, claim, checkpoints, reviews) refuse it the same way (kittrial-5bb.64)."""
         if is_record_anchor(row):
             raise not_found('Task not found')
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/references')
+    def references_list(self, ctx):
+        """The reference catalog (.41 slice 1), read-only at CAP_READ.
+
+        Query: `tag` (comma-separated, all must match), `owner`, `state`, `due`, `limit`
+        and the page `cursor`. Statements are untrusted text: they are returned as data
+        and never placed in an error body or an audit record.
+        """
+        self._project(ctx, CAP_READ)
+        limit, state = self._page(ctx, ctx.query)
+        args = ['--limit', str(limit), '--offset', str(state['o'])]
+        for tag in [t for t in (ctx.query.get('tag') or '').split(',') if t]:
+            args += ['--tag', tag]
+        for name in ('owner', 'state', 'due'):
+            if ctx.query.get(name):
+                args += ['--' + name, ctx.query[name]]
+        import reference_records
+        try:
+            options = reference_records.parse_list_options(args)
+        except ValueError as error:
+            raise invalid(str(error).replace('ref list: ', ''))
+        result = dict(self.backend.references(ctx.params['pid'], options))
+        result['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query,
+                                             state['o'] + limit)
+                                 if result.get('next_offset') is not None else None)
+        return 200, result
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/references/(?P<key>' + REFERENCE_KEY + r')')
+    def references_get(self, ctx):
+        self._project(ctx, CAP_READ)
+        return 200, self.backend.reference(ctx.params['pid'], ctx.params['key'])
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/brief')
     def tasks_brief(self, ctx):

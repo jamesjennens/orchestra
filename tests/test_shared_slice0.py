@@ -825,12 +825,16 @@ class NoWriterTests(unittest.TestCase):
     """Slice 0 writes nothing: no kit module but the guard names a record prefix, and
     the record journals are only ever read (backup) or validated (restore)."""
 
-    def test_only_the_guard_knows_the_record_prefixes(self):
+    def test_only_the_guard_and_the_landed_writers_know_the_record_prefixes(self):
+        # The .41 slice 1 writer (kittrial-5bb.66) owns the reference family; the
+        # proposal, settings and capability families have no writer yet.
+        writers = {'reference_records.py': ('Kind: reference-',)}
         offenders = []
         for path in sorted(KIT.glob('*.py')):
             text = path.read_text(encoding='utf-8')
             for marker in RECORD_MARKERS + tuple(prefix.strip() for prefix in PREFIX_WRITERS):
-                if marker in text and path.name != 'reserved_comments.py':
+                if marker in text and path.name != 'reserved_comments.py' \
+                        and not marker.startswith(writers.get(path.name, ('\0',))):
                     offenders.append((path.name, marker))
         self.assertEqual(offenders, [])
 

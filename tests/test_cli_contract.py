@@ -134,7 +134,10 @@ class WorkHelpContractTests(unittest.TestCase):
 
     def test_brief_shape_is_backward_compatible(self):
         result = briefing.brief(rows(), PROJECT, TASK)
-        self.assertEqual(set(result), BRIEF_FIELDS)
+        # Every v1 field stays; the only additions are the documented, additive
+        # reference-review attention fields (kittrial-5bb.66, .41 7.1).
+        self.assertLessEqual(BRIEF_FIELDS, set(result))
+        self.assertEqual(set(result) - BRIEF_FIELDS, {'attention', 'attention_total', 'attention_more'})
 
 
 class CheckpointErrorContractTests(unittest.TestCase):

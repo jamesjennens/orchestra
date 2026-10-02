@@ -720,6 +720,21 @@ the pilot phase, not part of this service.
   a row past its bound, has `review_state: null` and no next action, and the list
   reports `review_states_complete: false`; it never guesses "claim" or "deliver" for
   work that may be under review.
+- **Reference catalog reads.** The routes are `GET /v1/projects/{id}/references` and
+  `GET /v1/projects/{id}/references/{key}`, available to any project member
+  (`CAP_READ`). They are the .41 slice 1, kittrial-5bb.66.
+  - **Canonical binding:** they map the endpoint's read-only `ref list` and `ref get`.
+  - **List query:** `tag` (comma-separated, all must match), `owner`, `state`, `due`,
+    `limit` and `cursor`. A bad filter is a `422` before any canonical read.
+  - **404:** an unknown key, or an entry left without a record by an interrupted
+    propose.
+  - **In-process backend:** it holds no native records, so its catalog is empty.
+  - **Read-only:** there are no HTTP writes; proposals use the client and acceptance
+    uses `admin.py reference-apply`.
+  - **Untrusted text:** a statement is returned as data and never placed in an error
+    body or an audit record.
+  - **No web view yet:** when one is added, it must render statements as plain text,
+    never through `markdown()`.
 - **`GET /v1/me/work` cost.** On the canonical binding each project costs one bounded
   `work` walk (up to 10 subprocess reads of 100 rows), for at most 50 of the caller's
   projects. The same principal's read of a project is reused for 20 seconds

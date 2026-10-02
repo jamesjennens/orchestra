@@ -123,8 +123,8 @@ not just a suffix.
 
 ## Command help
 
-`work`, `review`, `handoff`, `brief`, `history`, `checkpoint` and `capability` answer
-`-h`/`--help` on stdout with exit code `0`:
+`work`, `review`, `handoff`, `brief`, `history`, `checkpoint`, `capability` and `ref`
+answer `-h`/`--help` on stdout with exit code `0`:
 
 ```sh
 b work --help
@@ -135,6 +135,7 @@ b history --help
 b checkpoint --help
 b capability --help
 b capability lookup --help
+b ref --help
 ```
 
 Help recognition is uniform: `-h`/`--help` is honoured wherever it appears as a
@@ -175,6 +176,27 @@ record's comment ID**, not a Git SHA and not `latest_comment_id`), `commit`,
 `integrated`; `workflow_state` keeps the raw workflow state. See
 [REVIEWS.md](REVIEWS.md) for their meaning.
 
+`work` also returns an additive `attention.reference_review` block. It is computed
+over the whole project, whatever the task filters, from the export `work` already
+reads.
+
+- **Counts, always:**
+  - `expired` and `due_soon`, for accepted reference entries;
+  - `unset`, for draft-only entries;
+  - `acceptance_inert`, for entries whose acceptance evidence was written by an
+    actor who is not on the allowlist (a removed operator, or one who never was);
+  - `malformed`;
+  - `total`.
+- **`items`** are returned only to an approver, which on the SSH route means an actor
+  on the deployment operator allowlist.
+  - Each item has `key`, `review_by`, `due`, `owner`, `state` and `revision`, plus
+    `inert_operator` on an inert entry.
+  - Inert entries come first, then expired, then due-soon.
+  - Items are paged by `--ref-limit` (1..100) and `--ref-offset`.
+- **Other callers** get `items: []` with `truncated: true` and a `coverage` note.
+  - An entry owner sees their own entries with `ref list --owner IDENTITY`.
+  - Draft entries are listed by `ref list --state draft-only`.
+
 `show TASK --json` returns native issue rows. `comments TASK --json` returns native
 comment rows. In raw rows a task's `assignee` is a plain string; in briefing/history
 views identity and authorship become excerpt objects (below).
@@ -193,6 +215,18 @@ objects**:
 a bare string; treat `omitted_chars > 0` as "read `show`/`history` for the full value".
 Opaque cursor fields (`activity_cursor`, `next_cursor`) are never excerpted: they are
 complete tokens.
+
+`brief` adds an `attention` array of at most 3 `reference-review` items, plus
+`attention_total` and `attention_more`.
+
+- **Selection:** entries tagged with one of the task's labels, plus expired and
+  due-soon entries, with expired first.
+- **Each item** has `key`, `due`, `review_by`, `trust` (`accepted`), `title` (an
+  excerpt object), `text` and `source` (`ref get KEY`).
+- **`text`** is server-derived from the key, the due class and the date. It never
+  includes the entry's statement.
+- **Separate from open items.** These items are not checkpoint items, and reading a
+  brief changes nothing.
 
 `brief` decodes unresolved items as `open_items[]` with `id`, `kind`, `text`, `source`;
 `history` pages entries with `entry_id`, `body`, `body_offset`, `body_total_chars` and
@@ -341,6 +375,112 @@ paragraph separators, is written as a `\u` escape.
 Recorded capability records, alias proposals and a recorded drift check are designed
 separately. The entry shape and pointer syntax here are what they are meant to feed.
 
+## `ref`: the reference catalog
+
+The reference catalog holds operational facts and their authority: what is
+authoritative for X, where it lives, and when it must be checked again. It is
+described in [the reference catalog design](REFERENCE_CATALOG_DESIGN.md); slice 1
+ships the commands below.
+
+```sh
+b ref get calendar.trading --json
+b ref list --tag data --state accepted --due expired --limit 20 --json
+b ref propose --file entry.json --json
+b ref revise --file entry.json --json
+```
+
+**Reading.** `ref get` and `ref list` are read-only. They take no coordination lock and
+never read more than they need:
+- `ref get` reads only its own key: one `bd list` by the key's lookup label and one
+  `bd show` of that row. Its cost does not grow with the catalog.
+- `ref list` reads the catalog in two native reads: one `bd list --label reference`,
+  then one `bd show --include-comments` for up to 20 entries, or one `bd export --all`
+  above that.
+- `ref propose`, `revise` and acceptance read only their own key before writing.
+
+- **`ref get KEY`** returns these fields:
+  - `key`, `state` and `native_id`.
+  - `record`: the newest accepted revision. Its `title` and `statement` are excerpt
+    objects.
+  - `record_comment_id`.
+  - `acceptance`: the F3 decision. Its `operator` is the allowlisted actor taken from
+    the evidence comment's **native author**.
+  - `acceptance_inert` and `inert_operator`.
+  - `proposed`: the newest draft after `record`, with `proposed_comment_id`.
+  - `due`: `ok`, `due-soon`, `expired` or `unset`.
+  - `replaces` (`[]` in slice 1) and `resolved` (`null`).
+  - `warnings`, `trust` and `coverage`.
+- **`ref get` states:**
+  - `state` is `accepted`, `draft-only`, `malformed` or `unsupported`.
+  - A `draft-only` entry is **not** authoritative.
+  - An unknown key, or a key whose anchor has no record yet, exits nonzero and names
+    the key.
+- **`ref list`** returns `{total, items, next_offset, coverage}`, one row per key.
+  - Rows are ordered expired, due-soon, unset, then ok, and by key within each.
+  - Each row has `key`, `title` (at most 200 characters), `state`, `owner`,
+    `review_by`, `proposed_review_by`, `due`, `tags`, `revision`, `native_id` and
+    `acceptance_inert`.
+  - Options: `--tag` (repeatable; all tags must match), `--owner IDENTITY`,
+    `--state draft-only|accepted|superseded|all`, `--due expired|due-soon|unset`,
+    `--limit` and `--offset`.
+- **Failures stay per entry.** A malformed entry, an unsupported newer record kind
+  (`Kind: reference-entry-v2`), or an anchor left without its record by an interrupted
+  propose fails only itself.
+  - `coverage` names such entries, with at most 10 anchor ids.
+  - A read never fails the whole catalog.
+  - **No repair yet.** The design (section 3.7) names the operator's `void-record` as
+    the repair for a malformed entry, but that is not available yet:
+    `recovery.KIND_PREFIXES` does not list the reference record kinds, so a reference
+    comment cannot be voided. Until a follow-up adds them, a malformed entry stays
+    isolated as `malformed`.
+
+**Writing.** `ref propose` and `ref revise` take a closed JSON payload. The command
+sets `operation`.
+
+```json
+{"schema_version": 1, "operation_id": "alex-ref-1", "key": "calendar.trading",
+ "title": "Trading calendar authority",
+ "statement": "Charts derive holidays and early closes from the pinned calendar module.",
+ "authority": {"type": "repo-path", "path": "src/example/calendar.py",
+               "commit": "0000000000000000000000000000000000000000", "anchor": "HOLIDAYS"},
+ "owner": "account:u-0001", "review_by": "2027-01-15", "tags": ["calendar", "data"],
+ "decisions": [], "revision": 1, "expected_sha256": null}
+```
+
+- **Fields:**
+  - `key`: lowercase dotted, at most 80 characters.
+  - `title`: at most 200 characters.
+  - `statement`: at most 2,000 characters. It is untrusted text, and it never
+    appears in an error.
+  - `authority`: a `repo-path` (a relative path with no `..`, an optional 40-hex
+    `commit` and an optional `anchor`) or a `url` (`https` only, no userinfo, with a
+    `retrieved` date no later than today).
+  - `owner`: `account:<uid>` or `person:<name>`. A session actor is refused.
+  - `review_by`: a real date at most 24 months ahead.
+  - `tags`: at most 12 lowercase slugs.
+  - `decisions`: each must be an issue of type `decision` or labelled `decision`.
+- **Caller-written fields are refused.** `acceptance_state`, `successor`, `sha256`,
+  `acceptance` and `labels` are written by the operation.
+- **`propose`** creates the entry's native anchor, closes it and posts revision 1 as a
+  draft.
+  - A duplicate key is refused before any write.
+  - So is a key whose lookup label collides with another key's, such as `a.b-c` and
+    `a.b.c`.
+- **`revise`** is compare-and-swap.
+  - `revision` must be the next number, and `expected_sha256` the newest revision's
+    `sha256`.
+  - On an accepted entry it adds a draft. The accepted revision is unchanged until an
+    operator accepts the draft.
+- **The result** is `{key, revision, native_id, record_comment_id, state, created,
+  reconciled}`.
+- **Retries.** `operation_id` makes a retry idempotent.
+  - A retry also finishes an anchor that an interrupted propose left without its
+    record.
+  - A different operation proposing that key is refused until then.
+
+Acceptance is not a client command. It is the operator's
+`admin.py reference-apply` ([operations](OPERATIONS.md#operator-commands)).
+
 ## IDs and cursor roles
 
 - **Native task ID**: `task`/`items[].task`/the positional argument to `show`, `brief`,
@@ -369,6 +509,8 @@ a clear refusal, not a wrong read.
 | `work` | `--limit`, `--handoff-limit` | 1..100 |
 | `work` | `--offset`, `--handoff-offset` | >= 0 |
 | `work` | `--state` | one of the documented review states |
+| `work` | `--ref-limit` / `--ref-offset` | 1..100 (default 20) / >= 0 |
+| `brief` | `attention` | at most 3 items |
 | `brief` | `--items-offset` | >= 0 |
 | `brief` | `--items-limit` | 1..10 |
 | `history` | `--limit` | 1..20 |
@@ -392,6 +534,11 @@ a clear refusal, not a wrong read.
 | `capability` | Markdown | heading lines over 1,000 characters are text; a summary is looked for in the 40 lines after its heading |
 | `capability` | entry `aliases` / `tests` / `related` | first 8 shown; `tests_total` / `related_total` count all |
 | `capability` | entry `name` / `summary` | excerpt objects of <= 120 / <= 200 characters |
+| `ref list` | `--limit` / `--offset` | 1..100 (default 20) / >= 0 |
+| `ref` | `key` / `title` / `statement` | <= 80 / <= 200 / <= 2,000 characters |
+| `ref` | `tags` / `review_by` | <= 12 slugs of <= 32 characters / at most 24 months ahead |
+| `ref` | `authority.url` | `https`, no userinfo, <= 2,048 characters |
+| `ref` | due-soon window | 30 days (fixed in slice 1) |
 
 Out-of-range values fail with a nonzero exit code and an error that names the option or
 field **and** the limit, for example:
