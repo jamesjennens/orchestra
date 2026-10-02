@@ -795,6 +795,36 @@ def list_entries(rows, options, operators):
                                                            'newest draft when none is accepted')}
 
 
+def _exact_phrases(entry):
+    """(names, accepted aliases): the normalised phrases `find` matches exactly for one entry.
+
+    The names are the key and the name of the revision a reader describes (the accepted
+    one, else the newest draft); the aliases are those of the accepted revision only.
+    """
+    record = _newest(entry) or {}
+    names = {normalize(entry['key']), normalize(record.get('name') or '')}
+    accepted_aliases = {normalize(item) for item in ((entry.get('record') or {}).get('aliases') or [])}
+    return names, accepted_aliases
+
+
+def exact_index(rows, operators):
+    """{normalised phrase: [{key, trust}]}: every phrase `find` would now match exactly.
+
+    The same rule as `find` (`_exact_phrases`), over every readable entry, accepted
+    records first. `capability misses` uses it to mark the misses that now resolve.
+    """
+    entries, _ = catalog(rows, operators)
+    index = {}
+    for entry in sorted((entry for entry in entries if entry['state'] not in ('malformed', 'unsupported')),
+                        key=lambda entry: (entry['record'] is None, entry['key'])):
+        names, accepted_aliases = _exact_phrases(entry)
+        for phrase in sorted(names | accepted_aliases):
+            if phrase:
+                index.setdefault(phrase, []).append({'key': entry['key'],
+                                                     'trust': 'accepted' if entry['record'] else 'draft'})
+    return index
+
+
 def find(rows, phrase, operators, limit=5):
     """`capability find PHRASE`: records only, scored like .61's lookup (.60 section 7).
 
@@ -818,8 +848,7 @@ def find(rows, phrase, operators, limit=5):
         if entry['state'] in ('malformed', 'unsupported'):
             continue
         record = _newest(entry) or {}
-        names = {normalize(entry['key']), normalize(record.get('name') or '')}
-        accepted_aliases = {normalize(item) for item in ((entry.get('record') or {}).get('aliases') or [])}
+        names, accepted_aliases = _exact_phrases(entry)
         if text == entry['key'] or key in names | accepted_aliases:
             exact.append(entry)
             continue
@@ -867,10 +896,14 @@ def help_payload():
     return {'schema_version': 1, 'action': 'capability', 'contract': 'cli-contract-v1',
             'usage': ['capability get KEY', 'capability list [--tag TAG]... [--owner IDENTITY] '
                       '[--state draft-only|accepted|superseded|all] [--limit N] [--offset N]',
-                      'capability find PHRASE [--limit N]', 'capability propose --file entry.json',
+                      'capability find PHRASE [--limit N]', 'capability misses [--limit N]',
+                      'capability propose --file entry.json',
                       'capability revise --file entry.json',
                       'capability propose-alias KEY PHRASE [--evidence POINTER]'],
             'local': ['capability lookup PHRASE', 'capability resolve POINTER...', 'capability index'],
+            'telemetry': 'Each find is counted per project, and a find with no exact match also records its '
+                         'normalised phrase, a count and first/last seen times; no actor is stored. Read it '
+                         'with capability misses.',
             'limits': {'find_limit': list(FIND_LIMIT), 'phrase': PHRASE_MAX, 'name': NAME_MAX,
                        'summary': SUMMARY_MAX, 'alias': ALIAS_MAX, 'pointer': POINTER_MAX,
                        'code': CODE_MAX, 'tests': TESTS_MAX, 'anchors': ANCHORS_MAX,
@@ -916,7 +949,11 @@ WRITE_COMMANDS = CONTRIBUTOR_OPERATIONS + ('propose-alias',)
 
 
 def read(args, run, operators):
-    """`capability get|list|find|--help`: read-only, one label-filtered read, no lock."""
+    """`capability get|list|find|--help`: read-only, one label-filtered read, no lock.
+
+    `capability misses` is answered by the endpoint itself (it needs the project
+    directory): see capability_misses.
+    """
     if not args or args[0] == 'help' or any(token in ('--help', '-h') for token in args):
         return help_payload()
     command, rest = args[0], args[1:]
@@ -941,7 +978,8 @@ def read(args, run, operators):
             raise ValueError('capability find takes a PHRASE')
         phrase, options = rest[0], _options(rest[1:], {'--limit': 'limit'})
         return find(read_rows(run), phrase, operators, limit=options['limit'] if '--limit' in rest else 5)
-    raise ValueError('capability: unknown command %s; use get, list, find, propose, revise or propose-alias'
+    raise ValueError('capability: unknown command %s; use get, list, find, misses, propose, revise or '
+                     'propose-alias'
                      % command)
 
 

@@ -177,7 +177,15 @@ class EndpointDispatchTests(unittest.TestCase):
         self.assertEqual(self.execute(['find', 'reserved label guard'])['candidates'][0]['key'],
                          'review.structured-contribution')
         self.assertEqual(self.execute(['find', '--help'])['action'], 'capability')
-        self.assertEqual((self.locks.call_count, self.guarded), (0, []))
+        # No read takes the coordination lock (a file object here) or writes a journal row.
+        # The one flock a find may make is the lookup-miss log's own (kittrial-5bb.77): a
+        # descriptor of .capability-misses.lock, never blocking, where the platform has flock.
+        coordination = [call for call in self.locks.call_args_list if not isinstance(call.args[0], int)]
+        telemetry = [call for call in self.locks.call_args_list if isinstance(call.args[0], int)]
+        self.assertEqual((coordination, self.guarded), ([], []))
+        self.assertLessEqual(len(telemetry), 1)
+        self.assertTrue(all(call.args[1] & self.endpoint.fcntl.LOCK_NB for call in telemetry))
+        self.assertEqual((self.project / '.capability-misses.lock').exists(), bool(telemetry))
 
 
 class OperatorCommandTests(unittest.TestCase):

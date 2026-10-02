@@ -209,6 +209,7 @@ def execute(root,request,authority_config=None,require_authority=False):
     if action=='capability':
         # The capability index (.60 slice 1a, kittrial-5bb.67). get, list, find and help
         # are reads (one label-filtered bd list plus bd show; no lock, not run_guarded);
+        # misses is a read of the lookup-miss log (capability_misses), which find feeds;
         # propose, revise and propose-alias are writes, under the lock and the journal.
         # lookup, resolve and index never reach the endpoint: they run in the client.
         import capability_records
@@ -220,7 +221,24 @@ def execute(root,request,authority_config=None,require_authority=False):
             if warnings:run_warnings.append(warnings)
             return stdout
         if not args or args[0] not in capability_records.WRITE_COMMANDS:
+            if args[:1]==['misses'] and not any(token in ('--help','-h') for token in args):
+                # The lookup-miss log (kittrial-5bb.77): read-only, no lock, not run_guarded.
+                # It reads the telemetry file, and the records once (only when the log holds
+                # a phrase) to mark the misses that would now resolve. ASCII-escaped: the
+                # phrases are untrusted text.
+                import capability_misses
+                limit=capability_misses.options(args[1:])['limit']
+                result=capability_misses.report(path,lambda:capability_records.exact_index(capability_records.read_rows(run),configured_operators(root)),limit)
+                return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=True)+'\n','stderr':''.join(run_warnings)}
             result=capability_records.read(args,run,configured_operators(root))
+            if args[:1]==['find'] and isinstance(result,dict) and isinstance(result.get('found'),bool):
+                # Telemetry (kittrial-5bb.77): count the find and, with no exact match, its
+                # normalised phrase. Its own non-blocking lock file, never .coordination.lock;
+                # no bd call, no subprocess, no journal row; it cannot fail or delay the read.
+                try:
+                    import capability_misses
+                    capability_misses.record_find(path,result.get('normalized'),result['found'])
+                except Exception:pass
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
         operators=configured_operators(root)
         runner=NativeRunner(run)
