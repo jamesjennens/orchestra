@@ -828,12 +828,13 @@ class NoWriterTests(unittest.TestCase):
     def test_only_the_guard_and_the_landed_writers_know_the_record_prefixes(self):
         # The .41 slice 1 writer (kittrial-5bb.66) owns the reference family; the .60
         # slice 1a writer (kittrial-5bb.67) owns the capability entry, acceptance and
-        # alias records. Capability verification (slice 1b), proposals and settings
-        # have no writer yet.
+        # alias records; the slice 1b writer (kittrial-5bb.69) owns capability
+        # verification. Proposals and settings have no writer yet.
         writers = {'reference_records.py': ('Kind: reference-', 'Kind: reference-entry-v1',
                                             'Kind: reference-acceptance-v1'),
                    'capability_records.py': ('Kind: capability-', 'Kind: capability-entry-v1',
-                                             'Kind: capability-acceptance-v1', 'Kind: capability-alias-v1')}
+                                             'Kind: capability-acceptance-v1', 'Kind: capability-alias-v1'),
+                   'capability_verification.py': ('Kind: capability-', 'Kind: capability-verification-v1')}
         offenders = []
         for path in sorted(KIT.glob('*.py')):
             text = path.read_text(encoding='utf-8')

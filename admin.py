@@ -311,6 +311,74 @@ def stored_operators(cfg):
     elif not isinstance(value,list):raise ValueError('deployment operators must be a list of actor identities')
     return [identity(item,'Invalid operator identity in the deployment allowlist') for item in value]
 
+def verifiers(root, strict=False):
+    """Server-side `verifiers` list for capability verifications (.60 section 5.2).
+
+    A second, narrow deployment-wide authority beside `operators`: an actor listed here
+    may record a capability check that readers count as `verified`
+    (`capability-verify`), and nothing else. `deployment.private.json`'s `verifiers` is
+    the single authority source, and the list is empty by default. Like `operators`,
+    `ORCHESTRA_VERIFIERS` is never an authority source: with `strict=True` (host-side
+    write commands) a shell value that disagrees with the file is refused loudly.
+    """
+    found=[]
+    marker=root/'deployment.private.json'
+    if marker.is_file():
+        value=json.loads(marker.read_text()).get('verifiers')
+        if isinstance(value,list):found.extend(value)
+        elif isinstance(value,str):found.append(value)
+        elif value is not None:raise ValueError('deployment verifiers must be a list of actor identities')
+    from recovery import configured_operators
+    allowed=configured_operators(found)
+    if strict:
+        shell=configured_operators((os.environ.get('ORCHESTRA_VERIFIERS') or '').replace(',',' ').split())
+        if shell and shell!=allowed:
+            raise ValueError('ORCHESTRA_VERIFIERS is set in this shell but is not an authority source; '
+                             'deployment.private.json verifiers is. Add the actor with `admin.py verifiers add` '
+                             'or unset ORCHESTRA_VERIFIERS before this command.')
+    return allowed
+
+def stored_verifiers(cfg):
+    """The deployment verifiers list as identity strings, normalised like `stored_operators`."""
+    from recovery import identity
+    value=cfg.get('verifiers')
+    if value is None:return []
+    if isinstance(value,str):value=[value]
+    elif not isinstance(value,list):raise ValueError('deployment verifiers must be a list of actor identities')
+    return [identity(item,'Invalid verifier identity in the deployment verifiers list') for item in value]
+
+def revoked_verifications(root,actor,limit=5):
+    """Name the capability verifications one verifier's revocation changes.
+
+    `verifiers remove ACTOR --confirm-revoke` makes every verification that actor
+    recorded read `reported`, and drift that only their passes had cleared reappears.
+    The answer is the difference between each capability's `verification` under the
+    live lists and under the verifiers list without `actor`, read by the reader every
+    other read uses. An actor who is also on the operator allowlist stays trusted, so
+    nothing changes for them. Read-only and best-effort, like `revoked_revert_records`.
+    """
+    import capability_records
+    authority=operators(root);listed=verifiers(root)
+    remaining=frozenset(item for item in listed if item!=actor)
+    changed=[];unreadable=0
+    for name in initialized_projects(root):
+        path=project_dir(root,name)
+        try:
+            rows=[json.loads(line) for line in run_bd(root,name,['export','--all']).splitlines() if line.strip()]
+            entries,_=capability_records.catalog(rows,authority)
+            before=capability_records.Trust(None,authority,listed,path,export_rows=rows)
+            after=capability_records.Trust(None,authority,remaining,path,export_rows=rows)
+            for entry in entries:
+                if entry['state'] in ('malformed','unsupported'):continue
+                was=capability_records.verification_of(entry,before)['state']
+                now=capability_records.verification_of(entry,after)['state']
+                if was!=now:changed.append('%s/%s %s -> %s'%(name,entry['key'],was,now))
+        except (OSError,ValueError,TypeError,KeyError):
+            unreadable+=1
+    changed.sort()
+    shown=', '.join(changed[:limit])+(' (+%d more)'%(len(changed)-limit) if len(changed)>limit else '')
+    return ' (capabilities whose verification changes: %s; projects that could not be read: %d)'%(shown or 'none',unreadable)
+
 def atomic_private_write(path, text):
     """Write a private config file atomically at mode 0600.
 
@@ -1393,8 +1461,10 @@ def backup_project(root,name):
                 # deployment-wide authority, so `restore-new` only re-grants it with an
                 # explicit --restore-operators. Native backup preserves the void comments
                 # and this preserves the record of the authority the reads would need.
+                # The `verifiers` list travels the same way and under the same rule
+                # (--restore-verifiers); older kits ignore the unknown key.
                 record={'schema_version':1,'status':'complete','files':files,
-                        'operators':sorted(operators(root))}
+                        'operators':sorted(operators(root)),'verifiers':sorted(verifiers(root))}
                 # A manifest of the native directory as this generation completed it. A
                 # restore recomputes it and warns when the directory no longer matches, so
                 # a partly rewritten native backup is never paired silently with the
@@ -1952,15 +2022,15 @@ def backup_projects(root,names,all_projects=False):
         raise SystemExit('backup incomplete for: '+' '.join(incomplete)+
                          ' (see %s)'%(root/'backups'/BACKUP_STATUS_NAME))
 
-def validate_coordination_operators(value):
-    """Validate the optional operator snapshot carried by a backup sidecar."""
+def validate_coordination_operators(value,noun='operators'):
+    """Validate the optional operator (or verifier) snapshot carried by a backup sidecar."""
     if value is None:return []
-    if not isinstance(value,list):raise ValueError('Coordination backup operators must be a list')
+    if not isinstance(value,list):raise ValueError('Coordination backup %s must be a list'%noun)
     from recovery import identity
     allowed=[]
     for item in value:
-        try:allowed.append(identity(item,'Invalid operator identity in coordination backup'))
-        except ValueError:raise ValueError('Invalid operator identity in coordination backup') from None
+        try:allowed.append(identity(item,'Invalid %s identity in coordination backup'%noun[:-1]))
+        except ValueError:raise ValueError('Invalid %s identity in coordination backup'%noun[:-1]) from None
     return allowed
 
 def coordination_sidecar_source(root,source):
@@ -2001,6 +2071,7 @@ def coordination_backup(root,source):
         raise ValueError('Incomplete coordination backup; recover/reconcile source first')
     validate_coordination_files(data.get('files'))
     validate_coordination_operators(data.get('operators'))
+    validate_coordination_operators(data.get('verifiers'),'verifiers')
     return data['files']
 
 def coordination_operators(root,source):
@@ -2017,6 +2088,41 @@ def coordination_operators(root,source):
     if data is None:data=complete_sidecar(last_complete_sidecar_path(root,source))
     if data is None:return []
     return validate_coordination_operators(data.get('operators'))
+
+def coordination_verifiers(root,source):
+    """Verifiers list snapshot in a project sidecar, or [] when absent (see `coordination_operators`)."""
+    validate_name(source)
+    bundle=root/'backups'/(source+'.coordination.json')
+    if bundle.is_symlink():return []
+    data=complete_sidecar(bundle)
+    if data is None:data=complete_sidecar(last_complete_sidecar_path(root,source))
+    if data is None:return []
+    return validate_coordination_operators(data.get('verifiers'),'verifiers')
+
+def merge_verifiers(root,actors):
+    """Add missing verifiers to the deployment list; return the added names.
+
+    Additive only, and only ever called by `restore_coordination` when the operator
+    explicitly passed `--restore-verifiers`: the list is deployment-wide authority, so
+    a backup taken before `verifiers remove ACTOR --confirm-revoke` must not silently
+    undo that revocation.
+    """
+    marker=root/'deployment.private.json'
+    if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
+    from recovery import identity
+    wanted=[identity(item,'Invalid verifier identity') for item in actors]
+    cfg=config(root)
+    current=stored_verifiers(cfg)
+    added=[item for item in wanted if item not in current]
+    if not added:return []
+    cfg['verifiers']=current+added
+    atomic_private_write(marker,json.dumps(cfg))
+    return added
+
+def missing_verifiers(root,source):
+    """Verifiers recorded in a project backup sidecar that this host does not list."""
+    listed=verifiers(root)
+    return [item for item in coordination_verifiers(root,source) if item not in listed]
 
 def merge_operators(root,actors):
     """Add missing operators to the deployment allowlist; return the added names.
@@ -2061,7 +2167,7 @@ def using_last_complete_sidecar(root,source):
     fallback=last_complete_sidecar_path(root,source)
     return complete_sidecar(bundle) is None and complete_sidecar(fallback) is not None
 
-def restore_coordination(root,source,destination,restore_operators=False):
+def restore_coordination(root,source,destination,restore_operators=False,restore_verifiers=False):
     from coordination import atomic
     path=project_dir(root,destination)
     files=coordination_backup(root,source)
@@ -2121,18 +2227,29 @@ def restore_coordination(root,source,destination,restore_operators=False):
     # Re-adding entries recorded in the backup is an explicit operator decision
     # (`--restore-operators`), and what it re-grants is reported either way.
     missing=missing_operators(root,source)
-    if not missing:
-        return
-    if not restore_operators:
+    if missing and not restore_operators:
         print('NOT restored: the backup records operator allowlist entries this host does not list: '
               + ', '.join(missing) + '. Restoring them would re-grant deployment-wide authority for every project, '
               'so they stay revoked here and void records they authored stay inert. Re-grant one deliberately with '
               '`admin.py --root ROOT operators add ACTOR`, or re-run this restore with --restore-operators to '
               're-establish the whole recorded allowlist.')
-        return
-    added=merge_operators(root,missing)
-    if added:
-        print('Re-granted operator allowlist entries from the backup (--restore-operators): ' + ', '.join(added))
+    elif missing:
+        added=merge_operators(root,missing)
+        if added:
+            print('Re-granted operator allowlist entries from the backup (--restore-operators): ' + ', '.join(added))
+    # The verifiers list is the second deployment-wide authority (.60 section 5.2) and
+    # follows the same rule: never re-granted by a restore on its own.
+    unlisted=missing_verifiers(root,source)
+    if unlisted and not restore_verifiers:
+        print('NOT restored: the backup records capability verifiers this host does not list: '
+              + ', '.join(unlisted) + '. They stay unlisted here, so capability verifications they recorded read '
+              '`reported`, not `verified`, and drift only their passes had cleared reappears. Re-grant one '
+              'deliberately with `admin.py --root ROOT verifiers add ACTOR`, or re-run this restore with '
+              '--restore-verifiers to re-establish the whole recorded list.')
+    elif unlisted:
+        added=merge_verifiers(root,unlisted)
+        if added:
+            print('Re-granted capability verifiers from the backup (--restore-verifiers): ' + ', '.join(added))
 
 def record_store_path(state):
     """The HTTP record store beside the service state document (``http_auth.Store``)."""
@@ -2243,6 +2360,12 @@ def main():
     a=sub.add_parser('operators');a.add_argument('action',choices=['list','add','remove']);a.add_argument('actor',nargs='?')
     a.add_argument('--confirm-revoke',action='store_true',dest='confirm_revoke',
                    help='with remove: acknowledge that this operator\'s earlier operator voids stop applying')
+    a=sub.add_parser('verifiers',help='the capability verifiers list: actors whose capability-verify records read verified')
+    a.add_argument('action',choices=['list','add','remove']);a.add_argument('actor',nargs='?')
+    a.add_argument('--confirm-revoke',action='store_true',dest='confirm_revoke',
+                   help='with remove: acknowledge that this verifier\'s capability verifications stop reading verified')
+    a=sub.add_parser('capability-verify',help='record verified capability checks (operator allowlist or verifiers list)')
+    a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('backup');a.add_argument('projects',nargs='*',metavar='project')
     a.add_argument('--all',action='store_true',dest='all_projects',
                    help='back up every initialized project in this runtime in one run')
@@ -2259,6 +2382,9 @@ def main():
                    help='explicitly re-grant the operator allowlist entries the backup records that this '
                         'host no longer lists; off by default because the allowlist is deployment-wide '
                         'authority for every project and a stale backup must not undo a revocation')
+    a.add_argument('--restore-verifiers',action='store_true',dest='restore_verifiers',
+                   help='explicitly re-grant the capability verifiers the backup records that this host no '
+                        'longer lists; off by default for the same reason as --restore-operators')
     a=sub.add_parser('reconcile-request');a.add_argument('project');a.add_argument('--request-id',required=True)
     a.add_argument('--actor',required=True);a.add_argument('--reason',required=True)
     a.add_argument('--disposition',choices=['failed','released','complete'],default='released')
@@ -2418,6 +2544,23 @@ def main():
                 else:
                     result=capability_records.apply_native(payload,args.actor,run,path,operator=True,operators=authority)
         print(json.dumps(result))
+    elif args.command=='capability-verify':
+        import contextlib
+        import fcntl
+        import capability_verification
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        payload=json.loads(Path(args.file).read_text(encoding='utf-8-sig'))
+        # Both lists are read strictly: a shell value that disagrees with the file is refused.
+        authority=operators(root,strict=True);listed=verifiers(root,strict=True)
+        def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
+        @contextlib.contextmanager
+        def held():
+            with (path/'.coordination.lock').open('a') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX)
+                yield
+        print(json.dumps(capability_verification.verify_batch(payload,args.actor,run,operators=authority,
+                                                              verifiers=listed,journal=path,lock=held)))
     elif args.command in ('reference-reconcile','capability-reconcile','record-reconcile'):
         import fcntl
         kind={'reference-reconcile':'reference','capability-reconcile':'capability'}.get(args.command) or args.kind
@@ -2483,6 +2626,30 @@ def main():
         else:cfg.pop('operators',None)
         atomic_private_write(marker,json.dumps(cfg))
         print(json.dumps({'operators':current}))
+    elif args.command=='verifiers':
+        marker=root/'deployment.private.json'
+        if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
+        from recovery import identity
+        cfg=config(root)
+        current=stored_verifiers(cfg)
+        if args.action=='list':print(json.dumps({'verifiers':current}));return
+        # Config is the single authority source, exactly as for `operators`.
+        verifiers(root, strict=True)
+        if not args.actor:raise ValueError('verifiers '+args.action+' requires an actor identity')
+        actor=identity(args.actor,'Invalid verifier identity')
+        if args.action=='add':
+            if actor not in current:current.append(actor)
+        else:
+            if not args.confirm_revoke:
+                raise ValueError('verifiers remove revokes ' + actor + ': every capability verification they '
+                                 'recorded reads `reported` instead of `verified`, and drift that only their '
+                                 'passes had cleared reappears' + revoked_verifications(root,actor) +
+                                 ' (re-add restores them). Re-run with --confirm-revoke to acknowledge this.')
+            if actor in current:current.remove(actor)
+        if current:cfg['verifiers']=current
+        else:cfg.pop('verifiers',None)
+        atomic_private_write(marker,json.dumps(cfg))
+        print(json.dumps({'verifiers':current}))
     elif args.command=='backup':backup_projects(root,args.projects,args.all_projects)
     elif args.command=='backup-copy':backup_copy(root,args.destination)
     elif args.command=='backup-repoint':print(json.dumps(repoint_backup(root,args.project),sort_keys=True))
@@ -2548,8 +2715,8 @@ def main():
             # deployment config with --restore-operators would then leave a partial
             # destination behind. `operators(root)` raises for a corrupt value, and
             # --restore-operators needs the config file that merge_operators reads.
-            operators(root)
-            if args.restore_operators and not (root/'deployment.private.json').is_file():
+            operators(root);verifiers(root)
+            if (args.restore_operators or args.restore_verifiers) and not (root/'deployment.private.json').is_file():
                 raise ValueError('Deployment is not installed; run install first')
             add_project(root,args.destination)
             print(run_bd(root,args.destination,['backup','restore',str(backup),'--force']))
@@ -2564,7 +2731,8 @@ def main():
             # clone that was not re-pointed this way.
             run_bd(root,args.destination,['backup','init',str(root/'backups'/args.destination)])
             restore_coordination(root,args.project,args.destination,
-                                 restore_operators=args.restore_operators)
+                                 restore_operators=args.restore_operators,
+                                 restore_verifiers=args.restore_verifiers)
             restored=restore_journal(snapshot,
                                      project_dir(root,args.destination)/JOURNAL_STORE_NAME)
             if restored is None:
