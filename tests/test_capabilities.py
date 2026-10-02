@@ -697,33 +697,49 @@ class GitCheckoutTests(Checkout):
         self.assertIs(result['index']['graph']['stale'], False)
         self.assertEqual(result['warnings'], [])
 
-    def test_a_stale_default_graph_degrades_to_the_ast_result_with_an_actionable_warning(self):
+    def test_a_stale_default_graph_is_still_used_with_an_actionable_warning(self):
         write(self.root, '.gitignore', 'ignored.py\ngraphify-out/\n')
         self.git('commit', '-q', '-a', '-m', 'ignore the graph output')
         head = self.git('rev-parse', 'HEAD')
-        write(self.root, capabilities.DEFAULT_GRAPH, graph_text(commit='0' * 40))
-        warning = ('graph.json is stale (it was built at 000000000000 but the checkout is at %s); %s'
-                   % (head[:12], FALLBACK))
+        graph = self.root / capabilities.DEFAULT_GRAPH
+        warning = ('graph.json is stale (it was built at 000000000000 but the checkout is at %s); '
+                   'results from it may be out of date. Regenerate graphify-out/graph.json, or delete it '
+                   'to use the ast index.' % head[:12])
         found = {'path': 'graphify-out/graph.json', 'built_at_commit': '0' * 40, 'stale': True,
                  'nodes': len(GOOD_NODES), 'links': len(GOOD_LINKS)}
-        for command in (('lookup', 'Engine'), ('lookup', 'render'), ('index',)):
+        commands = (('lookup', 'Engine'), ('lookup', 'render'), ('lookup', 'ghost'), ('index',),
+                    ('resolve', 'web/app.ts::render', 'web/app.ts::missing', 'pkg/core.py::ghost'))
+        for command in commands:
+            write(self.root, capabilities.DEFAULT_GRAPH, graph_text(commit='0' * 40))
             code, result, _, stderr = call(*command, '--repo', str(self.root))
             self.assertEqual((code, stderr), (0, 'warning: %s\n' % warning))
             self.assertEqual(result['warnings'], [warning])
-            self.assertEqual(result['index']['code_source'], 'ast')
+            self.assertEqual(result['index']['code_source'], 'graphify')
             self.assertEqual(result['index']['graph'], found)
-            code, plain, _, _ = call(*command, '--repo', str(self.root), '--source', 'ast')
-            self.assertEqual((code, plain['warnings'], plain['index']['graph']), (0, [], None))
-            result['index']['graph'] = None
-            self.assertEqual(dict(result, warnings=[]), plain)
+            self.assertLessEqual(len(warning), 200)
+            # Asking for the graph by name gives the same answer: only the advice differs.
+            code, asked, _, _ = call(*command, '--repo', str(self.root), '--source', 'graphify')
+            self.assertEqual(code, 0)
+            self.assertEqual(dict(result, warnings=[]), dict(asked, warnings=[]))
+            # So does a graph built at this commit: only what is said about staleness differs.
+            write(self.root, capabilities.DEFAULT_GRAPH, graph_text(commit=head))
+            code, fresh, _, _ = call(*command, '--repo', str(self.root))
+            self.assertEqual((code, fresh['warnings']), (0, []))
+            self.assertEqual(fresh['index']['graph'], dict(found, built_at_commit=head, stale=False))
+            result['index']['graph'] = fresh['index']['graph']
+            self.assertEqual(dict(result, warnings=[]), fresh)
+        write(self.root, capabilities.DEFAULT_GRAPH, graph_text(commit='0' * 40))
         match = self.lookup('Engine')['matches'][0]
-        self.assertEqual(match['source'], 'ast')
-        self.assertNotIn('verified', match)
-        # The graph is not consulted for the files ast cannot read either.
+        self.assertEqual((match['source'], match['verified'], match['line']), ('graphify', True, 5))
+        self.assertFalse(self.lookup('ghost')['matches'][0]['verified'])
         code, result, _, _ = call('resolve', 'web/app.ts::render', '--repo', str(self.root))
-        self.assertEqual((code, result['results'][0]['resolved'], result['results'][0]['reason']),
-                         (0, None, 'unsupported-file-type'))
-        self.assertEqual((result['index']['code_source'], result['warnings']), ('ast', [warning]))
+        self.assertEqual((code, result['results'][0]['resolved'], result['results'][0]['basis']),
+                         (0, True, 'graph'))
+        # Deleting the file is the other way out: the ast index, and nothing to warn about.
+        graph.unlink()
+        result = self.lookup('Engine')
+        self.assertEqual((result['index']['code_source'], result['index']['graph'], result['warnings']),
+                         ('ast', None, []))
 
     def test_a_stale_graph_that_was_asked_for_is_still_used(self):
         graph = write(self.root, capabilities.DEFAULT_GRAPH, graph_text(commit='0' * 40))
@@ -734,7 +750,7 @@ class GitCheckoutTests(Checkout):
             self.assertEqual(result['matches'][0]['source'], 'graphify')
             (warning,) = result['warnings']
             self.assertIn('was built at 000000000000', warning)
-            self.assertNotIn('using the ast index', warning)
+            self.assertIn('Rebuild the graph, or use --source ast.', warning)
 
 
 class ClientRoutingTests(Checkout):

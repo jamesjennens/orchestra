@@ -20,8 +20,8 @@ call runs with optional locks off). Sources:
   repo-relative POSIX paths are accepted, labels are cleaned and bounded, unknown
   shapes are counted and skipped, and nothing in it is executed. A Python match
   taken from the graph is re-checked with ``ast`` before it is returned, and a graph
-  built at another commit is reported as stale. With ``--source auto`` a stale or
-  refused graph is set aside for the ast index, with a warning that says what to do.
+  built at another commit is still used and is reported as stale. With ``--source
+  auto`` a refused graph is set aside for the ast index. Either warning says what to do.
 * Markdown headings are always indexed from the checkout as design anchors.
 
 Text taken from the repository (docstrings, headings, graph labels) is returned as
@@ -61,9 +61,12 @@ GRAPH_MB_MIN, GRAPH_MB_MAX, GRAPH_MB_DEFAULT = 1, 512, 64
 GRAPH_NODES_MAX = 500_000
 GRAPH_LINKS_MAX = 2_000_000
 GRAPH_LABEL_MAX = 1000
-# Appended to the warning whenever --source auto sets the default graph aside for the ast
-# index. A fixed sentence: nothing from the file is quoted in it.
+# Fixed sentences for the --source auto warnings about the default graph: what to do when
+# it is refused (the ast index is used) or stale (it is still used). Nothing from the
+# file is quoted in them.
 GRAPH_FALLBACK = 'using the ast index. Regenerate %s or delete it.' % DEFAULT_GRAPH
+GRAPH_STALE = ('results from it may be out of date. Regenerate %s, or delete it to use the ast index.'
+               % DEFAULT_GRAPH)
 FILES_MAX = 20_000
 FILE_BYTES_MAX = 2_000_000
 PARSE_STACK_BYTES = (512 * 1024 * 1024, 255 * 1024 * 1024)  # Windows refuses 256 MB and above
@@ -935,8 +938,9 @@ def index_graph(nodes, links, index):
 
 def load_graph_index(repo, index, graph_arg, source, max_mb):
     """Replace the ast code index with graph.json; True when the graph was used. With
-    --source auto, a default graph that is refused or stale is set aside with a warning
-    that says why and what to do; an explicit graph source fails or is used as asked."""
+    --source auto, a default graph that is refused is set aside with a warning that says
+    why and what to do; with an explicit graph source the refusal is an error. A stale
+    graph is used either way, with a warning."""
     root = repo['root']
     path = Path(graph_arg) if graph_arg else root / DEFAULT_GRAPH
     if graph_arg is None:
@@ -963,16 +967,13 @@ def load_graph_index(repo, index, graph_arg, source, max_mb):
     stale = None
     if commit and repo['commit']:
         stale = commit != repo['commit']
+    index.code_source = 'graphify'
     index.graph = {'path': shown, 'built_at_commit': commit, 'stale': stale,
                    'nodes': len(nodes), 'links': len(links)}
     if stale and source == 'auto' and graph_arg is None:
-        # Nobody asked for this graph, and it describes another commit: the checkout
-        # itself is the better source. index.graph still says what was found.
         index.warnings.append('graph.json is stale (it was built at %s but the checkout is at %s); %s'
-                              % (commit[:12], repo['commit'][:12], GRAPH_FALLBACK))
-        return False
-    index.code_source = 'graphify'
-    if stale:
+                              % (commit[:12], repo['commit'][:12], GRAPH_STALE))
+    elif stale:
         index.warnings.append('graph.json was built at %s but the checkout is at %s; pointers may have '
                               'moved. Rebuild the graph, or use --source ast.' % (commit[:12], repo['commit'][:12]))
     elif repo['dirty']:
