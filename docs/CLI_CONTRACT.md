@@ -269,8 +269,7 @@ current directory, widened to its Git top level.
     parser. It resolves calls and test references through imports, `self`/`cls` and
     same-module names, and marks them `INFERRED`.
   - `auto`, the default, uses graphify's `graphify-out/graph.json` instead when it is
-    present, accepted and not stale (see
-    [Producing `graph.json`](#producing-graphjson-optional)).
+    present and accepted (see [Producing `graph.json`](#producing-graphjson-optional)).
   - `--source graphify` or `--graph FILE` requires a graph; `--source ast` ignores one.
 - **Design anchors:** Markdown headings are always indexed from the checkout, with
   GitHub-style anchors (repeated headings get `-1`, `-2`, ...).
@@ -373,17 +372,18 @@ this command returns.
   explicit graph source, the refusal is an error.
 - A graph whose `built_at_commit` differs from the checkout's `HEAD` is reported as
   `index.graph.stale: true`, with a warning.
-  - With `--source auto` the stale graph is not used: the result is the `ast` result,
-    `index.code_source` is `ast`, and `index.graph` still describes the file that was
-    found.
-  - With `--source graphify` or `--graph FILE` the stale graph is used as asked.
-- Every fallback warning is one fixed sentence that says why and what to do, and quotes
-  nothing from the file:
+  - The stale graph is still used, whatever the source: a graph goes stale with every
+    commit, and Python matches taken from it are re-checked with `ast` (`verified`).
+  - With `--source auto` the warning says what to do:
+    `graph.json is stale (it was built at <12 hex> but the checkout is at <12 hex>); results from it may be out of date. Regenerate graphify-out/graph.json, or delete it to use the ast index.`
+- Every fallback warning is one fixed sentence that says why and what to do:
   `<reason>; using the ast index. Regenerate graphify-out/graph.json or delete it.`
-  The reasons are a stale graph (with the first 12 characters of both commits), a file
-  over the size limit, a file that is not UTF-8 or not valid JSON, the wrong top-level
-  shape, too many nodes or links, and a path that is not a regular file inside the
-  checkout.
+  The reasons are a file over the size limit, a file that is not UTF-8 or not valid
+  JSON, nesting that is too deep, the wrong top-level shape, too many nodes or links,
+  and a path that is not a regular file inside the checkout.
+- Neither warning quotes the file. The only text taken from it is the first 12
+  characters of `built_at_commit`, which is used only when it is a full hexadecimal
+  commit hash.
 
 Warnings appear in `warnings` and on stderr as `warning: ...` lines. Stdout carries only
 the JSON result. That JSON is ASCII: every non-ASCII character, including line and
@@ -411,9 +411,12 @@ what `ast` cannot read, such as code in other languages.
     (`index.graph.stale: null`) and the graph is used.
 - **Limits.** 64 MB by default (`--max-graph-mb`, 1..512), 500,000 nodes and 2,000,000
   links. The safety rules are under "Untrusted content" above.
-- **Stale.** The graph was built at another commit, so its pointers may have moved.
-  Regenerate it at the current commit, or delete the file; either way the lookup keeps
-  working, on the `ast` index until the graph is current again.
+- **Stale.** The graph was built at another commit, so its pointers may have moved. It
+  is still used, with the warning above. Regenerate it at the current commit, or delete
+  the file to use the `ast` index.
+- **Keep it current.** Because a graph goes stale on every commit, regenerate it
+  routinely (for example with a git hook, if graphify provides one; see graphify's own
+  documentation).
 
 Recorded capability records, alias proposals and a recorded drift check are designed
 separately. The entry shape and pointer syntax here are what they are meant to feed.
