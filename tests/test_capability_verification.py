@@ -191,7 +191,7 @@ class RecordTests(VerificationCase):
 
     def test_idempotent_per_key_revision_commit_actor_and_route(self):
         first = self.verify()
-        again = self.verify(checked_at='2026-10-02T09:00:00Z')
+        again = self.verify(checked_at='2026-10-02T09:00:00Z', tool={'name': 'another-kit', 'version': '0.2.0'})
         self.assertEqual((again['reconciled'], again['comment_id']), (True, first['comment_id']))
         with self.assertRaisesRegex(ValueError, 'already recorded a different result'):
             self.verify(missing=('review_workflow.py::execute',))

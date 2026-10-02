@@ -372,8 +372,9 @@ def public(block):
 # -- the write ----------------------------------------------------------------------------------
 
 def _same_check(record, payload):
-    return all(record[name] == payload[name] for name in ('results', 'passed', 'source', 'graph_built_at_commit',
-                                                           'tool'))
+    """Whether a repeat says the same thing: the same pointers resolved. The stamp, the
+    tool version and the index source may differ between two runs at one commit."""
+    return record['passed'] == payload['passed'] and record['results'] == payload['results']
 
 
 def verify(payload, actor, run, operators=None, verifiers=None, journal=None, operator=False):

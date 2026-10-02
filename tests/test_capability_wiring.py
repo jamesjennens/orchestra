@@ -32,7 +32,7 @@ from test_reference_records import OPERATOR, TODAY, acceptance
 from test_reference_wiring import _endpoint_module
 
 
-class ClientSplitTests(unittest.TestCase):
+class ClientCase(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
@@ -62,6 +62,8 @@ class ClientSplitTests(unittest.TestCase):
                 code = stop.code
         return code, out.getvalue(), err.getvalue(), calls
 
+
+class ClientSplitTests(ClientCase):
     def test_lookup_resolve_and_index_stay_local(self):
         for argv in (('capability', 'lookup', 'execute', '--repo', str(self.repo)),
                      ('capability', 'resolve', 'review_workflow.py::execute', '--repo', str(self.repo)),
@@ -123,7 +125,7 @@ def list_item(key, state='accepted', code=('review_workflow.py::execute',), test
             'record_sha256': 'c' * 64, 'code': list(code), 'tests': list(tests), 'anchors': list(anchors)}
 
 
-class ClientCheckTests(ClientSplitTests):
+class ClientCheckTests(ClientCase):
     """`capability check --repo PATH [--key KEY]... [--record | --payloads FILE]` (.60 section 5.1)."""
 
     ITEMS = [list_item('review.flow', code=['review_workflow.py::execute'], anchors=['README.md#usage']),
