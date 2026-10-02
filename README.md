@@ -16,7 +16,7 @@ The kit pins Beads 1.2.2 and Dolt 2.2.0, verifies release checksums, installs an
 - Operational feedback and next priorities: [pilot follow-up](docs/PILOT_FEEDBACK.md).
 - Lifecycle evidence, activity cursors, safe child creation and merge slots: [operational commands](docs/OPERATIONAL_WORKFLOW.md).
 - Versioned client/endpoint JSON, help, ID, cursor and limit contract: [CLI contract](docs/CLI_CONTRACT.md).
-- Finding code and design text in a checkout: the read-only, client-side [capability lookup](docs/CLI_CONTRACT.md#capability-client-side-code-and-design-lookup) (`capability lookup "<phrase>"`, `capability resolve POINTER`). It indexes Python with the standard-library parser, or reads graphify's `graph.json` when present.
+- Finding code and design text in a checkout: the read-only, client-side [capability lookup](docs/CLI_CONTRACT.md#capability-client-side-code-and-design-lookup) (`capability lookup "<phrase>"`, `capability resolve POINTER`). It indexes Python with the standard-library parser. graphify is optional external tooling, not a dependency: an up-to-date `graphify-out/graph.json` is read when one is present ([how to produce one](docs/CLI_CONTRACT.md#producing-graphjson-optional)).
 - Compact current task state, persistent unresolved items and paginated evidence: [briefings and checkpoints](docs/BRIEFINGS.md).
 - Copilot and remote development: [office setup](docs/COPILOT_REMOTE_DEV.md).
 - Optional headless workers: [Cline launch and recovery](docs/CLINE_WORKERS.md), [Hermes planning and resumption](docs/HERMES_WORKERS.md).
