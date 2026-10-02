@@ -166,7 +166,9 @@ There are at most 32 `code`, 32 `tests`, 16 `anchors` and 16 `requirements` entr
 the native closed status and with `acceptance_state`, and would go stale the moment
 the code moved. Reads report two things:
 - **`state`:** `draft`, `accepted` or `superseded`, plus `malformed` or `unsupported`
-  for a bad record (.41 §3.7).
+  for a bad record (.41 §3.7). The .41 repair applies unchanged (kittrial-5bb.74): an
+  operator `void-record` of a malformed entry, acceptance, alias or verification
+  record, and `admin.py anchor-release --kind capability` for an anchor with no record.
 - **`verification`** (§5.2): `verified`, `reported`, `drifted`, `unverified` or
   `superseded-revision`.
 

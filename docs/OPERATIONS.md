@@ -56,7 +56,7 @@ history](#malformed-structured-history) (`void-record`).
 | `requirement-backfill PROJECT --actor ACTOR --file backfill.json` | add the controlled requirement type/state labels to records created before this route | an `evidence` pointer for an entry that becomes `accepted`, and the deployment operator allowlist |
 | `requirement-reconcile PROJECT --operation-id ID --actor ACTOR --disposition ...` | finish a requirement operation whose real write was uncertain | confirmation of the native record state |
 | `reference-apply PROJECT --actor OPERATOR --file acceptance.json` | accept a reference catalog entry: the payload names the newest draft `revision` and its `record_sha256`, and the command writes the next revision as accepted, after the F3 evidence (`operation: "draft"` with full content writes a direct accepted revision 1) | the deployment operator allowlist, checked before any write, and F3 evidence (`acceptance`: owners, approvers, policy, decision id, evidence) |
-| `reference-reconcile PROJECT --operation-id ID --actor ACTOR --reason TEXT --disposition ...` | finish a reference operation whose real write was uncertain; `complete` needs `--issue-id` and refuses an anchor that has no revision record yet (re-run the original `ref propose` with its `operation_id` first) | confirmation of the native record state |
+| `reference-reconcile PROJECT --operation-id ID --actor ACTOR --reason TEXT --disposition ...` | finish a reference operation whose real write was uncertain; `complete` needs `--issue-id` and refuses an anchor that has no revision record yet (re-run the original `ref propose` with its `operation_id` first; if that payload is lost, use `anchor-release`) | confirmation of the native record state |
 | `capability-apply PROJECT --actor OPERATOR --file batch.json` | accept a batch of capabilities under one F3 decision: `items` of `{key, revision, record_sha256}` (each the newest draft reviewed). The command writes one acceptance record and one receipt per item, keyed `(operation_id, key)`, in list order. It reports `accepted`, `already-accepted`, `refused` or `uncertain` per item; an uncertain item stops the batch, and re-running the same batch resumes it. A changed list needs a new `operation_id`. The coordination lock is taken per item and released between items, with a 50 ms pause while it is free, so other writers wait behind at most one item; each item re-checks its `revision` and `record_sha256` under its own hold. An item takes about 3 seconds (two reads and four writes), so 100 items take 5 to 6 minutes: prefer batches of about 20. `operation: "draft"` with full content writes a direct accepted revision 1 | the deployment operator allowlist, checked before any write, and F3 evidence |
 | `capability-retire PROJECT --actor OPERATOR --file retire.json` | supersede the newest revision of a key by a `successor` key, with evidence. The successor must exist, and a cycle is refused. A retired key refuses `revise` and acceptance. This also stands in for the design's "demote" in slice 1a | the deployment operator allowlist and F3 evidence |
 | `capability-alias-reject PROJECT --actor OPERATOR --file reject.json` | reject a pending alias (`{schema_version, key, alias, reason}`); lookup then ignores it | the deployment operator allowlist |
@@ -65,12 +65,13 @@ history](#malformed-structured-history) (`void-record`).
 | `verifiers list\|add\|remove [ACTOR] [--confirm-revoke]` | manage the deployment `verifiers` list: actors, other than operators, whose `capability-verify` records readers count as verified. The list is empty by default and grants nothing else. `remove` needs `--confirm-revoke`; the refusal names the capabilities whose verification would change | shell access to the coordination host; `deployment.private.json` is the only authority source |
 | `capability-reconcile PROJECT --operation-id ID ...` | finish a capability operation whose write was uncertain (for a batch item, the id is `OPERATION_ID/KEY`). A transient native failure can leave a `pending` receipt with no native row behind it, and the same `operation_id` is then refused until it is cleared: run `capability-reconcile --disposition released`, then retry the original command | confirmation of the native record state |
 | `record-reconcile PROJECT --kind requirement\|reference\|capability ...` | the same reconcile for any record kind | as above |
-| `void-record PROJECT --actor OPERATOR --file void.json` | void a malformed or stale contribution-review record | the deployment operator allowlist (`operators` in `deployment.private.json`) |
+| `void-record PROJECT --actor OPERATOR --file void.json` | void a malformed or stale contribution-review record, or a malformed, foreign or conflicting reference or capability record ([below](#reference-and-capability-records)) | the deployment operator allowlist (`operators` in `deployment.private.json`) |
+| `anchor-release PROJECT --kind reference\|capability --issue-id ID --actor OPERATOR --reason TEXT` | close a reference or capability anchor that holds no record and free its key, when the propose that created it cannot be re-run ([orphan anchors](#orphan-anchors)) | the deployment operator allowlist, checked before any read |
 | `handoff PROJECT --actor ACTOR --file handoff.json` | transfer a claim when the current owner cannot act | an owner decision/evidence pointer in the payload's `approval` |
 
 All five are shell-trusted: access to the service account's shell is the boundary.
-`requirement-apply`, `requirement-backfill` and `void-record` also check the
-deployment operator allowlist (`operators` in `deployment.private.json`), so a
+`requirement-apply`, `requirement-backfill`, `void-record` and `anchor-release` also
+check the deployment operator allowlist (`operators` in `deployment.private.json`), so a
 deployment that configures no operators authorizes nobody and an unlisted
 `--actor` is refused before any native or journal write. The allowlist is read
 strictly: a shell-only `ORCHESTRA_OPERATORS` value that disagrees with the
@@ -169,7 +170,10 @@ not the author field.
   ```
 
   It prints nothing on a project that has never used the catalog. Any line it prints
-  on such a project is a comment to void or investigate before you rely on the catalog.
+  on such a project is a comment to investigate before you rely on the catalog. A
+  malformed one can be voided ([reference and capability records](#reference-and-capability-records)).
+  A well-formed one reads like a real record, so `void-record` refuses it: supersede it
+  with a newer accepted revision, or retire the key.
   The coordinator ran this scan on all seven live projects on 2026-10-02 and found none.
 
 A row is hidden as a record anchor only when it carries one of the labels `reference`, `proposal`, `contribution-settings` or `capability` **and** a v1 record comment of the same family. A project's own task that merely uses one of those words as a label (for example jjbp-j03.20's `proposal`) stays visible and editable.
@@ -231,6 +235,80 @@ python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime voi
 `target_sha256` is the SHA-256 of `original` encoded as UTF-8, so the record proves which bytes were reconciled. Operator authority is server-side configuration, never the payload's own `operator` string: the deployment allowlist (`operators` in `deployment.private.json`) is the single authority source, the endpoint supplies it to every read and to `refresh`/`render`, and reads require the void's stored native author to be on it as well as to match the name in the payload. `ORCHESTRA_OPERATORS` is not an authority source; a host command refuses when it is set to a set that differs from the deployment configuration, instead of authorizing a write the endpoint would ignore. `void-record` refuses any actor outside the allowlist; a deployment that configures no operators authorizes nobody. A contributor therefore cannot make a void valid by naming their own actor as the operator, so a forged or self-authored void is inert even if the generic raw-write guard is bypassed. Void records are append-only and are written only by this host command; the record-void prefix is reserved, so any raw `comments add` write of one is refused on the contributor endpoint, exactly like a raw review or handoff record. The guard parses the `comments` request structurally: it resolves `add` past leading flags, refuses an attachment transported before `add`, and refuses the operator-only `-a`/`--author` spelling, so the reviewer's `["comments","@attachment:a","add",TASK,"-a","ops-james"]` forged-authorship request fails closed with zero native writes. A malformed, stale, foreign-authored or unconfigured-author void comment is ignored and reported rather than applied. Nothing is deleted: the original comment, the void record and its actor, timestamp and reason all stay in native history, in `history` reads and in rendered pages, and native backup plus `restore-new` preserve both. Reads expose applied voids in `review.recoveries`. Reads also require a void to follow its target in native order, so a void recorded before the record it targets cannot apply.
 
 A void may not target a record that is part of the contribution history the surviving records currently form, so recovery cannot suppress a current revision or approval. If a surviving record's `previous` names a voided comment, reads keep failing closed and name that record; void it explicitly as well, or deliver a revision that repairs the chain. A directly written void that would suppress the surviving history is inert: reads stay healthy, the void is listed in `review.recoveries` with `applied: false` and its refusal reason, and a warning names it. A void is a repair of a broken history, so a void applied after the latest approval invalidates that approval: the task returns to `awaiting-review` and a fresh approval is required before integration. Re-running the identical void payload is idempotent.
+
+#### Reference and capability records
+
+A comment that claims a reference or capability record kind but fails its schema makes
+only its own entry read `malformed`: `ref` and `capability` reads, `work` and `brief`
+keep working and name the anchor in `coverage`, but a `revise` of that key is refused
+until the record is repaired. `void-record` repairs it (kittrial-5bb.74). The payload is
+the one above, with the anchor as `task` and one of these as `target_kind`:
+`reference-entry`, `reference-acceptance`, `capability-entry`, `capability-acceptance`,
+`capability-verification` or `capability-alias`. `ref get KEY` (or `capability get KEY`)
+gives the anchor as `native_id`; on the host, read the comment's `id` and exact `text`
+from `bd export --all`, as in the scan above.
+
+- **Same command, same authority.** The host command, the allowlist check before any
+  read, the payload binding, the idempotent retry and the refusal of a reused
+  operation ID or a second void of one target are the review void's. Reads trust a void
+  by the same rule (`recovery.records`). Like a contribution-review void it is one
+  appended native comment and writes no host journal: only the integration-revert
+  retraction is journaled, because it must prove that the host issued the revert.
+- **What a void applies to.** A void applies only to a comment the entry cannot read:
+  one that fails its kind's schema, belongs to another anchor or key, or shares its
+  revision with another comment of the same kind (a conflicting or duplicated revision
+  or acceptance: void the wrong one). A well-formed record the entry reads is refused
+  at write and ignored on read. A void repairs history and never withdraws a decision:
+  to replace an entry, revise it and accept the new revision, or retire the key.
+- **What readers show.** The entry reads as if the voided comment were absent, and its
+  `warnings` carry `record-voided`. A void written around the host command is reported
+  instead: `void-invalid` (malformed, stale, out of order, or not written by a
+  configured operator) or `void-refused` (it names a record the entry reads, or a
+  record of another kind). The anchor stays hidden on every surface, because all its
+  comments are kept.
+- **Writes agree.** The endpoint gives contributor writes the allowlist, so `ref
+  revise` and `capability revise` see the same entry `get` shows once the void applies.
+- **Revocation.** After `operators remove`, that operator's voids stop applying here too
+  and the entry reads `malformed` again; re-adding the operator restores the repair.
+- **Rolling back below this kit.** An older kit's reference and capability readers do
+  not read voids at all, so a repaired entry reads `malformed` again there (only that
+  entry). The anchor stays hidden. A review read of the anchor, if one reaches it, lists
+  the void among ignored operator void comments. An older `void-record` refuses these
+  target kinds before any write. No sidecar path is added, so backups restore on either
+  kit, and rolling forward restores the repair with nothing to clean up.
+- **Limits.** A record this kit cannot read as v1 at all (`Kind: reference-entry-v2`,
+  or a lookalike with a leading BOM or CRLF line ends) cannot be a void target, because
+  the target must start with the exact v1 prefix. It stays `unsupported` or `malformed`.
+
+#### Orphan anchors
+
+`ref propose` and `capability propose` create the entry's anchor, close it and post
+revision 1 inside one locked operation. If that write stops in between, the anchor holds
+no record: readers report it as an incomplete anchor, every other operation is refused
+the key, and if it stopped before the close the row is open and claimable in `work`. Only
+the same operation's retry, with the identical payload, finishes it. When that payload is
+lost, release the anchor:
+
+```sh
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime anchor-release PROJECT --kind reference --issue-id ANCHOR --actor OPERATOR --reason 'original payload lost'
+```
+
+- It checks the operator allowlist before any read. It refuses a row that is not an
+  anchor of that kind, or that still holds a live record. An anchor whose every record an
+  applied void names holds none, so the same command frees it.
+- It marks the pending receipt that the row's `request:` label names as `released`, with
+  the audit, so that operation ID is settled.
+- It closes the row if it is open, adds one plain audit comment, then removes the state,
+  `request:` and `request-content:` labels and, last, the lookup label, which frees the
+  key. The type label stays, so an anchor with voided records stays hidden, and a row
+  that never held a record reads as the ordinary closed task it already was.
+- Each step is skipped when it is already done, so a re-run after an uncertain write
+  finishes the release. Once the lookup label is gone the row is no longer an anchor, and
+  a re-run is refused.
+- It is a host command only. Over SSH the endpoint actor is self-declared, so nothing
+  that rests on the operator allowlist is offered there.
+
+An older kit reads a released row the same way: it holds no key and is never claimable.
 
 #### Operator removal and restore policy
 
