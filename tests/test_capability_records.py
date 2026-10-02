@@ -219,6 +219,35 @@ class BatchAcceptanceTests(CapabilityCase):
             with self.assertRaisesRegex(ValueError, message):
                 self.batch(bad, operation_id='batch-x')
 
+    def test_a_refused_item_does_not_stop_the_batch_and_a_rerun_writes_nothing(self):
+        mixed = self.batch([{'key': 'a.one', 'revision': 1, 'record_sha256': 'f' * 64}, self.item('a.two'),
+                            self.item('a.three')], operation_id='mixed')
+        self.assertEqual([item['result'] for item in mixed['items']], ['refused', 'accepted', 'accepted'])
+        self.assertTrue(mixed['complete'])   # only an uncertain write leaves a batch incomplete
+        self.assertEqual(self.read('get', 'a.one')['state'], 'draft-only')
+        # An identical re-run: the accepted items are reported from their receipts, with no
+        # native write and no native read of their anchors beyond the one catalog snapshot.
+        self.native.calls = []
+        again = self.batch([{'key': 'a.one', 'revision': 1, 'record_sha256': 'f' * 64}, self.item('a.two'),
+                            self.item('a.three')], operation_id='mixed')
+        self.assertEqual([item['result'] for item in again['items']],
+                         ['refused', 'already-accepted', 'already-accepted'])
+        self.assertEqual(self.native.writes(), [])
+
+    def test_reaccepting_an_accepted_revision_writes_a_new_revision_and_evidence(self):
+        self.batch([self.item('a.one')])
+        first = self.read('get', 'a.one')
+        self.native.calls = []
+        again = self.batch([self.item('a.one', 2)], operation_id='batch-again', decision='decision-8')
+        self.assertEqual([(item['result'], item['revision']) for item in again['items']], [('accepted', 3)])
+        writes = self.native.writes()
+        self.assertTrue(writes[0][3].startswith('Kind: capability-acceptance-v1\n'))
+        self.assertTrue(writes[1][3].startswith('Kind: capability-entry-v1\n'))
+        view = self.read('get', 'a.one')
+        self.assertEqual((view['record']['revision'], view['acceptance']['decision_id']), (3, 'decision-8'))
+        self.assertNotEqual(view['record']['sha256'], first['record']['sha256'])
+        self.assertEqual(view['record']['name'], first['record']['name'])
+
     def test_direct_accepted_revision_1_needs_an_owner(self):
         self.native.actor = OPERATOR
         payload = dict(entry(operation='draft', operation_id='direct', key='a.direct', owner=None),

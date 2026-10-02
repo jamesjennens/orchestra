@@ -466,6 +466,27 @@ Acceptance, retirement and alias rejection are operator commands
 ([operations](OPERATIONS.md#operator-commands)). There is no demotion in slice 1a: the
 design's "demote" (section 4) is covered by retiring the key for now.
 
+**Batch acceptance results** (`admin.py capability-apply`). Each item names the newest
+revision the operator reviewed, by `revision` and `record_sha256`, and gets one result:
+
+| Result | Meaning | Effect on the batch |
+| --- | --- | --- |
+| `accepted` | this run wrote the acceptance evidence and the next revision as accepted | continues |
+| `already-accepted` | the item's accepted revision and evidence were already there | continues; no native write |
+| `refused` | the item was refused before any write: a stale `revision` (a newer one exists), a wrong `record_sha256`, an unknown key | **continues** with the next item; the reason is reported |
+| `uncertain` | a native write did not confirm | **stops**; later items are `not-run` |
+
+- **`complete`** is `true` unless an item was `uncertain`. A refused item does not make
+  the batch incomplete.
+- **Re-running the identical batch** resumes it. Items already accepted are reported
+  `already-accepted` from their own receipts, with no native write. An `uncertain`
+  item is finished, or reconciled first with
+  `admin.py capability-reconcile --operation-id OPERATION_ID/KEY`.
+- **A changed list** under the same `operation_id` is refused.
+- **Re-accepting.** Naming a revision that is already accepted, and still the newest,
+  is a new decision: it writes the next revision with identical content, and new
+  evidence. `ref` acceptance follows the same rule.
+
 ## `ref`: the reference catalog
 
 The reference catalog holds operational facts and their authority: what is
