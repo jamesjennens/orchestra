@@ -66,6 +66,7 @@ PARSE_STACK_BYTES = (512 * 1024 * 1024, 255 * 1024 * 1024)  # Windows refuses 25
 PARSE_STACK_BYTES_PER_LEVEL = 512
 NESTING_MAX_BIG_STACK = 50_000
 NESTING_MAX = 2_000 if os.name == 'nt' else 5_000
+EXPRESSION_TOKENS_MAX = 200_000
 TOKENIZE_BUDGET_BYTES = 16_000_000
 LINE_TEXT_MAX = 2_000
 HEADING_LINE_MAX = 1_000
@@ -473,6 +474,19 @@ NESTING_OPS = frozenset({'+', '-', '*', '/', '//', '%', '@', '&', '|', '^', '~',
                          '.', '(', '['})
 NESTING_WORDS = frozenset({'not', 'if', 'lambda', 'await', 'yield'})
 
+# Bytes counted as one expression token each when budgeting a file: the NESTING
+# operators and brackets plus the comma that separates flat elements and the '=' of
+# assignment and of `==`/`!=`/`<=`/`>=`. `and`, `or`, `in` and `is` build wide (flat)
+# nodes too, so they are counted as well. A '.' between two digits is a float literal,
+# not an attribute access, and does not count.
+_EXPRESSION_BYTES = frozenset(b'-+*/%@&|^~.<>([,=')
+_DIGITS = frozenset(b'0123456789')
+_NAME_START = frozenset(b'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_')
+_NAME_CHARS = _NAME_START | _DIGITS
+_EXPRESSION_WORDS = frozenset({b'not', b'if', b'lambda', b'await', b'yield',
+                               b'and', b'or', b'in', b'is'})
+
+
 
 def _skip_string(data, start):
     """The index just past the string literal that starts at `start` (a quote byte).
@@ -500,6 +514,43 @@ def _skip_string(data, start):
         else:
             end += 1
     return size
+
+
+def _expression_tokens(data):
+    """A cheap per-file bound on how many AST nodes one file can build.
+
+    Counts operators, brackets and commas outside strings and comments (a large data
+    string is one node, so its text must not count). The nesting pre-count alone is
+    blind to a flat but huge expression: `1<1<...`, `(1,1,...)`, `[1,1,...]` and
+    `1 and 1 and ...` are not deep, so ast.parse builds millions of sibling nodes and
+    hundreds of MB of objects on CPython 3.10/3.11."""
+    size = len(data)
+    position = total = 0
+    while position < size:
+        char = data[position]
+        if char == 0x23:  # '#': a comment is not code
+            found = data.find(b'\n', position)
+            position = size if found < 0 else found
+            continue
+        if char in (0x27, 0x22):  # a string literal is one node
+            position = _skip_string(data, position)
+            continue
+        if char in _EXPRESSION_BYTES:
+            if not (char == 0x2E and 0 < position < size - 1
+                    and data[position - 1] in _DIGITS and data[position + 1] in _DIGITS):
+                total += 1
+            position += 1
+            continue
+        if char in _NAME_START:
+            end = position + 1
+            while end < size and data[end] in _NAME_CHARS:
+                end += 1
+            if data[position:end] in _EXPRESSION_WORDS:
+                total += 1
+            position = end
+            continue
+        position += 1
+    return total
 
 
 def _logical_line_peak(data, limit):
@@ -546,23 +597,86 @@ def _logical_line_peak(data, limit):
     return peak
 
 
-def _deepest_logical_line(data, limit):
-    """The most nesting-capable tokens in any one logical line, counting operators
-    inside f-strings (a single STRING token before Python 3.12). Returns as soon as
-    one line passes `limit`, so a hostile file costs no more than that line."""
-    deepest = current = 0
-    for token in tokenize.tokenize(io.BytesIO(data).readline):
-        if token.type in (tokenize.NEWLINE, tokenize.ENDMARKER):
-            deepest, current = max(deepest, current), 0
-        elif token.type == tokenize.OP and token.string in NESTING_OPS:
-            current += 1
-        elif token.type == tokenize.NAME and token.string in NESTING_WORDS:
-            current += 1
-        elif token.type == tokenize.STRING and 'f' in token.string.split('"')[0].split("'")[0].lower():
-            current += len(NESTING.findall(token.string.encode('utf-8', 'replace')))
-        if current > limit:
-            return current
-    return max(deepest, current)
+def _is_fstring(string):
+    """True for a string token that is an f-string (before 3.12 the whole f-string is
+    one STRING token, so its embedded operators must be counted by hand)."""
+    return 'f' in string.split('"')[0].split("'")[0].lower()
+
+
+def _atom_before(token):
+    """True when `token` can end an atom, so a following `(` or `[` is a call or
+    subscript: a postfix bracket that keeps the expression chain. Otherwise the bracket
+    opens a display (or a grouping), whose comma-separated elements are siblings."""
+    if token is None:
+        return False
+    if token.type in (tokenize.NAME, tokenize.NUMBER, tokenize.STRING):
+        return True
+    return token.type == tokenize.OP and token.string in (')', ']', '}')
+
+
+def _deepest_logical_line(text, limit):
+    """An upper bound on the expression tree depth ast.parse will build on one logical
+    line, counting operators inside f-strings (a single STRING token before Python
+    3.12). Returns as soon as one line passes `limit`, so a hostile file costs no more
+    than that line.
+
+    Comma-separated elements of a display are siblings, so the chain resets after each
+    one at the display's depth: a 60,000-row table is shallow, not 60,000 levels deep.
+    A call or subscript bracket after an atom keeps the chain, so `a[1,2][3,4]...` and
+    `f(x,y)(z)()` still accumulate.
+
+    `text` is the decoded source, not raw bytes: tokenizing bytes would re-read the
+    file's coding cookie and, for a `# coding: utf-7` file re-encoded as UTF-8, decode
+    the UTF-8 bytes with the wrong codec."""
+    deepest = chain = 0
+    stack = []  # [is a display, chain before the bracket, deepest element so far]
+    previous = None
+    for token in tokenize.generate_tokens(io.StringIO(text).readline):
+        kind, string = token.type, token.string
+        if kind in (tokenize.NEWLINE, tokenize.ENDMARKER):
+            deepest, chain, stack = max(deepest, chain), 0, []
+        elif kind == tokenize.OP:
+            if string in '([{':
+                display = string == '{' or not _atom_before(previous)
+                stack.append([display, chain, 0])
+                if display:
+                    chain = 0
+                else:
+                    chain += 1
+            elif string in ')]}':
+                if stack:
+                    display, outer, inner = stack.pop()
+                    if display:
+                        chain = max(outer, inner, chain) + 1
+            elif string == ',' and stack and stack[-1][0]:
+                if chain > stack[-1][2]:
+                    stack[-1][2] = chain
+                chain = 0
+            elif string in NESTING_OPS:
+                chain += 1
+        elif kind == tokenize.NAME and string in NESTING_WORDS:
+            chain += 1
+        elif kind == tokenize.STRING and _is_fstring(string):
+            chain += len(NESTING.findall(string.encode('utf-8', 'replace')))
+        if chain > limit:
+            return chain
+        previous = token
+    return max(deepest, chain)
+
+
+def _decode_source(data):
+    """The source text the parser will see, with its PEP 263 coding cookie honoured.
+
+    The cheap gate must run on exactly this text: CPython 3.10 and 3.11 accept a
+    `# coding: utf-7` cookie, and inside a UTF-7 `+...-` shift sequence ASCII operators
+    are base64-encoded, so a byte scan of the raw file sees almost nothing. A cookie
+    whose codec cannot decode the file is a parse error, never a fall-through to the
+    raw bytes (which is what let a hostile UTF-7 file reach ast.parse)."""
+    try:
+        encoding, _ = tokenize.detect_encoding(io.BytesIO(data).readline)
+        return data.decode(encoding)
+    except (SyntaxError, UnicodeError, LookupError, ValueError):
+        raise SyntaxError('cannot decode source') from None
 
 
 def parse_python(data, rel):
@@ -575,38 +689,51 @@ def parse_python(data, rel):
     Windows), and trusts it for at most NESTING_MAX_BIG_STACK levels: 50,000 levels need
     about 25 MB of C stack, so one hostile file cannot commit hundreds of MB.
 
+    The source is decoded first with its declared encoding (`_decode_source`), and the
+    cheap pre-count runs on `text.encode('utf-8')`: a UTF-7 coding cookie would
+    otherwise hide an ASCII operator chain inside a base64 `+...-` shift sequence, and
+    at most this text is handed to ast.parse.
+
     A cheap per-logical-line pre-count (`_logical_line_peak`: one byte scan, no
     tokenizer) decides whether the exact tokenize pass is needed. Ordinary files,
     dot-heavy ones included, are parsed directly even when a whole-file count would be
-    large; only a file whose logical line may out-nest the limit is tokenized. If no
-    worker thread could be made, the fallback guard on the calling thread uses
-    NESTING_MAX (5,000, or 2,000 on Windows): the same pre-count, then an exact tokenize
-    pass (early return, 16 MB per-run budget) against NESTING_MAX. Python 3.11 and later
-    raise RecursionError instead of crashing, which is caught.
+    large; only a file whose logical line may out-nest the limit is tokenized. A second
+    cheap count (`_expression_tokens`) bounds a flat but huge file independently of its
+    depth, so `1<1<...`, `(1,1,...)` or `1 and 1 and ...` is skipped before ast.parse
+    can build millions of sibling nodes. If no worker thread could be made, the fallback
+    guard on the calling thread uses NESTING_MAX (5,000, or 2,000 on Windows): the same
+    pre-count, then an exact tokenize pass (early return, 16 MB per-run budget) against
+    NESTING_MAX. Python 3.11 and later raise RecursionError instead of crashing, which
+    is caught.
     """
     if _parse['stack_bytes']:
         limit = min(NESTING_MAX_BIG_STACK, _parse['stack_bytes'] // PARSE_STACK_BYTES_PER_LEVEL)
     else:
         limit = NESTING_MAX
-    if _logical_line_peak(data, limit) > limit:
-        if _parse['tokenize_left'] < len(data):
+    text = _decode_source(data)
+    encoded = text.encode('utf-8')
+    if _expression_tokens(encoded) > EXPRESSION_TOKENS_MAX:
+        raise TooComplex('the file has more than %d expression tokens' % EXPRESSION_TOKENS_MAX)
+    if _logical_line_peak(encoded, limit) > limit:
+        if _parse['tokenize_left'] < len(encoded):
             _parse['budget_spent'] = True
             raise TooComplex('the per-run tokenize budget is spent')
-        _parse['tokenize_left'] -= len(data)
+        _parse['tokenize_left'] -= len(encoded)
         try:
-            deepest = _deepest_logical_line(data, limit)
+            deepest = _deepest_logical_line(text, limit)
         except (tokenize.TokenError, SyntaxError, UnicodeDecodeError, ValueError):
             raise SyntaxError('cannot tokenize') from None
         if deepest > limit:
             raise TooComplex('a logical line nests more than %d levels' % limit)
-    return ast.parse(data, filename=rel)
+    return ast.parse(text, filename=rel)
 
 
 def parse_warnings(skipped):
     """Warnings for files and entries a run left out, so a cap is never silent."""
     found = []
     if skipped.get('too-complex'):
-        found.append('skipped %d Python file(s) that could nest too deeply to parse safely%s'
+        found.append('skipped %d Python file(s) that could nest too deeply or hold too many '
+                     'expressions to parse safely%s'
                      % (skipped['too-complex'],
                         ' (the per-run tokenize budget was spent)' if _parse['budget_spent'] else ''))
     if skipped.get('parse-error'):
