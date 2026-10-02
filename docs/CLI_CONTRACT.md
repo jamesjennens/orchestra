@@ -431,6 +431,22 @@ unchanged, then one endpoint `find`. It adds these fields to `capability-lookup-
 If the endpoint cannot answer, the local result is still returned, with
 `records_warning`.
 
+**The worker loop: check the record first, and feed a miss back.**
+1. **Look up with your config**, so the recorded capabilities are included:
+   `b capability lookup "<phrase>"` with `--config` and `--project`. An exact record
+   with `trust: accepted` and pointers that are `live: resolved` is the answer.
+2. **On a miss** (`records_found: false`, or only candidates), use the code
+   `candidates` the same lookup returned, then search the checkout by hand.
+3. **Update the index with what you found:**
+   - it exists under another name: `capability propose-alias KEY "<phrase that missed>"
+     --evidence POINTER`;
+   - it is not indexed at all: `capability propose --file capability.json`, a draft
+     with the pointers you found.
+4. **A pending alias or a draft is never authoritative.** Until an operator accepts
+   it, it only lifts a candidate (`match: candidate`, `trust: draft`,
+   `alias_state: proposed`). Do not cite one as the accepted meaning of a capability,
+   and check its pointers yourself before relying on them.
+
 **Writing.**
 - **`propose` and `revise`** take a closed JSON payload:
   - `key`: lowercase dotted.
@@ -460,14 +476,21 @@ If the endpoint cannot answer, the local result is still returned, with
     proposers;
   - 20 per capability overall.
 - **Interim attribution:**
-  - In slice 1a only an actor on the deployment operator allowlist is a verified
-    person (`operator:<actor>`), read from the alias comment's stored native author.
-  - Everyone else is `unverified`.
-  - SSH attribution beyond operators arrives with kittrial-5bb.68.
+  - `capability propose-alias` through the endpoint **always** writes
+    `identity: unverified`, whatever actor the caller names. Over SSH the actor is
+    self-declared, so an operator's actor name proves nothing there. Every endpoint
+    proposer shares the unverified pool.
+  - Only the operator shell route, `admin.py capability-alias-propose`, writes
+    `identity: verified` (`operator:<actor>`), after its allowlist check.
+  - A reader counts an alias as verified only when **both** hold: the record says
+    `verified`, and its stored native author is that operator, on the allowlist. The
+    same two conditions make a rejection take effect.
+  - Attribution beyond operators arrives with kittrial-5bb.68 (and over HTTP once the
+    actor is bound to the principal).
   - `submitted_by_agent` is `false` until then.
 
-Acceptance, retirement and alias rejection are operator commands
-([operations](OPERATIONS.md#operator-commands)). There is no demotion in slice 1a: the
+Acceptance, retirement, alias rejection and a verified alias proposal are operator
+commands ([operations](OPERATIONS.md#operator-commands)). There is no demotion in slice 1a: the
 design's "demote" (section 4) is covered by retiring the key for now.
 
 **Batch acceptance results** (`admin.py capability-apply`). Each item names the newest
@@ -487,6 +510,11 @@ revision the operator reviewed, by `revision` and `record_sha256`, and gets one 
   item is finished, or reconciled first with
   `admin.py capability-reconcile --operation-id OPERATION_ID/KEY`.
 - **A changed list** under the same `operation_id` is refused.
+- **The lock is per item.** The batch takes the project's coordination lock for one
+  item at a time and releases it between items, so another writer waits behind at most
+  one item, never the whole batch. Each item reads only its own key and re-checks
+  `revision` and `record_sha256` under its own hold: a capability revised between two
+  items is seen, and its item is `refused` as stale.
 - **Re-accepting.** Naming a revision that is already accepted, and still the newest,
   is a new decision: it writes the next revision with identical content, and new
   evidence. `ref` acceptance follows the same rule.

@@ -165,8 +165,10 @@ class EndpointDispatchTests(unittest.TestCase):
         payload = {k: v for k, v in entry().items() if k != 'operation'}
         written = self.execute(['propose', '@attachment:0'], {'0': {'flag': '--file', 'text': json.dumps(payload)}})
         self.assertEqual(written['state'], 'draft')
-        aliased = self.execute(['propose-alias', 'review.structured-contribution', 'reserved label guard'])
-        self.assertEqual(aliased['state'], 'proposed')
+        # The endpoint never writes a verified alias, even for an actor named like an operator.
+        aliased = self.execute(['propose-alias', 'review.structured-contribution', 'reserved label guard'],
+                               actor=OPERATOR)
+        self.assertEqual((aliased['state'], aliased['identity']), ('proposed', 'unverified'))
         self.assertEqual((self.locks.call_count, self.guarded), (2, ['capability', 'capability']))
         self.locks.reset_mock()
         self.guarded.clear()
@@ -189,8 +191,9 @@ class OperatorCommandTests(unittest.TestCase):
         (self.root / 'deployment.private.json').write_text(
             json.dumps({'password': 'x', 'unit': 'none', 'operators': [OPERATOR]}), encoding='utf-8')
         self.native = CapabilityNative()
+        self.flock = Mock()
         for patcher in (patch.dict(os.environ, {'ORCHESTRA_OPERATORS': ''}),
-                        patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2)}),
+                        patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=self.flock, LOCK_EX=2)}),
                         patch('time.gmtime', return_value=TODAY)):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -227,8 +230,14 @@ class OperatorCommandTests(unittest.TestCase):
                            for key in ('review.structured-contribution', 'merge.slot')]}
         with self.assertRaisesRegex(ValueError, 'not a server-side configured operator'):
             self.admin('capability-apply', batch, actor='mallory')
+        self.flock.reset_mock()
         applied = self.admin('capability-apply', batch)
         self.assertEqual([item['result'] for item in applied['items']], ['accepted', 'accepted'])
+        # The batch takes the coordination lock per item (receipt, two items, final receipt)
+        # on a file it closes each time, never once around the whole run.
+        self.assertEqual(self.flock.call_count, 4)
+        self.assertTrue(all(call.args[0].closed for call in self.flock.call_args_list))
+        self.assertEqual(len({id(call.args[0]) for call in self.flock.call_args_list}), 4)
         retired = self.admin('capability-retire', {
             'schema_version': 1, 'operation_id': 'retire-1', 'key': 'merge.slot', 'revision': 2,
             'record_sha256': self.sha('merge.slot', 2), 'successor': 'review.structured-contribution',
@@ -240,6 +249,16 @@ class OperatorCommandTests(unittest.TestCase):
                                                           'key': 'review.structured-contribution',
                                                           'alias': 'review loop', 'reason': 'too vague'})
         self.assertEqual(rejected['state'], 'rejected')
+        # The operator shell route is the only one that writes a verified alias.
+        alias = {'schema_version': 1, 'key': 'review.structured-contribution', 'alias': 'operator phrase'}
+        with self.assertRaisesRegex(ValueError, 'not a server-side configured operator'):
+            self.admin('capability-alias-propose', alias, actor='mallory')
+        with self.assertRaisesRegex(ValueError, 'alias payload must be'):
+            self.admin('capability-alias-propose', dict(alias, identity='verified'))
+        self.flock.reset_mock()
+        proposed = self.admin('capability-alias-propose', alias)
+        self.assertEqual((proposed['state'], proposed['identity']), ('proposed', 'verified'))
+        self.assertEqual(self.flock.call_count, 1)
         with patch.object(sys, 'argv', ['admin.py', '--root', str(self.root), 'capability-reconcile', 'trial',
                                         '--operation-id', 'nope', '--actor', OPERATOR, '--reason', 'r']), \
                 patch.object(admin, 'root_path', return_value=self.root), \

@@ -2227,6 +2227,8 @@ def main():
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('capability-alias-reject',help='reject a pending capability alias (operator allowlist)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('capability-alias-propose',help='propose a capability alias as a verified operator (operator allowlist)')
+    a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('reference-apply',help='accept a reference catalog entry (operator allowlist, F3 evidence)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     for name in ('reference-reconcile','capability-reconcile','record-reconcile'):
@@ -2382,7 +2384,8 @@ def main():
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             print(json.dumps(reference_apply(payload,args.actor,run,path,operator=True,operators=authority)))
-    elif args.command in ('capability-apply','capability-retire','capability-alias-reject'):
+    elif args.command in ('capability-apply','capability-retire','capability-alias-reject','capability-alias-propose'):
+        import contextlib
         import fcntl
         import capability_records
         path=project_dir(root,args.project)
@@ -2390,18 +2393,31 @@ def main():
         payload=json.loads(Path(args.file).read_text(encoding='utf-8-sig'))
         authority=operators(root,strict=True)
         def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
-        with (path/'.coordination.lock').open('a') as lock:
-            fcntl.flock(lock,fcntl.LOCK_EX)
-            if args.command=='capability-alias-reject':
-                result=capability_records.reject_alias(payload,args.actor,run,path,operators=authority)
-            elif args.command=='capability-retire':
-                if isinstance(payload,dict):payload.setdefault('operation','retire')
-                result=capability_records.apply_native(payload,args.actor,run,path,operator=True,operators=authority)
-            elif isinstance(payload,dict) and 'items' in payload:
-                result=capability_records.apply_batch(payload,args.actor,run,path,operators=authority)
-            else:
-                result=capability_records.apply_native(payload,args.actor,run,path,operator=True,operators=authority)
-            print(json.dumps(result))
+        @contextlib.contextmanager
+        def held():
+            # One hold of the project's coordination lock; closing the file releases it.
+            with (path/'.coordination.lock').open('a') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX)
+                yield
+        if args.command=='capability-apply' and isinstance(payload,dict) and 'items' in payload:
+            # A batch takes the lock once per item and releases it between items, so
+            # another writer waits behind at most one item (kittrial-5bb.67 review 01a0fc55).
+            result=capability_records.apply_batch(payload,args.actor,run,path,operators=authority,lock=held)
+        else:
+            with held():
+                if args.command=='capability-alias-reject':
+                    result=capability_records.reject_alias(payload,args.actor,run,path,operators=authority)
+                elif args.command=='capability-alias-propose':
+                    if not isinstance(payload,dict) or set(payload)-{'schema_version','key','alias','evidence'} or payload.get('schema_version')!=1:
+                        raise ValueError('alias payload must be {schema_version: 1, key, alias, evidence?}')
+                    result=capability_records.propose_alias(payload.get('key'),payload.get('alias'),args.actor,run,authority,
+                                                            evidence=payload.get('evidence'),operator=True)
+                elif args.command=='capability-retire':
+                    if isinstance(payload,dict):payload.setdefault('operation','retire')
+                    result=capability_records.apply_native(payload,args.actor,run,path,operator=True,operators=authority)
+                else:
+                    result=capability_records.apply_native(payload,args.actor,run,path,operator=True,operators=authority)
+        print(json.dumps(result))
     elif args.command in ('reference-reconcile','capability-reconcile','record-reconcile'):
         import fcntl
         kind={'reference-reconcile':'reference','capability-reconcile':'capability'}.get(args.command) or args.kind

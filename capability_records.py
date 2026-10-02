@@ -24,11 +24,16 @@ Meaning is accepted; location is verified (.60 section 4). Slice 1a writes:
 
 A pending alias is only ever a **candidate**: it lifts its capability in `find`, never
 an exact match; an operator folds it into the next accepted revision's `aliases`, or
-rejects it. Caps are keyed on the resolved person, read from the alias comment's
-stored native author: in slice 1a only an actor on the deployment operator allowlist
-is a verified person (`operator:<actor>`); everyone else is `unverified` and shares
-one strict pool. SSH attribution beyond operators arrives with kittrial-5bb.68 (.58's
-actor map), which will also set `submitted_by_agent` (always `false` until then).
+rejects it. Caps are keyed on the resolved person. Over the SSH endpoint the native
+author of a comment is the actor the caller declared, so it proves nothing: the
+endpoint route always writes `identity: unverified`, and every such proposer shares
+one strict pool. Only the operator shell route (`admin.py capability-alias-propose`,
+allowlist checked) writes `verified` (`operator:<actor>`), and a reader counts a
+record as verified only when the record says so AND its stored native author is that
+allowlisted operator (the reserved-prefix guard keeps contributors from writing such a
+record raw). Attribution beyond operators arrives with kittrial-5bb.68 (.58's actor
+map, and HTTP once the actor is bound to the principal), which will also set
+`submitted_by_agent` (always `false` until then).
 There is no demotion in slice 1a: .60 section 4's "demote" is covered by retire.
 
 Verification (`capability check --record`, `capability verify`, the verifiers list
@@ -36,6 +41,7 @@ and the trust derivation) is slice 1b; a `capability-verification-v1` record on 
 anchor is reserved and ignored here. Summaries and alias text are untrusted: they
 never enter an error message, and every excerpt carries `trust`.
 """
+import contextlib
 import json
 import re
 import unicodedata
@@ -376,16 +382,16 @@ def parse_alias(body):
     return record
 
 
-def submitter_for(actor, operators):
-    """The attribution block, from server-side configuration only (interim until kittrial-5bb.68)."""
-    verified = actor in configured_operators(operators if operators is not None else ())
+def submitter_for(actor, verified):
+    """The attribution block. `verified` is decided by the ROUTE, never by the actor's name:
+    only the operator shell route, after its allowlist check, passes True (review 01a0fc55)."""
     return {'actor': actor, 'person': 'operator:' + actor if verified else None,
             'identity': 'verified' if verified else 'unverified', 'submitted_by_agent': False}
 
 
-def alias_record(key, alias, action, actor, operators, evidence=None, reason=None):
+def alias_record(key, alias, action, actor, verified, evidence=None, reason=None):
     record = {'schema_version': 1, 'key': key, 'alias': alias, 'normalized': normalize(alias), 'action': action,
-              'evidence': evidence, 'reason': reason, 'submitter': submitter_for(actor, operators),
+              'evidence': evidence, 'reason': reason, 'submitter': submitter_for(actor, verified),
               'at': core.now()}
     record['sha256'] = content_hash(record)
     body = ALIAS_PREFIX + canonical_bytes(record).decode('utf-8')
@@ -408,10 +414,15 @@ def alias_state(view, operators):
     """(pending, rejected) alias proposals for one entry, from records in native order.
 
     A proposal is pending until a later reject record with the same normalised text, or
-    until the accepted revision's `aliases` hold it (folded). The effective person is
-    read from the stored native author, never from the payload: only an author on the
-    operator allowlist, matching the record's actor, is a verified person.
+    until the accepted revision's `aliases` hold it (folded). A record counts as verified
+    (and a reject takes effect) only when it says `identity: verified` AND its stored
+    native author is the record's actor AND that actor is on the operator allowlist. The
+    author alone is not enough: over SSH it is whatever actor the caller declared.
     """
+    def trusted(record, author):
+        return (record['submitter']['identity'] == 'verified' and author == record['submitter']['actor']
+                and author in allowlist)
+
     allowlist = configured_operators(operators if operators is not None else ())
     accepted = {normalize(alias) for alias in ((view.get('record') or {}).get('aliases') or [])}
     pending, rejected = {}, set()
@@ -419,14 +430,14 @@ def alias_state(view, operators):
         if record['key'] != view['key']:
             continue
         if record['action'] == 'reject':
-            if author in allowlist and author == record['submitter']['actor']:
+            if trusted(record, author):
                 rejected.add(record['normalized'])
                 pending.pop(record['normalized'], None)
             continue
         if record['normalized'] in accepted or record['normalized'] in rejected \
                 or record['normalized'] in pending:
             continue
-        verified = author in allowlist and author == record['submitter']['actor']
+        verified = trusted(record, author)
         pending[record['normalized']] = {'alias': record['alias'], 'normalized': record['normalized'],
                                          'person': 'operator:' + author if verified else None,
                                          'identity': 'verified' if verified else 'unverified',
@@ -515,36 +526,7 @@ def item_operation_id(operation_id, key):
     return '%s/%s' % (operation_id, key)
 
 
-def snapshot_run(run, rows):
-    """A runner that serves the capability reads of one batch from one snapshot.
-
-    The core reads an item's rows once, at the start of that item, and a batch never
-    repeats a key, so no item reads an anchor another item of the batch has written; the
-    batch holds the coordination lock, so no other writer changes the rest. The batch
-    therefore pays one catalog read instead of one per item. Every other command, and
-    every write, goes to the real runner.
-    """
-    state = {row['id']: row for row in rows}
-
-    def serve(argv):
-        if argv[:1] == ['list'] and '--label' in argv and argv[argv.index('--label') + 1] == TYPE_LABEL:
-            listed = list(state.values())
-            for index, token in enumerate(argv):
-                if token == '--label':
-                    listed = [row for row in listed if argv[index + 1] in (row.get('labels') or [])]
-                elif token == '--label-any':
-                    wanted = argv[index + 1].split(',')
-                    listed = [row for row in listed if any(label in (row.get('labels') or []) for label in wanted)]
-            return json.dumps([{k: v for k, v in row.items() if k != 'comments'} for row in listed])
-        if argv[:1] == ['show'] and '--include-comments' in argv:
-            ids = [token for token in argv[1:] if not token.startswith('--')]
-            if ids and all(task in state for task in ids):
-                return json.dumps([state[task] for task in ids])
-        return run(argv)
-    return serve
-
-
-def apply_batch(payload, actor, run, project, operators=None):
+def apply_batch(payload, actor, run, project, operators=None, lock=None):
     """`admin.py capability-apply`: accept a batch under one F3 decision (.60 section 4).
 
     The operator allowlist is checked first. A batch receipt binds the operation id to
@@ -555,75 +537,95 @@ def apply_batch(payload, actor, run, project, operators=None):
     resumes at the first incomplete item. A refusal before an item's writes is reported
     `refused` and the batch continues; an uncertain write stops the batch (`uncertain`,
     reconcile that item), and the rest stay `not-run` until a retry.
+
+    `lock` is a callable returning a context manager that holds the project's
+    coordination lock. The batch takes it once per ITEM and releases it between items
+    (review 01a0fc55 `batch-lock`), so another writer waits behind at most one item, not
+    the whole batch. Each item reads only its own key and re-checks compare-and-swap
+    under its own hold, so a change made between two items is seen, and refused if it
+    made the reviewed revision stale. Without `lock` the caller is holding it.
     """
     core.require_configured_operator(actor, operators, KIND.spec.accept_action)
     validate_batch(payload)
+    lock = lock or contextlib.nullcontext
     identity = content_hash({'operation_id': payload['operation_id']})
     digest = content_hash({'actor': actor, 'payload': payload})
-    journal = core.journal_dir(project, JOURNAL)
-    receipt = core.receipt_path(journal, identity, 'capability')
-    prior = load_json(receipt) if receipt.exists() else None
-    if prior is not None and (prior.get('sha256') != digest or prior.get('operation') != 'apply-batch'):
-        raise ValueError('Operation ID already used for a different batch; a changed list needs a new operation ID.')
     keys = [item['key'] for item in payload['items']]
-    atomic(receipt, {'sha256': digest, 'status': 'pending', 'actor': actor, 'operation': 'apply-batch',
-                     'operation_id': payload['operation_id'], 'items': keys})
-    run = snapshot_run(run, KIND.read_rows(run))
+    with lock():
+        journal = core.journal_dir(project, JOURNAL)
+        receipt = core.receipt_path(journal, identity, 'capability')
+        prior = load_json(receipt) if receipt.exists() else None
+        if prior is not None and (prior.get('sha256') != digest or prior.get('operation') != 'apply-batch'):
+            raise ValueError('Operation ID already used for a different batch; a changed list needs a new '
+                             'operation ID.')
+        atomic(receipt, {'sha256': digest, 'status': 'pending', 'actor': actor, 'operation': 'apply-batch',
+                         'operation_id': payload['operation_id'], 'items': keys})
     results, stopped = [], False
     for item in payload['items']:
-        operation_id = item_operation_id(payload['operation_id'], item['key'])
         if stopped:
             results.append({'key': item['key'], 'result': 'not-run'})
             continue
-        item_receipt = core.receipt_path(journal, content_hash({'operation_id': operation_id}), 'capability')
-        done = load_json(item_receipt) if item_receipt.exists() else None
-        if isinstance(done, dict) and done.get('status') == 'complete':
-            results.append({'key': item['key'], 'result': 'already-accepted', 'revision': done.get('revision'),
-                            'native_id': done.get('id')})
-            continue
-        single = {'schema_version': 1, 'operation_id': operation_id, 'operation': 'accept', 'key': item['key'],
-                  'revision': item['revision'], 'record_sha256': item['record_sha256'],
-                  'acceptance_state': 'accepted', 'acceptance': payload['acceptance']}
-        writes = []
-
-        def counted(argv, writes=writes):
-            if argv[:1] in (['comments'], ['update'], ['close'], ['create']) and '--dry-run' not in argv:
-                writes.append(argv[0])
-            return run(argv)
-        try:
-            outcome = KIND.apply_native(single, actor, counted, project, operator=True, operators=operators)
-        except (ValueError, RuntimeError, OSError) as error:
-            text = str(error)
-            if 'outcome is uncertain' in text or isinstance(error, (RuntimeError, OSError)):
-                results.append({'key': item['key'], 'result': 'uncertain',
-                                'reason': 'the native write did not confirm; reconcile %s with admin.py '
-                                          'capability-reconcile --operation-id %s' % (item['key'], operation_id)})
-                stopped = True
-            else:
-                results.append({'key': item['key'], 'result': 'refused', 'reason': text[:300]})
-            continue
-        # `accepted` when this run wrote (including finishing an earlier uncertain attempt);
-        # `already-accepted` when the item's accepted revision and evidence were already there.
-        results.append({'key': item['key'], 'result': 'accepted' if writes else 'already-accepted',
-                        'revision': outcome['revision'], 'native_id': outcome['native_id'],
-                        'record_comment_id': outcome.get('record_comment_id')})
+        with lock():
+            result = _apply_item(payload, item, actor, run, project, operators, journal)
+        results.append(result)
+        stopped = result['result'] == 'uncertain'
     complete = not stopped
-    atomic(receipt, {'sha256': digest, 'status': 'complete' if complete else 'pending', 'actor': actor,
-                     'operation': 'apply-batch', 'operation_id': payload['operation_id'], 'items': keys,
-                     'results': {result['key']: result['result'] for result in results}})
+    with lock():
+        atomic(receipt, {'sha256': digest, 'status': 'complete' if complete else 'pending', 'actor': actor,
+                         'operation': 'apply-batch', 'operation_id': payload['operation_id'], 'items': keys,
+                         'results': {result['key']: result['result'] for result in results}})
     return {'operation_id': payload['operation_id'], 'decision_id': payload['acceptance']['decision_id'],
             'items': results, 'complete': complete}
 
 
+def _apply_item(payload, item, actor, run, project, operators, journal):
+    """One batch item, under one hold of the coordination lock."""
+    operation_id = item_operation_id(payload['operation_id'], item['key'])
+    item_receipt = core.receipt_path(journal, content_hash({'operation_id': operation_id}), 'capability')
+    done = load_json(item_receipt) if item_receipt.exists() else None
+    if isinstance(done, dict) and done.get('status') == 'complete':
+        return {'key': item['key'], 'result': 'already-accepted', 'revision': done.get('revision'),
+                'native_id': done.get('id')}
+    single = {'schema_version': 1, 'operation_id': operation_id, 'operation': 'accept', 'key': item['key'],
+              'revision': item['revision'], 'record_sha256': item['record_sha256'],
+              'acceptance_state': 'accepted', 'acceptance': payload['acceptance']}
+    writes = []
+
+    def counted(argv):
+        if argv[:1] in (['comments'], ['update'], ['close'], ['create']) and '--dry-run' not in argv:
+            writes.append(argv[0])
+        return run(argv)
+    try:
+        outcome = KIND.apply_native(single, actor, counted, project, operator=True, operators=operators)
+    except (ValueError, RuntimeError, OSError) as error:
+        text = str(error)
+        if 'outcome is uncertain' in text or isinstance(error, (RuntimeError, OSError)):
+            return {'key': item['key'], 'result': 'uncertain',
+                    'reason': 'the native write did not confirm; reconcile %s with admin.py '
+                              'capability-reconcile --operation-id %s' % (item['key'], operation_id)}
+        return {'key': item['key'], 'result': 'refused', 'reason': text[:300]}
+    # `accepted` when this run wrote (including finishing an earlier uncertain attempt);
+    # `already-accepted` when the item's accepted revision and evidence were already there.
+    return {'key': item['key'], 'result': 'accepted' if writes else 'already-accepted',
+            'revision': outcome['revision'], 'native_id': outcome['native_id'],
+            'record_comment_id': outcome.get('record_comment_id')}
+
+
 # -- aliases ---------------------------------------------------------------------------------------
 
-def propose_alias(key, alias, actor, run, operators, evidence=None):
+def propose_alias(key, alias, actor, run, operators, evidence=None, operator=False):
     """`capability propose-alias KEY "PHRASE" [--evidence POINTER]`: a capped candidate alias.
+
+    `operator=True` is the operator shell route (`admin.py capability-alias-propose`):
+    the allowlist is checked first and the record is written `verified`. The endpoint
+    route never is, whatever actor name the caller declares.
 
     Natively idempotent: the record itself is the receipt, so an identical pending
     proposal is returned instead of written twice. Refusals name the cap; none quotes
     another capability's text.
     """
+    if operator:
+        core.require_configured_operator(actor, operators, 'propose a verified capability alias')
     valid_key(key)
     valid_alias_text(alias)
     if evidence is not None:
@@ -657,7 +659,7 @@ def propose_alias(key, alias, actor, run, operators, evidence=None):
                 'comment_id': pending[phrase]['comment_id']}
     if phrase in target['aliases_rejected']:
         raise ValueError('That alias was rejected for capability %s by an operator' % key)
-    submitter = submitter_for(actor, operators)
+    submitter = submitter_for(actor, operator)
     mine = lambda item: (item['person'] == submitter['person']) if submitter['identity'] == 'verified' \
         else item['identity'] == 'unverified'
     on_target = [item for item in target['aliases_pending'] if mine(item)]
@@ -673,7 +675,7 @@ def propose_alias(key, alias, actor, run, operators, evidence=None):
         raise ValueError('The shared pool for unverified proposers is full (%d per capability, %d per project) '
                          'until an operator folds or rejects pending aliases; SSH attribution beyond operators '
                          'arrives with kittrial-5bb.68' % (CAP_UNVERIFIED_CAPABILITY, CAP_UNVERIFIED_PROJECT))
-    _, body = alias_record(key, alias, 'propose', actor, operators, evidence=evidence)
+    _, body = alias_record(key, alias, 'propose', actor, operator, evidence=evidence)
     raw = run(['comments', 'add', target['native_id'], body, '--json'])
     return {'key': key, 'alias': alias, 'state': 'proposed', 'reconciled': False,
             'comment_id': core._comment_id(raw), 'identity': submitter['identity']}
@@ -700,7 +702,7 @@ def reject_alias(payload, actor, run, project, operators=None):
         return {'key': payload['key'], 'alias': payload['alias'], 'state': 'rejected', 'reconciled': True}
     if phrase not in {item['normalized'] for item in target['aliases_pending']}:
         raise ValueError('No pending alias with that text on capability %s' % payload['key'])
-    _, body = alias_record(payload['key'], payload['alias'], 'reject', actor, operators, reason=payload['reason'])
+    _, body = alias_record(payload['key'], payload['alias'], 'reject', actor, True, reason=payload['reason'])
     raw = run(['comments', 'add', target['native_id'], body, '--json'])
     return {'key': payload['key'], 'alias': payload['alias'], 'state': 'rejected', 'reconciled': False,
             'comment_id': core._comment_id(raw)}
@@ -879,6 +881,7 @@ def help_payload():
                                               'per_capability': CAP_CAPABILITY}},
             'operator': ['admin.py capability-apply PROJECT --actor OPERATOR --file batch.json',
                          'admin.py capability-retire PROJECT --actor OPERATOR --file retire.json',
+                         'admin.py capability-alias-propose PROJECT --actor OPERATOR --file alias.json',
                          'admin.py capability-alias-reject PROJECT --actor OPERATOR --file reject.json',
                          'admin.py capability-reconcile PROJECT --operation-id ID --actor OPERATOR --reason TEXT '
                          '--disposition complete|failed|released [--issue-id ID]']}

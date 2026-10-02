@@ -4,6 +4,7 @@ Runs over the reference tests' fake bd (exact `list --label`, `show --include-co
 comment author = the acting actor). Rollback: the anchors this writer creates satisfy
 the unchanged `is_record_anchor`, and its receipts pass the frozen receipt schema.
 """
+import contextlib
 import copy
 import json
 import sys
@@ -70,11 +71,12 @@ class CapabilityCase(unittest.TestCase):
         row, _ = cr.anchor_for(cr.read_rows(self.native), key)
         return cr.existing_revisions(row)[revision]['sha256']
 
-    def batch(self, items, operation_id='batch-1', actor=OPERATOR, operators=(OPERATOR,), decision='decision-7'):
+    def batch(self, items, operation_id='batch-1', actor=OPERATOR, operators=(OPERATOR,), decision='decision-7',
+              lock=None):
         self.native.actor = actor
         payload = {'schema_version': 1, 'operation_id': operation_id, 'items': items,
                    'acceptance_state': 'accepted', 'acceptance': acceptance(decision_id=decision)}
-        return cr.apply_batch(payload, actor, self.native, self.project, operators=list(operators))
+        return cr.apply_batch(payload, actor, self.native, self.project, operators=list(operators), lock=lock)
 
     def item(self, key='review.structured-contribution', revision=1):
         return {'key': key, 'revision': revision, 'record_sha256': self.sha(revision, key)}
@@ -82,9 +84,11 @@ class CapabilityCase(unittest.TestCase):
     def read(self, *args, operators=(OPERATOR,)):
         return cr.read(list(args), self.native, list(operators))
 
-    def alias(self, key, phrase, actor='alice', operators=(OPERATOR,), evidence=None):
+    def alias(self, key, phrase, actor='alice', operators=(OPERATOR,), evidence=None, operator=False):
+        """`operator=False` is the endpoint route; `operator=True` the operator shell route."""
         self.native.actor = actor
-        return cr.propose_alias(key, phrase, actor, self.native, list(operators), evidence=evidence)
+        return cr.propose_alias(key, phrase, actor, self.native, list(operators), evidence=evidence,
+                                operator=operator)
 
 
 class RecordTests(CapabilityCase):
@@ -195,9 +199,10 @@ class BatchAcceptanceTests(CapabilityCase):
         self.assertTrue(result['complete'])
         self.assertEqual([(item['key'], item['result'], item['revision']) for item in result['items']],
                          [('a.one', 'accepted', 2), ('a.two', 'accepted', 2), ('a.three', 'accepted', 2)])
-        # One catalog read for the whole batch.
-        reads = [call[0] for call in self.native.calls if call[0] in ('list', 'show')]
-        self.assertEqual(reads, ['list', 'show'])
+        # Each item reads only its own key: one list by key label, one show of that anchor.
+        reads = [(call[0], len([arg for arg in call[1:] if not arg.startswith('--')]) if call[0] == 'show' else 1)
+                 for call in self.native.calls if call[0] in ('list', 'show', 'export')]
+        self.assertEqual(reads, [('list', 1), ('show', 1)] * 3)
         for key in ('a.one', 'a.two', 'a.three'):
             view = self.read('get', key)
             self.assertEqual((view['state'], view['acceptance']['decision_id'], view['acceptance']['operator']),
@@ -207,6 +212,85 @@ class BatchAcceptanceTests(CapabilityCase):
         self.assertIn('apply-batch', operations)
         admin.validate_coordination_files({'.capability-requests/' + path.name:
                                            json.loads(path.read_text(encoding='utf-8')) for path in receipts})
+
+    def test_the_lock_is_released_between_items_and_each_item_rechecks_under_its_own_hold(self):
+        """Review 01a0fc55 `batch-lock`: another writer waits behind at most one item.
+
+        The fake lock records every hold. A writer that starts waiting while the first
+        item holds the lock gets it as soon as that item releases, before the second
+        item; and because it revised the third item's capability, the third item's
+        compare-and-swap, re-checked under its own hold, refuses the stale revision.
+        """
+        items = [self.item(key) for key in ('a.one', 'a.two', 'a.three')]
+        anchors = {cr.anchor_for(cr.read_rows(self.native), key)[0]['id']: key for key in ('a.one', 'a.two', 'a.three')}
+        stale_sha = self.sha(1, 'a.three')
+        state = {'held': False, 'holds': 0, 'waiting': False}
+        events, unlocked_calls = [], []
+        native = self.native
+
+        def run(args):
+            if not state['held']:
+                unlocked_calls.append(list(args))
+            if args[:2] == ['comments', 'add']:
+                events.append(('write', anchors[args[2]], args[3].split('\n', 1)[0]))
+            return native(args)
+
+        def waiting_writer():
+            # A contributor's write through the endpoint: it takes the lock itself.
+            state['held'] = True
+            events.append(('lock', 'writer'))
+            native.actor = 'alice'
+            cr.apply_native(entry(operation='revise', operation_id='concurrent', key='a.three', name='Thing 2',
+                                  aliases=[], summary='Changed while the batch ran.', revision=2,
+                                  expected_sha256=stale_sha), 'alice', run, self.project)
+            native.actor = OPERATOR
+            events.append(('unlock', 'writer'))
+            state['held'] = False
+
+        @contextlib.contextmanager
+        def lock():
+            self.assertFalse(state['held'], 'the batch must not take the lock while it holds it')
+            state['held'] = True
+            state['holds'] += 1
+            hold = state['holds']
+            events.append(('lock', hold))
+            if hold == 2:                      # hold 1 is the batch receipt; hold 2 is the first item
+                state['waiting'] = True
+            try:
+                yield
+            finally:
+                events.append(('unlock', hold))
+                state['held'] = False
+                if state['waiting']:
+                    state['waiting'] = False
+                    waiting_writer()
+
+        self.native.actor = OPERATOR
+        payload = {'schema_version': 1, 'operation_id': 'locked', 'items': items, 'acceptance_state': 'accepted',
+                   'acceptance': acceptance()}
+        result = cr.apply_batch(payload, OPERATOR, run, self.project, operators=[OPERATOR], lock=lock)
+        self.assertEqual([(item['key'], item['result']) for item in result['items']],
+                         [('a.one', 'accepted'), ('a.two', 'accepted'), ('a.three', 'refused')])
+        self.assertIn('not the newest', result['items'][2]['reason'])
+        self.assertEqual(self.read('get', 'a.three')['state'], 'draft-only')
+        # Five holds: the batch receipt, one per item, the final receipt. No native call outside one.
+        self.assertEqual(state['holds'], 5)
+        self.assertEqual(unlocked_calls, [])
+        # Each hold wrote to at most one capability, and the lock was free between holds.
+        holds, current = {}, None
+        for event in events:
+            if event[0] == 'lock':
+                self.assertIsNone(current, events)
+                current = event[1]
+            elif event[0] == 'unlock':
+                self.assertEqual(current, event[1])
+                current = None
+            else:
+                holds.setdefault(current, set()).add(event[1])
+        self.assertEqual(holds, {2: {'a.one'}, 'writer': {'a.three'}, 3: {'a.two'}})
+        # The waiting writer ran after exactly one item: before any write of the second.
+        order = [event[1] for event in events if event[0] == 'lock']
+        self.assertEqual(order, [1, 2, 'writer', 3, 4, 5])
 
     def test_an_uncertain_item_stops_the_batch_and_a_retry_resumes_it(self):
         items = [self.item(key) for key in ('a.one', 'a.two', 'a.three')]
@@ -254,13 +338,16 @@ class BatchAcceptanceTests(CapabilityCase):
         self.assertTrue(mixed['complete'])   # only an uncertain write leaves a batch incomplete
         self.assertEqual(self.read('get', 'a.one')['state'], 'draft-only')
         # An identical re-run: the accepted items are reported from their receipts, with no
-        # native write and no native read of their anchors beyond the one catalog snapshot.
+        # native write and no native read at all; only the refused item is read again.
+        rerun = [{'key': 'a.one', 'revision': 1, 'record_sha256': 'f' * 64}, self.item('a.two'),
+                 self.item('a.three')]
         self.native.calls = []
-        again = self.batch([{'key': 'a.one', 'revision': 1, 'record_sha256': 'f' * 64}, self.item('a.two'),
-                            self.item('a.three')], operation_id='mixed')
+        again = self.batch(rerun, operation_id='mixed')
         self.assertEqual([item['result'] for item in again['items']],
                          ['refused', 'already-accepted', 'already-accepted'])
         self.assertEqual(self.native.writes(), [])
+        self.assertEqual([call[0] for call in self.native.calls if call[0] in ('list', 'show', 'export')],
+                         ['list', 'show'])
 
     def test_reaccepting_an_accepted_revision_writes_a_new_revision_and_evidence(self):
         self.batch([self.item('a.one')])
@@ -349,15 +436,52 @@ class AliasTests(CapabilityCase):
         with self.assertRaisesRegex(ValueError, '1..20'):
             self.read('find', 'merge', '--limit', '21')
 
+    def test_the_endpoint_route_is_never_verified_whatever_actor_is_declared(self):
+        """Review 01a0fc55 `verified-self-declared`: over SSH the actor is self-declared."""
+        # A caller naming an allowlisted operator as its actor over the endpoint route.
+        result = self.alias('review.structured-contribution', 'borrowed name', actor=OPERATOR)
+        self.assertEqual(result['identity'], 'unverified')
+        pending = self.read('get', 'review.structured-contribution')['aliases_pending'][0]
+        self.assertEqual(pending['submitter'], {'person': None, 'identity': 'unverified'})
+        # It took the shared unverified slot; it did not get an operator's own caps.
+        for actor in (OPERATOR, 'bob'):
+            with self.assertRaisesRegex(ValueError, 'shared pool for unverified proposers'):
+                self.alias('review.structured-contribution', 'another phrase', actor=actor)
+        # The operator shell route checks the allowlist, and only it writes `verified`.
+        with self.assertRaisesRegex(ValueError, 'not a server-side configured operator'):
+            self.alias('review.structured-contribution', 'mallory phrase', actor='mallory', operator=True)
+        verified = self.alias('review.structured-contribution', 'operator phrase', actor=OPERATOR, operator=True)
+        self.assertEqual(verified['identity'], 'verified')
+        self.assertIn({'person': 'operator:' + OPERATOR, 'identity': 'verified'},
+                      [item['submitter'] for item in
+                       self.read('get', 'review.structured-contribution')['aliases_pending']])
+        # The reader needs BOTH: the record says verified AND its author is that allowlisted operator.
+        anchor = cr.anchor_for(cr.read_rows(self.native), 'merge.slot')[0]['id']
+        for phrase, says_verified, author, operators, expected in (
+                ('says so wrong author', True, 'mallory', (OPERATOR,), 'unverified'),
+                ('right author does not say so', False, OPERATOR, (OPERATOR,), 'unverified'),
+                ('author off the allowlist', True, OPERATOR, ('someone-else',), 'unverified'),
+                ('both hold', True, OPERATOR, (OPERATOR,), 'verified')):
+            _, body = cr.alias_record('merge.slot', phrase, 'propose', OPERATOR, says_verified)
+            self.native.add_comment(anchor, body, author=author)
+            view = self.read('get', 'merge.slot', operators=operators)
+            shown = [item for item in view['aliases_pending'] if item['alias']['text'] == phrase]
+            self.assertEqual(shown[0]['submitter']['identity'], expected, phrase)
+        # A reject record takes effect on the same two conditions.
+        _, body = cr.alias_record('merge.slot', 'both hold', 'reject', OPERATOR, False, reason='r')
+        self.native.add_comment(anchor, body, author=OPERATOR)
+        self.assertIn('both hold', [item['alias']['text']
+                                    for item in self.read('get', 'merge.slot')['aliases_pending']])
+
     def test_caps_are_keyed_on_the_person_read_from_the_native_author(self):
         self.alias('review.structured-contribution', 'first phrase', actor='alice')
         with self.assertRaisesRegex(ValueError, 'shared pool for unverified proposers'):
             self.alias('review.structured-contribution', 'second phrase', actor='bob')
         for index in range(3):
             self.assertEqual(self.alias('review.structured-contribution', 'operator phrase %d' % index,
-                                        actor=OPERATOR)['identity'], 'verified')
+                                        actor=OPERATOR, operator=True)['identity'], 'verified')
         with self.assertRaisesRegex(ValueError, '3 per capability'):
-            self.alias('review.structured-contribution', 'operator phrase 9', actor=OPERATOR)
+            self.alias('review.structured-contribution', 'operator phrase 9', actor=OPERATOR, operator=True)
         with patch.object(cr, 'CAP_UNVERIFIED_PROJECT', 2):
             self.alias('merge.slot', 'slot phrase', actor='carol')
             self.propose(operation_id='p3', key='third.thing', name='Third')
@@ -365,7 +489,7 @@ class AliasTests(CapabilityCase):
                 self.alias('third.thing', 'another phrase', actor='dave')
         # A forged "verified" submitter written by a non-operator still counts as unverified.
         anchor = cr.anchor_for(cr.read_rows(self.native), 'merge.slot')[0]['id']
-        record, body = cr.alias_record('merge.slot', 'forged phrase', 'propose', OPERATOR, [OPERATOR])
+        record, body = cr.alias_record('merge.slot', 'forged phrase', 'propose', OPERATOR, True)
         self.native.add_comment(anchor, body, author='mallory')
         view = self.read('get', 'merge.slot')
         forged = [item for item in view['aliases_pending'] if item['alias']['text'] == 'forged phrase']
@@ -375,7 +499,7 @@ class AliasTests(CapabilityCase):
         with self.assertRaisesRegex(ValueError, 'collides'):
             self.alias('review.structured-contribution', 'merge slot')
         # A draft's alias is not protected; once accepted it is (.60 section 6).
-        self.alias('review.structured-contribution', 'integration lock', actor=OPERATOR)
+        self.alias('review.structured-contribution', 'integration lock', actor=OPERATOR, operator=True)
         self.batch([self.item('merge.slot')], operation_id='accept-merge')
         with self.assertRaisesRegex(ValueError, 'collides'):
             self.alias('review.structured-contribution', 'integration lock')
