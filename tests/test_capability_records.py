@@ -142,6 +142,34 @@ class RecordTests(CapabilityCase):
         with self.assertRaisesRegex(ValueError, 'Unknown requirement link.*R01'):
             self.propose(operation_id='cap-2', key='other.thing', requirements=[{'key': 'R01', 'revision': 2}])
 
+    def reads(self):
+        return [(call[0], len([token for token in call[1:] if not token.startswith('--')])
+                 if call[0] == 'show' else 1)
+                for call in self.native.calls if call[0] in ('list', 'show', 'export')]
+
+    def test_reads_cost_what_they_touch_whatever_the_index_size(self):
+        # The .66 review (01a0fbfd) found whole-catalog reads on get and on every write;
+        # the capability paths share the layer, so they are pinned the same way.
+        for index in range(240):
+            key = 'bulk.k%03d' % index
+            record = cr.entry_record(entry(key=key, name='Bulk %d' % index, aliases=[]), 1, 'draft')
+            self.native.seed('bulk-%d' % index, labels=['capability', 'capability:draft', cr.key_label(key)],
+                             status='closed', comments=[{'id': 'b%d' % index, 'text': cr.entry_comment(record),
+                                                         'author': 'alice'}])
+        self.native.calls = []
+        self.assertEqual(self.read('get', 'bulk.k150')['state'], 'draft-only')
+        # Its own key, then the (empty) list of retired keys for `replaces`.
+        self.assertEqual(self.reads(), [('list', 1), ('show', 1), ('list', 1)])
+        self.native.calls = []
+        self.propose()
+        self.assertEqual(self.reads(), [('list', 1), ('show', 1)])
+        self.native.calls = []
+        self.assertTrue(self.read('find', 'Bulk 7')['found'])
+        self.assertEqual([call[0] for call in self.native.calls], ['list', 'export'])
+        self.native.calls = []
+        self.alias('bulk.k007', 'a phrase')
+        self.assertEqual([call[0] for call in self.native.calls], ['list', 'export', 'comments'])
+
     def test_revise_is_compare_and_swap(self):
         self.propose()
         with self.assertRaisesRegex(ValueError, 'expected_sha256 does not match'):

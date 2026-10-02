@@ -397,7 +397,11 @@ b capability propose-alias merge.slot "single integrator" --evidence coordinatio
 ```
 
 **Reading.** `find`, `get` and `list` are read-only. They take no coordination lock and
-read only the capability-labelled rows, as `ref` does.
+read no more than they need, as `ref` does: `get` reads only its own key (and the
+retired keys, for `replaces`); `list` and `find` read the index in two native reads
+(one `bd list`, then one `bd show` up to 20 entries or one `bd export --all` above).
+`propose` and `revise` read only their own key before writing; `propose-alias` reads
+the index once, because its collision and cap rules span every capability.
 
 - **`find PHRASE`** returns `{found, match_type, records, total_records, candidates,
   hint, coverage}`.
