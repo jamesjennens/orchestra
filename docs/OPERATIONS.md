@@ -65,7 +65,7 @@ history](#malformed-structured-history) (`void-record`).
 | `verifiers list\|add\|remove [ACTOR] [--confirm-revoke]` | manage the deployment `verifiers` list: actors, other than operators, whose `capability-verify` records readers count as verified. The list is empty by default and grants nothing else. `remove` needs `--confirm-revoke`; the refusal names the capabilities whose verification would change | shell access to the coordination host; `deployment.private.json` is the only authority source |
 | `capability-reconcile PROJECT --operation-id ID ...` | finish a capability operation whose write was uncertain (for a batch item, the id is `OPERATION_ID/KEY`). A transient native failure can leave a `pending` receipt with no native row behind it, and the same `operation_id` is then refused until it is cleared: run `capability-reconcile --disposition released`, then retry the original command | confirmation of the native record state |
 | `record-reconcile PROJECT --kind requirement\|reference\|capability ...` | the same reconcile for any record kind | as above |
-| `capability-misses-clear PROJECT` | delete the project's [capability lookup-miss log](#the-capability-lookup-miss-log). It prints what was removed (`finds`, `misses`, `phrases`). It writes nothing to the tracker, takes no coordination lock and calls no `bd` | none beyond the service account: it deletes telemetry only, so there is no allowlist check and no `--actor` |
+| `capability-misses-clear PROJECT` | delete the project's [capability lookup-miss log](#the-capability-lookup-miss-log). It prints what was removed (`finds`, `misses`, `phrases`), and in `repaired` any symlink, directory or unopenable lock file it removed from the three miss-log names (never following a link). It writes nothing to the tracker, takes no coordination lock and calls no `bd` | none beyond the service account: it deletes telemetry only, so there is no allowlist check and no `--actor` |
 | `void-record PROJECT --actor OPERATOR --file void.json` | void a malformed or stale contribution-review record | the deployment operator allowlist (`operators` in `deployment.private.json`) |
 | `handoff PROJECT --actor ACTOR --file handoff.json` | transfer a claim when the current owner cannot act | an owner decision/evidence pointer in the payload's `approval` |
 
@@ -235,20 +235,30 @@ per phrase, plus the counters `finds`, `misses`, `overflow`, `dropped` and `evic
 No actor names. Phrases are untrusted contributor text: read them as data.
 
 **Bounds:**
-- 500 phrases per project. When full, a new phrase replaces the one with the oldest
-  last-seen time.
+- 500 phrases per project. When full, a new phrase replaces the one with the lowest
+  count, and among equal counts the one seen longest ago.
 - 60 new phrases per project per clock hour (UTC). Further new phrases that hour are
-  counted in `overflow` only. The bound is per project because no actor is stored.
+  counted in `overflow` only. The bound is per project because no actor is stored, so
+  one caller can use up the whole hourly quota.
+- Counts are not votes: no count can be attributed to anyone, and one caller can repeat
+  a phrase to push it to the top.
 - 80 characters per stored phrase. The file is at most about 530 kB, and normally a few
   tens of kB; a file over 1 MB is not read and is replaced.
 
 **Cost and locking:**
-- Recording takes its own lock (`.capability-misses.lock`), without waiting. If another
-  request holds it, that one find is not counted. It never takes `.coordination.lock`,
-  so it never waits for a writer and never makes one wait.
+- Recording takes its own lock (`.capability-misses.lock`) with a few non-blocking
+  attempts, waiting about 10 ms at most in total. If another request still holds it,
+  that one find is not counted, so the counts are lower bounds. It never takes
+  `.coordination.lock`, so it never waits for a writer and never makes one wait.
 - It calls no `bd` and starts no process. The log is rewritten on each counted find
-  (temp file, then rename, no fsync): about 2 ms with a full log, well under 1 ms with
-  a small one.
+  (temp file, then rename, no fsync). The independent review measured 2-3 ms for normal
+  logs, and for a worst-case 517 kB log about 5 ms median and up to 33 ms at the 95th
+  percentile.
+
+**Stuck states.** If the lock path is a symlink or directory, or the log or temp path
+is a directory, finds still answer but nothing is recorded. `capability misses` then
+reports `recording: lock-unusable` or `log-unwritable` instead of `ok`, so its zeros
+are not mistaken for "no misses". `capability-misses-clear` repairs it.
 
 **To clear it:**
 
@@ -258,7 +268,9 @@ python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime cap
 
 This deletes the log and starts a new measuring window (`since`). Clear it after a batch
 of aliases or capabilities has been accepted, so the next window measures the improved
-index. Deleting the two files by hand is equally safe.
+index. It also removes a symlink, directory or unopenable lock file found at
+`.capability-misses.json`, `.capability-misses.json.tmp` or `.capability-misses.lock`,
+without following a link. Deleting those paths by hand is equally safe.
 
 ### Malformed structured history
 
