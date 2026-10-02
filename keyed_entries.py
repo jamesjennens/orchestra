@@ -26,7 +26,8 @@ and gives it:
   `reserved_comments.is_record_anchor`, unchanged, so an anchor whose writer stopped
   before the first record is an ordinary closed row; the same operation's retry
   finishes it, another operation is refused that key, and readers report it as
-  incomplete;
+  incomplete. When its payload is lost, the operator's `release` (`admin.py
+  anchor-release`, kittrial-5bb.74) closes it and frees the key;
 - the reader view: an acceptance counts only while its evidence comment's stored
   native author equals the evidence `operator` and is on the live deployment
   operator allowlist, otherwise it is inert (named, never silent); every entry fails
@@ -43,13 +44,14 @@ import copy
 import json
 import re
 import subprocess
+from pathlib import Path
 
 import keyed_records as core
 import recovery
-from coordination import identifier
+from coordination import atomic, identifier
 from export_requirements import parse_json
 from recovery import configured_operators
-from requirements import SHA256_TEXT, canonical_bytes, content_hash
+from requirements import SHA256_TEXT, canonical_bytes, content_hash, load_json
 from reserved_comments import is_record_anchor, record_comment_kind
 
 SHOW_CHUNK = 50
@@ -61,6 +63,7 @@ SHOW_CHUNK = 50
 CATALOG_SHOW_MAX = 20
 ISSUE_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,160}')
 COVERAGE_IDS = 10
+RELEASE_REASON_MAX = 1000
 CONTRIBUTOR_OPERATIONS = ('propose', 'revise')
 OPERATOR_OPERATIONS = ('accept', 'draft')
 WRITTEN_BY_THE_OPERATION = ('acceptance_state', 'successor', 'sha256', 'acceptance', 'labels')
@@ -480,7 +483,8 @@ class AnchoredKind:
         if status == 'incomplete':
             raise ValueError('%s key %s is held by anchor %s, which has no revision record yet (an '
                              'interrupted propose); re-run that propose with its operation_id, or ask the operator '
-                             'to reconcile it.' % (self.title, payload['key'], row['id']))
+                             'to reconcile it, or to release the anchor (admin.py anchor-release) if its payload is '
+                             'lost.' % (self.title, payload['key'], row['id']))
         if payload['key'] not in {record['key'] for record in self.existing_revisions(row).values()}:
             # The lookup label is shared with a different key (a.b-c and a.b.c).
             raise ValueError('Unknown %s key %s; use %s list to see the catalog.'
@@ -500,7 +504,8 @@ class AnchoredKind:
             if not is_record_anchor(row):
                 raise ValueError('%s key %s is held by anchor %s, which has no revision record yet (an '
                                  'interrupted propose by another operation); that operation must be re-run with '
-                                 'its operation_id, or reconciled by the operator.'
+                                 'its operation_id, or reconciled by the operator, who releases the anchor '
+                                 '(admin.py anchor-release) if its payload is lost.'
                                  % (self.title, payload['key'], row['id']))
             revisions = self.existing_revisions(row)
             keys = {record['key'] for record in revisions.values()}
@@ -697,12 +702,99 @@ class AnchoredKind:
     def confirm_anchor(self, row):
         if not is_record_anchor(row):
             raise ValueError('Anchor %s has no %s revision record yet; re-run the original %s propose '
-                             'with the same operation_id to finish it, then reconcile.'
+                             'with the same operation_id to finish it, then reconcile. If that payload is lost, '
+                             'release the anchor with admin.py anchor-release.'
                              % (row.get('id'), self.noun, self.command))
 
     def reconcile(self, project, operation_id, actor, reason, disposition, run, issue_id=None):
         return core.reconcile(project, operation_id, actor, reason, disposition, run, self.spec,
                               issue_id=issue_id, confirm=self.confirm_anchor)
+
+    def release(self, project, issue_id, actor, reason, run, operators=None):
+        """`admin.py anchor-release` (operator): close an anchor that holds no record and free its key.
+
+        An anchor holds no record when its propose stopped between the create and the first
+        record (still open if it stopped before the close), or when operator voids name
+        every record it carried. Only the same operation's retry can finish it, so once
+        the original payload is lost its lookup label blocks the key for good, and an
+        open one is claimable as an ordinary task. The release:
+
+        - is refused for an actor outside the deployment allowlist before any read, for a
+          row that is not this kind's anchor, and for one that still holds a live record
+          (or a record this kit cannot read);
+        - marks each pending receipt the row's `request:` labels name as `released`, with
+          the audit, so the operation ID is settled and a retry of it starts a new anchor;
+        - closes the row if it is open, so it is never claimable;
+        - appends one plain audit comment, then removes the state, `request:` and
+          `request-content:` labels and, last, the lookup label, which frees the key.
+
+        The type label stays: an anchor whose records were voided keeps those comments
+        and stays hidden as an anchor, and a row that never held a record reads as an
+        ordinary closed task, as it already did. Nothing is deleted. Each step is skipped
+        when already done, so a re-run after an uncertain write finishes the release;
+        once the lookup label is gone the row is no longer an anchor and a re-run is
+        refused.
+        """
+        core.require_configured_operator(actor, operators, 'release a %s anchor' % self.noun)
+        if not isinstance(issue_id, str) or not ISSUE_ID.fullmatch(issue_id):
+            raise ValueError('Invalid issue ID')
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > RELEASE_REASON_MAX \
+                or '\x00' in reason:
+            raise ValueError('A release reason is required (at most %d characters)' % RELEASE_REASON_MAX)
+        rows = self.shown(run, [issue_id])
+        if len(rows) != 1:
+            raise ValueError('Unknown %s anchor %s' % (self.noun, issue_id))
+        row = rows[0]
+        labels = [label for label in row.get('labels') or [] if isinstance(label, str)]
+        keys = sorted(self.key_labels(row))
+        if self.type_label not in labels or not keys:
+            raise ValueError('%s carries no %s and %s labels: it is not a %s anchor, or it was already released'
+                             % (issue_id, self.type_label, self.key_prefix, self.noun))
+        live, _ = self.live_row(row, operators)
+        for comment in live.get('comments') or []:
+            kind = record_comment_kind(comment.get('text') if isinstance(comment, dict) else None)
+            if kind and (kind[0].startswith(self.family) or kind[0] == 'unknown'):
+                raise ValueError('%s anchor %s still holds a record, so it is an entry, not an orphan; an operator '
+                                 'void (admin.py void-record) repairs a malformed record' % (self.title, issue_id))
+        journal = Path(project) / self.journal
+        pending = []
+        for label in sorted(labels):
+            identity = label[len('request:'):] if label.startswith('request:') else None
+            if identity is None or not SHA256_TEXT.match(identity) or not journal.is_dir() or journal.is_symlink():
+                continue
+            receipt = core.receipt_path(journal, identity, self.noun)
+            prior = load_json(receipt) if receipt.exists() else None
+            if not isinstance(prior, dict) or prior.get('status') != 'pending':
+                continue
+            if prior.get('id') not in (None, issue_id):
+                raise ValueError('The receipt for %s records native record %s, not %s; reconcile it with %s first'
+                                 % (label, prior['id'], issue_id, self.reconcile_command))
+            pending.append((identity, receipt, prior))
+        at = core.now()
+        for identity, receipt, prior in pending:
+            audit = {'actor': actor, 'reason': reason, 'disposition': 'released', 'at': at,
+                     'released_anchor': issue_id}
+            updated = {'sha256': prior.get('sha256'), 'status': 'released', 'actor': prior.get('actor'),
+                       'reconciliation': audit,
+                       'error': 'Released by the operator with anchor %s, which held no record.' % issue_id}
+            for name in ('operation', 'revision'):
+                if name in prior:
+                    updated[name] = prior[name]
+            atomic(receipt, updated)
+        closed = row.get('status') != 'closed'
+        if closed:
+            run(['close', issue_id, '--reason', '%s anchor released by the operator (no record)' % self.title,
+                 '--json'])
+        note = ('Released by operator %s: this %s anchor held no record, so %s no longer holds its key. Reason: %s'
+                % (actor, self.noun, ', '.join(keys), reason))
+        if not any(isinstance(comment, dict) and comment.get('text') == note for comment in row.get('comments') or []):
+            run(['comments', 'add', issue_id, note, '--json'])
+        removed = sorted(label for label in labels if label in self.state_labels.values()
+                         or label.startswith(('request:', 'request-content:'))) + keys
+        for label in removed:
+            run(['update', issue_id, '--remove-label', label, '--json'])
+        return {'released': issue_id, 'kind': self.noun, 'closed': closed, 'labels_removed': removed,
+                'receipts_released': [identity for identity, _, _ in pending]}
 
     # -- the reader view ------------------------------------------------------------------------
 
@@ -838,7 +930,8 @@ class AnchoredKind:
                 return entry
         if incomplete:
             raise ValueError('%s key %s has no revision record yet (incomplete anchor %s); re-run its '
-                             'propose or ask the operator to reconcile it' % (self.title, key, incomplete[0]))
+                             'propose, or ask the operator to reconcile it or release the anchor'
+                             % (self.title, key, incomplete[0]))
         raise ValueError('Unknown %s key %s; use %s list to see the catalog' % (self.noun, key, self.command))
 
     @staticmethod

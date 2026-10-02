@@ -1060,7 +1060,10 @@ def help_payload():
                          'admin.py capability-alias-propose PROJECT --actor OPERATOR --file alias.json',
                          'admin.py capability-alias-reject PROJECT --actor OPERATOR --file reject.json',
                          'admin.py capability-reconcile PROJECT --operation-id ID --actor OPERATOR --reason TEXT '
-                         '--disposition complete|failed|released [--issue-id ID]']}
+                         '--disposition complete|failed|released [--issue-id ID]',
+                         'admin.py void-record PROJECT --actor OPERATOR --file void.json',
+                         'admin.py anchor-release PROJECT --kind capability --issue-id ID --actor OPERATOR '
+                         '--reason TEXT']}
 
 
 def _options(args, allowed):

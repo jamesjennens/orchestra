@@ -1,4 +1,4 @@
-"""Operator voids of reference and capability records (kittrial-5bb.74).
+"""Operator voids of reference and capability records, and orphan-anchor release (kittrial-5bb.74).
 
 The .41 design (section 3.7) repairs a malformed catalog record through the existing
 operator `void-record`. A void of a keyed record is a `record-void-v1` comment on the
@@ -7,6 +7,9 @@ record, its stored native author the payload's operator and on the deployment
 allowlist, after its target, the target's bytes preserved). The anchor kind's readers
 and writers leave out the comment an applied void names; a void of a record the entry
 reads is refused at write and inert on read.
+
+`admin.py anchor-release` closes an anchor that holds no record and frees its key, for
+the case where only the lost original payload could have finished it.
 
 Runs over the reference tests' fake bd (exact `list --label`, `show --include-comments`,
 comment author = the acting actor).
@@ -291,6 +294,116 @@ class CapabilityVoidTests(CapabilityCase):
         self.assertIn(self.KEY, cr.newest_revisions(rows, [OPERATOR]))
 
 
+class AnchorReleaseTests(VoidCase):
+    def crash_before_close(self, **extra):
+        self.native.close_outcome = 'crash'
+        with self.assertRaises(RuntimeError):
+            self.propose(**extra)
+        self.native.close_outcome = 'ok'
+
+    def release(self, issue_id='ref-1', actor=OPERATOR, operators=(OPERATOR,), kind=rr.KIND):
+        self.native.actor = actor
+        return kind.release(self.project, issue_id, actor, 'the original payload is lost', self.native,
+                            operators=list(operators))
+
+    def receipt(self):
+        return json.loads(next((self.project / '.reference-requests').glob('*.json')).read_text(encoding='utf-8'))
+
+    def test_an_open_orphan_is_closed_and_its_key_freed(self):
+        self.crash_before_close()
+        row = self.native.row('ref-1')
+        self.assertEqual((row['status'], reserved_comments.is_record_anchor(row)), ('open', False))
+        with self.assertRaisesRegex(ValueError, 'anchor-release'):
+            self.propose(operation_id='someone-else')
+        result = self.release()
+        self.assertEqual((result['closed'], result['labels_removed'][-1], len(result['receipts_released'])),
+                         (True, 'reference-key:calendar-trading', 1))
+        row = self.native.row('ref-1')
+        self.assertEqual(row['status'], 'closed')
+        self.assertEqual(row['labels'], ['reference'])
+        self.assertTrue(row['comments'][-1]['text'].startswith('Released by operator %s' % OPERATOR))
+        self.assertFalse(reserved_comments.is_record_anchor(row))
+        receipt = self.receipt()
+        self.assertEqual((receipt['status'], receipt['reconciliation']['released_anchor']), ('released', 'ref-1'))
+        admin.validate_coordination_files({'.reference-requests/' + 'a' * 64 + '.json': receipt})
+        listing = rr.read(['list'], self.native, [OPERATOR])
+        self.assertNotIn('incomplete', listing['coverage'])
+        # The key is free: another operation proposes it on a new anchor, and so does the
+        # original operation ID, now settled as released.
+        self.assertEqual(self.propose(operation_id='someone-else')['native_id'], 'ref-2')
+        self.assertEqual(self.get()['native_id'], 'ref-2')
+        with self.assertRaisesRegex(ValueError, 'it was already released'):
+            self.release()
+
+    def test_a_release_is_refused_while_the_anchor_holds_a_record(self):
+        self.propose()
+        writes = len(self.native.writes())
+        with self.assertRaisesRegex(ValueError, 'still holds a record'):
+            self.release()
+        self.malformed_entry_on_new_key()   # a malformed record is still a record until it is voided
+        with self.assertRaisesRegex(ValueError, 'still holds a record'):
+            self.release('ref-2')
+        self.assertEqual(len(self.native.writes()), writes)
+
+    def malformed_entry_on_new_key(self):
+        """feed.units whose only record comment is malformed (written around the writer)."""
+        task = self.native.seed('ref-2', labels=['reference', 'reference:draft', 'reference-key:feed-units'],
+                                status='closed')['id']
+        bad = self.native.add_comment(task, MALFORMED, author='mallory')
+        return task, bad
+
+    def test_an_anchor_whose_every_record_is_voided_is_released_and_stays_hidden(self):
+        task, bad = self.malformed_entry_on_new_key()
+        self.assertEqual(self.get('feed.units')['state'], 'malformed')
+        self.void(void_payload(task, bad['id'], MALFORMED))
+        self.assertIn('1 incomplete anchor with no record yet (ref-2)',
+                      rr.read(['list'], self.native, [OPERATOR])['coverage'])
+        with self.assertRaisesRegex(ValueError, 'release the anchor'):
+            self.get('feed.units')
+        result = self.release(task)
+        self.assertEqual((result['closed'], result['receipts_released']), (False, []))
+        row = self.native.row(task)
+        self.assertEqual(row['labels'], ['reference'])
+        self.assertTrue(reserved_comments.is_record_anchor(row))   # still hidden: its comments are kept
+        self.assertNotIn('incomplete', rr.read(['list'], self.native, [OPERATOR])['coverage'])
+        self.assertEqual(self.propose(operation_id='f-1', key='feed.units')['native_id'], 'ref-1')
+
+    def test_a_release_needs_a_configured_operator_and_a_matching_kind(self):
+        self.crash_before_close()
+        for actor, operators, message in (('alice', (OPERATOR,), 'not a server-side configured operator'),
+                                          (OPERATOR, (), 'No operator allowlist')):
+            with self.subTest(actor=actor), self.assertRaisesRegex(ValueError, message):
+                self.release(actor=actor, operators=operators)
+        with self.assertRaisesRegex(ValueError, 'not a capability anchor'):
+            self.release(kind=cr.KIND)
+        with self.assertRaisesRegex(ValueError, 'Unknown reference anchor'):
+            self.release('ref-9')
+        self.assertEqual(self.native.row('ref-1')['status'], 'open')
+        self.assertEqual(self.receipt()['status'], 'pending')
+
+    def test_an_interrupted_release_is_finished_by_a_rerun(self):
+        self.crash_before_close()
+        calls = []
+        original = self.native.__class__.__call__
+
+        def failing(native, args):
+            if args[:1] == ['update'] and 'reference-key:calendar-trading' in args:
+                calls.append(args)
+                raise ValueError('native update failed')
+            return original(native, args)
+
+        with patch.object(self.native.__class__, '__call__', failing):
+            with self.assertRaisesRegex(ValueError, 'native update failed'):
+                self.release()
+        self.assertEqual(len(calls), 1)
+        self.assertIn('reference-key:calendar-trading', self.native.row('ref-1')['labels'])
+        result = self.release()
+        self.assertEqual((result['closed'], result['receipts_released'], result['labels_removed']),
+                         (False, [], ['reference-key:calendar-trading']))
+        notes = [c for c in self.native.row('ref-1')['comments'] if c['text'].startswith('Released by operator')]
+        self.assertEqual(len(notes), 1)
+
+
 class EndpointWriteTests(VoidCase):
     """The endpoint gives contributor writes the deployment allowlist, so they see operator voids."""
 
@@ -343,7 +456,7 @@ class EndpointWriteTests(VoidCase):
 
 
 class AdminCommandTests(VoidCase):
-    """`admin.py void-record` with a keyed target kind."""
+    """`admin.py void-record` with a keyed target kind, and `admin.py anchor-release`."""
 
     def setUp(self):
         super().setUp()
@@ -384,6 +497,17 @@ class AdminCommandTests(VoidCase):
         with self.assertRaisesRegex(ValueError, 'not a server-side configured operator'):
             self.admin('void-record', 'trial', '--actor', 'alice', '--file', str(path))
 
+    def test_anchor_release_is_a_host_command_for_operators(self):
+        self.native.close_outcome = 'crash'
+        with self.assertRaises(RuntimeError):
+            self.propose()
+        self.native.close_outcome = 'ok'
+        argv = ('anchor-release', 'trial', '--kind', 'reference', '--issue-id', 'ref-1', '--reason', 'payload lost')
+        with self.assertRaisesRegex(ValueError, 'not a server-side configured operator'):
+            self.admin(*argv, '--actor', 'alice')
+        result = self.admin(*argv, '--actor', OPERATOR)
+        self.assertEqual((result['released'], result['closed']), ('ref-1', True))
+        self.assertEqual(self.native.row('ref-1')['labels'], ['reference'])
 
 
 if __name__ == '__main__':

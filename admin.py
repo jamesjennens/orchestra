@@ -2356,6 +2356,10 @@ def main():
                        help='with --disposition complete, the exact native record to confirm')
         if name=='record-reconcile':a.add_argument('--kind',choices=['requirement','reference','capability'],required=True)
     a=sub.add_parser('void-record');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('anchor-release',help='close a reference or capability anchor that holds no record and free its key (operator allowlist)')
+    a.add_argument('project');a.add_argument('--kind',choices=['reference','capability'],required=True)
+    a.add_argument('--issue-id',dest='issue_id',required=True);a.add_argument('--actor',required=True)
+    a.add_argument('--reason',required=True)
     a=sub.add_parser('revert-record');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('operators');a.add_argument('action',choices=['list','add','remove']);a.add_argument('actor',nargs='?')
     a.add_argument('--confirm-revoke',action='store_true',dest='confirm_revoke',
@@ -2574,6 +2578,20 @@ def main():
             fcntl.flock(lock,fcntl.LOCK_EX)
             print(json.dumps(record_reconcile(path,args.operation_id,args.actor,args.reason,
                                               args.disposition,run,issue_id=args.issue_id)))
+    elif args.command=='anchor-release':
+        # kittrial-5bb.74: an anchor whose propose stopped before its first record, or whose
+        # every record an operator void names, holds its key for good once the original
+        # payload is lost. Host route only: the allowlist is the authority.
+        import fcntl
+        if args.kind=='reference':import reference_records as records
+        else:import capability_records as records
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        authority=operators(root,strict=True)
+        def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            print(json.dumps(records.KIND.release(path,args.issue_id,args.actor,args.reason,run,operators=authority)))
     elif args.command=='void-record':
         import fcntl
         from recovery import KEYED_KIND_PREFIXES

@@ -47,7 +47,8 @@ catalog, with one `bd show` up to CATALOG_SHOW_MAX entries and one export above.
 A malformed entry reads `malformed` until the operator repairs it with `void-record`
 (the .41 design's section 3.7; kittrial-5bb.74): `keyed_entries` leaves out a comment an
 applied void names, on every read and write, and refuses a void of a record the entry
-reads.
+reads. An anchor that holds no record and whose propose cannot be re-run is closed and
+its key freed by `admin.py anchor-release`.
 
 Statements are untrusted text: they never enter an error message, and excerpts
 carry `trust`. The due-soon window is fixed at 30 days (a per-project setting is
@@ -554,7 +555,10 @@ def help_payload():
                        'tags': TAGS_MAX, 'key': KEY_MAX, 'due_soon_days': DUE_SOON_DAYS},
             'operator': ['admin.py reference-apply PROJECT --actor OPERATOR --file acceptance.json',
                          'admin.py reference-reconcile PROJECT --operation-id ID --actor OPERATOR '
-                         '--reason TEXT --disposition complete|failed|released [--issue-id ID]']}
+                         '--reason TEXT --disposition complete|failed|released [--issue-id ID]',
+                         'admin.py void-record PROJECT --actor OPERATOR --file void.json',
+                         'admin.py anchor-release PROJECT --kind reference --issue-id ID --actor OPERATOR '
+                         '--reason TEXT']}
 
 
 def parse_list_options(args):
