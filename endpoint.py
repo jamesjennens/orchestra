@@ -182,7 +182,7 @@ def execute(root,request,authority_config=None,require_authority=False):
         return {'returncode':0,'stdout':json.dumps({'schema_version':1,'anchors':record_anchor_ids(rows)})+'\n','stderr':warnings}
     if action=='ref':
         # The reference catalog (.41 slice 1, kittrial-5bb.66). Reads (get, list, help)
-        # are one label-filtered `bd list` plus `bd show --include-comments`, take no
+        # read their own key, or the catalog in two native reads (reference_records), take no
         # coordination lock and are not run_guarded (like the anchors read); propose
         # and revise are writes, under the lock and the operation journal.
         import reference_records

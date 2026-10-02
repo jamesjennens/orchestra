@@ -60,7 +60,7 @@ class RecordSpec:
     `accept_action`, `apply_command`, `reconcile_command`.
 
     Hooks, each a callable taking the arguments named in `apply_native`:
-    `validate`, `refuse_before_journal`, `explicit_task`, `read_rows`, `resolve_task`,
+    `validate`, `refuse_before_journal`, `explicit_task`, `read_rows`, `read_created`, `resolve_task`,
     `check_key_unique`, `create_revision`, `create_args`, `after_create`,
     `prepare_row`, `existing_revisions`, `require_selectable`, `build_record`,
     `require_bound_key`, `check_revision`, `check_acceptance`, `acceptance_evidence`,
@@ -71,7 +71,7 @@ class RecordSpec:
               'acceptance_prefix', 'journal', 'key_regex', 'fields',
               'allow_accepted_first_revision', 'supports_retire', 'accept_action',
               'apply_command', 'reconcile_command')
-    HOOKS = ('validate', 'refuse_before_journal', 'explicit_task', 'read_rows',
+    HOOKS = ('validate', 'refuse_before_journal', 'explicit_task', 'read_rows', 'read_created',
              'resolve_task', 'check_key_unique', 'create_revision', 'create_args',
              'after_create', 'prepare_row', 'existing_revisions', 'require_selectable',
              'build_record', 'require_bound_key', 'check_revision', 'check_acceptance',
@@ -391,7 +391,9 @@ def apply_native(payload, actor, run, project, spec, operator=False, operators=N
     if prior is not None and prior.get('id') and explicit and not reusable \
             and prior['id'] != explicit:
         raise ValueError('Operation ID already used for a different record')
-    rows = spec.read_rows(run)
+    # `read_rows(run, payload)` is the kind's one preflight read for this write: a kind
+    # whose records are found by label reads only the rows this payload can touch.
+    rows = spec.read_rows(run, payload)
     created = False
     task = (prior.get('id') if prior and not reusable and prior.get('id') else None) or explicit
     if task is None:
@@ -436,7 +438,7 @@ def apply_native(payload, actor, run, project, spec, operator=False, operators=N
             atomic(receipt, {'sha256': digest, 'status': 'pending', 'actor': actor, 'id': task,
                              'created': True, 'operation': payload['operation'], 'revision': revision})
             spec.after_create(run, task)
-            rows = spec.read_rows(run)
+            rows = spec.read_created(run, task, payload)
     row = find(rows, task)
     if row is None:
         if prior is not None:
@@ -573,7 +575,7 @@ def reconcile(project, operation_id, actor, reason, disposition, run, spec, issu
                                                                   audit.get('reason'), prior.get('id')))
     if prior['status'] != 'pending':
         raise ValueError('%s operation is not pending; nothing to reconcile' % title)
-    rows = spec.read_rows(run)
+    rows = spec.read_rows(run, None)
     found = [row for row in rows if 'request:' + identity in (row.get('labels') or [])]
     if len(found) > 1:
         raise ValueError('Duplicate native request records; manual operator reconciliation required')

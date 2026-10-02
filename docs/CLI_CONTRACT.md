@@ -183,8 +183,8 @@ reads.
 - **Counts, always:**
   - `expired` and `due_soon`, for accepted reference entries;
   - `unset`, for draft-only entries;
-  - `acceptance_inert`, for entries whose accepting operator is no longer on the
-    allowlist;
+  - `acceptance_inert`, for entries whose acceptance evidence was written by an
+    actor who is not on the allowlist (a removed operator, or one who never was);
   - `malformed`;
   - `total`.
 - **`items`** are returned only to an approver, which on the SSH route means an actor
@@ -390,8 +390,13 @@ b ref revise --file entry.json --json
 ```
 
 **Reading.** `ref get` and `ref list` are read-only. They take no coordination lock and
-read only the reference-labelled rows: one `bd list --label reference` plus one
-`bd show --include-comments` per 50 rows.
+never read more than they need:
+- `ref get` reads only its own key: one `bd list` by the key's lookup label and one
+  `bd show` of that row. Its cost does not grow with the catalog.
+- `ref list` reads the catalog in two native reads: one `bd list --label reference`,
+  then one `bd show --include-comments` for up to 20 entries, or one `bd export --all`
+  above that.
+- `ref propose`, `revise` and acceptance read only their own key before writing.
 
 - **`ref get KEY`** returns these fields:
   - `key`, `state` and `native_id`.

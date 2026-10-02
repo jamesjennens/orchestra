@@ -1,10 +1,11 @@
 """Reference catalog records, slice 1 (kittrial-5bb.66; docs/REFERENCE_CATALOG_DESIGN.md).
 
 The fake bd mirrors pinned bd 1.2.2 as verified on a disposable database: `list
---label X` matches the exact label and prints no comments, `show ID... --json`
-prints rows (comments only with `--include-comments`) and fails only when every id
-is missing, a comment's `author` is the acting `--actor`, and `close` sets the
-status.
+--label X` matches the exact label (every `--label` must match; `--label-any a,b`
+needs at least one; `--id a,b` returns only the rows that exist) and prints no
+comments, `show ID... --json` prints rows (comments only with `--include-comments`)
+and fails only when every id is missing, `export --all` prints every row with its
+comments, a comment's `author` is the acting `--actor`, and `close` sets the status.
 """
 import copy
 import json
@@ -37,6 +38,7 @@ class RefNative:
         self.create_outcome = 'ok'
         self.close_outcome = 'ok'
         self.fail_comment_prefix = None
+        self.unrelated = 0   # rows an export also carries, to make its cost visible
 
     def row(self, task):
         return next(row for row in self.rows if row['id'] == task)
@@ -62,10 +64,19 @@ class RefNative:
         self.calls.append(list(args))
         command = args[0]
         if command == 'export':
-            raise AssertionError('reference reads must not export the project')
+            return ''.join(json.dumps(row) + '\n' for row in self.rows)
         if command == 'list':
-            label = args[args.index('--label') + 1]
-            return json.dumps([self._bare(row) for row in self.rows if label in row['labels']])
+            rows = self.rows
+            for index, token in enumerate(args):
+                if token == '--label':
+                    rows = [row for row in rows if args[index + 1] in row['labels']]
+                elif token == '--label-any':
+                    wanted = args[index + 1].split(',')
+                    rows = [row for row in rows if any(label in row['labels'] for label in wanted)]
+                elif token == '--id':
+                    wanted = args[index + 1].split(',')
+                    rows = [row for row in rows if row['id'] in wanted]
+            return json.dumps([self._bare(row) for row in rows])
         if command == 'show':
             ids = [token for token in args[1:] if not token.startswith('--')]
             found = [copy.deepcopy(row) if '--include-comments' in args else self._bare(row)
@@ -90,6 +101,8 @@ class RefNative:
         if command == 'close':
             if self.close_outcome == 'fail':
                 raise ValueError('native close failed')
+            if self.close_outcome == 'crash':
+                raise RuntimeError('the process died before the close')
             self.row(args[1])['status'] = 'closed'
             return json.dumps([{'id': args[1], 'status': 'closed'}])
         if command == 'comments' and args[1] == 'add':
@@ -167,7 +180,7 @@ class ReferenceCase(unittest.TestCase):
         return rr.read(['get', key], self.native, list(operators))
 
     def sha(self, revision, key='calendar.trading'):
-        row, _ = rr.anchor_for(rr.read_rows(self.native), key)
+        row, _ = rr.anchor_for(rr.read_key_rows(self.native, key), key)
         return rr.existing_revisions(row)[revision]['sha256']
 
 
@@ -194,12 +207,57 @@ class ProposeAndReviseTests(ReferenceCase):
         self.assertTrue(reserved_comments.is_record_anchor(row))
         self.assertEqual(reserved_comments.hide_records([row]), [])
 
-    def test_reads_never_export_and_cost_one_list_plus_one_show_per_chunk(self):
-        self.propose()
+    def reads(self):
+        # (verb, number of ids named): a list or an export is one read; a show names ids.
+        return [(call[0], len([token for token in call[1:] if not token.startswith('--')])
+                 if call[0] == 'show' else 1)
+                for call in self.native.calls if call[0] in ('list', 'show', 'export')]
+
+    def seed_catalog(self, count):
+        """`count` more entries, written as the writer leaves them, without the per-entry cost."""
+        for index in range(count):
+            key = 'bulk.k%03d' % index
+            record = rr.entry_record(entry(key=key), 1, 'draft')
+            self.native.seed('bulk-%d' % index, labels=['reference', 'reference:draft', rr.key_label(key)],
+                             status='closed', comments=[{'id': 'b%d' % index, 'text': rr.entry_comment(record),
+                                                         'author': 'alice'}])
+
+    def test_get_and_the_writes_read_only_their_own_key_whatever_the_catalog_size(self):
+        # Review 01a0fbfd read-write-cost: at 236 entries get took 10 s and propose 23 s
+        # because both read the whole catalog (propose twice).
+        self.seed_catalog(240)
         self.native.calls = []
-        self.get()
-        self.assertEqual([call[0] for call in self.native.calls], ['list', 'show'])
-        self.assertIn('--include-comments', self.native.calls[1])
+        self.assertEqual(self.get('bulk.k150')['state'], 'draft-only')
+        self.assertEqual(self.reads(), [('list', 1), ('show', 1)])
+        self.native.calls = []
+        self.propose()
+        # One preflight read (a list; nothing to show yet), then only the new anchor.
+        self.assertEqual(self.reads(), [('list', 1), ('show', 1)])
+        self.assertEqual([call[0] for call in self.native.writes()], ['create', 'close', 'comments'])
+        digest = self.sha(1)
+        self.native.calls = []
+        self.revise(expected_sha256=digest)
+        self.assertEqual(self.reads(), [('list', 1), ('show', 1)])
+        digest = self.sha(2)
+        self.native.calls = []
+        self.accept(2, digest)
+        self.assertEqual(self.reads(), [('list', 1), ('show', 1)])
+        self.assertFalse([call for call in self.native.calls if call[0] == 'export'])
+
+    def test_the_whole_catalog_read_is_one_show_when_small_and_one_export_above_the_threshold(self):
+        self.seed_catalog(rr.CATALOG_SHOW_MAX)
+        self.native.calls = []
+        self.assertEqual(rr.read(['list', '--limit', '100'], self.native, [OPERATOR])['total'], rr.CATALOG_SHOW_MAX)
+        self.assertEqual(self.reads(), [('list', 1), ('show', rr.CATALOG_SHOW_MAX)])
+        self.seed_catalog_more = self.native.seed('bulk-x', labels=['reference', 'reference:draft',
+                                                                    rr.key_label('bulk.extra')], status='closed',
+                                                  comments=[{'id': 'bx', 'author': 'alice', 'text': rr.entry_comment(
+                                                      rr.entry_record(entry(key='bulk.extra'), 1, 'draft'))}])
+        self.native.seed('ordinary-task')
+        self.native.calls = []
+        listing = rr.read(['list', '--limit', '100'], self.native, [OPERATOR])
+        self.assertEqual(listing['total'], rr.CATALOG_SHOW_MAX + 1)
+        self.assertEqual([call[0] for call in self.native.calls], ['list', 'export'])
 
     def test_receipts_pass_the_frozen_slice0_schema(self):
         self.propose()
@@ -260,7 +318,7 @@ class ProposeAndReviseTests(ReferenceCase):
             ({'tags': ['Bad Tag']}, 'slugs'),
             ({'key': 'Calendar'}, 'lowercase dotted'),
             ({'title': 'x' * 201}, 'at most 200'),
-            ({'decisions': ['nope-1']}, 'Unknown decision link'),
+            ({'decisions': ['nope-1']}, 'Unknown decision link\\(s\\) nope-1'),
             ({'acceptance_state': 'accepted'}, 'never caller-supplied'),
             ({'sha256': 'a' * 64}, 'never caller-supplied'),
             ({'successor': 'x.y'}, 'never caller-supplied'),
@@ -379,7 +437,10 @@ class AcceptanceTests(ReferenceCase):
         view = self.get(operators=())
         self.assertEqual((view['state'], view['acceptance'], view['acceptance_inert'], view['inert_operator']),
                          ('draft-only', None, True, OPERATOR))
-        self.assertIn('acceptance-inert', [warning['code'] for warning in view['warnings']])
+        inert = [warning for warning in view['warnings'] if warning['code'] == 'acceptance-inert'][0]
+        # The wording covers both a removed operator and an author who never was one.
+        self.assertIn('who is not on the deployment operator allowlist', inert['detail'])
+        self.assertNotIn('no longer', inert['detail'])
         rows = rr.read_rows(self.native)
         approver = rr.work_attention(rows, 'ops-new', ['ops-new'])
         self.assertEqual((approver['acceptance_inert'], approver['unset'], approver['total']), (1, 0, 1))
@@ -396,6 +457,8 @@ class AcceptanceTests(ReferenceCase):
                 comment['author'] = 'mallory'
         view = self.get(operators=(OPERATOR, 'mallory'))
         self.assertEqual(view['state'], 'draft-only')
+        # The item names the stored native author, not the name the payload claims.
+        self.assertEqual(self.get(operators=(OPERATOR,))['inert_operator'], 'mallory')
 
 
 class CrashAndReconcileTests(ReferenceCase):
@@ -418,6 +481,29 @@ class CrashAndReconcileTests(ReferenceCase):
         self.assertEqual((result['native_id'], result['reconciled']), ('ref-1', True))
         self.assertEqual(self.native.row('ref-1')['status'], 'closed')
         self.assertEqual(self.get()['state'], 'draft-only')
+
+    def test_a_crash_between_create_and_close_is_finished_by_the_retry(self):
+        # Review 01a0fbfd (d): the process dies after the create committed and before
+        # the close. The row is open, labelled and has no record: an ordinary task.
+        self.native.close_outcome = 'crash'
+        with self.assertRaises(RuntimeError):
+            self.propose()
+        row = self.native.row('ref-1')
+        self.assertEqual((row['status'], row['comments']), ('open', []))
+        self.assertFalse(reserved_comments.is_record_anchor(row))
+        receipt = json.loads(next((self.project / '.reference-requests').glob('*.json')).read_text(encoding='utf-8'))
+        self.assertEqual((receipt['status'], receipt['id'], receipt['created']), ('pending', 'ref-1', True))
+        self.assertIn('1 incomplete anchor', rr.read(['list'], self.native, [OPERATOR])['coverage'])
+        with self.assertRaisesRegex(ValueError, 'interrupted propose by another operation'):
+            self.propose(operation_id='someone-else')
+        self.native.close_outcome = 'ok'
+        self.native.calls = []
+        result = self.propose()
+        self.assertEqual((result['native_id'], result['created']), ('ref-1', False))
+        self.assertEqual([call[0] for call in self.native.writes()], ['close', 'comments'])
+        self.assertEqual(self.native.row('ref-1')['status'], 'closed')
+        self.assertTrue(reserved_comments.is_record_anchor(self.native.row('ref-1')))
+        self.assertEqual(len([row for row in self.native.rows if 'reference' in row['labels']]), 1)
 
     def test_a_failed_close_is_finished_by_the_retry(self):
         self.native.close_outcome = 'fail'

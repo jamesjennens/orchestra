@@ -33,7 +33,15 @@ per entry: one malformed or unsupported entry is reported and never fails the
 read. An acceptance counts only while its evidence comment's stored native author
 equals the evidence `operator` and is on the live deployment operator allowlist;
 otherwise the entry reads `draft-only` with `acceptance_inert: true` and raises an
-`acceptance-inert` attention item to approvers.
+`acceptance-inert` attention item to approvers. The native author is self-declared
+over SSH, so the reserved-prefix guard is what keeps contributors from writing
+evidence; acceptance is deliberately not bound to the host receipt, because a read
+must not depend on a local journal (.41 section 10.2). docs/OPERATIONS.md states the
+residual risk and the scan to run before first use.
+
+Reads cost what they touch: `ref get` and every write read only their own key (one
+`bd list` by lookup label, one `bd show`); only `ref list` and reconcile read the
+catalog, with one `bd show` up to CATALOG_SHOW_MAX entries and one export above.
 
 A malformed entry stays `malformed`: the .41 design's repair through the operator's
 `void-record` (section 3.7) is a follow-up, because `recovery.KIND_PREFIXES` does
@@ -104,6 +112,12 @@ WRITTEN_BY_THE_OPERATION = ('acceptance_state', 'successor', 'sha256', 'acceptan
 LIST_LIMIT_MAX = 100
 COVERAGE_IDS = 10
 SHOW_CHUNK = 50
+# The whole-catalog read uses one `bd show --include-comments` up to this many
+# entries and one `bd export --all` above it (kittrial-5bb.66 review 01a0fbfd): on
+# real bd a show costs about 45 ms per id (2.2 s per 50), so past a couple of dozen
+# entries one export of the project is the cheaper read, as kittrial-5bb.71 found for
+# the anchors read.
+CATALOG_SHOW_MAX = 20
 ANCHOR_TITLE = 'Reference %s'
 ANCHOR_DESCRIPTION = ('Reference catalog entry %s. Read it with `ref get %s`; its record comments are '
                       'authoritative. This anchor is not a work item.')
@@ -428,27 +442,52 @@ def entry_record(payload, revision, acceptance_state, origin=None):
 
 # -- native reads ----------------------------------------------------------------------------
 
-def read_rows(run):
-    """The reference-labelled rows with their comments, in two native reads.
+def _listed_ids(run, extra):
+    listed = json.loads(run(['list', '--label', TYPE_LABEL, *extra, '--all', '--limit', '0', '--json']) or '[]')
+    return [row['id'] for row in listed or [] if isinstance(row, dict) and isinstance(row.get('id'), str)]
 
-    One label-filtered `bd list` (no comments) and one `bd show ... --include-comments`
-    per chunk of SHOW_CHUNK rows - never a full export (kittrial-5bb.71: a full export
-    of a large project costs seconds and over 100 MB).
+
+def _shown(run, ids):
+    """The named rows with their comments, in one `bd show --include-comments`."""
+    if not ids:
+        return []
+    try:
+        shown = json.loads(run(['show', *ids, '--json', '--include-comments']) or '[]')
+    except NATIVE_FAILURES as error:
+        if all_missing(error):
+            return []   # every named row was deleted after the list
+        raise
+    shown = shown if isinstance(shown, list) else [shown]
+    return [row for row in shown if isinstance(row, dict) and row.get('id') in ids]
+
+
+def read_rows(run):
+    """The whole catalog: every reference-labelled row with its comments, in two native reads.
+
+    One label-filtered `bd list` (no comments), then one `bd show --include-comments`
+    when there are at most CATALOG_SHOW_MAX entries, or one `bd export --all` above
+    that. `ref list` and reconcile use it; `ref get` and the writes never do (they
+    read by key label, `read_key_rows`).
     """
-    listed = json.loads(run(['list', '--label', TYPE_LABEL, '--all', '--limit', '0', '--json']) or '[]')
-    ids = [row['id'] for row in listed or [] if isinstance(row, dict) and isinstance(row.get('id'), str)]
-    rows = []
-    for start in range(0, len(ids), SHOW_CHUNK):
-        chunk = ids[start:start + SHOW_CHUNK]
-        try:
-            shown = json.loads(run(['show', *chunk, '--json', '--include-comments']) or '[]')
-        except NATIVE_FAILURES as error:
-            if all_missing(error):
-                continue   # every row of the chunk was deleted after the list
-            raise
-        shown = shown if isinstance(shown, list) else [shown]
-        rows.extend(row for row in shown if isinstance(row, dict) and row.get('id') in chunk)
-    return rows
+    ids = _listed_ids(run, [])
+    if len(ids) <= CATALOG_SHOW_MAX:
+        return _shown(run, ids)
+    wanted = set(ids)
+    exported = (json.loads(line) for line in run(['export', '--all']).splitlines() if line.strip())
+    return [row for row in exported if isinstance(row, dict) and row.get('id') in wanted]
+
+
+def read_key_rows(run, key, operation_id=None):
+    """Only the rows one key can touch: its lookup label, plus this operation's request label.
+
+    One `bd list` (reference AND (key label OR request label)) and one `bd show` of the
+    one or two rows it names. This is the whole preflight read of a propose, revise or
+    accept, and the read of `ref get`: its cost does not grow with the catalog.
+    """
+    labels = [key_label(key)]
+    if operation_id is not None:
+        labels.append('request:' + content_hash({'operation_id': operation_id}))
+    return _shown(run, _listed_ids(run, ['--label-any', ','.join(labels)]))
 
 
 # A native read failure: the endpoint's runner raises ValueError, admin's run_bd
@@ -664,7 +703,9 @@ SPEC = core.RecordSpec(
     validate=lambda payload, operator: validate_payload(payload, operator=operator),
     refuse_before_journal=_refuse_before_journal,
     explicit_task=lambda payload: None,
-    read_rows=read_rows,
+    read_rows=lambda run, payload=None: read_rows(run) if payload is None else read_key_rows(
+        run, payload['key'], payload['operation_id']),
+    read_created=lambda run, task, payload: _shown(run, [task]),
     resolve_task=_resolve_task,
     check_key_unique=_check_key_unique,
     create_revision=_create_revision,
@@ -691,14 +732,10 @@ def check_decisions(payload, run):
     wanted = list(payload.get('decisions') or [])
     if not wanted or payload['operation'] == 'accept':
         return
-    try:
-        shown = json.loads(run(['show', *wanted, '--json']) or '[]')
-    except NATIVE_FAILURES as error:
-        if not all_missing(error):
-            raise
-        shown = []
-    shown = shown if isinstance(shown, list) else [shown]
-    found = {row.get('id'): row for row in shown if isinstance(row, dict)}
+    # `bd list --id` returns only the rows that exist (an empty list when none do), so
+    # an unknown link is this refusal and never a native failure.
+    shown = json.loads(run(['list', '--id', ','.join(wanted), '--all', '--limit', '0', '--json']) or '[]')
+    found = {row.get('id'): row for row in shown or [] if isinstance(row, dict)}
     bad = [item for item in wanted
            if item not in found or not (found[item].get('issue_type') == 'decision'
                                         or 'decision' in (found[item].get('labels') or []))]
@@ -806,7 +843,7 @@ def entry_view(row, operators, current=None):
                 chosen = (number, live[0][0])
                 break
             if inert is None:
-                inert = (number, evidence[0][0]['operator'])
+                inert = (number, evidence[0][1] or evidence[0][0]['operator'])
         if chosen is not None:
             number, item = chosen
             record, comment_id = revisions[number]
@@ -819,8 +856,8 @@ def entry_view(row, operators, current=None):
         if inert is not None and (chosen is None or inert[0] > chosen[0]):
             view.update(acceptance_inert=True, inert_operator=inert[1])
             view['warnings'].append({'code': 'acceptance-inert',
-                                     'detail': 'revision %d was accepted by %s, who is no longer on the '
-                                               'deployment operator allowlist' % inert})
+                                     'detail': 'revision %d carries acceptance evidence written by %s, who is '
+                                               'not on the deployment operator allowlist' % inert})
         floor = chosen[0] if chosen is not None else 0
         drafts = [number for number, (record, _) in revisions.items()
                   if record['acceptance_state'] == 'draft' and number > floor]
@@ -1072,7 +1109,8 @@ def parse_list_options(args):
 
 
 def read(args, run, operators):
-    """`ref get KEY` / `ref list ...` / `ref --help`: read-only, one label-filtered read."""
+    """`ref get KEY` / `ref list ...` / `ref --help`: read-only. `get` reads only its key
+    (`read_key_rows`); `list` reads the catalog (`read_rows`)."""
     if not args or args[0] in ('--help', '-h', 'help'):
         return help_payload()
     command, rest = args[0], args[1:]
@@ -1080,7 +1118,8 @@ def read(args, run, operators):
         rest = [token for token in rest if token != '--json']
         if len(rest) != 1:
             raise ValueError('ref get takes exactly one KEY')
-        return get(read_rows(run), rest[0], operators)
+        valid_key(rest[0])
+        return get(read_key_rows(run, rest[0]), rest[0], operators)
     if command == 'list':
         return list_entries(read_rows(run), parse_list_options(rest), operators)
     raise ValueError('ref: unknown command %s; use get, list, propose or revise' % command)
