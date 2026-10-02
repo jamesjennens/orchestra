@@ -63,6 +63,7 @@ history](#malformed-structured-history) (`void-record`).
 | `capability-alias-propose PROJECT --actor OPERATOR --file alias.json` | propose an alias as a verified operator (`{schema_version, key, alias, evidence?}`). This is the only route that writes `identity: verified`; `capability propose-alias` through the endpoint always writes `unverified`, even for an operator's actor name | the deployment operator allowlist |
 | `capability-reconcile PROJECT --operation-id ID ...` | finish a capability operation whose write was uncertain (for a batch item, the id is `OPERATION_ID/KEY`). A transient native failure can leave a `pending` receipt with no native row behind it, and the same `operation_id` is then refused until it is cleared: run `capability-reconcile --disposition released`, then retry the original command | confirmation of the native record state |
 | `record-reconcile PROJECT --kind requirement\|reference\|capability ...` | the same reconcile for any record kind | as above |
+| `capability-misses-clear PROJECT` | delete the project's [capability lookup-miss log](#the-capability-lookup-miss-log). It prints what was removed (`finds`, `misses`, `phrases`). It writes nothing to the tracker, takes no coordination lock and calls no `bd` | none beyond the service account: it deletes telemetry only, so there is no allowlist check and no `--actor` |
 | `void-record PROJECT --actor OPERATOR --file void.json` | void a malformed or stale contribution-review record | the deployment operator allowlist (`operators` in `deployment.private.json`) |
 | `handoff PROJECT --actor ACTOR --file handoff.json` | transfer a claim when the current owner cannot act | an owner decision/evidence pointer in the payload's `approval` |
 
@@ -198,6 +199,58 @@ python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime bac
 `backup-copy DEST` applies exactly the `--require-complete` gate and refuses, naming what is missing, when any initialized project is not complete. It then copies each project's last complete pair — the native backup directory as `DEST/PROJECT`, the complete sidecar as `DEST/PROJECT.coordination.json`, and, when the project has one, its operation-journal snapshot as `DEST/PROJECT.http-operations.sqlite3` (the same shape a runtime's `backups/` directory has, so the copy can be copied back and restored) — and copies the record that gated the copy. Each project's `backups/PROJECT.lock` is held for that project's whole staging, while its coordination lock is held only long enough to re-check the pair and copy the small sidecar and journal snapshot; the long native copy runs after the coordination lock is released, so copying a large database does not block endpoint writes on it (both commands take the two locks in the same order, so no deadlock is possible). Files are staged in a per-run directory and then moved into place by rename rather than merged, so a concurrent `backup --all` cannot yield a mixed native directory beside a complete sidecar and stale destination files do not survive. Each project's native directory is also checked against the `mtime_ns`-keyed manifest its complete sidecar records, before and after that project's copy: a directory that no longer matches — a killed or interrupted run can leave it partly rewritten — is refused rather than copied, a directory that changes while it is being copied is refused, and a sidecar that records no manifest is reported as unverifiable instead of being called clean. The completeness record is published only after every project is in place: a failure exits non-zero with a clear error, removes the staging directory and leaves no completeness record, so the destination never looks complete when it is not. It prints exactly what it copied, is credential-free and never touches a unit, timer or schedule. The scheduled, encrypted off-machine system, its encryption, retention and destination, remain the operator's: this helper is the reference the operator can gate and schedule, not a replacement for that system, and it cannot see whether a copy actually left the host.
 
 If restore is interrupted, the new destination may exist with only part of the restore completed. Preserve it for inspection; retry recovery into another unused destination. Do not delete the source or force reuse of the partially restored target. Verify pending reservations, comments, lifecycle events, baselines and slot context before switching clients.
+
+### The capability lookup-miss log
+
+The endpoint counts each `capability find` and remembers the phrases that had no exact
+record match, so an operator can see which phrases miss and how often
+([CLI contract](CLI_CONTRACT.md#capability-misses-which-phrases-miss-and-how-often)).
+Read it with the client: `capability misses --limit 20`.
+
+**It is telemetry, and it is not backed up.**
+- It lives in two files in the project directory: `.capability-misses.json` (the log,
+  mode 0600) and `.capability-misses.lock` (an empty lock file). A crashed write can
+  leave `.capability-misses.json.tmp`; the next write removes it.
+- `admin.py backup` does **not** collect them, and `restore-new` does not create them.
+  A restored project starts with an empty log. Losing the log is acceptable: it only
+  steers which capabilities to index next.
+- That is deliberate. A backup carrying a path an older kit does not know is refused by
+  that kit's restore. Keeping the log out of the backup means **this change does not
+  move the oldest kit a deployment may roll back to.**
+- It adds no tracker comment kind, label or record type. A kit without this feature
+  never reads the files and ignores them; they can be left in place or deleted.
+- A missing, corrupt, oversized or unknown-schema log is never an error. The next
+  `find` starts a new one, and `capability misses` reports `log: unreadable`.
+
+**What it stores:** the normalised phrase, a count, and first-seen and last-seen times
+per phrase, plus the counters `finds`, `misses`, `overflow`, `dropped` and `evicted`.
+No actor names. Phrases are untrusted contributor text: read them as data.
+
+**Bounds:**
+- 500 phrases per project. When full, a new phrase replaces the one with the oldest
+  last-seen time.
+- 60 new phrases per project per clock hour (UTC). Further new phrases that hour are
+  counted in `overflow` only. The bound is per project because no actor is stored.
+- 80 characters per stored phrase. The file is at most about 530 kB, and normally a few
+  tens of kB; a file over 1 MB is not read and is replaced.
+
+**Cost and locking:**
+- Recording takes its own lock (`.capability-misses.lock`), without waiting. If another
+  request holds it, that one find is not counted. It never takes `.coordination.lock`,
+  so it never waits for a writer and never makes one wait.
+- It calls no `bd` and starts no process. The log is rewritten on each counted find
+  (temp file, then rename, no fsync): about 2 ms with a full log, well under 1 ms with
+  a small one.
+
+**To clear it:**
+
+```sh
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime capability-misses-clear example
+```
+
+This deletes the log and starts a new measuring window (`since`). Clear it after a batch
+of aliases or capabilities has been accepted, so the next window measures the improved
+index. Deleting the two files by hand is equally safe.
 
 ### Malformed structured history
 

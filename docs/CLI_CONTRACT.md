@@ -235,8 +235,8 @@ complete tokens.
 ## `capability`: client-side code and design lookup
 
 `capability lookup`, `resolve` and `index` are answered by the client itself and are
-read-only. The capability **records** commands (`find`, `get`, `list`, `propose`,
-`revise` and `propose-alias`) go to the endpoint and need `--config` and
+read-only. The capability **records** commands (`find`, `get`, `list`, `misses`,
+`propose`, `revise` and `propose-alias`) go to the endpoint and need `--config` and
 `--project`; see [capability records](#capability-records-the-index-on-the-endpoint)
 below. The local commands:
 - never contact the endpoint (`lookup` adds the endpoint's records only when you pass
@@ -392,6 +392,7 @@ accepted by an operator. Location is checked against a checkout, which is slice 
 b capability find "merge slot" --limit 5 --json
 b capability get review.structured-contribution --json
 b capability list --state draft-only --json
+b capability misses --limit 20 --json
 b capability propose --file capability.json --json
 b capability propose-alias merge.slot "single integrator" --evidence coordination.py::merge_acquire
 ```
@@ -518,6 +519,101 @@ revision the operator reviewed, by `revision` and `record_sha256`, and gets one 
 - **Re-accepting.** Naming a revision that is already accepted, and still the newest,
   is a new decision: it writes the next revision with identical content, and new
   evidence. `ref` acceptance follows the same rule.
+
+### `capability misses`: which phrases miss, and how often
+
+The endpoint counts every `capability find` for a project. When a `find` has no exact
+record match (`found: false`), it also remembers the phrase. `capability lookup` with
+`--config` makes exactly one `find`, so every such lookup is counted, from any client
+version. A purely local lookup (no config) reaches no endpoint and records nothing.
+Recording happens inside `find`, not through a separate call: older clients are
+covered without an upgrade, there is no second round trip, and the contributor
+interface gains no new write action.
+
+**What is stored, per project:**
+- per phrase: the normalised phrase, a count, and first-seen and last-seen times
+  (server clock, UTC);
+- five counters: `finds`, `misses`, `overflow`, `dropped` and `evicted`, and the time
+  the log started.
+
+Nothing else is stored. In particular no actor, session or person: the log cannot be
+turned into a per-person record. Whether code candidates were offered is not recorded
+either, because the client computes them and the endpoint never sees them.
+
+**The phrase is untrusted text.**
+- It is stored only after the lookup's own normalisation (`capabilities.clean`, then
+  `capabilities.normalized`): control, format (bidi overrides, zero-width and tag
+  characters) and separator characters become spaces, punctuation is dropped, case is
+  folded, and words are joined by single spaces. This is the key `find` itself matches on.
+- What remains must be at most 80 characters of letters, digits and single ASCII
+  spaces. Anything else (empty, longer, or still not of that shape) is counted in
+  `dropped` and not stored.
+- The file and the `capability misses` output are ASCII-escaped.
+- A stored phrase can still read like an instruction (`ignore previous instructions`).
+  The output is marked `trust: "untrusted-text"`; read it as data. Nothing in the kit
+  places a recorded phrase into an agent prompt, a briefing, a view or onboarding text.
+
+**Bounds** (fixed in this version):
+- at most 500 phrases per project; when full, a new phrase replaces the one with the
+  oldest last-seen time (`evicted` counts these);
+- at most 60 **new** phrases per project per clock hour (UTC); further new phrases in
+  that hour are counted in `overflow` and not stored. A phrase already in the log is
+  always counted. The bound is per project, not per actor, because no actor is stored;
+- a find made while another find is being recorded is not counted at all (the
+  recorder never waits), so `finds` and `misses` are lower bounds under load.
+
+**Reading it.** `capability misses [--limit N] [--json]` is read-only. It takes no
+lock, writes nothing and is not journalled. It reads the log, and (only when the log
+holds a phrase) the index once, as `find` does, to mark what would now resolve.
+`--limit` is 1..100 (default 20). Any contributor of the project may read it.
+
+```json
+{
+  "schema_version": 1,
+  "schema": "capability-misses-v1",
+  "contract": "cli-contract-v1",
+  "trust": "untrusted-text",
+  "log": "ok",
+  "since": "2026-10-01T12:00:00Z",
+  "finds": 6,
+  "misses": 5,
+  "miss_rate": 0.8333,
+  "phrases_stored": 3,
+  "phrases_resolved_now": 1,
+  "not_stored": {"overflow": 0, "dropped": 1, "evicted": 0},
+  "limit": 20,
+  "phrases": [
+    {"phrase": "merge slot", "count": 2, "first_seen": "2026-10-01T12:00:00Z",
+     "last_seen": "2026-10-01T12:01:00Z", "resolves_now": false, "resolved_by": []},
+    {"phrase": "single integrator", "count": 1, "first_seen": "2026-10-01T12:04:00Z",
+     "last_seen": "2026-10-01T12:04:00Z", "resolves_now": true,
+     "resolved_by": [{"key": "merge.slot", "trust": "accepted"}]}
+  ],
+  "bounds": {"phrases": 500, "new_phrases_per_hour": 60, "phrase_characters": 80},
+  "coverage": "..."
+}
+```
+
+- `log` is `ok`, `absent` (nothing recorded yet, or cleared) or `unreadable` (the file
+  is corrupt, oversized or of another schema; the next `find` starts a new log). With
+  `absent` or `unreadable`, `since` is `null` and the counters are `0`.
+- `since` is when the log started. `finds`, `misses` and the `not_stored` counters
+  cover everything since then, including phrases later evicted.
+- `miss_rate` is `misses / finds`, rounded to four places, or `null` when `finds` is `0`.
+- `phrases` are the top `limit` phrases by `count`; ties go to the most recently seen.
+  `phrases_stored` counts all of them.
+- `resolves_now` is `true` when a `find` for that phrase would be an exact match now:
+  it equals a capability's key, its name, or an accepted alias (the same rule as
+  `find`). `resolved_by` names up to five such capabilities, accepted first, each with
+  `trust: accepted|draft`. A pending alias never makes a phrase resolve.
+  `phrases_resolved_now` counts the stored phrases that resolve, whatever the limit.
+- `not_stored`: misses that are in `misses` but whose phrase is not (or no longer) in
+  the log: `overflow` (over the hourly bound), `dropped` (empty, too long or unsafe
+  after normalising) and `evicted` (pushed out by a newer phrase).
+
+The log is telemetry, not coordination state. It is one file in the project's
+coordination directory, it is not backed up, and an operator can delete it at any
+time; see [Operations](OPERATIONS.md#the-capability-lookup-miss-log).
 
 ## `ref`: the reference catalog
 
@@ -685,6 +781,8 @@ a clear refusal, not a wrong read.
 | `ref` | due-soon window | 30 days (fixed in slice 1) |
 | `capability find` | phrase / `--limit` | <= 200 characters / 1..20 (default 5) |
 | `capability list` | `--limit` / `--offset` | 1..100 (default 20) / >= 0 |
+| `capability misses` | `--limit` | 1..100 (default 20) |
+| lookup-miss log | phrases / new phrases / phrase length | 500 per project (oldest last-seen evicted) / 60 per project per clock hour (the rest counted in `overflow`) / <= 80 characters after normalising (else counted in `dropped`) |
 | `capability` record | `name` / `summary` / `aliases` | <= 120 / <= 1,200 characters / <= 32 phrases of <= 80 |
 | `capability` record | `code` / `tests` / `anchors` / `requirements` / `tags` | <= 32 / 32 / 16 / 16 / 8, pointers <= 400 characters |
 | `capability propose-alias` | pending aliases | person 3 per capability and 50 per project; unverified pool 1 and 10; 20 per capability |
