@@ -14,6 +14,17 @@ build them. The project owner accepts it together with the reference catalog
     `18ac3ef`, cited as **.58 §x**. Its own header says "revision 3"; the coordinator
     calls it rev 2.1. Revision 2 of this document cited the earlier `057c7fa`.
 
+## Revision 2.2 changes (kittrial-5bb.69, from the kittrial-5bb.67 review 01a0fc55)
+
+The owner's decision 3 is unchanged: anyone may report a verification, and only an
+allowlisted operator or a listed verifier confirms one. Only the mechanism changes.
+
+| Finding | Change | Where |
+| --- | --- | --- |
+| The SSH actor is self-declared | The .67 review found that, over the SSH endpoint, the native comment author is whatever actor the caller names. Trust therefore cannot come from the author alone through the endpoint route: a caller naming an operator could forge a `verified` pass and clear real drift. The endpoint `capability verify` now always writes `identity: unverified`. A host command, `admin.py capability-verify`, writes `verified` after checking the operator allowlist or the `verifiers` list. A reader trusts a record only when it says `verified` **and** its native author is that listed actor. | §4, §5.1, §5.2, §12 Q8 |
+| Passing reports were unbounded | Because the actor is self-declared, "one record per author" bounds nothing. Untrusted verification records are capped at 20 per capability revision. | §5.1 |
+| Scope of slice 1b | `work` and `brief` attention moved to a separate follow-up task. | §10 |
+
 ## Revision 2.1 changes (review 01a0f7a2)
 
 | Review item | Change | Where |
@@ -186,7 +197,7 @@ the payload.
 | propose or revise a draft | any contributor, including agents | `capability propose` / `capability revise --file` (endpoint, under the project lock) |
 | accept or demote | allowlisted operator only, with F3 `decision_id` and `evidence` | `admin.py capability-apply`, as .41's `reference-apply` (.41 §4) |
 | report a verification | any contributor, attributed (§3.3) | `capability check --record` → endpoint `capability verify` |
-| make a verification count as `verified` | allowlisted operator, or an actor on the deployment's `verifiers` list | the same route; trust comes from the author, not from the payload |
+| make a verification count as `verified` | allowlisted operator, or an actor on the deployment's `verifiers` list | the host command `admin.py capability-verify`, fed by `capability check --payloads FILE` (revision 2.2). The endpoint route never writes `verified`, because its actor is self-declared; trust never comes from the payload |
 | propose an alias | any contributor, including agents, within the caps in §6 | `capability propose-alias` |
 | fold or reject an alias | allowlisted operator | the next accepted revision, or `capability alias-reject` |
 | retire | allowlisted operator | `capability retire` |
@@ -244,8 +255,13 @@ b capability check --repo . [--key KEY ...] [--record]
 (`[{pointer, resolved, reason}]`), `passed`, `submitter` (§3.3) and `sha256`.
 
 The endpoint validates the closed shape and binds the record to the revision's exact
-`record_sha256`. Idempotency is per `(key, revision, commit, actor)`, so one author
-cannot pre-empt another's record at the same commit.
+`record_sha256`. Idempotency is per `(key, revision, commit, actor)` and route, so one
+author cannot pre-empt another's record at the same commit, and an endpoint report
+naming an operator cannot pre-empt that operator's host-written record.
+
+Revision 2.2: a record written through the endpoint always carries
+`submitter.identity: unverified`. At most 20 untrusted verification records are kept
+per capability revision; the excess is refused, naming the cap.
 
 `checked_at` is stamped by the client and is shown for information only. Every
 ordering decision below uses **native order**: the position of the record's comment
@@ -267,7 +283,9 @@ which is §5.2.
 
 ### 5.2 What readers conclude
 
-A verifier is **trusted** when the record's native author is either:
+A verifier is **trusted** when the record says `identity: verified` (which only the
+host command `admin.py capability-verify` writes, revision 2.2), its native author is
+the record's actor, and that actor is either:
 - on the deployment's operator allowlist (`admin.operators`); or
 - on a new `verifiers` list beside it in `deployment.private.json`. The list is empty
   by default.
@@ -517,8 +535,8 @@ aliases and verification reports.
    - `admin.py verifiers`, with the sidecar field, `--restore-verifiers` and the
      `docs/OPERATIONS.md` "Operator commands" row;
    - the trust derivation of §5.2;
-   - `views/CAPABILITIES.md` in `refresh`;
-   - `work`/`brief` attention.
+   - `views/CAPABILITIES.md` in `refresh`.
+   - `work`/`brief` attention is a separate follow-up task (revision 2.2).
 2. **HTTP and queue.** HTTP GET routes and a web panel; .58 slice 3 queue kinds
    `alias` and `capability`.
 
@@ -583,7 +601,9 @@ others.
 7. **Should `capability suggest` exist?** **Later.** It never auto-accepts.
 8. **Who are the CI verifiers?** *(New; recommendation refined in 2.1.)* **Keep the
    `verifiers` list empty for now.** The coordinator's integration step runs
-   `capability check --record` at the integrated commit as an allowlisted operator.
+   `capability check --payloads FILE` at the integrated commit, then
+   `admin.py capability-verify` on the coordination host as an allowlisted operator
+   (revision 2.2; `capability check --record` alone only files an unverified report).
    GitHub runners cannot reach the coordination host in this deployment, so a real CI
    verifier would itself be a host-side step. The list exists, with the operator-list
    rules of §5.2, for when one is named.
