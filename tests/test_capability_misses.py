@@ -594,6 +594,8 @@ class ReportTests(MissLogCase):
                  (cm.FILE_NAME, 'directory', 'log-unwritable'), (cm.TEMP_NAME, 'directory', 'log-unwritable'))
         for name, kind, recording in cases:
             with self.subTest(name=name, kind=kind):
+                self.addCleanup(cm.clear, self.project)   # one failing case must not leak into the next
+                cm.clear(self.project)
                 self.record('merge slot')
                 self.stuck(name, kind)
                 self.assertEqual(self.record('reserved label guard'), 'error')   # every recording fails

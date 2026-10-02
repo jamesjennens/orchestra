@@ -45,6 +45,7 @@ raises: `record_find` returns a status word instead. The write is temp-file-then
 os.replace in the same directory, without fsync (a crash can lose the log, never
 corrupt a reader). Reading the log (`capability misses`) takes no lock at all.
 """
+import errno
 import json
 import os
 import re
@@ -263,7 +264,13 @@ def apply(log, phrase, found, stamp):
 
 def _lock_descriptor(project):
     """The miss-log lock, created 0600. Never through a symlink (O_NOFOLLOW). flock needs
-    no write access, so it is opened read-only: a read-only lock file still works."""
+    no write access, so it is opened read-only: a read-only lock file still works.
+
+    Where the platform has no O_NOFOLLOW (Windows, where the endpoint does not run) a
+    symlink is refused by an lstat check first, so behaviour is the same everywhere."""
+    path = Path(project) / LOCK_NAME
+    if not hasattr(os, 'O_NOFOLLOW') and _kind(path) == 'symlink':
+        raise OSError(errno.ELOOP, 'the miss-log lock is a symlink', str(path))
     return os.open(Path(project) / LOCK_NAME, _flags('O_RDONLY', 'O_CREAT', 'O_NOFOLLOW', 'O_CLOEXEC'), 0o600)
 
 
