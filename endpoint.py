@@ -206,6 +206,32 @@ def execute(root,request,authority_config=None,require_authority=False):
             return run_guarded(request,journal_path(path),ref_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
+    if action=='capability':
+        # The capability index (.60 slice 1a, kittrial-5bb.67). get, list, find and help
+        # are reads (one label-filtered bd list plus bd show; no lock, not run_guarded);
+        # propose, revise and propose-alias are writes, under the lock and the journal.
+        # lookup, resolve and index never reach the endpoint: they run in the client.
+        import capability_records
+        args=request.get('args',[])
+        if not isinstance(args,list) or any(not isinstance(x,str) or '\0' in x for x in args):raise ValueError('Expected argument list')
+        run_warnings=[]
+        def run(argv):
+            stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warnings:run_warnings.append(warnings)
+            return stdout
+        if not args or args[0] not in capability_records.WRITE_COMMANDS:
+            result=capability_records.read(args,run,configured_operators(root))
+            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
+        operators=configured_operators(root)
+        runner=NativeRunner(run)
+        def capability_effect():
+            result=capability_records.write(args,request.get('attachments',{}),actor,runner,path,operators)
+            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            return run_guarded(request,journal_path(path),capability_effect,
+                               authority_config=authority_config,
+                               require_authority=require_authority,runner=runner)
     if action in ('brief','history','checkpoint'):
         from briefing import execute as briefing_execute
         args=request.get('args',[])

@@ -148,6 +148,40 @@ def request(config,project,actor,args,action='bd',path=None):
     try:return json.loads(p.stdout)
     except json.JSONDecodeError:raise RuntimeError('Invalid endpoint response; inspect state before retrying.') from None
 
+# Capability subcommands answered by the coordination endpoint (.60 slice 1a); lookup,
+# resolve and index stay in the client and never need a config.
+CAPABILITY_ENDPOINT = ('find', 'get', 'list', 'propose', 'revise', 'propose-alias')
+
+def _capabilities_module():
+    """capabilities.py from this client's own directory, loaded by path, or None.
+
+    An unrelated `capabilities` module elsewhere on sys.path is never used, and loading
+    leaves no __pycache__ beside the client: the lookup writes nothing.
+    """
+    import importlib.util
+    module_path = Path(__file__).resolve().parent/'capabilities.py'
+    if not module_path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location('orchestra_capabilities', module_path)
+    module = importlib.util.module_from_spec(spec)
+    write_bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = write_bytecode
+    return module
+
+def _emit(code,stdout,stderr,out):
+    """Same client-owned capture as the endpoint actions: UTF-8, LF, no BOM, and no
+    file at all on a nonzero exit."""
+    if out:
+        if code == 0:
+            with open(out,'w',encoding='utf-8',newline='') as capture:
+                capture.write(stdout)
+        sys.stderr.write(stderr);return code
+    sys.stdout.write(stdout);sys.stderr.write(stderr);return code
+
 def _capability(args,out):
     """Client-side, read-only capability lookup over the caller's own checkout.
 
@@ -156,21 +190,11 @@ def _capability(args,out):
     `capabilities` module elsewhere on sys.path is never used; a standalone client
     copied without it gets a clear refusal instead.
     """
-    import importlib.util
-    module_path = Path(__file__).resolve().parent/'capabilities.py'
-    if not module_path.is_file():
+    module = _capabilities_module()
+    if module is None:
         sys.stderr.write('ValueError: capability commands need capabilities.py from the same Orchestra kit '
                          'next to this client\n')
         return 2
-    spec = importlib.util.spec_from_file_location('orchestra_capabilities', module_path)
-    module = importlib.util.module_from_spec(spec)
-    # Loading must not leave __pycache__ beside the client: the lookup writes nothing.
-    write_bytecode = sys.dont_write_bytecode
-    sys.dont_write_bytecode = True
-    try:
-        spec.loader.exec_module(module)
-    finally:
-        sys.dont_write_bytecode = write_bytecode
     code,stdout,stderr = module.run(args)
     if out:
         # Same client-owned capture as the endpoint actions: UTF-8, LF, no BOM,
@@ -181,6 +205,58 @@ def _capability(args,out):
         sys.stderr.write(stderr);return code
     sys.stdout.write(stdout);sys.stderr.write(stderr);return code
 
+def _capability_lookup(args,config,project,actor,out):
+    """`capability lookup` with --config/--project: the local .61 lookup plus the
+    endpoint's records (.60 section 7).
+
+    One endpoint `find`; every returned record's pointers are resolved live against the
+    caller's own checkout (`live: resolved | missing | unknown`). The local result is
+    never lost: if the endpoint cannot answer, the lookup still returns it, with
+    `records_warning`. The output stays `capability-lookup-v1` with additive fields.
+    """
+    module = _capabilities_module()
+    if module is None:
+        return _capability(['lookup',*args],out)
+    code,stdout,stderr = module.run(['lookup',*args])
+    if code:
+        return _emit(code,stdout,stderr,out)
+    payload = json.loads(stdout)
+    options = module._parser().parse_args(['lookup',*args])
+    try:
+        result = request(config,project,actor,['find',options.phrase,'--limit',str(options.limit)],'capability')
+        if result['returncode']:
+            raise RuntimeError((result.get('stderr') or '').strip().splitlines()[-1:] or ['endpoint refused'])
+        found = json.loads(result['stdout'])
+    except (RuntimeError,ValueError,OSError) as error:
+        payload['records'] = []
+        payload['records_warning'] = 'capability records unavailable: %s' % str(error)[:300]
+        return _emit(0,json.dumps(payload,ensure_ascii=True,indent=2)+'\n',stderr,out)
+    repo = module.open_repo(options.repo)
+
+    def live(pointers):
+        rows = []
+        for pointer in pointers:
+            resolved = module.resolve_pointer(repo,pointer,None).get('resolved')
+            rows.append({'pointer':pointer,'live':{True:'resolved',False:'missing'}.get(resolved,'unknown')})
+        return rows
+
+    def annotate():
+        records = []
+        for match,items in (('exact',found.get('records') or []),('candidate',found.get('candidates') or [])):
+            for item in items:
+                records.append(dict(item,match=match,code=live(item.get('code') or []),
+                                    tests=live(item.get('tests') or []),anchors=live(item.get('anchors') or [])))
+        return records
+    module._reset_parse_state()
+    try:
+        payload['records'] = module.with_parse_stack(annotate)
+    finally:
+        module._reset_parse_state()
+    payload['records_found'] = bool(found.get('found'))
+    payload['records_hint'] = found.get('hint')
+    payload['records_coverage'] = found.get('coverage')
+    return _emit(0,json.dumps(payload,ensure_ascii=True,indent=2)+'\n',stderr,out)
+
 def main():
     p=argparse.ArgumentParser();p.add_argument('--version',action='store_true')
     p.add_argument('--config');p.add_argument('--project');p.add_argument('--actor')
@@ -190,7 +266,9 @@ def main():
         print(line(report(Path(__file__).resolve().parent, "client")))
         return 0
     args=a.args[1:] if a.args[:1]==['--'] else a.args
-    if args[:1]==['capability']:
+    if args[:1]==['capability'] and not (len(args)>1 and args[1] in CAPABILITY_ENDPOINT):
+        if len(args)>1 and args[1]=='lookup' and a.config and a.project:
+            return _capability_lookup(args[2:],json.loads(Path(a.config).read_text()),a.project,a.actor,a.out)
         return _capability(args[1:],a.out)
     if not a.config or not a.project:
         p.error('the following arguments are required: --config, --project')
@@ -198,7 +276,7 @@ def main():
     if args[:1]==['refresh']:action='refresh';args=[]
     elif args[:1]==['view']:
         action='view';path=args[1] if len(args)>1 else 'CURRENT.md';args=[]
-    elif args[:1] in (['brief'],['history'],['checkpoint'],['onboard'],['docs'],['session'],['handoff'],['review'],['work'],['feedback'],['requirement'],['ref']):action=args.pop(0)
+    elif args[:1] in (['brief'],['history'],['checkpoint'],['onboard'],['docs'],['session'],['handoff'],['review'],['work'],['feedback'],['requirement'],['ref'],['capability']):action=args.pop(0)
     result=request(json.loads(Path(a.config).read_text()),a.project,a.actor,args,action,path)
     output = result['stdout']
     if action == 'session' and args[:1] == ['resume'] and result['returncode'] == 0:

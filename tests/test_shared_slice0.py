@@ -826,15 +826,20 @@ class NoWriterTests(unittest.TestCase):
     the record journals are only ever read (backup) or validated (restore)."""
 
     def test_only_the_guard_and_the_landed_writers_know_the_record_prefixes(self):
-        # The .41 slice 1 writer (kittrial-5bb.66) owns the reference family; the
-        # proposal, settings and capability families have no writer yet.
-        writers = {'reference_records.py': ('Kind: reference-',)}
+        # The .41 slice 1 writer (kittrial-5bb.66) owns the reference family; the .60
+        # slice 1a writer (kittrial-5bb.67) owns the capability entry, acceptance and
+        # alias records. Capability verification (slice 1b), proposals and settings
+        # have no writer yet.
+        writers = {'reference_records.py': ('Kind: reference-', 'Kind: reference-entry-v1',
+                                            'Kind: reference-acceptance-v1'),
+                   'capability_records.py': ('Kind: capability-', 'Kind: capability-entry-v1',
+                                             'Kind: capability-acceptance-v1', 'Kind: capability-alias-v1')}
         offenders = []
         for path in sorted(KIT.glob('*.py')):
             text = path.read_text(encoding='utf-8')
             for marker in RECORD_MARKERS + tuple(prefix.strip() for prefix in PREFIX_WRITERS):
                 if marker in text and path.name != 'reserved_comments.py' \
-                        and not marker.startswith(writers.get(path.name, ('\0',))):
+                        and marker not in writers.get(path.name, ()):
                     offenders.append((path.name, marker))
         self.assertEqual(offenders, [])
 
