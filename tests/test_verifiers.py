@@ -220,6 +220,36 @@ class BackupRestoreTests(VerifiersCase):
         self.assertIn('Re-granted capability verifiers from the backup (--restore-verifiers): ' + VERIFIER, text)
         self.assertEqual((self.stored()['verifiers'], self.stored()['operators']), (['zeta', VERIFIER], [OPERATOR]))
 
+    def test_the_restore_new_command_prints_the_not_restored_notice(self):
+        """Review 01a0fe9e `smaller` (d): the notice through the real command, not only the function."""
+        self.configure(operators=[OPERATOR], verifiers=[VERIFIER, 'zeta'])
+        self.backup()
+        (self.root / 'backups' / 'trial').mkdir(exist_ok=True)
+        self.configure(operators=[OPERATOR], verifiers=['zeta'])
+
+        def restore(*flags):
+            (self.root / 'projects' / 'other').mkdir(exist_ok=True)
+            with patch.object(sys, 'argv', ['admin.py', '--root', str(self.root), 'restore-new', 'trial', 'other',
+                                            *flags]), \
+                    patch.object(admin, 'root_path', return_value=self.root), \
+                    patch.object(admin, 'add_project'), \
+                    patch.object(admin, 'run_bd', return_value='restored'), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                admin.main()
+            return out.getvalue()
+
+        text = restore()
+        self.assertIn('NOT restored: the backup records capability verifiers this host does not list: ' + VERIFIER,
+                      text)
+        self.assertIn('--restore-verifiers', text)
+        self.assertIn('read `reported`', text)
+        self.assertEqual(self.stored()['verifiers'], ['zeta'])
+        self.assertNotIn('NOT restored: the backup records operator', text)   # the operators agree
+        text = restore('--restore-verifiers')
+        self.assertIn('Re-granted capability verifiers from the backup (--restore-verifiers): ' + VERIFIER, text)
+        self.assertNotIn('NOT restored', text)
+        self.assertEqual(self.stored()['verifiers'], ['zeta', VERIFIER])
+
     def test_restore_new_takes_the_flag_and_an_older_or_bad_sidecar_is_handled(self):
         self.configure(operators=[OPERATOR], verifiers=[VERIFIER])
         bundle = self.backup()

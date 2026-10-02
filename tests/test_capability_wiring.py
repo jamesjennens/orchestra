@@ -285,6 +285,37 @@ class ClientCheckTests(ClientCase):
         self.assertEqual(len(capability_verification.validate_batch(written)), 2)
         self.assertEqual(json.loads(out)['recording'], 'payloads')
 
+    def test_the_payloads_file_is_private_and_replaced_whole(self):
+        """Review 01a0fe9e `smaller` (a)."""
+        self.commit()
+        target = self.root / 'payloads.json'
+        target.write_text('an older file\n', encoding='utf-8')
+        code, _, _, _ = self.check('--payloads', str(target))
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(target.read_text(encoding='utf-8'))['schema_version'], 1)
+        self.assertEqual([path.name for path in self.root.glob('.payloads.json.*')], [])   # no temporary left
+        if os.name == 'posix':
+            import stat
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+        code, _, err, calls = self.check('--payloads', str(self.repo))
+        self.assertEqual((code, calls), (2, []))
+        self.assertIn('symbolic link or onto a directory', err)
+
+    def test_the_payloads_file_is_never_written_through_a_symbolic_link(self):
+        self.commit()
+        victim = self.root / 'victim.txt'
+        victim.write_text('keep me\n', encoding='utf-8')
+        link = self.root / 'link.json'
+        try:
+            os.symlink(victim, link)
+        except (OSError, NotImplementedError):
+            self.skipTest('cannot create symlinks here')
+        code, _, err, calls = self.check('--payloads', str(link))
+        self.assertEqual((code, calls), (2, []))          # refused before any endpoint call
+        self.assertIn('symbolic link', err)
+        self.assertEqual(victim.read_text(encoding='utf-8'), 'keep me\n')
+        self.assertTrue(link.is_symlink())
+
     def test_a_transport_failure_stops_recording_and_says_how_to_resume(self):
         self.commit()
         listing = self.endpoint()

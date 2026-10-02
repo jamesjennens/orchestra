@@ -22,7 +22,8 @@ allowlisted operator or a listed verifier confirms one. Only the mechanism chang
 | Finding | Change | Where |
 | --- | --- | --- |
 | The SSH actor is self-declared | The .67 review found that, over the SSH endpoint, the native comment author is whatever actor the caller names. Trust therefore cannot come from the author alone through the endpoint route: a caller naming an operator could forge a `verified` pass and clear real drift. The endpoint `capability verify` now always writes `identity: unverified`. A host command, `admin.py capability-verify`, writes `verified` after checking the operator allowlist or the `verifiers` list. A reader trusts a record only when it says `verified` **and** its native author is that listed actor. | §4, §5.1, §5.2, §12 Q8 |
-| Passing reports were unbounded | Because the actor is self-declared, "one record per author" bounds nothing. Untrusted verification records are capped at 20 per capability revision. | §5.1 |
+| Passing reports were unbounded | Because the actor is self-declared, "one record per author" bounds nothing. Untrusted passing reports are capped at 20 per capability revision. Failing reports are bounded separately, by the §5.1 pools, so passes can never block a failure. | §5.1 |
+| "Integrated" is contributor-assertable | Lifecycle facts are recorded by contributors, so anyone can assert that a commit is integrated. On its own that changes nothing: it matters only together with a trusted pass at that same commit, which only an operator or listed verifier can record. A forged integration fact therefore cannot clear drift or make anything read `verified`. | §5.2 |
 | Scope of slice 1b | `work` and `brief` attention moved to a separate follow-up task. | §10 |
 
 ## Revision 2.1 changes (review 01a0f7a2)
@@ -260,8 +261,10 @@ author cannot pre-empt another's record at the same commit, and an endpoint repo
 naming an operator cannot pre-empt that operator's host-written record.
 
 Revision 2.2: a record written through the endpoint always carries
-`submitter.identity: unverified`. At most 20 untrusted verification records are kept
-per capability revision; the excess is refused, naming the cap.
+`submitter.identity: unverified`. At most 20 untrusted **passing** reports are kept
+per capability revision; the excess is refused, naming the cap. Failing reports are
+not counted by that cap and answer only to the pools below, so passing reports can
+never stop a contributor from raising drift (kittrial-5bb.69 review 01a0fe9e).
 
 `checked_at` is stamped by the client and is shown for information only. Every
 ordering decision below uses **native order**: the position of the record's comment
@@ -314,7 +317,9 @@ A revision's `verification` is derived from its records, in this order:
    and no **trusted** pass at an **integrated commit** that comes after it in native
    order (never by `checked_at`) has cleared it.
    - An integrated commit is one that some trusted lifecycle fact in this project
-     records as an `integration_commit` with `integrated=passed`. The test uses the
+     records as an `integration_commit` with `integrated=passed`. Lifecycle facts are
+     contributor-recorded, so "integrated" is contributor-assertable; it only matters
+     together with a trusted pass at that commit (revision 2.2). The test uses the
      same projection `review` and `work` use, **including kittrial-5bb.52's revert
      and retraction records**: a commit in `integration.reverted_commits` is not
      integrated, so a reverted integration never clears drift. A retraction that

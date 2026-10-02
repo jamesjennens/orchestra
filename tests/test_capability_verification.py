@@ -329,12 +329,21 @@ class CapTests(VerificationCase):
         for index in range(count):
             self.propose(operation_id='more-%d' % index, key='more.k%d' % index, name='More %d' % index, aliases=[])
 
-    def test_untrusted_records_are_capped_per_revision_and_trusted_ones_are_not(self):
+    def test_untrusted_passes_are_capped_per_revision_and_never_block_a_failing_report(self):
+        """Review 01a0fe9e `passes-block-failures`: junk passes must not silence drift."""
         with patch.object(cv, 'CAP_UNTRUSTED_REVISION', 2):
             self.verify(actor='a1')
             self.verify(actor='a2')
-            with self.assertRaisesRegex(ValueError, 'already has 2 untrusted verification records'):
+            with self.assertRaisesRegex(ValueError, 'already has 2 untrusted passing reports'):
                 self.verify(actor='a3')
+            self.assertEqual(self.state()['state'], 'reported')
+            # The pass cap is full, and a failing report is still accepted and raises drift.
+            failed = self.verify(actor='a3', missing=self.MISSING)
+            self.assertEqual((failed['passed'], failed['reconciled']), (False, False))
+            self.assertEqual(self.state()['state'], 'drifted')
+            # Failing reports do not use up the pass cap either, and trusted records are uncapped.
+            with self.assertRaisesRegex(ValueError, 'untrusted passing reports'):
+                self.verify(actor='a4')
             self.assertEqual(self.verify(actor=OPERATOR, operator=True)['identity'], 'verified')
 
     def test_open_failing_reports_from_unverified_submitters_share_one_project_pool(self):
@@ -429,6 +438,38 @@ class ReadCostTests(VerificationCase):
         self.assertTrue(exported(INTEGRATED))
         self.assertFalse(exported(follow.COMMIT_1))    # the source commit is not the integration commit
 
+    def test_list_and_find_make_one_export_and_no_narrow_read_once_the_catalog_exports(self):
+        """Review 01a0fe9e `list-find-two-exports`: above the show threshold the catalog
+        read exports once, and the integrated test is answered from that same export."""
+        commits = ['%040x' % (index + 30) for index in range(5)] + [INTEGRATED]
+        for index in range(cr.keyed_entries.CATALOG_SHOW_MAX + 4):
+            key = 'many.k%02d' % index
+            self.propose(operation_id='many-%d' % index, key=key, name='Many %d' % index, aliases=[])
+            # Trusted passes over six distinct commits: more than the narrow-read limit.
+            self.verify(actor=OPERATOR, operator=True, key=key, commit=commits[index % len(commits)])
+        for args in (['list', '--limit', '100'], ['find', 'Many 7', '--limit', '20']):
+            self.native.calls = []
+            result = cr.read(args, self.run_native, OPS, journal=self.journal)
+            self.assertEqual(self.reads(), ['list', 'export'], args)
+            rows = result.get('items') or (result['records'] + result['candidates'])
+            self.assertIn('verified', {row['verification'] for row in rows})
+        # The export answers the integrated question correctly: the same as the narrow read.
+        self.native.calls = []
+        shown = cr.read(['get', 'many.k05'], self.run_native, OPS, journal=self.journal)['verification']
+        self.assertEqual((shown['verified_at']['commit'], shown['verified_at']['integrated']), (INTEGRATED, True))
+        self.assertNotIn('export', self.reads())
+        self.sync()
+        _, lifecycle = cr.read_catalog(self.run_native)
+        self.assertTrue(lifecycle)
+        self.assertTrue(all(cv.is_lifecycle_row(row) for row in lifecycle))
+        self.assertTrue(cv.Integrated(None, OPS, self.journal, export_rows=lifecycle)(INTEGRATED))
+        # A failing report's pool check uses the same single export.
+        payload = self.payload(key='many.k01', commit='8' * 40, missing=('review_workflow.py::execute',))
+        self.native.calls = []
+        self.native.actor = 'bob'
+        cv.verify(payload, 'bob', self.run_native, operators=OPS, journal=self.journal)
+        self.assertEqual(self.reads(), ['list', 'show', 'list', 'export'])
+
     def test_list_derives_only_the_rows_it_shows_and_can_carry_the_pointers(self):
         for index in range(3):
             self.propose(operation_id='more-%d' % index, key='more.k%d' % index, name='More %d' % index, aliases=[])
@@ -475,12 +516,18 @@ class ViewTests(VerificationCase):
 
     def test_accepted_text_is_inert_markdown_and_refresh_writes_and_removes_the_page(self):
         self.propose(operation_id='hostile', key='hostile.entry', aliases=[], owner='person:james',
-                     name='Name | <b>bold</b>', summary='# Heading\n[link](http://x) `code` *em*')
+                     name='Name | <b>bold</b>',
+                     summary='# Heading\n[link](http://x) `code` *em* https://evil.example/a www.evil.example '
+                             'mail bob@evil.example')
         self.accept('hostile.entry', operation_id='accept-hostile')
         page = self.page()
         self.assertIn('Name \\| \\<b\\>bold\\</b\\>', page)
-        self.assertIn('\\# Heading \\[link\\]\\(http://x\\) \\`code\\` \\*em\\*', page)
+        self.assertIn('\\# Heading \\[link\\]\\(http\\[:\\]//x\\) \\`code\\` \\*em\\*', page)
         self.assertNotIn('\n# Heading', page)
+        # A bare URL or address is defanged, so no renderer auto-links it (review 01a0fe9e).
+        self.assertIn('https\\[:\\]//evil.example/a www\\[.\\]evil.example mail bob\\[at\\]evil.example', page)
+        for live in ('://', 'www.', '@'):
+            self.assertNotIn(live, page)
         self.sync()
         views = self.project / 'views'
         result = render.render([dict(row) for row in self.native.rows], views, OPS)

@@ -736,6 +736,32 @@ def entry_view(row, operators):
     return view
 
 
+def read_catalog(run):
+    """(rows, lifecycle rows or None): the whole catalog, in two native reads at most.
+
+    The same read as `read_rows` (one label-filtered `bd list`, then one `bd show` up
+    to CATALOG_SHOW_MAX entries or one `bd export --all` above). When it exports, it
+    also keeps the lifecycle rows of that same export, so the integrated-commit test of
+    `list` and `find` is answered from it: no second export and no narrow read
+    (kittrial-5bb.69 review 01a0fe9e). `None` means no export was made.
+    """
+    listed = json.loads(run(['list', '--label', TYPE_LABEL, '--all', '--limit', '0', '--json']) or '[]')
+    ids = [row['id'] for row in listed or [] if isinstance(row, dict) and isinstance(row.get('id'), str)]
+    if len(ids) <= keyed_entries.CATALOG_SHOW_MAX:
+        return KIND.shown(run, ids), None
+    wanted = set(ids)
+    rows, lifecycle = [], []
+    for line in run(['export', '--all']).splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if isinstance(row, dict) and row.get('id') in wanted:
+            rows.append(row)
+        elif verification.is_lifecycle_row(row):
+            lifecycle.append(row)
+    return rows, lifecycle
+
+
 class Trust:
     """Who is trusted to verify, and which commits are integrated, for one read."""
 
@@ -923,6 +949,11 @@ def _md(value, limit=None):
     text = clean('' if value is None else value)
     if limit is not None and len(text) > limit:
         text = text[:limit] + '...'
+    # Some renderers turn a bare URL or e-mail address into a link even in escaped
+    # text, so they are defanged the usual way: `://` -> `[:]//`, `www.` -> `www[.]`,
+    # `@` -> `[at]`.
+    text = re.sub(r'(?i)\bwww\.', lambda match: match.group(0)[:-1] + '[.]', text.replace('://', '[:]//'))
+    text = text.replace('@', '[at]')
     return re.sub(r'([\\`*_{}\[\]()#+!|<>~&-])', r'\\\1', text)
 
 
@@ -1012,7 +1043,8 @@ def help_payload():
                                         'open_failing_reports': {
                                             'verified_person': verification.CAP_PERSON_FAILING,
                                             'unverified_pool': verification.CAP_UNVERIFIED_FAILING},
-                                        'untrusted_records_per_revision': verification.CAP_UNTRUSTED_REVISION}},
+                                        'untrusted_passing_reports_per_revision':
+                                            verification.CAP_UNTRUSTED_REVISION}},
             'operator': ['admin.py capability-apply PROJECT --actor OPERATOR --file batch.json',
                          'admin.py capability-verify PROJECT --actor OPERATOR_OR_VERIFIER --file payloads.json',
                          'admin.py verifiers list|add|remove [ACTOR] [--confirm-revoke]',
@@ -1066,8 +1098,8 @@ def read(args, run, operators, verifiers=None, journal=None):
     if not args or args[0] == 'help' or any(token in ('--help', '-h') for token in args):
         return help_payload()
     command, rest = args[0], args[1:]
-    trust = Trust(run, operators, verifiers, journal)
     if command == 'get':
+        trust = Trust(run, operators, verifiers, journal)
         rest = [token for token in rest if token != '--json']
         if len(rest) != 1:
             raise ValueError('capability get takes exactly one KEY')
@@ -1082,13 +1114,15 @@ def read(args, run, operators, verifiers=None, journal=None):
             raise ValueError('capability list: --state must be draft-only, accepted, superseded or all')
         if options.get('owner') is not None:
             valid_owner(options['owner'], required=True)
-        return list_entries(read_rows(run), options, operators, trust)
+        rows, lifecycle = read_catalog(run)
+        return list_entries(rows, options, operators, Trust(run, operators, verifiers, journal, lifecycle))
     if command == 'find':
         if not rest or rest[0].startswith('--'):
             raise ValueError('capability find takes a PHRASE')
         phrase, options = rest[0], _options(rest[1:], {'--limit': 'limit'})
-        return find(read_rows(run), phrase, operators, limit=options['limit'] if '--limit' in rest else 5,
-                    trust=trust)
+        rows, lifecycle = read_catalog(run)
+        return find(rows, phrase, operators, limit=options['limit'] if '--limit' in rest else 5,
+                    trust=Trust(run, operators, verifiers, journal, lifecycle))
     raise ValueError('capability: unknown command %s; use get, list, find, propose, revise, propose-alias or '
                      'verify' % command)
 

@@ -297,6 +297,8 @@ def _capability_check(args,config,project,actor,out):
         options = parser.parse_args(args)
         if options.record and options.payloads:
             raise ValueError('use --record or --payloads FILE, not both')
+        if options.payloads and (Path(options.payloads).is_symlink() or Path(options.payloads).is_dir()):
+            raise ValueError('--payloads: refusing to write through a symbolic link or onto a directory')
         repo = module.open_repo(options.repo)
         writing = options.record or options.payloads
         if writing:
@@ -369,8 +371,24 @@ def _capability_check(args,config,project,actor,out):
                 'passed':row['passed']}
     warnings = list(index.warnings) if index is not None else []
     if options.payloads:
-        with open(options.payloads,'w',encoding='utf-8',newline='') as target:
-            target.write(json.dumps({'schema_version':1,'items':list(payloads.values())},ensure_ascii=True,indent=2)+'\n')
+        # Written to a new private (0600) file beside the target and moved into place, so
+        # the write never follows a link and never leaves a half-written or shared file.
+        import os,tempfile
+        target = Path(options.payloads)
+        try:
+            if target.is_symlink():
+                raise OSError('refusing to write through a symbolic link')
+            handle,name = tempfile.mkstemp(prefix='.'+target.name+'.',suffix='.tmp',dir=str(target.parent or '.'))
+            try:
+                with os.fdopen(handle,'w',encoding='utf-8',newline='') as stream:
+                    stream.write(json.dumps({'schema_version':1,'items':list(payloads.values())},ensure_ascii=True,indent=2)+'\n')
+                os.replace(name,str(target))
+            except BaseException:
+                try:os.unlink(name)
+                except OSError:pass
+                raise
+        except OSError as error:
+            sys.stderr.write('ValueError: --payloads: %s\n' % error);return 2
         for row in checked:
             row.setdefault('recorded','payload-written')
     elif options.record:

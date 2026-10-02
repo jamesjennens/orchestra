@@ -45,8 +45,10 @@ counts, so the integration counts again).
 Bounds at write: an untrusted failing report is refused when its submitter already
 holds 10 open failing reports in the project, or, for unverified submitters, when
 their shared pool of 5 is full ("open" means not cleared by a trusted pass); at most
-20 untrusted verification records per capability revision. Trusted records are never
-capped. Report text (`reason`) is untrusted and never enters an error message.
+20 untrusted PASSING reports per capability revision. The two bounds are separate on
+purpose: passing reports never use up room a failing report needs, so junk passes
+cannot stop anyone from raising drift. Trusted records are never capped. Report text
+(`reason`) is untrusted and never enters an error message.
 """
 import json
 import re
@@ -72,7 +74,8 @@ BATCH_MAX = 500
 # Open failing reports allowed (.60 section 5.1), keyed on the resolved person.
 CAP_PERSON_FAILING = 10
 CAP_UNVERIFIED_FAILING = 5
-# Untrusted verification records allowed per capability revision (plan answer b).
+# Untrusted PASSING reports allowed per capability revision (plan answer b). Failing
+# reports are bounded only by the open-failing pool above (review 01a0fe9e).
 CAP_UNTRUSTED_REVISION = 20
 # A read tests at most this many commits with narrow native reads before it falls
 # back to one full export; a commit recorded by more tasks than this also falls back.
@@ -205,6 +208,14 @@ def is_trusted(item, trusted):
             and item['author'] in trusted)
 
 
+def is_lifecycle_row(row):
+    """Whether an exported row can matter to the integrated-commit test: a lifecycle
+    event row, or a task carrying a native `integrated:` label (no other task can hold a
+    trusted integrated fact). A reader that streams an export keeps only these."""
+    return isinstance(row, dict) and (row.get('issue_type') == 'event' or any(
+        isinstance(label, str) and label.startswith('integrated:') for label in row.get('labels') or []))
+
+
 def integrated_commits(rows, operators=None, journal=None):
     """Every integrated commit the given native rows record (lowercase).
 
@@ -230,8 +241,9 @@ class Integrated:
     """`commit -> bool`: whether a commit is integrated, read as cheaply as the call allows.
 
     One instance serves one endpoint call, and nothing is read until a commit is asked
-    about (only a trusted pass asks). Given the rows of an export the caller already
-    holds (`refresh`), it answers from them. Otherwise each commit is tested with
+    about (only a trusted pass asks). Given the lifecycle rows of an export the caller
+    already made (`refresh`, or a `list`/`find` whose catalog read exported), it answers
+    from them and makes no native read at all. Otherwise each commit is tested with
     narrow native reads: one `bd list --desc-contains COMMIT` finds the lifecycle events
     that name it, then one `bd list --parent TASK` per task and one `bd show` of those
     tasks give exactly the rows `integrated_commits` needs. After NARROW_COMMITS
@@ -250,17 +262,14 @@ class Integrated:
     def _export(self):
         rows = self.export_rows
         if rows is None:
-            # Only lifecycle rows are kept while the export streams by: the event rows,
-            # and the tasks that carry a native `integrated:` label (no other task can
-            # hold a trusted integrated fact), so memory does not grow with the project.
+            # Only lifecycle rows are kept while the export streams by, so memory does
+            # not grow with the project.
             rows = []
             for line in self.run(['export', '--all']).splitlines():
                 if not line.strip():
                     continue
                 row = json.loads(line)
-                if isinstance(row, dict) and (row.get('issue_type') == 'event' or any(
-                        isinstance(label, str) and label.startswith('integrated:')
-                        for label in row.get('labels') or [])):
+                if is_lifecycle_row(row):
                     rows.append(row)
         self.everything = integrated_commits(rows, self.operators, self.journal)
         self.export_rows = None
@@ -430,12 +439,16 @@ def verify(payload, actor, run, operators=None, verifiers=None, journal=None, op
             raise ValueError('You already recorded a different result for capability %s revision %d at this '
                              'commit; check at a new commit' % (key, revision['revision']))
     if not operator:
-        untrusted = [item for item in mine if not is_trusted(item, trusted)]
-        if len(untrusted) >= CAP_UNTRUSTED_REVISION:
-            raise ValueError('Capability %s revision %d already has %d untrusted verification records (the cap); '
-                             'an operator or listed verifier must verify it'
-                             % (key, revision['revision'], CAP_UNTRUSTED_REVISION))
-        if not payload['passed']:
+        # Passing and failing reports are bounded separately: a failing report is never
+        # refused because passes filled the revision, so junk passes cannot silence
+        # drift (.60 section 5.2). It answers only to the open-failing pool.
+        if payload['passed']:
+            passes = [item for item in mine if item['record']['passed'] and not is_trusted(item, trusted)]
+            if len(passes) >= CAP_UNTRUSTED_REVISION:
+                raise ValueError('Capability %s revision %d already has %d untrusted passing reports (the cap); '
+                                 'an operator or listed verifier must verify it. A failing report is still '
+                                 'accepted' % (key, revision['revision'], CAP_UNTRUSTED_REVISION))
+        else:
             _check_failing_caps(run, operators, trusted, journal)
     record, body = build(payload, actor, operator)
     raw = run(['comments', 'add', entry['native_id'], body, '--json'])
@@ -451,8 +464,9 @@ def _check_failing_caps(run, operators, trusted, journal):
     resolves to a person without trusting them as a verifier.
     """
     import capability_records as records
-    integrated = Integrated(run, operators, journal)
-    entries, _ = records.catalog(records.read_rows(run), operators)
+    rows, lifecycle = records.read_catalog(run)
+    integrated = Integrated(run, operators, journal, export_rows=lifecycle)
+    entries, _ = records.catalog(rows, operators)
     pool = 0
     for entry in entries:
         if entry['state'] in ('malformed', 'unsupported', 'superseded'):
