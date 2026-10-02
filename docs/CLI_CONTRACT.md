@@ -376,7 +376,7 @@ this command returns.
     commit, and Python matches taken from it are re-checked with `ast` (`verified`).
   - With `--source auto` the warning says what to do:
     `graph.json is stale (it was built at <12 hex> but the checkout is at <12 hex>); results from it may be out of date. Regenerate graphify-out/graph.json, or delete it to use the ast index.`
-- Every fallback warning is one fixed sentence that says why and what to do:
+- Every fallback warning gives the reason and then one fixed sentence saying what to do:
   `<reason>; using the ast index. Regenerate graphify-out/graph.json or delete it.`
   The reasons are a file over the size limit, a file that is not UTF-8 or not valid
   JSON, nesting that is too deep, the wrong top-level shape, too many nodes or links,
@@ -392,13 +392,15 @@ paragraph separators, is written as a `\u` escape.
 ### Producing `graph.json` (optional)
 
 graphify is optional external tooling. It is **not** a kit dependency: the kit never
-installs, imports or runs it, and the built-in `ast` index is the default. A graph adds
-what `ast` cannot read, such as code in other languages.
+installs, imports or runs it, and the built-in `ast` index is the default. When a graph
+is used it **replaces** the Python code index rather than adding to it: code the graph
+leaves out is not found. A graph can cover what `ast` cannot read, such as code in
+other languages.
 
 - **Where.** The kit reads exactly one path: `graphify-out/graph.json` at the top level
   of the checkout (or the file named by `--graph FILE`). Keep `graphify-out/`
   git-ignored: it is generated output, and a committed graph can never name the commit
-  that contains it, so it would always read as stale.
+  that contains it, so one that records its commit would always read as stale.
 - **How.** A worker or a build step runs graphify so that its JSON output lands at that
   path. The kit does not wrap the tool and does not pin its command line: see
   graphify's own documentation for how to install and run it.

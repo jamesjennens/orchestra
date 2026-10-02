@@ -85,15 +85,17 @@ You do not need this. The lookup's default is its built-in index, made with Pyth
 standard-library `ast` parser. graphify is optional external tooling, not a kit
 dependency: the kit never installs or runs it.
 
-If you or a build step want the lookup to cover what `ast` cannot read:
+A graph can cover what `ast` cannot read, such as code in other languages. When one is
+used it replaces the built-in Python index rather than adding to it, so code the graph
+leaves out is not found. If you or a build step want that:
 
 - **Generate it.** Run graphify so that its JSON output lands at
   `graphify-out/graph.json` at the top level of your checkout. That is the only path
   the lookup reads by default. For how to install and run the tool, see graphify's own
   documentation.
 - **Keep it out of Git.** Add `graphify-out/` to the checkout's `.gitignore`. It is
-  generated output, it goes stale with every commit, and a committed copy would always
-  read as stale.
+  generated output, it goes stale with every commit, and a committed copy that records
+  its commit would always read as stale.
 - **Limits.** The file is untrusted input: at most 64 MB by default
   (`--max-graph-mb`, up to 512), 500,000 nodes and 2,000,000 links, UTF-8 JSON, and
   only clean repo-relative paths. Python matches taken from it are re-checked with
