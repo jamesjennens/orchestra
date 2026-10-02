@@ -141,7 +141,8 @@ def execute(root,request,authority_config=None,require_authority=False):
         runner=NativeRunner(run)
         def work_effect():
             return {'returncode':0,'stdout':json.dumps(work_execute(path,actor,action,args,request.get('attachments',{}),runner,
-                                                                    operators=configured_operators(root)),ensure_ascii=False,indent=2)+'\n','stderr':''.join(run_warnings)}
+                                                                    operators=configured_operators(root),
+                                                                    verifiers=configured_verifiers(root)),ensure_ascii=False,indent=2)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             return run_guarded(request,journal_path(path),work_effect,
@@ -248,7 +249,8 @@ def execute(root,request,authority_config=None,require_authority=False):
         runner=NativeRunner(run)
         def briefing_effect():
             return {'returncode':0,'stdout':briefing_execute(root,path,name,actor,action,args,request.get('attachments',{}),runner,
-                                                             operators=configured_operators(root)),'stderr':''.join(run_warnings)}
+                                                             operators=configured_operators(root),
+                                                             verifiers=configured_verifiers(root)),'stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             return run_guarded(request,journal_path(path),briefing_effect,
