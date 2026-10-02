@@ -176,6 +176,9 @@ GOOD_LINKS = [
 ]
 
 
+FALLBACK = 'using the ast index. Regenerate graphify-out/graph.json or delete it.'
+
+
 def graph_text(nodes=GOOD_NODES, links=GOOD_LINKS, commit=None, key='links', **extra):
     document = {'directed': False, 'multigraph': False, 'graph': {}, 'nodes': nodes, key: links,
                 'hyperedges': []}
@@ -488,6 +491,13 @@ class GraphTests(Checkout):
         self.assertEqual(result['index']['code_source'], 'graphify')
         self.assertEqual(result['index']['graph']['path'], '<outside the checkout>')
 
+    def test_a_default_graph_that_is_not_a_file_falls_back_with_an_actionable_warning(self):
+        (self.root / capabilities.DEFAULT_GRAPH).mkdir(parents=True)
+        result = self.lookup('Engine')
+        self.assertEqual(result['index']['code_source'], 'ast')
+        self.assertEqual(result['warnings'], [
+            'graphify-out/graph.json is missing or resolves outside the checkout; ' + FALLBACK])
+
     def test_missing_graph_with_explicit_source_fails(self):
         code, _, stdout, stderr = call('lookup', 'Engine', '--repo', str(self.root), '--source', 'graphify')
         self.assertEqual((code, stdout), (2, ''))
@@ -511,6 +521,37 @@ class HostileGraphTests(Checkout):
         self.assertIn(fragment, stderr)
         self.assertNotIn(self.SECRET, stderr)
         return stderr
+
+    def same_as_ast_only(self, warning, *extra):
+        """The refused graph changes nothing but the one warning, which says why and what
+        to do and quotes nothing from the file."""
+        for command in (('lookup', 'Engine'), ('lookup', 'no such thing anywhere'), ('index',)):
+            code, result, stdout, stderr = call(*command, '--repo', str(self.root), *extra)
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(result['warnings'], [warning])
+            self.assertEqual(stderr, 'warning: %s\n' % warning)
+            self.assertNotIn(self.SECRET, stdout + stderr)
+            code, plain, _, plain_stderr = call(*command, '--repo', str(self.root), '--source', 'ast')
+            self.assertEqual((code, plain_stderr, plain['warnings']), (0, '', []))
+            self.assertEqual(dict(result, warnings=[]), plain)
+        self.assertLessEqual(len(warning), 200)
+
+    def test_a_malformed_graph_degrades_to_the_ast_result_with_an_actionable_warning(self):
+        self.put_graph('{"nodes": [%s' % self.SECRET)
+        result = self.lookup('Engine')
+        (warning,) = result['warnings']
+        self.assertTrue(warning.startswith('graph.json is not valid JSON ('), warning)
+        self.assertTrue(warning.endswith('); ' + FALLBACK), warning)
+        self.same_as_ast_only(warning)
+        self.put_graph('{"nodes": {}, "links": []}')
+        self.same_as_ast_only('graph.json "nodes" and "links" (or "edges") must be lists; ' + FALLBACK)
+        self.put_graph(b'{"nodes": ["\xff\xfe"], "links": []}')
+        self.same_as_ast_only('graph.json is not UTF-8; ' + FALLBACK)
+
+    def test_an_oversized_graph_degrades_to_the_ast_result_with_an_actionable_warning(self):
+        self.put_graph(graph_text(graph={'padding': self.SECRET + 'x' * 1_100_000}))
+        self.same_as_ast_only('graph.json is larger than the 1 MB limit (--max-graph-mb); ' + FALLBACK,
+                              '--max-graph-mb', '1')
 
     def test_oversized_graph_is_refused_before_parsing(self):
         self.put_graph(graph_text(graph={'padding': 'x' * 1_100_000}))
@@ -655,6 +696,45 @@ class GitCheckoutTests(Checkout):
         result = self.lookup('Engine')
         self.assertIs(result['index']['graph']['stale'], False)
         self.assertEqual(result['warnings'], [])
+
+    def test_a_stale_default_graph_degrades_to_the_ast_result_with_an_actionable_warning(self):
+        write(self.root, '.gitignore', 'ignored.py\ngraphify-out/\n')
+        self.git('commit', '-q', '-a', '-m', 'ignore the graph output')
+        head = self.git('rev-parse', 'HEAD')
+        write(self.root, capabilities.DEFAULT_GRAPH, graph_text(commit='0' * 40))
+        warning = ('graph.json is stale (it was built at 000000000000 but the checkout is at %s); %s'
+                   % (head[:12], FALLBACK))
+        found = {'path': 'graphify-out/graph.json', 'built_at_commit': '0' * 40, 'stale': True,
+                 'nodes': len(GOOD_NODES), 'links': len(GOOD_LINKS)}
+        for command in (('lookup', 'Engine'), ('lookup', 'render'), ('index',)):
+            code, result, _, stderr = call(*command, '--repo', str(self.root))
+            self.assertEqual((code, stderr), (0, 'warning: %s\n' % warning))
+            self.assertEqual(result['warnings'], [warning])
+            self.assertEqual(result['index']['code_source'], 'ast')
+            self.assertEqual(result['index']['graph'], found)
+            code, plain, _, _ = call(*command, '--repo', str(self.root), '--source', 'ast')
+            self.assertEqual((code, plain['warnings'], plain['index']['graph']), (0, [], None))
+            result['index']['graph'] = None
+            self.assertEqual(dict(result, warnings=[]), plain)
+        match = self.lookup('Engine')['matches'][0]
+        self.assertEqual(match['source'], 'ast')
+        self.assertNotIn('verified', match)
+        # The graph is not consulted for the files ast cannot read either.
+        code, result, _, _ = call('resolve', 'web/app.ts::render', '--repo', str(self.root))
+        self.assertEqual((code, result['results'][0]['resolved'], result['results'][0]['reason']),
+                         (0, None, 'unsupported-file-type'))
+        self.assertEqual((result['index']['code_source'], result['warnings']), ('ast', [warning]))
+
+    def test_a_stale_graph_that_was_asked_for_is_still_used(self):
+        graph = write(self.root, capabilities.DEFAULT_GRAPH, graph_text(commit='0' * 40))
+        for extra in (('--source', 'graphify'), ('--graph', str(graph))):
+            result = self.lookup('Engine', *extra)
+            self.assertEqual(result['index']['code_source'], 'graphify')
+            self.assertTrue(result['index']['graph']['stale'])
+            self.assertEqual(result['matches'][0]['source'], 'graphify')
+            (warning,) = result['warnings']
+            self.assertIn('was built at 000000000000', warning)
+            self.assertNotIn('using the ast index', warning)
 
 
 class ClientRoutingTests(Checkout):
