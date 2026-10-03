@@ -76,12 +76,31 @@ def _python(config):
         raise ValueError('Configure "python" as one Python executable path without flags')
     return value
 
+def _forced_command(config):
+    """The optional ``"forced_command": true`` flag: strictly a JSON boolean.
+
+    With it, the server's authorized_keys ``command=`` wrapper (ssh_forced_command.py)
+    supplies ``--root`` itself and refuses every flag an ordinary remote command carries,
+    so the client sends the endpoint path alone, to select the endpoint. A truthy string
+    is refused rather than guessed, so a deployment never gets a command line it did not
+    choose.
+    """
+    value = config.get('forced_command',False)
+    if not isinstance(value,bool):
+        raise ValueError('Configure "forced_command" as true or false')
+    return value
+
 def _ssh_argv(config):
     host = config.get('host')
     if not isinstance(host,str) or not HOST.fullmatch(host):
         raise ValueError('Host must be an SSH alias or user@host')
+    # Both paths stay required in forced-command mode too: the wrapper fixes the root, but
+    # the client config must still name the deployment it is talking to.
     endpoint,root = _endpoint_paths(config)
-    command = ' '.join(shlex.quote(x) for x in ['python3',endpoint,'--root',root])
+    if _forced_command(config):
+        command = shlex.quote(endpoint)
+    else:
+        command = ' '.join(shlex.quote(x) for x in ['python3',endpoint,'--root',root])
     return ['ssh','-o','BatchMode=yes','-o','ConnectTimeout=10',host,command],'SSH'
 
 def _local_argv(config):

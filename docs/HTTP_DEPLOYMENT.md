@@ -755,6 +755,23 @@ HTTP roles. HTTP principals are never inferred from an actor string; mapping
 legacy actor-owned claims to a stable user id is an explicit migration action in
 the pilot phase, not part of this service.
 
+Over SSH the actor is self-declared, so several guarantees hold only where the caller
+cannot choose the remote command: the HTTP actor-shape reservation and the operator-only
+host commands (`admin.py`, including `requirement-apply` and `void-record`) are enforced by
+`endpoint.py`/`admin.py` themselves, and a contributor key with an ordinary service-account
+shell can run a different program instead. The forced-command wrapper
+(`ssh_forced_command.py`, [confine contributor keys](OPERATIONS.md#confine-contributor-keys-with-a-forced-command))
+is what makes the SSH path to `endpoint.py` confined. It also closes the last server-side
+launch flag: `--authority-store`, `--authority-lock` and `--require-authority` belong to the
+service's own launch command, and the wrapper never passes them, so an SSH caller cannot
+reach the HTTP authority path.
+
+The HTTP service's `--backend endpoint` launches `endpoint.py` itself as the service
+account; that is host configuration and is unaffected by a contributor's confined key.
+Operator host commands still need the service account's shell (a deliberately unrestricted
+operator key, or direct host access), which is why `admin.py authorized-keys` prints that
+line separately and unconfined.
+
 ## 10. Known limitations of this disposable build
 
 - The canonical binding is implemented for the full route surface:

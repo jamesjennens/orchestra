@@ -43,6 +43,91 @@ Keep local config outside committed project content or ignored. The client trans
 
 Copy templates/READ_ME_FIRST.md and docs/WORKFLOW.md into each project repository, fill in project details, and add links to README and AGENTS.md. This makes the entry instructions discoverable by later agents without needing a pasted chat message.
 
+## Confine contributor keys with a forced command
+
+The endpoint (`endpoint.py`) is what enforces the kit's authority rules: the operator
+allowlist on every host command, endpoint writes that always stay `unverified`, the
+reserved comment prefixes, the HTTP actor-shape reservation, and the runtime `--root`.
+Those rules bind a caller who cannot choose the remote command, and nothing else. The
+shared service account is shell-trusted (see the README), so a contributor key without a
+forced command can run `admin.py` or `bd` directly and every rule above holds only against
+a cooperative caller. A forced-command entry makes the boundary real for that key.
+
+`ssh_forced_command.py` is the `command=` value of a contributor key's `authorized_keys`
+entry. It gives the key exactly one capability - running the configured endpoint - and
+nothing else:
+
+* only the endpoint path(s) the entry names can be selected; another program, `admin.py`,
+  `bd` or a shell is refused;
+* `--root` is fixed by the entry, so the caller cannot point the endpoint at another
+  runtime, and no `--authority-store`, `--authority-lock` or `--require-authority` flag is
+  ever passed;
+* `SSH_ORIGINAL_COMMAND` is used only to select the endpoint; any other program, any flag
+  and any extra argument is refused on stderr with status 2, and nothing runs.
+
+Print the two exact lines for a public key with the helper:
+
+```sh
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime \
+  authorized-keys --key-file ~/alex.pub
+```
+
+The contributor line is the confined entry; the operator line is the bare key, deliberately
+unrestricted because the host commands need a shell. They are alternatives for different
+keys: install exactly one entry per key, and grant the operator line only to an allowlisted
+operator. The helper refuses a line that already carries options, a private key, several
+keys, or paths that cannot be quoted safely inside the entry.
+
+### What the four options close
+
+The contributor line carries four sshd options beside the forced command:
+
+| Option | What it closes |
+| --- | --- |
+| `no-pty` | no interactive terminal, so the key cannot type at a shell prompt |
+| `no-port-forwarding` | no `-L`/`-R` port forwarding through the service account |
+| `no-agent-forwarding` | the key cannot use its agent on the host to reach other accounts |
+| `no-X11-forwarding` | no X11 channel |
+
+### The client must know
+
+The forced command refuses the `--root` an ordinary command line carries, so the
+contributor whose key is confined sets `"forced_command": true` in their
+`client.local.json`; the client then sends only the endpoint path. The `endpoint` value
+there must be exactly the path printed in the entry (the helper prints both together, so
+copy them as a pair); `root` must still be present, but the wrapper's fixed root wins, so a
+stale value there can never move the endpoint to another runtime. Without
+`"forced_command": true` the connection is refused, loudly, with nothing run. Absent or
+`false` leaves today's command line byte-identical, so no existing client changes behaviour
+until it opts in.
+
+```json
+{"host": "beads-team", "endpoint": "/home/beads/beads-team-kit/endpoint.py",
+ "root": "/home/beads/beads-runtime", "forced_command": true}
+```
+
+One onboarding command changes: the bare `ssh beads-team python3 worker.py ... start` form
+runs another program and is refused by a confined key. Register through the endpoint
+instead (`python client.py --config client.local.json --project example -- session register
+--name cline`), or keep a separate, deliberately unrestricted onboarding key for whoever
+provisions workers.
+
+### Migration for an existing deployment
+
+1. Keep one unrestricted operator key (the operator line the helper prints) for `admin.py`
+   and the host commands; do not confine it.
+2. For each contributor key, replace any existing unrestricted entry for that key with its
+   confined line. sshd uses the first matching line, so a second entry is not a migration.
+3. Have each contributor add `"forced_command": true` to their `client.local.json`, then
+   confirm `python client.py --config client.local.json --project example --actor <actor> --
+   ready --json` succeeds and that `ssh beads-team /path/admin.py --help` is refused for
+   that key.
+4. Rollback is per key: remove the `command=` entry (and the `"forced_command"` key) and the
+   previous behaviour returns. Nothing in the runtime or the tracker changes.
+
+Nothing here changes a live deployment by itself: the coordinator rolls it out with the
+owner.
+
 ## Operator commands
 
 A few coordination actions are host shell commands rather than contributor-client

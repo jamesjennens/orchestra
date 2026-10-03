@@ -55,7 +55,7 @@ This is an independent community kit built around Beads and Dolt, not an officia
 
 This is a trusted-team setup, with SSH access and repository merge permissions providing the access boundaries. Actor names provide attribution, not verified identity. Project databases separate queries and records, not access rights between contributors. There is no scheduler, automatic conflict detection, web UI, role system or automatic off-machine backup. Impact statements and human/agent judgment decide which work can proceed together.
 
-The shared SSH service account can be reached using separately revocable contributor keys. People with shell access to that account can access all its coordination data. Use separate service accounts/deployments if projects require separate access. Do not share a private SSH key.
+The shared SSH service account can be reached using separately revocable contributor keys. People with shell access to that account can access all its coordination data. Use separate service accounts/deployments if projects require separate access. Do not share a private SSH key. A contributor key can instead be confined to the endpoint with the shipped forced-command setup, which is what makes the endpoint's authority rules real for that key: [confine contributor keys](docs/OPERATIONS.md#confine-contributor-keys-with-a-forced-command).
 
 This package contains only generic code, instructions and synthetic test results; no existing project history or credentials. Review workplace hosting and data rules using your normal process before installing there.
 

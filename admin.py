@@ -2540,6 +2540,116 @@ def record_store_stats(state):
     store,document,path=existing_record_store(state)
     return {'state':str(document),'record_store':str(path),'stats':store.stats()}
 
+# ---------------------------------------------------------------------------
+# Confined contributor keys (kittrial-5bb.89).
+#
+# The endpoint takes its HTTP authority from its own launch flags and enforces every
+# authority rule in the kit, so those rules bind only a caller who cannot choose the
+# remote command. `ssh_forced_command.py` is the authorized_keys `command=` wrapper that
+# makes that true for a contributor key; this helper prints the exact lines to install.
+# ---------------------------------------------------------------------------
+
+# One plain public key line is accepted; anything else (options, a private key, several
+# keys) is refused rather than concatenated into a line nobody can audit.
+AUTHORIZED_KEY_TYPES=('ssh-ed25519','ssh-rsa','ecdsa-sha2-nistp256','ecdsa-sha2-nistp384',
+                      'ecdsa-sha2-nistp521','sk-ssh-ed25519@openssh.com',
+                      'sk-ecdsa-sha2-nistp256@openssh.com','ssh-dss')
+CONTRIBUTOR_KEY_OPTIONS=('no-pty','no-port-forwarding','no-agent-forwarding','no-X11-forwarding')
+OPERATOR_KEY_NOTE=('Unrestricted service-account shell access: this key can run admin.py, bd '
+                   'and anything else the account can. It is deliberately not confined. '
+                   'Grant it only to an allowlisted operator.')
+
+def public_key_line(text,source='key file'):
+    """The one plain public-key line in `text` as (type, base64 body, comment).
+
+    A line that already carries authorized_keys options, a private key, several keys or
+    no key at all is refused: the helper must never nest a `command=` or grant more than
+    the one key the operator read.
+    """
+    for raw in str(text).splitlines():
+        line=raw.strip()
+        if not line or line.startswith('#'):continue
+        if 'PRIVATE KEY' in line:
+            raise ValueError('%s: that is a private key; install only its .pub public key'%source)
+        parts=line.split()
+        if len(parts)<2 or parts[0] not in AUTHORIZED_KEY_TYPES:
+            raise ValueError('%s: expected one plain public key line (<type> <base64> [comment]); '
+                             'remove any authorized_keys options and pass exactly one key'%source)
+        try:payload=base64.b64decode(parts[1],validate=True)
+        except Exception:
+            raise ValueError('%s: the key body is not valid base64'%source) from None
+        if not payload:
+            raise ValueError('%s: the key body is empty'%source)
+        return parts[0],parts[1],' '.join(parts[2:])
+    raise ValueError('%s: no public key line found'%source)
+
+def _authorized_key_path(value,label):
+    text=str(value)
+    if not re.fullmatch(r'/[A-Za-z0-9_./-]+',text):
+        raise ValueError('%s must be an absolute Linux path without spaces or quotes to be '
+                         'usable inside an authorized_keys command='%label)
+    return text
+
+def _authorized_key_python(value):
+    """One interpreter name (`python3`) or absolute path, never a name plus flags."""
+    text=str(value)
+    if (not text or text.startswith('-') or any(character in text for character in '\0\r\n"\' \t')):
+        raise ValueError('--python must be one interpreter name or absolute path without flags, '
+                         'spaces or quotes to be usable inside an authorized_keys command=')
+    return text
+
+def _authorized_key_comment(comment):
+    text=str(comment)
+    if any(character in text for character in '\0\r\n'):
+        raise ValueError('--comment must be one line without control characters')
+    return text.strip()
+
+def authorized_key_lines(root,kit,key_type,key_body,key_comment='',comment=None,python='python3'):
+    """The exact contributor (confined) and operator (unrestricted) authorized_keys lines.
+
+    The contributor line runs `ssh_forced_command.py` with the deployment's fixed root and
+    the endpoint path, plus the four options that close the interactive/forwarding paths.
+    The operator line is the bare key: an operator needs the service account's shell for
+    the host commands, and pretending otherwise would be a false guarantee.
+    """
+    root=_authorized_key_path(root,'--root')
+    kit=_authorized_key_path(kit,'the kit directory')
+    python=_authorized_key_python(python)
+    endpoint=kit+'/endpoint.py'
+    wrapper=kit+'/ssh_forced_command.py'
+    text=_authorized_key_comment(comment) if comment is not None else key_comment
+    if any(character in text for character in '\0\r\n'):
+        raise ValueError('the key comment must be one line without control characters')
+    key=' '.join(part for part in (key_type,key_body,text) if part)
+    command=' '.join((python,wrapper,'--root',root,'--endpoint',endpoint))
+    contributor='command="%s",%s %s'%(command,','.join(CONTRIBUTOR_KEY_OPTIONS),key)
+    return {'root':root,'kit':kit,'endpoint':endpoint,'wrapper':wrapper,
+            'contributor_options':list(CONTRIBUTOR_KEY_OPTIONS),
+            'contributor':contributor,'operator':key}
+
+def authorized_keys(root,key_file,role='both',python='python3',comment=None):
+    """Print the installable lines for one public key as JSON (see authorized_key_lines)."""
+    kit=Path(__file__).resolve().parent
+    for name in ('ssh_forced_command.py','endpoint.py'):
+        if not (kit/name).is_file():
+            raise ValueError('This kit copy has no %s; run the helper from the installed kit directory'%name)
+    path=Path(key_file)
+    lines=authorized_key_lines(root,kit,*public_key_line(path.read_text(encoding='utf-8-sig'),str(path)),
+                               comment=comment,python=python)
+    payload={'schema_version':1,'root':lines['root'],'kit':lines['kit'],'endpoint':lines['endpoint'],
+             'wrapper':lines['wrapper'],'contributor_options':lines['contributor_options'],
+             'operator_note':OPERATOR_KEY_NOTE,
+             'notes':['The contributor line needs "forced_command": true in that contributor\'s '
+                      'client config; without it the client sends a --root the wrapper refuses.',
+                      'Install one entry per key: both lines are alternatives for different keys, '
+                      'never two entries for the same key.']}
+    if role in ('contributor','both'):payload['contributor']=lines['contributor']
+    if role in ('operator','both'):payload['operator']=lines['operator']
+    print(json.dumps(payload,ensure_ascii=True,indent=2))
+    if role in ('operator','both'):
+        print('warning: the operator line is unrestricted service-account shell access; '+OPERATOR_KEY_NOTE,
+              file=sys.stderr)
+
 def main():
     p=argparse.ArgumentParser();p.add_argument('--root',required=True)
     sub=p.add_subparsers(dest='command',required=True)
@@ -2599,6 +2709,12 @@ def main():
                    help='with remove: acknowledge that this verifier\'s capability verifications stop reading verified')
     a=sub.add_parser('capability-verify',help='record verified capability checks (operator allowlist or verifiers list)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('authorized-keys',help='print the confined contributor and unrestricted operator authorized_keys lines for one public key')
+    a.add_argument('--key-file',required=True,help='a file holding one plain OpenSSH public key line')
+    a.add_argument('--role',choices=['contributor','operator','both'],default='both',
+                   help='which line(s) to print (default: both, for different keys)')
+    a.add_argument('--python',default='python3',help='interpreter in the contributor forced command')
+    a.add_argument('--comment',default=None,help='replace the key line comment')
     a=sub.add_parser('backup');a.add_argument('projects',nargs='*',metavar='project')
     a.add_argument('--all',action='store_true',dest='all_projects',
                    help='back up every initialized project in this runtime in one run')
@@ -2942,6 +3058,8 @@ def main():
         else:cfg.pop('verifiers',None)
         atomic_private_write(marker,json.dumps(cfg))
         print(json.dumps({'verifiers':current}))
+    elif args.command=='authorized-keys':
+        authorized_keys(root,args.key_file,args.role,args.python,args.comment)
     elif args.command=='backup':backup_projects(root,args.projects,args.all_projects)
     elif args.command=='backup-copy':backup_copy(root,args.destination)
     elif args.command=='backup-repoint':print(json.dumps(repoint_backup(root,args.project),sort_keys=True))
