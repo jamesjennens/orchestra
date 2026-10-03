@@ -52,6 +52,7 @@ the ``--root`` the old command line carried is refused here. See
 """
 import argparse
 import os
+import posixpath  # the paths here are the server's POSIX paths, whatever platform runs the tests
 import re
 import shlex
 import sys
@@ -86,7 +87,7 @@ def default_python():
     forwarded environment can move.
     """
     executable = getattr(sys, 'executable', '') or ''
-    if os.path.isabs(executable) and PYTHON_NAME.fullmatch(executable):
+    if posixpath.isabs(executable) and PYTHON_NAME.fullmatch(executable):
         return executable
     return '/usr/bin/python3'
 
@@ -110,7 +111,7 @@ def parse_args(argv):
 
 
 def _path(value, label):
-    if (not isinstance(value, str) or not value or not os.path.isabs(value)
+    if (not isinstance(value, str) or not value or not posixpath.isabs(value)
             or any(character in value for character in '\0\r\n')):
         raise ValueError('%s must be one absolute path with no control characters' % label)
     return value
