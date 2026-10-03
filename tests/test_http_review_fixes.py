@@ -617,7 +617,49 @@ class PlaintextLoopbackCase(Harness):
 
 
 # ------------------------------------------------------------------ 1. canonical-backend
-class CanonicalEndpointCase(Harness):
+class RegisteredProjects:
+    """Endpoint-backend harnesses make projects the way the endpoint backend requires
+    (kittrial-5bb.80): the canonical project is initialized on the host (what
+    `admin.py add-project` leaves: projects/NAME/.beads/metadata.json), a superuser
+    registers it, and the account that asked is added as an owner. The stub runs in its
+    strict project mode, so an unregistered or uninitialized project fails exactly as
+    endpoint.py fails it."""
+
+    def setUp(self):
+        from unittest.mock import patch
+        environment = patch.dict(os.environ, {"STRICT_ENDPOINT_PROJECTS": "1"})
+        environment.start()
+        self.addCleanup(environment.stop)
+        super().setUp()
+
+    def initialize_canonical(self, project_id):
+        beads = self.canonical_root / 'projects' / project_id / '.beads'
+        beads.mkdir(parents=True, exist_ok=True)
+        (beads / 'metadata.json').write_text('{}', encoding='utf-8')
+
+    def create_project(self, token, name, project_id=None):
+        import re
+        if project_id is None:
+            project_id = re.sub(r'[^a-z0-9]', '', name.lower())[:20] or 'project'
+            if not project_id[0].isalpha():
+                project_id = 'p' + project_id
+            base, number = project_id, 1
+            while (self.canonical_root / 'projects' / project_id).exists():
+                number += 1
+                project_id = '%s%d' % (base, number)
+        self.initialize_canonical(project_id)
+        admin = self.admin_token()
+        response = self.request('POST', '/v1/projects', {'project_id': project_id, 'name': name}, token=admin)
+        self.assertEqual(201, response.status, response.data)
+        if token != admin:
+            user = self.request('GET', '/v1/sessions/current', token=token).data['user']['id']
+            added = self.request('PUT', '/v1/projects/%s/members/%s' % (project_id, user), {'role': 'owner'},
+                                 token=admin)
+            self.assertIn(added.status, (200, 201), added.data)
+        return response.data['id']
+
+
+class CanonicalEndpointCase(RegisteredProjects, Harness):
     def make_backend(self):
         self.canonical_root = self.tmp / 'canonical'
         return EndpointBackend(sys.executable, str(STUB), str(self.canonical_root),
@@ -692,7 +734,7 @@ CONTRIBUTION = {'repository': 'https://example.invalid/repo.git', 'commit': COMM
                              'sha256': BUNDLE}}
 
 
-class EndpointCase(Harness):
+class EndpointCase(RegisteredProjects, Harness):
     """Base for canonical-binding cases: the strict stub applies the real contract."""
 
     def make_backend(self):

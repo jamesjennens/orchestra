@@ -11,7 +11,7 @@ python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime add
 
 `add-project` initializes the project, records the standard native configuration, provisions the project's merge slot (idempotently) and performs the initial backup. A project whose slot is missing refuses `merge-check`, `merge-acquire` and `merge-release` with an error naming the `merge-create` coordination operation, which is also the manual repair for a project created before this behavior.
 
-Project names use 2–24 lowercase letters/digits, starting with a letter. Run these commands as the service account. An administrator should enable its user manager at boot and after logout:
+Project names use 2–24 lowercase letters/digits, starting with a letter. To use a project in the web interface (`http_service.py --backend endpoint`), a superuser then registers it there under the same name; the web service never creates canonical projects ([HTTP deployment](HTTP_DEPLOYMENT.md#projects-on-the-endpoint-backend)). Run these commands as the service account. An administrator should enable its user manager at boot and after logout:
 
 ```sh
 sudo loginctl enable-linger beads
