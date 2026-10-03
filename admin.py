@@ -40,6 +40,11 @@ BACKUP_STATUS_NAME='backup-status.json'
 #: bounds a genuinely hung server; a large database legitimately needs minutes.
 BACKUP_SYNC_TIMEOUT=1800
 
+#: Explicit ceiling for one native restore through the SQL client (``restore-new``).
+#: ``bd backup restore`` has the same fixed ~10 s read timeout as ``bd backup sync``, so the
+#: restore uses the SQL client too, with the same generous bound for a genuinely hung server.
+RESTORE_TIMEOUT=BACKUP_SYNC_TIMEOUT
+
 #: Suffix of the durable copy of a project's last COMPLETE coordination sidecar. A
 #: failed or interrupted run must never destroy the previous restorable pair, so the
 #: last complete sidecar is kept here and ``coordination_backup`` can fall back to it.
@@ -617,6 +622,122 @@ def native_backup_sync(root,name,client=None):
              '--use-db',str(database),'sql','-q',"CALL DOLT_BACKUP('sync', '%s')"%backup_name]
     handle=client if client is not None else SyncClientHandle()
     return spawn_sync_client(command,handle,env=environment(root),cwd=root,timeout=BACKUP_SYNC_TIMEOUT)
+
+def native_restore_url(backup):
+    """The ``file://`` URL ``CALL DOLT_BACKUP('restore', ...)`` reads ``backup`` from.
+
+    The same form ``bd backup restore`` builds (``"file://" + absolute path``, not
+    percent-encoded). The URL is embedded in a SQL string literal, so a path that would need
+    quoting there (a quote, a backslash or a control character) is refused rather than
+    escaped; a runtime root accepted by ``root_path`` never contains one.
+    """
+    path=Path(backup).resolve().as_posix()
+    url='file://'+(path if path.startswith('/') else '/'+path)
+    if re.search(r"['\\\x00-\x1f]",url):
+        raise ValueError('The backup path cannot be named in a native restore statement')
+    return url
+
+def project_identity(root,database):
+    """The ``_project_id`` a project's Dolt database records, or None when it records none."""
+    if not re.fullmatch(r'[A-Za-z0-9_]{1,64}',database):
+        raise ValueError('The project records an unusable Dolt database name')
+    rows=list(csv.reader(io.StringIO(
+        sql(root,"SELECT value FROM `%s`.metadata WHERE `key`='_project_id';"%database))))
+    values=[row[0].strip() for row in rows[1:] if row and row[0].strip()]
+    return values[0] if values else None
+
+def adopt_project_identity(root,name):
+    """Write the restored database's ``_project_id`` into the project's ``.beads/metadata.json``.
+
+    ``bd backup restore --force`` does this itself after its restore (``syncProjectIDFromDB``):
+    the restored database carries the SOURCE project's identity, while ``metadata.json`` still
+    holds the one ``bd init`` generated for the new project, and bd refuses every later command
+    with ``PROJECT IDENTITY MISMATCH`` until the two agree. The SQL-client restore does not run
+    bd, so the kit performs the same step. Like bd, a database that records no identity leaves
+    the file unchanged. The file is replaced atomically and keeps its mode and every other key.
+    Returns the adopted identity, or None when nothing changed.
+    """
+    metadata=project_server_metadata(root,name)
+    if metadata is None:return None
+    identity=project_identity(root,metadata[3])
+    if identity is None:return None
+    path=project_dir(root,name)/'.beads'/'metadata.json'
+    data=json.loads(path.read_text(encoding='utf-8'))
+    if data.get('project_id')==identity:return None
+    data['project_id']=identity
+    mode=path.stat().st_mode&0o777
+    fd,temporary=tempfile.mkstemp(prefix=path.name+'.',suffix='.tmp',dir=str(path.parent))
+    try:
+        with os.fdopen(fd,'w',encoding='utf-8') as handle:
+            handle.write(json.dumps(data,indent=2)+'\n')
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary,mode)
+        os.replace(temporary,path)
+    except BaseException:
+        try: os.unlink(temporary)
+        except OSError: pass
+        raise
+    return identity
+
+def native_restore(root,source,destination,client=None):
+    """Restore ``backups/<source>`` into the new project ``destination``; return a report line.
+
+    ``bd backup restore`` inherits the same fixed client read timeout of about ten seconds as
+    ``bd backup sync`` (see ``native_backup_sync``): a restore drill cut a 588 MB backup at
+    exactly 10 s (``i/o timeout``, ``invalid connection``), while the same restore through the
+    SQL client took under a minute. So the native step is ``CALL DOLT_BACKUP('restore',
+    '--force', <file URL>, <database>)`` over the loopback connection, bounded only by the
+    explicit ``RESTORE_TIMEOUT``. ``--force`` replaces the empty database ``bd init`` just
+    created for the destination, exactly as ``bd backup restore --force`` does.
+
+    The client runs in its own session through ``spawn_sync_client``; ``SIGTERM`` is turned
+    into ``TerminatedBySignal`` for the duration, and on every exit that is not a normally
+    finished client (a stop, the ceiling, an exception) the whole process group is killed
+    before the source's backup lock is released. The password travels in the environment,
+    never in the command. After the restore, the restored project identity is adopted into
+    ``.beads/metadata.json`` (``adopt_project_identity``), which ``bd backup restore`` would
+    otherwise have done. A destination with no Dolt server metadata has no SQL coordinates,
+    so it keeps the ``bd backup restore`` path, as ``backup`` keeps ``bd backup sync``.
+    """
+    backup=root/'backups'/source
+    metadata=project_server_metadata(root,destination)
+    if metadata is None:
+        return run_bd(root,destination,['backup','restore',str(backup),'--force'])
+    host,port,user,database=metadata
+    if not re.fullmatch(r'[A-Za-z0-9_]{1,64}',str(database)):
+        raise ValueError('The project records an unusable Dolt database name')
+    url=native_restore_url(backup)
+    command=[root/'bin/dolt','--host',str(host),'--port',str(port),'--no-tls','--user',str(user),
+             'sql','-q',"CALL DOLT_BACKUP('restore', '--force', '%s', '%s')"%(url,database)]
+    handle=client if client is not None else SyncClientHandle()
+    started=time.monotonic()
+    with signal_termination_guard():
+        try:
+            spawn_sync_client(command,handle,env=environment(root),cwd=root,timeout=RESTORE_TIMEOUT)
+        finally:
+            # Inside the guard: a second stop cannot kill the interpreter before the
+            # client's group is killed. A finished client is not signalled again.
+            terminate_process_group(handle)
+    elapsed=time.monotonic()-started
+    identity=adopt_project_identity(root,destination)
+    report='Restored backups/%s into %s through the Dolt SQL client in %.1f s.'%(source,destination,elapsed)
+    if identity is not None:
+        report+=' Adopted the restored project identity %s into .beads/metadata.json.'%identity
+    return report
+
+def restore_failure_notice(destination,error):
+    """What an operator must do after the native step of ``restore-new`` did not complete."""
+    if isinstance(error,subprocess.TimeoutExpired):
+        cause='the native restore reached its %d s ceiling and its client was stopped'%RESTORE_TIMEOUT
+    elif isinstance(error,(TerminatedBySignal,KeyboardInterrupt)):
+        cause='the native restore was interrupted and its client was stopped'
+    else:
+        cause='the native restore failed'
+    return ('restore-new did not complete: %s. Project %s exists but holds a partial restore (its '
+            'coordination sidecar, journals and operation journal were NOT restored). Preserve it for '
+            'inspection, do not use or back it up as a tracker, and run restore-new again into another '
+            'unused destination name; the source backup was not modified.'%(cause,destination))
 
 def provision_merge_slot(root,name):
     """Create the project's merge slot once, tolerating an existing slot.
@@ -2719,7 +2840,14 @@ def main():
             if (args.restore_operators or args.restore_verifiers) and not (root/'deployment.private.json').is_file():
                 raise ValueError('Deployment is not installed; run install first')
             add_project(root,args.destination)
-            print(run_bd(root,args.destination,['backup','restore',str(backup),'--force']))
+            # The native restore runs through the Dolt SQL client (no bd ~10 s read
+            # timeout), in its own process group, and adopts the restored project identity;
+            # a destination without server metadata keeps `bd backup restore`.
+            try:
+                print(native_restore(root,args.project,args.destination))
+            except BaseException as error:
+                print(restore_failure_notice(args.destination,error),file=sys.stderr)
+                raise
             # The native restore brings the SOURCE project's backup configuration with the
             # restored database: `.beads/dolt-backup.json` and the restored `dolt_backups`
             # row both still name `backups/<source>`. Left there, `backup <destination>`
@@ -2744,6 +2872,9 @@ if __name__=='__main__':
     except subprocess.CalledProcessError as e:
         # Never echo credential-bearing command input or the environment.
         raise SystemExit(f'Command failed ({e.returncode}): {e.stderr[:2000]}')
+    except subprocess.TimeoutExpired as e:
+        # The client's group was already stopped; report the ceiling, never the command.
+        raise SystemExit(f'Command timed out after {e.timeout} s')
     except TerminatedBySignal as e:
         # The guarded cleanup ran (previous pair kept, sync client's group stopped); exit
         # with the conventional 128+signal status instead of a traceback.
