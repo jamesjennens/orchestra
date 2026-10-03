@@ -213,6 +213,73 @@ target.write_text('metrics:\\n  disabled: true\\n')
         self.assertIn('HOME=%s' % (runtime/'home'), log)
         self.assertNotIn(str(user_home), log)
 
+    def test_existing_deployment_upgrade_keeps_bd_metrics_disabled(self):
+        """An upgraded runtime must stay metrics-off without a runtime HOME config.
+
+        A runtime prepared the old way keeps its metrics-off setting only in the
+        login user's ``~/.config/bd/config.yaml`` and has no ``<root>/home``.
+        ``prepare`` takes the existing-deployment early-return path, so it never
+        runs ``bd metrics off`` and the runtime HOME has no config at all. The
+        fake bd below mirrors bd 1.2.2 enabling metrics (writing
+        ``disabled: false`` under ``$HOME``) unless ``BD_DISABLE_METRICS`` is set,
+        so this fails if the environment handed to every bd child omits the flag.
+        """
+        from office_service import prepare
+        from admin import environment, run_bd
+        runtime = self.base/'upgrade-runtime'
+        runtime.mkdir()
+        db_port = self.free_port()
+        (runtime/'deployment.private.json').write_text(json.dumps({
+            'schema': 1, 'port': db_port, 'unit': 'office-foreground',
+            'password': 'disposable-only'}), encoding='utf-8')
+        (runtime/'server.json').write_text(json.dumps({
+            'listener': {'host': '127.0.0.1', 'port': db_port}}), encoding='utf-8')
+        (runtime/'projects'/'demo').mkdir(parents=True)
+        user_home = self.base/'user-home'
+        (user_home/'.config'/'bd').mkdir(parents=True)
+        old_config = user_home/'.config'/'bd'/'config.yaml'
+        old_config.write_text('metrics:\n  disabled: true\n', encoding='utf-8')
+        calls = runtime/'bd-calls.log'
+
+        def fake_install(root, asset_dir=None):
+            binaries = root/'bin'
+            binaries.mkdir(parents=True, exist_ok=True)
+            bd = binaries/'bd'
+            bd.write_text('''#!__PYTHON__
+import os, sys
+from pathlib import Path
+with open(os.environ['FAKE_BD_LOG'], 'a') as stream:
+    stream.write('HOME=%s BD_DISABLE_METRICS=%s ARGS=%s\\n' % (
+        os.environ.get('HOME'), os.environ.get('BD_DISABLE_METRICS'),
+        ' '.join(sys.argv[1:])))
+if os.environ.get('BD_DISABLE_METRICS') != '1':
+    target = Path(os.environ['HOME']) / '.config' / 'bd' / 'config.yaml'
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text('metrics:\\n  disabled: false\\n')
+'''.replace('__PYTHON__', sys.executable), encoding='utf-8')
+            bd.chmod(0o755)
+
+        with mock.patch.dict(os.environ, {'HOME': str(user_home),
+                                          'FAKE_BD_LOG': str(calls)}), \
+                mock.patch('office_service.admin.install_binaries', side_effect=fake_install):
+            prepare(runtime, db_port)  # existing deployment: early return
+            run_bd(runtime, 'demo', ['metrics', 'status'])
+
+        # The behavioural checks come first so a regression fails on what bd did,
+        # not only on the missing key.
+        log = calls.read_text(encoding='utf-8')
+        self.assertIn('HOME=%s' % (runtime/'home'), log)
+        self.assertIn('BD_DISABLE_METRICS=1', log)
+        self.assertNotIn(str(user_home), log)
+        self.assertEqual(old_config.read_text(encoding='utf-8'),
+                         'metrics:\n  disabled: true\n')
+        self.assertFalse((runtime/'home'/'.config'/'bd'/'config.yaml').exists())
+        for candidate in (user_home, runtime/'home'):
+            config = candidate/'.config'/'bd'/'config.yaml'
+            if config.exists():
+                self.assertNotIn('disabled: false', config.read_text(encoding='utf-8'))
+        self.assertEqual(environment(runtime)['BD_DISABLE_METRICS'], '1')
+
     def test_existing_log_directory_is_left_undisturbed(self):
         self.logs.mkdir(mode=0o700)
         os.chmod(self.logs, 0o755)

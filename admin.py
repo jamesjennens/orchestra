@@ -424,13 +424,23 @@ def environment(root):
     Scoping ``HOME`` keeps that write, and bd's event data, inside the runtime so
     several runtimes can share a login user. Dolt's own global config is already
     pinned by ``DOLT_ROOT_PATH``.
+
+    ``BD_DISABLE_METRICS`` is the durable guard for an UPGRADED runtime. A runtime
+    prepared before this change (or by ``admin.install``) keeps its metrics-off
+    setting only in the login user's ``~/.config/bd/config.yaml`` and has no
+    ``<root>/home``. ``prepare`` then takes the existing-deployment early-return
+    path and never runs ``bd metrics off``, so the new ``HOME`` - which lacks that
+    config - would let bd re-enable usage metrics, queue
+    ``home/.beads/eventsData/*.evtq`` and start a ``bd send-metrics`` child.
+    Every bd child inherits this variable instead, which keeps a runtime that was
+    prepared the old way metrics-off without touching anything outside ``root``.
     """
     env=os.environ.copy()
     env.update({'HOME':str(root/'home'),
                 'PATH':str(root/'bin')+os.pathsep+env.get('PATH',''),
                 'DOLT_ROOT_PATH':str(root/'dolt-home'),'XDG_CONFIG_HOME':str(root/'config'),
                 'BEADS_DOLT_PASSWORD':config(root)['password'],'DOLT_CLI_PASSWORD':config(root)['password'],
-                'BD_NON_INTERACTIVE':'1','BEADS_NO_DAEMON':'1'})
+                'BD_NON_INTERACTIVE':'1','BEADS_NO_DAEMON':'1','BD_DISABLE_METRICS':'1'})
     return env
 
 def sql(root,query,password=None):
