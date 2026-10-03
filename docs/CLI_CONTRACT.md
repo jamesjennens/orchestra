@@ -228,6 +228,20 @@ holds at most 3 items of each kind: `reference-review` items first, then
 then `capability` items (see [capability attention](#capability-attention-in-work-and-brief)).
 The two totals count every kind.
 
+Every `brief`, `work` and session `resume` response also carries a `guidance` block
+for the project's operator-set standing guidance (kittrial-5bb.99): `present`,
+`version` (the SHA-256 of the guidance text), `set_at`, `set_by`,
+`previous_version`, this actor's `acknowledged` state, and `attention` (true when
+guidance is set and this actor has not acknowledged the current version;
+`next_action` then names `guidance get`). `guidance get [--since VERSION]` returns
+the current text and what changed since a version; `guidance ack` records the
+calling actor's own read; `guidance status` (operator only) lists which lanes have
+acknowledged which version. Guidance is written only by the operator host command
+`admin.py set-guidance PROJECT --actor ACTOR --file FILE`, is bounded (8000 bytes)
+plain text, is audited (who, when, version, previous version), and never overrides
+the user's authorization or the worker safety rules. A project with no guidance
+reads as `present: false`, never an error.
+
 The `reference-review` items:
 
 - **Selection:** entries tagged with one of the task's labels, plus expired and
