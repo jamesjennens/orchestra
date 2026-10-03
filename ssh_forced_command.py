@@ -2,12 +2,17 @@
 """Confine one SSH key to the coordination endpoint: an authorized_keys wrapper.
 
 Install this as the ``command=`` value of an ``authorized_keys`` entry, for example
-(one line):
+(one line; ``admin.py authorized-keys`` prints the exact text for a key):
 
-    command="/usr/bin/python3 /home/beads/beads-team-kit/ssh_forced_command.py \
+    command="/usr/bin/python3 -E -s /home/beads/beads-team-kit/ssh_forced_command.py \
 --root /home/beads/beads-runtime \
---endpoint /home/beads/beads-team-kit/endpoint.py",no-pty,no-port-forwarding,\
+--endpoint /home/beads/beads-team-kit/endpoint.py",restrict,no-pty,no-port-forwarding,\
 no-agent-forwarding,no-X11-forwarding ssh-ed25519 AAAA... contributor
+
+The interpreter is absolute and runs ``-E -s`` (ignore ``PYTHON*`` variables, ignore the
+user site directory; not ``-I``, which would also drop the script's directory from
+``sys.path``). ``restrict`` leads the options so the user rc file and any capability a
+later OpenSSH adds are off by default.
 
 Why: ``client.py`` runs the endpoint as ``ssh HOST "python3 endpoint.py --root ROOT"``
 and the endpoint takes its HTTP authority from *its own* launch flags, so every
@@ -31,6 +36,14 @@ The contract, deliberately narrow:
   ``[python, endpoint, '--root', <the fixed root>]``, so ``--root`` is fixed by the
   deployment and no authority flag can be passed. stdin, stdout and stderr (the JSON
   request/response envelope) pass through unchanged.
+* The endpoint is exec'd with a minimal, explicit environment: ``PATH``, ``HOME``, the
+  locale variables (``LANG``, ``LC_*``), and the variables this kit sets for the endpoint
+  itself (none today). Everything else the session carried - ``PYTHONPATH``, ``BASH_ENV``,
+  ``ENV``, ``LD_PRELOAD``, ``SSH_ORIGINAL_COMMAND`` - is dropped. sshd applies
+  ``PermitUserEnvironment`` and ``AcceptEnv`` *before* ``command=`` runs, so a forwarded
+  variable still reaches the interpreter that starts this wrapper (and ``BASH_ENV`` the
+  shell before it); what the wrapper can and does close is the endpoint's own process. See
+  ``docs/OPERATIONS.md`` ("sshd settings the boundary needs").
 
 The key this confines must belong to a contributor whose client config sets
 ``"forced_command": true``: that makes the client send only the endpoint path, because
@@ -39,6 +52,7 @@ the ``--root`` the old command line carried is refused here. See
 """
 import argparse
 import os
+import re
 import shlex
 import sys
 from pathlib import Path
@@ -47,6 +61,17 @@ REFUSAL = 'ssh_forced_command: '
 EXIT_REFUSED = 2
 # Bounded, so an unbounded or control-character-laden caller string never floods a log.
 ECHO_LIMIT = 120
+# One bare interpreter name (`python3`) or an absolute path; the same class admin.py's
+# authorized-keys helper prints, so the two never disagree about what a safe argv is.
+PYTHON_NAME = re.compile(r'(?:[A-Za-z0-9_][A-Za-z0-9_.-]*|/[A-Za-z0-9_./-]+)')
+# Variables this kit sets for the endpoint process itself. Empty today: endpoint.py reads
+# none. A future kit component that needs one adds it here deliberately, so nothing a
+# caller can forward (via AcceptEnv) reaches the endpoint by inheritance.
+KIT_ENVIRONMENT = {}
+# Forwarded from the session because the kit needs them: PATH to find the interpreter,
+# HOME for the account's own files, and the locale so text handling matches the terminal.
+LOCALE_NAMES = ('LANG',)
+LOCALE_PREFIX = 'LC_'
 
 
 def default_endpoint():
@@ -55,15 +80,24 @@ def default_endpoint():
 
 
 def default_python():
-    """The interpreter that is already running this wrapper, or python3 on PATH."""
+    """The interpreter that is already running this wrapper, or /usr/bin/python3.
+
+    Absolute on purpose: a bare name would be resolved through PATH, which the session's
+    forwarded environment can move.
+    """
     executable = getattr(sys, 'executable', '') or ''
-    return executable if os.path.isabs(executable) else 'python3'
+    if os.path.isabs(executable) and PYTHON_NAME.fullmatch(executable):
+        return executable
+    return '/usr/bin/python3'
 
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(
         prog='ssh_forced_command.py',
         description='Run one configured endpoint, with a fixed --root and no authority flags.',
+        # No prefix matching: `--end` must not silently select `--endpoint`, and an
+        # abbreviation introduced by a later option must not change this line's meaning.
+        allow_abbrev=False,
     )
     parser.add_argument('--root', required=True,
                         help='the fixed runtime root passed to the endpoint (never the caller\'s)')
@@ -82,6 +116,13 @@ def _path(value, label):
     return value
 
 
+def _python(value):
+    if not isinstance(value, str) or not PYTHON_NAME.fullmatch(value):
+        raise ValueError('--python must be one interpreter name or absolute path using only '
+                         'letters, digits, dot, underscore, dash and slash')
+    return value
+
+
 def configured(args):
     """Return (root, endpoints, python) as validated strings, or raise ValueError.
 
@@ -91,10 +132,25 @@ def configured(args):
     """
     root = _path(args.root, '--root')
     endpoints = [_path(item, '--endpoint') for item in (args.endpoint or [default_endpoint()])]
-    python = args.python or default_python()
-    if not isinstance(python, str) or not python or any(c in python for c in '\0\r\n'):
-        raise ValueError('--python must be one interpreter path with no control characters')
+    python = _python(default_python() if args.python is None else args.python)
     return root, endpoints, python
+
+
+def child_environment(environment=None):
+    """The exact environment the endpoint is exec'd with: explicit, minimal, no inheritance.
+
+    Everything not named here is dropped, so a caller who can influence the session
+    environment (``AcceptEnv``/``PermitUserEnvironment``) cannot plant ``PYTHONPATH``,
+    ``BASH_ENV``, ``ENV``, ``LD_PRELOAD`` or any other variable in the endpoint process.
+    """
+    source = os.environ if environment is None else environment
+    forwarded = {name: source[name] for name in sorted(source)
+                 if name in LOCALE_NAMES or name.startswith(LOCALE_PREFIX)}
+    forwarded['PATH'] = source.get('PATH') or os.defpath
+    if source.get('HOME'):
+        forwarded['HOME'] = source['HOME']
+    forwarded.update(KIT_ENVIRONMENT)
+    return forwarded
 
 
 def _echo(value):
@@ -138,8 +194,9 @@ def main(argv=None):
         if chosen is None:
             return refuse(reason)
         command = endpoint_argv(python, chosen, root)
-        # Replace this process: the endpoint inherits the caller's stdio byte for byte.
-        os.execvp(command[0], command)
+        # Replace this process: the endpoint inherits the caller's stdio byte for byte, but
+        # not the caller-influenced environment (see child_environment).
+        os.execvpe(command[0], command, child_environment())
     except ValueError as error:
         return refuse(str(error))
     except OSError as error:

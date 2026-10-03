@@ -4,9 +4,10 @@ The wrapper in ``ssh_forced_command.py`` is the boundary that makes the kit's au
 rules real for a contributor key: the key can select a configured endpoint and nothing
 else. These tests pin the selection rule (another program, a flag, ``admin.py``, an extra
 token, an empty or malformed command are all refused), the exact launched argv (fixed
-``--root``, no authority flag), the client's ``forced_command`` support, the
-``admin.py authorized-keys`` helper, and the documentation that states what needs the
-confined setup.
+``--root``, no authority flag), the minimal environment the endpoint is exec'd with, the
+client's ``forced_command`` support, the ``admin.py authorized-keys`` helper (including the
+interpreter character class and the literal single-key rule), and the documentation that
+states what needs the confined setup and which sshd settings it assumes.
 """
 import base64
 import io
@@ -31,6 +32,8 @@ ROOT = '/srv/state'
 PYTHON = '/usr/bin/python3'
 KEY_BODY = base64.b64encode(b'orchestra-synthetic-test-key').decode()
 KEY_LINE = 'ssh-ed25519 %s alex@laptop' % KEY_BODY
+SECOND_KEY_BODY = base64.b64encode(b'orchestra-second-synthetic-key').decode()
+SECOND_KEY_LINE = 'ssh-ed25519 %s mallory@laptop' % SECOND_KEY_BODY
 SSH = {'host': 'sample', 'endpoint': ENDPOINT, 'root': ROOT}
 SSH_COMMAND = 'python3 %s --root %s' % (ENDPOINT, ROOT)
 ANSWER = subprocess.CompletedProcess([], 0, json.dumps({'returncode': 0, 'stdout': 'ok', 'stderr': ''}), '')
@@ -108,24 +111,31 @@ class WrapperExecTests(unittest.TestCase):
     def invoke(self, original, argv=None):
         argv = argv or ['--root', ROOT, '--endpoint', ENDPOINT, '--python', PYTHON]
         out, err = io.StringIO(), io.StringIO()
+        # Both exec entry points are patched: `execvpe` is the one that must be used, and
+        # `execvp` (which inherits the caller's environment) must never run - patching it too
+        # means a regression there fails a test instead of replacing the test process.
         with patch.dict(os.environ, {'SSH_ORIGINAL_COMMAND': original}), \
+                patch('ssh_forced_command.os.execvpe') as execvpe, \
                 patch('ssh_forced_command.os.execvp') as execvp, \
                 patch('sys.stdout', out), patch('sys.stderr', err):
             code = forced.main(argv)
-        return code, out.getvalue(), err.getvalue(), execvp
+        self.assertEqual(execvp.call_count, 0,
+                         'os.execvp inherits the caller environment; use os.execvpe')
+        return code, out.getvalue(), err.getvalue(), execvpe
 
     def test_a_normal_client_selection_execs_the_endpoint_with_the_fixed_root(self):
-        code, out, err, execvp = self.invoke(ENDPOINT)
-        self.assertEqual(execvp.call_args.args,
-                         (PYTHON, [PYTHON, ENDPOINT, '--root', ROOT]))
+        code, out, err, execvpe = self.invoke(ENDPOINT)
+        self.assertEqual(execvpe.call_args.args,
+                         (PYTHON, [PYTHON, ENDPOINT, '--root', ROOT], execvpe.call_args.args[2]))
+        self.assertEqual(execvpe.call_args.args[1], [PYTHON, ENDPOINT, '--root', ROOT])
         self.assertEqual(out, '')
         # The mocked exec returns, so the wrapper's fail-closed safety net reports it.
         self.assertEqual(code, 2)
         self.assertIn('did not replace this process', err)
 
     def test_the_launched_argv_carries_no_authority_flag(self):
-        _, _, _, execvp = self.invoke(ENDPOINT)
-        launched = execvp.call_args.args[1]
+        _, _, _, execvpe = self.invoke(ENDPOINT)
+        launched = execvpe.call_args.args[1]
         for flag in ('--authority-store', '--authority-lock', '--require-authority'):
             self.assertNotIn(flag, launched)
         self.assertEqual(launched[2:], ['--root', ROOT])
@@ -136,10 +146,10 @@ class WrapperExecTests(unittest.TestCase):
                          ENDPOINT + ' --require-authority',
                          '--root ' + ROOT):
             with self.subTest(original=original):
-                code, out, err, execvp = self.invoke(original)
+                code, out, err, execvpe = self.invoke(original)
                 self.assertEqual(code, 2)
                 self.assertEqual(out, '')
-                execvp.assert_not_called()
+                execvpe.assert_not_called()
 
     def test_a_caller_cannot_run_another_program_or_admin_py(self):
         for original in ('/srv/kit/admin.py --root %s operators add alice' % ROOT,
@@ -148,55 +158,140 @@ class WrapperExecTests(unittest.TestCase):
                          '/bin/sh -c id',
                          'python3 %s --root %s' % (ENDPOINT, ROOT)):
             with self.subTest(original=original):
-                code, out, err, execvp = self.invoke(original)
+                code, out, err, execvpe = self.invoke(original)
                 self.assertEqual(code, 2)
                 self.assertEqual(out, '')
                 self.assertTrue(err)
-                execvp.assert_not_called()
+                execvpe.assert_not_called()
 
     def test_shell_metacharacters_never_reach_a_shell(self):
         for original in (ENDPOINT + '; rm -rf /', ENDPOINT + ' && id', '$(id)',
                          ENDPOINT + ' `id`', ENDPOINT + ' | tee /tmp/x'):
             with self.subTest(original=original):
-                code, out, _, execvp = self.invoke(original)
+                code, out, _, execvpe = self.invoke(original)
                 self.assertEqual(code, 2)
                 self.assertEqual(out, '')
-                execvp.assert_not_called()
+                execvpe.assert_not_called()
 
     def test_an_empty_or_unbalanced_command_is_refused(self):
         for original in ('', '   ', '"unbalanced'):
             with self.subTest(original=original):
-                code, out, err, execvp = self.invoke(original)
+                code, out, err, execvpe = self.invoke(original)
                 self.assertEqual(code, 2)
                 self.assertEqual(out, '')
                 self.assertTrue(err)
-                execvp.assert_not_called()
+                execvpe.assert_not_called()
 
     def test_the_endpoint_defaults_to_the_one_beside_the_wrapper(self):
         if os.name != 'posix':
             self.skipTest('the wrapper and its default endpoint use POSIX absolute paths')
-        code, _, _, execvp = self.invoke(forced.default_endpoint(),
-                                         argv=['--root', ROOT, '--python', PYTHON])
-        self.assertEqual(execvp.call_args.args[1][1], forced.default_endpoint())
+        code, _, _, execvpe = self.invoke(forced.default_endpoint(),
+                                          argv=['--root', ROOT, '--python', PYTHON])
+        self.assertEqual(execvpe.call_args.args[1][1], forced.default_endpoint())
 
     def test_authority_flags_in_the_wrappers_own_argv_are_refused(self):
         for extra in (['--authority-store', '/srv/authority.json'], ['--require-authority'],
                       ['--authority-lock', '/srv/authority.lock']):
             with self.subTest(extra=extra):
                 with patch.dict(os.environ, {'SSH_ORIGINAL_COMMAND': ENDPOINT}), \
+                        patch('ssh_forced_command.os.execvpe') as execvpe, \
                         patch('ssh_forced_command.os.execvp') as execvp, \
                         patch('sys.stderr', io.StringIO()):
                     with self.assertRaises(SystemExit) as caught:
                         forced.main(['--root', ROOT, '--endpoint', ENDPOINT, *extra])
                 self.assertEqual(caught.exception.code, 2)
+                execvpe.assert_not_called()
                 execvp.assert_not_called()
 
     def test_relative_paths_in_the_wrappers_own_argv_are_refused(self):
-        code, _, err, execvp = self.invoke(ENDPOINT, argv=['--root', 'relative',
+        code, _, err, execvpe = self.invoke(ENDPOINT, argv=['--root', 'relative',
                                                            '--endpoint', ENDPOINT])
         self.assertEqual(code, 2)
         self.assertIn('absolute', err)
-        execvp.assert_not_called()
+        execvpe.assert_not_called()
+
+    def test_an_abbreviated_flag_is_not_accepted(self):
+        # allow_abbrev=False: `--roo` must not silently become `--root`, and a later option
+        # must not change what this installable line means.
+        for argv in (['--roo', ROOT, '--endpoint', ENDPOINT],
+                     ['--root', ROOT, '--end', ENDPOINT],
+                     ['--root', ROOT, '--endpoint', ENDPOINT, '--pyt', PYTHON]):
+            with self.subTest(argv=argv):
+                with patch.dict(os.environ, {'SSH_ORIGINAL_COMMAND': ENDPOINT}), \
+                        patch('ssh_forced_command.os.execvpe') as execvpe, \
+                        patch('ssh_forced_command.os.execvp') as execvp, \
+                        patch('sys.stderr', io.StringIO()):
+                    with self.assertRaises(SystemExit) as caught:
+                        forced.main(argv)
+                self.assertEqual(caught.exception.code, 2)
+                execvpe.assert_not_called()
+                execvp.assert_not_called()
+
+    def test_a_metacharacter_interpreter_in_the_wrappers_argv_is_refused(self):
+        for value in ('$(touch${IFS}/tmp/canary)python3', 'python3;id', '`id`python3',
+                      'python3 --flag', ''):
+            with self.subTest(value=value):
+                code, out, err, execvpe = self.invoke(
+                    ENDPOINT, argv=['--root', ROOT, '--endpoint', ENDPOINT, '--python', value])
+                self.assertEqual(code, 2)
+                self.assertEqual(out, '')
+                self.assertIn('--python', err)
+                execvpe.assert_not_called()
+
+    def test_the_endpoint_is_exec_d_with_a_minimal_explicit_environment(self):
+        code, _, _, execvpe = self.invoke(ENDPOINT)
+        launched_env = execvpe.call_args.args[2]
+        self.assertNotIn('SSH_ORIGINAL_COMMAND', launched_env)
+        for name in ('PYTHONPATH', 'BASH_ENV', 'ENV', 'LD_PRELOAD'):
+            self.assertNotIn(name, launched_env)
+        self.assertIn('PATH', launched_env)
+
+    def test_a_forwarded_session_variable_never_reaches_the_endpoint(self):
+        planted = {'SSH_ORIGINAL_COMMAND': ENDPOINT,
+                   'PYTHONPATH': '/tmp/attacker-modules',
+                   'BASH_ENV': '/tmp/attacker-bashenv',
+                   'ENV': '/tmp/attacker-env',
+                   'LD_PRELOAD': '/tmp/attacker.so',
+                   'ATTACKER_ONLY': 'planted',
+                   'PATH': '/usr/bin:/bin', 'HOME': '/home/beads',
+                   'LANG': 'en_GB.UTF-8', 'LC_ALL': 'en_GB.UTF-8'}
+        with patch.dict(os.environ, planted), \
+                patch('ssh_forced_command.os.execvpe') as execvpe, \
+                patch('ssh_forced_command.os.execvp') as execvp, \
+                patch('sys.stderr', io.StringIO()):
+            forced.main(['--root', ROOT, '--endpoint', ENDPOINT, '--python', PYTHON])
+        self.assertEqual(execvp.call_count, 0)
+        launched_env = execvpe.call_args.args[2]
+        self.assertEqual(launched_env['PATH'], '/usr/bin:/bin')
+        self.assertEqual(launched_env['HOME'], '/home/beads')
+        self.assertEqual(launched_env['LANG'], 'en_GB.UTF-8')
+        self.assertEqual(launched_env['LC_ALL'], 'en_GB.UTF-8')
+        for name in ('PYTHONPATH', 'BASH_ENV', 'ENV', 'LD_PRELOAD', 'ATTACKER_ONLY',
+                     'SSH_ORIGINAL_COMMAND'):
+            self.assertNotIn(name, launched_env)
+
+
+class ChildEnvironmentTests(unittest.TestCase):
+    """`child_environment` forwards a named few variables and drops everything else."""
+
+    def test_only_path_home_locale_and_kit_variables_are_forwarded(self):
+        source = {'PATH': '/usr/bin', 'HOME': '/home/beads', 'LANG': 'C', 'LC_TIME': 'C',
+                  'LC_ALL': 'C.UTF-8', 'PYTHONPATH': '/tmp/x', 'BASH_ENV': '/tmp/y',
+                  'ENV': '/tmp/e', 'LD_PRELOAD': '/tmp/z', 'SSH_ORIGINAL_COMMAND': 'evil',
+                  'TERM': 'xterm'}
+        self.assertEqual(forced.child_environment(source),
+                         {'PATH': '/usr/bin', 'HOME': '/home/beads', 'LANG': 'C',
+                          'LC_ALL': 'C.UTF-8', 'LC_TIME': 'C'})
+
+    def test_a_missing_path_falls_back_to_the_platform_default(self):
+        self.assertEqual(forced.child_environment({})['PATH'], os.defpath)
+
+    def test_a_missing_home_is_not_invented(self):
+        self.assertNotIn('HOME', forced.child_environment({}))
+
+    def test_the_kit_can_name_a_variable_it_sets_itself(self):
+        with patch.dict(forced.KIT_ENVIRONMENT, {'KIT_SETTING': '1'}):
+            self.assertEqual(forced.child_environment({})['KIT_SETTING'], '1')
 
 
 class ClientForcedCommandTests(unittest.TestCase):
@@ -279,6 +374,20 @@ class PublicKeyLineTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     admin.public_key_line(text, 'key.pub')
 
+    def test_a_second_key_line_is_refused(self):
+        # Regression (docs-and-small, item 1): the helper and OPERATIONS said several keys
+        # are refused, but the second valid line was silently ignored.
+        for text in ('%s\n%s\n' % (KEY_LINE, SECOND_KEY_LINE),
+                     '%s\n# a comment\n%s\n' % (KEY_LINE, SECOND_KEY_LINE),
+                     '# lead\n%s\n%s\n' % (KEY_LINE, SECOND_KEY_LINE)):
+            with self.subTest(text=text):
+                with self.assertRaisesRegex(ValueError, 'second'):
+                    admin.public_key_line(text, 'two-keys.pub')
+
+    def test_comments_do_not_count_as_a_second_key(self):
+        text = '%s\n# a second comment\n\n' % KEY_LINE
+        self.assertEqual(admin.public_key_line(text, 'key.pub')[1], KEY_BODY)
+
 
 class AuthorizedKeyLineTests(unittest.TestCase):
     """The helper prints the exact confined contributor line and the bare operator line."""
@@ -288,25 +397,68 @@ class AuthorizedKeyLineTests(unittest.TestCase):
                                           'alex@laptop', **kwargs)
 
     def test_the_contributor_line_is_exact(self):
-        expected = ('command="python3 /srv/kit/ssh_forced_command.py '
+        expected = ('command="%s -E -s /srv/kit/ssh_forced_command.py '
                     '--root /srv/state --endpoint /srv/kit/endpoint.py",'
-                    'no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding '
-                    'ssh-ed25519 %s alex@laptop' % KEY_BODY)
-        self.assertEqual(self.lines()['contributor'], expected)
+                    'restrict,no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding '
+                    'ssh-ed25519 %s alex@laptop' % (PYTHON, KEY_BODY))
+        self.assertEqual(self.lines(python=PYTHON)['contributor'], expected)
+
+    def test_the_default_interpreter_is_absolute(self):
+        default = admin.default_authorized_key_python()
+        self.assertTrue(default.startswith('/'), default)
+        self.assertIn('command="%s -E -s ' % default, self.lines()['contributor'])
+        self.assertEqual(self.lines()['python'], default)
+
+    def test_the_default_interpreter_falls_back_to_usr_bin_python3(self):
+        with patch.object(admin.sys, 'executable', 'C:\\Python311\\python.exe'):
+            self.assertEqual(admin.default_authorized_key_python(), '/usr/bin/python3')
+
+    def test_the_interpreter_runs_with_E_and_s_but_not_I(self):
+        contributor = self.lines(python=PYTHON)['contributor']
+        self.assertIn('command="%s -E -s ' % PYTHON, contributor)
+        # -I also removes the script's directory from sys.path, which the kit's modules need.
+        self.assertNotIn(' -I ', contributor)
+        self.assertEqual(list(admin.AUTHORIZED_KEY_PYTHON_FLAGS), ['-E', '-s'])
 
     def test_an_absolute_interpreter_appears_verbatim(self):
         lines = self.lines(python=PYTHON)
-        self.assertTrue(lines['contributor'].startswith('command="%s ' % PYTHON))
+        self.assertTrue(lines['contributor'].startswith('command="%s -E -s ' % PYTHON))
 
-    def test_the_four_sshd_options_are_present(self):
-        for option in admin.CONTRIBUTOR_KEY_OPTIONS:
-            self.assertIn(option, self.lines()['contributor'])
-        self.assertEqual(list(admin.CONTRIBUTOR_KEY_OPTIONS),
-                         ['no-pty', 'no-port-forwarding', 'no-agent-forwarding', 'no-X11-forwarding'])
+    def test_a_bare_interpreter_name_is_accepted(self):
+        for value in ('python3', 'python3.11'):
+            with self.subTest(value=value):
+                self.assertIn('command="%s -E -s ' % value, self.lines(python=value)['contributor'])
+
+    def test_a_python_value_a_shell_would_expand_is_refused(self):
+        # Regression (helper-python-metacharacters): sshd runs command= through the account
+        # shell, so `$(touch${IFS}/tmp/canary)python3` created the canary on every connection.
+        for value in ('$(touch${IFS}/tmp/canary)python3', '`id`python3', 'python3;id',
+                      'python3|id', 'python3&id', 'python3(id)', 'python3>x', 'python3</dev/null',
+                      'python3\n/tmp/x', 'python3 -E', 'python3\t', '', '-E', '-S',
+                      'py"thon3', "py'thon3", '../python3', './python3', 'python3/',
+                      '/srv/kit/python 3', '/srv/kit/py$thon3', '/srv/kit/py`thon3`'):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, '--python'):
+                    self.lines(python=value)
+
+    def test_the_sshd_options_start_with_restrict_and_keep_the_four(self):
+        options = list(admin.CONTRIBUTOR_KEY_OPTIONS)
+        self.assertEqual(options[0], 'restrict')
+        for option in ('no-pty', 'no-port-forwarding', 'no-agent-forwarding', 'no-X11-forwarding'):
+            self.assertIn(option, options)
+        for option in options:
+            self.assertIn(option, self.lines(python=PYTHON)['contributor'])
+        self.assertTrue(self.lines(python=PYTHON)['contributor']
+                        .startswith('command="%s -E -s ' % PYTHON))
+
+    def test_the_options_precede_the_key_after_the_restrict_lead(self):
+        contributor = self.lines(python=PYTHON)['contributor']
+        self.assertIn('",restrict,no-pty,', contributor)
 
     def test_the_operator_line_is_the_unrestricted_bare_key(self):
         self.assertEqual(self.lines()['operator'], KEY_LINE)
         self.assertNotIn('command=', self.lines()['operator'])
+        self.assertNotIn('restrict', self.lines()['operator'])
 
     def test_the_contributor_line_never_carries_an_authority_flag(self):
         contributor = self.lines()['contributor']
@@ -380,8 +532,37 @@ class AuthorizedKeysCommandTests(unittest.TestCase):
         self.assertNotIn('contributor', payload)
         self.assertEqual(payload['operator'], KEY_LINE)
 
+    def test_the_printed_interpreter_is_absolute_with_E_and_s(self):
+        payload, _ = self.invoke('--role', 'contributor')
+        interpreter = payload['python']
+        self.assertTrue(interpreter.startswith('/'), interpreter)
+        self.assertIn('command="%s -E -s ' % interpreter, payload['contributor'])
+        self.assertEqual(payload['contributor_options'][0], 'restrict')
 
-@unittest.skipUnless(os.name == 'posix', 'the wrapper replaces itself with os.execvp')
+    def test_a_metacharacter_interpreter_is_refused_by_the_command(self):
+        # The reproduction for helper-python-metacharacters at the command level: this used
+        # to print a line whose command= created /tmp/canary on every connection.
+        for value in ('$(touch${IFS}/tmp/ssh89-canary)python3', '`touch${IFS}/tmp/x`python3',
+                      'python3;touch${IFS}/tmp/x'):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, '--python'):
+                    self.invoke('--role', 'contributor', '--python', value)
+
+    def test_a_key_file_with_two_keys_is_refused_by_the_command(self):
+        self.key_file.write_text(KEY_LINE + '\n' + SECOND_KEY_LINE + '\n', encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'second'):
+            self.invoke('--role', 'contributor')
+
+    def test_the_notes_state_the_coupled_pair_and_the_actor_boundary(self):
+        payload, _ = self.invoke('--role', 'contributor')
+        notes = ' '.join(payload['notes'])
+        for phrase in ('coupled pair', 'Permission denied', 'second SSH session',
+                       'not to an actor'):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, notes)
+
+
+@unittest.skipUnless(os.name == 'posix', 'the wrapper replaces itself with os.execvpe')
 class EndToEndTests(unittest.TestCase):
     """The real wrapper runs a stub endpoint with the fixed root and passes stdio through."""
 
@@ -393,12 +574,13 @@ class EndToEndTests(unittest.TestCase):
         self.state.mkdir()
         self.endpoint = self.root / 'endpoint.py'
         self.endpoint.write_text(
-            'import json, sys\n'
-            'print(json.dumps({"argv": sys.argv[1:], "stdin": sys.stdin.read()}))\n',
+            'import json, os, sys\n'
+            'print(json.dumps({"argv": sys.argv[1:], "stdin": sys.stdin.read(), '
+            '"env": dict(os.environ)}))\n',
             encoding='utf-8')
 
-    def run_wrapper(self, original, data='{"project": "example"}'):
-        env = dict(os.environ, SSH_ORIGINAL_COMMAND=original)
+    def run_wrapper(self, original, data='{"project": "example"}', **extra):
+        env = dict(os.environ, SSH_ORIGINAL_COMMAND=original, **extra)
         return subprocess.run([sys.executable, str(KIT / 'ssh_forced_command.py'),
                                '--root', str(self.state), '--endpoint', str(self.endpoint)],
                               input=data, capture_output=True, text=True, encoding='utf-8',
@@ -411,6 +593,23 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(payload['argv'], ['--root', str(self.state)])
         self.assertEqual(payload['stdin'], '{"project": "example"}')
         self.assertEqual(completed.stderr, '')
+
+    def test_a_forwarded_session_environment_does_not_reach_the_endpoint(self):
+        # The environment-and-sshd-prerequisites reproduction: PYTHONPATH/BASH_ENV act on an
+        # interpreter before any kit code runs, so the wrapper can only close the endpoint's
+        # own process - and does.
+        completed = self.run_wrapper(str(self.endpoint), data='{}',
+                                     PYTHONPATH='/tmp/attacker-modules',
+                                     BASH_ENV='/tmp/attacker-bashenv',
+                                     LD_PRELOAD='/tmp/attacker.so',
+                                     ATTACKER_ONLY='planted')
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        received = json.loads(completed.stdout)['env']
+        for name in ('PYTHONPATH', 'BASH_ENV', 'LD_PRELOAD', 'ATTACKER_ONLY',
+                     'SSH_ORIGINAL_COMMAND'):
+            with self.subTest(name=name):
+                self.assertNotIn(name, received)
+        self.assertIn('PATH', received)
 
     def test_another_program_is_refused_without_running_it(self):
         canary = self.root / 'canary'
@@ -455,6 +654,38 @@ class ForcedCommandDocumentationTests(unittest.TestCase):
                        'actor-shape reservation', '--root'):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, text)
+
+    def test_operations_states_the_sshd_prerequisites_and_how_to_check_them(self):
+        text = self.text('OPERATIONS.md')
+        for phrase in ('sshd settings the boundary needs', 'PermitUserEnvironment no',
+                       'AcceptEnv LANG LC_*', 'sshd -T', 'permituserenvironment',
+                       'acceptenv', 'SetEnv', 'PYTHONPATH', 'BASH_ENV'):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, text)
+
+    def test_operations_states_the_hardening_and_the_coupled_pair(self):
+        text = self.text('OPERATIONS.md')
+        for phrase in ('-E -s', 'restrict', '~/.ssh/rc', 'explicit environment',
+                       'coupled pair', 'Permission denied', 'second session'):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, text)
+
+    def test_operations_states_confinement_does_not_bind_a_key_to_an_actor(self):
+        text = self.text('OPERATIONS.md')
+        self.assertIn('binds the key to the endpoint, not to an actor', text)
+        self.assertIn('operator-gated and reserved operations', text)
+
+    def test_operations_states_the_single_key_rule(self):
+        normalized = ' '.join(self.text('OPERATIONS.md').split())
+        self.assertIn('a second key line', normalized)
+
+    def test_the_client_example_mentions_forced_command(self):
+        self.assertIn('forced_command', (KIT / 'client.example.json').read_text(encoding='utf-8'))
+
+    def test_the_onboarding_texts_mention_forced_command(self):
+        for name in ('docs/ONBOARDING.md', 'templates/PROJECT_ONBOARDING.md'):
+            with self.subTest(name=name):
+                self.assertIn('forced_command', (KIT / name).read_text(encoding='utf-8'))
 
     def test_http_deployment_points_at_the_confined_setup(self):
         text = self.text('HTTP_DEPLOYMENT.md')

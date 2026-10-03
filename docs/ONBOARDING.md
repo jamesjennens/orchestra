@@ -6,7 +6,7 @@ Start a worker in an empty directory. It needs SSH access to the configured serv
 ssh beads-team python3 /home/beads/orchestra/worker.py --root /home/beads/beads-runtime --project example start --name cline
 ```
 
-`worker.py start` allocates a durable actor and prints it with onboarding instructions. Run it for a new worker from that worker's dedicated local working directory; use one directory and checkout per actor, never another worker's directory or another project's checkout. Save the full actor privately in that directory alongside the exact client configuration supplied by the server-owned project entry, outside Git or in local ignored state. Use the installed client and printed project-specific endpoint/configuration; do not copy settings from another project. The readable name need not be unique. See [session registration and retries](SESSIONS.md). `onboard` and `docs [NAME]` remain read-only for existing actors. Bootstrap uses the installed endpoint locally and cannot claim tasks or write task records. Normal contributions use `client.py` and their configured project endpoint, including any project-specific guard. SSH access retains the existing trusted-team security model.
+`worker.py start` allocates a durable actor and prints it with onboarding instructions. Run it for a new worker from that worker's dedicated local working directory; use one directory and checkout per actor, never another worker's directory or another project's checkout. Save the full actor privately in that directory alongside the exact client configuration supplied by the server-owned project entry, outside Git or in local ignored state. Use the installed client and printed project-specific endpoint/configuration; do not copy settings from another project. If the server-owned entry says the contributor key is confined to the endpoint, that configuration also carries `"forced_command": true`; keep it exactly as supplied, because the confined key refuses the `--root` an unconfined client sends (see [installation and recovery](OPERATIONS.md#confine-contributor-keys-with-a-forced-command)). The readable name need not be unique. See [session registration and retries](SESSIONS.md). `onboard` and `docs [NAME]` remain read-only for existing actors. Bootstrap uses the installed endpoint locally and cannot claim tasks or write task records. Normal contributions use `client.py` and their configured project endpoint, including any project-specific guard. SSH access retains the existing trusted-team security model; a confined contributor key narrows its reach to the endpoint without binding the key to an actor, which still self-declares.
 
 With a configured client, the equivalent is:
 
@@ -35,7 +35,7 @@ The project entry point should explicitly supersede obsolete checkout-local coor
 
 ## Private config and the platform credential store
 
-`setup_assistant.py` writes the private `client.local.json`-shaped config that `client.py` reads (`transport`, `host`, `endpoint`, `root`, `python`) and, only when asked, stores a secret in the operating system's credential store instead of in a file:
+`setup_assistant.py` writes the private `client.local.json`-shaped config that `client.py` reads (`transport`, `host`, `endpoint`, `root`, `python`; `client.py` also reads the optional `forced_command` boolean, which this tool does not set) and, only when asked, stores a secret in the operating system's credential store instead of in a file:
 
 ```sh
 python3 setup_assistant.py --help

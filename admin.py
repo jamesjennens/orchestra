@@ -2554,7 +2554,23 @@ def record_store_stats(state):
 AUTHORIZED_KEY_TYPES=('ssh-ed25519','ssh-rsa','ecdsa-sha2-nistp256','ecdsa-sha2-nistp384',
                       'ecdsa-sha2-nistp521','sk-ssh-ed25519@openssh.com',
                       'sk-ecdsa-sha2-nistp256@openssh.com','ssh-dss')
-CONTRIBUTOR_KEY_OPTIONS=('no-pty','no-port-forwarding','no-agent-forwarding','no-X11-forwarding')
+# `restrict` comes first: OpenSSH documents it as switching off pty, port forwarding, agent
+# forwarding, X11 forwarding *and* the user rc file (~/.ssh/rc), so a capability OpenSSH adds
+# later is off for this key by default rather than granted until someone edits this list. The
+# four explicit options follow so a stock sshd that predates `restrict` still gets them, and
+# so a reader sees exactly what the entry closes.
+CONTRIBUTOR_KEY_OPTIONS=('restrict','no-pty','no-port-forwarding','no-agent-forwarding',
+                         'no-X11-forwarding')
+# The character class --root, the kit directory and --python must all satisfy: sshd hands
+# `command=` to the account shell, so anything a shell would expand (`$`, backtick, `;`, `|`,
+# `&`, `(`, `)`), any whitespace and any quote must never reach the printed line. A bare
+# interpreter name (`python3`) or an absolute path are the only two accepted shapes.
+AUTHORIZED_KEY_PATH=re.compile(r'/[A-Za-z0-9_./-]+')
+AUTHORIZED_KEY_PYTHON=re.compile(r'(?:[A-Za-z0-9_][A-Za-z0-9_.-]*|/[A-Za-z0-9_./-]+)')
+# The flags the contributor line runs the interpreter with: -E ignores PYTHON* environment
+# variables and -s drops the user site directory. Not -I, which also removes the script's own
+# directory from sys.path and would stop the kit's modules importing each other.
+AUTHORIZED_KEY_PYTHON_FLAGS=('-E','-s')
 OPERATOR_KEY_NOTE=('Unrestricted service-account shell access: this key can run admin.py, bd '
                    'and anything else the account can. It is deliberately not confined. '
                    'Grant it only to an allowlisted operator.')
@@ -2562,10 +2578,11 @@ OPERATOR_KEY_NOTE=('Unrestricted service-account shell access: this key can run 
 def public_key_line(text,source='key file'):
     """The one plain public-key line in `text` as (type, base64 body, comment).
 
-    A line that already carries authorized_keys options, a private key, several keys or
-    no key at all is refused: the helper must never nest a `command=` or grant more than
-    the one key the operator read.
+    A line that already carries authorized_keys options, a private key, a second key line
+    or no key at all is refused: the helper must never nest a `command=`, grant more than
+    the one key the operator read, or silently ignore a key the operator did not see.
     """
+    found=None
     for raw in str(text).splitlines():
         line=raw.strip()
         if not line or line.startswith('#'):continue
@@ -2575,27 +2592,50 @@ def public_key_line(text,source='key file'):
         if len(parts)<2 or parts[0] not in AUTHORIZED_KEY_TYPES:
             raise ValueError('%s: expected one plain public key line (<type> <base64> [comment]); '
                              'remove any authorized_keys options and pass exactly one key'%source)
+        if found is not None:
+            raise ValueError('%s: expected exactly one public key line but found a second one; '
+                             'pass one key per entry, one entry per key'%source)
         try:payload=base64.b64decode(parts[1],validate=True)
         except Exception:
             raise ValueError('%s: the key body is not valid base64'%source) from None
         if not payload:
             raise ValueError('%s: the key body is empty'%source)
-        return parts[0],parts[1],' '.join(parts[2:])
-    raise ValueError('%s: no public key line found'%source)
+        found=(parts[0],parts[1],' '.join(parts[2:]))
+    if found is None:
+        raise ValueError('%s: no public key line found'%source)
+    return found
 
 def _authorized_key_path(value,label):
     text=str(value)
-    if not re.fullmatch(r'/[A-Za-z0-9_./-]+',text):
+    if not AUTHORIZED_KEY_PATH.fullmatch(text):
         raise ValueError('%s must be an absolute Linux path without spaces or quotes to be '
                          'usable inside an authorized_keys command='%label)
     return text
 
+def default_authorized_key_python():
+    """The interpreter the contributor line runs: this interpreter, else `/usr/bin/python3`.
+
+    Absolute on purpose. A bare `python3` is resolved by the account shell through PATH,
+    which PermitUserEnvironment or an AcceptEnv forwarding the caller's PATH can move, so
+    the printed line names the interpreter the deployment actually tested.
+    """
+    executable=getattr(sys,'executable','') or ''
+    if executable.startswith('/') and AUTHORIZED_KEY_PYTHON.fullmatch(executable):
+        return executable
+    return '/usr/bin/python3'
+
 def _authorized_key_python(value):
-    """One interpreter name (`python3`) or absolute path, never a name plus flags."""
+    """One bare interpreter name (`python3`) or absolute path - never a name plus flags.
+
+    The same character class as --root and the kit directory. sshd hands `command=` to the
+    account shell, so `--python '$(touch${IFS}/tmp/canary)python3'` would run the substitution
+    on every connection; a value outside this class is refused rather than printed.
+    """
     text=str(value)
-    if (not text or text.startswith('-') or any(character in text for character in '\0\r\n"\' \t')):
-        raise ValueError('--python must be one interpreter name or absolute path without flags, '
-                         'spaces or quotes to be usable inside an authorized_keys command=')
+    if not AUTHORIZED_KEY_PYTHON.fullmatch(text):
+        raise ValueError('--python must be one interpreter name or absolute path using only '
+                         'letters, digits, dot, underscore, dash and slash, to be usable '
+                         'inside an authorized_keys command=')
     return text
 
 def _authorized_key_comment(comment):
@@ -2604,30 +2644,33 @@ def _authorized_key_comment(comment):
         raise ValueError('--comment must be one line without control characters')
     return text.strip()
 
-def authorized_key_lines(root,kit,key_type,key_body,key_comment='',comment=None,python='python3'):
+def authorized_key_lines(root,kit,key_type,key_body,key_comment='',comment=None,python=None):
     """The exact contributor (confined) and operator (unrestricted) authorized_keys lines.
 
-    The contributor line runs `ssh_forced_command.py` with the deployment's fixed root and
-    the endpoint path, plus the four options that close the interactive/forwarding paths.
-    The operator line is the bare key: an operator needs the service account's shell for
-    the host commands, and pretending otherwise would be a false guarantee.
+    The contributor line runs `ssh_forced_command.py` - under an absolute interpreter with
+    `-E -s` - with the deployment's fixed root and the endpoint path, plus the options that
+    close the interactive, forwarding, agent, X11 and user-rc paths. The operator line is the
+    bare key: an operator needs the service account's shell for the host commands, and
+    pretending otherwise would be a false guarantee.
     """
     root=_authorized_key_path(root,'--root')
     kit=_authorized_key_path(kit,'the kit directory')
-    python=_authorized_key_python(python)
+    python=_authorized_key_python(default_authorized_key_python() if python is None else python)
     endpoint=kit+'/endpoint.py'
     wrapper=kit+'/ssh_forced_command.py'
     text=_authorized_key_comment(comment) if comment is not None else key_comment
     if any(character in text for character in '\0\r\n'):
         raise ValueError('the key comment must be one line without control characters')
     key=' '.join(part for part in (key_type,key_body,text) if part)
-    command=' '.join((python,wrapper,'--root',root,'--endpoint',endpoint))
+    command=' '.join((python,)+AUTHORIZED_KEY_PYTHON_FLAGS+(wrapper,'--root',root,
+                                                           '--endpoint',endpoint))
     contributor='command="%s",%s %s'%(command,','.join(CONTRIBUTOR_KEY_OPTIONS),key)
-    return {'root':root,'kit':kit,'endpoint':endpoint,'wrapper':wrapper,
+    return {'root':root,'kit':kit,'endpoint':endpoint,'wrapper':wrapper,'python':python,
+            'python_flags':list(AUTHORIZED_KEY_PYTHON_FLAGS),
             'contributor_options':list(CONTRIBUTOR_KEY_OPTIONS),
             'contributor':contributor,'operator':key}
 
-def authorized_keys(root,key_file,role='both',python='python3',comment=None):
+def authorized_keys(root,key_file,role='both',python=None,comment=None):
     """Print the installable lines for one public key as JSON (see authorized_key_lines)."""
     kit=Path(__file__).resolve().parent
     for name in ('ssh_forced_command.py','endpoint.py'):
@@ -2637,10 +2680,19 @@ def authorized_keys(root,key_file,role='both',python='python3',comment=None):
     lines=authorized_key_lines(root,kit,*public_key_line(path.read_text(encoding='utf-8-sig'),str(path)),
                                comment=comment,python=python)
     payload={'schema_version':1,'root':lines['root'],'kit':lines['kit'],'endpoint':lines['endpoint'],
-             'wrapper':lines['wrapper'],'contributor_options':lines['contributor_options'],
+             'wrapper':lines['wrapper'],'python':lines['python'],
+             'contributor_options':lines['contributor_options'],
              'operator_note':OPERATOR_KEY_NOTE,
              'notes':['The contributor line needs "forced_command": true in that contributor\'s '
                       'client config; without it the client sends a --root the wrapper refuses.',
+                      'The confined key and that client flag are a coupled pair per contributor: '
+                      'the flag without the confined entry makes the connection fail '
+                      '(Permission denied 126, the account shell cannot execute the path).',
+                      'Verify the operator key in a second SSH session before closing the one '
+                      'used to edit authorized_keys, so a bad edit cannot lock everyone out.',
+                      'Confinement binds the key to the endpoint, not to an actor: a confined key '
+                      'still self-declares its actor on every request, and what it protects is the '
+                      'operator-gated and reserved operations, not the actor name.',
                       'Install one entry per key: both lines are alternatives for different keys, '
                       'never two entries for the same key.']}
     if role in ('contributor','both'):payload['contributor']=lines['contributor']
@@ -2713,7 +2765,7 @@ def main():
     a.add_argument('--key-file',required=True,help='a file holding one plain OpenSSH public key line')
     a.add_argument('--role',choices=['contributor','operator','both'],default='both',
                    help='which line(s) to print (default: both, for different keys)')
-    a.add_argument('--python',default='python3',help='interpreter in the contributor forced command')
+    a.add_argument('--python',default=None,help='interpreter in the contributor forced command (default: this interpreter, or /usr/bin/python3)')
     a.add_argument('--comment',default=None,help='replace the key line comment')
     a=sub.add_parser('backup');a.add_argument('projects',nargs='*',metavar='project')
     a.add_argument('--all',action='store_true',dest='all_projects',
