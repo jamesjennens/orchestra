@@ -234,7 +234,25 @@ class HostCommandTests(unittest.TestCase):
             with self.subTest(actor=actor), self.assertRaisesRegex(ValueError, 'never added to the operator allowlist'):
                 operators('add', actor)
         self.assertEqual(operators('list'), before)
-        self.assertIn('usr_short', operators('add', 'usr_short'))             # not the reserved shape
+        # Only the exact shape is reserved: near misses are ordinary names.
+        for near in ('usr_short', 'usr_0123456789abcde', 'USR_0123456789abcdef'):
+            self.assertIn(near, operators('add', near))
+        # An allowlist that already holds such an id is flagged, on the host and at service start.
+        import http_service
+        marker = self.root / 'deployment.private.json'
+        document = json.loads(marker.read_text(encoding='utf-8'))
+        self.assertEqual(http_service.operator_allowlist_warnings(str(self.root)), [])
+        document['operators'].append('usr_0123456789abcdef')
+        marker.write_text(json.dumps(document), encoding='utf-8')
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertIn('usr_0123456789abcdef', operators('list'))
+        self.assertIn('Warning: the operator allowlist holds usr_0123456789abcdef', stderr.getvalue())
+        warned = http_service.operator_allowlist_warnings(str(self.root))
+        self.assertEqual(len(warned), 1)
+        self.assertIn('holds usr_0123456789abcdef', warned[0])
+        self.assertEqual(http_service.operator_allowlist_warnings(None), [])
+        self.assertEqual(http_service.operator_allowlist_warnings(str(self.root / 'nowhere')), [])
 
     def payload(self, to_state, **fields):
         view = pr.read(['get', self.made['key']], self.native, COORD, [COORD, OWNER], self.project)

@@ -254,7 +254,7 @@ The routes exist on the endpoint backend; the in-process backend answers 501.
 | `GET /v1/projects/{id}/proposals` | any member | the queue: `state`, `target`, `limit`, `cursor`. Also `can_propose` and `can_triage` for the caller |
 | `GET /v1/projects/{id}/proposals/{key}` | any member | the newest revision, the disposition timeline (`history` 1..50) and the derived links |
 | `POST /v1/projects/{id}/proposals/{key}/dispositions` | `reviews.approve`: owners, in a signed-in session | triage (`operation: "review"`, the default) or the owner decision (`"decide"`), with `previous` and `proposal_sha256` from the detail read |
-| `GET /v1/me/contributions` | a signed-in session | your own **verified** proposals across your projects, newest first, `limit` per page with a `cursor` (`next_cursor`); it pages through the newest 100 and then says `truncated`. A proposal that only names your account, or whose later revision someone else wrote, is not listed |
+| `GET /v1/me/contributions` | a signed-in session | your own **verified** proposals across your projects, newest first, `limit` per page with a `cursor` (`next_cursor`); it pages through the newest 100 and stops there: the last page has `truncated: true` and no `next_cursor`, and older proposals are read per project from the queue. A cursor the route did not issue is refused with 409. A proposal that only names your account, or whose later revision someone else wrote, is not listed |
 
 The rules:
 - **The submitter is the account.** `submitter` is `account:<your user id>`; for an agent
@@ -279,7 +279,9 @@ The rules:
     already have such a title stay readable);
   - free text (a task description on create and on update, proposal, checkpoint and
     review bodies) travels as an attachment, never as an argument, so a text such as
-    `--help`, `- item` or `@attachment:0` is stored as written.
+    `--help`, `- item` or `@attachment:0` is stored as written. The one exception is
+    clearing a description on update: the empty value is sent inline, because the
+    native tool refuses an empty body file and an empty value cannot be a flag.
 - **Who reads coordinator text.** A rejection reason, a coordinator question and an
   escalation question are returned only to the submitter and to members with
   `reviews.approve`. Everyone else gets `null` and `withheld: true`.
@@ -349,7 +351,11 @@ The rules:
     "re-adding them (`admin.py operators add ACTOR`) makes those records count again".
     For a web disposition the author is an account id: adding `usr_...` to the operator
     allowlist would make an HTTP account id an operator. Roll forward instead. This
-    kit's `operators add` refuses an account- or agent-shaped id.
+    kit's `operators add` refuses an account- or agent-shaped id. Only the exact shape
+    is reserved (`usr_` or `agent_` and 16 lowercase hex digits); a near miss such as
+    15 digits or `USR_...` is an ordinary name. An allowlist that already holds such an
+    id is not changed for you: `operators list` and the service at start print a warning
+    that names it; remove it with `operators remove NAME --confirm-revoke`.
   - While the older kit is the endpoint, the actor-shape reservation is off. Run the
     scan above when you roll forward.
 

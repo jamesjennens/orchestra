@@ -411,6 +411,9 @@ def execute(root,request,authority_config=None,require_authority=False):
                 key=a.partition(':')[2]
                 item=attachments.get(key)
                 if not isinstance(item,dict) or item.get('flag') not in FILE_FLAGS or not isinstance(item.get('text'),str):raise ValueError('Invalid attachment')
+                # bd refuses an empty body file; refuse it here, before any native call, so the
+                # caller gets a clear refusal and not an uncertain outcome (review 01a10352).
+                if item['flag']=='--body-file' and not item['text'].strip():raise ValueError('An attached description is empty; send an empty value inline to clear it')
                 dest=Path(tmp)/f'{i}.txt';dest.write_text(item['text'],encoding='utf-8')
                 final.extend([item['flag'],str(dest)])
             else: final.append(a)

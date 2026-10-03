@@ -1728,6 +1728,13 @@ def http_actor_id(actor):
     return head if head and HTTP_ACTOR_ID.fullmatch(head) else None
 
 
+def http_shaped_names(names):
+    """The names in a list (an operator allowlist) that have the exact reserved shape of an
+    HTTP account or agent id. Only the exact shape is reserved: `usr_` or `agent_` and 16
+    lowercase hex digits. A near miss (15 digits, `USR_`) is an ordinary name."""
+    return [name for name in names or [] if isinstance(name, str) and http_actor_id(name) is not None]
+
+
 def http_actor_denial(request, authority_config):
     """Why a request under an HTTP-shaped actor is refused, as the envelope, or None.
 

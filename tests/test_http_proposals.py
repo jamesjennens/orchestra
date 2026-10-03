@@ -593,6 +593,14 @@ class ReviewFixCase(ProposalHarness):
                              token=self.token('alex')).data
         self.assertEqual([item['key'] for item in second['items'] + third['items']], newest_first[2:])
         self.assertIsNone(third['next_cursor'])
+        # A cursor the route did not issue is refused, not answered with an empty page.
+        import base64
+        forged = json.loads(base64.urlsafe_b64decode(first['next_cursor'] + '=' * (-len(first['next_cursor']) % 4)))
+        for offset in (4, 5, 99, 100, 10 ** 9):
+            cursor = base64.urlsafe_b64encode(json.dumps(dict(forged, o=offset)).encode()).decode().rstrip('=')
+            with self.subTest(offset=offset):
+                answer = self.request('GET', '/v1/me/contributions?limit=2&cursor=' + cursor, token=self.token('alex'))
+                self.assertEqual(answer.status, 200 if offset < 5 else 409, answer.data)
         # A cursor belongs to its query and its account.
         self.assertEqual(409, self.request('GET', '/v1/me/contributions?limit=3&cursor=' + first['next_cursor'],
                                            token=self.token('alex')).status)
@@ -622,6 +630,24 @@ class ReviewFixCase(ProposalHarness):
             self.assertEqual(200, done.status, done.data)
             self.assertEqual(self.request('GET', '%s/%s' % (base, task),
                                           token=self.token('blair')).data['description'], text)
+        # Clearing a description (review 01a10352): an empty value goes inline, not as an empty
+        # body file, which bd refuses.
+        action, _, args, attachments = http_service.EndpointBackend._command(
+            self.backend, 'tasks.update', None, self.project, {'task_id': task, 'description': ''})
+        self.assertEqual((args, attachments), (['update', task, '--description', '', '--json'], {}))
+        for index, text in enumerate(('', '   ')):
+            done = self.request('PATCH', '%s/%s' % (base, task), {'description': text}, token=self.token('blair'),
+                                key='patch-clear-%d' % index)
+            self.assertEqual(200, done.status, done.data)
+            self.assertEqual(self.request('GET', '%s/%s' % (base, task),
+                                          token=self.token('blair')).data.get('description') or '', '')
+            self.request('PATCH', '%s/%s' % (base, task), {'description': 'again'}, token=self.token('blair'),
+                         key='patch-refill-%d' % index)
+        # An empty body file never reaches the native tool: the endpoint refuses it clearly.
+        answer = self.plain('alice', 'bd', ['update', task, '@attachment:0', '--json'],
+                            {'0': {'flag': '--body-file', 'text': ''}})
+        self.assertEqual(answer['returncode'], 2, answer)
+        self.assertIn('An attached description is empty', answer['stderr'])
         # A task that already has such a title stays readable.
         path = self.canonical_root / 'canonical.json'
         state = json.loads(path.read_text(encoding='utf-8'))

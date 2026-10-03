@@ -1170,7 +1170,11 @@ class EndpointBackend:
             if payload.get('status') in ('open', 'closed'):
                 args[2:2] = ['--status', payload['status']]
             attachments = {}
-            if payload.get('description') is not None:
+            if payload.get('description') is not None and not str(payload['description']).strip():
+                # Clearing the description: bd refuses an empty body file, and an empty
+                # value cannot be mistaken for a flag, so it goes inline (review 01a10352).
+                args[2:2] = ['--description', '']
+            elif payload.get('description') is not None:
                 # Free text never travels as a free-standing argument: like create, the
                 # description goes through the attachment transport, so a text that looks
                 # like a flag ("--help"), a list ("- item") or the transport itself
@@ -1642,6 +1646,25 @@ def caller_arg(value, name):
     if not isinstance(value, str) or not value or value.startswith(('-', '@')) or '\0' in value:
         raise invalid('%s is not a valid value' % name)
     return value
+
+
+def operator_allowlist_warnings(root):
+    """What to say at service start when the runtime's operator allowlist holds a name
+    with the shape of an HTTP account or agent id: that id would be an operator for every
+    host-command check, and this service acts under such ids. Never raises."""
+    if not root:
+        return []
+    try:
+        document = json.loads((Path(root) / 'deployment.private.json').read_text(encoding='utf-8'))
+        names = document.get('operators')
+        names = [names] if isinstance(names, str) else names
+    except (OSError, ValueError, AttributeError):
+        return []
+    from http_authority import http_shaped_names
+    shaped = http_shaped_names(names if isinstance(names, list) else [])
+    return ['Warning: the operator allowlist of %s holds %s, which has the shape of an HTTP account or agent id. '
+            'Remove it with admin.py operators remove NAME --confirm-revoke.' % (root, ', '.join(shaped))] \
+        if shaped else []
 
 
 def task_matches(task, filters):
@@ -3200,6 +3223,10 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise forbidden('Session authority required')
         limit, state = self._page(ctx, ctx.query)
         offset = state['o']
+        if offset >= ME_CONTRIBUTIONS_MAX:
+            # Not a cursor this route issued: it never points past the newest
+            # ME_CONTRIBUTIONS_MAX (a cursor is not signed, so the offset is checked).
+            raise conflict('Cursor is stale or belongs to a different query')
         wanted = min(offset + limit, ME_CONTRIBUTIONS_MAX)
         projects = [p for p in self.service.list_projects(principal)
                     if not p.get('archived') and principal.user_id in (p.get('members') or [])]
@@ -3221,6 +3248,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 items.append(dict(self._proposal_view(ctx, capabilities, item), project=project['id'],
                                   project_name=project['name']))
         items.sort(key=lambda item: (item.get('submitted_at') or '', item.get('key') or ''), reverse=True)
+        if offset and offset >= total and not unavailable:
+            raise conflict('Cursor is stale or belongs to a different query')
         more = offset + limit < total
         reachable = offset + limit < ME_CONTRIBUTIONS_MAX
         truncated = truncated or (more and not reachable)
@@ -3668,6 +3697,8 @@ def main(argv=None):
         trusted.append('localhost')
     service = Service(store, public_url=args.public_url)
     backend = build_backend(service, args)
+    for line in operator_allowlist_warnings(args.root if args.backend == 'endpoint' else None):
+        print(line, file=sys.stderr)
     httpd = create_server(service, backend, host=args.host, port=args.port,
                           trusted_proxies=trusted, max_body=args.max_body,
                           certfile=args.cert, keyfile=args.key,

@@ -184,7 +184,11 @@ class Canonical:
                         if index + 1 >= len(rest):
                             raise ValueError('Missing value for %s' % flag)
                         source = Path(rest[index + 1])
-                        row['description'] = source.read_text(encoding='utf-8') if source.exists() else ''
+                        text = source.read_text(encoding='utf-8') if source.exists() else ''
+                        if not text.strip():
+                            # As bd 1.2.2 does: an empty body file is refused.
+                            raise ValueError('empty description from stdin/file requires --allow-empty-description')
+                        row['description'] = text
                         index += 2
                         continue
                     if flag == '--json':
@@ -241,6 +245,8 @@ def materialize(args, attachments, tmp):
             if not isinstance(item, dict) or item.get('flag') not in FILE_FLAGS or \
                     not isinstance(item.get('text'), str):
                 raise ValueError('Invalid attachment')
+            if item['flag'] == '--body-file' and not item['text'].strip():   # as endpoint.py refuses it
+                raise ValueError('An attached description is empty; send an empty value inline to clear it')
             destination = Path(tmp) / ('%d.txt' % index)
             destination.write_text(item['text'], encoding='utf-8')
             final.extend([item['flag'], str(destination)])

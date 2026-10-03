@@ -3422,7 +3422,17 @@ def main():
         from recovery import identity
         cfg=config(root)
         current=stored_operators(cfg)
-        if args.action=='list':print(json.dumps({'operators':current}));return
+        if args.action=='list':
+            print(json.dumps({'operators':current}))
+            # An allowlist that already holds an HTTP account or agent id (added by hand, or
+            # by an older kit following its own advice) makes that id an operator.
+            from http_authority import http_shaped_names
+            shaped=http_shaped_names(current)
+            if shaped:
+                print('Warning: the operator allowlist holds %s, which has the shape of an HTTP account or agent '
+                      'id. Such an id must not be an operator; remove it with: admin.py operators remove NAME '
+                      '--confirm-revoke'%', '.join(shaped),file=sys.stderr)
+            return
         # Config is the single authority source; a shell-only ORCHESTRA_OPERATORS
         # that disagrees is refused before the change rather than applied here
         # and ignored by the endpoint.
