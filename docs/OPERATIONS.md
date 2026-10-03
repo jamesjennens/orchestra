@@ -98,9 +98,11 @@ put into the session *before* it runs:
 * `PermitUserEnvironment no` (the default). With `yes`, a client can send environment
   variables through its own `~/.ssh/environment` or `SetEnv`.
 * No `AcceptEnv` beyond locale variables: `AcceptEnv LANG LC_*`. With `AcceptEnv *`, a client
-  `SetEnv PYTHONPATH=...` reaches the service account. `PYTHONPATH` then runs a module in the
-  interpreter that starts `ssh_forced_command.py`, and `BASH_ENV` runs a script in the shell
-  before it - both act before any kit code executes, so the wrapper cannot close them. The
+  `SetEnv LD_PRELOAD=...` or `SetEnv BASH_ENV=...` reaches the service account: `LD_PRELOAD`
+  loads a library into the shell and the interpreter, and `BASH_ENV` runs a script in the
+  shell - both act before any kit code executes, so the wrapper cannot close them. (The
+  printed line starts the interpreter with `-E -s`, so a forwarded `PYTHONPATH` no longer
+  runs a module there.) The
   wrapper does close the endpoint's own process: it execs the endpoint with a minimal,
   explicit environment (`PATH`, `HOME`, `LANG`/`LC_*`, and the variables the kit sets for the
   endpoint itself - none today), so a forwarded `PYTHONPATH`, `BASH_ENV`, `ENV`, `LD_PRELOAD`
@@ -114,7 +116,9 @@ sshd -T | grep -Ei 'permituserenvironment|acceptenv'
 ```
 
 `permituserenvironment no` and an `acceptenv` line limited to `LANG`/`LC_*` (or no
-`acceptenv` line at all) are what the confined setup assumes. `restrict` in the key options
+`acceptenv` line at all) are what the confined setup assumes. The key line needs OpenSSH 7.2
+or later on the server: an older sshd does not know `restrict` and refuses the key (it fails
+closed). `restrict` in the key options
 separately closes the user rc file (`~/.ssh/rc`), which sshd would otherwise run for the
 session.
 
