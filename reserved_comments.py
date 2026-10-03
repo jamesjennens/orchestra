@@ -875,6 +875,42 @@ def is_record_anchor(row):
     return False
 
 
+# Requirement and brd-section records are their own anchor family: they carry a
+# controlled type label (`RESERVED_EXACT_LABELS`) plus a `Kind: requirement-revision-vN`
+# comment, and an acceptance evidence comment once accepted. They stay visible as work
+# items, so they are deliberately NOT part of `is_record_anchor`/`hide_records`; the
+# status guard reads them through this separate predicate (kittrial-5bb.92 review item 1).
+REQUIREMENT_RECORD_PREFIXES = ('Kind: requirement-revision-',
+                               'Kind: requirement-acceptance-')
+
+
+def carries_requirement_label(row):
+    """True when a row carries the controlled requirement/brd-section type label."""
+    labels = row.get('labels') if isinstance(row, dict) else None
+    return isinstance(labels, (list, tuple)) and any(
+        isinstance(label, str) and label in RESERVED_EXACT_LABELS for label in labels)
+
+
+def is_requirement_record_anchor(row):
+    """True for the native anchor of a requirement or brd-section record.
+
+    Like `is_record_anchor`, the label alone is not evidence, and the comment is read
+    through the same BOM/CRLF view every reserved-prefix surface uses, so a lookalike
+    cannot hide a record from the status guard.
+    """
+    if not isinstance(row, dict) or not carries_requirement_label(row):
+        return False
+    comments = row.get('comments')
+    if not isinstance(comments, list):
+        return False
+    for comment in comments:
+        text = comment.get('text') if isinstance(comment, dict) else None
+        if isinstance(text, str) and any(view.startswith(REQUIREMENT_RECORD_PREFIXES)
+                                         for view in (text, _reserved_prefix_view(text))):
+            return True
+    return False
+
+
 def is_record_comment(text):
     """True for a reference/proposal/settings/capability record comment, any version.
 
@@ -1224,10 +1260,49 @@ COMMENT_NO_VALUE_FLAGS = BD_GLOBAL_BOOL_FLAGS
 COMMENT_FLAGS_WITH_VALUE = {'-f', '--file'}
 
 
-def status_change_targets(args):
-    """The ids a `close`/`reopen`/`update --status` invocation names, for the guard.
+# The `update` flags that move an anchor's status or assignee. `--status`/`-s` set the
+# status field in any spelling; `--claim` moves it to in_progress and assigns the acting
+# actor; `--defer` moves it to deferred; `--assignee`/`-a` changes the assignee. A record
+# anchor is created closed on purpose and hidden from work, so every one of these is
+# refused on one (kittrial-5bb.92 review item 1). The value-taking spellings are the
+# pinned bd 1.2.2 inventory already used by `_bd_scan`, so `-sopen`, `-s=open` and
+# `-s open` all resolve to the same flag and `-a` cannot be mistaken for a label flag.
+STATUS_ASSIGNEE_LONG_FLAGS = ('--status', '--defer', '--assignee')
+STATUS_ASSIGNEE_SHORT_FLAGS = ('-s', '-a')
 
-    Returns ``None`` when the invocation cannot move a status, else
+
+def _moves_status_or_assignee(flags):
+    """Whether an `update` flag list changes an anchor's status or assignee.
+
+    pflag decides a repeated boolean by its LAST occurrence, so `--claim` follows the
+    same rule as `--no-inherit-labels`: an explicit false last means bd does not claim.
+    An unparseable value makes bd reject the whole command, so the guard treats it as a
+    change and fails closed instead of guessing which spelling bd would have used. The
+    value-taking flags are unconditional: any occurrence moves the field.
+    """
+    move = False
+    claim = False
+    for name, value in flags:
+        if name in STATUS_ASSIGNEE_LONG_FLAGS or name in STATUS_ASSIGNEE_SHORT_FLAGS:
+            move = True
+        elif name == '--claim':
+            parsed = _parse_go_bool(value)
+            if parsed is None:
+                move = True
+            else:
+                claim = parsed
+    return move or claim
+
+
+def status_change_targets(args):
+    """The ids a status/assignee-moving invocation names, for the guard.
+
+    Covers `close`, `reopen`, and `update` with any flag that changes status or
+    assignee (`--status`/`-s` in every spelling, `--claim`, `--defer`,
+    `--assignee`/`-a`), so the record-anchor guard cannot be bypassed by the short
+    flag or by the claim/defer/assign shortcuts (kittrial-5bb.92 review item 1).
+
+    Returns ``None`` when the invocation cannot move a status or assignee, else
     ``(command, targets)``. ``targets`` is the positional issue ids, or ``None`` when
     the scan is ambiguous (an unknown flag) or names no issue: bd would then act on the
     last touched issue, which the record-anchor guard cannot verify, so the caller
@@ -1240,7 +1315,7 @@ def status_change_targets(args):
     if command not in ('close', 'reopen', 'update'):
         return None
     flags, operands, unknown = _bd_scan(args, command)
-    if command == 'update' and not any(name == '--status' for name, _ in flags):
+    if command == 'update' and not _moves_status_or_assignee(flags):
         return None
     if unknown:
         return (command, None)

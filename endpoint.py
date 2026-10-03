@@ -22,7 +22,8 @@ from render import render
 from lifecycle import apply_native
 from version import report
 from reserved_comments import (carries_record_label, check_raw_request, comment_target,
-                               first_reserved_label, is_record_anchor, label_guard_request,
+                               first_reserved_label, is_record_anchor, is_requirement_record_anchor,
+                               label_guard_request,
                                operator_only_in_args, raw_file_flag_in_args,
                                reserved_label_in_args, refuse_http_actor, status_change_targets,
                                unresolved_bd_flags)
@@ -107,16 +108,52 @@ def _guard_reserved_labels(root,path,args,actor):
             if is_record_anchor(row):
                 raise ValueError('Refusing to replace labels on %s: it is a reference/proposal/settings/capability record anchor, whose labels only its record operations may change. --add-label remains available for ordinary labels.'%(canonical,))
 
+def _native_anchor_rows(root,path,actor,tokens):
+    """Resolve every named token to its canonical id and row, in ONE native read.
+
+    `bd show ID... --json --include-comments` returns each row's labels and comments
+    together, so the whole status guard costs one read per call however many ids the
+    invocation names (kittrial-5bb.92 review item 1, one read per call). bd resolves an
+    issue id by unambiguous suffix, so each requested token is matched against the
+    returned rows; a token that resolves to zero or several rows fails closed, exactly
+    as `_native_labels` does for one token.
+    """
+    p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,
+                      'show',*tokens,'--json','--include-comments'],env=environment(root),
+                     capture_output=True,text=True,encoding='utf-8',timeout=60)
+    if p.returncode:raise ValueError('Could not read %s before the status write, so the record-anchor guard cannot verify it: %s'%(', '.join(tokens),(p.stderr or p.stdout).strip()))
+    try:rows=json.loads(p.stdout)
+    except ValueError:raise ValueError('Could not parse the current rows of %s before the status write; refusing.'%(', '.join(tokens),))
+    if isinstance(rows,dict):rows=[rows]
+    if not isinstance(rows,list):raise ValueError('Unexpected native read for %s; refusing the status change.'%(', '.join(tokens),))
+    resolved={}
+    for token in tokens:
+        matched={}
+        for row in rows:
+            if not isinstance(row,dict):continue
+            rid=row.get('id')
+            if not isinstance(rid,str):continue
+            if rid==token or rid.endswith('.'+token) or rid.endswith('-'+token):
+                matched.setdefault(rid,row)
+        if len(matched)!=1:
+            raise ValueError('Could not resolve %s to exactly one native issue before the status write (matched: %s), so the record-anchor guard cannot verify it; refusing. Pass the canonical issue id.'%(token,', '.join(sorted(matched)) or 'none'))
+        rid,row=next(iter(matched.items()))
+        resolved[token]=(rid,row)
+    return resolved
+
 def _guard_record_anchor_status(root,path,args,actor):
     """Read-before-write guard: a status change never moves a record anchor.
 
     A reference/proposal/settings/capability anchor is created closed on purpose and is
     hidden from work by `is_record_anchor`; the raw bd path let a contributor `reopen`
     it (or `close` a forged open one), which the record operations own (kittrial-5bb.64,
-    kittrial-5bb.92 item 4). Runs under the same coordination lock as the write it
-    guards, like `_guard_reserved_labels`, and fails closed when the target cannot be
-    resolved: bd would otherwise act on the last touched issue, which this guard cannot
-    verify.
+    kittrial-5bb.92 item 4). A requirement/brd-section record anchor is covered by the
+    same guard through `is_requirement_record_anchor` (kittrial-5bb.92 review item 1).
+    Any flag that moves status or assignee counts, including the short `-s` spellings,
+    `--claim`, `--defer` and `--assignee` (`status_change_targets`). Runs under the same
+    coordination lock as the write it guards, reads every named target in ONE native
+    read, and fails closed when the target cannot be resolved: bd would otherwise act on
+    the last touched issue, which this guard cannot verify.
     """
     request=status_change_targets(args)
     if request is None:return
@@ -124,14 +161,15 @@ def _guard_record_anchor_status(root,path,args,actor):
     if targets is None:
         raise ValueError('Refusing %s: name exactly the issue(s) to change; bd would otherwise act on the last '
                          'touched issue, whose record-anchor status cannot be verified.'%command)
+    rows=_native_anchor_rows(root,path,actor,targets)
     for token in targets:
-        canonical,labels=_native_labels(root,path,actor,token)
-        row={'labels':sorted(labels)}
-        if carries_record_label(row):
-            row['comments']=_native_comments(root,path,actor,canonical)
-            if is_record_anchor(row):
-                raise ValueError('Refusing to %s %s: it is a reference/proposal/settings/capability record anchor, '
-                                 'whose status only its record operations may change.'%(command,canonical))
+        canonical,row=rows[token]
+        if is_record_anchor(row):
+            raise ValueError('Refusing to %s %s: it is a reference/proposal/settings/capability record anchor, '
+                             'whose status only its record operations may change.'%(command,canonical))
+        if is_requirement_record_anchor(row):
+            raise ValueError('Refusing to %s %s: it is a requirement/brd-section record anchor, whose status only '
+                             'its record operations may change.'%(command,canonical))
 
 def execute(root,request,authority_config=None,require_authority=False):
     name=request['project'];path=project_dir(root,name)

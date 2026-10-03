@@ -16,11 +16,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from reserved_comments import (
     PREFIXES,
+    carries_requirement_label,
     check_comment_body,
     check_raw_request,
     comment_target,
     first_reserved_label,
     is_legitimate_writer,
+    is_record_anchor,
+    is_requirement_record_anchor,
     label_guard_request,
     operator_only_flag,
     operator_only_in_args,
@@ -1329,6 +1332,77 @@ class ReservedLabelMutationGuardTests(unittest.TestCase):
         # No named issue: bd would act on the last touched issue, which is unverifiable.
         self.assertEqual(status_change_targets(['close', '--json']), ('close', None))
         self.assertEqual(status_change_targets(['close', 'task-1', '--mystery']), ('close', None))
+
+    def test_status_change_targets_covers_every_status_and_assignee_spelling(self):
+        # kittrial-5bb.92 review item 1: only `--status` was matched, so the short flag,
+        # --claim, --defer and --assignee bypassed the record-anchor guard entirely.
+        for args, expected in (
+            (['update', 'task-1', '-s', 'open'], ('update', ['task-1'])),
+            (['update', 'task-1', '-sopen'], ('update', ['task-1'])),
+            (['update', 'task-1', '-s=open'], ('update', ['task-1'])),
+            (['update', '-s', 'open', 'task-1'], ('update', ['task-1'])),
+            (['update', 'task-1', 'task-2', '-s', 'in_progress'], ('update', ['task-1', 'task-2'])),
+            (['update', 'task-1', '--claim'], ('update', ['task-1'])),
+            (['update', 'task-1', '--claim=true'], ('update', ['task-1'])),
+            (['update', 'task-1', '--claim=1'], ('update', ['task-1'])),
+            (['update', 'task-1', '--defer', '+1d'], ('update', ['task-1'])),
+            (['update', 'task-1', '--defer=+1d'], ('update', ['task-1'])),
+            (['update', 'task-1', '--assignee', 'bob'], ('update', ['task-1'])),
+            (['update', 'task-1', '-a', 'bob'], ('update', ['task-1'])),
+            (['update', 'task-1', '-abob'], ('update', ['task-1'])),
+        ):
+            with self.subTest(args=args):
+                self.assertEqual(status_change_targets(args), expected)
+        # A last explicit false --claim means bd does not claim, so it cannot move a
+        # status; every unparseable value fails closed instead of guessing.
+        self.assertIsNone(status_change_targets(['update', 'task-1', '--claim=false']))
+        self.assertIsNone(status_change_targets(['update', 'task-1', '--claim=0']))
+        self.assertEqual(status_change_targets(['update', 'task-1', '--claim=false', '--claim']),
+                         ('update', ['task-1']))
+        self.assertIsNone(status_change_targets(['update', 'task-1', '--claim', '--claim=F']))
+        self.assertEqual(status_change_targets(['update', 'task-1', '--claim=maybe']),
+                         ('update', ['task-1']))
+        # The no-id forms fail closed: the guard cannot verify the last touched issue.
+        for args in (['update', '-s', 'open'], ['update', '-sopen'], ['update', '--claim'],
+                     ['update', '--defer', '+1d'], ['update', '--assignee', 'bob']):
+            with self.subTest(args=args):
+                self.assertEqual(status_change_targets(args), ('update', None))
+        # Ordinary title/label/description writes still move no status and stay free.
+        for args in (['update', 'task-1', '--title', 'x'],
+                     ['update', 'task-1', '-t', 'x'],
+                     ['update', 'task-1', '--add-label', 'bug'],
+                     ['update', 'task-1', '--description', 'text']):
+            with self.subTest(args=args):
+                self.assertIsNone(status_change_targets(args))
+
+    def test_requirement_record_anchor_predicate(self):
+        # kittrial-5bb.92 review item 1: requirement/brd-section records are their own
+        # anchor family, covered by the status guard but still visible as work items.
+        revision = 'Kind: requirement-revision-v1\n{"id": "req-1"}'
+        acceptance = 'Kind: requirement-acceptance-v1\n{"id": "req-1"}'
+        row = {'id': 'req-1', 'labels': ['requirement', 'requirement:draft'],
+               'comments': [{'id': 'c-1', 'text': revision}]}
+        self.assertTrue(is_requirement_record_anchor(row))
+        self.assertFalse(is_record_anchor(row))
+        self.assertTrue(carries_requirement_label(row))
+        # brd-section, an acceptance-only record, and the BOM/CRLF view all count.
+        self.assertTrue(is_requirement_record_anchor(
+            {'labels': ['brd-section'], 'comments': [{'id': 'c-1', 'text': revision}]}))
+        self.assertTrue(is_requirement_record_anchor(
+            {'labels': ['requirement', 'requirement:accepted'],
+             'comments': [{'id': 'c-1', 'text': acceptance}]}))
+        self.assertTrue(is_requirement_record_anchor(
+            {'labels': ['requirement'],
+             'comments': [{'id': 'c-1', 'text': '\ufeff' + revision}]}))
+        # The label alone is not evidence, and a lookalike of another family is not one.
+        self.assertFalse(is_requirement_record_anchor({'labels': ['requirement'], 'comments': []}))
+        self.assertFalse(is_requirement_record_anchor(
+            {'labels': ['requirement'],
+             'comments': [{'id': 'c-1', 'text': 'Kind: reference-entry-v1\n{}'}]}))
+        self.assertFalse(is_requirement_record_anchor(
+            {'labels': ['plain'], 'comments': [{'id': 'c-1', 'text': revision}]}))
+        self.assertFalse(is_requirement_record_anchor({'labels': ['requirement']}))
+        self.assertFalse(is_requirement_record_anchor(None))
 
     def test_guard_refuses_reserved_holder_before_native_write(self):
         # Mirror endpoint.execute's locked section: the read-before-write guard

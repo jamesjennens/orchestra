@@ -356,7 +356,7 @@ class AnchoredKind:
             return None
         return ('record', str(comment.get('id')))
 
-    def void_refusal(self, row, payload, dropped=()):
+    def void_refusal(self, row, payload, dropped=(), operators=None):
         """Why a valid void of a comment on this anchor does not apply, else None.
 
         `dropped` are the comments earlier applied voids already name. A void applies to
@@ -368,10 +368,20 @@ class AnchoredKind:
         record, and a void cannot itself be voided (kittrial-5bb.74 review, P2). The
         earliest holder is established by BOTH bd's native order and comment-id
         (UUIDv7) order; when the two disagree the history is conflicted and no void of
-        that place applies (kittrial-5bb.92 item 2). A record the entry reads is the
+        that place applies (kittrial-5bb.92 item 2). That cross-check is a consistency
+        check, not a security boundary: a writer who can rewrite the comment id as well
+        as created_at makes the orders agree again, so it cannot close a native-write
+        hole and a repaired ledger is not proof of authorship (kittrial-5bb.92 review
+        `order-check-limits-and-rollback`). A record the entry reads is the
         ledger itself, so a void of it is refused: withdrawing an entry is a new
         revision or a retirement, which keeps revision numbers monotonic for the writer
         and for an older kit.
+
+        Acceptance evidence whose stored native author is not a live configured
+        operator is inert: it holds no place, so it is the voidable one and the
+        operator's own live evidence is the protected one (kittrial-5bb.92 review
+        item 2). `operators` is the deployment allowlist; None keeps the raw ledger,
+        for direct library callers.
         """
         kind = payload['target_kind']
         if not kind.startswith(self.family):
@@ -387,6 +397,16 @@ class AnchoredKind:
         holders = [comment for comment in comments if isinstance(comment.get('text'), str)
                    and recovery.claims_kind(comment['text'], kind) and self.record_slot(kind, comment, row) == slot]
         place = ('revision %s' if slot[0] == 'revision' else 'the acceptance evidence for revision %s') % slot[1]
+        if slot[0] == 'acceptance' and operators is not None:
+            # An inert evidence record (its native author is not on the deployment
+            # allowlist) is not a holder of the place: it cannot be the legitimate
+            # record, so a void of it applies, and it never outranks the live record.
+            allowlist = configured_operators(operators)
+            live = [comment for comment in holders
+                    if isinstance(comment.get('author'), str) and comment['author'] in allowlist]
+            if target not in live:
+                return None
+            holders = live
         if len(holders) > 1:
             # bd orders comments by the stored created_at, which direct SQL can rewrite; a
             # comment id is UUIDv7, so id order is the real creation order. When the two
@@ -443,7 +463,7 @@ class AnchoredKind:
                             'configured operator' % comment_id} for comment_id in invalid]
         applied, dropped = [], set()
         for payload, comment in voids:
-            reason = self.void_refusal(row, payload, dropped)
+            reason = self.void_refusal(row, payload, dropped, operators)
             if reason is not None:
                 notes.append({'code': 'void-refused',
                               'detail': 'void record %s is not applied: %s' % (comment.get('id'), reason)})
@@ -763,7 +783,7 @@ class AnchoredKind:
         if not recovery.preserves(raw, payload):
             raise ValueError('Operator void record must preserve the exact current bytes of ' + payload['target'])
         dropped = {applied['target'] for applied, _ in self.applied_voids(row, operators)[0]}
-        reason = self.void_refusal(row, payload, dropped)
+        reason = self.void_refusal(row, payload, dropped, operators)
         if reason is not None:
             raise ValueError('Operator void refused for %s: %s' % (payload['target'], reason))
         raw = run(['comments', 'add', row['id'], recovery.PREFIX + canonical_bytes(payload).decode('utf-8'), '--json'])
@@ -1114,6 +1134,17 @@ class AnchoredKind:
                         if author == item['operator'] and author in allowlist]
                 if live:
                     chosen = (number, live[0][0])
+                    # An inert evidence record beside a live one is not silent: it holds
+                    # no place, but the reader names it (kittrial-5bb.92 review item 2).
+                    live_items = [item for item, _ in live]
+                    for item, author in evidence:
+                        if any(item is kept for kept in live_items):
+                            continue
+                        view['warnings'].append({'code': 'inert-evidence',
+                                                 'detail': 'revision %d also carries acceptance evidence written by '
+                                                           '%s, who is not on the deployment operator allowlist; it '
+                                                           'is inert and the live evidence stands'
+                                                           % (number, author or item['operator'])})
                     break
                 if inert is None:
                     inert = (number, evidence[0][1] or evidence[0][0]['operator'])

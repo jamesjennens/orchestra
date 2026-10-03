@@ -562,6 +562,28 @@ class LifecycleTests(ProposalCase):
         self.assertEqual((view['linked_requirement']['acceptance_state'], view['text']['trust']),
                          ('accepted', 'incorporated'))
 
+    def test_an_incorporation_ignores_a_plant_beside_the_operators_evidence(self):
+        # kittrial-5bb.92 review item 3: _check_incorporation reads the acceptance
+        # ledger through the live operator filter, so a contributor-planted record beside
+        # the operator's real evidence for revision 2 does not fail the disposition with
+        # conflicting acceptance evidence (which the unfiltered reader raises).
+        requirement = self.requirement('R01', accepted=True)
+        row = self.native.row(requirement)
+        accepted = rq.existing_revisions(row)[2]
+        bound = rq.core.bind_acceptance(acceptance(decision_id='dec-plant'), accepted)
+        _, body = rq.acceptance_evidence(bound, requirement, 2, accepted['acceptance_state'],
+                                         'mallory', at='2026-10-01T13:00:00Z')
+        self.plant(requirement, body, 'mallory')
+        # The unfiltered reader sees the conflicting pair; the live filter does not.
+        with self.assertRaisesRegex(ValueError, 'conflicting acceptance evidence for one revision'):
+            rq.existing_acceptances(row)
+        self.assertEqual(sorted(rq.existing_acceptances(row, OPS)), [2])
+        key = self.submit()['key']
+        self.claim(key)
+        self.dispose(key, 'incorporated', incorporation=self.incorporation(
+            requirement, revision=2, acceptance_decision_id='dec-1'))
+        self.assertEqual(self.get(key)['linked_requirement']['acceptance_state'], 'accepted')
+
     def test_a_disposition_retry_is_adopted_and_a_crash_before_the_label_is_finished(self):
         key = self.submit()['key']
         first = self.dispose(key, 'under-review', operation_id='claim-1')

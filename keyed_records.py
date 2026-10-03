@@ -243,6 +243,11 @@ def existing_ledger(row, prefix, parse, noun, what, key, belongs=None, keep=None
     `keep(comment, record)`, when given, decides whether a well-formed record takes part
     in the ledger at all (an acceptance whose native author is not a configured operator
     does not). It runs after the strict parse, so a malformed comment still fails closed.
+
+    For acceptance evidence (`what == 'acceptance'`) a second record for one revision is
+    only a conflict when it carries a DIFFERENT decision; two records with the same
+    decision are one decision recorded twice, and the first in native order stands
+    (kittrial-5bb.92 review item 3).
     """
     found = {}
     task = row.get('id')
@@ -263,8 +268,10 @@ def existing_ledger(row, prefix, parse, noun, what, key, belongs=None, keep=None
             continue
         slot = record[key]
         prior = found.get(slot)
-        if prior is not None and prior != record:
-            raise ValueError(conflict_message(noun, what, task))
+        if prior is not None:
+            if prior != record and not (what == 'acceptance' and same_acceptance_decision(prior, record)):
+                raise ValueError(conflict_message(noun, what, task))
+            continue   # a duplicate of one decision: the first in native order stands
         found[slot] = record
     return found
 
@@ -273,6 +280,19 @@ def conflict_message(noun, what, task):
     if what == 'revision':
         return 'conflicting content for one id/revision: ' + str(task)
     return 'conflicting acceptance evidence for one revision on ' + str(task)
+
+
+# The fields that identify one F3 acceptance decision. Two evidence records for one
+# revision can both be live when an operator wrote the first, was removed, and another
+# operator accepted: the writer must not rewrite that decision, but a second record that
+# carries the SAME decision is not a conflict - the first in native order stands. Only a
+# differing record hash or decision object is a conflict (kittrial-5bb.92 review item 3).
+ACCEPTANCE_DECISION_FIELDS = ('record_sha256', 'decision')
+
+
+def same_acceptance_decision(first, second):
+    """True when two acceptance records carry the same decision for one revision."""
+    return all(first.get(name) == second.get(name) for name in ACCEPTANCE_DECISION_FIELDS)
 
 
 def latest_revision(existing):
@@ -470,10 +490,14 @@ def apply_native(payload, actor, run, project, spec, operator=False, operators=N
         evidence_record, candidate = spec.acceptance_evidence(
             bound, task, revision, record, actor)
         # Only acceptance evidence whose stored native author is a live configured
-        # operator counts as a prior decision the writer must not rewrite; the reader
-        # applies the same author rule. A planted acceptance (a contributor cannot
-        # write one, but a raw nudge can) therefore never makes the operator's own
-        # apply return 0 without evidence (kittrial-5bb.92 item 1, p74 5c).
+        # operator counts as a prior decision the writer must not rewrite. The
+        # reference and capability readers apply the same author rule when they select
+        # the accepted revision; a requirement record's reader does NOT - it reads the
+        # controlled state label and the latest revision's `acceptance_state`, and the
+        # durable evidence is only the binding an operator's apply left behind. A
+        # planted acceptance (a contributor cannot write one, but a raw nudge can)
+        # therefore never makes the operator's own apply return 0 without evidence
+        # (kittrial-5bb.92 item 1, p74 5c; reader note corrected in item 3).
         prior_evidence = spec.live_acceptances(row, operators).get(revision)
         if prior_evidence is not None:
             if (prior_evidence.get('record_sha256') != evidence_record['record_sha256']

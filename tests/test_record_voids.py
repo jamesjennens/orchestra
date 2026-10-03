@@ -243,7 +243,10 @@ class ReferenceVoidTests(VoidCase):
         # Review P2, case B: duplicate acceptance evidence for one revision. Evidence a
         # non-operator planted is inert rather than a conflicting ledger entry
         # (kittrial-5bb.92 item 1), so the writer records its own decision; the earliest
-        # holder among the records it counts is still never voidable.
+        # holder among the records it counts is still never voidable. The plant is later
+        # and inert, so the operator's earliest live record is refused as a well-formed
+        # record rather than as an earliest holder with an inert alternative
+        # (kittrial-5bb.92 review item 2).
         self.propose()
         self.accept(1, self.sha(1))
         legitimate = self.comment('ref-1', 'Kind: reference-acceptance-v1')
@@ -254,13 +257,42 @@ class ReferenceVoidTests(VoidCase):
         _, body = rr.acceptance_evidence(bound, 'ref-1', 2, accepted, OPERATOR, at='2026-10-01T12:00:00Z')
         planted = self.native.add_comment('ref-1', body, author='mallory')
         self.assertEqual(self.accept(2, accepted['sha256'])['revision'], 3)   # the inert copy is ignored
-        with self.assertRaisesRegex(ValueError, 'earliest holder of the acceptance evidence for revision 2'):
+        with self.assertRaisesRegex(ValueError, 'well-formed reference-acceptance record the entry reads'):
             self.void(void_payload('ref-1', legitimate['id'], legitimate['text'], kind='reference-acceptance'))
         self.void(void_payload('ref-1', planted['id'], planted['text'], kind='reference-acceptance'))
         view = self.get()
         self.assertEqual((view['state'], view['acceptance']['decision_id'], view['acceptance_inert']),
                          ('accepted', 'decision-42', False))
         self.assertEqual(self.accept(3, self.sha(3))['revision'], 4)   # the writer agrees again
+
+    def test_an_inert_plant_is_the_voidable_holder_not_the_operators_evidence(self):
+        # kittrial-5bb.92 review item 2 (checkpoint `inert-dup-holder`): the plant is
+        # earliest in native order but its author is not a live operator, so it holds no
+        # place. Voiding the operator's own evidence would drop the entry to draft-only;
+        # the plant must be the voidable record and the operator's evidence the
+        # protected one, and the reader must warn about the inert pair.
+        self.propose()
+        draft = rr.existing_revisions(self.native.row('ref-1'))[1]
+        future = {name: value for name, value in draft.items() if name != 'sha256'}
+        future.update(revision=2, acceptance_state='accepted', successor=None)
+        future['sha256'] = rr.core.content_hash(future)
+        bound = rr.core.bind_acceptance(acceptance(), future)
+        _, plant_body = rr.acceptance_evidence(bound, 'ref-1', 2, future, 'mallory')
+        plant = self.native.add_comment('ref-1', plant_body, author='mallory')
+        self.accept(1, draft['sha256'])
+        live = next(comment for comment in self.native.row('ref-1')['comments']
+                    if comment['text'].startswith('Kind: reference-acceptance-v1\n')
+                    and comment['author'] == OPERATOR)
+        ids = [comment['id'] for comment in self.native.row('ref-1')['comments']]
+        self.assertLess(ids.index(plant['id']), ids.index(live['id']))   # the plant is earliest
+        view = self.get()
+        self.assertEqual(view['state'], 'accepted')
+        self.assertIn('inert-evidence', [warning['code'] for warning in view['warnings']])
+        # The operator's live evidence is protected; the inert plant is the voidable one.
+        with self.assertRaisesRegex(ValueError, 'well-formed reference-acceptance record the entry reads'):
+            self.void(void_payload('ref-1', live['id'], live['text'], kind='reference-acceptance'))
+        self.void(void_payload('ref-1', plant['id'], plant['text'], kind='reference-acceptance'))
+        self.assertEqual(self.get()['state'], 'accepted')
 
     def test_a_planted_future_acceptance_does_not_replace_the_operators_own_evidence(self):
         # kittrial-5bb.92 item 1 (p74 5c): a contributor plants evidence for the FUTURE

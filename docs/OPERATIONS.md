@@ -599,9 +599,27 @@ from `bd export --all`, as in the scan above.
   a revision, that an **earlier** comment of the same kind already holds. Of a
   conflicting or duplicated pair, only the later one can be voided: the writer never
   writes a second holder, so the earliest is the only one it can have written, and a
-  void cannot itself be voided. A well-formed record the entry reads is refused at
-  write and ignored on read. A void repairs history and never withdraws a decision: to
-  replace an entry, revise it and accept the new revision, or retire the key.
+  void cannot itself be voided. Acceptance evidence whose stored native author is not a
+  live configured operator is inert: it is not a holder of the place, so it is the
+  voidable record and the operator's live evidence beside it is the protected one
+  (kittrial-5bb.92 review `plant-protected-by-void-rule`). A well-formed record the entry
+  reads is refused at write and ignored on read. A void repairs history and never
+  withdraws a decision: to replace an entry, revise it and accept the new revision, or
+  retire the key.
+- **The earliest-holder cross-check is a consistency check, not a security boundary.**
+  The earliest holder is established by **both** bd's native (stored `created_at`) order
+  and comment-id (UUIDv7) order. An edit of `created_at` alone is visible because the two
+  orders then disagree. Someone who can write the native database can rewrite the comment
+  `id` too, make the orders agree, and leave the legitimate record as the later - and so
+  voidable - holder. It raises the cost of a forgery and surfaces a partial one; it does
+  not close the hole and a repaired ledger is not proof of authorship
+  (kittrial-5bb.92 review `order-check-limits-and-rollback`).
+- **When the two orders disagree.** The history is conflicted, **no** void of that place
+  applies, and the kit has no command that repairs it: both holders stay. The operator
+  stops, reads the anchor natively (`bd show ANCHOR --include-comments`), decides which
+  record is genuine, and repairs the stored order from a native backup or with the native
+  tooling (recording the reason on the project), then re-reads. Do not guess, and do not
+  void either holder to force a state the ledger cannot justify.
 - **What readers show.** The entry reads as if the voided comment were absent, and its
   `warnings` carry `record-voided`. A void written around the host command is reported
   instead: `void-invalid` (malformed, stale, out of order, or not written by a
@@ -625,8 +643,15 @@ from `bd export --all`, as in the scan above.
   not read voids at all, so a repaired entry reads `malformed` again there (only that
   entry). The anchor stays hidden. A review read of the anchor, if one reaches it, lists
   the void among ignored operator void comments. An older `void-record` refuses these
-  target kinds before any write. No sidecar path is added, so backups restore on either
-  kit, and rolling forward restores the repair with nothing to clean up.
+  target kinds before any write. An older kit also counts every acceptance evidence
+  record with no author rule, so on an entry where this kit wrote the operator's own
+  evidence beside an inert plant for one revision, the older kit refuses any further
+  accept with `conflicting acceptance evidence for one revision` and cannot void the
+  plant (it still reads the plant as a holder). Reconcile that entry natively or restore
+  from a backup; rolling forward to this kit restores the repair with nothing to clean
+  up (kittrial-5bb.92 review `order-check-limits-and-rollback`). No sidecar path is
+  added, so backups restore on either kit, and rolling forward restores the repair with
+  nothing to clean up.
 - **Limits.** A record of a newer version (`Kind: reference-entry-v2`) or of an unknown
   kind of the family cannot be a void target: the target must claim the v1 prefix of
   the declared kind, exactly or through the BOM/CRLF view the readers use. It stays
