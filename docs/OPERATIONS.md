@@ -304,6 +304,18 @@ index. It also removes a symlink, directory or unopenable lock file found at
 `.capability-misses.json`, `.capability-misses.json.tmp` or `.capability-misses.lock`,
 without following a link. Deleting those paths by hand is equally safe.
 
+### A duplicated record key
+
+A reference or capability key normally has exactly one anchor. If a second anchor carries the same key label, `get` reports `duplicate-key` (when exactly one anchor has live acceptance evidence, that one is still shown) or `conflicted` (no record is shown), `list` and coverage name every anchor, and **every write on that key is refused** until an operator reconciles the anchors. Contributors cannot create a duplicate through the endpoint; it takes native access on the host.
+
+The kit has no command for this repair yet. On the host, as an operator, first read both anchors (`capability get KEY` or `ref get KEY` names them, and `history` shows each one), decide which is the genuine one, then remove the type, key and state labels from the other with the native tool under the kit environment, for example for a capability:
+
+```sh
+bd update PROJECT-FORGED --remove-label capability --remove-label capability-key:KEY-SLUG --remove-label capability:accepted
+```
+
+Use the labels the forged anchor actually carries (`bd show PROJECT-FORGED --json`). The stripped issue stays in the database, closed, with its comments, as evidence; it no longer counts as an anchor, and writes on the key work again. Record what you did and why on the genuine anchor's project, and take a backup afterwards. When both anchors have live acceptance evidence, do not guess: retire the key or ask the project owner.
+
 ### Malformed structured history
 
 A comment that claims a reserved machine format (`Kind: contribution-review-v1`, `Kind: task-checkpoint-v1`) but fails validation makes `brief`, `review` and `refresh` fail for that task. Repair it on the host; never edit or delete rows in the native database.
