@@ -34,8 +34,8 @@ PREFIX_WRITERS = {
     'Kind: reference-entry-v1\n': 'ref propose|revise',
     'Kind: reference-acceptance-v1\n': 'admin.py reference-apply',
     'Kind: requirement-proposal-v1\n': 'proposal submit|revise',
-    'Kind: proposal-disposition-v1\n': 'proposal review|decide',
-    'Kind: contribution-settings-v1\n': 'proposal settings|hide-self',
+    'Kind: proposal-disposition-v1\n': 'admin.py proposal-review|proposal-decide',
+    'Kind: contribution-settings-v1\n': 'admin.py proposal-settings',
     'Kind: capability-entry-v1\n': 'capability propose|revise',
     'Kind: capability-acceptance-v1\n': 'admin.py capability-apply',
     'Kind: capability-verification-v1\n': 'capability check --record',
@@ -829,15 +829,19 @@ class NoWriterTests(unittest.TestCase):
         # The .41 slice 1 writer (kittrial-5bb.66) owns the reference family; the .60
         # slice 1a writer (kittrial-5bb.67) owns the capability entry, acceptance and
         # alias records; the slice 1b writer (kittrial-5bb.69) owns capability
-        # verification. Proposals and settings have no writer yet. recovery.py names the
-        # reference and capability kinds as operator void targets (kittrial-5bb.74); it
-        # writes none of those records, only a `record-void-v1` comment that names one.
+        # verification; the .58 slice 1a writer (kittrial-5bb.68) owns proposals,
+        # dispositions and contribution settings. recovery.py names the reference and
+        # capability kinds as operator void targets (kittrial-5bb.74); it writes none of
+        # those records, only a `record-void-v1` comment that names one.
         writers = {'recovery.py': ('Kind: reference-', 'Kind: reference-entry-v1', 'Kind: reference-acceptance-v1',
                                    'Kind: capability-', 'Kind: capability-entry-v1',
                                    'Kind: capability-acceptance-v1', 'Kind: capability-verification-v1',
                                    'Kind: capability-alias-v1'),
                    'reference_records.py': ('Kind: reference-', 'Kind: reference-entry-v1',
                                             'Kind: reference-acceptance-v1'),
+                   'proposal_records.py': ('Kind: requirement-proposal-', 'Kind: proposal-disposition-',
+                                           'Kind: contribution-settings-', 'Kind: requirement-proposal-v1',
+                                           'Kind: proposal-disposition-v1', 'Kind: contribution-settings-v1'),
                    'capability_records.py': ('Kind: capability-', 'Kind: capability-entry-v1',
                                              'Kind: capability-acceptance-v1', 'Kind: capability-alias-v1'),
                    'capability_verification.py': ('Kind: capability-', 'Kind: capability-verification-v1')}

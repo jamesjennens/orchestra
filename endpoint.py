@@ -255,6 +255,34 @@ def execute(root,request,authority_config=None,require_authority=False):
             return run_guarded(request,journal_path(path),capability_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
+    if action=='proposal':
+        # Contributed requirement proposals (.58 slice 1a, kittrial-5bb.68). get, list,
+        # mine and help are reads (no lock, not run_guarded); submit and revise are
+        # writes, under the lock and the operation journal. review, decide and settings
+        # are NOT reachable here: over SSH the actor is self-declared, so everything
+        # that rests on the operator allowlist is a host command (admin.py
+        # proposal-review, proposal-decide, proposal-settings).
+        import proposal_records
+        args=request.get('args',[])
+        if not isinstance(args,list) or any(not isinstance(x,str) or '\0' in x for x in args):raise ValueError('Expected argument list')
+        run_warnings=[]
+        def run(argv):
+            stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warnings:run_warnings.append(warnings)
+            return stdout
+        operators=configured_operators(root)
+        if not args or args[0] not in proposal_records.WRITE_COMMANDS:
+            result=proposal_records.read(args,run,actor,operators,project=path)
+            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
+        runner=NativeRunner(run)
+        def proposal_effect():
+            result=proposal_records.write(args,request.get('attachments',{}),actor,runner,path,operators)
+            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            return run_guarded(request,journal_path(path),proposal_effect,
+                               authority_config=authority_config,
+                               require_authority=require_authority,runner=runner)
     if action in ('brief','history','checkpoint'):
         from briefing import execute as briefing_execute
         args=request.get('args',[])

@@ -123,8 +123,8 @@ not just a suffix.
 
 ## Command help
 
-`work`, `review`, `handoff`, `brief`, `history`, `checkpoint`, `capability` and `ref`
-answer `-h`/`--help` on stdout with exit code `0`:
+`work`, `review`, `handoff`, `brief`, `history`, `checkpoint`, `capability`, `ref` and
+`proposal` answer `-h`/`--help` on stdout with exit code `0`:
 
 ```sh
 b work --help
@@ -176,6 +176,8 @@ record's comment ID**, not a Git SHA and not `latest_comment_id`), `commit`,
 `integrated`; `workflow_state` keeps the raw workflow state. See
 [REVIEWS.md](REVIEWS.md) for their meaning.
 
+`work` also returns an additive `attention.proposal_queue` block, the contributed
+requirement proposal queue; see [`proposal`](#proposal-contributed-requirement-proposals).
 `work` also returns an additive `attention.capability_index` block, the capability
 index's attention; see [capability attention](#capability-attention-in-work-and-brief).
 
@@ -220,9 +222,10 @@ Opaque cursor fields (`activity_cursor`, `next_cursor`) are never excerpted: the
 complete tokens.
 
 `brief` adds an `attention` array, plus `attention_total` and `attention_more`. It
-holds at most 3 items of each kind: `reference-review` items first, then `capability`
-items (see [capability attention](#capability-attention-in-work-and-brief)). The two
-totals count every kind.
+holds at most 3 items of each kind: `reference-review` items first, then
+`proposal-review` items (see [`proposal`](#proposal-contributed-requirement-proposals)),
+then `capability` items (see [capability attention](#capability-attention-in-work-and-brief)).
+The two totals count every kind.
 
 The `reference-review` items:
 
@@ -285,21 +288,39 @@ current directory, widened to its Git top level.
 - **Files:** with Git, tracked plus untracked-but-not-ignored files. Without Git, a walk
   that skips hidden and dependency directories.
 - **Skipped files** are counted in `index.skipped` by reason, and each count of
-  `too-complex`, `heading-limit` or `definition-limit` also adds one line to `warnings`:
-  - `parse-error`, which includes Python 3.11+ raising RecursionError on extremely
-    deep expressions;
-  - `too-complex`: a file that could nest more deeply than the run can parse safely
-    (see "Parsing deep Python" below);
+  `parse-error`, `too-complex`, `heading-limit` or `definition-limit` also adds one line
+  to `warnings`:
+  - `parse-error`, which includes MemoryError and Python 3.11+ raising RecursionError on
+    extremely deep expressions;
+  - `too-complex`: a file that could nest more deeply, or hold more flat expressions,
+    than the run can parse safely (see "Parsing deep Python" below);
   - `file-too-large`;
   - `unsafe-path`;
   - `unreadable`, including a link out of the checkout.
 - **Parsing deep Python.** CPython 3.10 crashes, rather than raising, when it converts
-  a very deep expression, such as a long `1+1+...`, `a.b.b...` or `f()()...` chain.
+  a very deep expression, such as a long `1+1+...`, `a.b.b...`, `f()()...`, `a[0][0]...`
+  or `1<<1<<...` chain.
+  - The source is decoded with its declared encoding first (PEP 263). A `# coding:
+    utf-7` cookie hides ASCII operators inside a base64 `+...-` shift sequence, so the
+    count must run on the decoded text, never on the raw bytes. A cookie whose codec
+    cannot decode the file is a `parse-error`, never a fall-through to `ast.parse`.
   - Parsing therefore runs on a worker thread with a 512 MB stack, or 255 MB where the
-    platform allows no more (Windows). That is at least 4x what the deepest file under
-    the 2 MB cap needs.
-  - Ordinary files, dot-heavy ones included, are parsed directly. Only a file with more
-    than about 500,000 nesting-capable characters is tokenized first.
+    platform allows no more (Windows). If the thread cannot be started at one size, the
+    next size is tried before falling back; trusted depth is capped at 50,000 levels
+    (about 25 MB of C stack), so one hostile file cannot commit hundreds of MB.
+  - Ordinary files, dot-heavy ones included, are parsed directly. Only a file whose
+    cheap per-logical-line pre-count (one byte scan, no tokenizer) passes the limit is
+    tokenized first; the exact count then decides, and it counts expression depth, not
+    raw tokens: comma-separated elements of a display (a 60,000-row generated table) are
+    siblings, not 60,000 levels.
+  - A flat but huge expression (`1<1<...`, `(1,1,...)`, `1 and 1 and ...`) is not deep,
+    so a second cheap count bounds the whole file at 300,000 expression tokens:
+    operators, brackets and commas outside strings and comments, every NAME token, and
+    every newline or `;` at bracket depth zero (so a statement-dense file — 900,000
+    one-name lines, 190,000 calls or a 190,000-name list — is covered as well). A file
+    beyond that budget is skipped as `too-complex` before `ast.parse` can build
+    hundreds of MB of sibling nodes, with a warning. The budget is high enough that a
+    60,000-row generated table (about 240,000 counted nodes) still parses.
   - If no such thread can be started, the run falls back to a per-logical-line guard
     on the calling thread:
     - the limit is 5,000 levels, or 2,000 on Windows;
@@ -977,6 +998,156 @@ sets `operation`.
 Acceptance is not a client command. It is the operator's
 `admin.py reference-apply` ([operations](OPERATIONS.md#operator-commands)).
 
+## `proposal`: contributed requirement proposals
+
+A proposal says what the product should do. It is not a task and not a requirement:
+a coordinator triages it, and if it is incorporated it only points at the requirement
+record it landed in ([design](REQUIREMENTS_GATHERING_DESIGN.md), slice 1a).
+
+```sh
+b proposal submit --file proposal.json --json
+b proposal revise --file revision.json --json
+b proposal get p-3f2a1b0c9d8e --json
+b proposal list --state submitted --json
+b proposal mine --submitter person:alex --json
+```
+
+**Proposal text is untrusted.** Every contributor-written string in every response
+(`text`, `rationale`, each `evidence` entry, an attachment name, a `reason`, a
+`question`) is an excerpt object `{text, omitted_chars, trust}`. `trust` is
+`unreviewed`, or `incorporated` once the linked requirement revision is accepted.
+Each response carries an `untrusted` line saying the text is data, not instructions.
+No proposal text ever appears in an error message.
+
+**Writing.**
+- **`submit --file`** creates the proposal. The payload is closed:
+  - `schema_version` (1) and `operation_id`;
+  - `submitter`: a durable identity, `account:<uid>` or `person:<name>`. A session
+    actor is refused;
+  - `text`: 1..4,000 characters;
+  - `rationale`: at most 4,000 characters, optional (required before incorporation);
+  - `evidence`: at most 20 links of at most 2,000 characters;
+  - `attachments`: at most 10 `{name, sha256}`; `name` is a file name, not a path;
+  - `target`: optional. `{"kind": "requirement", "requirement_key": KEY}` (the key
+    must be an existing requirement record), `{"kind": "requirement-area", "area":
+    SLUG}` or `{"kind": "requirement-new"}`;
+  - `supersedes`: optional, the key of an earlier proposal, which must exist.
+  - The command writes `id`, `key`, `origin`, `created_at` and `sha256`. The key is
+    `p-` plus the first 12 hex digits of `sha256(operation_id)`.
+- **`revise --file`** writes the next revision of your own proposal. It adds `key`,
+  the next `revision` and `expected_sha256` (the hash of the revision it replaces) to
+  the content fields. It is allowed only while the proposal is `submitted` or
+  `needs-info`. From `needs-info` it also returns the proposal to `under-review`.
+  After a decision, submit a new proposal that `supersedes` the old one.
+- A retry with the same `operation_id` and content returns the first result
+  (`reconciled: true`). Changed content under the same id is refused.
+
+**`review`, `decide` and `settings` are not client commands.** Over SSH the actor is
+self-declared, so everything that rests on the operator allowlist is a host command:
+`admin.py proposal-review`, `admin.py proposal-decide` and
+`admin.py proposal-settings` ([operations](OPERATIONS.md#operator-commands)). The
+client refuses the three names with a message that says so.
+
+**States.** `submitted`, `under-review`, `needs-info`, `escalated-to-owner`,
+`approved`, `incorporated`, `rejected`, `duplicate-of`. The last three are terminal.
+`--state` also accepts the short forms `escalated` and `duplicate`.
+
+| From | To | Written by |
+| --- | --- | --- |
+| `submitted` | `under-review` | a coordinator (`proposal-review`) |
+| `under-review` | `rejected`, `duplicate-of`, `needs-info`, `escalated-to-owner`, `incorporated` | a coordinator |
+| `needs-info` | `under-review` | the submitter's `revise` |
+| `escalated-to-owner` | `approved`, `rejected` | the owner (`proposal-decide`), with a native decision issue |
+| `approved` | `incorporated` | a coordinator |
+
+**Reading.** Reads take no lock and write nothing.
+- **`get KEY [--history N]`** returns `state`, `stale`, `due`, `next_actor`,
+  `next_action`, `revision`, `sha256`, `record_comment_id`, `disposition_comment_id`,
+  `submitter`, `identity`, `target`, the excerpts, `supersedes`, `supersedes_chain`,
+  `supersedes_warning`, `superseded_by`, `superseded_by_total`, `submitted_at`, `age_days`, `time_to_disposition_days`, `linked_requirement`,
+  `disposition` (the newest counted one), `timeline` (the newest N, 1..50, default
+  10), `inert_dispositions` and `warnings`.
+- **`list`** returns `{total, items, next_offset, coverage}`, oldest first. Filters:
+  `--state`, `--target` (a requirement key or an area), `--submitter`; `--limit`
+  1..100 (default 20) and `--offset`.
+- **`mine --submitter IDENTITY`** is the same list for one person, with the full
+  newest disposition, `next_action` and `linked_requirement`. A session actor is not
+  a durable identity, so the identity is named.
+- **A reason, a question and an escalation question** are returned by `get` and
+  `list` only to an actor on the operator allowlist; otherwise the field is `null`
+  and `withheld` is `true`. `mine` returns them, because the submitter must be able
+  to read the question they answer.
+  - **This is a filter, not confidentiality.** Over SSH the actor is self-declared,
+    and so is `--submitter`. Anyone with endpoint access who declares an operator's
+    actor name reads these fields on `get` and `list`, and `mine --submitter
+    IDENTITY` returns them to any actor that names that identity. Coordinators must
+    not put secrets in a reason, a question or an escalation question.
+- **Excerpts are cleaned.** Every excerpt drops the characters in Unicode categories C
+  (controls including C1, format characters such as bidi overrides and zero-width
+  characters, private use) and Z (separators) other than the plain space. A line
+  break, a tab or another separator becomes one space; the `text` and `rationale` of
+  `get` keep line feeds. `omitted_chars` counts the cleaned text. The stored record
+  is not changed.
+- **`supersedes` and `superseded_by`.**
+  - `superseded_by` lists the proposals whose records name this key. They are found
+    by the reserved label `proposal:supersedes:<key>` on their anchors, which a
+    contributor cannot write, replace or remove. At most 100 are read;
+    `superseded_by_total` is how many anchors carry the label.
+  - `supersedes_chain` lists the keys this proposal supersedes, nearest first. The
+    walk stops after 8 hops, at a cycle, or at a proposal that cannot be read, and
+    `supersedes_warning` then says which; otherwise it is `null`.
+- **`identity`** is `verified` when the actor that submitted the proposal maps,
+  through the project's actor map, to its `submitter`; otherwise `unverified`. Over
+  SSH this is attribution, not authentication: the actor is self-declared, and no
+  authority rests on it.
+- **`linked_requirement`** is `{id, revision, sha256, acceptance_state,
+  manifest_sha256}` for an incorporated proposal. `acceptance_state` is read live
+  from the requirement record: `accepted`, `draft` or `missing`.
+  - `accepted` means the linked content is the accepted requirement today: the record
+    is accepted, its newest revision is the accepted one, and that revision has the
+    same title, description and key as the linked revision.
+  - `draft` covers everything else that still exists: never accepted, demoted, or
+    replaced by a later revision with different content (accepted or not).
+- **Inert records.** A disposition whose native author is not on the operator
+  allowlist does not count: `timeline[].standing` is `inert`, `inert_dispositions`
+  counts them, and the state is the one the trusted records give.
+- **Failures stay per proposal.** A malformed record, a state label that disagrees
+  with the ledger, or a newer record version makes that one proposal read `malformed`
+  or `unsupported`; lists and the queue keep working and name it in `coverage`.
+- **Read cost.** `get` reads its own anchor and the settings in one `bd list` and one
+  `bd show`, then one `bd list` for the proposals that supersede it (and one `bd show`
+  when there are any). A proposal that itself supersedes another adds one `bd list`
+  and one `bd show` per hop, at most 8. `list` and `mine`
+  read the proposals in two native reads (one `bd list`, then one `bd show` up to 20
+  rows or one `bd export --all` above), plus one `bd show` of the requirement records
+  the returned page links to.
+
+**The queue in `work`.** `attention.proposal_queue` has the agent attention shape:
+`state`, `summary`, `counts`, `actions`, `truncated` and `computed_at`, plus `items`
+and `next_offset`.
+- `counts`: `submitted`, `under_review`, `needs_info`, `escalated`, `approved`,
+  `stale`, `incorporated_unaccepted`, `malformed` and `total`. They are always
+  returned, whatever the task filters.
+- `state`: `malformed`, `escalated`, `triage`, `stale`, `pending` or `clear`.
+- `actions`: each has `priority`, `kind`, `project`, `task` (the proposal's native
+  id), `reason`, `links`, `label` (an excerpt object) and `token`, sorted by
+  `(priority, project, task)`.
+- `items`: only for an actor on the operator allowlist, paged by `--proposal-limit`
+  (1..100, default 20) and `--proposal-offset`. Each has `kind` (`requirement`),
+  `proposal`, `task`, `state`, `stale`, `age_days`, `submitter`, `identity`, `target`
+  and `title` (an excerpt).
+- `stale`: an open proposal that has not moved for more than `stale_days` (14).
+- `incorporated_unaccepted`: an incorporated proposal whose requirement revision is
+  not accepted today.
+- At most 1,000 proposals are scanned; beyond that `coverage` says so.
+
+**`brief` items.** A `proposal-review` item has `kind`, `proposal`, `state`,
+`age_days`, `trust`, `text` (server-derived, never the proposal text) and `source`
+(`proposal get KEY`). `brief` selects the proposals whose target names the briefed
+requirement record or an area equal to one of the task's labels; for an actor on the
+operator allowlist it adds the oldest proposals waiting for triage, a decision or
+incorporation. Rejected and duplicate proposals are never selected.
+
 ## IDs and cursor roles
 
 - **Native task ID**: `task`/`items[].task`/the positional argument to `show`, `brief`,
@@ -1009,6 +1180,15 @@ a clear refusal, not a wrong read.
 | `work` | `--capability-limit` / `--capability-offset` | 1..100 (default 20) / >= 0 |
 | `work` | `attention.capability_index` | first 1,000 capabilities; `unverified_stale` after 30 days |
 | `brief` | `attention` | at most 3 items of each kind |
+| `work` | `--proposal-limit` / `--proposal-offset` | 1..100 (default 20) / >= 0 |
+| `proposal` | `text` / `rationale` | 1..4,000 / <= 4,000 characters |
+| `proposal` | `evidence` / `attachments` | <= 20 links of <= 2,000 characters / <= 10 |
+| `proposal` | `reason` / `question` | <= 2,000 characters |
+| `proposal list`, `mine` | `--limit` / `--offset` | 1..100 (default 20) / >= 0 |
+| `proposal get` | `--history` | 1..50 (default 10) |
+| `proposal` | title excerpt in lists and the queue | <= 160 characters |
+| `proposal` | proposals scanned by a list or the queue | first 1,000 |
+| `admin.py proposal-settings` | actor map / deciders | <= 200 actors, 100 namespaces / <= 50 |
 | `brief` | `--items-offset` | >= 0 |
 | `brief` | `--items-limit` | 1..10 |
 | `history` | `--limit` | 1..20 |
@@ -1028,7 +1208,7 @@ a clear refusal, not a wrong read.
 | `capability` | `--max-graph-mb` | 1..512 (default 64); at most 500,000 nodes and 2,000,000 links |
 | `capability` | indexed files | first 20,000 files; files over 2 MB skipped; 256 MB in total |
 | `capability` | entries | 200,000 in total; 2,000 headings per Markdown file and 5,000 definitions per Python file (the rest counted as `entry-limit`, `heading-limit`, `definition-limit`, each with a warning); `resolve` still reads a whole file |
-| `capability` | Python nesting | parsed on a 512 MB (Windows: 255 MB) worker stack, trusted to stack / 512 bytes levels; fallback guard 5,000 levels per logical line (Windows: 2,000) with a 16 MB per-run tokenize budget (`too-complex`) |
+| `capability` | Python nesting | source decoded with its declared encoding (UTF-7 cookie cannot hide operators); parsed on a 512 MB (Windows: 255 MB) worker stack, trusted to at most 50,000 levels, retrying 255 MB if the 512 MB thread cannot start; a flat or statement-dense file over 300,000 expression tokens (operators, brackets, commas, NAME tokens and depth-zero statement separators) is `too-complex`; fallback guard 5,000 levels per logical line (Windows: 2,000) with a 16 MB per-run tokenize budget (`too-complex`); `parse-error` skips warn with counts |
 | `capability` | Markdown | heading lines over 1,000 characters are text; a summary is looked for in the 40 lines after its heading |
 | `capability` | entry `aliases` / `tests` / `related` | first 8 shown; `tests_total` / `related_total` count all |
 | `capability` | entry `name` / `summary` | excerpt objects of <= 120 / <= 200 characters |

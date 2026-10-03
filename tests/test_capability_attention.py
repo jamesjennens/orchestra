@@ -134,7 +134,7 @@ class WorkAttentionTests(AttentionCase):
         self.native.calls = []
         result = work.queue(rows, OPERATOR, [], operators=OPS, journal=self.journal, reference_attention=True)
         self.assertEqual(self.native.calls, [])     # no read and no write: computed from the rows work holds
-        self.assertEqual(set(result['attention']), {'reference_review', 'capability_index'})
+        self.assertEqual(set(result['attention']), {'reference_review', 'proposal_queue', 'capability_index'})
         self.assertEqual(result['attention']['capability_index']['counts']['drifted'], 1)
         self.assertEqual(result['attention']['capability_index']['actions'][0]['project'],
                          Path(self.journal).name)

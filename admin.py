@@ -40,6 +40,11 @@ BACKUP_STATUS_NAME='backup-status.json'
 #: bounds a genuinely hung server; a large database legitimately needs minutes.
 BACKUP_SYNC_TIMEOUT=1800
 
+#: Explicit ceiling for one native restore through the SQL client (``restore-new``).
+#: ``bd backup restore`` has the same fixed ~10 s read timeout as ``bd backup sync``, so the
+#: restore uses the SQL client too, with the same generous bound for a genuinely hung server.
+RESTORE_TIMEOUT=BACKUP_SYNC_TIMEOUT
+
 #: Suffix of the durable copy of a project's last COMPLETE coordination sidecar. A
 #: failed or interrupted run must never destroy the previous restorable pair, so the
 #: last complete sidecar is kept here and ``coordination_backup`` can fall back to it.
@@ -617,6 +622,122 @@ def native_backup_sync(root,name,client=None):
              '--use-db',str(database),'sql','-q',"CALL DOLT_BACKUP('sync', '%s')"%backup_name]
     handle=client if client is not None else SyncClientHandle()
     return spawn_sync_client(command,handle,env=environment(root),cwd=root,timeout=BACKUP_SYNC_TIMEOUT)
+
+def native_restore_url(backup):
+    """The ``file://`` URL ``CALL DOLT_BACKUP('restore', ...)`` reads ``backup`` from.
+
+    The same form ``bd backup restore`` builds (``"file://" + absolute path``, not
+    percent-encoded). The URL is embedded in a SQL string literal, so a path that would need
+    quoting there (a quote, a backslash or a control character) is refused rather than
+    escaped; a runtime root accepted by ``root_path`` never contains one.
+    """
+    path=Path(backup).resolve().as_posix()
+    url='file://'+(path if path.startswith('/') else '/'+path)
+    if re.search(r"['\\\x00-\x1f]",url):
+        raise ValueError('The backup path cannot be named in a native restore statement')
+    return url
+
+def project_identity(root,database):
+    """The ``_project_id`` a project's Dolt database records, or None when it records none."""
+    if not re.fullmatch(r'[A-Za-z0-9_]{1,64}',database):
+        raise ValueError('The project records an unusable Dolt database name')
+    rows=list(csv.reader(io.StringIO(
+        sql(root,"SELECT value FROM `%s`.metadata WHERE `key`='_project_id';"%database))))
+    values=[row[0].strip() for row in rows[1:] if row and row[0].strip()]
+    return values[0] if values else None
+
+def adopt_project_identity(root,name):
+    """Write the restored database's ``_project_id`` into the project's ``.beads/metadata.json``.
+
+    ``bd backup restore --force`` does this itself after its restore (``syncProjectIDFromDB``):
+    the restored database carries the SOURCE project's identity, while ``metadata.json`` still
+    holds the one ``bd init`` generated for the new project, and bd refuses every later command
+    with ``PROJECT IDENTITY MISMATCH`` until the two agree. The SQL-client restore does not run
+    bd, so the kit performs the same step. Like bd, a database that records no identity leaves
+    the file unchanged. The file is replaced atomically and keeps its mode and every other key.
+    Returns the adopted identity, or None when nothing changed.
+    """
+    metadata=project_server_metadata(root,name)
+    if metadata is None:return None
+    identity=project_identity(root,metadata[3])
+    if identity is None:return None
+    path=project_dir(root,name)/'.beads'/'metadata.json'
+    data=json.loads(path.read_text(encoding='utf-8'))
+    if data.get('project_id')==identity:return None
+    data['project_id']=identity
+    mode=path.stat().st_mode&0o777
+    fd,temporary=tempfile.mkstemp(prefix=path.name+'.',suffix='.tmp',dir=str(path.parent))
+    try:
+        with os.fdopen(fd,'w',encoding='utf-8') as handle:
+            handle.write(json.dumps(data,indent=2)+'\n')
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary,mode)
+        os.replace(temporary,path)
+    except BaseException:
+        try: os.unlink(temporary)
+        except OSError: pass
+        raise
+    return identity
+
+def native_restore(root,source,destination,client=None):
+    """Restore ``backups/<source>`` into the new project ``destination``; return a report line.
+
+    ``bd backup restore`` inherits the same fixed client read timeout of about ten seconds as
+    ``bd backup sync`` (see ``native_backup_sync``): a restore drill cut a 588 MB backup at
+    exactly 10 s (``i/o timeout``, ``invalid connection``), while the same restore through the
+    SQL client took under a minute. So the native step is ``CALL DOLT_BACKUP('restore',
+    '--force', <file URL>, <database>)`` over the loopback connection, bounded only by the
+    explicit ``RESTORE_TIMEOUT``. ``--force`` replaces the empty database ``bd init`` just
+    created for the destination, exactly as ``bd backup restore --force`` does.
+
+    The client runs in its own session through ``spawn_sync_client``; ``SIGTERM`` is turned
+    into ``TerminatedBySignal`` for the duration, and on every exit that is not a normally
+    finished client (a stop, the ceiling, an exception) the whole process group is killed
+    before the source's backup lock is released. The password travels in the environment,
+    never in the command. After the restore, the restored project identity is adopted into
+    ``.beads/metadata.json`` (``adopt_project_identity``), which ``bd backup restore`` would
+    otherwise have done. A destination with no Dolt server metadata has no SQL coordinates,
+    so it keeps the ``bd backup restore`` path, as ``backup`` keeps ``bd backup sync``.
+    """
+    backup=root/'backups'/source
+    metadata=project_server_metadata(root,destination)
+    if metadata is None:
+        return run_bd(root,destination,['backup','restore',str(backup),'--force'])
+    host,port,user,database=metadata
+    if not re.fullmatch(r'[A-Za-z0-9_]{1,64}',str(database)):
+        raise ValueError('The project records an unusable Dolt database name')
+    url=native_restore_url(backup)
+    command=[root/'bin/dolt','--host',str(host),'--port',str(port),'--no-tls','--user',str(user),
+             'sql','-q',"CALL DOLT_BACKUP('restore', '--force', '%s', '%s')"%(url,database)]
+    handle=client if client is not None else SyncClientHandle()
+    started=time.monotonic()
+    with signal_termination_guard():
+        try:
+            spawn_sync_client(command,handle,env=environment(root),cwd=root,timeout=RESTORE_TIMEOUT)
+        finally:
+            # Inside the guard: a second stop cannot kill the interpreter before the
+            # client's group is killed. A finished client is not signalled again.
+            terminate_process_group(handle)
+    elapsed=time.monotonic()-started
+    identity=adopt_project_identity(root,destination)
+    report='Restored backups/%s into %s through the Dolt SQL client in %.1f s.'%(source,destination,elapsed)
+    if identity is not None:
+        report+=' Adopted the restored project identity %s into .beads/metadata.json.'%identity
+    return report
+
+def restore_failure_notice(destination,error):
+    """What an operator must do after the native step of ``restore-new`` did not complete."""
+    if isinstance(error,subprocess.TimeoutExpired):
+        cause='the native restore reached its %d s ceiling and its client was stopped'%RESTORE_TIMEOUT
+    elif isinstance(error,(TerminatedBySignal,KeyboardInterrupt)):
+        cause='the native restore was interrupted and its client was stopped'
+    else:
+        cause='the native restore failed'
+    return ('restore-new did not complete: %s. Project %s exists but holds a partial restore (its '
+            'coordination sidecar, journals and operation journal were NOT restored). Preserve it for '
+            'inspection, do not use or back it up as a tracker, and run restore-new again into another '
+            'unused destination name; the source backup was not modified.'%(cause,destination))
 
 def provision_merge_slot(root,name):
     """Create the project's merge slot once, tolerating an existing slot.
@@ -1527,6 +1648,37 @@ def initialized_projects(root):
         if (path/'.beads'/'metadata.json').is_file():found.append(path.name)
     return sorted(found)
 
+def revoked_proposal_records(root,actor,limit=5):
+    """Name the requirement-proposal effects of one operator's revocation.
+
+    A proposal disposition, an owner decision and a contribution-settings record count
+    only while their native author is on the operator allowlist. Removing an operator
+    therefore moves every proposal they decided back to its earlier trusted state, and
+    can make the settings chain read empty (the actor map and the deciders), which stops
+    triage. Both are named here, from the difference between a read under the live
+    allowlist and one without `actor`, with the reader every other read uses. Read-only
+    and best-effort, like `revoked_revert_records`.
+    """
+    import proposal_records
+    authority=operators(root)
+    changed=[];settings=[];unreadable=0
+    for name in initialized_projects(root):
+        path=project_dir(root,name)
+        try:
+            rows=[json.loads(line) for line in run_bd(root,name,['export','--all']).splitlines() if line.strip()]
+            moved,setting=proposal_records.revocation_effects(rows,authority,actor,path)
+            changed+=['%s/%s'%(name,item) for item in moved]
+            if setting:settings.append('%s: %s'%(name,setting))
+        except (OSError,ValueError,TypeError,KeyError,subprocess.CalledProcessError):
+            unreadable+=1
+    def listed(found):
+        return (', '.join(found[:limit])+(' (+%d more)'%(len(found)-limit) if len(found)>limit else '')) or 'none'
+    return (' Requirement proposals: dispositions, owner decisions and contribution settings they recorded stop '
+            'counting too (proposals whose state changes: %s; contribution settings that change: %s; projects that '
+            'could not be read: %d). Re-adding the operator restores them; otherwise re-enter the settings with '
+            'admin.py proposal-settings, and note that %s.'
+            %(listed(changed),listed(settings),unreadable,proposal_records.NO_REPAIR[0].lower()+proposal_records.NO_REPAIR[1:]))
+
 def revoked_revert_records(root,actor,limit=5):
     """Name the host-issued records one operator's revocation changes.
 
@@ -2350,13 +2502,24 @@ def main():
     a.add_argument('project')
     a=sub.add_parser('reference-apply',help='accept a reference catalog entry (operator allowlist, F3 evidence)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
-    for name in ('reference-reconcile','capability-reconcile','record-reconcile'):
+    a=sub.add_parser('proposal-review',help='record a coordinator disposition on a requirement proposal (operator allowlist)')
+    a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('proposal-decide',help='record the owner decision on an escalated requirement proposal (operator allowlist)')
+    a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('proposal-settings',help='read or change the contribution settings: the actor map and the owner deciders (operator allowlist)')
+    a.add_argument('project');a.add_argument('--actor',required=True)
+    a.add_argument('--map-actor',dest='map_actor',metavar='ACTOR',help='map a session actor to a person, with --to')
+    a.add_argument('--namespace',metavar='NAME',help='map a session name (and NAME/..., NAME-...) to a person, with --to')
+    a.add_argument('--to',metavar='IDENTITY',help='account:<uid> or person:<name>')
+    a.add_argument('--unmap-actor',dest='unmap_actor',metavar='ACTOR');a.add_argument('--unmap-namespace',dest='unmap_namespace',metavar='NAME')
+    a.add_argument('--add-decider',dest='add_decider',metavar='IDENTITY');a.add_argument('--remove-decider',dest='remove_decider',metavar='IDENTITY')
+    for name in ('reference-reconcile','capability-reconcile','proposal-reconcile','record-reconcile'):
         a=sub.add_parser(name);a.add_argument('project');a.add_argument('--operation-id',required=True)
         a.add_argument('--actor',required=True);a.add_argument('--reason',required=True)
         a.add_argument('--disposition',choices=['failed','released','complete'],default='released')
         a.add_argument('--issue-id',dest='issue_id',default=None,
                        help='with --disposition complete, the exact native record to confirm')
-        if name=='record-reconcile':a.add_argument('--kind',choices=['requirement','reference','capability'],required=True)
+        if name=='record-reconcile':a.add_argument('--kind',choices=['requirement','reference','capability','proposal'],required=True)
     a=sub.add_parser('void-record');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('anchor-release',help='close a reference or capability anchor that holds no record and free its key (operator allowlist)')
     a.add_argument('project');a.add_argument('--kind',choices=['reference','capability'],required=True)
@@ -2574,19 +2737,43 @@ def main():
                 yield
         print(json.dumps(capability_verification.verify_batch(payload,args.actor,run,operators=authority,
                                                               verifiers=listed,journal=path,lock=held)))
-    elif args.command in ('reference-reconcile','capability-reconcile','record-reconcile'):
+    elif args.command in ('proposal-review','proposal-decide','proposal-settings'):
+        # Requirement proposals (.58 slice 1a, kittrial-5bb.68). Everything that rests on
+        # the operator allowlist is a host command, because over SSH the actor is
+        # self-declared: the allowlist is read strictly here and checked before any read.
         import fcntl
-        kind={'reference-reconcile':'reference','capability-reconcile':'capability'}.get(args.command) or args.kind
+        import proposal_records
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        authority=operators(root,strict=True)
+        def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            if args.command=='proposal-settings':
+                changes={name:getattr(args,name) for name in proposal_records.SETTINGS_CHANGES}
+                result=proposal_records.change_settings(changes,args.actor,run,operators=authority)
+            else:
+                payload=json.loads(Path(args.file).read_text(encoding='utf-8-sig'))
+                result=proposal_records.dispose(payload,args.actor,run,path,operators=authority,
+                                                route='decide' if args.command=='proposal-decide' else 'review')
+        print(json.dumps(result))
+    elif args.command in ('reference-reconcile','capability-reconcile','proposal-reconcile','record-reconcile'):
+        import fcntl
+        kind={'reference-reconcile':'reference','capability-reconcile':'capability','proposal-reconcile':'proposal'}.get(args.command) or args.kind
         if kind=='reference':from reference_records import reconcile as record_reconcile
         elif kind=='capability':from capability_records import reconcile as record_reconcile
+        elif kind=='proposal':from proposal_records import reconcile as record_reconcile
         else:from requirement_records import reconcile as record_reconcile
         path=project_dir(root,args.project)
         if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
         def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
+            # A proposal reconcile checks the operator allowlist strictly (kittrial-5bb.68
+            # review 01a10180); the other kinds' reconciles do not yet take the list.
+            extra={'operators':operators(root,strict=True)} if kind=='proposal' else {}
             print(json.dumps(record_reconcile(path,args.operation_id,args.actor,args.reason,
-                                              args.disposition,run,issue_id=args.issue_id)))
+                                              args.disposition,run,issue_id=args.issue_id,**extra)))
     elif args.command=='anchor-release':
         # kittrial-5bb.74: an anchor whose propose stopped before its first record, or whose
         # every record an operator void names, holds its key for good once the original
@@ -2657,7 +2844,8 @@ def main():
                 raise ValueError('operators remove revokes ' + actor + ': voids they authored stop applying on '
                                  'reads, and so do the host-issued integration revert records and retractions '
                                  'they authored' + revoked_revert_records(root,actor) +
-                                 ' (re-add restores them). Re-run with --confirm-revoke to acknowledge this.')
+                                 ' (re-add restores them).' + revoked_proposal_records(root,actor) +
+                                 ' Re-run with --confirm-revoke to acknowledge this.')
             if actor in current:current.remove(actor)
         if current:cfg['operators']=current
         else:cfg.pop('operators',None)
@@ -2756,7 +2944,14 @@ def main():
             if (args.restore_operators or args.restore_verifiers) and not (root/'deployment.private.json').is_file():
                 raise ValueError('Deployment is not installed; run install first')
             add_project(root,args.destination)
-            print(run_bd(root,args.destination,['backup','restore',str(backup),'--force']))
+            # The native restore runs through the Dolt SQL client (no bd ~10 s read
+            # timeout), in its own process group, and adopts the restored project identity;
+            # a destination without server metadata keeps `bd backup restore`.
+            try:
+                print(native_restore(root,args.project,args.destination))
+            except BaseException as error:
+                print(restore_failure_notice(args.destination,error),file=sys.stderr)
+                raise
             # The native restore brings the SOURCE project's backup configuration with the
             # restored database: `.beads/dolt-backup.json` and the restored `dolt_backups`
             # row both still name `backups/<source>`. Left there, `backup <destination>`
@@ -2781,6 +2976,9 @@ if __name__=='__main__':
     except subprocess.CalledProcessError as e:
         # Never echo credential-bearing command input or the environment.
         raise SystemExit(f'Command failed ({e.returncode}): {e.stderr[:2000]}')
+    except subprocess.TimeoutExpired as e:
+        # The client's group was already stopped; report the ceiling, never the command.
+        raise SystemExit(f'Command timed out after {e.timeout} s')
     except TerminatedBySignal as e:
         # The guarded cleanup ran (previous pair kept, sync client's group stopped); exit
         # with the conventional 128+signal status instead of a traceback.
