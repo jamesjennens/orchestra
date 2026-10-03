@@ -124,9 +124,10 @@ class EndpointDispatchTests(unittest.TestCase):
         self.assertEqual((view['state'], view['identity'], view['text']['trust']),
                          ('submitted', 'unverified', 'unreviewed'))
         self.assertEqual(self.execute(['list'])['total'], 1)
-        # `mine` lists verified proposals only; this one merely names its submitter.
+        # Over SSH `mine` is the declared query of slice 1a: it lists by the named submitter.
         mine = self.execute(['mine', '--submitter', 'person:alex'])
-        self.assertEqual((mine['total'], mine['unverified_omitted']), (0, 1))
+        self.assertEqual((mine['total'], mine['items'][0]['identity'], 'unverified_omitted' in mine),
+                         (1, 'unverified', False))
         # Help is a command, never an option value (kittrial-5bb.70 review 01a10262).
         self.assertEqual(self.execute(['list', '--help'])['action'], 'proposal')
         for args, message in ((['list', '--state', '--help'], '--state must be one of'),

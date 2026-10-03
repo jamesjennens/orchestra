@@ -906,14 +906,20 @@ class ReadTests(ProposalCase):
                              (None, True, 'needs-info'))
         self.assertEqual(self.get(key)['disposition']['question']['text'],
                          'Which feed should the snapshot be pinned to?')
-        # `mine` lists verified proposals only (review 01a10262): until the submitter's
-        # session is mapped, the proposal merely names person:alex.
-        unmapped = self.read('mine', '--submitter', ALEX, actor='bob')
-        self.assertEqual((unmapped['items'], unmapped['total'], unmapped['unverified_omitted']), ([], 0, 1))
-        self.settings(namespace='alex', to=ALEX)
+        # Over SSH `mine` is a declared query (slice 1a): an unmapped contributor's proposal
+        # is listed, marked unverified. Through the HTTP service the same read lists
+        # verified proposals only (review 01a10262).
         listed = self.read('mine', '--submitter', ALEX, actor='bob')
-        self.assertEqual((listed['total'], listed['unverified_omitted']), (1, 0))
+        self.assertEqual((listed['total'], listed['items'][0]['identity'], 'unverified_omitted' in listed),
+                         (1, 'unverified', False))
         mine = listed['items'][0]
+        self.native.actor = 'http/read'
+        service = lambda: pr.read(['mine', '--submitter', ALEX], self.native, 'http/read', OPS, self.project,
+                                  full=True)
+        self.assertEqual((service()['items'], service()['total'], service()['unverified_omitted']), ([], 0, 1))
+        self.settings(namespace='alex', to=ALEX)
+        self.assertEqual((service()['total'], service()['unverified_omitted']), (1, 0))
+        self.assertEqual(pr.read(['list'], self.native, 'http/read', OPS, self.project, full=True)['total'], 1)
         self.assertEqual((mine['disposition']['question']['text'], mine['next_actor'], mine['next_action']),
                          ('Which feed should the snapshot be pinned to?', 'submitter',
                           "Answer the coordinator's question with proposal revise."))
@@ -1221,8 +1227,10 @@ class SubmitterBindingTests(ProposalCase):
         self.assertEqual((entry['identity_broken'], entry['authors']),
                          ({'revision': 2, 'author': MALLORY, 'disposition': None}, [SUBMITTER, MALLORY]))
         self.assertEqual(self.read('list')['items'][0]['identity'], 'unverified')
-        mine = self.read('mine', '--submitter', ALEX)
-        self.assertEqual((mine['total'], mine['unverified_omitted']), (0, 1))
+        mine = self.read('mine', '--submitter', ALEX)                      # the declared query still lists it
+        self.assertEqual((mine['total'], mine['items'][0]['identity']), (1, 'unverified'))
+        served = pr.read(['mine', '--submitter', ALEX], self.native, 'http/read', OPS, self.project, full=True)
+        self.assertEqual((served['total'], served['unverified_omitted']), (0, 1))
         # The submitter cannot build on the forged revision by the same-author rule either.
         self.sessions({SUBMITTER: 'someone-else/session7'})
         with self.assertRaisesRegex(ValueError, 'Only the submitter may revise'):

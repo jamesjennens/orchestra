@@ -1165,9 +1165,11 @@ action unless the HTTP service launched the endpoint. Declare your own session a
   (an unmapped contributor revising their own proposal). Repeating the stored
   `submitter` in the payload is not enough, and an `account:` submitter is never
   revised on the actor's say-so.
-- **`mine` lists verified proposals only.** A proposal that merely names the
-  identity is counted in `unverified_omitted` and not shown: `mine` returns the
-  coordinator's reason and question, which are for the submitter.
+- **`mine` over the endpoint is a declared query**, as in slice 1a: it lists every
+  proposal whose `submitter` is the identity named, each with its `identity`
+  (`verified` or `unverified`), so an unmapped contributor sees their own
+  submissions. Through the HTTP service the same read lists verified proposals only
+  and adds `unverified_omitted`: there the submitter is an authenticated account.
 - **Help is a command.** `proposal --help` and `proposal list --help` return the help
   payload. `--help` in an option's value position is that option's bad value.
 - **`linked_requirement`** is `{id, revision, sha256, acceptance_state,

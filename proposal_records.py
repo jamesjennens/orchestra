@@ -1997,16 +1997,17 @@ def _matches(entry, options):
 
 
 def list_entries(rows, options, operators, resolve, settings, requirements, actor, mine=False, now=None,
-                 coordinator=None):
+                 coordinator=None, verified_only=False):
     now = now if now is not None else calendar.timegm(time.gmtime())
     entries, incomplete = catalog(rows, operators, resolve)
     scanned = entries[:PROPOSAL_SCAN_MAX]
     good = [entry for entry in scanned if entry['state'] not in ('malformed', 'unsupported') and _matches(entry, options)]
-    # `mine` is a person's own log, with the coordinator's words to them: a proposal that
-    # merely NAMES the submitter is not theirs. Only verified ones are listed; the rest
-    # are counted, never shown (review 01a10262).
-    unverified = [entry for entry in good if entry['identity'] != 'verified'] if mine else []
-    if mine:
+    # `verified_only` is the HTTP service's `mine`: there the submitter is an authenticated
+    # account, and a proposal that merely NAMES it is not that account's (review 01a10262).
+    # Over SSH `mine --submitter X` stays the declared query of slice 1a: every proposal
+    # that names X, each with its `identity`, so an unmapped contributor still sees their own.
+    unverified = [entry for entry in good if entry['identity'] != 'verified'] if verified_only else []
+    if verified_only:
         good = [entry for entry in good if entry['identity'] == 'verified']
     good.sort(key=lambda entry: (entry['first']['created_at'], entry['key']))
     coordinator = authority(actor, operators) if coordinator is None else coordinator
@@ -2022,7 +2023,7 @@ def list_entries(rows, options, operators, resolve, settings, requirements, acto
     result = {'schema_version': 1, 'total': len(good), 'items': page,
               'next_offset': offset + limit if offset + limit < len(good) else None, 'untrusted': UNTRUSTED_LINE,
               'coverage': _coverage(scanned, incomplete, len(entries) <= PROPOSAL_SCAN_MAX)}
-    if mine:
+    if verified_only:
         result['unverified_omitted'] = len(unverified)
     return result
 
@@ -2188,7 +2189,8 @@ def help_payload():
                       'submitter is a durable identity, account:<uid> or person:<name>; a session actor is refused.',
                       'identity is verified when the author of every revision maps to the submitter in the actor '
                       'map (or wrote it through the web service as that account); over SSH that is attribution, '
-                      'not authentication. Only the submitter revises; mine lists verified proposals only.',
+                      'not authentication. Only the submitter revises. mine lists every proposal that names '
+                      'the submitter, each with its identity.',
                       'A reason, a question and an escalation question are returned by get and list only to an '
                       'actor on the operator allowlist, and by proposal mine --submitter IDENTITY to anyone who '
                       'names that identity. Over SSH the actor and the submitter are self-declared, so this is '
@@ -2289,7 +2291,7 @@ def read(args, run, actor, operators, project=None, full=False):
     settings = settings_view(rows, operators)
     return list_entries(rows, options, operators, Resolver(settings, project), settings,
                         lambda entries: read_linked_requirements(run, entries), actor, mine=command == 'mine',
-                        coordinator=coordinator)
+                        coordinator=coordinator, verified_only=full and command == 'mine')
 
 
 def refuse_host_only(command):
