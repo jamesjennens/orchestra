@@ -196,6 +196,7 @@ reads.
   on the deployment operator allowlist.
   - Each item has `key`, `review_by`, `due`, `owner`, `state` and `revision`, plus
     `inert_operator` on an inert entry.
+    `owner` is a quoted, bounded `agent_prompts.label()` value (or null).
   - Inert entries come first, then expired, then due-soon.
   - Items are paged by `--ref-limit` (1..100) and `--ref-offset`.
 - **Other callers** get `items: []` with `truncated: true` and a `coverage` note.
@@ -233,6 +234,8 @@ The `reference-review` items:
   due-soon entries, with expired first.
 - **Each item** has `key`, `due`, `review_by`, `trust` (`accepted`), `title` (an
   excerpt object), `text` and `source` (`ref get KEY`).
+  The title's text uses `agent_prompts.label()`; its omission count describes the
+  normalized source characters replaced by the label's ellipsis.
 - **`text`** is server-derived from the key, the due class and the date. It never
   includes the entry's statement.
 - **Separate from open items.** These items are not checkpoint items, and reading a
@@ -720,6 +723,7 @@ projection: it never runs a check, and capabilities never appear in a task page.
 the export `work` already makes, including the verification trust rules: it adds no
 native read, and reading it writes nothing.
 - **`counts`, always:**
+  - `conflicted`: keys with duplicate anchors and zero or multiple live acceptances;
   - `drifted`: accepted capabilities whose verification is `drifted`;
   - `reported_only`: accepted capabilities with passing reports but no trusted
     verification;
@@ -730,20 +734,27 @@ native read, and reading it writes nothing.
     newer draft of an accepted one);
   - `malformed`; and `total`, the number of capabilities with at least one flag.
   Retired capabilities are never counted.
-- **`state`:** `malformed`, `drifted`, `pending` (drafts or aliases), `stale`
+- **`state`:** `conflicted`, `malformed`, `drifted`, `pending` (drafts or aliases), `stale`
   (unverified or reported only) or `clear`.
 - **`actions`:** one per non-zero count, naming the first capability concerned. Each
-  has `priority`, `kind` (`capability-repair`, `capability-drift`,
+  has `priority`, `kind` (`capability-conflict`, `capability-repair`, `capability-drift`,
   `capability-accept`, `capability-alias`, `capability-verify`,
   `capability-verify-report`), `project`, `task` (the capability's native anchor id),
   `reason`, `links`, `label` (`capability get KEY`, an excerpt object) and `token`.
+  An unreadable key routes to `capability list --state all` and the catalog link:
+  lookup labels replace dots with hyphens and cannot be inverted unambiguously.
   They are sorted by `(priority, project, task)`.
-- **`items`:** only for an actor on the deployment operator allowlist, drifted first,
+- **`items`:** only for an actor on the deployment operator allowlist, conflicted first, then drifted,
   paged by `--capability-limit` (1..100, default 20) and `--capability-offset`. Each
   has `kind` (`capability`), `key`, `task`, `state`, `verification`, `flags`,
   `owner`, `aliases_pending`, `accepted_days` and `title` (an excerpt object with
   `trust`). Anyone else gets the counts with `truncated: true`; an owner reads their
   own capabilities with `capability list --owner IDENTITY`.
+  Owner and title text use quoted, bounded `agent_prompts.label()` values; a missing
+  owner stays null. The surrounding double quotes are literal JSON string content.
+  Each label contains at most 60 normalized characters inside those quotes
+  (62 including the quotes); truncation uses an ellipsis. The title's omission count describes the normalized source
+  characters replaced by the label's ellipsis.
 - At most 1,000 capabilities are scanned; beyond that `coverage` says so.
 
 **`capability` items in `brief`.** At most 3 accepted capabilities whose `tags` match
@@ -751,6 +762,31 @@ one of the task's labels, drifted first, then by key. Each has `kind`
 (`capability`), `key`, `trust` (`accepted`), `verification`, `title` (an excerpt
 object), `text` (server-derived from the key and the verification state, never the
 summary) and `source` (`capability get KEY`).
+The title text uses the same quoted label as work attention.
+
+**Duplicate reference and capability anchors.** Only exactly one anchor with valid
+acceptance evidence from a live operator can supply a duplicate key's record.
+It remains readable with a `duplicate-key` warning and an `anchors` array naming
+every matching native ID with its original state and trust. Zero or multiple live
+acceptances make the key `conflicted`: `get` has no selected native ID, record,
+proposal or acceptance, and returns every anchor's ID/state/trust in `anchors`.
+`list` and capability `find` show the individual rows as `conflicted`, with their
+original `anchor_trust`; content is a discovery label, not an authoritative record.
+Conflicted capability rows expose no code/test/requirement pointers or verification
+authority, are excluded from the exact lookup index and accepted briefs, and an
+exact conflict lookup returns `found: false`, `match_type: conflicted`.
+Existing result limits still apply; coverage names every duplicate native ID.
+Display order is live acceptance, readable draft, then malformed/unsupported or
+incomplete content, with native ID used only to order rows within a rank.
+Operator attention counts each conflicted key once and includes all its anchors;
+capability attention offers a `capability-conflict` action to reconcile it.
+All writes (propose, revise, apply/accept/retire, verify and alias writes), including
+receipt-bound retries, refuse a duplicated key before mutation and name every
+matching anchor. An operator must reconcile it before any write, even when one
+uniquely accepted record remains readable. Records and evidence are never combined
+across anchors. Distinct readable keys sharing a lookup slug remain distinct;
+malformed or incomplete lookup-labelled rows participate in every plausible key's
+duplicate group because their exact key cannot be established from a lossy label.
 
 ### `capability misses`: which phrases miss, and how often
 
@@ -924,7 +960,8 @@ never read more than they need:
   - A `draft-only` entry is **not** authoritative.
   - An unknown key, or a key whose anchor has no record yet, exits nonzero and names
     the key.
-- **`ref list`** returns `{total, items, next_offset, coverage}`, one row per key.
+- **`ref list`** returns `{total, items, next_offset, coverage}`, one row per
+  unambiguous key, or every anchor row for a conflicted key (see duplicate rules above).
   - Rows are ordered expired, due-soon, unset, then ok, and by key within each.
   - Each row has `key`, `title` (at most 200 characters), `state`, `owner`,
     `review_by`, `proposed_review_by`, `due`, `tags`, `revision`, `native_id` and

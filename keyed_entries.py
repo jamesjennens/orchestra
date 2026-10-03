@@ -209,14 +209,32 @@ class AnchoredKind:
 
     def anchor_for(self, rows, key):
         """(row, status) for a key: status is `entry`, `incomplete` or None."""
-        label = self.key_label(key)
-        for row in rows:
-            if self.type_label not in (row.get('labels') or []) or label not in self.key_labels(row):
-                continue
+        matches = self.require_unique_key(rows, key)
+        for row in matches:
             if not is_record_anchor(row):
                 return row, 'incomplete'
             return row, 'entry'
         return None, None
+
+    def require_unique_key(self, rows, key):
+        """Every write refuses duplicate anchors, including incomplete/malformed ones.
+
+        A readable different key sharing the lossy lookup slug is not this key.
+        Unknown content cannot establish that distinction and requires repair.
+        """
+        matches = []
+        for row in rows:
+            if not isinstance(row, dict) or self.type_label not in (row.get('labels') or []) \
+                    or self.key_label(key) not in self.key_labels(row):
+                continue
+            if is_record_anchor(row) and self.entry_view(row, ())['key'] not in (key, None):
+                continue
+            matches.append(row)
+        if len(matches) > 1:
+            raise ValueError('%s key %s has duplicate anchors (%s); every write is refused until an '
+                             'operator reconciles them' % (self.title, key,
+                                                          ', '.join(str(row['id']) for row in matches)))
+        return matches
 
     # -- records -----------------------------------------------------------------------------
 
@@ -371,6 +389,8 @@ class AnchoredKind:
         return row['id']
 
     def check_key_unique(self, rows, payload, task):
+        # Also check receipt-bound retries: resolve_task may have been bypassed.
+        self.require_unique_key(rows, payload['key'])
         if task is not None:
             return
         label = self.key_label(payload['key'])
@@ -629,9 +649,66 @@ class AnchoredKind:
             if not is_record_anchor(row):
                 if self.key_labels(row):
                     incomplete.append(row.get('id'))
+                    entry = view(row, operators)
+                    entry['state'] = 'incomplete'
+                    entries.append((entry, self.key_labels(row)))
                 continue
-            entries.append(view(row, operators))
-        return entries, incomplete
+            entries.append((view(row, operators), self.key_labels(row)))
+        # Group by the record's exact key, never its lossy lookup slug. A bare
+        # accepted label/comment cannot displace an anchor with live evidence.
+        grouped, unknown = {}, []
+        for entry, labels in entries:
+            if entry['key'] is None:
+                unknown.append((entry, labels))
+            else:
+                grouped.setdefault(entry['key'], []).append(entry)
+        # A malformed row's label can identify its readable siblings, but cannot
+        # be inverted to invent a dotted key. Include it in every plausible group
+        # if distinct known keys share the same slug.
+        for entry, labels in unknown:
+            keys = [key for key in grouped if isinstance(key, str) and self.key_label(key) in labels]
+            if keys:
+                for key in keys:
+                    grouped[key].append(dict(entry, key=key, warnings=list(entry['warnings'])))
+            else:
+                group = ('lookup', tuple(sorted(labels))) if labels else ('native', entry['native_id'])
+                grouped.setdefault(group, []).append(entry)
+        return [entry for group in grouped.values() for entry in self.select_entries(group)
+                if entry['state'] != 'incomplete'], incomplete
+
+    @staticmethod
+    def select_entries(entries):
+        """Only one uniquely live acceptance can select a duplicate key's record.
+
+        Otherwise retain every anchor as conflicted. Rank is display order only:
+        live evidence, readable content, then malformed/unsupported content.
+        """
+        if len(entries) == 1:
+            return entries
+        ordered = sorted(entries, key=lambda entry: (
+            0 if entry['record'] is not None else 2 if entry['state'] in ('malformed', 'unsupported', 'incomplete') else 1,
+            str(entry['native_id'])))
+        anchors = [{'native_id': entry['native_id'], 'state': entry['state'],
+                    'trust': 'accepted' if entry['record'] is not None else
+                    entry['state'] if entry['state'] in ('malformed', 'unsupported', 'incomplete') else 'draft'}
+                   for entry in ordered]
+        warning = {'code': 'duplicate-key', 'detail': 'Duplicate anchors (%s); operator reconciliation required'
+                   % ', '.join(str(anchor['native_id']) for anchor in anchors)}
+        live = [entry for entry in ordered if entry['record'] is not None]
+        if len(live) == 1:
+            chosen = live[0]
+            chosen.update(duplicate_anchors=anchors)
+            chosen['warnings'].insert(0, warning)
+            return [chosen]
+        for entry, anchor in zip(ordered, anchors):
+            entry.update(candidate=entry['record'] or entry['proposed'] or entry.get('newest'),
+                         anchor_trust=anchor['trust'], state='conflicted', record=None, acceptance=None,
+                         record_comment_id=None, proposed=None, proposed_comment_id=None,
+                         acceptance_inert=False, inert_operator=None, duplicate_anchors=anchors)
+            if 'aliases_pending' in entry:
+                entry.update(aliases_pending=[], aliases_rejected=set())
+            entry['warnings'].insert(0, dict(warning))
+        return ordered
 
     def find_entry(self, rows, key, operators, view=None):
         """The view for one key, found through its lookup label; the record's own key must match.
@@ -642,17 +719,30 @@ class AnchoredKind:
         self.valid_key(key)
         view = view or self.entry_view
         label = self.key_label(key)
-        incomplete = []
+        incomplete, candidates = [], []
         for row in rows:
             if not isinstance(row, dict) or self.type_label not in (row.get('labels') or []) \
                     or label not in self.key_labels(row):
                 continue
             if not is_record_anchor(row):
                 incomplete.append(row.get('id'))
+                entry = view(row, operators)
+                entry.update(key=key, state='incomplete')
+                candidates.append(entry)
                 continue
             entry = view(row, operators)
             if entry['key'] in (key, None):
-                return entry
+                entry['key'] = key
+                candidates.append(entry)
+        if candidates and not (len(candidates) == 1 and candidates[0]['state'] == 'incomplete'):
+            selected = self.select_entries(candidates)
+            if len(selected) == 1:
+                return selected[0]
+            # A shape-compatible conflict response carries no selected anchor or
+            # record. The anchors' individual trust is evidence for reconciliation.
+            result = dict(selected[0], native_id=None, candidate=None)
+            result.update(aliases_pending=[], aliases_rejected=set(), newest=None, verification_records=[])
+            return result
         if incomplete:
             raise ValueError('%s key %s has no revision record yet (incomplete anchor %s); re-run its '
                              'propose or ask the operator to reconcile it' % (self.title, key, incomplete[0]))
@@ -661,6 +751,11 @@ class AnchoredKind:
     @staticmethod
     def coverage(entries, incomplete, base):
         notes = [base]
+        duplicates = {tuple(anchor['native_id'] for anchor in entry['duplicate_anchors'])
+                      for entry in entries if entry.get('duplicate_anchors')}
+        if duplicates:
+            notes.append('%d duplicate key(s); operator reconciliation required (%s)' % (
+                len(duplicates), '; '.join(', '.join(str(task) for task in group) for group in sorted(duplicates))))
         for state in ('malformed', 'unsupported'):
             ids = [entry['native_id'] for entry in entries if entry['state'] == state]
             if ids:

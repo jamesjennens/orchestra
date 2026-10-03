@@ -50,7 +50,7 @@ class WorkAttentionTests(AttentionCase):
         shape = set(http_service.ApiHandler._agent_attention_view({}))
         self.assertTrue(shape | {'actions'} <= set(block))
         self.assertEqual(set(block) - shape - {'actions'}, {'items', 'next_offset'})
-        self.assertEqual(block['counts'], {'drifted': 0, 'reported_only': 0, 'unverified_stale': 0,
+        self.assertEqual(block['counts'], {'conflicted': 0, 'drifted': 0, 'reported_only': 0, 'unverified_stale': 0,
                                            'alias_pending': 0, 'draft_pending': 1, 'malformed': 0, 'total': 1})
         self.assertEqual((block['state'], block['summary']), ('pending', '1 draft(s) waiting for acceptance.'))
         action = block['actions'][0]
@@ -71,7 +71,7 @@ class WorkAttentionTests(AttentionCase):
         self.verify(actor=OPERATOR, operator=True, key='a.verified', commit=INTEGRATED)
         later = self.days_later(cr.UNVERIFIED_STALE_DAYS + 1)
         block = self.block(now=later)
-        self.assertEqual(block['counts'], {'drifted': 1, 'reported_only': 1, 'unverified_stale': 4,
+        self.assertEqual(block['counts'], {'conflicted': 0, 'drifted': 1, 'reported_only': 1, 'unverified_stale': 4,
                                            'alias_pending': 1, 'draft_pending': 1, 'malformed': 0, 'total': 6})
         self.assertEqual(block['state'], 'drifted')
         kinds = [action['kind'] for action in block['actions']]
@@ -165,7 +165,7 @@ class BriefAttentionTests(AttentionCase):
         self.assertEqual((brief['attention_total'], brief['attention_more']), (4, 1))
         item = brief['attention'][0]
         self.assertEqual((item['trust'], item['source'], item['title']['text']),
-                         ('accepted', 'capability get t.d', 'Name of t.d'))
+                         ('accepted', 'capability get t.d', '"Name of t.d"'))
         self.assertEqual(item['text'], 'Capability t.d is tagged for this task (verification: drifted).')
         self.assertIn('Capability [drifted, accepted]', briefing.format_brief(brief))
         untagged = briefing.brief(rows, 'demo', 'task-1', operators=OPS, journal=self.journal)

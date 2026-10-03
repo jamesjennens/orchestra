@@ -361,8 +361,8 @@ class BatchAcceptanceTests(CapabilityCase):
         self.assertEqual([item['result'] for item in mixed['items']], ['refused', 'accepted', 'accepted'])
         self.assertTrue(mixed['complete'])   # only an uncertain write leaves a batch incomplete
         self.assertEqual(self.read('get', 'a.one')['state'], 'draft-only')
-        # An identical re-run: the accepted items are reported from their receipts, with no
-        # native write and no native read at all; only the refused item is read again.
+        # An identical re-run reports accepted items from receipts, but rereads each key
+        # to refuse newly planted duplicate anchors before any native write.
         rerun = [{'key': 'a.one', 'revision': 1, 'record_sha256': 'f' * 64}, self.item('a.two'),
                  self.item('a.three')]
         self.native.calls = []
@@ -371,7 +371,7 @@ class BatchAcceptanceTests(CapabilityCase):
                          ['refused', 'already-accepted', 'already-accepted'])
         self.assertEqual(self.native.writes(), [])
         self.assertEqual([call[0] for call in self.native.calls if call[0] in ('list', 'show', 'export')],
-                         ['list', 'show'])
+                         ['list', 'show', 'list', 'show', 'list', 'show'])
 
     def test_reaccepting_an_accepted_revision_writes_a_new_revision_and_evidence(self):
         self.batch([self.item('a.one')])
