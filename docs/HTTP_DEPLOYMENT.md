@@ -169,6 +169,42 @@ contribution review and feedback. Requirements, decisions and records are hidden
 from its navigation (the service has no routes for them yet) and a direct link
 shows "not available on this server".
 
+### Projects on the endpoint backend
+
+With `--backend endpoint`, a project's tasks live in a canonical Beads project under
+the runtime root, and only an operator creates one, on the coordination host. The web
+service never creates it. A project is therefore made in two steps:
+
+1. On the host, as the service account: `admin.py --root <RUNTIME_ROOT> add-project
+   NAME` (2-24 lowercase letters or digits, starting with a letter).
+2. In the web interface, a **superuser** registers it: Projects, "Register a project",
+   canonical project name `NAME` and an optional display name. Through the API, this is
+   `POST /v1/projects` with `{"project_id": "NAME", "name": ...}`.
+
+The rules:
+- Registration is superuser-only. Anyone else gets the same 403 whatever name they send,
+  so the check that the canonical project exists cannot be used to probe for names.
+- The project id is the canonical name. One canonical project is registered once; a
+  second registration is refused with 409, naming the existing record (archived or not).
+- If no initialized canonical project `NAME` exists, the request is refused with 422 and
+  nothing is stored.
+- Registering makes the superuser the project's only member (owner). Add members
+  afterwards on its Members page.
+- `GET /v1/sessions/current` reports `project_create`: `register` for a superuser,
+  `operator-only` for anyone else. The Projects page shows the register form, or only the
+  explanation.
+
+**Records from before this rule.** An older kit let any account "create" a project from
+the web interface. That wrote only an HTTP record with a `proj_...` id, which can never
+match a canonical project, so its task pages failed. Such a record is now listed with
+`usable: false` and a reason, the UI marks it "Not usable" with no task links, and its
+task routes answer 409 instead of an endpoint error. Nothing is deleted. Archive each one
+(the Archive button, or `POST /v1/projects/{id}/archive`), then create and register the
+real project as above.
+
+With `--backend inprocess` (disposable local validation) everything is service-local, so
+"New project" still creates the project directly (`project_create: create`).
+
 ## 6. Worker clients
 
 ```sh
@@ -808,8 +844,10 @@ the pilot phase, not part of this service.
   it. Requests recorded in older disposable state, without that flag, keep the old
   rule (the next revision resolves them).
 - **Account lookup residual risk.** `GET /v1/accounts/lookup` answers exact usernames
-  for a project administrator, and any account may create a project and so become
-  one; an account holder can therefore still test whether a given username exists.
+  for a project administrator. With the in-process backend any account may create a
+  project and so become one; with the endpoint backend only a superuser registers projects
+  and becomes their first owner. An account holder who is a project administrator can
+  therefore still test whether a given username exists.
   Mitigations: exact match only (no prefix or search), the same 404 for missing,
   partial and disabled accounts, at most 20 lookups per principal per 10 minutes
   (`429 rate_limited` beyond that; in memory, reset on restart) and an audit event
