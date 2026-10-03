@@ -152,17 +152,41 @@ class BackupCommandCase(unittest.TestCase):
         entries = {entry['name']: entry for entry in admin.read_backup_status(self.root)['projects']}
         self.assertEqual(entries['beta']['reason'], 'native backup directory is missing')
 
-    def test_uninitialized_named_project_is_skipped_and_names_its_reason(self):
+    def test_an_unknown_named_project_is_refused_and_never_recorded(self):
+        # kittrial-5bb.85 review 01a1026a: `backup NOSUCHPROJECT` recorded a skipped entry
+        # that every later `backup --all` carried forward, so the gate failed for good.
         with patch.object(admin, 'backup_project', side_effect=self.fake_backup()) as backup:
-            stdout, stderr, code = self.run_admin('backup', 'gamma')
-        self.assertNotEqual(code, 0)
-        backup.assert_not_called()
-        self.assertEqual(stderr.count('backup skipped for gamma'), 1)
+            with self.assertRaisesRegex(ValueError, 'Not an initialized project in this runtime: gamma. Nothing '
+                                                    'was backed up or recorded'):
+                self.run_admin('backup', 'gamma')
+            with self.assertRaisesRegex(ValueError, 'Not an initialized project in this runtime: gamma, zeta'):
+                self.run_admin('backup', 'alpha', 'zeta', 'gamma')       # the known one is not backed up either
+            backup.assert_not_called()
+            self.assertFalse((self.root / 'backups' / admin.BACKUP_STATUS_NAME).exists())
+            stdout, stderr, code = self.run_admin('backup', '--all')
+        self.assertEqual(code, 0, stderr)
         record = admin.read_backup_status(self.root)
-        self.assertEqual(record['status'], 'incomplete')
-        self.assertEqual(record['projects'],
-                         [{'name': 'gamma', 'status': 'skipped',
-                           'reason': 'not an initialized project in this runtime'}])
+        self.assertEqual((record['status'], [entry['name'] for entry in record['projects']]),
+                         ('complete', ['alpha', 'beta']))
+
+    def test_an_entry_for_a_name_that_is_not_a_project_is_not_carried_forward(self):
+        # What an older kit recorded for a mistyped name is dropped by the next run.
+        with patch.object(admin, 'backup_project', side_effect=self.fake_backup()):
+            self.run_admin('backup', '--all')
+            record = admin.read_backup_status(self.root)
+            record['status'] = 'incomplete'
+            record['projects'].append({'name': 'nosuchproject', 'status': 'skipped',
+                                       'reason': 'not an initialized project in this runtime'})
+            admin.write_backup_status(self.root, record)
+            gate = self.run_admin('backup-status', '--require-complete')
+            self.assertNotEqual(gate[2], 0)
+            for argv in (('backup', 'alpha'), ('backup', '--all')):
+                stdout, stderr, code = self.run_admin(*argv)
+                self.assertEqual(code, 0, stderr)
+                record = admin.read_backup_status(self.root)
+                self.assertEqual((record['status'], [entry['name'] for entry in record['projects']]),
+                                 ('complete', ['alpha', 'beta']), argv)
+            self.assertEqual(self.run_admin('backup-status', '--require-complete')[2], 0)
 
     def test_a_run_without_targets_is_refused_rather_than_recorded_empty(self):
         with self.assertRaises(ValueError):

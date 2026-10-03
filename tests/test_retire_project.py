@@ -26,6 +26,17 @@ from test_backup_multi import make_project, write_pair
 OPERATOR = 'ops-james'
 # The move renames a directory while its own coordination lock file is held open, which
 # POSIX allows and Windows refuses; the command itself is POSIX-only (it takes fcntl locks).
+REAL_SQL = admin.sql
+SERVER = {'dolt_server_host': '127.0.0.1', 'dolt_server_port': 13317, 'dolt_server_user': 'root'}
+
+
+def server_project(root, name):
+    """A project as `bd init --server` leaves it: its metadata records the Dolt server."""
+    path = make_project(root, name)
+    (path / '.beads' / 'metadata.json').write_text(json.dumps(dict(SERVER, dolt_database=name)), encoding='utf-8')
+    return path
+
+
 moves = unittest.skipUnless(os.name == 'posix', 'retire-project renames a directory holding its open lock file '
                                                 '(POSIX only)')
 
@@ -49,7 +60,7 @@ class RetireCase(unittest.TestCase):
         # alpha is a healthy project; gamma is what a stopped restore-new leaves: an
         # initialized project bd cannot read, beside the pair add-project made.
         for name in ('alpha', 'gamma'):
-            make_project(self.root, name)
+            server_project(self.root, name)
             write_pair(self.root, name)
             (self.root / 'backups' / name / 'manifest').write_text('native ' + name, encoding='utf-8')
         self.flock = Mock()
@@ -58,12 +69,21 @@ class RetireCase(unittest.TestCase):
         self.issues = {}
         self.slot_fails = set()
         self.bd = []
-        for patcher in (patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=self.flock, LOCK_EX=2)}),
+        self.probes = []
+        self.server = '1'                      # what the Dolt server answers the probe, or an exception
+        for patcher in (patch.object(admin, 'sql', side_effect=self.sql),
+                        patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=self.flock, LOCK_EX=2)}),
                         patch.dict(os.environ, {'ORCHESTRA_OPERATORS': ''}),
                         patch.object(admin, 'root_path', return_value=self.root),
                         patch.object(admin, 'run_bd', side_effect=self.run_bd)):
             patcher.start()
             self.addCleanup(patcher.stop)
+
+    def sql(self, root, query, password=None, timeout=None):
+        self.probes.append((query, timeout))
+        if isinstance(self.server, BaseException):
+            raise self.server
+        return self.server
 
     def run_bd(self, root, name, args):
         self.bd.append((name, list(args)))
@@ -193,21 +213,20 @@ class RetireCase(unittest.TestCase):
         self.assertIn('bd reads it and it holds 3 issue(s), so it looks like a working tracker', stderr)
         # The Dolt server is down: nothing is known, so it is refused, and bd is not asked.
         self.bd.clear()
-        with patch.object(admin, 'project_server_metadata', return_value=('127.0.0.1', 13317, 'root', 'gamma')), \
-                patch.object(admin, 'sql', side_effect=subprocess.CalledProcessError(1, ['dolt'], stderr='refused')):
-            stdout, stderr, code = self.retire('gamma')
+        self.server = subprocess.CalledProcessError(1, ['dolt'], stderr='refused')
+        stdout, stderr, code = self.retire('gamma')
+        self.server = '1'
         self.assertNotEqual(code, 0)
         self.assertIn('the Dolt server (or bd) could not be reached, so the project could not be checked: it may '
                       'be a healthy tracker', stderr)
         self.assertIn('its merge slot could not be read, so it is treated as held', stderr)
         self.assertEqual(self.bd, [])
         # The server answers and bd rejects the project: that is the partial project, no flag.
-        with patch.object(admin, 'project_server_metadata', return_value=('127.0.0.1', 13317, 'root', 'gamma')), \
-                patch.object(admin, 'sql', return_value='1'):
-            findings = admin.retire_findings(self.root, 'gamma')
-        self.assertEqual((findings['server'], findings['bd'], admin.retire_blockers(findings)), ('up', 'rejects', []))
+        findings = admin.retire_findings(self.root, 'gamma')
+        self.assertEqual((findings['metadata'], findings['server'], findings['bd'], admin.retire_blockers(findings)),
+                         ('server', 'up', 'rejects', []))
         # bd reads an empty project but not its merge slot: treated as held.
-        make_project(self.root, 'delta')
+        server_project(self.root, 'delta')
         self.slot_fails.add('delta')
         stdout, stderr, code = self.retire('delta')
         self.assertNotEqual(code, 0)
@@ -225,6 +244,62 @@ class RetireCase(unittest.TestCase):
                       '.requirement-requests)', stderr)
         self.assertEqual(tree(self.root), before | {k: v for k, v in tree(self.root).items() if 'delta' in k})
         self.assertEqual(self.journal(), [])
+
+    def test_an_unreadable_metadata_file_is_not_an_empty_project(self):
+        # Review 01a1026a, P2: with metadata.json present but unusable the kit found no
+        # server coordinates, skipped the server check and ran bd, which fell back to an
+        # embedded database inside the project and reported zero issues.
+        self.issues['alpha'] = 3
+        metadata = self.root / 'projects' / 'alpha' / '.beads' / 'metadata.json'
+        for label, text in (('not JSON', '{"dolt_server_host": '), ('not an object', '[]'),
+                            ('no server coordinates', '{}'), ('not text', None)):
+            with self.subTest(label):
+                metadata.write_bytes(b'\xff\xfe') if text is None else metadata.write_text(text, encoding='utf-8')
+                self.bd.clear()
+                self.probes.clear()
+                findings = admin.retire_findings(self.root, 'alpha')
+                self.assertEqual((findings['metadata'], findings['bd'], findings['issues'], findings['merge_slot']),
+                                 ('unreadable', 'unreachable', None, 'unreadable'))
+                stdout, stderr, code = self.retire('alpha')
+                self.assertNotEqual(code, 0)
+                self.assertIn('its .beads/metadata.json is there but could not be read (or does not record the Dolt '
+                              'server), so the project could not be checked: it may be a healthy tracker', stderr)
+                self.assertEqual((self.bd, self.probes), ([], []))          # bd is never run without coordinates
+                self.assertTrue(metadata.is_file())
+        self.assertEqual(self.journal(), [])
+        if os.name == 'posix' and os.geteuid() != 0:
+            metadata.write_text(json.dumps(dict(SERVER, dolt_database='alpha')), encoding='utf-8')
+            for target in (metadata, metadata.parent):                      # the file, then .beads itself, at mode 000
+                mode = target.stat().st_mode
+                target.chmod(0)
+                try:
+                    findings = admin.retire_findings(self.root, 'alpha')
+                finally:
+                    target.chmod(mode)
+                self.assertEqual((findings['metadata'], findings['bd']), ('unreadable', 'unreachable'), target)
+                self.assertIn('could not be read', '; '.join(admin.retire_blockers(findings)))
+            self.assertEqual(self.bd, [])
+        # A directory that was never initialized has nothing to read; bd is not run there either.
+        (self.root / 'projects' / 'epsilon').mkdir()
+        self.bd.clear()
+        findings = admin.retire_findings(self.root, 'epsilon')
+        self.assertEqual((findings['metadata'], findings['bd'], findings['merge_slot'],
+                          admin.retire_blockers(findings), self.bd),
+                         ('absent', 'uninitialized', 'not-applicable', [], []))
+
+    def test_a_frozen_server_is_could_not_be_checked_not_a_hang(self):
+        # Review 01a1026a, P3: the probe has a ceiling; no answer in time is "unreachable".
+        self.server = subprocess.TimeoutExpired(['dolt'], admin.RETIRE_PROBE_TIMEOUT)
+        stdout, stderr, code = self.retire('alpha')
+        self.assertNotEqual(code, 0)
+        self.assertIn('the Dolt server (or bd) could not be reached, so the project could not be checked', stderr)
+        self.assertEqual(self.probes, [('SELECT 1;', admin.RETIRE_PROBE_TIMEOUT)])
+        self.assertEqual(self.bd, [])
+        self.assertLessEqual(admin.RETIRE_PROBE_TIMEOUT, 30)
+        with patch.object(admin, 'config', return_value={'port': 13317}), \
+                patch.object(admin, 'environment', return_value={}), patch.object(admin, 'checked') as checked:
+            REAL_SQL(self.root, 'SELECT 1;', timeout=7)
+        self.assertEqual(checked.call_args.kwargs['timeout'], 7)
 
     def test_a_retire_is_refused_while_a_restore_into_the_name_is_running(self):
         # Review 01a10219, P3: restore-new holds backups/NAME.restore.lock for its whole run.
@@ -280,7 +355,7 @@ class RetireCase(unittest.TestCase):
         self.assertIn('looks like a working tracker', stderr)
         self.assertIn('Nothing was changed', stderr)
         # A project that is not working can still strand a held slot or a reservation.
-        make_project(self.root, 'delta')
+        server_project(self.root, 'delta')
         self.slot['delta'] = 'alice/session'
         requests = self.root / 'projects' / 'delta' / '.coordination-requests'
         requests.mkdir()
@@ -366,11 +441,27 @@ class RestoreNoticeCase(unittest.TestCase):
             with self.subTest(answer=str(answer)[:30]), tempfile.TemporaryDirectory() as temp, patch.object(
                     admin, 'run_bd', side_effect=[answer] if isinstance(answer, Exception) else None,
                     return_value=None if isinstance(answer, Exception) else answer):
-                make_project(Path(temp), 'beta')
+                server_project(Path(temp), 'beta')
                 self.assertEqual(admin.restore_destination_state(Path(temp), 'beta'), expected)
         with tempfile.TemporaryDirectory() as temp, patch.object(admin, 'run_bd') as native:
             self.assertEqual(admin.restore_destination_state(Path(temp), 'beta'), 'missing')
+            # Review 01a1026a: a directory add-project never initialized is not "an empty,
+            # working project", and bd is never run where there are no server coordinates
+            # (it would create an embedded database inside the directory).
+            (Path(temp) / 'projects' / 'beta').mkdir(parents=True)
+            self.assertEqual(admin.restore_destination_state(Path(temp), 'beta'), 'uninitialized')
+            for text in ('{}', 'not json', '[]'):
+                make_project(Path(temp), 'beta').joinpath('.beads', 'metadata.json').write_text(text,
+                                                                                                 encoding='utf-8')
+                self.assertEqual(admin.restore_destination_state(Path(temp), 'beta'), 'partial')
             native.assert_not_called()
+        stopped = admin.restore_failure_notice('beta', admin.TerminatedBySignal(signal.SIGTERM), 'uninitialized',
+                                               step='add-project')
+        self.assertIn('the restore was interrupted during the add-project step', stopped)
+        self.assertIn('The directory projects/beta exists but the project was not initialized, so it is not a '
+                      'working project', stopped)
+        self.assertNotIn('empty, working project', stopped)
+        self.assertIn('admin.py retire-project beta --actor OPERATOR --reason TEXT', stopped)
 
     def test_the_identity_step_runs_inside_the_termination_guard(self):
         seen = {}
@@ -398,10 +489,86 @@ class RestoreNoticeCase(unittest.TestCase):
 
     def test_a_refusal_is_one_line_not_a_traceback(self):
         # Review 01a10219, P3 (e): the line a traceback would end with, and nothing else.
-        with patch.object(admin, 'main', side_effect=ValueError('Refusing to retire x: y')):
-            with self.assertRaises(SystemExit) as refused:
+        import requirements
+        for error, line in ((ValueError('Refusing to retire x: y'), 'ValueError: Refusing to retire x: y'),
+                            (requirements.ValidationError('bad publication'), 'ValueError: bad publication')):
+            with patch.object(admin, 'main', side_effect=error):
+                with self.assertRaises(SystemExit) as refused:
+                    admin.run_main()
+            self.assertEqual(refused.exception.code, line)
+
+    def test_an_error_that_is_not_a_kit_refusal_keeps_its_traceback(self):
+        # Review 01a1026a, P2: JSONDecodeError is a ValueError; shortened to one line it named
+        # no file. Only the kit's own refusals are shortened.
+        for error in (json.JSONDecodeError('Expecting value', 'x', 0),
+                      UnicodeDecodeError('utf-8', b'\xff', 0, 1, 'invalid start byte')):
+            with self.subTest(error=type(error).__name__), patch.object(admin, 'main', side_effect=error):
+                with self.assertRaises(type(error)):
+                    admin.run_main()
+        self.assertFalse(admin.kit_refusal(json.JSONDecodeError('Expecting value', 'x', 0)))
+        self.assertTrue(admin.kit_refusal(ValueError('x')))
+
+    def test_a_broken_json_file_is_a_refusal_that_names_the_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            marker = root / 'deployment.private.json'
+            marker.write_text('{"port": 13317,', encoding='utf-8')
+            for read in (admin.config, admin.operators, admin.verifiers):
+                with self.subTest(read=read.__name__), self.assertRaises(ValueError) as refused:
+                    read(root)
+                self.assertIs(type(refused.exception), ValueError)
+                self.assertIn('Deployment configuration %s is not valid JSON: Expecting' % marker,
+                              str(refused.exception))
+            marker.write_text(json.dumps({'port': 13317, 'operators': [OPERATOR]}), encoding='utf-8')
+            make_project(root, 'alpha')
+            payload = root / 'void.json'
+            payload.write_text('{"schema_version": 1, oops', encoding='utf-8')
+            for command in ('void-record', 'requirement-apply', 'handoff'):
+                argv = ['admin.py', '--root', str(root), command, 'alpha', '--actor', OPERATOR, '--file', str(payload)]
+                with self.subTest(command=command), patch.object(sys, 'argv', argv), \
+                        patch.object(admin, 'root_path', return_value=root), \
+                        patch.dict(os.environ, {'ORCHESTRA_OPERATORS': ''}), \
+                        patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2)}), \
+                        patch.object(admin, 'run_bd') as native, self.assertRaises(SystemExit) as refused:
+                    admin.run_main()
+                self.assertEqual(refused.exception.code.count('\n'), 0)
+                self.assertIn('ValueError: Payload file %s is not valid JSON: ' % payload, refused.exception.code)
+                native.assert_not_called()
+            payload.write_bytes(b'\xff\xfe{')
+            with self.assertRaisesRegex(ValueError, 'is not readable text'):
+                admin.read_json_file(payload, 'Payload file', encoding='utf-8-sig')
+            with self.assertRaises(FileNotFoundError):                      # names its path already
+                admin.read_json_file(root / 'absent.json', 'Payload file')
+
+    def test_a_stop_during_add_project_prints_the_notice(self):
+        # Review 01a1026a, P3: SIGTERM is an exception for every step of restore-new, so the
+        # notice is printed for a stop during add-project too.
+        seen = {}
+
+        def add_project(root, name):
+            seen['handler'] = signal.getsignal(signal.SIGTERM)
+            (root / 'projects' / name).mkdir(parents=True)
+            raise admin.TerminatedBySignal(signal.SIGTERM)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / 'backups' / 'alpha').mkdir(parents=True)
+            (root / 'deployment.private.json').write_text(json.dumps({'port': 13317}), encoding='utf-8')
+            stderr = io.StringIO()
+            before = signal.getsignal(signal.SIGTERM)
+            argv = ['admin.py', '--root', str(root), 'restore-new', 'alpha', 'beta']
+            with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', return_value=root), \
+                    patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2)}), \
+                    patch.object(admin, 'coordination_backup'), patch.object(admin, 'add_project', add_project), \
+                    patch.object(admin, 'run_bd') as native, contextlib.redirect_stderr(stderr), \
+                    self.assertRaises(SystemExit) as stopped:
                 admin.run_main()
-        self.assertEqual(refused.exception.code, 'ValueError: Refusing to retire x: y')
+            self.assertEqual(stopped.exception.code, 128 + signal.SIGTERM)
+            self.assertIs(seen['handler'], admin.raise_termination)
+            self.assertIs(signal.getsignal(signal.SIGTERM), before)
+            self.assertIn('restore-new did not complete: the restore was interrupted during the add-project step. '
+                          'The directory projects/beta exists but the project was not initialized',
+                          stderr.getvalue())
+            native.assert_not_called()
 
 
 class ReconcileAllowlistCase(unittest.TestCase):
