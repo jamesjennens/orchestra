@@ -179,6 +179,38 @@ class ReadableRecordRuleTests(ReleaseCase):
             for other in (orphan, malformed, voided_only):
                 self.assertFalse(module.KIND.presents_record(other(module, 'x'), OPS), other.__name__)
 
+    def test_an_inert_accepted_entry_is_still_readable(self):
+        # Review of 3531a05: an entry accepted by an operator who was later removed reads
+        # draft-only with acceptance-inert and shows neither a record nor a proposed revision.
+        # It is still the genuine entry: the forged draft beside it is the one released.
+        for module in (cr, rr):
+            with self.subTest(kind=module.TYPE_LABEL, shape='inert accepted and a forged draft'):
+                native = self.native(evidence_by(module, anchor(module, 'a-genuine'), 'ops7'),
+                                     anchor(module, 'b-forged', state='draft'))
+                genuine = module.KIND.entry_view(native.row('a-genuine'), OPS)
+                self.assertEqual((genuine['state'], genuine['record'], genuine.get('proposed')),
+                                 ('draft-only', None, None))
+                self.assertTrue(module.KIND.presents_record(native.row('a-genuine'), OPS))
+                done = self.release(module, native, 'b-forged')
+                self.assertEqual((done['remaining'], done['evidence_set_aside']), (['a-genuine'], []))
+                view = module.get(native.rows, KEY, OPS)
+                self.assertEqual((view['native_id'], [w['code'] for w in view['warnings']]),
+                                 ('a-genuine', ['acceptance-inert']))
+                # Re-adding the operator makes the genuine entry accepted again.
+                self.assertEqual(module.get(native.rows, KEY, OPS + ['ops7'])['state'], 'accepted')
+            with self.subTest(kind=module.TYPE_LABEL, shape='two inert accepted anchors'):
+                native = self.native(evidence_by(module, anchor(module, 'a-genuine'), 'ops7'),
+                                     evidence_by(module, anchor(module, 'b-forged'), 'ops8'))
+                for task in ('a-genuine', 'b-forged'):
+                    with self.assertRaisesRegex(ValueError, 'released only with --set-aside-evidence'):
+                        self.release(module, native, task)                 # never without the explicit flag
+                self.assertEqual(self.writes(native), [])
+                done = self.release(module, native, 'b-forged', set_aside_evidence=True)
+                self.assertEqual((done['remaining'], [(item['operator'], item['live'])
+                                                      for item in done['evidence_set_aside']]),
+                                 (['a-genuine'], [('ops8', False)]))
+                self.assertEqual(module.get(native.rows, KEY, OPS + ['ops7', 'ops8'])['state'], 'accepted')
+
     def test_an_accepted_anchor_that_reads_malformed_is_not_set_aside(self):
         # Review of b1b2b10: the genuine accepted anchor carries one unvoided malformed
         # comment, so it reads no accepted record and neither rule protected it.

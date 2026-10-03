@@ -874,16 +874,17 @@ class AnchoredKind:
             return []
 
     def presents_record(self, row, operators):
-        """Whether a reader would present a record from this anchor: its `entry_view` is not
-        malformed, unsupported or incomplete and shows an accepted record or a proposed
-        revision. The revision ledger alone is not enough: one other bad comment on the
+        """Whether a reader would present this anchor's entry: it still holds a record after
+        applied voids and its `entry_view` state is not malformed, unsupported or
+        incomplete. The revision ledger alone is not enough: one other bad comment on the
         anchor (a malformed acceptance, a CRLF lookalike, a newer or unknown record kind)
-        makes the reader refuse the whole entry (review of b1b2b10)."""
+        makes the reader refuse the whole entry (review of b1b2b10). The state is the
+        whole test: an entry accepted by an operator who was later removed reads
+        `draft-only` with no record and no proposed revision shown, and is still the
+        genuine entry (review of 3531a05); superseded and drifted entries count too."""
         if not self.has_live_record(row, operators):
             return False
-        view = self.entry_view(row, operators)
-        return view['state'] not in (None, 'malformed', 'unsupported', 'incomplete') \
-            and (view.get('record') is not None or view.get('proposed') is not None)
+        return self.entry_view(row, operators)['state'] not in (None, 'malformed', 'unsupported', 'incomplete')
 
     def acceptance_on(self, row, operators):
         """The acceptance evidence on one anchor that no applied void names:
