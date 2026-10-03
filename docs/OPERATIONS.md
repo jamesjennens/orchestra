@@ -65,6 +65,7 @@ history](#malformed-structured-history) (`void-record`).
 | `verifiers list\|add\|remove [ACTOR] [--confirm-revoke]` | manage the deployment `verifiers` list: actors, other than operators, whose `capability-verify` records readers count as verified. The list is empty by default and grants nothing else. `remove` needs `--confirm-revoke`; the refusal names the capabilities whose verification would change | shell access to the coordination host; `deployment.private.json` is the only authority source |
 | `capability-reconcile PROJECT --operation-id ID ...` | finish a capability operation whose write was uncertain (for a batch item, the id is `OPERATION_ID/KEY`). A transient native failure can leave a `pending` receipt with no native row behind it, and the same `operation_id` is then refused until it is cleared: run `capability-reconcile --disposition released`, then retry the original command | confirmation of the native record state |
 | `record-reconcile PROJECT --kind requirement\|reference\|capability ...` | the same reconcile for any record kind | as above |
+| `capability-misses-clear PROJECT` | delete the project's [capability lookup-miss log](#the-capability-lookup-miss-log). It prints what was removed (`finds`, `misses`, `phrases`), and in `repaired` any symlink, directory or unopenable lock file it removed from the three miss-log names (never following a link). It writes nothing to the tracker, takes no coordination lock and calls no `bd` | none beyond the service account: it deletes telemetry only, so there is no allowlist check and no `--actor` |
 | `void-record PROJECT --actor OPERATOR --file void.json` | void a malformed or stale contribution-review record, or a malformed, foreign or conflicting reference or capability record ([below](#reference-and-capability-records)) | the deployment operator allowlist (`operators` in `deployment.private.json`) |
 | `anchor-release PROJECT --kind reference\|capability --issue-id ID --actor OPERATOR --reason TEXT` | close a reference or capability anchor that holds no record and free its key, when the propose that created it cannot be re-run ([orphan anchors](#orphan-anchors)) | the deployment operator allowlist, checked before any read |
 | `handoff PROJECT --actor ACTOR --file handoff.json` | transfer a claim when the current owner cannot act | an owner decision/evidence pointer in the payload's `approval` |
@@ -183,6 +184,7 @@ A row is hidden as a record anchor only when it carries one of the labels `refer
 - **One authority source.** `deployment.private.json` is the only source. A shell `ORCHESTRA_VERIFIERS` that disagrees with the file is refused by `verifiers add`, `verifiers remove` and `capability-verify`; it is never read as authority. Entries are actor identities (letters, digits, `_`, `.`, `-`), so an `account:` value can never be a verifier.
 - **Revocation.** `verifiers remove ACTOR` requires `--confirm-revoke`. Afterwards every check that actor recorded reads `reported`, and drift that only their passes had cleared reappears. Nothing is deleted: re-adding the actor restores the reading. An actor who is also an operator stays trusted.
 - **Backup and restore.** Each project's coordination sidecar records the list beside `operators`, for information. `restore-new` never re-grants it on its own. When the backup records verifiers this host does not list, the restore prints them, says they were **NOT** restored, and their checks read `reported`. Re-grant one with `verifiers add ACTOR`, or pass `--restore-verifiers` to re-establish the whole recorded list. `--restore-operators` does not re-grant verifiers.
+- **One caller can fill the failing-report pool.** Every contributor posting through the endpoint is `unverified` until SSH actors are bound to people (kittrial-5bb.68), so they share one pool of 5 open failing reports per project. One caller can fill it, and then every other contributor's failing report is refused, naming the cap, until those failures are cleared. To clear them, an operator or listed verifier records a passing check at an integrated commit for each drifted capability (`capability check --payloads`, then `capability-verify`); `capability list` shows which ones read `drifted`. If the reports are noise, that pass is still the way to clear them, because a report is never deleted.
 - **Integration step.** At the integrated commit, in a clean checkout: `capability check --repo . --payloads payloads.json`, then on the coordination host `admin.py capability-verify PROJECT --actor OPERATOR --file payloads.json`. The payloads file is created private (mode 0600) and is never written through a symbolic link. Drift clears only on such a verified pass at a commit the project's lifecycle evidence records as integrated; a reverted integration does not count.
 - **Rolling back below this kit.** An older kit keeps every record, hides them as before and simply reports no `verification`. It never rewrites or removes `views/CAPABILITIES.md`, so after a rollback delete `projects/PROJECT/views/CAPABILITIES.md` by hand; otherwise the last page rendered stays readable through `view` with its old export stamp.
 
@@ -210,6 +212,78 @@ python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime bac
 `backup-copy DEST` applies exactly the `--require-complete` gate and refuses, naming what is missing, when any initialized project is not complete. It then copies each project's last complete pair — the native backup directory as `DEST/PROJECT`, the complete sidecar as `DEST/PROJECT.coordination.json`, and, when the project has one, its operation-journal snapshot as `DEST/PROJECT.http-operations.sqlite3` (the same shape a runtime's `backups/` directory has, so the copy can be copied back and restored) — and copies the record that gated the copy. Each project's `backups/PROJECT.lock` is held for that project's whole staging, while its coordination lock is held only long enough to re-check the pair and copy the small sidecar and journal snapshot; the long native copy runs after the coordination lock is released, so copying a large database does not block endpoint writes on it (both commands take the two locks in the same order, so no deadlock is possible). Files are staged in a per-run directory and then moved into place by rename rather than merged, so a concurrent `backup --all` cannot yield a mixed native directory beside a complete sidecar and stale destination files do not survive. Each project's native directory is also checked against the `mtime_ns`-keyed manifest its complete sidecar records, before and after that project's copy: a directory that no longer matches — a killed or interrupted run can leave it partly rewritten — is refused rather than copied, a directory that changes while it is being copied is refused, and a sidecar that records no manifest is reported as unverifiable instead of being called clean. The completeness record is published only after every project is in place: a failure exits non-zero with a clear error, removes the staging directory and leaves no completeness record, so the destination never looks complete when it is not. It prints exactly what it copied, is credential-free and never touches a unit, timer or schedule. The scheduled, encrypted off-machine system, its encryption, retention and destination, remain the operator's: this helper is the reference the operator can gate and schedule, not a replacement for that system, and it cannot see whether a copy actually left the host.
 
 If restore is interrupted, the new destination may exist with only part of the restore completed. Preserve it for inspection; retry recovery into another unused destination. Do not delete the source or force reuse of the partially restored target. Verify pending reservations, comments, lifecycle events, baselines and slot context before switching clients.
+
+### The capability lookup-miss log
+
+The endpoint counts each `capability find` and remembers the phrases that had no exact
+record match, so an operator can see which phrases miss and how often
+([CLI contract](CLI_CONTRACT.md#capability-misses-which-phrases-miss-and-how-often)).
+Read it with the client: `capability misses --limit 20`.
+
+**It is telemetry, and it is not backed up.**
+- It lives in two files in the project directory: `.capability-misses.json` (the log,
+  mode 0600) and `.capability-misses.lock` (an empty lock file). A crashed write can
+  leave `.capability-misses.json.tmp`; the next write removes it.
+- `admin.py backup` does **not** collect them, and `restore-new` does not create them.
+  A restored project starts with an empty log. Losing the log is acceptable: it only
+  steers which capabilities to index next.
+- That is deliberate. A backup carrying a path an older kit does not know is refused by
+  that kit's restore. Keeping the log out of the backup means **this change does not
+  move the oldest kit a deployment may roll back to.**
+- It adds no tracker comment kind, label or record type. A kit without this feature
+  never reads the files and ignores them; they can be left in place or deleted.
+- A missing, corrupt, oversized or unknown-schema log is never an error. The next
+  `find` starts a new one, and `capability misses` reports `log: unreadable`.
+
+**What it stores:** the normalised phrase, a count, and first-seen and last-seen times
+per phrase, plus the counters `finds`, `misses`, `overflow`, `dropped` and `evicted`.
+No actor names. Phrases are untrusted contributor text: read them as data.
+
+**Bounds:**
+- 500 phrases per project. When full, phrases first seen in the last 2 hours are
+  protected, and among the rest the one with the lowest count goes (the one seen
+  longest ago among equal counts). If every phrase was first seen in the last 2 hours,
+  the one seen longest ago goes. A flood of one-off phrases evicts other one-offs, and
+  a new phrase that keeps recurring is kept long enough to build up a count. Protection
+  is keyed on first-seen, so repeating a phrase cannot keep it protected. When the log
+  is full of phrases with a count of 2 or more, a phrase that recurs less often than
+  every 2 hours is not kept.
+- 60 new phrases per project per clock hour (UTC). Further new phrases that hour are
+  counted in `overflow` only. The bound is per project because no actor is stored, so
+  one caller can use up the whole hourly quota.
+- Counts are not votes: no count can be attributed to anyone, and one caller can repeat
+  a phrase to push it to the top.
+- 80 characters per stored phrase. The file is at most about 530 kB, and normally a few
+  tens of kB; a file over 1 MB is not read and is replaced.
+
+**Cost and locking:**
+- Recording takes its own lock (`.capability-misses.lock`) with a few non-blocking
+  attempts, waiting about 10 ms at most in total. If another request still holds it,
+  that one find is not counted, so the counts are lower bounds. It never takes
+  `.coordination.lock`, so it never waits for a writer and never makes one wait.
+- It calls no `bd` and starts no process. The log is rewritten on each counted find
+  (temp file, then rename, no fsync). The independent review measured 2-3 ms for normal
+  logs, and for a worst-case 517 kB log about 5 ms median and up to 33 ms at the 95th
+  percentile.
+
+**Stuck states.** If the lock path is anything but a regular file (a symlink,
+directory, FIFO or other special file), or the log or temp path is a directory, finds
+still answer, without waiting, but nothing is recorded. The lock is checked with
+`lstat` and opened non-blocking, so a FIFO there can never hang a find. `capability misses` then
+reports `recording: lock-unusable` or `log-unwritable` instead of `ok`, so its zeros
+are not mistaken for "no misses". `capability-misses-clear` repairs it.
+
+**To clear it:**
+
+```sh
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime capability-misses-clear example
+```
+
+This deletes the log and starts a new measuring window (`since`). Clear it after a batch
+of aliases or capabilities has been accepted, so the next window measures the improved
+index. It also removes a symlink, directory or unopenable lock file found at
+`.capability-misses.json`, `.capability-misses.json.tmp` or `.capability-misses.lock`,
+without following a link. Deleting those paths by hand is equally safe.
 
 ### Malformed structured history
 

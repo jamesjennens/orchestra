@@ -438,6 +438,62 @@ class ReadCostTests(VerificationCase):
         self.assertTrue(exported(INTEGRATED))
         self.assertFalse(exported(follow.COMMIT_1))    # the source commit is not the integration commit
 
+    def test_a_capability_anchor_that_carries_lifecycle_facts_reads_the_same_everywhere(self):
+        """kittrial-5bb.69 re-review P3: read_catalog put such a row in only one of its two
+        sets, so list and find read drifted where get read verified."""
+        for index in range(cr.keyed_entries.CATALOG_SHOW_MAX + 2):
+            self.propose(operation_id='many-%d' % index, key='many.k%02d' % index, name='Many %d' % index,
+                         aliases=[])
+        anchor = self.anchor('many.k03')
+        self.record_lifecycle_on(anchor, OTHER)        # the anchor itself records OTHER as integrated
+        self.verify(actor='bob', key='many.k03', missing=('review_workflow.py::execute',))
+        self.verify(actor=OPERATOR, operator=True, key='many.k03', commit=OTHER)
+        self.sync()
+        rows, lifecycle = cr.read_catalog(self.run_native)
+        self.assertIn(anchor, [row['id'] for row in rows])
+        self.assertIn(anchor, [row['id'] for row in lifecycle])
+        self.assertEqual(self.state('many.k03')['state'], 'verified')
+        listed = cr.read(['list', '--limit', '100'], self.run_native, OPS, journal=self.journal)
+        self.assertEqual([item['verification'] for item in listed['items'] if item['key'] == 'many.k03'],
+                         ['verified'])
+        found = cr.read(['find', 'Many 3'], self.run_native, OPS, journal=self.journal)
+        self.assertEqual([item['verification'] for item in found['records'] if item['key'] == 'many.k03'],
+                         ['verified'])
+
+    def record_lifecycle_on(self, task, integration_commit):
+        """A scoped `integrated=passed` fact on `task`, written the way lifecycle.apply_native writes it."""
+        import lifecycle
+        from requirements import content_hash as digest
+        self.sync()
+        row = self.native.row(task)
+
+        def run(args):
+            if args == ['export', '--all']:
+                return self.native(['export', '--all'])
+            dimension, value = args[2].split('=', 1)
+            old = next((label.split(':', 1)[1] for label in row['labels'] if label.startswith(dimension + ':')), None)
+            row['labels'] = [label for label in row['labels'] if not label.startswith(dimension + ':')] + \
+                ['%s:%s' % (dimension, value)]
+            event = '%s.%d' % (task, len(self.native.rows))
+            reason = args[args.index('--reason') + 1]
+            self.native.rows.append(dict(
+                id=event, issue_type='event', title='State change: %s \u2192 %s' % (dimension, value),
+                description=('Set %s to %s' % (dimension, value) if old is None else
+                             'Changed %s from %s to %s' % (dimension, old, value)) + '\n\nReason: ' + reason,
+                status='closed', created_by='worker', created_at='2026-10-01T00:00:00Z', labels=[], comments=[],
+                dependencies=[dict(issue_id=event, depends_on_id=task, type='parent-child')]))
+            self.capability_rows = [item for item in self.native.rows if item not in self.fixture.rows]
+            return json.dumps(dict(changed=True, dimension=dimension, event_id=event, new_value=value))
+
+        scope = {'source_commit': '2' * 40, 'integration_commit': integration_commit, 'release_id': '',
+                 'environment': ''}
+        base = dict(schema_version=1, task=task, scope=scope, evidence=['commit:' + integration_commit],
+                    provenance='performed', actor='worker')
+        lifecycle.apply_native(dict(base, operation_id='scope-on-anchor', dimension='lifecycle-scope',
+                                    value=digest(scope)), 'worker', run)
+        lifecycle.apply_native(dict(base, operation_id='fact-on-anchor', dimension='integrated', value='passed'),
+                               'worker', run)
+
     def test_list_and_find_make_one_export_and_no_narrow_read_once_the_catalog_exports(self):
         """Review 01a0fe9e `list-find-two-exports`: above the show threshold the catalog
         read exports once, and the integrated test is answered from that same export."""

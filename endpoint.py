@@ -141,7 +141,8 @@ def execute(root,request,authority_config=None,require_authority=False):
         runner=NativeRunner(run)
         def work_effect():
             return {'returncode':0,'stdout':json.dumps(work_execute(path,actor,action,args,request.get('attachments',{}),runner,
-                                                                    operators=configured_operators(root)),ensure_ascii=False,indent=2)+'\n','stderr':''.join(run_warnings)}
+                                                                    operators=configured_operators(root),
+                                                                    verifiers=configured_verifiers(root)),ensure_ascii=False,indent=2)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             return run_guarded(request,journal_path(path),work_effect,
@@ -209,9 +210,10 @@ def execute(root,request,authority_config=None,require_authority=False):
     if action=='capability':
         # The capability index (.60 slices 1a and 1b, kittrial-5bb.67/.69). get, list, find
         # and help are reads (one label-filtered bd list plus bd show; no lock, not
-        # run_guarded); propose, revise, propose-alias and verify are writes, under the
-        # lock and the journal. lookup, resolve, index and check run in the client. A
-        # verification written here is always `unverified`; the deployment verifiers list
+        # run_guarded); misses is a read of the lookup-miss log (capability_misses, kittrial-
+        # 5bb.77), which find feeds; propose, revise, propose-alias and verify are writes,
+        # under the lock and the journal. lookup, resolve, index and check run in the client.
+        # A verification written here is always `unverified`; the deployment verifiers list
         # only decides how host-written (`admin.py capability-verify`) records are read.
         import capability_records
         args=request.get('args',[])
@@ -222,8 +224,25 @@ def execute(root,request,authority_config=None,require_authority=False):
             if warnings:run_warnings.append(warnings)
             return stdout
         if not args or args[0] not in capability_records.WRITE_COMMANDS:
+            if args[:1]==['misses'] and not any(token in ('--help','-h') for token in args):
+                # The lookup-miss log (kittrial-5bb.77): read-only, no lock, not run_guarded.
+                # It reads the telemetry file, and the records once (only when the log holds
+                # a phrase) to mark the misses that would now resolve. ASCII-escaped: the
+                # phrases are untrusted text.
+                import capability_misses
+                limit=capability_misses.options(args[1:])['limit']
+                result=capability_misses.report(path,lambda:capability_records.exact_index(capability_records.read_catalog(run)[0],configured_operators(root)),limit)
+                return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=True)+'\n','stderr':''.join(run_warnings)}
             result=capability_records.read(args,run,configured_operators(root),
                                            verifiers=configured_verifiers(root),journal=path)
+            if args[:1]==['find'] and isinstance(result,dict) and isinstance(result.get('found'),bool):
+                # Telemetry (kittrial-5bb.77): count the find and, with no exact match, its
+                # normalised phrase. Its own non-blocking lock file, never .coordination.lock;
+                # no bd call, no subprocess, no journal row; it cannot fail or delay the read.
+                try:
+                    import capability_misses
+                    capability_misses.record_find(path,result.get('normalized'),result['found'])
+                except Exception:pass
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
         operators=configured_operators(root)
         runner=NativeRunner(run)
@@ -248,7 +267,8 @@ def execute(root,request,authority_config=None,require_authority=False):
         runner=NativeRunner(run)
         def briefing_effect():
             return {'returncode':0,'stdout':briefing_execute(root,path,name,actor,action,args,request.get('attachments',{}),runner,
-                                                             operators=configured_operators(root)),'stderr':''.join(run_warnings)}
+                                                             operators=configured_operators(root),
+                                                             verifiers=configured_verifiers(root)),'stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             return run_guarded(request,journal_path(path),briefing_effect,

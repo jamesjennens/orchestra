@@ -391,12 +391,25 @@ class EndpointDispatchTests(unittest.TestCase):
         self.assertEqual((self.locks.call_count, self.guarded), (2, ['capability', 'capability']))
         self.locks.reset_mock()
         self.guarded.clear()
+        flocked = []
+        self.locks.side_effect = lambda handle, flags: flocked.append(
+            os.fstat(handle) if isinstance(handle, int) else None)
         self.assertEqual(self.execute(['get', 'review.structured-contribution'])['state'], 'draft-only')
         self.assertEqual(self.execute(['list'])['total'], 1)
         self.assertEqual(self.execute(['find', 'reserved label guard'])['candidates'][0]['key'],
                          'review.structured-contribution')
         self.assertEqual(self.execute(['find', '--help'])['action'], 'capability')
-        self.assertEqual((self.locks.call_count, self.guarded), (0, []))
+        # No read takes the coordination lock (a file object here) or writes a journal row.
+        # The one flock a find may make is the lookup-miss log's own (kittrial-5bb.77): a
+        # descriptor of .capability-misses.lock, never blocking, where the platform has flock.
+        coordination = [call for call in self.locks.call_args_list if not isinstance(call.args[0], int)]
+        telemetry = [call for call in self.locks.call_args_list if isinstance(call.args[0], int)]
+        self.assertEqual((coordination, self.guarded), ([], []))
+        self.assertLessEqual(len(telemetry), 1)
+        self.assertTrue(all(call.args[1] & self.endpoint.fcntl.LOCK_NB for call in telemetry))
+        self.assertEqual((self.project / '.capability-misses.lock').exists(), bool(telemetry))
+        if telemetry:   # the descriptor flocked is the miss-log lock file itself
+            self.assertTrue(os.path.samestat(flocked[-1], os.stat(self.project / '.capability-misses.lock')))
 
     def test_verify_is_a_locked_guarded_write_that_is_never_verified(self):
         payload = {k: v for k, v in entry().items() if k != 'operation'}

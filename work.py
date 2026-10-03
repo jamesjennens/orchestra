@@ -24,7 +24,8 @@ MISTAKEN_FLAGS = {
 HELP_TOKENS = ('-h', '--help')
 VALUE_OPTIONS = {'--owner', '--state', '--limit', '--offset', '--handoff-limit',
                  '--handoff-offset', '--file', '-f', '--items-offset', '--items-limit',
-                 '--since', '--cursor', '--body-budget', '--ref-limit', '--ref-offset'}
+                 '--since', '--cursor', '--body-budget', '--ref-limit', '--ref-offset',
+                 '--capability-limit', '--capability-offset'}
 
 def help_requested(args):
     """True when args ask for help; side-effect free for every command."""
@@ -58,13 +59,20 @@ def help_payload(action='work'):
             'handoff-offset': '>= %d' % WORK_OFFSET_MIN,
             'ref-limit': '%d..%d' % (WORK_LIMIT_MIN, WORK_LIMIT_MAX),
             'ref-offset': '>= %d' % WORK_OFFSET_MIN,
+            'capability-limit': '%d..%d' % (WORK_LIMIT_MIN, WORK_LIMIT_MAX),
+            'capability-offset': '>= %d' % WORK_OFFSET_MIN,
         }
         payload['output'] = {
             'top_level': ['owner', 'total', 'items', 'next_offset', 'coverage', 'attention'],
             'attention': 'attention.reference_review: project-wide reference catalog counts (expired, '
                          'due_soon, unset = draft-only entries, acceptance_inert, malformed, total), always; '
                          'items only for an approver (an actor on the deployment operator allowlist), '
-                         'paged by --ref-limit/--ref-offset; task filters never hide it',
+                         'paged by --ref-limit/--ref-offset; task filters never hide it. '
+                         'attention.capability_index: the capability index in the agent attention shape '
+                         '(state, summary, counts, actions, truncated, computed_at) plus items and next_offset; '
+                         'counts (drifted, reported_only, unverified_stale, alias_pending, draft_pending, '
+                         'malformed, total) always, items only for an actor on the deployment operator '
+                         'allowlist, paged by --capability-limit/--capability-offset',
             'item_identity': 'items[].task is the native task ID; items[].contribution_id is the '
                              'contribution comment ID, not a Git commit or latest_comment_id',
             'item_fields': ['task', 'title', 'owner', 'status', 'review_state', 'contribution_id',
@@ -105,6 +113,8 @@ def help_options(action):
             {'flag': '--handoff-offset N', 'description': 'pending handoff offset >= %d (default 0)' % WORK_OFFSET_MIN},
             {'flag': '--ref-limit N', 'description': 'reference attention items per page %d..%d (default 20)' % (WORK_LIMIT_MIN, WORK_LIMIT_MAX)},
             {'flag': '--ref-offset N', 'description': 'reference attention offset >= %d (default 0)' % WORK_OFFSET_MIN},
+            {'flag': '--capability-limit N', 'description': 'capability attention items per page %d..%d (default 20)' % (WORK_LIMIT_MIN, WORK_LIMIT_MAX)},
+            {'flag': '--capability-offset N', 'description': 'capability attention offset >= %d (default 0)' % WORK_OFFSET_MIN},
             *common,
         ]
     if action == 'review':
@@ -154,7 +164,7 @@ def workflow(issue,scopes=None,operators=None,reverts=None,journal=None,invalid_
     return reviewed(issue,scopes,operators,reverts,journal,invalid_reverts)
 
 def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes=None, journal=None,
-          reference_attention=False):
+          reference_attention=False, verifiers=None):
     """One page of the work queue.
 
     ``reverts`` and ``scopes`` are PER TASK: each is a mapping of task id to that
@@ -177,11 +187,15 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
     parser.add_argument('--limit',type=int,default=20);parser.add_argument('--offset',type=int,default=0)
     parser.add_argument('--handoff-limit',type=int,default=20);parser.add_argument('--handoff-offset',type=int,default=0)
     parser.add_argument('--ref-limit',type=int,default=20);parser.add_argument('--ref-offset',type=int,default=0)
+    parser.add_argument('--capability-limit',type=int,default=20);parser.add_argument('--capability-offset',type=int,default=0)
     parser.add_argument('--json',action='store_true')  # output is always JSON; accepted for consistency
     a=parser.parse_args(args)
     if not WORK_LIMIT_MIN<=a.limit<=WORK_LIMIT_MAX or a.offset<WORK_OFFSET_MIN or not WORK_LIMIT_MIN<=a.handoff_limit<=WORK_LIMIT_MAX or a.handoff_offset<WORK_OFFSET_MIN:
         raise ValueError('Invalid work page: --limit and --handoff-limit must be %d..%d; '
                          '--offset and --handoff-offset must be >= %d' % (WORK_LIMIT_MIN,WORK_LIMIT_MAX,WORK_OFFSET_MIN))
+    if not WORK_LIMIT_MIN<=a.capability_limit<=WORK_LIMIT_MAX or a.capability_offset<WORK_OFFSET_MIN:
+        raise ValueError('Invalid work page: --capability-limit must be %d..%d and --capability-offset >= %d'
+                         % (WORK_LIMIT_MIN,WORK_LIMIT_MAX,WORK_OFFSET_MIN))
     if not WORK_LIMIT_MIN<=a.ref_limit<=WORK_LIMIT_MAX or a.ref_offset<WORK_OFFSET_MIN:
         raise ValueError('Invalid work page: --ref-limit must be %d..%d and --ref-offset >= %d'
                          % (WORK_LIMIT_MIN,WORK_LIMIT_MAX,WORK_OFFSET_MIN))
@@ -270,9 +284,15 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         from reference_records import work_attention
         result['attention']={'reference_review':work_attention(rows,actor,operators,limit=a.ref_limit,
                                                                offset=a.ref_offset)}
+        # The capability index (.60 section 8, kittrial-5bb.76): also project-wide and
+        # from the same export, trust derivation included; one bad entry never fails it.
+        from capability_records import work_attention as capability_attention
+        result['attention']['capability_index']=capability_attention(
+            rows,actor,operators,journal.name if journal is not None else '',verifiers=verifiers,project=journal,
+            limit=a.capability_limit,offset=a.capability_offset)
     return result
 
-def execute(path,actor,action,args,attachments,run,operators=None):
+def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None):
     # Help is recognised anywhere as a standalone token and never touches the
     # native export, the coordination lock or an attachment.
     if help_requested(args):
@@ -283,7 +303,7 @@ def execute(path,actor,action,args,attachments,run,operators=None):
     if action=='work':
         rows=[json.loads(line) for line in run(['export','--all']).splitlines() if line.strip()]
         return queue(rows,actor,args,path/'.handoff-requests', operators=operators, journal=path,
-                     reference_attention=True)
+                     reference_attention=True, verifiers=verifiers)
     if len(args) not in (1,2):raise ValueError('Use review TASK [--file payload.json] or handoff TASK --file payload.json')
     task=args[0]
     if action=='review' and len(args)==1:

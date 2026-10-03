@@ -752,6 +752,11 @@ def read_catalog(run):
     also keeps the lifecycle rows of that same export, so the integrated-commit test of
     `list` and `find` is answered from it: no second export and no narrow read
     (kittrial-5bb.69 review 01a0fe9e). `None` means no export was made.
+
+    A row can be both: a capability anchor that also carries lifecycle facts (an
+    integrated fact recorded on the anchor's own id). It goes into BOTH lists, so
+    `list` and `find` reach the same verdict as `get`, which reads lifecycle facts
+    without this split (kittrial-5bb.69 re-review, P3).
     """
     listed = json.loads(run(['list', '--label', TYPE_LABEL, '--all', '--limit', '0', '--json']) or '[]')
     ids = [row['id'] for row in listed or [] if isinstance(row, dict) and isinstance(row.get('id'), str)]
@@ -765,7 +770,7 @@ def read_catalog(run):
         row = json.loads(line)
         if isinstance(row, dict) and row.get('id') in wanted:
             rows.append(row)
-        elif verification.is_lifecycle_row(row):
+        if verification.is_lifecycle_row(row):
             lifecycle.append(row)
     return rows, lifecycle
 
@@ -873,6 +878,37 @@ def list_entries(rows, options, operators, trust=None):
                                                            'newest draft when none is accepted')}
 
 
+def _exact_phrases(entry):
+    """(names, accepted aliases): the normalised phrases `find` matches exactly for one entry.
+
+    The names are the key and the name of the revision a reader describes (the accepted
+    one, else the newest draft); the aliases are those of the accepted revision only.
+    """
+    record = _newest(entry) or {}
+    names = {normalize(entry['key']), normalize(record.get('name') or '')}
+    accepted_aliases = {normalize(item) for item in ((entry.get('record') or {}).get('aliases') or [])}
+    return names, accepted_aliases
+
+
+def exact_index(rows, operators):
+    """{normalised phrase: [{key, trust, state}]}: every phrase `find` would now match exactly.
+
+    The same rule as `find` (`_exact_phrases`), over every readable entry, accepted
+    records first. `capability misses` uses it to mark the misses that now resolve.
+    """
+    entries, _ = catalog(rows, operators)
+    index = {}
+    for entry in sorted((entry for entry in entries if entry['state'] not in ('malformed', 'unsupported')),
+                        key=lambda entry: (entry['record'] is None, entry['key'])):
+        names, accepted_aliases = _exact_phrases(entry)
+        for phrase in sorted(names | accepted_aliases):
+            if phrase:
+                index.setdefault(phrase, []).append({'key': entry['key'],
+                                                     'trust': 'accepted' if entry['record'] else 'draft',
+                                                     'state': entry['state']})
+    return index
+
+
 def find(rows, phrase, operators, limit=5, trust=None):
     """`capability find PHRASE`: records only, scored like .61's lookup (.60 section 7).
 
@@ -896,8 +932,7 @@ def find(rows, phrase, operators, limit=5, trust=None):
         if entry['state'] in ('malformed', 'unsupported'):
             continue
         record = _newest(entry) or {}
-        names = {normalize(entry['key']), normalize(record.get('name') or '')}
-        accepted_aliases = {normalize(item) for item in ((entry.get('record') or {}).get('aliases') or [])}
+        names, accepted_aliases = _exact_phrases(entry)
         if text == entry['key'] or key in names | accepted_aliases:
             exact.append(entry)
             continue
@@ -1029,16 +1064,172 @@ def capabilities_view(rows, operators=None, verifiers=None, journal=None, banner
     return ''.join(lines)
 
 
+# -- attention: `work` and `brief` (kittrial-5bb.76) ------------------------------------------
+
+# An accepted capability whose current revision has had no trusted pass for this many
+# days since its acceptance counts as `unverified_stale` (coordinator answer (c)).
+UNVERIFIED_STALE_DAYS = 30
+ATTENTION_SCAN_MAX = 1000
+BRIEF_MAX = 3
+CAPABILITY_ACTIONS = (  # (count key, priority, kind, reason)
+    ('malformed', 1, 'capability-repair', 'A capability record cannot be read and needs an operator repair.'),
+    ('drifted', 1, 'capability-drift', 'A capability pointer was reported missing; fix the record or the code, then '
+                                       'verify it at an integrated commit.'),
+    ('draft_pending', 2, 'capability-accept', 'A capability draft waits for an operator to accept it.'),
+    ('alias_pending', 2, 'capability-alias', 'A proposed alias waits for an operator to fold or reject it.'),
+    ('unverified_stale', 3, 'capability-verify', 'An accepted capability has had no trusted verification for '
+                                                 'more than %d days.' % UNVERIFIED_STALE_DAYS),
+    ('reported_only', 3, 'capability-verify-report', 'An accepted capability has passing reports but no trusted '
+                                                     'verification.'),
+)
+
+
+def _days_since(stamp, now):
+    import calendar
+    try:
+        return max(0, int((now - calendar.timegm(time.strptime(stamp, core.STAMP))) // 86400))
+    except (TypeError, ValueError):
+        return None
+
+
+def _flags(entry, block, now):
+    """The attention flags of one readable capability."""
+    flags = []
+    if entry['state'] == 'accepted':
+        if block['state'] == 'drifted':
+            flags.append('drifted')
+        else:
+            age = _days_since((entry.get('acceptance') or {}).get('at'), now)
+            if block['state'] != 'verified' and age is not None and age > UNVERIFIED_STALE_DAYS:
+                flags.append('unverified_stale')
+            if block['state'] == 'reported':
+                flags.append('reported_only')
+    if entry['state'] == 'draft-only' or entry.get('proposed') is not None:
+        flags.append('draft_pending')
+    if entry.get('aliases_pending'):
+        flags.append('alias_pending')
+    return flags
+
+
+def work_attention(rows, actor, operators, project_name, verifiers=None, project=None, limit=20, offset=0,
+                   now=None):
+    """`attention.capability_index` for `work` (.60 section 8), in the agent attention shape.
+
+    Counts always; `items` only for an actor on the deployment operator allowlist (an
+    owner reads their own with `capability list --owner`; owner routing comes with the
+    actor-map wiring). Computed from the export `work` already made, including the
+    integrated-commit test, so it adds no native read. Reading changes nothing.
+    """
+    import calendar
+    now = now if now is not None else calendar.timegm(time.gmtime())
+    trust = Trust(None, operators, verifiers, project, export_rows=rows)
+    entries, incomplete = catalog(rows, operators)
+    scanned = sorted(entries, key=lambda entry: str(entry['key'] or entry['native_id']))[:ATTENTION_SCAN_MAX]
+    counts = {'drifted': 0, 'reported_only': 0, 'unverified_stale': 0, 'alias_pending': 0, 'draft_pending': 0,
+              'malformed': 0, 'total': 0}
+    first, flagged = {}, []
+    for entry in scanned:
+        if entry['state'] in ('malformed', 'unsupported'):
+            counts['malformed'] += 1
+            counts['total'] += 1
+            first.setdefault('malformed', entry)
+            continue
+        if entry['state'] == 'superseded':
+            continue
+        block = verification_of(entry, trust)
+        flags = _flags(entry, block, now)
+        for flag in flags:
+            counts[flag] += len(entry['aliases_pending']) if flag == 'alias_pending' else 1
+            first.setdefault(flag, entry)
+        if flags:
+            counts['total'] += 1
+            flagged.append((entry, block, flags))
+    base = '/v1/projects/%s' % project_name
+    actions = []
+    for name, priority, kind, reason in CAPABILITY_ACTIONS:
+        if counts[name]:
+            entry = first[name]
+            key = entry['key'] or str(entry['native_id'])
+            actions.append({'priority': priority, 'kind': kind, 'project': project_name,
+                            'task': entry['native_id'], 'reason': reason,
+                            'links': {'capability': '%s/capabilities/%s' % (base, key)},
+                            'label': {'text': 'capability get %s' % key, 'omitted_chars': 0},
+                            'token': 'capability.get'})
+    actions.sort(key=lambda action: (action['priority'], str(action['project']), str(action['task'])))
+    state = ('malformed' if counts['malformed'] else 'drifted' if counts['drifted'] else
+             'pending' if counts['draft_pending'] or counts['alias_pending'] else
+             'stale' if counts['unverified_stale'] or counts['reported_only'] else 'clear')
+    phrases = (('drifted', '{} capability(ies) drifted'), ('draft_pending', '{} draft(s) waiting for acceptance'),
+               ('alias_pending', '{} alias(es) waiting for an operator'),
+               ('unverified_stale', '{} accepted but not verified for over %d days' % UNVERIFIED_STALE_DAYS),
+               ('reported_only', '{} with reports but no trusted verification'), ('malformed', '{} unreadable'))
+    parts = [text.format(counts[name]) for name, text in phrases if counts[name]]
+    operator = actor in configured_operators(operators if operators is not None else ())
+    order = {'drifted': 0, 'draft_pending': 1, 'alias_pending': 2, 'unverified_stale': 3, 'reported_only': 4}
+    flagged.sort(key=lambda item: (min(order[flag] for flag in item[2]), item[0]['key']))
+    page = flagged[offset:offset + limit] if operator else []
+    items = []
+    for entry, block, flags in page:
+        record = _newest(entry) or {}
+        items.append({'kind': 'capability', 'key': entry['key'], 'task': entry['native_id'], 'state': entry['state'],
+                      'verification': block['state'], 'flags': flags, 'owner': record.get('owner'),
+                      'aliases_pending': len(entry['aliases_pending']),
+                      'accepted_days': _days_since((entry.get('acceptance') or {}).get('at'), now),
+                      'title': dict(_excerpt(record.get('name'), NAME_MAX) or {'text': '', 'omitted_chars': 0},
+                                    trust='accepted' if entry['record'] else 'draft')})
+    result = {'state': state, 'summary': ('; '.join(parts) + '.') if parts else 'No capability needs attention.',
+              'counts': counts, 'actions': actions,
+              'truncated': (not operator and bool(flagged)) or offset + limit < len(flagged)
+              or len(entries) > ATTENTION_SCAN_MAX,
+              'computed_at': time.strftime(core.STAMP, time.gmtime(now)), 'items': items,
+              'next_offset': offset + limit if operator and offset + limit < len(flagged) else None}
+    notes = []
+    if not operator and flagged:
+        notes.append('%d item(s) for operators (actors on the deployment operator allowlist); an owner reads '
+                     'their own with capability list --owner' % len(flagged))
+    if incomplete:
+        notes.append('%d incomplete anchor(s)' % len(incomplete))
+    if len(entries) > ATTENTION_SCAN_MAX:
+        notes.append('only the first %d capabilities were scanned' % ATTENTION_SCAN_MAX)
+    if notes:
+        result['coverage'] = '; '.join(notes)
+    return result
+
+
+def brief_attention(rows, task_row, operators, verifiers=None, project=None, limit=BRIEF_MAX):
+    """At most 3 `capability` items for a brief (.60 section 8): accepted capabilities whose
+    tags match the task's labels, drifted first, then by key. Server-derived text only."""
+    labels = set((task_row or {}).get('labels') or [])
+    trust = Trust(None, operators, verifiers, project, export_rows=rows)
+    entries, _ = catalog(rows, operators)
+    chosen = []
+    for entry in entries[:ATTENTION_SCAN_MAX]:
+        if entry['state'] != 'accepted' or not labels & set(entry['record'].get('tags') or []):
+            continue
+        chosen.append((entry, verification_of(entry, trust)['state']))
+    chosen.sort(key=lambda pair: (pair[1] != 'drifted', pair[0]['key']))
+    items = [{'kind': 'capability', 'key': entry['key'], 'trust': 'accepted', 'verification': state,
+              'title': _excerpt(entry['record']['name'], NAME_MAX),
+              'text': 'Capability %s is tagged for this task (verification: %s).' % (entry['key'], state),
+              'source': 'capability get ' + entry['key']}
+             for entry, state in chosen[:limit]]
+    return {'attention': items, 'attention_total': len(chosen), 'attention_more': (len(chosen) - len(items)) or None}
+
+
 def help_payload():
     return {'schema_version': 1, 'action': 'capability', 'contract': 'cli-contract-v1',
             'usage': ['capability get KEY', 'capability list [--tag TAG]... [--owner IDENTITY] '
                       '[--state draft-only|accepted|superseded|all] [--limit N] [--offset N] [--pointers]',
-                      'capability find PHRASE [--limit N]', 'capability propose --file entry.json',
+                      'capability find PHRASE [--limit N]', 'capability misses [--limit N]',
+                      'capability propose --file entry.json',
                       'capability revise --file entry.json',
                       'capability propose-alias KEY PHRASE [--evidence POINTER]',
                       'capability verify --file verification.json'],
             'local': ['capability lookup PHRASE', 'capability resolve POINTER...', 'capability index',
                       'capability check --repo PATH [--key KEY]... [--record | --payloads FILE]'],
+            'telemetry': 'Each find is counted per project, and a find with no exact match also records its '
+                         'normalised phrase, a count and first/last seen times; no actor is stored. Read it '
+                         'with capability misses.',
             'limits': {'find_limit': list(FIND_LIMIT), 'phrase': PHRASE_MAX, 'name': NAME_MAX,
                        'summary': SUMMARY_MAX, 'alias': ALIAS_MAX, 'pointer': POINTER_MAX,
                        'code': CODE_MAX, 'tests': TESTS_MAX, 'anchors': ANCHORS_MAX,
@@ -1105,6 +1296,9 @@ def read(args, run, operators, verifiers=None, journal=None):
     (it holds the host revert journal); both feed the verification trust rules. The
     integrated-commit test reads nothing unless an entry being shown has a trusted
     passing verification.
+
+    `capability misses` is answered by the endpoint itself (it needs the project
+    directory): see capability_misses.
     """
     if not args or args[0] == 'help' or any(token in ('--help', '-h') for token in args):
         return help_payload()
@@ -1134,8 +1328,8 @@ def read(args, run, operators, verifiers=None, journal=None):
         rows, lifecycle = read_catalog(run)
         return find(rows, phrase, operators, limit=options['limit'] if '--limit' in rest else 5,
                     trust=Trust(run, operators, verifiers, journal, lifecycle))
-    raise ValueError('capability: unknown command %s; use get, list, find, propose, revise, propose-alias or '
-                     'verify' % command)
+    raise ValueError('capability: unknown command %s; use get, list, find, misses, propose, revise, '
+                     'propose-alias or verify' % command)
 
 
 def write(args, attachments, actor, run, project, operators, verifiers=None):
