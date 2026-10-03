@@ -1,6 +1,7 @@
 # Contributed requirement proposals - design proposal
 
-Status: **proposal, revision 4. Not implemented, not accepted.** This document
+Status: **revision 5. Slice 0 and slice 1a are implemented; the rest is not.** Apart
+from the revision 5 note, this document describes the design as accepted and
 changes no code. It proposes a record kind, a lifecycle and authority model, a
 coordinator input queue, an escalation path, attribution and statistics, a
 "my contributions" read, client commands, HTTP routes, backup/rollback coverage
@@ -77,10 +78,79 @@ The shared hidden-surface list grows to **ten** with `refresh`'s
 deployment list beside the operator allowlist so one slice 0 serves `.41`, `.58`
 and `.60` (3.2, 8.5).
 
-Nothing here is implemented: there is no `proposal` command, no
-`requirement-proposal` record kind, no disposition ledger, no queue block and no
-scoreboard in the current kit. Every change named below is a follow-up
-implementation slice (section 11), to be filed only after acceptance.
+Revision 5 (2026-10-02, kittrial-5bb.68, slice 1a as built) records the
+coordinator's decisions on the implementer's seven questions (task comment
+`01a0feb9-05b1`). Where this note and the text below disagree, **this note is what
+the kit does**; the first item changes 4.1 and 8.1 and was reported to the owner.
+
+1. **Authority over SSH is host-only.** The kittrial-5bb.67 review found that over
+   the SSH endpoint the actor is self-declared. So nothing that rests on the operator
+   allowlist is a client command: dispositions, owner decisions and settings are the
+   host commands `admin.py proposal-review`, `admin.py proposal-decide` and
+   `admin.py proposal-settings`, each with the strict allowlist check. The endpoint
+   keeps `submit`, `revise`, `get`, `list` and `mine`, and refuses `review`, `decide`
+   and `settings` with a message naming the host command. A reader counts a
+   disposition, a decision or a settings record only when its native author is on
+   the allowlist; otherwise it is **inert**: reported, never moving state. HTTP
+   (slice 1b) is unaffected, because identity is server-bound there. (Changes 4.1,
+   8.1; the rules of 3.4, 3.5, 5.4 and 6.5 are unchanged and run inside the host
+   commands.)
+2. **`verified` on SSH is attribution, not authentication.** A submission is
+   `verified` when the declared actor maps, through the actor map, to its
+   `submitter`. No authority rests on it (4.2).
+3. **A third `role`, `submitter`.** The return-to-review disposition that `revise`
+   writes from `needs-info` carries `role: "submitter"`. It is valid only for
+   `needs-info -> under-review`, must name the hash of the newest revision, must
+   directly follow that revision in native order and must have the same native
+   author. A reader accepts it on that structure alone; any other submitter-role
+   record is inert (3.4, 3.5).
+4. **The settings record, frozen** (8.3):
+   `{schema_version: 1, id, revision, previous_sha256 (null for the first),
+   contributions: {scoreboard: "off"|"on", hidden_scoreboard: [identity],
+   actor_map: {actors: {actor: identity}, namespaces: {name: identity}},
+   stale_days (1..90, default 14), due_soon_days (1..30, default 7)},
+   deciders: [identity], at, sha256}`. At most 200 actors, 100 namespaces, 50
+   deciders and 200 hidden identities. An actor key has the `session-<uuid>` shape;
+   a namespace satisfies the session name rule and carries no session marker; every
+   identity is an `account:` or `person:` value, never a session actor. A newer
+   `contribution-settings-vN` record is reported and ignored (3.8).
+5. **A host operator with no session is matched by its own name.** An allowlisted
+   actor such as `james` runs host commands without a session registration, so the
+   namespace entries are matched against its actor string. Without this the owner
+   could never be mapped, and so could never decide (4.2).
+6. **`hide-self` needs its own mechanism.** Settings are host-only, so slice 2's
+   self-service hide cannot write this record from the endpoint. `hidden_scoreboard`
+   is the operator's list; how a person hides their own row is decided in slice 2
+   (6.4, 6.6, 7.1, 8.1).
+7. **`brief` attention is per kind.** One `attention` array: up to 3
+   `reference-review` items, then up to 3 `proposal-review` items; `attention_total`
+   and `attention_more` count both (5.2).
+8. **`proposal submit --from-feedback` moves to slice 1b** with the web promotion
+   action. In slice 1a the writer always records `origin: {type: authored}`; the
+   reader accepts the frozen `feedback` shape (9.1, 11).
+9. **Owner question 12.2 is closed.** `admin.py requirement-apply` checks the
+   operator allowlist strictly since kittrial-5bb.65, so slice 1a adds nothing to it.
+10. **Three clarifications of derived values.**
+    - The reverse `superseded_by` relation is found by one narrow native read: the
+      anchor of a superseding proposal carries the label
+      `proposal:supersedes:<superseded key>`. The `proposal:` label prefix is
+      value-reserved, so a contributor can neither add that label to another row nor
+      remove it, and cannot hide or crowd out the relation (kittrial-5bb.68 review
+      01a10180). The record stays the authority (3.5): a label the record does not
+      back, or a pointer without its label, makes that one proposal read `malformed`.
+    - Accepting a requirement writes its **next** revision. So the live acceptance of
+      a linked revision is `accepted` only while the record is accepted, its **newest**
+      revision is the accepted one, and that newest revision has the same title,
+      description and key as the linked revision. Once a later revision with different
+      content exists, accepted or not, the link reads `draft` again and the proposal
+      is counted as `incorporated_unaccepted` (6.2; review 01a10180).
+    - `brief` selects a proposal for a task when the task **is** the requirement
+      record its target names, or when the task carries a label equal to the target's
+      area (5.2).
+
+Slice 1a is implemented by `proposal_records.py`. Slices 1b, 2 and 3 are not: there
+is no HTTP route, no web screen, no statistics and no scoreboard in the kit. Every
+remaining change named below is a follow-up implementation slice (section 11).
 
 The design is written against `main`
 `8e1f9ec6f4d818de8983f59f80aa896111a99712`, the base commit of this task. Every
