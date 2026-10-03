@@ -1103,6 +1103,14 @@ def _flags(entry, block, now):
     return flags
 
 
+def _attention_title(value):
+    from agent_prompts import TITLE_LIMIT, label
+    from capabilities import clean
+    text = clean(value or '')
+    return {'text': label(value),
+            'omitted_chars': len(text) - TITLE_LIMIT + 1 if len(text) > TITLE_LIMIT else 0}
+
+
 def work_attention(rows, actor, operators, project_name, verifiers=None, project=None, limit=20, offset=0,
                    now=None):
     """`attention.capability_index` for `work` (.60 section 8), in the agent attention shape.
@@ -1113,6 +1121,7 @@ def work_attention(rows, actor, operators, project_name, verifiers=None, project
     integrated-commit test, so it adds no native read. Reading changes nothing.
     """
     import calendar
+    from agent_prompts import label
     now = now if now is not None else calendar.timegm(time.gmtime())
     trust = Trust(None, operators, verifiers, project, export_rows=rows)
     entries, incomplete = catalog(rows, operators)
@@ -1141,12 +1150,16 @@ def work_attention(rows, actor, operators, project_name, verifiers=None, project
     for name, priority, kind, reason in CAPABILITY_ACTIONS:
         if counts[name]:
             entry = first[name]
-            key = entry['key'] or str(entry['native_id'])
+            key = entry['key']
+            # Lookup labels replace dots with hyphens and cannot be inverted
+            # unambiguously. An unreadable key needs the catalog repair view.
+            command = 'capability get %s' % key if key else 'capability list --state all'
+            link = '%s/capabilities/%s' % (base, key) if key else '%s/capabilities?state=all' % base
             actions.append({'priority': priority, 'kind': kind, 'project': project_name,
                             'task': entry['native_id'], 'reason': reason,
-                            'links': {'capability': '%s/capabilities/%s' % (base, key)},
-                            'label': {'text': 'capability get %s' % key, 'omitted_chars': 0},
-                            'token': 'capability.get'})
+                            'links': {'capability': link},
+                            'label': {'text': command, 'omitted_chars': 0},
+                            'token': 'capability.get' if key else 'capability.list'})
     actions.sort(key=lambda action: (action['priority'], str(action['project']), str(action['task'])))
     state = ('malformed' if counts['malformed'] else 'drifted' if counts['drifted'] else
              'pending' if counts['draft_pending'] or counts['alias_pending'] else
@@ -1164,10 +1177,11 @@ def work_attention(rows, actor, operators, project_name, verifiers=None, project
     for entry, block, flags in page:
         record = _newest(entry) or {}
         items.append({'kind': 'capability', 'key': entry['key'], 'task': entry['native_id'], 'state': entry['state'],
-                      'verification': block['state'], 'flags': flags, 'owner': record.get('owner'),
+                      'verification': block['state'], 'flags': flags,
+                      'owner': label(record['owner']) if record.get('owner') is not None else None,
                       'aliases_pending': len(entry['aliases_pending']),
                       'accepted_days': _days_since((entry.get('acceptance') or {}).get('at'), now),
-                      'title': dict(_excerpt(record.get('name'), NAME_MAX) or {'text': '', 'omitted_chars': 0},
+                      'title': dict(_attention_title(record.get('name')),
                                     trust='accepted' if entry['record'] else 'draft')})
     result = {'state': state, 'summary': ('; '.join(parts) + '.') if parts else 'No capability needs attention.',
               'counts': counts, 'actions': actions,
@@ -1176,6 +1190,8 @@ def work_attention(rows, actor, operators, project_name, verifiers=None, project
               'computed_at': time.strftime(core.STAMP, time.gmtime(now)), 'items': items,
               'next_offset': offset + limit if operator and offset + limit < len(flagged) else None}
     notes = []
+    if any(any(warning['code'] == 'duplicate-key' for warning in entry['warnings']) for entry in entries):
+        notes.append(KIND.coverage(entries, [], 'Catalog warnings'))
     if not operator and flagged:
         notes.append('%d item(s) for operators (actors on the deployment operator allowlist); an owner reads '
                      'their own with capability list --owner' % len(flagged))
@@ -1201,7 +1217,7 @@ def brief_attention(rows, task_row, operators, verifiers=None, project=None, lim
         chosen.append((entry, verification_of(entry, trust)['state']))
     chosen.sort(key=lambda pair: (pair[1] != 'drifted', pair[0]['key']))
     items = [{'kind': 'capability', 'key': entry['key'], 'trust': 'accepted', 'verification': state,
-              'title': _excerpt(entry['record']['name'], NAME_MAX),
+              'title': _attention_title(entry['record']['name']),
               'text': 'Capability %s is tagged for this task (verification: %s).' % (entry['key'], state),
               'source': 'capability get ' + entry['key']}
              for entry, state in chosen[:limit]]

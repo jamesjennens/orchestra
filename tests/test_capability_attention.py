@@ -165,7 +165,7 @@ class BriefAttentionTests(AttentionCase):
         self.assertEqual((brief['attention_total'], brief['attention_more']), (4, 1))
         item = brief['attention'][0]
         self.assertEqual((item['trust'], item['source'], item['title']['text']),
-                         ('accepted', 'capability get t.d', 'Name of t.d'))
+                         ('accepted', 'capability get t.d', '"Name of t.d"'))
         self.assertEqual(item['text'], 'Capability t.d is tagged for this task (verification: drifted).')
         self.assertIn('Capability [drifted, accepted]', briefing.format_brief(brief))
         untagged = briefing.brief(rows, 'demo', 'task-1', operators=OPS, journal=self.journal)

@@ -194,6 +194,7 @@ reads.
   on the deployment operator allowlist.
   - Each item has `key`, `review_by`, `due`, `owner`, `state` and `revision`, plus
     `inert_operator` on an inert entry.
+    `owner` is a quoted, bounded `agent_prompts.label()` value (or null).
   - Inert entries come first, then expired, then due-soon.
   - Items are paged by `--ref-limit` (1..100) and `--ref-offset`.
 - **Other callers** get `items: []` with `truncated: true` and a `coverage` note.
@@ -230,6 +231,8 @@ The `reference-review` items:
   due-soon entries, with expired first.
 - **Each item** has `key`, `due`, `review_by`, `trust` (`accepted`), `title` (an
   excerpt object), `text` and `source` (`ref get KEY`).
+  The title's text uses `agent_prompts.label()`; its omission count describes the
+  normalized source characters replaced by the label's ellipsis.
 - **`text`** is server-derived from the key, the due class and the date. It never
   includes the entry's statement.
 - **Separate from open items.** These items are not checkpoint items, and reading a
@@ -716,6 +719,8 @@ native read, and reading it writes nothing.
   `capability-accept`, `capability-alias`, `capability-verify`,
   `capability-verify-report`), `project`, `task` (the capability's native anchor id),
   `reason`, `links`, `label` (`capability get KEY`, an excerpt object) and `token`.
+  An unreadable key routes to `capability list --state all` and the catalog link:
+  lookup labels replace dots with hyphens and cannot be inverted unambiguously.
   They are sorted by `(priority, project, task)`.
 - **`items`:** only for an actor on the deployment operator allowlist, drifted first,
   paged by `--capability-limit` (1..100, default 20) and `--capability-offset`. Each
@@ -723,6 +728,9 @@ native read, and reading it writes nothing.
   `owner`, `aliases_pending`, `accepted_days` and `title` (an excerpt object with
   `trust`). Anyone else gets the counts with `truncated: true`; an owner reads their
   own capabilities with `capability list --owner IDENTITY`.
+  Owner and title text use quoted, bounded `agent_prompts.label()` values; a missing
+  owner stays null. The title's omission count describes the normalized source
+  characters replaced by the label's ellipsis.
 - At most 1,000 capabilities are scanned; beyond that `coverage` says so.
 
 **`capability` items in `brief`.** At most 3 accepted capabilities whose `tags` match
@@ -730,6 +738,15 @@ one of the task's labels, drifted first, then by key. Each has `kind`
 (`capability`), `key`, `trust` (`accepted`), `verification`, `title` (an excerpt
 object), `text` (server-derived from the key and the verification state, never the
 summary) and `source` (`capability get KEY`).
+The title text uses the same quoted label as work attention.
+
+**Duplicate reference and capability anchors.** `get`, `list` and attention select
+one anchor per exact record key, preferring valid acceptance evidence from a live
+operator. Ties use native id order, independent of export order; records from
+different anchors are never combined. `get` returns a `duplicate-key` warning,
+and catalog/attention coverage reports duplicates requiring operator reconciliation.
+An accepted label or entry comment alone cannot displace a trusted accepted record.
+Distinct keys sharing a lookup slug remain distinct.
 
 ### `capability misses`: which phrases miss, and how often
 

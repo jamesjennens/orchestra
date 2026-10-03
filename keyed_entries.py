@@ -631,7 +631,29 @@ class AnchoredKind:
                     incomplete.append(row.get('id'))
                 continue
             entries.append(view(row, operators))
-        return entries, incomplete
+        # Group by the record's exact key, never its lossy lookup slug. A bare
+        # accepted label/comment cannot displace an anchor with live evidence.
+        grouped, unknown = {}, []
+        for entry in entries:
+            if entry['key'] is None:
+                unknown.append(entry)
+            else:
+                grouped.setdefault(entry['key'], []).append(entry)
+        return [self.select_entry(group) for group in grouped.values()] + unknown, incomplete
+
+    @staticmethod
+    def select_entry(entries):
+        """Prefer live acceptance evidence; break ties by native id, independent of read order.
+
+        Do not combine revisions/evidence from different anchors. Duplicate anchors
+        require operator reconciliation even when a trusted record can be selected.
+        """
+        chosen = min(entries, key=lambda entry: (entry['record'] is None, str(entry['native_id'])))
+        if len(entries) > 1:
+            chosen['warnings'].insert(0, {'code': 'duplicate-key',
+                                         'detail': '%d anchors match this key; selected %s; operator '
+                                                   'reconciliation required' % (len(entries), chosen['native_id'])})
+        return chosen
 
     def find_entry(self, rows, key, operators, view=None):
         """The view for one key, found through its lookup label; the record's own key must match.
@@ -642,7 +664,7 @@ class AnchoredKind:
         self.valid_key(key)
         view = view or self.entry_view
         label = self.key_label(key)
-        incomplete = []
+        incomplete, candidates = [], []
         for row in rows:
             if not isinstance(row, dict) or self.type_label not in (row.get('labels') or []) \
                     or label not in self.key_labels(row):
@@ -652,7 +674,9 @@ class AnchoredKind:
                 continue
             entry = view(row, operators)
             if entry['key'] in (key, None):
-                return entry
+                candidates.append(entry)
+        if candidates:
+            return self.select_entry(candidates)
         if incomplete:
             raise ValueError('%s key %s has no revision record yet (incomplete anchor %s); re-run its '
                              'propose or ask the operator to reconcile it' % (self.title, key, incomplete[0]))
@@ -661,6 +685,11 @@ class AnchoredKind:
     @staticmethod
     def coverage(entries, incomplete, base):
         notes = [base]
+        duplicates = [entry for entry in entries
+                      if any(warning['code'] == 'duplicate-key' for warning in entry['warnings'])]
+        if duplicates:
+            notes.append('%d duplicate key(s); operator reconciliation required (%s)' % (
+                len(duplicates), ', '.join(entry['native_id'] for entry in duplicates[:COVERAGE_IDS])))
         for state in ('malformed', 'unsupported'):
             ids = [entry['native_id'] for entry in entries if entry['state'] == state]
             if ids:

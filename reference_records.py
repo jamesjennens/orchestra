@@ -502,13 +502,25 @@ def work_attention(rows, actor, operators, current=None, limit=20, offset=0):
                              'ref list --owner' % (len(candidates), '' if len(candidates) == 1 else 's'))
     if incomplete:
         block['incomplete'] = len(incomplete)
+    if any(any(warning['code'] == 'duplicate-key' for warning in entry['warnings']) for entry in entries):
+        block['coverage'] = KIND.coverage(entries, [], block.get('coverage', 'Catalog warnings'))
     return block
 
 
 def _attention_item(entry):
+    from agent_prompts import label
     record = entry['record'] or entry['proposed'] or {}
     return {'key': entry['key'], 'review_by': record.get('review_by'), 'due': entry['due'],
-            'owner': record.get('owner'), 'state': entry['state'], 'revision': record.get('revision')}
+            'owner': label(record['owner']) if record.get('owner') is not None else None,
+            'state': entry['state'], 'revision': record.get('revision')}
+
+
+def _attention_title(value):
+    from agent_prompts import TITLE_LIMIT, label
+    from capabilities import clean
+    text = clean(value or '')
+    return {'text': label(value),
+            'omitted_chars': len(text) - TITLE_LIMIT + 1 if len(text) > TITLE_LIMIT else 0}
 
 
 def brief_attention(rows, task_row, operators, current=None, limit=3):
@@ -525,7 +537,7 @@ def brief_attention(rows, task_row, operators, current=None, limit=3):
     chosen.sort(key=lambda entry: (DUE_ORDER.get(entry['due'], 9), entry['key']))
     items = [{'kind': 'reference-review', 'key': entry['key'], 'due': entry['due'],
               'review_by': entry['record']['review_by'], 'trust': 'accepted',
-              'title': clip(entry['record']['title'], TITLE_MAX),
+              'title': _attention_title(entry['record']['title']),
               'text': _attention_text(entry), 'source': 'ref get ' + entry['key']}
              for entry in chosen[:limit]]
     more = len(chosen) - len(items)
