@@ -66,7 +66,12 @@ PARSE_STACK_BYTES = (512 * 1024 * 1024, 255 * 1024 * 1024)  # Windows refuses 25
 PARSE_STACK_BYTES_PER_LEVEL = 512
 NESTING_MAX_BIG_STACK = 50_000
 NESTING_MAX = 2_000 if os.name == 'nt' else 5_000
-EXPRESSION_TOKENS_MAX = 200_000
+# Per-file budget on the nodes ast.parse may build. It counts operators, brackets,
+# commas, NAME tokens and the statement separators at bracket depth zero, so a
+# statement-dense file (900,000 one-name lines, 190,000 calls, a 190,000-name list)
+# is refused even though it has few operators. It is generous enough to keep the
+# kit and the largest generated tables (60,000 rows, ~240,000 counted nodes) parsing.
+EXPRESSION_TOKENS_MAX = 300_000
 TOKENIZE_BUDGET_BYTES = 16_000_000
 LINE_TEXT_MAX = 2_000
 HEADING_LINE_MAX = 1_000
@@ -472,19 +477,22 @@ def _reset_parse_state():
 NESTING = re.compile(rb'[-+*/%@&|^~.<>(\[]|\b(?:not|if|lambda|await|yield)\b')
 NESTING_OPS = frozenset({'+', '-', '*', '/', '//', '%', '@', '&', '|', '^', '~', '**', '<<', '>>',
                          '.', '(', '['})
-NESTING_WORDS = frozenset({'not', 'if', 'lambda', 'await', 'yield'})
+# `for` and `in` are counted by the exact pass as well as the keyword operators: a
+# comprehension nests a ListComp/SetComp/DictComp/GeneratorExp plus a comprehension
+# node per `for`, so `[i for i in [...]]` repeated would otherwise undercount by one
+# level per repetition.
+NESTING_WORDS = frozenset({'not', 'if', 'lambda', 'await', 'yield', 'for', 'in'})
 
 # Bytes counted as one expression token each when budgeting a file: the NESTING
 # operators and brackets plus the comma that separates flat elements and the '=' of
 # assignment and of `==`/`!=`/`<=`/`>=`. `and`, `or`, `in` and `is` build wide (flat)
-# nodes too, so they are counted as well. A '.' between two digits is a float literal,
+# nodes too, and every NAME token is counted separately, so the keyword operators are
+# covered by the generic NAME count. A '.' between two digits is a float literal,
 # not an attribute access, and does not count.
 _EXPRESSION_BYTES = frozenset(b'-+*/%@&|^~.<>([,=')
 _DIGITS = frozenset(b'0123456789')
 _NAME_START = frozenset(b'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_')
 _NAME_CHARS = _NAME_START | _DIGITS
-_EXPRESSION_WORDS = frozenset({b'not', b'if', b'lambda', b'await', b'yield',
-                               b'and', b'or', b'in', b'is'})
 
 
 
@@ -523,9 +531,15 @@ def _expression_tokens(data):
     string is one node, so its text must not count). The nesting pre-count alone is
     blind to a flat but huge expression: `1<1<...`, `(1,1,...)`, `[1,1,...]` and
     `1 and 1 and ...` are not deep, so ast.parse builds millions of sibling nodes and
-    hundreds of MB of objects on CPython 3.10/3.11."""
+    hundreds of MB of objects on CPython 3.10/3.11.
+
+    Every NAME token and every statement separator (a newline or `;` at bracket depth
+    zero) counts too: a statement-dense file, such as 900,000 one-name lines, 190,000
+    calls or a single 190,000-name list, has almost no operators but just as many
+    nodes. A newline or `;` inside brackets is a continuation, not a statement, and a
+    newline inside a triple-quoted string is string text, so neither counts."""
     size = len(data)
-    position = total = 0
+    position = total = depth = 0
     while position < size:
         char = data[position]
         if char == 0x23:  # '#': a comment is not code
@@ -535,9 +549,25 @@ def _expression_tokens(data):
         if char in (0x27, 0x22):  # a string literal is one node
             position = _skip_string(data, position)
             continue
+        if char in (0x28, 0x5B, 0x7B):  # ( [ { open a bracket
+            depth += 1
+            if char in _EXPRESSION_BYTES:
+                total += 1
+            position += 1
+            continue
+        if char in (0x29, 0x5D, 0x7D):  # ) ] } close one
+            if depth:
+                depth -= 1
+            position += 1
+            continue
         if char in _EXPRESSION_BYTES:
             if not (char == 0x2E and 0 < position < size - 1
                     and data[position - 1] in _DIGITS and data[position + 1] in _DIGITS):
+                total += 1
+            position += 1
+            continue
+        if char == 0x0A or char == 0x3B:  # a newline or ';' ends a statement
+            if depth == 0:
                 total += 1
             position += 1
             continue
@@ -545,8 +575,7 @@ def _expression_tokens(data):
             end = position + 1
             while end < size and data[end] in _NAME_CHARS:
                 end += 1
-            if data[position:end] in _EXPRESSION_WORDS:
-                total += 1
+            total += 1  # every NAME is a node, keyword operators included
             position = end
             continue
         position += 1
@@ -625,6 +654,17 @@ def _deepest_logical_line(text, limit):
     A call or subscript bracket after an atom keeps the chain, so `a[1,2][3,4]...` and
     `f(x,y)(z)()` still accumulate.
 
+    The returned number is a lower bound on the real AST depth and stays within a
+    small constant of it: the depth property tests require `computed >= real - 6` at
+    every nesting depth of every shape they generate (the six levels are the fixed
+    wrappers this pass does not model: the statement around the expression, and the
+    JoinedStr/FormattedValue pair plus a format spec of an f-string). The lag must not
+    grow with depth, so a display contributes one level above its deepest element and
+    the prefix chain already counted before the opening bracket applies on top of
+    that. It is therefore added rather than compared in a `max()`: `-[-1]` must count
+    3, not 2, or a `[-`-repeated file would undercount by one level per nesting and
+    reach ast.parse at twice the trusted depth.
+
     `text` is the decoded source, not raw bytes: tokenizing bytes would re-read the
     file's coding cookie and, for a `# coding: utf-7` file re-encoded as UTF-8, decode
     the UTF-8 bytes with the wrong codec."""
@@ -647,7 +687,7 @@ def _deepest_logical_line(text, limit):
                 if stack:
                     display, outer, inner = stack.pop()
                     if display:
-                        chain = max(outer, inner, chain) + 1
+                        chain = outer + 1 + max(inner, chain)
             elif string == ',' and stack and stack[-1][0]:
                 if chain > stack[-1][2]:
                     stack[-1][2] = chain

@@ -263,10 +263,13 @@ current directory, widened to its Git top level.
     raw tokens: comma-separated elements of a display (a 60,000-row generated table) are
     siblings, not 60,000 levels.
   - A flat but huge expression (`1<1<...`, `(1,1,...)`, `1 and 1 and ...`) is not deep,
-    so a second cheap count bounds the whole file at 200,000 expression tokens
-    (operators, brackets and commas outside strings and comments). A file beyond that
-    budget is skipped as `too-complex` before `ast.parse` can build hundreds of MB of
-    sibling nodes, with a warning.
+    so a second cheap count bounds the whole file at 300,000 expression tokens:
+    operators, brackets and commas outside strings and comments, every NAME token, and
+    every newline or `;` at bracket depth zero (so a statement-dense file — 900,000
+    one-name lines, 190,000 calls or a 190,000-name list — is covered as well). A file
+    beyond that budget is skipped as `too-complex` before `ast.parse` can build
+    hundreds of MB of sibling nodes, with a warning. The budget is high enough that a
+    60,000-row generated table (about 240,000 counted nodes) still parses.
   - If no such thread can be started, the run falls back to a per-logical-line guard
     on the calling thread:
     - the limit is 5,000 levels, or 2,000 on Windows;
@@ -403,7 +406,7 @@ a clear refusal, not a wrong read.
 | `capability` | `--max-graph-mb` | 1..512 (default 64); at most 500,000 nodes and 2,000,000 links |
 | `capability` | indexed files | first 20,000 files; files over 2 MB skipped; 256 MB in total |
 | `capability` | entries | 200,000 in total; 2,000 headings per Markdown file and 5,000 definitions per Python file (the rest counted as `entry-limit`, `heading-limit`, `definition-limit`, each with a warning); `resolve` still reads a whole file |
-| `capability` | Python nesting | source decoded with its declared encoding (UTF-7 cookie cannot hide operators); parsed on a 512 MB (Windows: 255 MB) worker stack, trusted to at most 50,000 levels, retrying 255 MB if the 512 MB thread cannot start; a flat file over 200,000 expression tokens is `too-complex`; fallback guard 5,000 levels per logical line (Windows: 2,000) with a 16 MB per-run tokenize budget (`too-complex`); `parse-error` skips warn with counts |
+| `capability` | Python nesting | source decoded with its declared encoding (UTF-7 cookie cannot hide operators); parsed on a 512 MB (Windows: 255 MB) worker stack, trusted to at most 50,000 levels, retrying 255 MB if the 512 MB thread cannot start; a flat or statement-dense file over 300,000 expression tokens (operators, brackets, commas, NAME tokens and depth-zero statement separators) is `too-complex`; fallback guard 5,000 levels per logical line (Windows: 2,000) with a 16 MB per-run tokenize budget (`too-complex`); `parse-error` skips warn with counts |
 | `capability` | Markdown | heading lines over 1,000 characters are text; a summary is looked for in the 40 lines after its heading |
 | `capability` | entry `aliases` / `tests` / `related` | first 8 shown; `tests_total` / `related_total` count all |
 | `capability` | entry `name` / `summary` | excerpt objects of <= 120 / <= 200 characters |

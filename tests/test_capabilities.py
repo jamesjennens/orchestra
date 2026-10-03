@@ -5,6 +5,7 @@ the ast and Markdown index, exact and near matches, pointer resolution (the drif
 primitive), the versioned JSON/help/error shapes, the client routing, and the
 defensive handling of graphify's graph.json as untrusted input.
 """
+import ast
 import base64
 import io
 import json
@@ -1023,6 +1024,113 @@ class NestingGuardTests(Checkout):
         self.assertEqual(seen[-1], sizes[1])
         if sys.version_info < (3, 11):
             self.assertIn('pkg/deep.py', {row['file'] for row in result['entries']})
+
+    def test_the_computed_depth_never_undercuts_the_real_ast_depth(self):
+        # The exact pass decides whether a file reaches ast.parse, so an undercount is
+        # the same failure class as the UTF-7 bypass. Real depth is the longest path of
+        # AST nodes from the statement's expression, walked iteratively. The computed
+        # depth may lag it by at most DEPTH_SLACK: the wrappers it does not model are
+        # fixed (the JoinedStr/FormattedValue pair of an f-string, the statement around
+        # the expression), so the lag must stay under the slack at every depth of every
+        # shape. A per-level undercount (the display-aware reset losing the prefix of
+        # `[-...]`, or a comprehension's `for`/`in` not counted) grows past the slack
+        # and fails here.
+        depth_slack = 6
+
+        def real_depth(node):
+            deepest = 0
+            stack = [(node, 0)]
+            while stack:
+                current, depth = stack.pop()
+                depth += 1
+                deepest = max(deepest, depth)
+                for child in ast.iter_child_nodes(current):
+                    stack.append((child, depth))
+            return deepest
+
+        def expression(source):
+            return ast.parse(source).body[0].value
+
+        def wrap(seed, times, patterns):
+            text = seed
+            for index in range(times):
+                text = patterns[index % len(patterns)] % text
+            return text
+
+        shapes = {
+            'nested displays, no commas': lambda n: '[' * n + '1' + ']' * n,
+            'nested displays, comma before the inner element':
+                lambda n: wrap('1', n, ['[0, %s]']),
+            'dict values': lambda n: wrap('1', n, ["{'k': %s}"]),
+            'mixed lambda, subscript, call and display':
+                lambda n: wrap('1', n, ['(lambda: %s)', 'f(%s)', 'a[%s]', '[%s]', '{%s: 1}']),
+            'postfix chains interleaved with displays':
+                lambda n: wrap('a', n, ['%s[0]', '%s(0)', '%s.b', '(%s)', '[%s]']),
+            'unary operators inside displays': lambda n: wrap('1', n, ['[-%s]']),
+            'comprehensions': lambda n: wrap('1', n, ['[i for i in [%s]]']),
+            'f-string replacement field': lambda n: 'f"{%s}"' % '+'.join(['1'] * (n + 1)),
+            'f-string format-spec replacement field':
+                lambda n: 'f"{1:>%s}"' % wrap('1', n, ['(%s + 1)']),
+            'nested f-string replacement field':
+                lambda n: 'f"{f\'{%s}\'}"' % '+'.join(['1'] * (n + 1)),
+        }
+        for name, shape in shapes.items():
+            for n in range(1, 26):
+                source = 'x = ' + shape(n) + '\n'
+                real = real_depth(expression(source))
+                computed = capabilities._deepest_logical_line(source, 10 ** 9)
+                self.assertLessEqual(
+                    real - computed, depth_slack,
+                    '%s at depth %d: computed %d is more than %d below real %d'
+                    % (name, n, computed, depth_slack, real))
+
+    def test_names_and_depth_zero_separators_count_toward_the_expression_budget(self):
+        # A NAME is a node and a statement is at least one, so both count. A newline
+        # inside brackets is a continuation, not a statement, and a newline inside a
+        # string is string text, so neither counts.
+        self.assertEqual(capabilities._expression_tokens(b'a\n'), 2)
+        self.assertEqual(capabilities._expression_tokens(b'a;b\n'), 4)
+        self.assertEqual(capabilities._expression_tokens(b'x = [\na,\n]\n'), 6)
+        self.assertEqual(capabilities._expression_tokens(b'x = """a\nb\n"""\n'), 3)
+
+    def test_statement_dense_files_are_skipped_by_the_expression_budget(self):
+        # Operators alone miss these: on the worker, 900,000 one-name lines (1.8 MB)
+        # reached 1,424 MB RSS, 190,000 calls 491 MB and a 190,000-name list 257 MB.
+        # The NAME tokens and the statement separators at bracket depth zero count
+        # toward the same budget, so all three are refused before ast.parse.
+        dense = {
+            'nine hundred thousand one-name lines': b'a\n' * 900_000,
+            'a hundred and ninety thousand calls': b'f()\n' * 190_000,
+            'a hundred and ninety thousand names': b'x = [' + b'a,' * 190_000 + b']\n',
+        }
+        for name, data in dense.items():
+            self.assertGreater(capabilities._expression_tokens(data),
+                               capabilities.EXPRESSION_TOKENS_MAX, name)
+            with self.assertRaises(capabilities.TooComplex, msg=name):
+                capabilities.parse_python(data, 'dense.py')
+        write(self.root, 'pkg/lines.py', dense['nine hundred thousand one-name lines'])
+        write(self.root, 'pkg/names.py', dense['a hundred and ninety thousand names'])
+        code, result, _, stderr = call('index', '--repo', str(self.root), '--source', 'ast')
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(result['index']['skipped'].get('too-complex'), 2)
+        self.assertFalse({'pkg/lines.py', 'pkg/names.py'}
+                         & {row['file'] for row in result['entries']})
+        self.assertTrue(any('too many expressions' in warning for warning in result['warnings']))
+
+    def test_the_budget_leaves_room_for_large_generated_tables(self):
+        # The largest legitimate shape the review measured is a 60,000-row generated
+        # table (~240,000 counted nodes in the dict form), so the budget must stay
+        # above it and both forms must still reach ast.parse.
+        rows = 60_000
+        tables = {
+            'neg_table': ('T = [\n' + ''.join('    -%d,\n' % i for i in range(rows)) + ']\n').encode(),
+            'dict_table': ('D = {\n' + ''.join('    "k%d": f(%d),\n' % (i, i)
+                                               for i in range(rows)) + '}\n').encode(),
+        }
+        for name, data in tables.items():
+            self.assertLessEqual(capabilities._expression_tokens(data),
+                                 capabilities.EXPRESSION_TOKENS_MAX, name)
+            self.assertEqual(len(capabilities.parse_python(data, name + '.py').body), 1, name)
 
 
 class MarkdownCostTests(unittest.TestCase):
