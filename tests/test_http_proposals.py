@@ -539,6 +539,91 @@ class ReviewFixCase(ProposalHarness):
         # The service's own writes still pass: they carry the descriptor.
         self.assertEqual(201, self.create_task(self.token('alex'), self.project, 'Still works').status)
 
+    def test_a_mapped_actor_never_writes_as_a_web_account(self):
+        # Review 01a10308, P2 (p7.py C): the docs tell an operator with a web account to map
+        # their actor to account:<id>. That feeds the no-self rules and nothing else.
+        key = self.submit('dana').data['key']
+        dana = 'account:' + self.uid('dana')
+        made = pr.change_settings({'namespace': 'ops', 'to': dana}, 'ops',
+                                  stub_module().Canonical(self.canonical_root, self.project, actor='ops').run, ['ops'])
+        self.assertEqual(made['contributions']['actor_map']['namespaces'], {'ops': dana})
+        rows_before = json.dumps(stub_module().Canonical(self.canonical_root, self.project).rows(), sort_keys=True)
+        for actor in ('ops', 'ops-anything', 'ops/x', 'opsx', 'mallory'):
+            with self.subTest(actor=actor):
+                answer = self.plain(actor, 'proposal', ['revise', '@attachment:0'], {'0': {
+                    'flag': '--file', 'text': self.revise_payload(key, submitter=dana,
+                                                                 operation_id='mapped-' + actor)}})
+                self.assertEqual(answer['returncode'], 2, answer)
+                self.assertIn('Only the submitter may revise', answer['stderr'])
+        self.assertEqual(rows_before, json.dumps(
+            stub_module().Canonical(self.canonical_root, self.project).rows(), sort_keys=True))
+        view = self.get(key, 'dana')
+        self.assertEqual((view['revision'], view['identity'], view['mine']), (1, 'verified', True))
+        # An SSH submission by the mapped actor naming dana's account is not dana's.
+        payload = json.loads(self.revise_payload(key, submitter=dana, operation_id='ops-submit'))
+        for name in ('key', 'revision', 'expected_sha256'):
+            payload.pop(name)
+        answer = self.plain('ops', 'proposal', ['submit', '@attachment:0'],
+                            {'0': {'flag': '--file', 'text': json.dumps(payload)}})
+        self.assertEqual(answer['returncode'], 0, answer)
+        planted = json.loads(answer['stdout'])['key']
+        seen = self.get(planted, 'dana')
+        self.assertEqual((seen['identity'], seen['mine']), ('unverified', False))
+        log = self.request('GET', '/v1/me/contributions', token=self.token('dana')).data
+        self.assertEqual([item['key'] for item in log['items']], [key])
+
+    def test_my_contributions_is_newest_first_with_a_cursor(self):
+        keys = [self.submit(text='Proposal number %d.' % index).data['key'] for index in range(5)]
+        stamps = {}
+        path = self.canonical_root / 'canonical.json'
+        state = json.loads(path.read_text(encoding='utf-8'))
+        for row in state['rows']:                                  # give each submission its own second
+            for comment in row.get('comments') or []:
+                if comment['text'].startswith(pr.REVISION_PREFIX):
+                    record = pr.parse_revision(comment['text'])
+                    stamps[record['key']] = record['created_at']
+        newest_first = sorted(keys, key=lambda key: (stamps[key], key), reverse=True)
+        first = self.request('GET', '/v1/me/contributions?limit=2', token=self.token('alex')).data
+        self.assertEqual(([item['key'] for item in first['items']], first['total'], first['truncated']),
+                         (newest_first[:2], 5, False))
+        self.assertTrue(first['next_cursor'])
+        second = self.request('GET', '/v1/me/contributions?limit=2&cursor=' + first['next_cursor'],
+                              token=self.token('alex')).data
+        third = self.request('GET', '/v1/me/contributions?limit=2&cursor=' + second['next_cursor'],
+                             token=self.token('alex')).data
+        self.assertEqual([item['key'] for item in second['items'] + third['items']], newest_first[2:])
+        self.assertIsNone(third['next_cursor'])
+        # A cursor belongs to its query and its account.
+        self.assertEqual(409, self.request('GET', '/v1/me/contributions?limit=3&cursor=' + first['next_cursor'],
+                                           token=self.token('alex')).status)
+        self.assertEqual(409, self.request('GET', '/v1/me/contributions?limit=2&cursor=' + first['next_cursor'],
+                                           token=self.token('blair')).status)
+
+    def test_a_task_title_is_never_a_flag_on_update_either(self):
+        base = '/v1/projects/%s/tasks' % self.project
+        task = self.create_task(self.token('blair'), self.project, 'A task').data['id']
+        for title in ('--help', '--set-labels', '--status', '-dash', '@mention'):
+            with self.subTest(title=title):
+                done = self.request('PATCH', '%s/%s' % (base, task), {'title': title}, token=self.token('blair'),
+                                    key='patch-' + title.strip('-@'))
+                self.assertEqual(422, done.status, done.data)
+        self.assertEqual(self.request('GET', '%s/%s' % (base, task), token=self.token('blair')).data['title'], 'A task')
+        # A description is a flag's value and is stored as written: lists and mentions are ordinary text.
+        for index, text in enumerate(('- first item', '@dana please look', '--help')):
+            done = self.request('PATCH', '%s/%s' % (base, task), {'description': text}, token=self.token('blair'),
+                                key='patch-description-%d' % index)
+            self.assertEqual(200, done.status, done.data)
+            self.assertEqual(self.request('GET', '%s/%s' % (base, task),
+                                          token=self.token('blair')).data['description'], text)
+        # A task that already has such a title stays readable.
+        path = self.canonical_root / 'canonical.json'
+        state = json.loads(path.read_text(encoding='utf-8'))
+        next(row for row in state['rows'] if row['id'] == task)['title'] = '--help'
+        path.write_text(json.dumps(state), encoding='utf-8')
+        self.assertEqual(self.request('GET', '%s/%s' % (base, task), token=self.token('blair')).data['title'], '--help')
+        listed = self.request('GET', base, token=self.token('blair')).data['items']
+        self.assertIn('--help', [item['title'] for item in listed])
+
     def test_a_credential_namespace_cannot_be_another_accounts_id(self):
         url = '/v1/projects/%s/worker-credentials' % self.project
         for actor in (self.uid('alex'), self.uid('alex') + '/worker', 'usr_0123456789abcdef',

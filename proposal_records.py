@@ -773,9 +773,14 @@ def writes_as(author, submitter, resolve=None, agent=None):
     The one binding rule, used by the reader for every revision and by the writer before
     a revise. Server-bound: an HTTP account that IS the submitter, or an HTTP agent that
     the record itself names (`agent`, the record's `submitted_by_agent`; the endpoint
-    bound its submitter to the agent's owner when it wrote the record). Otherwise the
-    project's actor map must resolve the author to the submitter. A payload that merely
-    repeats the stored submitter string proves nothing.
+    bound its submitter to the agent's owner when it wrote the record). A payload that
+    merely repeats the stored submitter string proves nothing.
+
+    An `account:` submitter accepts ONLY a server-bound author (review 01a10308). The
+    actor map can name an account as an SSH actor's identity, so that the no-self rules
+    join an operator to their web account, but a self-declared actor that maps to an
+    account never writes as that account and never makes its proposal read verified.
+    A `person:` submitter resolves through the map, as in slice 1a.
     """
     if not isinstance(author, str) or not isinstance(submitter, str):
         return False
@@ -783,6 +788,8 @@ def writes_as(author, submitter, resolve=None, agent=None):
         return submitter == 'account:' + author
     if HTTP_AGENT.fullmatch(author):
         return isinstance(agent, dict) and agent.get('agent_id') == author
+    if submitter.startswith('account:'):
+        return False
     return resolve is not None and resolve(author) == submitter
 
 
@@ -791,11 +798,11 @@ def require_submitter(entry, key, actor, resolve, http=None):
 
     Under HTTP authority the endpoint has bound the payload's submitter to the signed-in
     account (`bind_http_submission`), so the account, or its agent, must be the stored
-    submitter. Over the plain endpoint the actor is self-declared: it must resolve to
-    the submitter through the actor map. For a submitter that is not an `account:`
-    identity, the native author of every earlier revision may also revise (an unmapped
-    contributor revising their own, unverified, proposal). An `account:` submitter is
-    never revised on the strength of the actor's own say-so.
+    submitter. Over the plain endpoint the actor is self-declared. An `account:`
+    submitter is never revised there, mapped or not: only the web service writes as an
+    account. A `person:` submitter is revised by an actor the map resolves to it, or by
+    the native author of every earlier revision (an unmapped contributor revising their
+    own, unverified, proposal).
     """
     first = entry.get('first')
     if first is None:
@@ -803,14 +810,18 @@ def require_submitter(entry, key, actor, resolve, http=None):
     submitter = first['submitter']
     if http is not None:
         allowed = http.submitter == submitter
+    elif submitter.startswith('account:'):
+        allowed = False
     else:
-        allowed = resolve(actor) == submitter or (
-            not submitter.startswith('account:') and entry.get('authors') == [actor])
+        allowed = resolve(actor) == submitter or entry.get('authors') == [actor]
     if not allowed:
-        raise ValueError('Only the submitter may revise proposal %s: actor %s is not server-bound as %s and does '
-                         'not resolve to it through the actor map. Revise it from the account or session that '
-                         'submitted it, or submit a new proposal that supersedes it.'
-                         % (key, str(actor)[:60], submitter))
+        raise ValueError('Only the submitter may revise proposal %s: actor %s is not server-bound as %s%s. Revise '
+                         'it from the account or session that submitted it, or submit a new proposal that '
+                         'supersedes it.'
+                         % (key, str(actor)[:60], submitter,
+                            ', and only the web service writes as an account (the actor map does not)'
+                            if submitter.startswith('account:') else
+                            ' and does not resolve to it through the actor map'))
 
 
 # -- reading one proposal ------------------------------------------------------------------------
@@ -1693,7 +1704,7 @@ def dispose(payload, actor, run, project, operators=None, route='review', http=N
     return _disposed(key, task, record, core._comment_id(raw), False)
 
 
-def http_authored(rows, before=None):
+def http_authored(rows, before=None, after=None):
     """`admin.py proposal-http-records`: every proposal revision and disposition whose
     native author has an HTTP account or agent id shape, with its native creation time.
 
@@ -1701,8 +1712,10 @@ def http_authored(rows, before=None):
     reservation (any kit before kittrial-5bb.70, and any rollback to one) lets an SSH
     caller write under such an actor, so a record created while such a kit was the
     endpoint proves nothing. The operator compares the times with the deploy time;
-    `before` (a UTC stamp) keeps only the records natively created before it, and the
-    records with no readable native time, which cannot be cleared.
+    `before` (a UTC stamp) keeps only the records natively created before it, and `after`
+    only those created at or after it; together they are the window in which an older
+    kit was the endpoint (the rollback case). A record with no readable native time
+    cannot be cleared and is always listed.
     """
     found = []
     for row in rows or []:
@@ -1722,6 +1735,8 @@ def http_authored(rows, before=None):
             created = created if isinstance(created, str) else None
             if before is not None and created is not None and created[:19] >= before[:19]:
                 continue
+            if after is not None and created is not None and created[:19] < after[:19]:
+                continue
             keys = [label[len(KEY_LABEL):] for label in row.get('labels') or []
                     if isinstance(label, str) and label.startswith(KEY_LABEL)]
             item = {'proposal': keys[0] if len(keys) == 1 else None, 'task': row.get('id'),
@@ -1736,7 +1751,7 @@ def http_authored(rows, before=None):
                 item['unreadable'] = True
             found.append(item)
     found.sort(key=lambda item: (item['native_created_at'] or '', str(item['task']), str(item['comment_id'])))
-    return {'schema_version': 1, 'before': before, 'total': len(found), 'records': found,
+    return {'schema_version': 1, 'before': before, 'after': after, 'total': len(found), 'records': found,
             'note': 'A record natively created while an endpoint without the actor-shape reservation was '
                     'deployed (any kit before kittrial-5bb.70, or a rollback to one) is not proof of HTTP '
                     'authority. Compare native_created_at with the deploy time. native_created_at comes from '
@@ -2009,7 +2024,8 @@ def list_entries(rows, options, operators, resolve, settings, requirements, acto
     unverified = [entry for entry in good if entry['identity'] != 'verified'] if verified_only else []
     if verified_only:
         good = [entry for entry in good if entry['identity'] == 'verified']
-    good.sort(key=lambda entry: (entry['first']['created_at'], entry['key']))
+    good.sort(key=lambda entry: (entry['first']['created_at'], entry['key']),
+              reverse=options.get('order') == 'newest')
     coordinator = authority(actor, operators) if coordinator is None else coordinator
     offset, limit = options.get('offset', 0), options.get('limit', 20)
     shown = good[offset:offset + limit]
@@ -2179,7 +2195,8 @@ def help_payload():
                       'proposal revise --file revision.json',
                       'proposal get KEY [--history N]',
                       'proposal list [--state STATE] [--target KEY_OR_AREA] [--submitter IDENTITY] [--limit N] '
-                      '[--offset N]', 'proposal mine --submitter IDENTITY [--limit N] [--offset N]'],
+                      '[--offset N] [--order oldest|newest]',
+                      'proposal mine --submitter IDENTITY [--limit N] [--offset N] [--order oldest|newest]'],
             'states': list(STATES),
             'limits': {'text': TEXT_MAX, 'rationale': RATIONALE_MAX, 'evidence': [EVIDENCE_MAX, EVIDENCE_TEXT_MAX],
                        'attachments': ATTACHMENTS_MAX, 'reason': REASON_MAX, 'question': QUESTION_MAX,
@@ -2187,10 +2204,11 @@ def help_payload():
                        'scan': PROPOSAL_SCAN_MAX},
             'notes': [UNTRUSTED_LINE,
                       'submitter is a durable identity, account:<uid> or person:<name>; a session actor is refused.',
-                      'identity is verified when the author of every revision maps to the submitter in the actor '
-                      'map (or wrote it through the web service as that account); over SSH that is attribution, '
-                      'not authentication. Only the submitter revises. mine lists every proposal that names '
-                      'the submitter, each with its identity.',
+                      'identity is verified when the author of every revision maps to a person: submitter in the '
+                      'actor map, or wrote it through the web service as the account: submitter; over SSH that '
+                      'is attribution, not authentication. An account: submitter is written and verified only '
+                      'through the web service. Only the submitter revises. mine lists every proposal that '
+                      'names the submitter, each with its identity.',
                       'A reason, a question and an escalation question are returned by get and list only to an '
                       'actor on the operator allowlist, and by proposal mine --submitter IDENTITY to anyone who '
                       'names that identity. Over SSH the actor and the submitter are self-declared, so this is '
@@ -2275,7 +2293,9 @@ def read(args, run, actor, operators, project=None, full=False):
         return get(rows + superseders, key, operators, resolve, settings, read_linked_requirements(run, [entry]),
                    actor, history=history, chain=chain, superseders_total=total, coordinator=coordinator, http=full)
     options = _options(rest, {'--state': 'state', '--target': 'target', '--submitter': 'submitter',
-                              '--limit': 'limit', '--offset': 'offset'})
+                              '--limit': 'limit', '--offset': 'offset', '--order': 'order'})
+    if options.get('order', 'oldest') not in ('oldest', 'newest'):
+        raise ValueError('proposal %s: --order must be oldest or newest' % command)
     if not 1 <= options['limit'] <= LIST_LIMIT_MAX:
         raise ValueError('proposal %s: --limit must be 1..%d' % (command, LIST_LIMIT_MAX))
     if 'state' in options:

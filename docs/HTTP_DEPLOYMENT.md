@@ -254,24 +254,28 @@ The routes exist on the endpoint backend; the in-process backend answers 501.
 | `GET /v1/projects/{id}/proposals` | any member | the queue: `state`, `target`, `limit`, `cursor`. Also `can_propose` and `can_triage` for the caller |
 | `GET /v1/projects/{id}/proposals/{key}` | any member | the newest revision, the disposition timeline (`history` 1..50) and the derived links |
 | `POST /v1/projects/{id}/proposals/{key}/dispositions` | `reviews.approve`: owners, in a signed-in session | triage (`operation: "review"`, the default) or the owner decision (`"decide"`), with `previous` and `proposal_sha256` from the detail read |
-| `GET /v1/me/contributions` | a signed-in session | your own **verified** proposals across your projects, at most `limit` from each. A proposal that only names your account, or whose later revision someone else wrote, is not listed |
+| `GET /v1/me/contributions` | a signed-in session | your own **verified** proposals across your projects, newest first, `limit` per page with a `cursor` (`next_cursor`); it pages through the newest 100 and then says `truncated`. A proposal that only names your account, or whose later revision someone else wrote, is not listed |
 
 The rules:
 - **The submitter is the account.** `submitter` is `account:<your user id>`; for an agent
   it is the agent's owner, and `submitted_by_agent` names the agent. A body that carries
   `submitter`, `submitted_by_agent`, `actor` or `origin` is refused. A worker credential
   cannot propose.
-- **Only the submitter revises, and `verified` covers every revision.** A revise is
-  refused unless the caller is server-bound as the submitter (this service, for the
-  account or its agent) or, over the plain endpoint, an actor the project's actor map
-  resolves to the submitter. Repeating the stored `submitter` string in the payload
-  proves nothing. A reader reports `identity: verified` only when the native author of
+- **Only the submitter revises, and `verified` covers every revision.** A proposal
+  with an `account:` submitter is written, revised and read as verified only through
+  this service (the account or its agent). No SSH actor writes as an account, even one
+  the actor map maps to that account. A `person:` submitter is revised over the plain
+  endpoint by an actor the map resolves to that person. Repeating the stored
+  `submitter` string in the payload proves nothing. A reader reports `identity: verified` only when the native author of
   every revision stands for the submitter; otherwise the proposal reads `unverified`
   and an `identity-broken` warning names the first revision someone else wrote.
 - **Query values are validated, never forwarded as flags.** `state` is one of the
   proposal states and `target` a requirement key or area; anything else is 422. No
-  caller-supplied value that starts with `-` or `@` reaches the endpoint's arguments
-  on any route, and a task title cannot start with either.
+  caller-supplied positional value that starts with `-` or `@` reaches the endpoint's
+  arguments on any route, and a task title cannot start with either, on create or on
+  update. A task description may: it travels as an attachment (create) or as a flag's
+  value (update), and lists and mentions are ordinary text. Tasks that already have
+  such a title stay readable.
 - **Who reads coordinator text.** A rejection reason, a coordinator question and an
   escalation question are returned only to the submitter and to members with
   `reviews.approve`. Everyone else gets `null` and `withheld: true`.
@@ -288,6 +292,9 @@ The rules:
   person could submit on the web and triage with the host command.
   `admin.py proposal-settings PROJECT --actor OPERATOR --namespace OPERATOR --to account:usr_<id>`.
   A namespace that itself has the shape of an account or agent id is refused.
+  The mapping feeds the no-self rules and nothing else: it does not let that actor (or
+  any SSH caller who declares a name in that namespace) revise the account's proposals
+  or submit proposals that read as the account's.
 - **No credential triages.** `reviews.approve` is never granted to a worker or agent
   credential.
 - **Refusals** from the canonical rules (a stale read, an illegal transition, a no-self
@@ -323,7 +330,8 @@ The rules:
     has an account or agent id shape, with the tracker's own creation time. Before this
     slice no web route wrote proposals, so on first upgrade the list should be empty;
     anything listed was planted. After a rollback, compare each record's
-    `native_created_at` with the window in which the older kit was the endpoint.
+    `native_created_at` with the window in which the older kit was the endpoint:
+    `--after <rollback time> --before <roll-forward time>` lists exactly that window.
   - The limit: the scan reports; it does not change how the records read. A planted
     record keeps reading as verified (a revision) or counted (a disposition) until a
     repair exists for these kinds (kittrial-5bb.74 for dispositions). Until then, treat
@@ -336,7 +344,8 @@ The rules:
   - Do **not** follow the older kit's advice for such a disposition. Its refusal says
     "re-adding them (`admin.py operators add ACTOR`) makes those records count again".
     For a web disposition the author is an account id: adding `usr_...` to the operator
-    allowlist would make an HTTP account id an operator. Roll forward instead.
+    allowlist would make an HTTP account id an operator. Roll forward instead. This
+    kit's `operators add` refuses an account- or agent-shaped id.
   - While the older kit is the endpoint, the actor-shape reservation is off. Run the
     scan above when you roll forward.
 

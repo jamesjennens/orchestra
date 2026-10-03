@@ -1153,23 +1153,29 @@ action unless the HTTP service launched the endpoint. Declare your own session a
     walk stops after 8 hops, at a cycle, or at a proposal that cannot be read, and
     `supersedes_warning` then says which; otherwise it is `null`.
 - **`identity`** is `verified` when the native author of **every** revision stands
-  for the proposal's `submitter`: the author maps to it through the project's actor
-  map, or the revision was written through the web service (its author is the account
-  itself, or the agent that the revision's `submitted_by_agent` names). Otherwise it
-  is `unverified`; when revision 1 was the submitter's and a later one was not, an
-  `identity-broken` warning names that revision. Over SSH this is attribution, not
-  authentication: the actor is self-declared, and no authority rests on it.
-- **Who may revise.** Only the submitter. Over the endpoint the declared actor must
-  resolve to the submitter through the actor map; for a submitter that is not an
-  `account:` identity, the actor that wrote every earlier revision may also revise
-  (an unmapped contributor revising their own proposal). Repeating the stored
-  `submitter` in the payload is not enough, and an `account:` submitter is never
-  revised on the actor's say-so.
+  for the proposal's `submitter`.
+  - For a `person:` submitter: the author maps to it through the project's actor map.
+  - For an `account:` submitter: the revision was written through the web service (its
+    author is the account itself, or the agent that the revision's
+    `submitted_by_agent` names). Nothing else counts. An SSH actor that the actor map
+    maps to that account is still not the account: the map joins people for the
+    no-self rules and never makes a record read as written by a web account.
+  - Otherwise it is `unverified`; when revision 1 was the submitter's and a later one
+    was not, an `identity-broken` warning names that revision. Over SSH this is
+    attribution, not authentication: the actor is self-declared, and no authority
+    rests on it.
+- **Who may revise.** Only the submitter. A proposal with an `account:` submitter is
+  revised only through the web service, mapped actor or not. A proposal with a
+  `person:` submitter is revised over the endpoint by an actor the map resolves to
+  that person, or by the actor that wrote every earlier revision (an unmapped
+  contributor revising their own proposal). Repeating the stored `submitter` in the
+  payload is never enough.
 - **`mine` over the endpoint is a declared query**, as in slice 1a: it lists every
   proposal whose `submitter` is the identity named, each with its `identity`
   (`verified` or `unverified`), so an unmapped contributor sees their own
   submissions. Through the HTTP service the same read lists verified proposals only
   and adds `unverified_omitted`: there the submitter is an authenticated account.
+  `list` and `mine` take `--order oldest|newest` (default oldest).
 - **Help is a command.** `proposal --help` and `proposal list --help` return the help
   payload. `--help` in an option's value position is that option's bad value.
 - **`linked_requirement`** is `{id, revision, sha256, acceptance_state,

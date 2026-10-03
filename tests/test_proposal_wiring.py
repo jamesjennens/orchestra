@@ -211,9 +211,30 @@ class HostCommandTests(unittest.TestCase):
         self.assertEqual(scan('--before', '2026-10-01T00:00:00Z')['total'], 1)
         with self.assertRaisesRegex(ValueError, '--before is a UTC stamp'):
             scan('--before', 'yesterday')
+        self.assertEqual(scan('--after', '2026-09-30T00:00:00Z', '--before', '2026-10-01T00:00:00Z')['total'], 1)
+        self.assertEqual(scan('--after', '2026-10-01T00:00:00Z')['total'], 0)
+        with self.assertRaisesRegex(ValueError, '--after is a UTC stamp'):
+            scan('--after', 'last week')
+        with self.assertRaisesRegex(ValueError, '--after must be earlier than --before'):
+            scan('--after', '2026-10-02T00:00:00Z', '--before', '2026-10-01T00:00:00Z')
         self.assertFalse([call for call in self.native.calls if call[0] in ('create', 'update', 'close')
                           or call[:2] == ['comments', 'add']])
         self.flock.assert_not_called()
+
+    def test_an_http_id_is_never_added_to_the_operator_allowlist(self):
+        # Review 01a10308: an older kit advises `operators add ACTOR` for an inert web disposition.
+        def operators(*argv):
+            with patch.object(sys, 'argv', ['admin.py', '--root', str(self.root), 'operators', *argv]), \
+                    patch.object(admin, 'root_path', return_value=self.root), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                admin.main()
+            return json.loads(out.getvalue())['operators']
+        before = operators('list')
+        for actor in ('usr_0123456789abcdef', 'agent_0123456789abcdef'):
+            with self.subTest(actor=actor), self.assertRaisesRegex(ValueError, 'never added to the operator allowlist'):
+                operators('add', actor)
+        self.assertEqual(operators('list'), before)
+        self.assertIn('usr_short', operators('add', 'usr_short'))             # not the reserved shape
 
     def payload(self, to_state, **fields):
         view = pr.read(['get', self.made['key']], self.native, COORD, [COORD, OWNER], self.project)

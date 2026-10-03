@@ -193,6 +193,10 @@ kit does**.
      the stored submitter proves nothing. `mine` and `/v1/me/contributions` list
      verified proposals only. Launched by the HTTP service, the endpoint needs the
      verified descriptor for every action under an account- or agent-shaped actor.
+   - **Amended again by review 01a10308.** For an `account:` submitter the writer and
+     `verified` accept only server-bound authors. The actor map may name an account as
+     an SSH actor's identity, for the no-self rules only. A `person:` submitter keeps
+     resolving through the map, as in slice 1a.
    - **The reservation is not retroactive.** A record written under such an actor while
      a kit without the reservation was the endpoint reads as HTTP-written. The operator
      scan `admin.py proposal-http-records` lists them with their native creation time

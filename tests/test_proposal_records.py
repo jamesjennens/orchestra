@@ -1200,17 +1200,34 @@ class SubmitterBindingTests(ProposalCase):
 
     def test_an_account_submitter_is_never_revised_on_the_actors_say_so(self):
         # Over the plain endpoint an actor that names an account as the submitter reads
-        # unverified, and even the same actor cannot revise it until the map resolves it.
+        # unverified, and nobody revises it there: only the web service writes as an account.
+        # Review 01a10308 (p7.py C): MAPPING the actor to the account changes neither.
         key = self.submit(submitter=ALEX_ACCOUNT)['key']
         self.assertEqual(self.get(key)['identity'], 'unverified')
         before = len(self.native.writes())
-        for actor in (SUBMITTER, MALLORY):
-            with self.subTest(actor=actor), self.assertRaisesRegex(ValueError, 'Only the submitter may revise'):
-                self.revise(key, actor=actor, submitter=ALEX_ACCOUNT, operation_id='acct-' + actor[-1])
-        self.assertEqual(len(self.native.writes()), before)
-        self.map(SUBMITTER, ALEX_ACCOUNT)
-        self.assertEqual(self.revise(key, submitter=ALEX_ACCOUNT, operation_id='acct-ok')['revision'], 2)
-        self.assertEqual(self.get(key)['identity'], 'verified')
+        for mapped in (False, True):
+            if mapped:
+                self.map(SUBMITTER, ALEX_ACCOUNT)
+                self.settings(namespace=OPERATOR, to=ALEX_ACCOUNT)
+                before = len(self.native.writes())
+            for actor in (SUBMITTER, MALLORY, OPERATOR, OPERATOR + '-anything', OPERATOR + '/x'):
+                with self.subTest(actor=actor, mapped=mapped), self.assertRaisesRegex(
+                        ValueError, 'Only the submitter may revise .* only the web service writes as an account'):
+                    self.revise(key, actor=actor, submitter=ALEX_ACCOUNT, operation_id='acct-%s-%s' % (actor, mapped))
+            self.assertEqual(len(self.native.writes()), before)
+            self.assertEqual((self.get(key)['identity'], self.get(key)['revision']), ('unverified', 1))
+        # A mapped actor's own SSH submission naming the account is not the account's either.
+        second = self.submit(actor=OPERATOR, submitter=ALEX_ACCOUNT, operation_id='ops-names-the-account')['key']
+        self.assertEqual(self.get(second)['identity'], 'unverified')
+        served = pr.read(['mine', '--submitter', ALEX_ACCOUNT], self.native, 'http/read', OPS, self.project,
+                         full=True)
+        self.assertEqual((served['total'], served['unverified_omitted']), (0, 2))
+        # What the map is still for: the no-self rules join the operator to the account.
+        resolve = pr.Resolver(pr.settings_view(pr.read_settings_rows(self.native), OPS), self.project)
+        self.assertEqual((resolve(OPERATOR), resolve(SUBMITTER)), (ALEX_ACCOUNT, ALEX_ACCOUNT))
+        with self.assertRaisesRegex(ValueError, 'submitter'):
+            self.dispose(key, 'under-review', actor=OPERATOR)
+        self.assertEqual(self.dispose(key, 'under-review')['state'], 'under-review')     # another person may
 
     def test_a_revision_by_another_author_reads_unverified_and_is_named(self):
         self.settings(namespace='alex', to=ALEX)
@@ -1266,10 +1283,13 @@ class SubmitterBindingTests(ProposalCase):
         resolve = pr.Resolver({'contributions': {'actor_map': {
             'actors': {SUBMITTER: ALEX}, 'namespaces': {'usr_0123456789abcdef': 'person:mallory',
                                                         'agent_0123456789abcdef': 'person:mallory',
-                                                        'james': 'person:james'}}}}, names={})
+                                                        'james': 'person:james', 'ops': ALEX_ACCOUNT}}}}, names={})
+        self.assertEqual(resolve('ops'), ALEX_ACCOUNT)                         # the no-self rules still see it
         agent = {'agent_id': 'agent_0123456789abcdef', 'on_behalf_of': ALEX_ACCOUNT}
         for author, submitter, named, expected in (
                 (SUBMITTER, ALEX, None, True), (MALLORY, ALEX, None, False), ('james', 'person:james', None, True),
+                ('ops', ALEX_ACCOUNT, None, False),        # mapped to the account: still not server-bound
+                ('ops-anything', ALEX_ACCOUNT, None, False), ('ops', 'person:ops', None, False),
                 ('usr_0123456789abcdef', ALEX_ACCOUNT, None, True),
                 ('usr_0123456789abcdef', 'person:mallory', None, False),       # the map never re-attributes an account
                 ('usr_fedcba9876543210', ALEX_ACCOUNT, None, False),
@@ -1320,6 +1340,12 @@ class SubmitterBindingTests(ProposalCase):
                            True)])
         self.assertEqual(found['records'][0]['proposal'], 'p-0123456789ab')
         self.assertNotIn(row['id'], [item['task'] for item in found['records']])     # session authors are not listed
+        window = pr.http_authored(pr.read_rows(self.native), before='2026-10-03T00:00:00Z',
+                                  after='2026-10-01T00:00:00Z')
+        self.assertEqual(([item['comment_id'] for item in window['records']], window['after']),
+                         (['c-later'], '2026-10-01T00:00:00Z'))
+        self.assertEqual([item['comment_id'] for item in pr.http_authored(
+            pr.read_rows(self.native), after='2026-10-03T00:00:00Z')['records']], [])
         before = pr.http_authored(pr.read_rows(self.native), before='2026-10-01T00:00:00Z')
         self.assertEqual(([item['comment_id'] for item in before['records']], before['before']),
                          (['c-planted'], '2026-10-01T00:00:00Z'))

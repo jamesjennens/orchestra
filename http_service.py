@@ -68,6 +68,8 @@ AGENT_CLAIMABLE_LIMIT = MAX_PAGE
 #: Bound on the projects one ``GET /v1/me/work`` read walks (the caller's own
 #: memberships, each read once). Reaching it reports ``truncated``.
 ME_WORK_MAX_PROJECTS = 50
+#: How far back `/v1/me/contributions` pages: the endpoint's own list ceiling per read.
+ME_CONTRIBUTIONS_MAX = 100
 #: Bound on the per-task detail reads one ``GET /v1/me/work`` adds on a backend whose
 #: queue lacks request ids, review times and checkpoint state (the canonical binding:
 #: one ``brief`` subprocess per task, cached per principal like the queue).
@@ -1160,6 +1162,11 @@ class EndpointBackend:
             return 'bd', project_id, ['create', title, '--json'], {}
         if route == 'tasks.update':
             args = ['update', str(task_id), '--json']
+            if str(payload.get('title') or '').startswith(('-', '@')):
+                # Same rule as create (review 01a10308). The description is not refused: it
+                # is a flag's value, which bd takes as a value, and text legitimately
+                # starts with "- " (a list) or "@name".
+                raise invalid('A task title cannot start with "-" or "@"')
             if payload.get('title') is not None:
                 args[2:2] = ['--title', str(payload['title'])]
             if payload.get('status') in ('open', 'closed'):
@@ -3177,14 +3184,19 @@ class ApiHandler(BaseHTTPRequestHandler):
         """The signed-in person's own proposals across their projects (design 7.1).
 
         Session only: the identity is the session's account and cannot be named. One
-        read per project, at most ME_WORK_MAX_PROJECTS projects and `limit` items from
-        each. Reading changes nothing.
+        read per project, at most ME_WORK_MAX_PROJECTS projects. Newest first, with a
+        page `cursor`: each read takes the newest `offset + limit` of a project, and the
+        merged list is sliced, so the order is exact across projects. The log pages
+        through the newest ME_CONTRIBUTIONS_MAX proposals; beyond that it says
+        `truncated`. Reading changes nothing.
         """
         self._proposals_backend()
         principal = ctx.principal
         if principal.via == 'credential':
             raise forbidden('Session authority required')
-        limit, _ = self._page(ctx, ctx.query)
+        limit, state = self._page(ctx, ctx.query)
+        offset = state['o']
+        wanted = min(offset + limit, ME_CONTRIBUTIONS_MAX)
         projects = [p for p in self.service.list_projects(principal)
                     if not p.get('archived') and principal.user_id in (p.get('members') or [])]
         truncated = len(projects) > ME_WORK_MAX_PROJECTS
@@ -3195,17 +3207,23 @@ class ApiHandler(BaseHTTPRequestHandler):
                 continue
             try:
                 read = self.backend.proposal_read(project['id'], [
-                    'mine', '--submitter', 'account:' + principal.user_id, '--limit', str(limit)])
+                    'mine', '--submitter', 'account:' + principal.user_id, '--limit', str(wanted),
+                    '--order', 'newest'])
             except HttpError as error:
                 unavailable.append({'project': project['id'], 'reason': error.code})
                 continue
             total += read.get('total') or 0
-            truncated = truncated or read.get('next_offset') is not None
             for item in read.get('items') or []:
                 items.append(dict(self._proposal_view(ctx, capabilities, item), project=project['id'],
                                   project_name=project['name']))
         items.sort(key=lambda item: (item.get('submitted_at') or '', item.get('key') or ''), reverse=True)
-        return 200, {'items': items, 'total': total, 'truncated': truncated, 'unavailable': unavailable,
+        more = offset + limit < total
+        reachable = offset + limit < ME_CONTRIBUTIONS_MAX
+        truncated = truncated or (more and not reachable)
+        return 200, {'items': items[offset:offset + limit], 'total': total, 'truncated': truncated,
+                     'next_cursor': make_cursor(principal, None, ctx.query, offset + limit)
+                     if more and reachable else None,
+                     'unavailable': unavailable,
                      'identity': 'account:' + principal.user_id,
                      'generated_at': now_iso(self.service._now())}
 
