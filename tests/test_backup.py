@@ -3,6 +3,7 @@ import base64
 import contextlib
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -37,6 +38,14 @@ class BackupTests(unittest.TestCase):
         self.patcher = patch.dict(sys.modules, {'fcntl': self.fake_fcntl})
         self.patcher.start()
         self.addCleanup(self.patcher.stop)
+
+    def allow_operator(self, actor='operator-1'):
+        """The reconcile host commands check the deployment operator allowlist (kittrial-5bb.85)."""
+        (self.root / 'deployment.private.json').write_text(
+            json.dumps({'password': 'x', 'unit': 'none', 'operators': [actor]}), encoding='utf-8')
+        environment = patch.dict(os.environ, {'ORCHESTRA_OPERATORS': ''})
+        environment.start()
+        self.addCleanup(environment.stop)
 
     def save_bundle(self, **overrides):
         data = {'schema_version': 1, 'status': 'complete',
@@ -322,10 +331,13 @@ class BackupTests(unittest.TestCase):
         self.save_bundle()
         phases = []
         def locked(phase):
-            self.flock.assert_called_once()
-            handle = self.flock.call_args.args[0]
-            self.assertEqual(Path(handle.name), self.root / 'backups' / 'source.lock')
-            self.assertFalse(handle.closed, phase)
+            # The source's backup lock is taken first and held to the end. From the moment
+            # the destination starts to exist, its own restore lock is held too, so
+            # retire-project cannot pull it away mid-restore (kittrial-5bb.85).
+            handles = [call.args[0] for call in self.flock.call_args_list]
+            self.assertEqual([Path(handle.name).name for handle in handles],
+                             ['source.lock', 'destination.restore.lock'][:1 if phase == 'validate-sidecar' else 2])
+            self.assertFalse(any(handle.closed for handle in handles), phase)
             phases.append(phase)
         real_read = admin.coordination_backup
         def read(root, source):
@@ -440,6 +452,7 @@ class BackupTests(unittest.TestCase):
                 admin.provision_merge_slot(self.root, 'newproject')
 
     def test_reconcile_request_command_releases_under_lock_and_prints_audit(self):
+        self.allow_operator()
         (self.source / '.beads').mkdir()
         (self.source / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
         journal = self.source / '.coordination-requests'
@@ -464,6 +477,7 @@ class BackupTests(unittest.TestCase):
         self.assertIn('operator-1', out.getvalue())
 
     def test_reconcile_request_command_opens_the_id_with_any_actor_release(self):
+        self.allow_operator()
         (self.source / '.beads').mkdir()
         (self.source / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
         journal = self.source / '.coordination-requests'
@@ -483,6 +497,7 @@ class BackupTests(unittest.TestCase):
         self.assertTrue(stored['reconciliation']['any_actor'])
 
     def test_reconcile_request_command_completes_from_a_labelled_native_issue(self):
+        self.allow_operator()
         (self.source / '.beads').mkdir()
         (self.source / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
         journal = self.source / '.coordination-requests'
