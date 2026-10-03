@@ -608,8 +608,15 @@ class ReviewFixCase(ProposalHarness):
                                     key='patch-' + title.strip('-@'))
                 self.assertEqual(422, done.status, done.data)
         self.assertEqual(self.request('GET', '%s/%s' % (base, task), token=self.token('blair')).data['title'], 'A task')
-        # A description is a flag's value and is stored as written: lists and mentions are ordinary text.
-        for index, text in enumerate(('- first item', '@dana please look', '--help')):
+        # A description is free text: it travels as an attachment, never as a free-standing
+        # argument, and is stored as written. Lists and mentions are ordinary text.
+        import http_service
+        action, _, args, attachments = http_service.EndpointBackend._command(
+            self.backend, 'tasks.update', None, self.project, {'task_id': task, 'description': '--help'})
+        self.assertEqual((action, args, attachments), ('bd', ['update', task, '@attachment:0', '--json'],
+                                                       {'0': {'flag': '--body-file', 'text': '--help'}}))
+        for index, text in enumerate(('- first item', '@dana please look', '--help', '@attachment:0',
+                                      '--status closed', '--set-labels proposal')):
             done = self.request('PATCH', '%s/%s' % (base, task), {'description': text}, token=self.token('blair'),
                                 key='patch-description-%d' % index)
             self.assertEqual(200, done.status, done.data)

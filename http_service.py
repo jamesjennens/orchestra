@@ -1163,17 +1163,21 @@ class EndpointBackend:
         if route == 'tasks.update':
             args = ['update', str(task_id), '--json']
             if str(payload.get('title') or '').startswith(('-', '@')):
-                # Same rule as create (review 01a10308). The description is not refused: it
-                # is a flag's value, which bd takes as a value, and text legitimately
-                # starts with "- " (a list) or "@name".
+                # Same rule as create (review 01a10308).
                 raise invalid('A task title cannot start with "-" or "@"')
             if payload.get('title') is not None:
                 args[2:2] = ['--title', str(payload['title'])]
             if payload.get('status') in ('open', 'closed'):
                 args[2:2] = ['--status', payload['status']]
+            attachments = {}
             if payload.get('description') is not None:
-                args[2:2] = ['--description', str(payload['description'])]
-            return 'bd', project_id, args, {}
+                # Free text never travels as a free-standing argument: like create, the
+                # description goes through the attachment transport, so a text that looks
+                # like a flag ("--help"), a list ("- item") or the transport itself
+                # ("@attachment:0") is stored as written whatever the native parser does.
+                args[2:2] = ['@attachment:0']
+                attachments = {'0': {'flag': '--body-file', 'text': str(payload['description'])}}
+            return 'bd', project_id, args, attachments
         if route == 'tasks.claim':
             actor = payload.get('actor') or self._actor(principal)
             return ('bd', project_id,

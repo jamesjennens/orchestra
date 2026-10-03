@@ -270,12 +270,16 @@ The rules:
   every revision stands for the submitter; otherwise the proposal reads `unverified`
   and an `identity-broken` warning names the first revision someone else wrote.
 - **Query values are validated, never forwarded as flags.** `state` is one of the
-  proposal states and `target` a requirement key or area; anything else is 422. No
-  caller-supplied positional value that starts with `-` or `@` reaches the endpoint's
-  arguments on any route, and a task title cannot start with either, on create or on
-  update. A task description may: it travels as an attachment (create) or as a flag's
-  value (update), and lists and mentions are ordinary text. Tasks that already have
-  such a title stay readable.
+  proposal states and `target` a requirement key or area; anything else is 422. What
+  is guaranteed, exactly:
+  - enumerated values (`state`, `status`, `due`, ...) are checked against their closed
+    set, and patterned values (keys, ids, `target`, `owner`, tags, numbers) against
+    their pattern, before the endpoint is called;
+  - a task title cannot start with `-` or `@`, on create or on update (tasks that
+    already have such a title stay readable);
+  - free text (a task description on create and on update, proposal, checkpoint and
+    review bodies) travels as an attachment, never as an argument, so a text such as
+    `--help`, `- item` or `@attachment:0` is stored as written.
 - **Who reads coordinator text.** A rejection reason, a coordinator question and an
   escalation question are returned only to the submitter and to members with
   `reviews.approve`. Everyone else gets `null` and `withheld: true`.

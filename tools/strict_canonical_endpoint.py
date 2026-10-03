@@ -180,6 +180,13 @@ class Canonical:
                         row[flag[2:].replace('-', '_')] = rest[index + 1]
                         index += 2
                         continue
+                    if flag == '--body-file':
+                        if index + 1 >= len(rest):
+                            raise ValueError('Missing value for %s' % flag)
+                        source = Path(rest[index + 1])
+                        row['description'] = source.read_text(encoding='utf-8') if source.exists() else ''
+                        index += 2
+                        continue
                     if flag == '--json':
                         index += 1
                         continue
