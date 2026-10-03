@@ -416,10 +416,12 @@ it must never fail `ref list`, `work` or `brief` for the whole project (7.3).
 Repair is the existing operator `void-record` path; nothing is deleted.
 kittrial-5bb.74 adds the reference (and capability) record kinds as void targets, with
 two rules the review voids already follow:
-- a void applies only to a comment the entry cannot read: malformed, another anchor's
-  or key's, or one of a conflicting or duplicated pair. A well-formed record the entry
-  reads is refused at write and ignored on read, because a void repairs history and
-  never withdraws a decision; replacing an entry is a new revision or a retirement;
+- a void applies only to a comment the entry cannot read: malformed (a BOM or CRLF
+  lookalike included), another anchor's or key's, or the later holder of a revision an
+  earlier comment already holds. The earliest holder is never voided, because the writer
+  never writes a second one, and a void cannot itself be voided. A well-formed record the
+  entry reads is refused at write and ignored on read, because a void repairs history
+  and never withdraws a decision; replacing an entry is a new revision or a retirement;
 - readers and writers both leave out a voided comment, so `ref revise` sees what
   `ref get` shows.
 

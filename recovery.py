@@ -161,6 +161,24 @@ def validate(p, task):
     return issued(p, task)
 
 
+def claims_kind(raw, kind):
+    """True when the target's bytes claim the v1 record `kind`.
+
+    A keyed kind is matched through the reserved-prefix view its readers use
+    (`reserved_comments`: one leading BOM dropped, CRLF folded), so a lookalike that
+    reads as a malformed record of that kind can be voided (kittrial-5bb.74 review). A
+    review kind keeps the exact prefix: its reader does not read a lookalike as a
+    record at all. An unknown or newer version (`-v2`) never matches.
+    """
+    prefix = KIND_PREFIXES[kind]
+    if raw.startswith(prefix):
+        return True
+    if kind not in KEYED_KIND_PREFIXES:
+        return False
+    from reserved_comments import _reserved_prefix_view   # it imports this module
+    return _reserved_prefix_view(raw).startswith(prefix)
+
+
 def preserves(raw, p):
     """True when the void payload still carries the target's exact current bytes."""
     return raw == p['original'] and digest(raw) == p['target_sha256']
@@ -264,7 +282,7 @@ def records(issue, operators=None):
             original = target_text(issue, p['target'])
             if not preserves(original, p):
                 raise ValueError('Operator void record does not preserve the exact target bytes')
-            if not original.startswith(KIND_PREFIXES[p['target_kind']]):
+            if not claims_kind(original, p['target_kind']):
                 raise ValueError('Operator void target is not a ' + p['target_kind'] + ' record')
             target_position = order.get(p['target'])
             if target_position is None or order.get(cid, len(comments)) <= target_position:

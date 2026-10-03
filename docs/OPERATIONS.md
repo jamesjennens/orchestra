@@ -56,7 +56,7 @@ history](#malformed-structured-history) (`void-record`).
 | `requirement-backfill PROJECT --actor ACTOR --file backfill.json` | add the controlled requirement type/state labels to records created before this route | an `evidence` pointer for an entry that becomes `accepted`, and the deployment operator allowlist |
 | `requirement-reconcile PROJECT --operation-id ID --actor ACTOR --disposition ...` | finish a requirement operation whose real write was uncertain | confirmation of the native record state |
 | `reference-apply PROJECT --actor OPERATOR --file acceptance.json` | accept a reference catalog entry: the payload names the newest draft `revision` and its `record_sha256`, and the command writes the next revision as accepted, after the F3 evidence (`operation: "draft"` with full content writes a direct accepted revision 1) | the deployment operator allowlist, checked before any write, and F3 evidence (`acceptance`: owners, approvers, policy, decision id, evidence) |
-| `reference-reconcile PROJECT --operation-id ID --actor ACTOR --reason TEXT --disposition ...` | finish a reference operation whose real write was uncertain; `complete` needs `--issue-id` and refuses an anchor that has no revision record yet (re-run the original `ref propose` with its `operation_id` first; if that payload is lost, use `anchor-release`) | confirmation of the native record state |
+| `reference-reconcile PROJECT --operation-id ID --actor ACTOR --reason TEXT --disposition ...` | finish a reference operation whose real write was uncertain; `complete` needs `--issue-id` and refuses an anchor that has no live revision record, because its propose stopped or every record it held is voided (re-run the original `ref propose` with its `operation_id` first; if that payload is lost, use `anchor-release`) | confirmation of the native record state |
 | `capability-apply PROJECT --actor OPERATOR --file batch.json` | accept a batch of capabilities under one F3 decision: `items` of `{key, revision, record_sha256}` (each the newest draft reviewed). The command writes one acceptance record and one receipt per item, keyed `(operation_id, key)`, in list order. It reports `accepted`, `already-accepted`, `refused` or `uncertain` per item; an uncertain item stops the batch, and re-running the same batch resumes it. A changed list needs a new `operation_id`. The coordination lock is taken per item and released between items, with a 50 ms pause while it is free, so other writers wait behind at most one item; each item re-checks its `revision` and `record_sha256` under its own hold. An item takes about 3 seconds (two reads and four writes), so 100 items take 5 to 6 minutes: prefer batches of about 20. `operation: "draft"` with full content writes a direct accepted revision 1 | the deployment operator allowlist, checked before any write, and F3 evidence |
 | `capability-retire PROJECT --actor OPERATOR --file retire.json` | supersede the newest revision of a key by a `successor` key, with evidence. The successor must exist, and a cycle is refused. A retired key refuses `revise` and acceptance. This also stands in for the design's "demote" in slice 1a | the deployment operator allowlist and F3 evidence |
 | `capability-alias-reject PROJECT --actor OPERATOR --file reject.json` | reject a pending alias (`{schema_version, key, alias, reason}`); lookup then ignores it | the deployment operator allowlist |
@@ -350,16 +350,19 @@ from `bd export --all`, as in the scan above.
   appended native comment and writes no host journal: only the integration-revert
   retraction is journaled, because it must prove that the host issued the revert.
 - **What a void applies to.** A void applies only to a comment the entry cannot read:
-  one that fails its kind's schema, belongs to another anchor or key, or shares its
-  revision with another comment of the same kind (a conflicting or duplicated revision
-  or acceptance: void the wrong one). A well-formed record the entry reads is refused
-  at write and ignored on read. A void repairs history and never withdraws a decision:
-  to replace an entry, revise it and accept the new revision, or retire the key.
+  one that fails its kind's schema (a BOM or CRLF lookalike of a v1 prefix included),
+  belongs to another anchor or key, or holds a revision, or the acceptance evidence for
+  a revision, that an **earlier** comment of the same kind already holds. Of a
+  conflicting or duplicated pair, only the later one can be voided: the writer never
+  writes a second holder, so the earliest is the only one it can have written, and a
+  void cannot itself be voided. A well-formed record the entry reads is refused at
+  write and ignored on read. A void repairs history and never withdraws a decision: to
+  replace an entry, revise it and accept the new revision, or retire the key.
 - **What readers show.** The entry reads as if the voided comment were absent, and its
   `warnings` carry `record-voided`. A void written around the host command is reported
   instead: `void-invalid` (malformed, stale, out of order, or not written by a
-  configured operator) or `void-refused` (it names a record the entry reads, or a
-  record of another kind). The anchor stays hidden on every surface, because all its
+  configured operator) or `void-refused` (it names a record the entry reads, the
+  earliest holder of a revision, or a record of another kind). The anchor stays hidden on every surface, because all its
   comments are kept.
 - **Writes agree.** The endpoint gives contributor writes the allowlist, so `ref
   revise` and `capability revise` see the same entry `get` shows once the void applies.
@@ -371,9 +374,10 @@ from `bd export --all`, as in the scan above.
   the void among ignored operator void comments. An older `void-record` refuses these
   target kinds before any write. No sidecar path is added, so backups restore on either
   kit, and rolling forward restores the repair with nothing to clean up.
-- **Limits.** A record this kit cannot read as v1 at all (`Kind: reference-entry-v2`,
-  or a lookalike with a leading BOM or CRLF line ends) cannot be a void target, because
-  the target must start with the exact v1 prefix. It stays `unsupported` or `malformed`.
+- **Limits.** A record of a newer version (`Kind: reference-entry-v2`) or of an unknown
+  kind of the family cannot be a void target: the target must claim the v1 prefix of
+  the declared kind, exactly or through the BOM/CRLF view the readers use. It stays
+  `unsupported` (or `malformed`) until a kit that reads it handles it.
 
 #### Orphan anchors
 

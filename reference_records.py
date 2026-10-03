@@ -366,9 +366,12 @@ def apply_native(payload, actor, run, project, operator=False, operators=None):
     return KIND.apply_native(payload, actor, run, project, operator=operator, operators=operators)
 
 
-def reconcile(project, operation_id, actor, reason, disposition, run, issue_id=None):
-    """Operator-only: resolve a stuck `.reference-requests/` receipt from native state."""
-    return KIND.reconcile(project, operation_id, actor, reason, disposition, run, issue_id=issue_id)
+def reconcile(project, operation_id, actor, reason, disposition, run, issue_id=None, operators=None):
+    """Operator-only: resolve a stuck `.reference-requests/` receipt from native state. `operators`
+    (the deployment allowlist) decides which operator voids apply when `complete` confirms
+    the anchor holds a live record."""
+    return KIND.reconcile(project, operation_id, actor, reason, disposition, run, issue_id=issue_id,
+                          operators=operators)
 
 
 # -- the catalog as readers see it ---------------------------------------------------------------

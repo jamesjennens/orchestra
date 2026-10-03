@@ -214,6 +214,85 @@ class ReferenceVoidTests(VoidCase):
         with self.assertRaisesRegex(ValueError, 'well-formed reference-entry record the entry reads'):
             self.void(void_payload('ref-1', original['id'], original['text'], operation_id='void-2'))
 
+    def test_the_earliest_holder_of_an_accepted_revision_is_never_voided(self):
+        # Review P2, case A: an operator-accepted revision 1, then a canonical revision 1
+        # with other content written around the writer. Voiding the legitimate first holder
+        # would hand the ledger to the forgery and could never be undone.
+        self.native.actor = OPERATOR
+        rr.apply_native(dict(entry(operation_id='direct-1'), operation='draft', acceptance_state='accepted',
+                             acceptance=acceptance()), OPERATOR, self.native, self.project, operator=True,
+                        operators=[OPERATOR])
+        legitimate = self.comment('ref-1', 'Kind: reference-entry-v1')
+        forged = rr.entry_record(dict(entry(statement='A forged statement.'), operation='draft'), 1, 'accepted')
+        planted = self.native.add_comment('ref-1', rr.entry_comment(forged), author='mallory')
+        self.assertEqual(self.get()['state'], 'malformed')
+        writes = len(self.native.writes())
+        with self.assertRaisesRegex(ValueError, 'earliest holder of revision 1, so it is the only one the writer '
+                                                'can have written; void the later holder ' + planted['id']):
+            self.void(void_payload('ref-1', legitimate['id'], legitimate['text']))
+        self.assertEqual(len(self.native.writes()), writes)
+        # Planted around the host command, it is inert, and voiding the forgery repairs the entry.
+        self.plant_void(void_payload('ref-1', legitimate['id'], legitimate['text'], operation_id='planted'))
+        self.void(void_payload('ref-1', planted['id'], planted['text']))
+        view = self.get()
+        self.assertEqual((view['state'], view['record']['statement']['text'], view['acceptance']['operator']),
+                         ('accepted', entry()['statement'], OPERATOR))
+        self.assertIn('void-refused', [warning['code'] for warning in view['warnings']])
+
+    def test_the_earliest_acceptance_evidence_for_a_revision_is_never_voided(self):
+        # Review P2, case B: duplicate acceptance evidence for one revision.
+        self.propose()
+        self.accept(1, self.sha(1))
+        legitimate = self.comment('ref-1', 'Kind: reference-acceptance-v1')
+        row = self.native.row('ref-1')
+        accepted = rr.existing_revisions(row)[2]
+        bound = rr.core.bind_acceptance(acceptance(decision_id='decision-99', evidence='decision decision-99'),
+                                        accepted)
+        _, body = rr.acceptance_evidence(bound, 'ref-1', 2, accepted, OPERATOR, at='2026-10-01T12:00:00Z')
+        planted = self.native.add_comment('ref-1', body, author='mallory')
+        with self.assertRaisesRegex(ValueError, 'conflicting acceptance evidence'):
+            self.accept(2, accepted['sha256'])   # the writer fails closed on the duplicate
+        with self.assertRaisesRegex(ValueError, 'earliest holder of the acceptance evidence for revision 2'):
+            self.void(void_payload('ref-1', legitimate['id'], legitimate['text'], kind='reference-acceptance'))
+        self.void(void_payload('ref-1', planted['id'], planted['text'], kind='reference-acceptance'))
+        view = self.get()
+        self.assertEqual((view['state'], view['acceptance']['decision_id'], view['acceptance_inert']),
+                         ('accepted', 'decision-42', False))
+        self.assertEqual(self.accept(2, accepted['sha256'])['revision'], 3)   # the writer agrees again
+
+    def test_a_bom_or_crlf_lookalike_record_can_be_voided_and_a_newer_version_cannot(self):
+        # Review P3: the readers read these as malformed records, so the void matches its
+        # target through the same reserved-prefix view.
+        self.propose()
+        for number, text in enumerate(('\ufeffKind: reference-entry-v1\n{"not": "valid"}',
+                                       'Kind: reference-entry-v1\r\n{"not": "valid"}'), 1):
+            with self.subTest(text=text[:3]):
+                bad = self.native.add_comment('ref-1', text, author='mallory')
+                self.assertEqual(self.get()['state'], 'malformed')
+                self.void(void_payload('ref-1', bad['id'], text, operation_id='void-%d' % number))
+                self.assertEqual(self.get()['state'], 'draft-only')
+        newer = self.native.add_comment('ref-1', 'Kind: reference-entry-v2\n{}', author='mallory')
+        with self.assertRaisesRegex(ValueError, 'not a reference-entry record'):
+            self.void(void_payload('ref-1', newer['id'], newer['text'], operation_id='void-3'))
+        self.assertEqual(self.get()['state'], 'unsupported')
+        # A review kind keeps the exact prefix: its reader never reads a lookalike as a record.
+        self.assertFalse(recovery.claims_kind('\ufeff' + recovery.REVIEW_KIND_PREFIXES['contribution-review'] + '{}',
+                                              'contribution-review'))
+
+    def test_reconcile_complete_refuses_an_anchor_whose_every_record_is_voided(self):
+        # Review P3: `complete` confirms the anchor through the live row.
+        self.native.fail_comment_prefix = 'Kind: reference-entry-v1'
+        with self.assertRaises(ValueError):
+            self.propose()
+        self.native.fail_comment_prefix = None
+        bad = self.native.add_comment('ref-1', MALFORMED, author='mallory')
+        self.void(void_payload('ref-1', bad['id'], MALFORMED))
+        with self.assertRaisesRegex(ValueError, 'every record it held is voided'):
+            rr.reconcile(self.project, 'alex-ref-1', OPERATOR, 'checked', 'complete', self.native, issue_id='ref-1',
+                         operators=[OPERATOR])
+        self.assertEqual(json.loads(next((self.project / '.reference-requests').glob('*.json'))
+                                    .read_text(encoding='utf-8'))['status'], 'pending')
+
     def test_what_a_kit_without_keyed_voids_reads(self):
         # The rollback claim, checked against this kit's code paths with the void support
         # taken away: the anchor stays hidden, the entry reads malformed again (the older
@@ -367,6 +446,16 @@ class AnchorReleaseTests(VoidCase):
         self.assertTrue(reserved_comments.is_record_anchor(row))   # still hidden: its comments are kept
         self.assertNotIn('incomplete', rr.read(['list'], self.native, [OPERATOR])['coverage'])
         self.assertEqual(self.propose(operation_id='f-1', key='feed.units')['native_id'], 'ref-1')
+
+    def test_a_lookalike_only_anchor_is_released_once_its_record_is_voided(self):
+        task = self.native.seed('ref-2', labels=['reference', 'reference:draft', 'reference-key:feed-units'],
+                                status='closed')['id']
+        text = 'Kind: reference-entry-v1\r\n{"not": "valid"}'
+        bad = self.native.add_comment(task, text, author='mallory')
+        with self.assertRaisesRegex(ValueError, 'still holds a record'):
+            self.release(task)
+        self.void(void_payload(task, bad['id'], text))
+        self.assertEqual(self.release(task)['released'], task)
 
     def test_a_release_needs_a_configured_operator_and_a_matching_kind(self):
         self.crash_before_close()

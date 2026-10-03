@@ -945,7 +945,8 @@ never read more than they need:
     then see the entry as if that comment were absent, and its `warnings` carry
     `record-voided`. A void that does not apply is reported as `void-invalid` (not a
     valid void by a configured operator) or `void-refused` (it names a well-formed
-    record the entry reads, or a record of another kind).
+    record the entry reads, the earliest holder of a revision, or a record of another
+    kind).
   - An anchor that holds no record, because its propose cannot be re-run or because
     every record it held is voided, is closed and its key freed with `admin.py
     anchor-release` ([operations](OPERATIONS.md#orphan-anchors)).

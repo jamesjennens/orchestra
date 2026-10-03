@@ -2770,8 +2770,10 @@ def main():
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             # A proposal reconcile checks the operator allowlist strictly (kittrial-5bb.68
-            # review 01a10180); the other kinds' reconciles do not yet take the list.
-            extra={'operators':operators(root,strict=True)} if kind=='proposal' else {}
+            # review 01a10180). A reference or capability reconcile reads it strictly too,
+            # only to decide which operator voids apply when `complete` confirms the anchor
+            # holds a live record (kittrial-5bb.74 review); requirements do not take it.
+            extra={'operators':operators(root,strict=True)} if kind in ('proposal','reference','capability') else {}
             print(json.dumps(record_reconcile(path,args.operation_id,args.actor,args.reason,
                                               args.disposition,run,issue_id=args.issue_id,**extra)))
     elif args.command=='anchor-release':

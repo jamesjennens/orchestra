@@ -319,16 +319,18 @@ class AnchoredKind:
 
         `dropped` are the comments earlier applied voids already name. A void applies to
         a comment of one of this kind's record kinds that the entry cannot read
-        (malformed, or another anchor's or key's), or whose place another live comment
-        also holds (a conflicting or duplicated revision or acceptance). A record the
-        entry reads is the ledger itself, so a void of it is refused: withdrawing an entry
-        is a new revision or a retirement, which keeps revision numbers monotonic for the
-        writer and for an older kit.
+        (malformed, or another anchor's or key's), or to a LATER holder of a place an
+        earlier live comment already holds (a conflicting or duplicated revision or
+        acceptance). The earliest holder in native order is never voided: the writer
+        never writes a second holder of a place, so only the first can be the legitimate
+        record, and a void cannot itself be voided (kittrial-5bb.74 review, P2). A record
+        the entry reads is the ledger itself, so a void of it is refused: withdrawing an
+        entry is a new revision or a retirement, which keeps revision numbers monotonic
+        for the writer and for an older kit.
         """
         kind = payload['target_kind']
         if not kind.startswith(self.family):
             return 'it targets a %s record, not a %s record' % (kind, self.noun)
-        prefix = recovery.KIND_PREFIXES[kind]
         comments = [comment for comment in row.get('comments') or []
                     if isinstance(comment, dict) and str(comment.get('id')) not in dropped]
         target = next((comment for comment in comments if str(comment.get('id')) == payload['target']), None)
@@ -337,10 +339,14 @@ class AnchoredKind:
         slot = self.record_slot(kind, target, row)
         if slot is None:
             return None
-        for comment in comments:
-            if comment is not target and isinstance(comment.get('text'), str) \
-                    and comment['text'].startswith(prefix) and self.record_slot(kind, comment, row) == slot:
-                return None
+        holders = [comment for comment in comments if isinstance(comment.get('text'), str)
+                   and recovery.claims_kind(comment['text'], kind) and self.record_slot(kind, comment, row) == slot]
+        if holders[0] is not target:
+            return None
+        if len(holders) > 1:
+            place = ('revision %s' if slot[0] == 'revision' else 'the acceptance evidence for revision %s') % slot[1]
+            return ('record %s is the earliest holder of %s, so it is the only one the writer can have written; '
+                    'void the later holder %s instead' % (payload['target'], place, holders[1].get('id')))
         return ('record %s is a well-formed %s record the entry reads; a void repairs a malformed, foreign or '
                 'conflicting record and never withdraws one' % (payload['target'], kind))
 
@@ -357,19 +363,29 @@ class AnchoredKind:
         surface (`reserved_comments.is_record_anchor` reads the stored row). `notes` are
         entry warnings: `record-voided`, `void-refused` and `void-invalid`. Never raises.
         """
+        applied, notes = self.applied_voids(row, operators)
+        if not applied:
+            return row, notes
+        dropped = {payload['target'] for payload, _ in applied}
+        return dict(row, comments=[comment for comment in row['comments']
+                                   if not (isinstance(comment, dict) and str(comment.get('id')) in dropped)]), notes
+
+    def applied_voids(self, row, operators):
+        """(applied, notes): the voids that apply on this anchor, as (payload, comment) in
+        native order, and the entry warnings `live_row` reports. Never raises."""
         comments = row.get('comments') if isinstance(row, dict) else None
         if not isinstance(comments, list) or not any(
                 isinstance(comment, dict) and isinstance(comment.get('text'), str)
                 and comment['text'].startswith(recovery.PREFIX) for comment in comments):
-            return row, []
+            return [], []
         try:
             voids, _, invalid = recovery.records(row, operators if operators is not None else ())
         except (AttributeError, TypeError, KeyError):
-            return row, [{'code': 'void-invalid', 'detail': 'the void records on this anchor cannot be read'}]
+            return [], [{'code': 'void-invalid', 'detail': 'the void records on this anchor cannot be read'}]
         notes = [{'code': 'void-invalid',
                   'detail': 'void record %s is not applied: it is malformed, stale, out of order or not written by a '
                             'configured operator' % comment_id} for comment_id in invalid]
-        dropped = set()
+        applied, dropped = [], set()
         for payload, comment in voids:
             reason = self.void_refusal(row, payload, dropped)
             if reason is not None:
@@ -377,14 +393,12 @@ class AnchoredKind:
                               'detail': 'void record %s is not applied: %s' % (comment.get('id'), reason)})
                 continue
             dropped.add(payload['target'])
+            applied.append((payload, comment))
             notes.append({'code': 'record-voided',
                           'detail': '%s record %s is voided by operator %s (void record %s)'
                                     % (payload['target_kind'], payload['target'], payload['operator'],
                                        comment.get('id'))})
-        if not dropped:
-            return row, notes
-        return dict(row, comments=[comment for comment in comments
-                                   if not (isinstance(comment, dict) and str(comment.get('id')) in dropped)]), notes
+        return applied, notes
 
     def live_rows(self, rows, operators):
         return [self.live_row(row, operators)[0] if isinstance(row, dict) else row for row in rows]
@@ -685,30 +699,30 @@ class AnchoredKind:
         if prior is not None:
             return dict(comment_id=str(prior[1]['id']), reconciled=True, target=prior[0]['target'])
         raw = recovery.target_text(row, payload['target'])
-        if not raw.startswith(recovery.KIND_PREFIXES[payload['target_kind']]):
+        if not recovery.claims_kind(raw, payload['target_kind']):
             raise ValueError('Operator void target is not a %s record: %s' % (payload['target_kind'],
                                                                               payload['target']))
         if not recovery.preserves(raw, payload):
             raise ValueError('Operator void record must preserve the exact current bytes of ' + payload['target'])
-        live, _ = self.live_row(row, operators)
-        dropped = {str(comment.get('id')) for comment in row.get('comments') or [] if isinstance(comment, dict)} - \
-            {str(comment.get('id')) for comment in live.get('comments') or [] if isinstance(comment, dict)}
+        dropped = {applied['target'] for applied, _ in self.applied_voids(row, operators)[0]}
         reason = self.void_refusal(row, payload, dropped)
         if reason is not None:
             raise ValueError('Operator void refused for %s: %s' % (payload['target'], reason))
         raw = run(['comments', 'add', row['id'], recovery.PREFIX + canonical_bytes(payload).decode('utf-8'), '--json'])
         return dict(comment_id=core._comment_id(raw), reconciled=False, target=payload['target'])
 
-    def confirm_anchor(self, row):
-        if not is_record_anchor(row):
-            raise ValueError('Anchor %s has no %s revision record yet; re-run the original %s propose '
-                             'with the same operation_id to finish it, then reconcile. If that payload is lost, '
-                             'release the anchor with admin.py anchor-release.'
+    def confirm_anchor(self, row, operators=None):
+        """A `complete` reconcile needs the anchor to hold a live record: one no applied
+        operator void names (`operators` is the deployment allowlist)."""
+        if not self.has_live_record(row, operators):
+            raise ValueError('Anchor %s has no %s revision record yet (or every record it held is voided); re-run '
+                             'the original %s propose with the same operation_id to finish it, then reconcile. If '
+                             'that payload is lost, release the anchor with admin.py anchor-release.'
                              % (row.get('id'), self.noun, self.command))
 
-    def reconcile(self, project, operation_id, actor, reason, disposition, run, issue_id=None):
+    def reconcile(self, project, operation_id, actor, reason, disposition, run, issue_id=None, operators=None):
         return core.reconcile(project, operation_id, actor, reason, disposition, run, self.spec,
-                              issue_id=issue_id, confirm=self.confirm_anchor)
+                              issue_id=issue_id, confirm=lambda row: self.confirm_anchor(row, operators))
 
     def release(self, project, issue_id, actor, reason, run, operators=None):
         """`admin.py anchor-release` (operator): close an anchor that holds no record and free its key.
