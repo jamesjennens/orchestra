@@ -757,6 +757,16 @@ class WebScreenTests(unittest.TestCase):
         self.assertIn('p.incorporated_unaccepted', self.proposals)
         self.assertNotIn("acceptance_state !== 'accepted'", self.proposals)
 
+    def test_the_mock_answers_an_unknown_route_in_the_servers_words(self):
+        # kittrial-5bb.102: unavailable() recognises "No such operation"; the mock said
+        # "No such route", so the prototype showed "Not found" panels.
+        mock = (KIT / 'web' / 'js' / 'mock.js').read_text(encoding='utf-8')
+        server = (KIT / 'http_service.py').read_text(encoding='utf-8')
+        self.assertIn("raise not_found('No such operation')", server)
+        self.assertIn("err(404, 'not_found', 'No such operation')", mock)
+        self.assertNotIn('No such route', mock)
+        self.assertIn('/No such operation/i.test(error.message', self.proposals)
+
     def test_an_older_server_degrades_and_my_contributions_is_on_my_work(self):
         # Only a server without the routes is "not available"; a project 404 is "not found".
         self.assertIn("error.status === 404 && /No such operation/i.test(error.message || '')", self.proposals)
@@ -795,6 +805,9 @@ class ScreenBehaviourCase(ProposalHarness):
         from test_http_web import run_node_module
         node = shutil.which('node')
         if not node:
+            # Said on stderr too, so it shows in a run without -v (kittrial-5bb.102).
+            print('NOTE: ScreenBehaviourCase.test_the_screens_under_node_against_the_real_service was SKIPPED: node '
+                  'is not installed, so web/js/views/proposals.js was not run on this platform.', file=sys.stderr)
             self.skipTest('node is not installed; the screen module is checked statically above')
         self.seed(104)
         time.sleep(1.1)                                    # the next ones are strictly newer
@@ -804,6 +817,14 @@ class ScreenBehaviourCase(ProposalHarness):
             'question': 'Replace the baseline?', 'owner_identity': 'account:' + self.uid('dana'), 'due_by': None})
         time.sleep(1.1)
         fresh = self.submit(text='The newest proposal of all.').data['key']
+        # Configured deciders (kittrial-5bb.102): an owner, a viewer, the escalator herself,
+        # and a person: identity that is not a web account.
+        (self.canonical_root / 'deployment.private.json').write_text(json.dumps({'operators': ['ops']}),
+                                                                      encoding='utf-8')
+        settings = stub_module().Canonical(self.canonical_root, self.project, actor='ops').run
+        for decider in ('account:' + self.uid('dana'), 'account:' + self.uid('casey'),
+                        'account:' + self.uid('blair'), 'person:owner'):
+            pr.change_settings({'add_decider': decider}, 'ops', settings, ['ops'])
         erin = self.create_account(self.admin, 'erin', 'erin-password-1')          # not a member of the project
         self.people['erin'] = (self.login('erin', 'erin-password-1')[0], erin)
         web = KIT / 'web' / 'js'
@@ -826,6 +847,8 @@ class ScreenBehaviourCase(ProposalHarness):
         # P2 uncertain-submit-retry-duplicates: the second press reuses the key; one proposal.
         retry = seen['retry']
         self.assertIn('cannot create a duplicate', retry['first']['message'])
+        self.assertIn('Do not reload first; after a reload the next press is a new request',
+                      retry['first']['message'])
         self.assertEqual(retry['first']['went'], 0)                       # the page stayed on the form
         self.assertEqual(len(retry['keys']), 2)
         self.assertEqual(retry['keys'][0], retry['keys'][1])
@@ -839,6 +862,16 @@ class ScreenBehaviourCase(ProposalHarness):
         self.assertNotEqual(seen['refusal']['message'], 'Canonical command rejected the request')
         self.assertEqual(seen['refusal']['rendered'], 0)
         self.assertIn('Reload the page to see the current version', seen['stale']['message'])
+
+        # Who decides (kittrial-5bb.102): only the configured decider who is an owner and not
+        # the caller is offered; the others are named, never by a raw account id.
+        deciders = seen['deciders']
+        self.assertEqual(deciders['options'], [['account:' + self.uid('dana'), 'dana']])
+        for text in ('casey (not an owner of this project, so cannot decide here)',
+                     'you (the one who escalates cannot also decide)',
+                     'person:owner (not a web account in this project)'):
+            self.assertIn(text, deciders['note'])
+        self.assertNotIn('usr_', deciders['note'])
 
         # The smaller ones.
         self.assertEqual(seen['badKey']['requests'], 0)
@@ -870,6 +903,25 @@ class ScreenBehaviourCase(ProposalHarness):
         self.assertEqual((len(keys), len(set(keys))), (106, 106))
         own = self.request('GET', self.base() + '?mine=1&limit=1', token=self.token('alex')).data
         self.assertEqual(own['total'], 105)
+        # kittrial-5bb.102: an SSH submission that merely NAMES the account is not the
+        # account's own. It is in the queue (unverified), and not in the mine=1 totals.
+        time.sleep(1.1)
+        named = pr.apply_native({'schema_version': 1, 'operation_id': 'ssh-names-alex', 'operation': 'submit',
+                                 'submitter': 'account:' + self.uid('alex'), 'target': {'kind': 'requirement-new'},
+                                 'text': 'Submitted over SSH, naming alex.', 'rationale': None, 'evidence': [],
+                                 'attachments': []}, 'mallory',
+                                stub_module().Canonical(self.canonical_root, self.project, actor='mallory').run,
+                                self.canonical_root / self.project, [])['key']
+        for query, expected in (('mine=1&limit=100&order=newest', 105), ('mine=1&state=submitted&limit=1', 105),
+                                ('mine=1&state=needs-info&limit=1', 0)):
+            data = self.request('GET', self.base() + '?' + query, token=self.token('alex')).data
+            self.assertEqual(data['total'], expected, query)
+            self.assertNotIn(named, [item['key'] for item in data['items']])
+            self.assertTrue(all(item['mine'] and item['identity'] == 'verified' for item in data['items']))
+        everything = self.request('GET', self.base() + '?state=submitted&order=newest&limit=1',
+                                  token=self.token('alex')).data
+        self.assertEqual((everything['total'], everything['items'][0]['key'], everything['items'][0]['identity'],
+                          everything['items'][0]['mine']), (107, named, 'unverified', False))
         self.assertEqual(self.request('GET', self.base() + '?mine=1&limit=1', token=self.token('blair')).data['total'], 1)
         for query in ('order=sideways', 'order=--help', 'mine=2', 'mine=account:x'):
             self.assertEqual(422, self.request('GET', self.base() + '?' + query, token=self.token('blair')).status, query)

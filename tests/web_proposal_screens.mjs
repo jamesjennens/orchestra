@@ -180,5 +180,19 @@ const control = (root, id) => root.querySelector('#' + id);
   out.outsider = outsider.textContent;
 }
 
+// 5. "Who decides": only configured deciders who are owners here are offered; the note
+//    names the others without a raw account id. (The proposal is under review by now.)
+{
+  const { ctx } = who.blair;
+  const panel = await screens.detailPanel(ctx, project, fresh);
+  const form = panel.all((e) => e.tagName === 'FORM')[0];
+  const select = control(form, 'to_state');
+  select.value = 'escalated-to-owner';
+  await select.dispatch('change');
+  const owner = control(form, 'owner_identity');
+  out.deciders = { options: owner.all((e) => e.tagName === 'OPTION').map((o) => [o.value, o.textContent]),
+    note: control(form, 'owner_identity-hint').textContent };
+}
+
 console.log(JSON.stringify(out));
 process.exit(0);

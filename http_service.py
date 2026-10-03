@@ -3183,6 +3183,11 @@ class ApiHandler(BaseHTTPRequestHandler):
             # account (for an agent, its owner's) and cannot be named.
             if ctx.query['mine'] != '1':
                 raise invalid('mine must be 1')
+            # Read through `proposal mine`: launched by this service it lists VERIFIED
+            # proposals only, the rule of /v1/me/contributions. A proposal that merely
+            # names the account (an SSH submission) is not the caller's and is not counted
+            # (kittrial-5bb.102).
+            args[0] = 'mine'
             args += ['--submitter', 'account:' + ctx.principal.user_id]
         result = dict(self.backend.proposal_read(pid, args))
         capabilities = self.service.capabilities_for(ctx.principal, pid)
