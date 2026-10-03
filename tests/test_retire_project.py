@@ -55,6 +55,8 @@ class RetireCase(unittest.TestCase):
         self.flock = Mock()
         self.unreadable = {'gamma'}
         self.slot = {}
+        self.issues = {}
+        self.slot_fails = set()
         self.bd = []
         for patcher in (patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=self.flock, LOCK_EX=2)}),
                         patch.dict(os.environ, {'ORCHESTRA_OPERATORS': ''}),
@@ -68,9 +70,12 @@ class RetireCase(unittest.TestCase):
         if name in self.unreadable:
             raise subprocess.CalledProcessError(1, ['bd'], stderr='PROJECT IDENTITY MISMATCH')
         if args[:2] == ['merge-slot', 'check']:
+            if name in self.slot_fails:
+                raise subprocess.CalledProcessError(1, ['bd'], stderr='merge slot unreadable')
             return json.dumps({'available': name not in self.slot, 'holder': self.slot.get(name), 'waiters': None,
                                'id': name + '-merge-slot'})
-        return '[]'
+        return json.dumps([{'id': name + '-merge-slot'}] + [{'id': '%s-%d' % (name, index)}
+                                                             for index in range(self.issues.get(name, 0))])
 
     def run_admin(self, *argv):
         stdout, stderr, code = io.StringIO(), io.StringIO(), 0
@@ -121,9 +126,10 @@ class RetireCase(unittest.TestCase):
         result = json.loads(stdout)
         entry = result['destination'].split('/', 1)[1]
         self.assertRegex(entry, r'^gamma-[0-9]{8}T[0-9]{6}Z$')
-        self.assertEqual((result['forced'], result['overrode'], result['findings']['working'],
-                          result['findings']['bd_readable'], result['findings']['last_backup_run']),
-                         (False, [], False, False, 'failed'))
+        self.assertEqual((result['forced'], result['overrode'], result['findings']['bd'],
+                          result['findings']['issues'], result['findings']['merge_slot'],
+                          result['findings']['last_backup_run']),
+                         (False, [], 'rejects', None, 'not-applicable', 'failed'))
         self.assertIn('Nothing was deleted', stderr)
         self.assertIn('archive it there', stderr)                  # the web interface reminder
         # Moved, not deleted; no backup directory was touched, gamma's own included.
@@ -176,8 +182,98 @@ class RetireCase(unittest.TestCase):
         self.assertEqual(self.bd, [])                               # refused before any native call
         self.flock.assert_not_called()
 
+    def test_the_force_rule_fails_closed(self):
+        # Review 01a10219, P2 and P3 (a): what cannot be read is treated as the dangerous
+        # answer, and a project that holds issues needs --force whatever its backups say.
+        self.issues['alpha'] = 3
+        self.nightly(fail=('alpha', 'gamma'))                       # alpha's own last backup failed
+        before = tree(self.root)
+        stdout, stderr, code = self.retire('alpha')
+        self.assertNotEqual(code, 0)
+        self.assertIn('bd reads it and it holds 3 issue(s), so it looks like a working tracker', stderr)
+        # The Dolt server is down: nothing is known, so it is refused, and bd is not asked.
+        self.bd.clear()
+        with patch.object(admin, 'project_server_metadata', return_value=('127.0.0.1', 13317, 'root', 'gamma')), \
+                patch.object(admin, 'sql', side_effect=subprocess.CalledProcessError(1, ['dolt'], stderr='refused')):
+            stdout, stderr, code = self.retire('gamma')
+        self.assertNotEqual(code, 0)
+        self.assertIn('the Dolt server (or bd) could not be reached, so the project could not be checked: it may '
+                      'be a healthy tracker', stderr)
+        self.assertIn('its merge slot could not be read, so it is treated as held', stderr)
+        self.assertEqual(self.bd, [])
+        # The server answers and bd rejects the project: that is the partial project, no flag.
+        with patch.object(admin, 'project_server_metadata', return_value=('127.0.0.1', 13317, 'root', 'gamma')), \
+                patch.object(admin, 'sql', return_value='1'):
+            findings = admin.retire_findings(self.root, 'gamma')
+        self.assertEqual((findings['server'], findings['bd'], admin.retire_blockers(findings)), ('up', 'rejects', []))
+        # bd reads an empty project but not its merge slot: treated as held.
+        make_project(self.root, 'delta')
+        self.slot_fails.add('delta')
+        stdout, stderr, code = self.retire('delta')
+        self.assertNotEqual(code, 0)
+        self.assertIn('its merge slot could not be read, so it is treated as held', stderr)
+        self.assertNotIn('working tracker', stderr)
+        # A receipt that cannot be read is treated as pending.
+        self.slot_fails.clear()
+        requests = self.root / 'projects' / 'delta' / '.requirement-requests'
+        requests.mkdir()
+        (requests / ('0' * 64 + '.json')).write_text('not json', encoding='utf-8')
+        (requests / ('1' * 64 + '.json')).write_text(json.dumps({'status': 7}), encoding='utf-8')
+        stdout, stderr, code = self.retire('delta')
+        self.assertNotEqual(code, 0)
+        self.assertIn('its reservations could not all be read, so they are treated as pending (2 in '
+                      '.requirement-requests)', stderr)
+        self.assertEqual(tree(self.root), before | {k: v for k, v in tree(self.root).items() if 'delta' in k})
+        self.assertEqual(self.journal(), [])
+
+    def test_a_retire_is_refused_while_a_restore_into_the_name_is_running(self):
+        # Review 01a10219, P3: restore-new holds backups/NAME.restore.lock for its whole run.
+        def flock(handle, flags):
+            if flags & 4:                                           # LOCK_NB: the restore lock is taken
+                raise BlockingIOError()
+        self.flock.side_effect = flock
+        before = tree(self.root)
+        for extra in ((), ('--force',)):
+            stdout, stderr, code = self.retire('gamma', OPERATOR, *extra)
+            self.assertNotEqual(code, 0)
+            self.assertIn('a restore-new into it is running', stderr)
+        self.assertEqual(tree(self.root), before)
+        self.assertEqual((self.bd, self.journal()), ([], []))
+        self.assertEqual(admin.restore_lock_path(self.root, 'gamma'), self.root / 'backups' / 'gamma.restore.lock')
+
+    def test_a_failed_move_is_journaled_and_explained(self):
+        # Review 01a10219, P3 (b): retired/ on another filesystem.
+        self.nightly()
+        with patch.object(admin.os, 'rename', side_effect=OSError(18, 'Invalid cross-device link')):
+            stdout, stderr, code = self.retire()
+        self.assertNotEqual(code, 0)
+        self.assertIn('Could not move projects/gamma to retired/gamma-', stderr)
+        self.assertIn('Invalid cross-device link', stderr)
+        self.assertIn('Nothing was changed', stderr)
+        self.assertEqual([(line['event'], line.get('error')) for line in self.journal()],
+                         [('intent', None), ('failed', 'OSError: Invalid cross-device link')])
+        self.assertTrue((self.root / 'projects' / 'gamma' / '.beads' / 'metadata.json').is_file())
+        self.assertEqual(admin.retired_entries(self.root), [])
+
+    def test_a_symlinked_retired_directory_refuses_instead_of_hiding_names(self):
+        # Review 01a10219, P3 (c).
+        elsewhere = Path(self.temp.name) / 'elsewhere'
+        elsewhere.mkdir()
+        try:
+            os.symlink(elsewhere, self.root / 'retired', target_is_directory=True)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest('cannot create symlinks here: %s' % error.__class__.__name__)
+        for argv in (('add-project', 'omega'), ('restore-new', 'alpha', 'omega')):
+            stdout, stderr, code = self.run_admin(*argv)
+            self.assertNotEqual(code, 0)
+            self.assertIn('retired directory is a symlink, so retired project names cannot be checked', stderr)
+        stdout, stderr, code = self.retire()
+        self.assertIn('must not be a symlink', stderr)
+        self.assertEqual((self.bd, list(elsewhere.iterdir())), ([], []))
+
     @moves
-    def test_a_working_project_a_held_slot_and_pending_reservations_need_force(self):
+    def test_a_held_slot_and_pending_reservations_need_force(self):
+        self.issues['alpha'] = 2
         self.nightly()                                              # alpha is recorded complete
         stdout, stderr, code = self.retire('alpha')
         self.assertNotEqual(code, 0)
@@ -205,8 +301,8 @@ class RetireCase(unittest.TestCase):
             self.assertTrue(result['forced'])
             self.assertTrue(result['overrode'])
         done = [line for line in self.journal() if line['event'] == 'retired']
-        self.assertEqual([(line['project'], line['forced'], len(line['overrode'])) for line in done],
-                         [('alpha', True, 1), ('delta', True, 2)])
+        self.assertEqual([(line['project'], line['forced'], len(line['overrode']), line['findings']['issues'])
+                          for line in done], [('alpha', True, 1, 2), ('delta', True, 2, 0)])
         self.assertTrue((self.root / 'backups' / 'alpha' / 'manifest').is_file())
 
     # -- a retired name is never reused --------------------------------------------------
@@ -249,7 +345,16 @@ class RestoreNoticeCase(unittest.TestCase):
         empty = admin.restore_failure_notice('beta', error, 'empty')
         self.assertIn('exists as an empty, working project: nothing was restored into it', empty)
         self.assertNotIn('partial', empty)
-        self.assertIn('retire-project beta --actor OPERATOR --reason TEXT --force', empty)
+        self.assertIn('retire-project beta --actor OPERATOR --reason TEXT', empty)
+        self.assertNotIn('--force', empty)                           # an empty project needs no flag now
+        # Review 01a10219: the destination can disappear, and every step has a notice.
+        gone = admin.restore_failure_notice('beta', FileNotFoundError(2, 'No such file'), 'missing',
+                                            step='re-point and coordination')
+        self.assertIn('the re-point and coordination step failed', gone)
+        self.assertIn('The directory of project beta is no longer there', gone)
+        self.assertNotIn('retire-project', gone)
+        stopped = admin.restore_failure_notice('beta', KeyboardInterrupt(), 'empty', step='add-project')
+        self.assertIn('the restore was interrupted during the add-project step', stopped)
         self.assertIn('holds a partial restore', admin.restore_failure_notice('beta', error))   # the default
 
     def test_the_destination_is_empty_only_when_bd_reads_it_and_it_holds_nothing(self):
@@ -258,10 +363,14 @@ class RestoreNoticeCase(unittest.TestCase):
                                  ('not json', 'partial'), ('{}', 'partial'),
                                  (subprocess.CalledProcessError(1, ['bd'], stderr='PROJECT IDENTITY MISMATCH'),
                                   'partial')):
-            with self.subTest(answer=str(answer)[:30]), patch.object(
+            with self.subTest(answer=str(answer)[:30]), tempfile.TemporaryDirectory() as temp, patch.object(
                     admin, 'run_bd', side_effect=[answer] if isinstance(answer, Exception) else None,
                     return_value=None if isinstance(answer, Exception) else answer):
-                self.assertEqual(admin.restore_destination_state(Path('/unused'), 'beta'), expected)
+                make_project(Path(temp), 'beta')
+                self.assertEqual(admin.restore_destination_state(Path(temp), 'beta'), expected)
+        with tempfile.TemporaryDirectory() as temp, patch.object(admin, 'run_bd') as native:
+            self.assertEqual(admin.restore_destination_state(Path(temp), 'beta'), 'missing')
+            native.assert_not_called()
 
     def test_the_identity_step_runs_inside_the_termination_guard(self):
         seen = {}
@@ -286,6 +395,13 @@ class RestoreNoticeCase(unittest.TestCase):
             with self.assertRaises(SystemExit) as stopped:
                 admin.run_main()
         self.assertEqual(stopped.exception.code, 128 + signal.SIGINT)
+
+    def test_a_refusal_is_one_line_not_a_traceback(self):
+        # Review 01a10219, P3 (e): the line a traceback would end with, and nothing else.
+        with patch.object(admin, 'main', side_effect=ValueError('Refusing to retire x: y')):
+            with self.assertRaises(SystemExit) as refused:
+                admin.run_main()
+        self.assertEqual(refused.exception.code, 'ValueError: Refusing to retire x: y')
 
 
 class ReconcileAllowlistCase(unittest.TestCase):

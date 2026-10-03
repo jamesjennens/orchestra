@@ -331,10 +331,13 @@ class BackupTests(unittest.TestCase):
         self.save_bundle()
         phases = []
         def locked(phase):
-            self.flock.assert_called_once()
-            handle = self.flock.call_args.args[0]
-            self.assertEqual(Path(handle.name), self.root / 'backups' / 'source.lock')
-            self.assertFalse(handle.closed, phase)
+            # The source's backup lock is taken first and held to the end. From the moment
+            # the destination starts to exist, its own restore lock is held too, so
+            # retire-project cannot pull it away mid-restore (kittrial-5bb.85).
+            handles = [call.args[0] for call in self.flock.call_args_list]
+            self.assertEqual([Path(handle.name).name for handle in handles],
+                             ['source.lock', 'destination.restore.lock'][:1 if phase == 'validate-sidecar' else 2])
+            self.assertFalse(any(handle.closed for handle in handles), phase)
             phases.append(phase)
         real_read = admin.coordination_backup
         def read(root, source):

@@ -285,6 +285,47 @@ class RestoreNewCommandCase(RuntimeCase):
                 patch.object(admin, 'sql', side_effect=identity_sql(SOURCE_ID)):
             return self.run_admin('restore-new', 'alpha', 'beta', *extra)
 
+    def test_every_way_restore_new_stops_prints_the_notice(self):
+        # kittrial-5bb.85 review 01a10219: Ctrl-C in the add-project step, and a destination
+        # that disappears after the native restore, each end with the notice.
+        def interrupted(root, name):
+            make_destination(root, name)
+            raise KeyboardInterrupt()
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(KeyboardInterrupt), \
+                patch.object(sys, 'argv', ['admin.py', '--root', str(self.root), 'restore-new', 'alpha', 'beta']), \
+                patch.object(admin, 'root_path', return_value=self.root), \
+                patch.object(admin, 'add_project', side_effect=interrupted), \
+                patch.object(admin, 'run_bd', side_effect=self.fake_run_bd), \
+                contextlib.redirect_stdout(io.StringIO()):
+            admin.main()
+        notice = stderr.getvalue()
+        self.assertIn('restore-new did not complete: the restore was interrupted during the add-project step',
+                      notice)
+        self.assertIn('retire-project beta', notice)
+
+        import shutil
+        shutil.rmtree(self.root / 'projects' / 'beta')
+
+        def vanished(root, name, args):
+            if args[:2] == ['backup', 'init']:
+                shutil.rmtree(self.root / 'projects' / 'beta')         # moved away under the restore
+                raise FileNotFoundError(2, 'No such file or directory')
+            return 'ok'
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(FileNotFoundError), \
+                patch.object(sys, 'argv', ['admin.py', '--root', str(self.root), 'restore-new', 'alpha', 'beta']), \
+                patch.object(admin, 'root_path', return_value=self.root), \
+                patch.object(admin, 'add_project', side_effect=self.fake_add_project), \
+                patch.object(admin, 'run_bd', side_effect=vanished), \
+                patch.object(admin, 'spawn_sync_client', side_effect=self.fake_spawn), \
+                patch.object(admin, 'sql', side_effect=identity_sql(SOURCE_ID)), \
+                contextlib.redirect_stdout(io.StringIO()):
+            admin.main()
+        notice = stderr.getvalue()
+        self.assertIn('the re-point and coordination step failed', notice)
+        self.assertIn('The directory of project beta is no longer there', notice)
+
     def test_restore_new_uses_the_sql_path_then_every_existing_step(self):
         stdout, stderr, code = self.run_restore()
         self.assertEqual(code, 0, stderr)
