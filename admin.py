@@ -1491,6 +1491,16 @@ def validate_coordination_files(files):
         if quarantine:
             from feedback import validate_quarantine_record
             validate_quarantine_record(name,record)
+    # The guidance text and its audit record are one generation: a backup that
+    # carries the text but not the matching record (or a record whose version is not
+    # the hash of the text) is refused rather than restored as a mismatched pair
+    # (kittrial-5bb.99 review `get-misattributes-on-mismatch`).
+    if 'GUIDANCE.md' in files or '.guidance.json' in files:
+        if 'GUIDANCE.md' not in files or '.guidance.json' not in files:
+            raise ValueError('Invalid guidance backup: the text and its audit record must be backed up together')
+        from guidance import version_of as guidance_version
+        if files['.guidance.json'].get('version')!=guidance_version(files['GUIDANCE.md']['text']):
+            raise ValueError('Invalid guidance backup: the audit record does not match the guidance text')
 
 def journal_snapshot_path(root,name):
     """Where ``backup_project`` stores the project's operation-journal snapshot."""
@@ -1881,13 +1891,17 @@ def backup_project(root,name):
             # record are one generation, so a backup that could not read the audit
             # refuses rather than silently dropping who set the guidance and the acks.
             from guidance import (META_NAME as GUIDANCE_META, read_meta as read_guidance_meta,
-                                  read_text as read_guidance_text, validate_meta as validate_guidance_meta)
+                                  read_text as read_guidance_text, validate_meta as validate_guidance_meta,
+                                  version_of as guidance_version)
             guidance_text=read_guidance_text(path)
             guidance_meta=read_guidance_meta(path)
             if guidance_meta is None:
                 raise ValueError('Guidance text exists without readable audit metadata; ask the operator to set '
                                  'the guidance again before backing up')
             validate_guidance_meta(guidance_meta)
+            if guidance_meta['version']!=guidance_version(guidance_text):
+                raise ValueError('Guidance audit metadata does not match the guidance text (a hand edit or a '
+                                 'crashed set); ask the operator to set the guidance again before backing up')
             files['GUIDANCE.md']={'text':guidance_text}
             files[GUIDANCE_META]=guidance_meta
         feedback=path/'.feedback.jsonl'
@@ -2786,6 +2800,14 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
         elif name=='.guidance.json':
             from guidance import validate_meta
             validate_meta(record)
+    # The guidance text and its audit record are one generation: refuse to restore a
+    # mismatched pair rather than installing text that cannot be attributed.
+    if 'GUIDANCE.md' in files or '.guidance.json' in files:
+        if 'GUIDANCE.md' not in files or '.guidance.json' not in files:
+            raise ValueError('Invalid guidance backup: the text and its audit record must be restored together')
+        from guidance import version_of as guidance_version
+        if files['.guidance.json'].get('version')!=guidance_version(files['GUIDANCE.md']['text']):
+            raise ValueError('Invalid guidance backup: the audit record does not match the guidance text')
     for name,record in files.items():
         target=project_dir(root,destination)/name
         target.parent.mkdir(exist_ok=True)
@@ -3087,6 +3109,10 @@ def main():
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('guidance-status',help='which actors have acknowledged which guidance version (operator allowlist)')
     a.add_argument('project');a.add_argument('--actor',required=True)
+    a=sub.add_parser('clear-guidance',help='remove the project standing guidance and its audit record (operator allowlist)')
+    a.add_argument('project');a.add_argument('--actor',required=True)
+    a=sub.add_parser('compact-guidance-acks',help='drop guidance acknowledgements for versions no longer current or previous (operator allowlist, audited)')
+    a.add_argument('project');a.add_argument('--actor',required=True)
     a=sub.add_parser('handoff');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('requirement-backfill');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('requirement-apply');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
@@ -3238,8 +3264,37 @@ def main():
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             result=write_guidance(path,text,args.actor)
+        outcome='installed' if result['changed'] else ('repaired' if result.get('repaired') else 'unchanged')
         print('Project guidance %s (version %s); back up the project after changes.'
-              %('installed' if result['changed'] else 'unchanged',result['version']))
+              %(outcome,result['version']))
+        if result.get('repaired') and not result['changed']:
+            print('The audit record was missing or did not match the text; it is now bound to the text you set.')
+        print(json.dumps(result,sort_keys=True))
+    elif args.command=='clear-guidance':
+        import fcntl
+        from guidance import clear as guidance_clear
+        from keyed_records import require_configured_operator
+        require_configured_operator(args.actor,operators(root,strict=True),'clear the project guidance')
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            result=guidance_clear(path,args.actor)
+        print('Project guidance cleared (%s); back up the project after changes. The removed record stays in the '
+              'most recent coordination backup, if one was taken.'%(', '.join(result['removed']) or 'nothing was set'))
+        print(json.dumps(result,sort_keys=True))
+    elif args.command=='compact-guidance-acks':
+        import fcntl
+        from guidance import compact as guidance_compact
+        from keyed_records import require_configured_operator
+        require_configured_operator(args.actor,operators(root,strict=True),'compact the project guidance acks')
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            result=guidance_compact(path,args.actor)
+        print('Guidance acknowledgements compacted: removed %d for versions no longer current or previous.'
+              %result['removed_total'])
         print(json.dumps(result,sort_keys=True))
     elif args.command=='guidance-status':
         import fcntl

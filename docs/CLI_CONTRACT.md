@@ -230,17 +230,41 @@ The two totals count every kind.
 
 Every `brief`, `work` and session `resume` response also carries a `guidance` block
 for the project's operator-set standing guidance (kittrial-5bb.99): `present`,
-`version` (the SHA-256 of the guidance text), `set_at`, `set_by`,
+`version` (the SHA-256 of the guidance text), `set_at`, `set_by` (`null`, with a
+`warning`, when the stored audit record does not bind to the text read),
 `previous_version`, this actor's `acknowledged` state, and `attention` (true when
-guidance is set and this actor has not acknowledged the current version;
-`next_action` then names `guidance get`). `guidance get [--since VERSION]` returns
-the current text and what changed since a version; `guidance ack` records the
-calling actor's own read; `guidance status` (operator only) lists which lanes have
-acknowledged which version. Guidance is written only by the operator host command
+guidance is set, or cannot be read, and this actor has not acknowledged the current
+version; `next_action` then names `guidance get`). An unreadable record carries
+`present: null`, `unreadable: true`, `attention: true` and a `warning` instead of
+failing. The reader never reports a setter for text the audit record does not bind
+to.
+
+`guidance get [--since VERSION]` returns the current text and what changed since a
+version the server recorded (`since_known` is false and a `warning` is returned for
+an unknown version); `guidance version` returns the block without the text.
+`guidance ack --version VERSION` records that the calling actor read that exact
+version: the version is required, a stale one is refused naming the current version,
+and the endpoint requires a registered session (or a configured operator name).
+`guidance status` lists which lanes have acknowledged which version, with the
+previous text, `up_to_date`, `behind` and `stale`; it is gated on the configured
+operator allowlist, but the actor name is self-declared, so the authoritative
+operator read is the host command `admin.py guidance-status`. The endpoint's other
+guidance subcommands are refused: it never writes guidance.
+
+Guidance is written only by the operator host command
 `admin.py set-guidance PROJECT --actor ACTOR --file FILE`, is bounded (8000 bytes)
-plain text, is audited (who, when, version, previous version), and never overrides
-the user's authorization or the worker safety rules. A project with no guidance
-reads as `present: false`, never an error.
+plain text (C0, C1, bidi and zero-width characters are refused), is audited (who,
+when, version, previous version, bounded history), and never overrides the user's
+authorization or the worker safety rules. A set with the same text repairs a
+missing or mismatched audit record (`repaired: true`). An acknowledgement proves
+only that some caller named that actor and version, not that the text was read. The
+table is bounded, drops acks for versions other than the current and previous one at
+every set, evicts its oldest entry rather than refusing a new lane, and the operator
+can drop stale acks with `admin.py compact-guidance-acks PROJECT --actor ACTOR`
+(audited in the record). `admin.py clear-guidance PROJECT --actor ACTOR` removes the
+text and its record. A project with no guidance reads as `present: false`, never an
+error. Rolling a project back to an older kit has a documented
+[clear-first step](OPERATIONS.md#standing-guidance).
 
 The `reference-review` items:
 

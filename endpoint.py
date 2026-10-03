@@ -34,6 +34,49 @@ ALLOWED={'list','show','ready','search','count','create','update','close','reope
 FORBIDDEN={'--directory','-C','--db','--repo','--global','--actor','--author','--profile','--graph','--config','--metadata'}
 FILE_FLAGS={'--body-file','--design-file','--file','-f'}
 
+def _guidance_ack_version(args):
+    """The version named by `guidance ack [--version VERSION]` (kittrial-5bb.99).
+
+    The caller must name the version it actually read; the endpoint never assumes
+    the current version. Accepts `--version V`, `--version=V` and the bare `V`.
+    """
+    if not args:
+        raise ValueError('Name the guidance version you read: guidance ack --version VERSION')
+    if args[0]=='--version':
+        if len(args)!=2:raise ValueError('Use guidance ack --version VERSION')
+        return args[1]
+    if args[0].startswith('--version='):
+        if len(args)!=1:raise ValueError('Use guidance ack --version VERSION')
+        value=args[0].split('=',1)[1]
+        if not value:raise ValueError('Use guidance ack --version VERSION')
+        return value
+    if len(args)==1 and not args[0].startswith('-'):
+        return args[0]
+    raise ValueError('Use guidance ack --version VERSION')
+
+def _registered_guidance_actor(root,path,actor):
+    """True when the acking actor has a session registration (or is a configured operator).
+
+    Actors are self-declared everywhere in this protocol, so this is not
+    authentication; it only removes unregistered made-up names as the cheap way to
+    fill the bounded acknowledgement table (kittrial-5bb.99 review `ack-table-fill`).
+    """
+    try:
+        if actor in configured_operators(root):
+            return True
+    except ValueError:
+        pass
+    registry=path/'.sessions.json'
+    if registry.is_symlink() or not registry.is_file():
+        return False
+    try:
+        from sessions import validate as validate_sessions
+        data=validate_sessions(json.loads(registry.read_text(encoding='utf-8')))
+    except (OSError,UnicodeError,ValueError):
+        return False
+    return any(record.get('actor')==actor for record in data['records'].values())
+
+
 def _native_labels(root,path,actor,task):
     """Canonical id and labels of one native issue, read through pinned bd.
 
@@ -221,24 +264,35 @@ def execute(root,request,authority_config=None,require_authority=False):
         from onboarding import execute as onboard
         return {'returncode':0,'stdout':onboard(Path(__file__).resolve().parent,path,name,actor,action,request.get('args',[]),endpoint=Path(__file__).resolve()),'stderr':''}
     if action=='guidance':
-        # The standing guidance channel (kittrial-5bb.99 slice 1). Reads (get,
-        # version) take no coordination lock; `ack` records the calling actor's own
-        # acknowledgement, so it holds the lock like feedback. The write route is
-        # the operator host command (admin.py set-guidance) only; `status` is the
-        # operator read of who has acknowledged what.
+        # The standing guidance channel (kittrial-5bb.99 slice 1, revised). The
+        # endpoint is read-only except for the caller's own acknowledgement: the only
+        # guidance writer is the operator host command `admin.py set-guidance`, and
+        # this allowlist refuses every other subcommand, so adding a write route here
+        # cannot pass unnoticed (review `tests-for-the-refusals`). `ack` names the
+        # version the caller read and needs a registered session (or a configured
+        # operator) because the actor name is self-declared.
         import guidance
         args=request.get('args',[])
         if not isinstance(args,list) or any(not isinstance(a,str) or '\0' in a for a in args):
             raise ValueError('Expected argument list')
-        if args[:1]==['ack']:
-            if len(args)!=1:raise ValueError('Use guidance ack without arguments')
+        subcommand=args[0] if args else 'get'
+        if subcommand not in ('get','version','ack','status'):
+            raise ValueError('Unknown guidance action %r: the endpoint can only read guidance (get, version), '
+                             'acknowledge the version the caller read (ack), or, for an operator, read status. '
+                             'The only writer is the operator host command admin.py set-guidance.'%subcommand)
+        if subcommand=='ack':
+            version=_guidance_ack_version(args[1:])
             with (path/'.coordination.lock').open('a') as lock:
                 fcntl.flock(lock,fcntl.LOCK_EX)
-                result=guidance.acknowledge(path,actor)
-        elif args[:1]==['status']:
+                if not _registered_guidance_actor(root,path,actor):
+                    raise ValueError('A guidance acknowledgement needs a registered session for this project '
+                                     '(or a configured operator name); register with the session action first')
+                result=guidance.acknowledge(path,actor,version)
+        elif subcommand=='status':
             if len(args)!=1:raise ValueError('Use guidance status without arguments')
             result=guidance.status(path,actor,configured_operators(root))
-        elif args[:1]==['version']:
+        elif subcommand=='version':
+            if len(args)!=1:raise ValueError('Use guidance version without arguments')
             result=guidance.state(path,actor)
         else:
             result=guidance.read(path,args,actor)

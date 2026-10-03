@@ -218,6 +218,10 @@ history](#malformed-structured-history) (`void-record`).
 | `void-record PROJECT --actor OPERATOR --file void.json` | void a malformed or stale contribution-review record, or a malformed, foreign or conflicting reference or capability record ([below](#reference-and-capability-records)) | the deployment operator allowlist (`operators` in `deployment.private.json`) |
 | `anchor-release PROJECT --kind reference\|capability --issue-id ID --actor OPERATOR --reason TEXT` | close a reference or capability anchor that holds no record and free its key, when the propose that created it cannot be re-run ([orphan anchors](#orphan-anchors)). With `--duplicate` (and, for an anchor that carries acceptance evidence, `--set-aside-evidence`) it releases a named anchor of a [duplicated key](#a-duplicated-record-key) although it holds well-formed records | the deployment operator allowlist, checked before any read |
 | `handoff PROJECT --actor ACTOR --file handoff.json` | transfer a claim when the current owner cannot act | an owner decision/evidence pointer in the payload's `approval` |
+| `set-guidance PROJECT --actor OPERATOR --file FILE` | install the project's [standing guidance](#standing-guidance) text (bounded plain text, 8000 bytes) and its audit record. A set with the same text repairs a missing or mismatched audit record (`repaired: true`) | the deployment operator allowlist, checked before any write |
+| `guidance-status PROJECT --actor OPERATOR` | print who has acknowledged which guidance version, with the previous text, `up_to_date`, `behind` and `stale` | the deployment operator allowlist |
+| `clear-guidance PROJECT --actor OPERATOR` | remove `GUIDANCE.md` and `.guidance.json`; guidance then reads `present: false` | the deployment operator allowlist |
+| `compact-guidance-acks PROJECT --actor OPERATOR` | drop acknowledgements for versions other than the current and previous one; the record keeps `acks_compacted_by`/`acks_compacted_at` as the audit trail | the deployment operator allowlist |
 
 All five are shell-trusted: access to the service account's shell is the boundary.
 `requirement-apply`, `requirement-backfill`, `void-record` and `anchor-release` also
@@ -234,6 +238,49 @@ and confirm with `operators list`; an empty or short list is a deploy blocker,
 not a warning. Use the identity of the person actually running the command as
 `--actor`; the owner decision is named in the payload, never by reusing the
 owner's actor.
+
+### Standing guidance
+
+The standing guidance channel (kittrial-5bb.99) stores one operator-set instruction
+per project in `projects/PROJECT/GUIDANCE.md` plus its audit record
+`projects/PROJECT/.guidance.json`. The version is the SHA-256 of the exact text
+bytes, computed by every reader. Only `admin.py set-guidance` writes it (operator
+allowlist, checked before any file is read). The endpoint can read it and record a
+registered session's own acknowledgement of the exact version it names; it cannot
+write it, and every other guidance subcommand is refused.
+
+* A hand edit of `GUIDANCE.md`, or a crash between the two writes, is reported as a
+  mismatch: readers show `present: true` with `set_by: null` and a `warning`, never
+  crediting the text to the previous setter. Setting the same text again repairs the
+  record and prints `repaired`. A project backup refuses a mismatched pair, and so
+  does a restore.
+* Acknowledgement requires the version the caller read and a registered session (or
+  a configured operator name). The acknowledgement table is bounded (500): a new
+  lane evicts the oldest entry rather than being refused, acks for versions other
+  than the current and previous one are dropped at every set, and
+  `compact-guidance-acks` drops stale ones on demand. An acknowledgement does not
+  prove a read: actors are self-declared, so any caller that can reach the endpoint
+  can name another actor.
+* `clear-guidance` removes both files and guidance reads `present: false`; the
+  removed record stays in the project's most recent coordination backup, if one was
+  taken.
+
+**Rollback gap and the exact step.** An older kit (at or before
+`dca96b9d`) validates the coordination sidecar against a fixed path set that does
+not include `GUIDANCE.md` or `.guidance.json`, so `restore-new` by that kit fails
+with `Invalid coordination backup path` on a backup taken by this kit while
+guidance is set. A backup taken by the older kit during a rollback succeeds but
+silently omits guidance. To roll back:
+
+1. While still on this kit, run `admin.py clear-guidance PROJECT --actor OPERATOR`
+   (or delete `projects/PROJECT/GUIDANCE.md` and `projects/PROJECT/.guidance.json`
+   by hand), then take the backup (`admin.py backup PROJECT`). Keep a copy of the
+   two files if the guidance text and acks are needed later.
+2. Restore that backup with the older kit's `restore-new`. Guidance on the restored
+   project reads `present: false`.
+3. After rolling forward again, re-run `admin.py set-guidance` to reinstall the
+   text. The previous history and acknowledgements are not recovered
+   automatically from the cleared files.
 
 Validate a payload before writing. Each command is fail-closed and refuses before
 any native write, and the same validator can be run with no native read or write

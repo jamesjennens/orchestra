@@ -357,7 +357,8 @@ def help_notes(action):
         return ['Unresolved items come from the latest valid checkpoint; a missing checkpoint means unknown, not zero.',
                 'Every endpoint brief carries a guidance block (kittrial-5bb.99): the current coordinator '
                 'guidance version, who set it and whether this actor has acknowledged it; read it with '
-                '`guidance get` and record the read with `guidance ack`.',
+                '`guidance get` and record the read with `guidance ack --version VERSION`, naming the version '
+                'you read. An unreadable or mismatched guidance record carries attention true and a warning.',
                 '--limit/--offset are not brief options; use --items-limit/--items-offset.',
                 'attention lists at most 3 reference-review items (entries tagged with the task\'s labels, '
                 'then expired and due-soon), expired first, then at most 3 proposal-review items (proposals '

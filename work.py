@@ -67,10 +67,11 @@ def help_payload(action='work'):
         payload['output'] = {
             'top_level': ['owner', 'total', 'items', 'next_offset', 'coverage', 'attention', 'guidance'],
             'guidance': 'guidance: the project\'s current standing guidance version (kittrial-5bb.99), '
-                        'with present, version, set_at, set_by, previous_version, the calling actor\'s '
-                        'acknowledged state and attention (true when guidance is set and this actor has not '
-                        'acknowledged the current version); next_action names `guidance get`. A project with '
-                        'no guidance reads as present: false, never an error.',
+                        'with present, version, set_at, set_by (null when the audit record does not bind to '
+                        'the text), previous_version, the calling actor\'s '
+                        'acknowledged state and attention (true when guidance is set, or cannot be read, and '
+                        'this actor has not acknowledged the current version); next_action names `guidance get`. '
+                        'A project with no guidance reads as present: false, never an error.',
             'attention': 'attention.reference_review: project-wide reference catalog counts (expired, '
                          'due_soon, unset = draft-only entries, acceptance_inert, malformed, total), always; '
                          'items only for an approver (an actor on the deployment operator allowlist), '
