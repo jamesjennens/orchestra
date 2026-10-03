@@ -148,10 +148,11 @@ def request(config,project,actor,args,action='bd',path=None):
     try:return json.loads(p.stdout)
     except json.JSONDecodeError:raise RuntimeError('Invalid endpoint response; inspect state before retrying.') from None
 
-# Capability subcommands answered by the coordination endpoint (.60 slices 1a/1b); lookup,
-# resolve and index stay in the client and never need a config. `check` runs in the
-# client too, but reads the records (and with --record posts `verify`) through the endpoint.
-CAPABILITY_ENDPOINT = ('find', 'get', 'list', 'propose', 'revise', 'propose-alias', 'verify')
+# Capability subcommands answered by the coordination endpoint (.60 slices 1a/1b, and the
+# lookup-miss log `misses`, kittrial-5bb.77); lookup, resolve and index stay in the client
+# and never need a config. `check` runs in the client too, but reads the records (and
+# with --record posts `verify`) through the endpoint.
+CAPABILITY_ENDPOINT = ('find', 'get', 'list', 'propose', 'revise', 'propose-alias', 'verify', 'misses')
 
 def _capabilities_module():
     """capabilities.py from this client's own directory, loaded by path, or None.

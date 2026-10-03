@@ -870,6 +870,37 @@ def list_entries(rows, options, operators, trust=None):
                                                            'newest draft when none is accepted')}
 
 
+def _exact_phrases(entry):
+    """(names, accepted aliases): the normalised phrases `find` matches exactly for one entry.
+
+    The names are the key and the name of the revision a reader describes (the accepted
+    one, else the newest draft); the aliases are those of the accepted revision only.
+    """
+    record = _newest(entry) or {}
+    names = {normalize(entry['key']), normalize(record.get('name') or '')}
+    accepted_aliases = {normalize(item) for item in ((entry.get('record') or {}).get('aliases') or [])}
+    return names, accepted_aliases
+
+
+def exact_index(rows, operators):
+    """{normalised phrase: [{key, trust, state}]}: every phrase `find` would now match exactly.
+
+    The same rule as `find` (`_exact_phrases`), over every readable entry, accepted
+    records first. `capability misses` uses it to mark the misses that now resolve.
+    """
+    entries, _ = catalog(rows, operators)
+    index = {}
+    for entry in sorted((entry for entry in entries if entry['state'] not in ('malformed', 'unsupported')),
+                        key=lambda entry: (entry['record'] is None, entry['key'])):
+        names, accepted_aliases = _exact_phrases(entry)
+        for phrase in sorted(names | accepted_aliases):
+            if phrase:
+                index.setdefault(phrase, []).append({'key': entry['key'],
+                                                     'trust': 'accepted' if entry['record'] else 'draft',
+                                                     'state': entry['state']})
+    return index
+
+
 def find(rows, phrase, operators, limit=5, trust=None):
     """`capability find PHRASE`: records only, scored like .61's lookup (.60 section 7).
 
@@ -893,8 +924,7 @@ def find(rows, phrase, operators, limit=5, trust=None):
         if entry['state'] in ('malformed', 'unsupported'):
             continue
         record = _newest(entry) or {}
-        names = {normalize(entry['key']), normalize(record.get('name') or '')}
-        accepted_aliases = {normalize(item) for item in ((entry.get('record') or {}).get('aliases') or [])}
+        names, accepted_aliases = _exact_phrases(entry)
         if text == entry['key'] or key in names | accepted_aliases:
             exact.append(entry)
             continue
@@ -1182,12 +1212,16 @@ def help_payload():
     return {'schema_version': 1, 'action': 'capability', 'contract': 'cli-contract-v1',
             'usage': ['capability get KEY', 'capability list [--tag TAG]... [--owner IDENTITY] '
                       '[--state draft-only|accepted|superseded|all] [--limit N] [--offset N] [--pointers]',
-                      'capability find PHRASE [--limit N]', 'capability propose --file entry.json',
+                      'capability find PHRASE [--limit N]', 'capability misses [--limit N]',
+                      'capability propose --file entry.json',
                       'capability revise --file entry.json',
                       'capability propose-alias KEY PHRASE [--evidence POINTER]',
                       'capability verify --file verification.json'],
             'local': ['capability lookup PHRASE', 'capability resolve POINTER...', 'capability index',
                       'capability check --repo PATH [--key KEY]... [--record | --payloads FILE]'],
+            'telemetry': 'Each find is counted per project, and a find with no exact match also records its '
+                         'normalised phrase, a count and first/last seen times; no actor is stored. Read it '
+                         'with capability misses.',
             'limits': {'find_limit': list(FIND_LIMIT), 'phrase': PHRASE_MAX, 'name': NAME_MAX,
                        'summary': SUMMARY_MAX, 'alias': ALIAS_MAX, 'pointer': POINTER_MAX,
                        'code': CODE_MAX, 'tests': TESTS_MAX, 'anchors': ANCHORS_MAX,
@@ -1251,6 +1285,9 @@ def read(args, run, operators, verifiers=None, journal=None):
     (it holds the host revert journal); both feed the verification trust rules. The
     integrated-commit test reads nothing unless an entry being shown has a trusted
     passing verification.
+
+    `capability misses` is answered by the endpoint itself (it needs the project
+    directory): see capability_misses.
     """
     if not args or args[0] == 'help' or any(token in ('--help', '-h') for token in args):
         return help_payload()
@@ -1280,8 +1317,8 @@ def read(args, run, operators, verifiers=None, journal=None):
         rows, lifecycle = read_catalog(run)
         return find(rows, phrase, operators, limit=options['limit'] if '--limit' in rest else 5,
                     trust=Trust(run, operators, verifiers, journal, lifecycle))
-    raise ValueError('capability: unknown command %s; use get, list, find, propose, revise, propose-alias or '
-                     'verify' % command)
+    raise ValueError('capability: unknown command %s; use get, list, find, misses, propose, revise, '
+                     'propose-alias or verify' % command)
 
 
 def write(args, attachments, actor, run, project, operators, verifiers=None):

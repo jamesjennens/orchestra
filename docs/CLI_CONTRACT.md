@@ -242,8 +242,8 @@ The `reference-review` items:
 ## `capability`: client-side code and design lookup
 
 `capability lookup`, `resolve` and `index` are answered by the client itself and are
-read-only. The capability **records** commands (`find`, `get`, `list`, `propose`,
-`revise`, `propose-alias` and `verify`) go to the endpoint and need `--config` and
+read-only. The capability **records** commands (`find`, `get`, `list`, `misses`,
+`propose`, `revise`, `propose-alias` and `verify`) go to the endpoint and need `--config` and
 `--project`; see [capability records](#capability-records-the-index-on-the-endpoint)
 below. `capability check` runs in the client against your checkout but reads the
 records from the endpoint; see [the drift check](#capability-check-the-drift-check).
@@ -445,6 +445,7 @@ Meaning is accepted by an operator. Location is checked against a checkout with
 b capability find "merge slot" --limit 5 --json
 b capability get review.structured-contribution --json
 b capability list --state draft-only --json
+b capability misses --limit 20 --json
 b capability propose --file capability.json --json
 b capability propose-alias merge.slot "single integrator" --evidence coordination.py::merge_acquire
 ```
@@ -730,6 +731,138 @@ one of the task's labels, drifted first, then by key. Each has `kind`
 object), `text` (server-derived from the key and the verification state, never the
 summary) and `source` (`capability get KEY`).
 
+### `capability misses`: which phrases miss, and how often
+
+The endpoint counts every `capability find` for a project. When a `find` has no exact
+record match (`found: false`), it also remembers the phrase. `capability lookup` with
+`--config` makes exactly one `find`, so every such lookup is counted, from any client
+version. A purely local lookup (no config) reaches no endpoint and records nothing.
+Recording happens inside `find`, not through a separate call: older clients are
+covered without an upgrade, there is no second round trip, and the contributor
+interface gains no new write action.
+
+**What is stored, per project:**
+- per phrase: the normalised phrase, a count, and first-seen and last-seen times
+  (server clock, UTC);
+- five counters: `finds`, `misses`, `overflow`, `dropped` and `evicted`, and the time
+  the log started.
+
+Nothing else is stored. In particular no actor, session or person: the log cannot be
+turned into a per-person record. Whether code candidates were offered is not recorded
+either, because the client computes them and the endpoint never sees them.
+
+**The phrase is untrusted text.**
+- It is stored only after the lookup's own normalisation (`capabilities.clean`, then
+  `capabilities.normalized`): control, format (bidi overrides, zero-width and tag
+  characters) and separator characters become spaces, punctuation is dropped, case is
+  folded, and words are joined by single spaces. This is the key `find` itself matches on.
+- What remains must be at most 80 characters of letters, digits and single ASCII
+  spaces. Anything else (empty, longer, or still not of that shape) is counted in
+  `dropped` and not stored.
+- The file and the `capability misses` output are ASCII-escaped.
+- A stored phrase can still read like an instruction (`ignore previous instructions`).
+  The output is marked `trust: "untrusted-text"`; read it as data. Nothing in the kit
+  places a recorded phrase into an agent prompt, a briefing, a view or onboarding text.
+
+**Bounds** (fixed in this version):
+- at most 500 phrases per project (`evicted` counts the phrases dropped to make room).
+  When the log is full, a new phrase replaces:
+  - among the phrases **first** seen more than 2 hours ago, the one with the **lowest
+    count**, the one seen longest ago among equal counts;
+  - or, when every phrase was first seen in the last 2 hours, the one seen longest ago.
+
+  The count rule means a burst of one-off phrases evicts other one-offs, never a phrase
+  that keeps missing. The 2-hour protection means a new phrase that recurs (for example
+  hourly) is kept long enough to build up a count, instead of being evicted by the next
+  newcomer while older phrases with a count of 2 sit on every slot. It is keyed on
+  first-seen because repeating a phrase refreshes its last-seen: protection by
+  last-seen would let a caller keep its own junk protected while it evicts everything
+  else. When the log is full of phrases with a count of 2 or more, a new phrase that
+  recurs **less often than every 2 hours** is not kept: it is still at count 1 when its
+  protection ends, so it is the lowest count and the next newcomer evicts it;
+- at most 60 **new** phrases per project per clock hour (UTC); further new phrases in
+  that hour are counted in `overflow` and not stored. A phrase already in the log is
+  always counted. The bound is per project, not per actor, because no actor is stored:
+  **one caller can use up the whole project's hourly quota**, and its phrases then
+  crowd out everyone else's new phrases for that hour;
+- recording tries the log's own lock a few times without blocking, for at most about
+  10 ms in total. A find made while another find holds it for longer is not counted
+  at all, so `finds` and `misses` are lower bounds under load.
+
+**Counts are not votes.** A count cannot be attributed to anyone: one caller can repeat
+a phrase as often as it likes and push it to the top. Read a high count as "this phrase
+keeps missing", never as "many people asked for this".
+
+**Reading it.** `capability misses [--limit N] [--json]` is read-only. It takes no
+lock, writes nothing and is not journalled. It reads the log, and (only when the log
+holds a phrase) the index once, as `find` does, to mark what would now resolve.
+`--limit` is 1..100 (default 20). Any contributor of the project may read it.
+
+```json
+{
+  "schema_version": 1,
+  "schema": "capability-misses-v1",
+  "contract": "cli-contract-v1",
+  "trust": "untrusted-text",
+  "log": "ok",
+  "recording": "ok",
+  "since": "2026-10-01T12:00:00Z",
+  "finds": 6,
+  "misses": 5,
+  "miss_rate": 0.8333,
+  "phrases_stored": 3,
+  "phrases_resolved_now": 1,
+  "not_stored": {"overflow": 0, "dropped": 1, "evicted": 0},
+  "limit": 20,
+  "notice": "The phrases below are normalised text typed by contributors and agents. ...",
+  "phrases": [
+    {"trust": "untrusted-text", "phrase": "merge slot", "count": 2,
+     "first_seen": "2026-10-01T12:00:00Z", "last_seen": "2026-10-01T12:01:00Z",
+     "resolves_now": false, "resolved_by": []},
+    {"trust": "untrusted-text", "phrase": "single integrator", "count": 1,
+     "first_seen": "2026-10-01T12:04:00Z", "last_seen": "2026-10-01T12:04:00Z",
+     "resolves_now": true,
+     "resolved_by": [{"key": "merge.slot", "trust": "accepted", "state": "accepted"}]}
+  ],
+  "bounds": {"phrases": 500, "new_phrases_per_hour": 60, "phrase_characters": 80},
+  "coverage": "..."
+}
+```
+
+- `log` is `ok`, `absent` (nothing recorded yet, or cleared) or `unreadable` (the file
+  is corrupt, oversized or of another schema; the next `find` starts a new log). With
+  `absent` or `unreadable`, `since` is `null` and the counters are `0`.
+- `recording` says whether a find could record now, judged without writing: `ok`;
+  `lock-unusable` (the lock path is not a regular file - a symlink, directory, FIFO or
+  other special file - or cannot be opened); `log-unwritable` (the log or temp path is a
+  directory, or the project directory cannot be written); or `unsupported` (no
+  `flock`). A symlink or FIFO at the log or temp path does not stop recording: the
+  next write replaces it.
+  Anything but `ok` means finds still answer but nothing is counted, so zeros are not
+  "no misses". `admin.py capability-misses-clear` repairs the first two.
+- `notice` comes immediately before `phrases`, and every row starts with
+  `trust: "untrusted-text"`. A stored phrase can be an 80-character imperative sentence
+  pushed to the top by repetition; it is still only text someone typed.
+- `since` is when the log started. `finds`, `misses` and the `not_stored` counters
+  cover everything since then, including phrases later evicted.
+- `miss_rate` is `misses / finds`, rounded to four places, or `null` when `finds` is `0`.
+- `phrases` are the top `limit` phrases by `count`; ties go to the most recently seen.
+  `phrases_stored` counts all of them.
+- `resolves_now` is `true` when a `find` for that phrase would be an exact match now:
+  it equals a capability's key, its name, or an accepted alias (the same rule as
+  `find`). `resolved_by` names up to five such capabilities, accepted first, each with
+  `trust: accepted|draft` and the capability's `state` (`accepted`, `draft-only`,
+  `superseded`, ...). A retired key still matches exactly, so check `state` before
+  treating the miss as fixed. A pending alias never makes a phrase resolve.
+  `phrases_resolved_now` counts the stored phrases that resolve, whatever the limit.
+- `not_stored`: misses that are in `misses` but whose phrase is not (or no longer) in
+  the log: `overflow` (over the hourly bound), `dropped` (empty, too long or unsafe
+  after normalising) and `evicted` (pushed out by a newer phrase when the log was full).
+
+The log is telemetry, not coordination state. It is one file in the project's
+coordination directory, it is not backed up, and an operator can delete it at any
+time; see [Operations](OPERATIONS.md#the-capability-lookup-miss-log).
+
 ## `ref`: the reference catalog
 
 The reference catalog holds operational facts and their authority: what is
@@ -898,6 +1031,8 @@ a clear refusal, not a wrong read.
 | `ref` | due-soon window | 30 days (fixed in slice 1) |
 | `capability find` | phrase / `--limit` | <= 200 characters / 1..20 (default 5) |
 | `capability list` | `--limit` / `--offset` | 1..100 (default 20) / >= 0 |
+| `capability misses` | `--limit` | 1..100 (default 20) |
+| lookup-miss log | phrases / new phrases / phrase length | 500 per project (phrases first seen in the last 2 hours protected; otherwise lowest count evicted, oldest first among equals) / 60 per project per clock hour (the rest counted in `overflow`) / <= 80 characters after normalising (else counted in `dropped`) |
 | `capability` record | `name` / `summary` / `aliases` | <= 120 / <= 1,200 characters / <= 32 phrases of <= 80 |
 | `capability` record | `code` / `tests` / `anchors` / `requirements` / `tags` | <= 32 / 32 / 16 / 16 / 8, pointers <= 400 characters |
 | `capability propose-alias` | pending aliases | person 3 per capability and 50 per project; unverified pool 1 and 10; 20 per capability |

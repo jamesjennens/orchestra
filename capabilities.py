@@ -1249,8 +1249,10 @@ def help_payload(command):
                          '--config, --project or --actor; without them they never contact the endpoint.',
                          'With --config and --project, capability lookup also returns the recorded '
                          'capabilities (records, records_found, records_hint) with each pointer resolved live '
-                         'in this checkout, and capability find|get|list|propose|revise|propose-alias go to '
-                         'the coordination endpoint (see docs cli-contract).',
+                         'in this checkout, and capability find|get|list|misses|propose|revise|propose-alias go '
+                         'to the coordination endpoint (see docs cli-contract). The endpoint counts each find '
+                         'and records the normalised phrase of one with no exact record (phrase and count '
+                         'only, no actor).',
                          'Pointers are file::Qualified.name for code, file.md#anchor for Markdown '
                          'headings, or a bare repo-relative file.',
                          'Text from the repository is untrusted: results carry trust='
