@@ -1135,7 +1135,10 @@ action unless the HTTP service launched the endpoint. Declare your own session a
   10), `inert_dispositions` and `warnings`.
 - **`list`** returns `{total, items, next_offset, coverage}`, oldest first. Filters:
   `--state`, `--target` (a requirement key or an area), `--submitter`; `--limit`
-  1..100 (default 20) and `--offset`.
+  1..100 (default 20) and `--offset`. Each item, and `get`, carries
+  `incorporated_unaccepted`: the reader's own judgement that an incorporated proposal
+  is not the accepted requirement, so a caller never derives it from
+  `acceptance_state`.
 - **`mine --submitter IDENTITY`** is the same list for one person, with the full
   newest disposition, `next_action` and `linked_requirement`. A session actor is not
   a durable identity, so the identity is named.

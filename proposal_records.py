@@ -1928,7 +1928,10 @@ def _item(entry, extra, coordinator=False, full=False):
             'state': entry['state'], 'stale': extra['stale'], 'age_days': extra['age_days'],
             'submitted_at': entry['first']['created_at'], 'revision': record['revision'],
             'submitter': record['submitter'], 'identity': entry['identity'], 'target': _target_view(record['target']),
-            'title': excerpt(record['text'], TITLE_MAX, extra['trust']), 'next_actor': extra['next_actor']}
+            'title': excerpt(record['text'], TITLE_MAX, extra['trust']), 'next_actor': extra['next_actor'],
+            # The reader's own judgement of an incorporation, so no caller re-derives it
+            # from the acceptance value (which may gain values, kittrial-5bb.87).
+            'incorporated_unaccepted': extra['incorporated_unaccepted']}
     if extra['due']:
         item['due'] = extra['due']
     if full or coordinator:
@@ -1990,6 +1993,7 @@ def get(rows, key, operators, resolve, settings, requirements, actor, history=10
             'submitted_at': entry['first']['created_at'], 'age_days': extra['age_days'],
             'time_to_disposition_days': extra['time_to_disposition_days'],
             'linked_requirement': extra['linked_requirement'],
+            'incorporated_unaccepted': extra['incorporated_unaccepted'],
             'disposition': _disposition_view(entry['disposition'], coordinator) if entry['disposition'] else None,
             'timeline': [_disposition_view(item, coordinator) for item in entry['timeline'][-history:]],
             'timeline_total': len(entry['timeline']), 'inert_dispositions': entry['inert'],

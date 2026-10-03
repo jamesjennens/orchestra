@@ -3079,6 +3079,28 @@ class ApiHandler(BaseHTTPRequestHandler):
         # text to that account (review 01a10262).
         mine = submitter == 'account:' + ctx.principal.user_id and item.get('identity') == 'verified'
         item['mine'] = mine
+        # Display names for the people in the timeline (account ids), best effort.
+        entries = [entry for entry in [item.get('disposition')] + list(item.get('timeline') or [])
+                   if isinstance(entry, dict)]
+
+        def decider(entry):
+            identity = (entry.get('escalation') or {}).get('owner_identity')
+            return identity[len('account:'):] if isinstance(identity, str) and identity.startswith('account:')                 else None
+        names = self.service.actor_names([entry.get('actor') for entry in entries]
+                                         + [decider(entry) for entry in entries])
+
+        def named(disposition):
+            if not isinstance(disposition, dict):
+                return disposition
+            actor = disposition.get('actor')
+            shown = dict(disposition, actor_name=names.get(actor, actor) if isinstance(actor, str) else None)
+            if decider(disposition):
+                shown['escalation'] = dict(shown['escalation'], owner_name=names.get(decider(disposition)))
+            return shown
+        if 'disposition' in item:
+            item['disposition'] = named(item['disposition'])
+        if isinstance(item.get('timeline'), list):
+            item['timeline'] = [named(entry) for entry in item['timeline']]
         if mine or CAP_APPROVE in capabilities:
             return item
 

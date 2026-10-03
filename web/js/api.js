@@ -120,6 +120,12 @@ export function createApi(transport) {
     // A NEW credential for the agent; its secret is in this one response only.
     issueAgentCredential: (aid) => mutate('POST', `/v1/agents/${aid}/credentials`, { label: 'web: new secret' }),
     revokeAgentCredential: (aid, cid) => mutate('POST', `/v1/agents/${aid}/credentials/${cid}/revoke`, {}),
+    // requirement proposals (identity is the session's; the submitter is never sent)
+    proposals: (pid, params) => call('GET', `/v1/projects/${pid}/proposals`, { params }),
+    proposal: (pid, key) => call('GET', `/v1/projects/${pid}/proposals/${key}`, { params: { history: 50 } }),
+    submitProposal: (pid, body) => mutate('POST', `/v1/projects/${pid}/proposals`, body),
+    disposeProposal: (pid, key, body) => mutate('POST', `/v1/projects/${pid}/proposals/${key}/dispositions`, body),
+    myContributions: () => call('GET', '/v1/me/contributions'),
     feedback: (pid, params) => call('GET', `/v1/projects/${pid}/feedback`, { params }),
     addFeedback: (pid, body) => mutate('POST', `/v1/projects/${pid}/feedback`, body),
     requirements: (pid) => call('GET', `/v1/projects/${pid}/requirements`),

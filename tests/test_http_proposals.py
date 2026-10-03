@@ -671,6 +671,94 @@ class ReviewFixCase(ProposalHarness):
                                                    token=self.token('blair')).status)
 
 
+class ScreenDataCase(ProposalHarness):
+    """What the web screens (delivery B) read from the routes."""
+
+    def test_the_views_carry_names_and_the_readers_own_flag(self):
+        key = self.submit().data['key']
+        self.dispose(key, 'under-review')
+        self.dispose(key, 'escalated-to-owner', escalation={
+            'question': 'Replace the baseline?', 'owner_identity': 'account:' + self.uid('dana'), 'due_by': None})
+        view = self.get(key)
+        self.assertEqual([entry['actor_name'] for entry in view['timeline']], ['blair', 'blair'])
+        self.assertEqual((view['disposition']['actor'], view['disposition']['escalation']['owner_name']),
+                         (self.uid('blair'), 'dana'))
+        self.assertIs(view['incorporated_unaccepted'], False)
+        row = self.request('GET', self.base(), token=self.token('blair')).data['items'][0]
+        self.assertEqual((row['incorporated_unaccepted'], row['submitter_name'], row['mine']), (False, 'alex', False))
+        # A viewer still learns who decides, never the question.
+        seen = self.request('GET', '%s/%s' % (self.base(), key), token=self.token('casey')).data['disposition']
+        self.assertEqual((seen['escalation']['owner_name'], seen['escalation']['question'], seen['withheld']),
+                         ('dana', None, True))
+
+
+class WebScreenTests(unittest.TestCase):
+    """The proposal screens exist and follow the rules (static checks; the browser
+    behaviour was exercised by hand against a local service, see the evidence)."""
+
+    def setUp(self):
+        web = KIT / 'web' / 'js'
+        self.proposals = (web / 'views' / 'proposals.js').read_text(encoding='utf-8')
+        self.project = (web / 'views' / 'project.js').read_text(encoding='utf-8')
+        self.work = (web / 'views' / 'work.js').read_text(encoding='utf-8')
+        self.api = (web / 'api.js').read_text(encoding='utf-8')
+        self.app = (web / 'app.js').read_text(encoding='utf-8')
+
+    def test_the_api_never_sends_a_submitter(self):
+        for text in ("proposals: (pid, params) => call('GET', `/v1/projects/${pid}/proposals`, { params })",
+                     "submitProposal: (pid, body) => mutate('POST', `/v1/projects/${pid}/proposals`, body)",
+                     "disposeProposal: (pid, key, body) => mutate('POST', `/v1/projects/${pid}/proposals/${key}/dispositions`, body)",
+                     "myContributions: () => call('GET', '/v1/me/contributions')"):
+            self.assertIn(text, self.api)
+        # The two request bodies the screens build name only content fields.
+        for start in ('const body = { target, text:', 'const body = { key: view.key, revision:'):
+            body = self.proposals[self.proposals.index(start):]
+            body = body[:body.index('};')]
+            self.assertNotIn('submitter', body)
+            self.assertNotIn('actor', body)
+
+    def test_untrusted_text_is_never_markup_and_links_are_https_only(self):
+        for forbidden in ('innerHTML', 'outerHTML', 'insertAdjacentHTML', 'document.write', 'eval('):
+            self.assertNotIn(forbidden, self.proposals)
+        self.assertIn("url.protocol === 'https:'", self.proposals)
+        self.assertIn("rel: 'noopener noreferrer'", self.proposals)
+        self.assertIn('data.untrusted', self.proposals)            # the server's framing line is shown
+        # Revision 2 of delivery A: the identity-broken warning is shown on the detail, as text,
+        # and the contributions panel says when it shows only the newest page.
+        self.assertIn("w.code === 'identity-broken'", self.proposals)
+        self.assertIn("String(broken.detail || '')", self.proposals)      # a text node, never markup
+        self.assertIn('data.truncated || data.next_cursor', self.proposals)
+
+    def test_the_reviews_page_shows_the_queue_the_detail_and_the_form(self):
+        self.assertIn("import { queuePanel, detailPanel, proposeForm, myStrip } from './proposals.js';", self.project)
+        self.assertIn("ctx.query.get('proposal')", self.project)
+        self.assertIn("ctx.query.get('propose')", self.project)
+        # A route may carry a query; the path is what is matched.
+        self.assertIn("const [path, search] = route.split('?');", self.app)
+        self.assertIn('ctx.query = new URLSearchParams(search', self.app)
+        self.assertIn('matchRoute(path)', self.app)
+        for group in ("'submitted'", "'under-review'", "'needs-info'", "'escalated-to-owner'", "'approved'"):
+            self.assertIn(group, self.proposals[self.proposals.index('const GROUPS'):self.proposals.index('const TRANSITIONS')])
+        self.assertIn('Incorporated, awaiting acceptance', self.proposals)
+        # The awaiting-acceptance group is the server's own flag; nothing is compared here.
+        self.assertIn('p.incorporated_unaccepted', self.proposals)
+        self.assertNotIn("acceptance_state !== 'accepted'", self.proposals)
+
+    def test_an_older_server_degrades_and_my_contributions_is_on_my_work(self):
+        self.assertIn('[404, 501].includes(error.status)', self.proposals)
+        self.assertIn('Not available on this server', self.proposals)
+        self.assertIn("import { myContributionsPanel } from './proposals.js';", self.work)
+        home = self.work[self.work.index('export async function home'):self.work.index('export function agentPromptPanel')]
+        self.assertLess(home.index('agentPromptPanel(ctx, data)'), home.index('contributions,'))
+        self.assertLess(home.index('contributions,'), home.index('agentsPanel,'))
+
+    def test_the_forms_follow_the_no_self_rules(self):
+        self.assertIn('view.can_triage && !view.mine && !escalatedByMe', self.proposals)
+        self.assertIn('You escalated this proposal: a different owner has to decide it.', self.proposals)
+        self.assertIn('This is your own proposal: another owner has to triage it.', self.proposals)
+        self.assertIn("m.user_id !== ctx.me.id", self.proposals)   # the escalator is not offered as the decider
+
+
 class InProcessCase(Harness):
     def test_the_in_process_backend_has_no_proposals(self):
         admin = self.admin_token()

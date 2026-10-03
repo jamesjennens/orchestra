@@ -1,5 +1,6 @@
 import { h, time, confirmDialog, secretDialog, toast, shortSha } from '../dom.js';
 import { pageHead, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, errorState, describe } from '../ui.js';
+import { queuePanel, detailPanel, proposeForm, myStrip } from './proposals.js';
 
 const PAGE = 10;
 export const canWrite = (p) => ['owner', 'contributor', 'superuser'].includes(p.role);
@@ -85,18 +86,35 @@ export async function overview(ctx, { pid }) {
   }
   draw();
 
+  // "My contributions" strip: filled after the page is shown, so the task list never
+  // waits for it; it stays empty on a server without the proposal routes.
+  const strip = h('div');
+  myStrip(ctx, pid).then((node) => { if (node) strip.replaceChildren(node); }).catch(() => {});
+
   return h('div', { class: 'stack' },
     pageHead({ crumbs: crumbs(ctx, project), title: project.name, lede: project.description || null,
       actions: canWrite(project) && !project.archived ? h('a', { class: 'btn primary', href: ctx.href(`/p/${pid}/new`) }, 'New task') : null }),
     archivedBanner(project),
     unusableBanner(project),
+    strip,
     h('div', { class: 'toolbar' }, search, statusSeg, reviewSel),
     tableHost);
 }
 
 export async function reviews(ctx, { pid }) {
   const project = await load(ctx, pid);
-  const data = await ctx.api.queue(pid);
+  // One proposal, or the propose form, replaces the lists on the same page
+  // (/p/{pid}/reviews?proposal=<key> and ?propose=1): no separate route.
+  const key = ctx.query.get('proposal');
+  if (key || ctx.query.get('propose')) {
+    const reviewsCrumb = [{ label: 'Projects', href: ctx.href('/projects') }, { label: project.name, href: ctx.href('/p/' + project.id) },
+      { label: 'Reviews', href: ctx.href(`/p/${pid}/reviews`) }, { label: key ? 'Proposal' : 'Propose a requirement' }];
+    return h('div', { class: 'stack' },
+      pageHead({ crumbs: reviewsCrumb, title: key ? 'Requirement proposal' : 'Propose a requirement' }),
+      archivedBanner(project),
+      key ? await detailPanel(ctx, pid, key) : proposeForm(ctx, pid));
+  }
+  const [data, proposals] = await Promise.all([ctx.api.queue(pid), queuePanel(ctx, pid)]);
   // The disposable server calls an approved contribution "approved"; the canonical
   // review projection calls it "awaiting-integration". Both land in one group.
   const groups = [
@@ -107,7 +125,8 @@ export async function reviews(ctx, { pid }) {
   ];
   const openRequests = (t) => (t.open_requests ?? (t.requests || []).filter((r) => r.status === 'open').length);
   return h('div', { class: 'stack' },
-    pageHead({ crumbs: crumbs(ctx, project, 'Reviews'), title: 'Reviews', lede: 'Every contribution in flight, grouped by who has to act next.' }),
+    pageHead({ crumbs: crumbs(ctx, project, 'Reviews'), title: 'Reviews', lede: 'Requirement proposals and every contribution in flight, grouped by who has to act next.' }),
+    proposals,
     data.complete === false ? h('div', { class: 'banner' }, 'This list is incomplete: the project has more contributions in flight than one read covers.') : null,
     groups.map(([keys, title, note]) => {
       const key = keys[0];

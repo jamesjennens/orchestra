@@ -359,10 +359,32 @@ The rules:
   - While the older kit is the endpoint, the actor-shape reservation is off. Run the
     scan above when you roll forward.
 
-Not built yet: the web screens (the next delivery), the scoreboard and statistics, the
-self-service scoreboard hide, and promoting a feedback entry from the web (the HTTP
-feedback routes are not canonical on the endpoint backend; `proposal submit
---from-feedback` on the client works).
+**In the web interface.**
+- **Reviews** shows the proposal queue above the contribution groups: Submitted, Under
+  review, Needs information, Escalated to the owner and Approved, and for members who can
+  triage, Incorporated but not yet the accepted requirement. A row opens the proposal on
+  the same page (`#/p/{id}/reviews?proposal={key}`): the text, why, evidence, what has
+  happened, and the form for whoever acts next.
+  - A member with `reviews.approve` gets the triage form, or the owner-decision form on
+    an escalated proposal. It is not offered on their own proposal, nor the decision to
+    the member who escalated.
+  - The submitter gets a revise form while the proposal is submitted or a coordinator
+    has asked a question.
+- **Propose a requirement** is a button on Reviews (`?propose=1`). The form never sends
+  a submitter.
+- **My work** has a "My contributions" panel, and a project's task page shows one line
+  about your own proposals there.
+- Proposal text is always rendered as plain text. An evidence entry is a link only when
+  it is a plain `https` URL.
+- A server without these routes shows "Not available on this server" in place of the
+  queue, and no My contributions panel.
+
+Not built yet:
+- creating the decision issue from the web, so an owner's yes or no still needs an
+  operator to file the decision issue first;
+- promoting a feedback entry from the web (the HTTP feedback routes are not canonical on
+  the endpoint backend; `proposal submit --from-feedback` on the client works);
+- the scoreboard, statistics and the self-service scoreboard hide (slice 2).
 
 ## 6. Worker clients
 
