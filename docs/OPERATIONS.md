@@ -312,7 +312,7 @@ without following a link. Deleting those paths by hand is equally safe.
 
 A reference or capability key normally has exactly one anchor. If a second anchor carries the same key label, `get` reports `duplicate-key` (when exactly one anchor has live acceptance evidence, that one is still shown) or `conflicted` (no record is shown), `list` and coverage name every anchor, and **every write on that key is refused** until an operator reconciles the anchors. Contributors cannot create a duplicate through the endpoint; it takes native access on the host.
 
-The kit has no command for this repair yet. On the host, as an operator, first read both anchors (`capability get KEY` or `ref get KEY` names them, and `history` shows each one), decide which is the genuine one, then remove the type, key and state labels from the other with the native tool under the kit environment, for example for a capability:
+When the extra anchor holds no record, or only malformed comments, repair it with the kit: void each malformed comment (`admin.py void-record`), then release the anchor (`admin.py anchor-release --kind reference|capability --issue-id ID --actor OPERATOR --reason TEXT`); the key leaves the duplicated state and writes work again. When the extra anchor holds a well-formed record, the kit has no command for the repair yet. On the host, as an operator, first read both anchors (`capability get KEY` or `ref get KEY` names them, and `history` shows each one), decide which is the genuine one, then remove the type, key and state labels from the other with the native tool under the kit environment, for example for a capability:
 
 ```sh
 bd update PROJECT-FORGED --remove-label capability --remove-label capability-key:KEY-SLUG --remove-label capability:accepted
