@@ -215,7 +215,7 @@ history](#malformed-structured-history) (`void-record`).
 | `retire-project PROJECT --actor OPERATOR --reason TEXT [--force]` | retire a partial or drill project: move `projects/PROJECT` to `retired/PROJECT-<UTC stamp>`. Nothing is deleted; see [Retiring a project](#retiring-a-project) | the deployment operator allowlist, checked first |
 | `capability-misses-clear PROJECT` | delete the project's [capability lookup-miss log](#the-capability-lookup-miss-log). It prints what was removed (`finds`, `misses`, `phrases`), and in `repaired` any symlink, directory or unopenable lock file it removed from the three miss-log names (never following a link). It writes nothing to the tracker, takes no coordination lock and calls no `bd` | none beyond the service account: it deletes telemetry only, so there is no allowlist check and no `--actor` |
 | `void-record PROJECT --actor OPERATOR --file void.json` | void a malformed or stale contribution-review record, or a malformed, foreign or conflicting reference or capability record ([below](#reference-and-capability-records)) | the deployment operator allowlist (`operators` in `deployment.private.json`) |
-| `anchor-release PROJECT --kind reference\|capability --issue-id ID --actor OPERATOR --reason TEXT` | close a reference or capability anchor that holds no record and free its key, when the propose that created it cannot be re-run ([orphan anchors](#orphan-anchors)) | the deployment operator allowlist, checked before any read |
+| `anchor-release PROJECT --kind reference\|capability --issue-id ID --actor OPERATOR --reason TEXT` | close a reference or capability anchor that holds no record and free its key, when the propose that created it cannot be re-run ([orphan anchors](#orphan-anchors)). With `--duplicate` (and, for an anchor that carries acceptance evidence, `--set-aside-evidence`) it releases a named anchor of a [duplicated key](#a-duplicated-record-key) although it holds well-formed records | the deployment operator allowlist, checked before any read |
 | `handoff PROJECT --actor ACTOR --file handoff.json` | transfer a claim when the current owner cannot act | an owner decision/evidence pointer in the payload's `approval` |
 
 All five are shell-trusted: access to the service account's shell is the boundary.
@@ -492,13 +492,60 @@ without following a link. Deleting those paths by hand is equally safe.
 
 A reference or capability key normally has exactly one anchor. If a second anchor carries the same key label, `get` reports `duplicate-key` (when exactly one anchor has live acceptance evidence, that one is still shown) or `conflicted` (no record is shown), `list` and coverage name every anchor, and **every write on that key is refused** until an operator reconciles the anchors. Contributors cannot create a duplicate through the endpoint; it takes native access on the host.
 
-When the extra anchor holds no record, or only malformed comments, repair it with the kit: void each malformed comment (`admin.py void-record`), then release the anchor (`admin.py anchor-release --kind reference|capability --issue-id ID --actor OPERATOR --reason TEXT`); the key leaves the duplicated state and writes work again. When the extra anchor holds a well-formed record, the kit has no command for the repair yet. On the host, as an operator, first read both anchors (`capability get KEY` or `ref get KEY` names them, and `history` shows each one), decide which is the genuine one, then remove the type, key and state labels from the other with the native tool under the kit environment, for example for a capability:
+When the extra anchor holds no record, or only malformed comments, repair it with the kit: void each malformed comment (`admin.py void-record`), then release the anchor (`admin.py anchor-release --kind reference|capability --issue-id ID --actor OPERATOR --reason TEXT`); the key leaves the duplicated state and writes work again.
+
+When the extra anchor holds a well-formed record, a void cannot repair it: a void never withdraws a well-formed record the entry reads, and that includes acceptance evidence. Release the wrong anchor by name instead. First read every anchor (`capability get KEY` or `ref get KEY` names them, and `history` shows each one) and decide which is the genuine one. Then, on the host:
+
+```sh
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime anchor-release PROJECT --kind capability --issue-id PROJECT-FORGED --actor OPERATOR --reason 'forged beside PROJECT-GENUINE' --duplicate
+```
+
+`--duplicate` releases the NAMED anchor only. Every refusal comes before the first write:
+
+- The actor is not on the deployment operator allowlist (checked before any read).
+- The row is not an anchor of that kind, was already released, or carries more than one key label.
+- The key is not duplicated. The anchors are counted exactly as every write counts them, so the last anchor of a key is never released this way.
+- The named anchor holds a record this kit cannot read (a newer record version).
+- The named anchor holds a readable record and no remaining anchor does. "Readable" is what a reader would present: an anchor that is record-less, whose records are all voided, or that reads `malformed`, `unsupported` or incomplete does not count, even when its revisions themselves parse (one other bad comment on an anchor makes readers refuse the whole entry). Every other reader state counts, including an entry whose acceptance is inert because its operator was removed (it reads `draft-only` with `acceptance-inert`), a superseded entry and a drifted one. A key is never left with nothing readable: deal with the other anchor first (release it; void its malformed records first if the plain mode asks for that), which leaves the readable one as the key's only anchor.
+- The named anchor carries acceptance evidence that no void names, **live or inert**. It needs the extra flag `--set-aside-evidence`. That covers the anchor readers currently select: among duplicates only live acceptance evidence selects an anchor. Inert evidence (its operator was removed from the allowlist) counts, because it would read live again if that operator were re-added.
+- The named anchor reads `malformed` and carries live acceptance evidence. It may be the key's accepted record behind one bad comment: void that comment first (`admin.py void-record`), then run the release again.
+- The named anchor reads an accepted record and no remaining anchor reads one. The key never loses its only accepted record; release the other anchor instead. Live acceptance evidence on a remaining anchor is not enough: an operator accept that stopped after writing its evidence and before the accepted revision leaves evidence on a draft.
+
+What a release does, in order: it settles the pending receipt the row's `request:` label names, closes the row if it is open, adds one audit comment as the operator, then removes the state, `request:` and `request-content:` labels and, last, the key label. The type label and every comment stay, so nothing is deleted and the row stays hidden from `work`. Each step is skipped when already done, so a re-run after an uncertain write finishes the release.
+
+The audit comment names the operator, the reason, the key, the anchors that remain, which anchor readers selected before and select now, every record set aside (revision and hash), every piece of acceptance evidence set aside (revision, record hash, operator, decision id, live or inert), and the count of other records on the anchor (capability aliases and verifications) that stop counting for the key. The printed JSON carries the same facts: `remaining`, `selected_before`, `selected_after`, `records`, `evidence_set_aside`, `stop_counting`.
+
+A released row is no longer an anchor of any key and is never read for one again. **Evidence set aside stays set aside**: re-adding the operator who recorded it does not bring it back, and the key reads exactly as it did after the release. The release cannot be undone through the kit. Aliases and verifications on the released anchor stop counting; record them again on the remaining anchor if they are still wanted. Take a backup afterwards.
+
+Which anchor to name, by shape:
+
+| The key's anchors | The safe sequence |
+| --- | --- |
+| a genuine draft and a record-less anchor (orphan) | plain `anchor-release` of the orphan |
+| a genuine draft and a forged draft | `--duplicate` on the forged one |
+| two accepted anchors, both with live evidence | `--duplicate --set-aside-evidence` on the forged one |
+| an accepted anchor and a draft whose accept stopped after its evidence | `--duplicate --set-aside-evidence` on that draft |
+| a forged accepted anchor whose evidence is inert (or by an unlisted author) and a genuine draft | `--duplicate --set-aside-evidence` on the forged one |
+| a genuine entry whose acceptance is inert (its operator was removed) and a forged draft | `--duplicate` on the forged draft; the genuine entry keeps its evidence and reads accepted again if the operator is re-added |
+| two anchors whose acceptance is inert | `--duplicate --set-aside-evidence` on the forged one: its inert evidence is set aside for good. If you cannot tell which is genuine from the records, re-add the operator(s) first so the entries read as they were accepted, decide, then release with the same command; or use the host procedure below |
+| an anchor that reads `malformed` beside a readable one | void the malformed comment, or `--duplicate` on the malformed anchor when it is the forged one and carries no live evidence |
+
+Two shapes have no clean kit path:
+
+- **A forged accepted anchor with LIVE evidence beside a genuine draft.** The forged anchor holds the key's only accepted record, so it is not released. Release the genuine draft with `--duplicate` (the forged anchor is readable, so this is allowed), then revise and accept the right content on top of the anchor that remains.
+- **A forged anchor that holds a `-v2` record or an unknown record kind of the family.** This kit cannot judge it, so it refuses to release it, and it refuses to release the genuine anchor beside it (nothing readable would remain). Use the host procedure below, or a kit that reads the record.
+
+When two anchors both have live acceptance evidence, the key reads `conflicted` and neither is selected. Decide which is wrong, with the project owner if it is not obvious, and release that one with `--duplicate --set-aside-evidence`; the other becomes the selected anchor, and the output shows it. Do not try to void the acceptance evidence first: that void is refused.
+
+On an older kit (rollback), a released anchor that still holds records is not read for its key either, but that kit lists it as a `malformed` entry with no key in `coverage` until the kit is rolled forward. A project backup taken with duplicates restores them as they were, and the release works on the restored project.
+
+Last resort, when the command refuses a case you have decided by other means: on the host, as an operator, remove the type, key and state labels from the wrong anchor with the native tool under the kit environment, for example for a capability:
 
 ```sh
 bd update PROJECT-FORGED --remove-label capability --remove-label capability-key:KEY-SLUG --remove-label capability:accepted
 ```
 
-Use the labels the forged anchor actually carries (`bd show PROJECT-FORGED --json`). The stripped issue stays in the database, closed, with its comments, as evidence; it no longer counts as an anchor, and writes on the key work again. Record what you did and why on the genuine anchor's project, and take a backup afterwards. When both anchors have live acceptance evidence, do not guess: retire the key or ask the project owner.
+Use the labels the forged anchor actually carries (`bd show PROJECT-FORGED --json`). The stripped issue stays in the database, closed, with its comments, as evidence; it no longer counts as an anchor, and writes on the key work again. Record what you did and why on the genuine anchor's project, and take a backup afterwards.
 
 ### Malformed structured history
 
@@ -595,7 +642,9 @@ python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime anc
 
 - It checks the operator allowlist before any read. It refuses a row that is not an
   anchor of that kind, or that still holds a live record. An anchor whose every record an
-  applied void names holds none, so the same command frees it.
+  applied void names holds none, so the same command frees it. An anchor that holds a
+  well-formed record is released only as a named duplicate of its key, with
+  `--duplicate` ([a duplicated record key](#a-duplicated-record-key)).
 - It marks the pending receipt that the row's `request:` label names as `released`, with
   the audit, so that operation ID is settled.
 - It closes the row if it is open, adds one plain audit comment, then removes the state,
