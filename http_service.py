@@ -3173,6 +3173,17 @@ class ApiHandler(BaseHTTPRequestHandler):
             if not proposal_records.valid_target_filter(target):
                 raise invalid('target must be a requirement key or a requirement area')
             args += ['--target', caller_arg(target, 'target')]
+        order = ctx.query.get('order')
+        if order:
+            if order not in ('oldest', 'newest'):
+                raise invalid('order must be oldest or newest')
+            args += ['--order', caller_arg(order, 'order')]
+        if ctx.query.get('mine'):
+            # The caller's own proposals in this project: the identity is the session's
+            # account (for an agent, its owner's) and cannot be named.
+            if ctx.query['mine'] != '1':
+                raise invalid('mine must be 1')
+            args += ['--submitter', 'account:' + ctx.principal.user_id]
         result = dict(self.backend.proposal_read(pid, args))
         capabilities = self.service.capabilities_for(ctx.principal, pid)
         result['items'] = [self._proposal_view(ctx, capabilities, item) for item in result.get('items') or []]

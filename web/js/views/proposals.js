@@ -48,8 +48,29 @@ const TRANSITIONS = {
   'approved': [['incorporated', 'Record as incorporated']],
 };
 
+// A proposal key, exactly as the server issues it. Anything else never reaches a request path.
+const KEY = /^p-[0-9a-f]{12}$/;
+export const validKey = (key) => typeof key === 'string' && KEY.test(key);
+// How many rows a queue group or the contributions panel loads at a time.
+const PAGE = 50;
+
 export const proposalHref = (ctx, pid, key) => ctx.href(`/p/${pid}/reviews?proposal=${key}`);
-export const unavailable = (error) => Boolean(error && [404, 501].includes(error.status));
+// A server without the routes answers 501, or 404 "No such operation". A 404 for the
+// project itself (not a member, or no such project) is a different thing and is shown
+// as "not found", never as "this server has no proposals".
+export const unavailable = (error) => Boolean(error && (error.status === 501
+  || (error.status === 404 && /No such operation/i.test(error.message || ''))));
+
+// One submit handler shape for every form here: a lost session goes to sign-in, and no
+// rejection is left unhandled (act() has already shown the message).
+function guarded(ctx, handler) {
+  return async (event) => {
+    event.preventDefault();
+    try { await handler(event); } catch (error) {
+      if (error && error.status === 401 && ctx.sessionLost) ctx.sessionLost();
+    }
+  };
+}
 
 export function stateChip(state) {
   const [label, tone] = STATES[state] || [state || 'Unknown', ''];
@@ -69,8 +90,12 @@ function targetText(target) {
   return 'A new requirement';
 }
 
+// Who a proposal is from. A web account shows its display name. A `person:` identity is
+// a name an operator mapped to an SSH actor, not a signed-in account, and says so.
 function who(item) {
-  return item.submitter_name || String(item.submitter || '').replace(/^(account|person):/, '');
+  const submitter = String(item.submitter || '');
+  if (submitter.startsWith('person:')) return submitter.slice('person:'.length) + ' (a named person, not a web account)';
+  return item.submitter_name || submitter.replace(/^account:/, '');
 }
 
 const days = (n) => (n === 1 ? '1 day' : `${n} days`);
@@ -80,7 +105,7 @@ function evidenceNode(value) {
   const text = excerpt(value);
   let url = null;
   try { url = new URL(text); } catch { url = null; }
-  if (url && url.protocol === 'https:' && !value.omitted_chars && !/\s/.test(text)) {
+  if (url && url.protocol === 'https:' && !url.username && !url.password && !value.omitted_chars && !/\s/.test(text)) {
     return h('a', { href: url.href, rel: 'noopener noreferrer', target: '_blank' }, text);
   }
   return h('span', null, text);
@@ -100,11 +125,50 @@ function rowsTable(ctx, pid, rows) {
       h('td', null, NEXT_ACTOR[p.next_actor] || p.next_actor))))));
 }
 
+// One group of the queue: the newest PAGE proposals in one state, with a control that
+// loads older ones through the route's cursor. `total` is the server's count.
+function groupPanel(ctx, pid, state, title, note, first) {
+  let rows = first.items || [];
+  let cursor = first.next_cursor;
+  const count = h('span', { class: 'nav-count' }, first.total);
+  const holder = h('div', null, rowsTable(ctx, pid, rows));
+  const status = h('span', { class: 'small muted' });
+  const more = h('button', { type: 'button' }, 'Show older');
+  const foot = h('div', { class: 'panel-body' }, more, ' ', status);
+  const redraw = () => {
+    holder.replaceChildren(rowsTable(ctx, pid, rows));
+    foot.hidden = !cursor;
+    status.textContent = cursor ? `Showing the newest ${rows.length} of ${first.total}.` : '';
+  };
+  more.addEventListener('click', async () => {
+    more.disabled = true;
+    try {
+      const next = await ctx.api.proposals(pid, { state, order: 'newest', limit: PAGE, cursor });
+      rows = rows.concat(next.items || []);
+      cursor = next.next_cursor;
+      redraw();
+    } catch (error) {
+      if (error && error.status === 401 && ctx.sessionLost) return ctx.sessionLost();
+      status.textContent = describe(error);
+    } finally { more.disabled = false; }
+  });
+  redraw();
+  return h('div', { class: 'panel' },
+    h('div', { class: 'panel-head' }, h('h3', { class: 'small' }, title, ' ', count), h('span', { class: 'small muted hide-narrow' }, note)),
+    holder, foot);
+}
+
 // The Proposal queue panel for the Reviews page. Resolves to null on a server without
 // the routes, so the page keeps working there.
+//
+// Each open state is read on its own, newest first, so a new submission is always on
+// the first page however many proposals the project has had; the counts are the
+// server's totals, not the number of rows loaded.
 export async function queuePanel(ctx, pid) {
-  let data;
-  try { data = await ctx.api.proposals(pid, { limit: 100 }); } catch (error) {
+  let groups;
+  try {
+    groups = await Promise.all(GROUPS.map(([state]) => ctx.api.proposals(pid, { state, order: 'newest', limit: PAGE })));
+  } catch (error) {
     if (unavailable(error)) {
       return h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Requirement proposals')),
         h('div', { class: 'empty', role: 'status' }, h('strong', null, 'Not available on this server'),
@@ -112,28 +176,45 @@ export async function queuePanel(ctx, pid) {
     }
     return errorState(error);
   }
-  const items = data.items || [];
+  const data = groups[0];
   // "Incorporated, awaiting acceptance" is the server's own per-proposal flag, shown to
-  // members who can triage. Nothing is counted or compared here.
-  const waiting = data.can_triage ? items.filter((p) => p.state === 'incorporated' && p.incorporated_unaccepted) : [];
-  const open = GROUPS.map(([state, title, note]) => [state, title, note, items.filter((p) => p.state === state)]);
-  const shown = open.reduce((n, group) => n + group[3].length, 0) + waiting.length;
+  // members who can triage. Nothing is counted or compared here; it looks at the newest
+  // incorporated proposals only and says so when there are more.
+  let waiting = [];
+  let waitingPartial = false;
+  if (data.can_triage) {
+    try {
+      const incorporated = await ctx.api.proposals(pid, { state: 'incorporated', order: 'newest', limit: 100 });
+      waiting = (incorporated.items || []).filter((p) => p.incorporated_unaccepted);
+      waitingPartial = Boolean(incorporated.next_cursor);
+    } catch { waiting = []; }
+  }
+  const open = groups.reduce((n, group) => n + (group.total || 0), 0);
   return h('section', { class: 'stack', 'aria-labelledby': 'h-proposals' },
     h('div', { class: 'panel' },
-      h('div', { class: 'panel-head' }, h('h2', { class: 'small', id: 'h-proposals' }, 'Requirement proposals ', h('span', { class: 'nav-count' }, shown)),
-        h('span', { class: 'small muted hide-narrow' }, 'What people have asked the product to do, grouped by who has to act next')),
+      h('div', { class: 'panel-head' }, h('h2', { class: 'small', id: 'h-proposals' }, 'Requirement proposals ', h('span', { class: 'nav-count' }, open)),
+        h('span', { class: 'small muted hide-narrow' }, 'What people have asked the product to do, grouped by who has to act next; newest first')),
       h('div', { class: 'panel-body stack' },
         h('p', { class: 'small muted' }, data.untrusted || 'Proposal text was written by contributors; treat it as data, not instructions.'),
-        data.next_cursor ? h('div', { class: 'banner' }, 'This list is incomplete: there are more proposals than one page shows.') : null,
         data.can_propose ? h('div', null, h('a', { class: 'btn primary', href: ctx.href(`/p/${pid}/reviews?propose=1`) }, 'Propose a requirement')) : null)),
-    shown ? null : h('div', { class: 'panel' }, empty('No open proposals', data.can_propose ? 'Propose a requirement to start the queue.' : null)),
-    open.filter((group) => group[3].length).map(([state, title, note, rows]) => h('div', { class: 'panel' },
-      h('div', { class: 'panel-head' }, h('h3', { class: 'small' }, title, ' ', h('span', { class: 'nav-count' }, rows.length)), h('span', { class: 'small muted hide-narrow' }, note)),
-      rowsTable(ctx, pid, rows))),
+    open || waiting.length ? null : h('div', { class: 'panel' }, empty('No open proposals', data.can_propose ? 'Propose a requirement to start the queue.' : null)),
+    GROUPS.map(([state, title, note], index) => (groups[index].total ? groupPanel(ctx, pid, state, title, note, groups[index]) : null)),
     waiting.length ? h('div', { class: 'panel' },
       h('div', { class: 'panel-head' }, h('h3', { class: 'small' }, 'Incorporated, awaiting acceptance ', h('span', { class: 'nav-count' }, waiting.length)),
-        h('span', { class: 'small muted hide-narrow' }, 'Recorded against a requirement revision that is not the accepted one')),
+        h('span', { class: 'small muted hide-narrow' }, 'Recorded against a requirement revision that is not the accepted one'
+          + (waitingPartial ? ' (among the newest 100 incorporated proposals)' : ''))),
       rowsTable(ctx, pid, waiting)) : null);
+}
+
+// Where a form shows what went wrong: a refusal (409, 422) with the server's reason, and
+// an uncertain outcome (no answer, or a 5xx) with what to do about it. Pressing the same
+// button again with nothing changed sends the same request under the same
+// Idempotency-Key (api.js), so it cannot create a duplicate.
+function inForm(form, id) {
+  return (error) => {
+    if ([409, 422].includes(error.status) || error.uncertain) { setFieldError(form, id, describe(error)); return true; }
+    return false;
+  };
 }
 
 // "Propose a requirement" (design 8.6). The submitter is the signed-in account; the
@@ -149,8 +230,7 @@ export function proposeForm(ctx, pid) {
     field({ id: 'evidence', label: 'Evidence links', type: 'textarea', rows: 2, hint: 'One per line, optional.' }),
     h('div', { class: 'actions' }, h('button', { type: 'submit', class: 'primary' }, 'Submit proposal'),
       h('a', { class: 'btn', href: ctx.href(`/p/${pid}/reviews`) }, 'Cancel')));
-  form.addEventListener('submit', async (event) => {
-    event.preventDefault();
+  form.addEventListener('submit', guarded(ctx, async () => {
     const values = formValues(form);
     if (!values.text.trim()) return setFieldError(form, 'text', 'Say what the product should do.');
     setFieldError(form, 'text', '');
@@ -163,10 +243,9 @@ export function proposeForm(ctx, pid) {
     const body = { target, text: values.text.trim(), rationale: values.rationale.trim() || null,
       evidence: values.evidence.split('\n').map((line) => line.trim()).filter(Boolean), attachments: [] };
     const made = await act(form.querySelector('button'), () => ctx.api.submitProposal(pid, body), {
-      success: 'Proposal submitted',
-      onError: (e) => { if (e.status === 422) { setFieldError(form, 'text', describe(e)); return true; } return false; } });
+      success: 'Proposal submitted', onError: inForm(form, 'text') });
     if (made) ctx.go(`/p/${pid}/reviews?proposal=${made.key}`);
-  });
+  }));
   return h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Propose a requirement')),
     h('div', { class: 'panel-body' }, form));
 }
@@ -185,7 +264,7 @@ function timelineItem(d) {
       d.standing !== 'counted' ? h('div', { class: 'small muted' }, 'This entry does not count: its author had no authority to record it.') : null,
       d.question ? h('p', { class: 'prose' }, 'Question: ', excerpt(d.question)) : null,
       d.reason ? h('p', { class: 'prose' }, 'Reason: ', excerpt(d.reason)) : null,
-      d.escalation ? h('p', { class: 'prose' }, 'Asked of ', d.escalation.owner_name || String(d.escalation.owner_identity).replace(/^(account|person):/, ''),
+      d.escalation ? h('p', { class: 'prose' }, 'Asked of ', d.escalation.owner_name || who({ submitter: d.escalation.owner_identity }),
         d.escalation.due_by ? ` by ${d.escalation.due_by}` : '', d.escalation.question ? [': ', excerpt(d.escalation.question)] : null) : null,
       d.duplicate_of ? h('p', null, 'Duplicate of ', h('span', { class: 'mono' }, d.duplicate_of)) : null,
       d.decision ? h('p', { class: 'small muted' }, 'Decision ', h('span', { class: 'mono' }, d.decision.decision_id)) : null,
@@ -209,7 +288,8 @@ function triageForm(ctx, pid, view, owners) {
     if (to === 'escalated-to-owner') {
       fields.push(field({ id: 'escalation_question', label: 'Question for the owner', type: 'textarea', rows: 3, required: true, maxlength: 2000 }));
       fields.push(h('div', { class: 'form-row' },
-        field({ id: 'owner_identity', label: 'Who decides', type: 'select', options: owners.length ? owners : [['', 'No other owner in this project']] }),
+        field({ id: 'owner_identity', label: 'Who decides', type: 'select', options: owners.length ? owners : [['', 'Nobody can be chosen here']],
+          hint: view.deciders_note || undefined }),
         field({ id: 'due_by', label: 'Decide by (optional)', type: 'date' })));
     }
     if (to === 'approved' || (to === 'rejected' && view.state === 'escalated-to-owner')) {
@@ -234,10 +314,10 @@ function triageForm(ctx, pid, view, owners) {
       h('div', { class: 'error', id: 'to_state-error', hidden: true })),
     extra,
     h('div', null, h('button', { type: 'submit', class: 'primary' }, 'Record')));
-  form.addEventListener('submit', async (event) => {
-    event.preventDefault();
+  form.addEventListener('submit', guarded(ctx, async () => {
     const v = formValues(form);
     const to = v.to_state;
+    if (to === 'escalated-to-owner' && !v.owner_identity) return setFieldError(form, 'to_state', 'Nobody who can decide this can be chosen here.');
     const body = { previous: view.disposition_comment_id, proposal_sha256: view.sha256, to_state: to };
     if (view.state === 'escalated-to-owner') { body.operation = 'decide'; body.decision = { decision_id: (v.decision_id || '').trim() }; }
     if (to === 'needs-info') body.question = v.question;
@@ -253,10 +333,9 @@ function triageForm(ctx, pid, view, owners) {
     }
     setFieldError(form, 'to_state', '');
     const done = await act(form.querySelector('button[type=submit]'), () => ctx.api.disposeProposal(pid, view.key, body), {
-      success: 'Recorded',
-      onError: (e) => { if ([409, 422].includes(e.status)) { setFieldError(form, 'to_state', describe(e)); return true; } return false; } });
+      success: 'Recorded', onError: inForm(form, 'to_state') });
     if (done) ctx.render();
-  });
+  }));
   return h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h3', { class: 'small' }, view.state === 'escalated-to-owner' ? 'Owner decision' : 'Triage')),
     h('div', { class: 'panel-body' }, form));
 }
@@ -268,24 +347,27 @@ function reviseForm(ctx, pid, view) {
     field({ id: 'text', label: 'What should the product do?', type: 'textarea', rows: 5, required: true, maxlength: 4000, value: view.text.text }),
     field({ id: 'rationale', label: 'Why', type: 'textarea', rows: 3, maxlength: 4000, value: view.rationale ? view.rationale.text : '' }),
     h('div', null, h('button', { type: 'submit', class: 'primary' }, 'Save revision')));
-  form.addEventListener('submit', async (event) => {
-    event.preventDefault();
+  form.addEventListener('submit', guarded(ctx, async () => {
     const v = formValues(form);
     if (!v.text.trim()) return setFieldError(form, 'text', 'Say what the product should do.');
     const body = { key: view.key, revision: view.revision + 1, expected_sha256: view.sha256, target: view.target,
       text: v.text.trim(), rationale: v.rationale.trim() || null,
       evidence: (view.evidence || []).map((item) => item.text), attachments: (view.attachments || []).map((a) => ({ name: a.name.text, sha256: a.sha256 })) };
     const done = await act(form.querySelector('button'), () => ctx.api.submitProposal(pid, body), {
-      success: 'Revision saved',
-      onError: (e) => { if ([409, 422].includes(e.status)) { setFieldError(form, 'text', describe(e)); return true; } return false; } });
+      success: 'Revision saved', onError: inForm(form, 'text') });
     if (done) ctx.render();
-  });
+  }));
   return h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h3', { class: 'small' }, 'Revise your proposal')),
     h('div', { class: 'panel-body' }, form));
 }
 
 // The detail panel at /p/{pid}/reviews?proposal=<key>.
 export async function detailPanel(ctx, pid, key) {
+  if (!validKey(key)) {
+    return h('div', { class: 'panel' }, h('div', { class: 'empty', role: 'alert' }, h('strong', null, 'Not found'),
+      h('p', null, 'That is not a proposal key. A key looks like p- followed by 12 letters and digits.'),
+      h('a', { class: 'btn', href: ctx.href(`/p/${pid}/reviews`) }, 'Back to the queue')));
+  }
   let view;
   try { view = await ctx.api.proposal(pid, key); } catch (error) { return errorState(error); }
   const back = h('a', { class: 'btn', href: ctx.href(`/p/${pid}/reviews`) }, 'Back to the queue');
@@ -293,12 +375,24 @@ export async function detailPanel(ctx, pid, key) {
     return h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Proposal ', h('span', { class: 'mono' }, key)), back),
       h('div', { class: 'empty', role: 'alert' }, h('strong', null, 'This proposal cannot be read'), h('p', null, view.coverage || 'An operator has to repair it.')));
   }
+  // Who may be asked to decide. When the project has configured owner deciders, the
+  // server accepts only those, so only those are offered; a decider that is not a web
+  // account (a `person:` identity) cannot be chosen from the web, and the form says so.
   let owners = [];
   if (view.can_triage && view.state === 'under-review') {
-    try {
-      const members = await ctx.api.members(pid);
-      owners = members.items.filter((m) => m.role === 'owner' && !m.disabled && m.user_id !== ctx.me.id).map((m) => ['account:' + m.user_id, m.display_name]);
-    } catch { owners = []; }
+    let members = [];
+    try { members = (await ctx.api.members(pid)).items.filter((m) => !m.disabled); } catch { members = []; }
+    const configured = view.deciders || [];
+    if (configured.length) {
+      const names = new Map(members.map((m) => ['account:' + m.user_id, m.display_name]));
+      owners = configured.filter((d) => names.has(d) && d !== 'account:' + ctx.me.id).map((d) => [d, names.get(d)]);
+      const elsewhere = configured.filter((d) => !names.has(d));
+      if (!owners.length) view.deciders_note = 'The deciders configured for this project (' + configured.join(', ') + ') cannot be chosen from the web. An operator escalates with the host command.';
+      else if (elsewhere.length) view.deciders_note = 'Also configured, but not web accounts in this project: ' + elsewhere.join(', ') + '.';
+    } else {
+      owners = members.filter((m) => m.role === 'owner' && m.user_id !== ctx.me.id).map((m) => ['account:' + m.user_id, m.display_name]);
+      if (!owners.length) view.deciders_note = 'There is no other owner in this project to decide it.';
+    }
   }
   const linked = view.linked_requirement;
   const canRevise = view.mine && ['submitted', 'needs-info'].includes(view.state);
@@ -337,45 +431,75 @@ export async function detailPanel(ctx, pid, key) {
     view.can_triage && view.mine && TRANSITIONS[view.state] ? h('div', { class: 'banner' }, 'This is your own proposal: another owner has to triage it.') : null);
 }
 
+function contributionRows(ctx, items) {
+  return h('div', { class: 'table-wrap' }, h('table', null,
+    h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Proposal'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Project'), h('th', { scope: 'col' }, 'State'), h('th', { scope: 'col' }, 'What happens next'))),
+    h('tbody', null, items.map((p) => h('tr', { class: 'row-link', onclick: (e) => { if (e.target.tagName !== 'A') ctx.go(`/p/${p.project}/reviews?proposal=${p.key}`); } },
+      h('td', null, h('a', { class: 'title', href: proposalHref(ctx, p.project, p.key) }, excerpt(p.title)),
+        h('div', { class: 'sub' }, h('span', { class: 'mono' }, p.key), ' · ', days(p.age_days), ' old')),
+      h('td', { class: 'hide-narrow' }, p.project_name || p.project),
+      h('td', null, stateChip(p.state)),
+      h('td', null, NEXT_STEP[p.state] || (p.disposition && p.disposition.reason ? 'Reason: ' + excerpt(p.disposition.reason) : 'Nothing: it is closed.')))))));
+}
+
 // "My contributions" on My work (design 7.1). Null on a server without the route.
+// Newest first; "Show older" follows the route's cursor until the route says it stops.
 export async function myContributionsPanel(ctx) {
   let data;
-  try { data = await ctx.api.myContributions(); } catch (error) {
+  try { data = await ctx.api.myContributions({ limit: PAGE }); } catch (error) {
     if (unavailable(error)) return null;
     return h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'My contributions')),
       h('div', { class: 'panel-body' }, h('p', { class: 'small muted' }, describe(error))));
   }
-  const items = data.items || [];
-  // The route returns the newest page first; `next_cursor` means there are older ones.
+  let items = data.items || [];
+  let cursor = data.next_cursor;
+  let truncated = data.truncated;
   const unread = data.unavailable && data.unavailable.length;
-  const older = data.truncated || data.next_cursor;
+  const holder = h('div', null, items.length ? contributionRows(ctx, items) : empty('Nothing proposed yet', 'Propose a requirement from a project’s Reviews page.'));
+  const status = h('span', { class: 'small muted' });
+  const more = h('button', { type: 'button' }, 'Show older');
+  const foot = h('div', { class: 'panel-body' }, more, ' ', status);
+  const redraw = () => {
+    if (items.length) holder.replaceChildren(contributionRows(ctx, items));
+    more.hidden = !cursor;
+    foot.hidden = !(cursor || truncated || unread);
+    status.textContent = (cursor || truncated ? `Showing your newest ${items.length} of ${data.total}. ` : '')
+      + (truncated && !cursor ? 'Older ones are on each project’s Reviews page. ' : '')
+      + (unread ? 'Some projects could not be read just now.' : '');
+  };
+  more.addEventListener('click', async () => {
+    more.disabled = true;
+    try {
+      const next = await ctx.api.myContributions({ limit: PAGE, cursor });
+      items = items.concat(next.items || []);
+      cursor = next.next_cursor;
+      truncated = next.truncated;
+      redraw();
+    } catch (error) {
+      if (error && error.status === 401 && ctx.sessionLost) return ctx.sessionLost();
+      status.textContent = describe(error);
+    } finally { more.disabled = false; }
+  });
+  redraw();
   return h('section', { class: 'panel', 'aria-labelledby': 'h-contributions' },
     h('div', { class: 'panel-head' }, h('h2', { class: 'small', id: 'h-contributions' }, 'My contributions ', h('span', { class: 'nav-count' }, data.total)),
-      h('span', { class: 'small muted hide-narrow' }, 'Requirement proposals you submitted. Looking at them changes nothing.')),
-    unread || older ? h('div', { class: 'panel-body' }, h('p', { class: 'small muted' },
-      older ? `Showing your newest ${items.length} of ${data.total}. ` : '',
-      unread ? 'Some projects could not be read just now.' : '')) : null,
-    items.length ? h('div', { class: 'table-wrap' }, h('table', null,
-      h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Proposal'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Project'), h('th', { scope: 'col' }, 'State'), h('th', { scope: 'col' }, 'What happens next'))),
-      h('tbody', null, items.map((p) => h('tr', { class: 'row-link', onclick: (e) => { if (e.target.tagName !== 'A') ctx.go(`/p/${p.project}/reviews?proposal=${p.key}`); } },
-        h('td', null, h('a', { class: 'title', href: proposalHref(ctx, p.project, p.key) }, excerpt(p.title)),
-          h('div', { class: 'sub' }, h('span', { class: 'mono' }, p.key), ' · ', days(p.age_days), ' old')),
-        h('td', { class: 'hide-narrow' }, p.project_name || p.project),
-        h('td', null, stateChip(p.state)),
-        h('td', null, NEXT_STEP[p.state] || (p.disposition && p.disposition.reason ? 'Reason: ' + excerpt(p.disposition.reason) : 'Nothing: it is closed.'))))))) :
-      empty('Nothing proposed yet', 'Propose a requirement from a project’s Reviews page.'));
+      h('span', { class: 'small muted hide-narrow' }, 'Requirement proposals you submitted, newest first. Looking at them changes nothing.')),
+    holder, foot);
 }
 
-// A one-line strip for the project page when the caller has proposals there.
+// A one-line strip for the project page when the caller has proposals there. The counts
+// are the server's totals for the caller's own account (`mine=1`), not a count of rows
+// on one page.
 export async function myStrip(ctx, pid) {
-  let data;
-  try { data = await ctx.api.proposals(pid, { limit: 100 }); } catch { return null; }
-  const mine = (data.items || []).filter((p) => p.mine);
-  const open = mine.filter((p) => !['incorporated', 'rejected', 'duplicate-of'].includes(p.state));
-  const waiting = open.filter((p) => p.next_actor === 'submitter');
-  if (!mine.length && !data.can_propose) return null;
+  let all;
+  let waiting;
+  try {
+    [all, waiting] = await Promise.all([ctx.api.proposals(pid, { mine: 1, limit: 1 }),
+      ctx.api.proposals(pid, { mine: 1, state: 'needs-info', limit: 1 })]);
+  } catch { return null; }
+  const mine = all.total || 0;
+  if (!mine && !all.can_propose) return null;
   return h('div', { class: 'banner info' },
-    mine.length ? `You have ${mine.length} requirement proposal${mine.length === 1 ? '' : 's'} here, ${open.length} still open` + (waiting.length ? `, ${waiting.length} waiting for your answer. ` : '. ') : 'Want the product to do something? ',
-    h('a', { href: ctx.href(`/p/${pid}/reviews`) }, mine.length ? 'See them on Reviews' : 'Propose a requirement on Reviews'));
+    mine ? `You have ${mine} requirement proposal${mine === 1 ? '' : 's'} here` + (waiting.total ? `, ${waiting.total} waiting for your answer. ` : '. ') : 'Want the product to do something? ',
+    h('a', { href: ctx.href(`/p/${pid}/reviews`) }, mine ? 'See them on Reviews' : 'Propose a requirement on Reviews'));
 }
-

@@ -42,19 +42,30 @@ export function createApi(transport) {
     throw new ApiError(response.status, error.code, error.message, error.detail, data && data.request_id);
   }
 
-  // A mutation keeps one idempotency key across retries of the same user intent.
-  function mutation(method, path, body) {
-    const key = newKey();
-    const run = () => call(method, path, { body, key });
-    return { key, run };
-  }
+  // A mutation keeps one idempotency key across retries of the same user intent. The
+  // intent is the request itself (method, path and body): while its outcome is unknown
+  // (no answer, or a 5xx), sending the same request again reuses the key, so pressing
+  // the same button twice replays the first write instead of repeating it. A definite
+  // answer, or different content, ends the intent and the next send gets a new key.
+  const uncertainKeys = new Map();
+  const UNCERTAIN_KEYS_MAX = 50;
 
   async function mutate(method, path, body) {
-    const op = mutation(method, path, body);
+    const intent = method + ' ' + path + ' ' + JSON.stringify(body === undefined ? null : body);
+    const key = uncertainKeys.get(intent) || newKey();
     try {
-      return await op.run();
+      const result = await call(method, path, { body, key });
+      uncertainKeys.delete(intent);
+      return result;
     } catch (error) {
-      if (error instanceof ApiError && error.uncertain) error.retry = op.run;
+      if (error instanceof ApiError && error.uncertain) {
+        uncertainKeys.delete(intent);
+        uncertainKeys.set(intent, key);
+        if (uncertainKeys.size > UNCERTAIN_KEYS_MAX) uncertainKeys.delete(uncertainKeys.keys().next().value);
+        error.retry = () => mutate(method, path, body);
+      } else {
+        uncertainKeys.delete(intent);
+      }
       throw error;
     }
   }
@@ -125,7 +136,7 @@ export function createApi(transport) {
     proposal: (pid, key) => call('GET', `/v1/projects/${pid}/proposals/${key}`, { params: { history: 50 } }),
     submitProposal: (pid, body) => mutate('POST', `/v1/projects/${pid}/proposals`, body),
     disposeProposal: (pid, key, body) => mutate('POST', `/v1/projects/${pid}/proposals/${key}/dispositions`, body),
-    myContributions: () => call('GET', '/v1/me/contributions'),
+    myContributions: (params) => call('GET', '/v1/me/contributions', { params }),
     feedback: (pid, params) => call('GET', `/v1/projects/${pid}/feedback`, { params }),
     addFeedback: (pid, body) => mutate('POST', `/v1/projects/${pid}/feedback`, body),
     requirements: (pid) => call('GET', `/v1/projects/${pid}/requirements`),

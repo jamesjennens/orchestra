@@ -1188,7 +1188,8 @@ action unless the HTTP service launched the endpoint. Declare your own session a
   (`verified` or `unverified`), so an unmapped contributor sees their own
   submissions. Through the HTTP service the same read lists verified proposals only
   and adds `unverified_omitted`: there the submitter is an authenticated account.
-  `list` and `mine` take `--order oldest|newest` (default oldest).
+  `list` and `mine` take `--order oldest|newest` (default oldest). `get` returns
+  `deciders`, the configured owner deciders.
 - **Help is a command.** `proposal --help` and `proposal list --help` return the help
   payload. `--help` in an option's value position is that option's bad value.
 - **`linked_requirement`** is `{id, revision, sha256, acceptance_state,

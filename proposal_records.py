@@ -1994,6 +1994,9 @@ def get(rows, key, operators, resolve, settings, requirements, actor, history=10
             'time_to_disposition_days': extra['time_to_disposition_days'],
             'linked_requirement': extra['linked_requirement'],
             'incorporated_unaccepted': extra['incorporated_unaccepted'],
+            # The configured owner deciders (identities, operator-written): an escalation
+            # must name one of them when any is configured.
+            'deciders': list(settings.get('deciders') or []),
             'disposition': _disposition_view(entry['disposition'], coordinator) if entry['disposition'] else None,
             'timeline': [_disposition_view(item, coordinator) for item in entry['timeline'][-history:]],
             'timeline_total': len(entry['timeline']), 'inert_dispositions': entry['inert'],
