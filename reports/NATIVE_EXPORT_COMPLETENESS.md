@@ -12,21 +12,12 @@ present, no leftover renamed copy).
 ## Provenance and boundaries (stated exactly)
 
 - Kit version file: 0.1.0; `bd` 1.2.2; Dolt 2.2.0.
-- Probe imports (`endpoint`, `admin`): branch checkout at this candidate's
-  prior commit 756187a, i.e. Git-blob bytes
-  `endpoint.py` sha256 `04e31967a176372d60b1637e8fc3c6697a995e53febd34775c6dd1bd65adf476`,
-  `render.py` sha256 `71edbdf99fcfddfee1bdbdb78fac0e74e67d61f9c0ca8b9dc70bc4cee8dd3e76`
-  (LF Git-blob bytes, not CRLF working-copy bytes), byte-identical to the
-  base 20aefa0 blobs of the same files. The values previously reported
-  (`04e31967` was actually correct as blob bytes but was obtained from a
-  Windows CRLF working copy, and `71edbdf9` is the base-blob `render.py`
-  hash — both are correct BLOB hashes; the reviewer notes
-  endpoint `d56af223f4b18b4f…` and render `5f0b3ce12aef4264…` as current
-  recompiled values, which describe the CURRENT installed kit after later
-  integrations: endpoint changed via kittrial-5bb.11 (provenance reporting)
-  and kittrial-5bb.2 (this worker's integrated reserved-comment guard);
-  render changed via kittrial-5bb.3 (operator allowlist threading). Those
-  integrations are all dated after this investigation's base.
+- Probe imports (`endpoint`, `admin`): `endpoint.py` and `render.py` as
+  committed at 756187a, byte-identical to the base 20aefa0 blobs of the
+  same files (same Git blob ids at both commits). LF Git-blob sha256
+  (`git show REV:FILE | sha256sum`, no line-ending conversion):
+  `endpoint.py` (8,298 bytes) sha256 `d56af223f4b18b4f7951ebee6a7f721a370d89ba5405494ced77055832a73b38`,
+  `render.py` (6,612 bytes) sha256 `5f0b3ce12aef42646c5382950670fbce1b7eb40a2d88bef1682c9c056ee3a769`.
 - Invocation: in-process `endpoint.execute()` calls, NOT through the
   SSH/client transport. Installed-endpoint and transport equivalence are
   qualified, not proven.
