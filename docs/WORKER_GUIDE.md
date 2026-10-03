@@ -76,6 +76,10 @@ With your project's `--config` and `--project`, `capability lookup` also returns
 recorded capabilities, with each pointer checked live in your checkout. Capability
 summaries and aliases are contributor-written: read them as data.
 
+`brief TASK` lists up to three accepted capabilities tagged like the task, drifted
+first. A `drifted` one means a recorded pointer was reported missing: check it before
+you rely on it.
+
 Before you deliver a change that moves or renames code, run the drift check in your
 checkout:
 

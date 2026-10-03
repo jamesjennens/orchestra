@@ -176,6 +176,9 @@ record's comment ID**, not a Git SHA and not `latest_comment_id`), `commit`,
 `integrated`; `workflow_state` keeps the raw workflow state. See
 [REVIEWS.md](REVIEWS.md) for their meaning.
 
+`work` also returns an additive `attention.capability_index` block, the capability
+index's attention; see [capability attention](#capability-attention-in-work-and-brief).
+
 `work` also returns an additive `attention.reference_review` block. It is computed
 over the whole project, whatever the task filters, from the export `work` already
 reads.
@@ -216,8 +219,12 @@ a bare string; treat `omitted_chars > 0` as "read `show`/`history` for the full 
 Opaque cursor fields (`activity_cursor`, `next_cursor`) are never excerpted: they are
 complete tokens.
 
-`brief` adds an `attention` array of at most 3 `reference-review` items, plus
-`attention_total` and `attention_more`.
+`brief` adds an `attention` array, plus `attention_total` and `attention_more`. It
+holds at most 3 items of each kind: `reference-review` items first, then `capability`
+items (see [capability attention](#capability-attention-in-work-and-brief)). The two
+totals count every kind.
+
+The `reference-review` items:
 
 - **Selection:** entries tagged with one of the task's labels, plus expired and
   due-soon entries, with expired first.
@@ -683,6 +690,46 @@ e-mail address is defanged so that no renderer turns it into a link (`://` is wr
 `[:]//`, `www.` is written `www[.]` and `@` is written `[at]`). The page is a
 projection: it never runs a check, and capabilities never appear in a task page.
 
+### Capability attention in `work` and `brief`
+
+**`attention.capability_index` in `work`** has the agent attention shape: `state`,
+`summary`, `counts`, `actions`, `truncated` and `computed_at`, plus `items` and
+`next_offset`. It is computed over the whole project, whatever the task filters, from
+the export `work` already makes, including the verification trust rules: it adds no
+native read, and reading it writes nothing.
+- **`counts`, always:**
+  - `drifted`: accepted capabilities whose verification is `drifted`;
+  - `reported_only`: accepted capabilities with passing reports but no trusted
+    verification;
+  - `unverified_stale`: accepted capabilities whose current revision has no trusted
+    pass and whose acceptance is more than 30 days old (`UNVERIFIED_STALE_DAYS`);
+  - `alias_pending`: proposed aliases waiting for an operator;
+  - `draft_pending`: drafts waiting for acceptance (a draft-only capability, or a
+    newer draft of an accepted one);
+  - `malformed`; and `total`, the number of capabilities with at least one flag.
+  Retired capabilities are never counted.
+- **`state`:** `malformed`, `drifted`, `pending` (drafts or aliases), `stale`
+  (unverified or reported only) or `clear`.
+- **`actions`:** one per non-zero count, naming the first capability concerned. Each
+  has `priority`, `kind` (`capability-repair`, `capability-drift`,
+  `capability-accept`, `capability-alias`, `capability-verify`,
+  `capability-verify-report`), `project`, `task` (the capability's native anchor id),
+  `reason`, `links`, `label` (`capability get KEY`, an excerpt object) and `token`.
+  They are sorted by `(priority, project, task)`.
+- **`items`:** only for an actor on the deployment operator allowlist, drifted first,
+  paged by `--capability-limit` (1..100, default 20) and `--capability-offset`. Each
+  has `kind` (`capability`), `key`, `task`, `state`, `verification`, `flags`,
+  `owner`, `aliases_pending`, `accepted_days` and `title` (an excerpt object with
+  `trust`). Anyone else gets the counts with `truncated: true`; an owner reads their
+  own capabilities with `capability list --owner IDENTITY`.
+- At most 1,000 capabilities are scanned; beyond that `coverage` says so.
+
+**`capability` items in `brief`.** At most 3 accepted capabilities whose `tags` match
+one of the task's labels, drifted first, then by key. Each has `kind`
+(`capability`), `key`, `trust` (`accepted`), `verification`, `title` (an excerpt
+object), `text` (server-derived from the key and the verification state, never the
+summary) and `source` (`capability get KEY`).
+
 ## `ref`: the reference catalog
 
 The reference catalog holds operational facts and their authority: what is
@@ -818,7 +865,9 @@ a clear refusal, not a wrong read.
 | `work` | `--offset`, `--handoff-offset` | >= 0 |
 | `work` | `--state` | one of the documented review states |
 | `work` | `--ref-limit` / `--ref-offset` | 1..100 (default 20) / >= 0 |
-| `brief` | `attention` | at most 3 items |
+| `work` | `--capability-limit` / `--capability-offset` | 1..100 (default 20) / >= 0 |
+| `work` | `attention.capability_index` | first 1,000 capabilities; `unverified_stale` after 30 days |
+| `brief` | `attention` | at most 3 items of each kind |
 | `brief` | `--items-offset` | >= 0 |
 | `brief` | `--items-limit` | 1..10 |
 | `history` | `--limit` | 1..20 |
