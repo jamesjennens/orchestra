@@ -497,7 +497,10 @@ the index once, because its collision and cap rules span every capability.
 - **`list`** returns one row per key. It takes `--tag`, `--owner`,
   `--state draft-only|accepted|superseded|all`, `--limit` and `--offset`.
 - **Failures stay per entry.** A malformed or unsupported entry fails only itself. A
-  malformed alias record is a warning on its entry.
+  malformed alias or verification record is a warning on its entry. The operator's
+  `void-record` repairs a malformed capability, alias or verification record, and
+  `anchor-release --kind capability` frees a key held by an anchor with no record,
+  exactly as for references.
 
 **`capability lookup` with `--config` and `--project`** runs the local code lookup,
 unchanged, then one endpoint `find`. It adds these fields to `capability-lookup-v1`:
@@ -974,11 +977,16 @@ never read more than they need:
   propose fails only itself.
   - `coverage` names such entries, with at most 10 anchor ids.
   - A read never fails the whole catalog.
-  - **No repair yet.** The design (section 3.7) names the operator's `void-record` as
-    the repair for a malformed entry, but that is not available yet:
-    `recovery.KIND_PREFIXES` does not list the reference record kinds, so a reference
-    comment cannot be voided. Until a follow-up adds them, a malformed entry stays
-    isolated as `malformed`.
+  - **Repair.** The operator voids a malformed record with `admin.py void-record`
+    ([operations](OPERATIONS.md#reference-and-capability-records)). Reads and writes
+    then see the entry as if that comment were absent, and its `warnings` carry
+    `record-voided`. A void that does not apply is reported as `void-invalid` (not a
+    valid void by a configured operator) or `void-refused` (it names a well-formed
+    record the entry reads, the earliest holder of a revision, or a record of another
+    kind).
+  - An anchor that holds no record, because its propose cannot be re-run or because
+    every record it held is voided, is closed and its key freed with `admin.py
+    anchor-release` ([operations](OPERATIONS.md#orphan-anchors)).
 
 **Writing.** `ref propose` and `ref revise` take a closed JSON payload. The command
 sets `operation`.
@@ -1022,7 +1030,8 @@ sets `operation`.
 - **Retries.** `operation_id` makes a retry idempotent.
   - A retry also finishes an anchor that an interrupted propose left without its
     record.
-  - A different operation proposing that key is refused until then.
+  - A different operation proposing that key is refused until then, or until the
+    operator releases the anchor (`admin.py anchor-release`).
 
 Acceptance is not a client command. It is the operator's
 `admin.py reference-apply` ([operations](OPERATIONS.md#operator-commands)).

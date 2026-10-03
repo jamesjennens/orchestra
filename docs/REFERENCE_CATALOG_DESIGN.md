@@ -413,8 +413,21 @@ three names to the existing namespace and nothing else.
 **Malformed records fail per entry.** A comment that claims one of these prefixes
 but fails schema validation makes **only that entry** read as `state: malformed`;
 it must never fail `ref list`, `work` or `brief` for the whole project (7.3).
-Repair is the existing operator `void-record` path; nothing new is needed and
-nothing is deleted. A reader that meets an unknown newer `Kind: reference-entry-v2`
+Repair is the existing operator `void-record` path; nothing is deleted.
+kittrial-5bb.74 adds the reference (and capability) record kinds as void targets, with
+two rules the review voids already follow:
+- a void applies only to a comment the entry cannot read: malformed (a BOM or CRLF
+  lookalike included), another anchor's or key's, or the later holder of a revision an
+  earlier comment already holds. The earliest holder is never voided, because the writer
+  never writes a second one, and a void cannot itself be voided. A well-formed record the
+  entry reads is refused at write and ignored on read, because a void repairs history
+  and never withdraws a decision; replacing an entry is a new revision or a retirement;
+- readers and writers both leave out a voided comment, so `ref revise` sees what
+  `ref get` shows.
+
+An anchor left with no live record, by an interrupted propose whose payload is lost or
+because every record it held is voided, is closed and its key freed by the operator's
+`admin.py anchor-release` (`docs/OPERATIONS.md`, "Orphan anchors"). A reader that meets an unknown newer `Kind: reference-entry-v2`
 comment reports that entry as `unsupported` and leaves it visible to an operator,
 rather than failing the read (3.8).
 
