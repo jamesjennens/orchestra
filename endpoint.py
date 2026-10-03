@@ -22,8 +22,7 @@ from render import render
 from lifecycle import apply_native
 from version import report
 from reserved_comments import (carries_record_label, check_raw_request, comment_target,
-                               first_reserved_label, is_record_anchor, is_requirement_record_anchor,
-                               label_guard_request,
+                               first_reserved_label, is_record_anchor, label_guard_request,
                                operator_only_in_args, raw_file_flag_in_args,
                                reserved_label_in_args, refuse_http_actor, status_change_targets,
                                unresolved_bd_flags)
@@ -147,13 +146,16 @@ def _guard_record_anchor_status(root,path,args,actor):
     A reference/proposal/settings/capability anchor is created closed on purpose and is
     hidden from work by `is_record_anchor`; the raw bd path let a contributor `reopen`
     it (or `close` a forged open one), which the record operations own (kittrial-5bb.64,
-    kittrial-5bb.92 item 4). A requirement/brd-section record anchor is covered by the
-    same guard through `is_requirement_record_anchor` (kittrial-5bb.92 review item 1).
-    Any flag that moves status or assignee counts, including the short `-s` spellings,
-    `--claim`, `--defer` and `--assignee` (`status_change_targets`). Runs under the same
-    coordination lock as the write it guards, reads every named target in ONE native
-    read, and fails closed when the target cannot be resolved: bd would otherwise act on
-    the last touched issue, which this guard cannot verify.
+    kittrial-5bb.92 item 4). Requirement and brd-section records are deliberately NOT
+    covered: they stay visible as work items, so live projects claim, close, reassign
+    and defer them through this endpoint exactly as on main. Keeping requirement records
+    that are not work items out of the claimable pool is kittrial-5bb.97 (a
+    not-a-work-item label), designed with the jjbp coordinator (kittrial-5bb.92 review
+    item 1). Any flag that moves status or assignee counts, including the short `-s`
+    spellings, `--claim`, `--defer` and `--assignee` (`status_change_targets`). Runs
+    under the same coordination lock as the write it guards, reads every named target in
+    ONE native read, and fails closed when the target cannot be resolved: bd would
+    otherwise act on the last touched issue, which this guard cannot verify.
     """
     request=status_change_targets(args)
     if request is None:return
@@ -167,9 +169,6 @@ def _guard_record_anchor_status(root,path,args,actor):
         if is_record_anchor(row):
             raise ValueError('Refusing to %s %s: it is a reference/proposal/settings/capability record anchor, '
                              'whose status only its record operations may change.'%(command,canonical))
-        if is_requirement_record_anchor(row):
-            raise ValueError('Refusing to %s %s: it is a requirement/brd-section record anchor, whose status only '
-                             'its record operations may change.'%(command,canonical))
 
 def execute(root,request,authority_config=None,require_authority=False):
     name=request['project'];path=project_dir(root,name)

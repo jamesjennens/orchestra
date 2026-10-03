@@ -450,7 +450,25 @@ two rules the review voids already follow:
   the **same** decision are one decision recorded twice rather than a conflict - the
   first in native order stands - so re-adding a removed operator does not wedge later
   accepts; only a differing `record_sha256`/`decision` conflict (kittrial-5bb.92 review
-  `same-decision-evidence-conflicts`).
+  `same-decision-evidence-conflicts`). The void rule (`keyed_entries.void_refusal`) uses
+  that same definition through `keyed_entries.evidence_is_live`, so the reader and the
+  operator repair agree about which evidence holds the place: evidence written by a
+  listed operator whose record names some other `operator` is inert on both surfaces, so
+  the mismatched record is the voidable one and the operator's real evidence is protected
+  (kittrial-5bb.92 review `void-rule-live-definition`).
+- **Removing and re-adding an accepting operator.** `operators remove` makes that
+  operator's evidence inert, so the entry reads `draft-only` with `acceptance_inert` and
+  their sole evidence is voidable by another operator while they are removed. Re-adding
+  the operator makes the evidence live again, so the void then names a well-formed record
+  the entry reads: it stops applying, the evidence returns, and the read carries a
+  `void-refused` warning. If, while the first operator is removed, a second operator
+  accepts the same revision with a **different** decision, the shown acceptance is the
+  second operator's; re-adding the first flips the shown acceptance back to theirs
+  (earliest in native order) and later accepts are refused with `conflicting acceptance
+  evidence for one revision` - the way out is to void the later evidence.
+  `requirement-backfill` reads the same live filter, so a backfill by another operator
+  while the first author is removed writes a second evidence comment (kittrial-5bb.92
+  review `void-rule-live-definition`).
 
 An anchor left with no live record, by an interrupted propose whose payload is lost or
 because every record it held is voided, is closed and its key freed by the operator's

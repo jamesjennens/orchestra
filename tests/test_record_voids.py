@@ -294,6 +294,36 @@ class ReferenceVoidTests(VoidCase):
         self.void(void_payload('ref-1', plant['id'], plant['text'], kind='reference-acceptance'))
         self.assertEqual(self.get()['state'], 'accepted')
 
+    def test_evidence_whose_author_does_not_match_its_operator_is_not_a_holder(self):
+        # kittrial-5bb.92 review item 2 (`void-rule-live-definition`): the reader requires
+        # the author to equal the record's own `operator` as well as to be listed. The
+        # void rule counted any listed author as live, so evidence written by a listed
+        # operator whose record names ANOTHER operator (ops2) protected the inert first
+        # holder and told the operator to void their own real evidence. Both must use the
+        # reader's definition.
+        self.propose()
+        draft = rr.existing_revisions(self.native.row('ref-1'))[1]
+        future = {name: value for name, value in draft.items() if name != 'sha256'}
+        future.update(revision=2, acceptance_state='accepted', successor=None)
+        future['sha256'] = rr.core.content_hash(future)
+        bound = rr.core.bind_acceptance(acceptance(), future)
+        _, plant_body = rr.acceptance_evidence(bound, 'ref-1', 2, future, 'ops2')
+        plant = self.native.add_comment('ref-1', plant_body, author=OPERATOR)
+        self.accept(1, draft['sha256'])
+        live = next(comment for comment in self.native.row('ref-1')['comments']
+                    if comment['text'].startswith('Kind: reference-acceptance-v1\n')
+                    and comment['id'] != plant['id'])
+        ids = [comment['id'] for comment in self.native.row('ref-1')['comments']]
+        self.assertLess(ids.index(plant['id']), ids.index(live['id']))   # the mismatched one is earliest
+        view = self.get()
+        self.assertEqual((view['state'], view['acceptance']['operator']), ('accepted', OPERATOR))
+        self.assertIn('inert-evidence', [warning['code'] for warning in view['warnings']])
+        # The operator's real evidence is protected; the mismatched first holder is voidable.
+        with self.assertRaisesRegex(ValueError, 'well-formed reference-acceptance record the entry reads'):
+            self.void(void_payload('ref-1', live['id'], live['text'], kind='reference-acceptance'))
+        self.void(void_payload('ref-1', plant['id'], plant['text'], kind='reference-acceptance'))
+        self.assertEqual(self.get()['state'], 'accepted')
+
     def test_a_planted_future_acceptance_does_not_replace_the_operators_own_evidence(self):
         # kittrial-5bb.92 item 1 (p74 5c): a contributor plants evidence for the FUTURE
         # revision the operator's accept will write, carrying the SAME decision. The

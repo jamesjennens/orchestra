@@ -599,13 +599,29 @@ from `bd export --all`, as in the scan above.
   a revision, that an **earlier** comment of the same kind already holds. Of a
   conflicting or duplicated pair, only the later one can be voided: the writer never
   writes a second holder, so the earliest is the only one it can have written, and a
-  void cannot itself be voided. Acceptance evidence whose stored native author is not a
-  live configured operator is inert: it is not a holder of the place, so it is the
-  voidable record and the operator's live evidence beside it is the protected one
-  (kittrial-5bb.92 review `plant-protected-by-void-rule`). A well-formed record the entry
+  void cannot itself be voided. Acceptance evidence is live only when its stored native
+  author is a live configured operator AND matches the record's own `operator` - the same
+  rule the readers use (`keyed_entries.evidence_is_live`); anything else is inert. Inert
+  evidence is not a holder of the place, so it is the voidable record and the operator's
+  live evidence beside it is the protected one (kittrial-5bb.92 review
+  `plant-protected-by-void-rule`; the void rule uses the reader's definition, review
+  `void-rule-live-definition`). A well-formed record the entry
   reads is refused at write and ignored on read. A void repairs history and never
   withdraws a decision: to replace an entry, revise it and accept the new revision, or
   retire the key.
+- **Removing and re-adding an accepting operator.** `operators remove` makes that
+  operator's evidence inert: the entry reads `draft-only` with `acceptance_inert`, and
+  their sole evidence can be voided by another operator while they are removed. Re-adding
+  the operator makes the evidence live again, so the void names a well-formed record the
+  entry reads: it stops applying, the evidence returns, and the read carries a
+  `void-refused` warning. If, while the first operator is removed, a second operator
+  accepts the same revision with a DIFFERENT decision, the shown acceptance is the second
+  operator's; re-adding the first flips the shown acceptance back to theirs (earliest in
+  native order) and later accepts are refused with `conflicting acceptance evidence for
+  one revision` - the way out is to void the later evidence. `requirement-backfill` reads
+  the same live filter, so a backfill by another operator while the first author is
+  removed writes a second evidence comment (kittrial-5bb.92 review
+  `void-rule-live-definition`).
 - **The earliest-holder cross-check is a consistency check, not a security boundary.**
   The earliest holder is established by **both** bd's native (stored `created_at`) order
   and comment-id (UUIDv7) order. An edit of `created_at` alone is visible because the two

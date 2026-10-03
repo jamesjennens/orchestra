@@ -875,42 +875,6 @@ def is_record_anchor(row):
     return False
 
 
-# Requirement and brd-section records are their own anchor family: they carry a
-# controlled type label (`RESERVED_EXACT_LABELS`) plus a `Kind: requirement-revision-vN`
-# comment, and an acceptance evidence comment once accepted. They stay visible as work
-# items, so they are deliberately NOT part of `is_record_anchor`/`hide_records`; the
-# status guard reads them through this separate predicate (kittrial-5bb.92 review item 1).
-REQUIREMENT_RECORD_PREFIXES = ('Kind: requirement-revision-',
-                               'Kind: requirement-acceptance-')
-
-
-def carries_requirement_label(row):
-    """True when a row carries the controlled requirement/brd-section type label."""
-    labels = row.get('labels') if isinstance(row, dict) else None
-    return isinstance(labels, (list, tuple)) and any(
-        isinstance(label, str) and label in RESERVED_EXACT_LABELS for label in labels)
-
-
-def is_requirement_record_anchor(row):
-    """True for the native anchor of a requirement or brd-section record.
-
-    Like `is_record_anchor`, the label alone is not evidence, and the comment is read
-    through the same BOM/CRLF view every reserved-prefix surface uses, so a lookalike
-    cannot hide a record from the status guard.
-    """
-    if not isinstance(row, dict) or not carries_requirement_label(row):
-        return False
-    comments = row.get('comments')
-    if not isinstance(comments, list):
-        return False
-    for comment in comments:
-        text = comment.get('text') if isinstance(comment, dict) else None
-        if isinstance(text, str) and any(view.startswith(REQUIREMENT_RECORD_PREFIXES)
-                                         for view in (text, _reserved_prefix_view(text))):
-            return True
-    return False
-
-
 def is_record_comment(text):
     """True for a reference/proposal/settings/capability record comment, any version.
 

@@ -864,6 +864,24 @@ class RequirementRecordTests(unittest.TestCase):
         self.assertEqual(len(self.native.writes('update')), updates)
         self.assertEqual(len(self.native.acceptances('req-2')), 1)
 
+    def test_backfill_writes_second_evidence_when_the_first_author_is_removed(self):
+        # kittrial-5bb.92 review item 2: the backfill reads the acceptance ledger through
+        # the live operator filter, so evidence whose author was removed no longer counts
+        # as prior and the backfill writes its own second evidence comment; re-adding the
+        # first author leaves both records live.
+        self.native.seed('req-1')
+        self.native.seed('req-2')
+        self.native.actor = 'removed-op'
+        rr.backfill(self.backfill(), 'removed-op', self.native, self.project,
+                    operators=['removed-op', 'operator'])
+        self.assertEqual([item['operator'] for item in self.native.acceptances('req-2')],
+                         ['removed-op'])
+        self.native.actor = 'operator'
+        rr.backfill(self.backfill(operation_id='bf-2'), 'operator', self.native, self.project,
+                    operators=['operator'])
+        self.assertEqual([item['operator'] for item in self.native.acceptances('req-2')],
+                         ['removed-op', 'operator'])
+
     def test_backfill_refuses_unknown_records_and_arbitrary_labels_before_writing(self):
         self.native.seed('req-1')
         with self.assertRaisesRegex(ValueError, 'Unknown requirement record'):

@@ -300,21 +300,62 @@ class NativeLabelResolutionTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'record anchor'):
                     _guard_record_anchor_status(self.root, self.path, argv, 'worker')
 
-    def test_status_guard_refuses_a_requirement_record_anchor(self):
-        # kittrial-5bb.92 review item 1: requirement/brd-section records are their own
-        # anchor family; a status change must not move one either.
+    def test_status_guard_allows_a_requirement_record_anchor(self):
+        # kittrial-5bb.92 review item 1 (coordinator correction): requirement/brd-section
+        # records stay visible as work items, so the guard must NOT freeze them - they
+        # behave exactly as on main. Only the reference/proposal/settings/capability
+        # anchors stay guarded.
         comments = [{'id': 'c-1', 'text': 'Kind: requirement-revision-v1\n{"id": "pp-3q2"}',
                      'author': 'ops-james', 'created_at': '2026-10-01T00:00:00Z'}]
         for labels in (['requirement', 'requirement:draft'],
+                       ['requirement', 'requirement:accepted'],
                        ['brd-section', 'requirement:accepted']):
             for argv in (['close', 'pp-3q2', '--reason', 'done'],
                          ['reopen', 'pp-3q2'],
                          ['update', 'pp-3q2', '-s', 'open'],
-                         ['update', 'pp-3q2', '--claim']):
+                         ['update', 'pp-3q2', '--claim'],
+                         ['update', 'pp-3q2', '--assignee', 'lane-a'],
+                         ['update', 'pp-3q2', '--defer', '+1d']):
                 with self.subTest(labels=labels, argv=argv), mock.patch.object(
                         endpoint.subprocess, 'run', self._status_run(labels, comments)):
-                    with self.assertRaisesRegex(ValueError, 'record anchor'):
-                        _guard_record_anchor_status(self.root, self.path, argv, 'worker')
+                    self.assertIsNone(
+                        _guard_record_anchor_status(self.root, self.path, argv, 'worker'))
+
+    def test_an_accepted_requirement_record_is_claimed_and_closed_through_the_endpoint(self):
+        # kittrial-5bb.92 review item 1: on jjbp six requirement records are in_progress
+        # and assigned to worker lanes (three accepted). A contributor must still be able
+        # to claim, close, reopen, reassign and defer them through the endpoint, so each
+        # one reaches the native write instead of being refused by the status guard.
+        (self.path / '.beads').mkdir()
+        (self.path / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+        rows = [{'id': 'pp-req.1', 'status': 'in_progress', 'assignee': 'lane-a',
+                 'labels': ['requirement', 'requirement:accepted'],
+                 'comments': [{'id': 'c-1', 'author': 'ops-james',
+                               'created_at': '2026-10-01T00:00:00Z',
+                               'text': 'Kind: requirement-revision-v1\n{"id": "pp-req.1"}'},
+                              {'id': 'c-2', 'author': 'ops-james',
+                               'created_at': '2026-10-02T00:00:00Z',
+                               'text': 'Kind: requirement-acceptance-v1\n{"id": "pp-req.1"}'}]}]
+        writes = []
+
+        def run(argv, **kwargs):
+            if 'show' in argv:
+                tokens = [token for token in argv[argv.index('show') + 1:]
+                          if not token.startswith('--')]
+                return _Proc(0, json.dumps([row for row in rows if row['id'] in tokens]))
+            writes.append(list(argv))
+            return _Proc(0, json.dumps({'ok': True}))
+
+        for args in (['update', 'pp-req.1', '--claim'],
+                     ['close', 'pp-req.1', '--reason', 'done'],
+                     ['reopen', 'pp-req.1'],
+                     ['update', 'pp-req.1', '--assignee', 'lane-b'],
+                     ['update', 'pp-req.1', '--defer', '+1d']):
+            with self.subTest(args=args), mock.patch.object(endpoint.subprocess, 'run', run):
+                answer = endpoint.execute(self.root, {'project': 'pp', 'actor': 'worker',
+                                                      'action': 'bd', 'args': args})
+                self.assertEqual(answer['returncode'], 0, answer.get('stderr'))
+        self.assertEqual(len(writes), 5)
 
     def test_status_guard_reads_every_target_in_one_native_read(self):
         # kittrial-5bb.92 review item 1: keep the read-before-write to one read per

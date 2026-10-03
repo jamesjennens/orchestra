@@ -96,6 +96,19 @@ def all_missing(error):
     return 'no issue' in text and 'found' in text
 
 
+def evidence_is_live(record, author, allowlist):
+    """Whether one acceptance-evidence record is `live` on the reader's definition.
+
+    The stored native author must be on the deployment operator allowlist AND equal the
+    record's own `operator` field. The reader (`entry_view`), the writer's
+    prior-evidence check (`live_acceptances`) and the operator void rule
+    (`void_refusal`) all use this one rule, so they agree on which evidence holds the
+    revision's acceptance place; evidence whose author does not match its record is
+    inert on every surface (kittrial-5bb.92 review item 2).
+    """
+    return isinstance(author, str) and author == record.get('operator') and author in allowlist
+
+
 class AnchoredKind:
     """One keyed-entry kind: its names, its record parsers and its content hooks.
 
@@ -239,8 +252,7 @@ class AnchoredKind:
         allowlist = configured_operators(operators)
 
         def keep(comment, record):
-            author = comment.get('author')
-            return isinstance(author, str) and author == record.get('operator') and author in allowlist
+            return evidence_is_live(record, comment.get('author'), allowlist)
 
         return core.existing_ledger(row, self.acceptance_prefix, self.parse_acceptance, self.noun, 'acceptance',
                                     'revision', belongs=lambda record, row: record['id'] == row.get('id')
@@ -377,11 +389,12 @@ class AnchoredKind:
         revision or a retirement, which keeps revision numbers monotonic for the writer
         and for an older kit.
 
-        Acceptance evidence whose stored native author is not a live configured
-        operator is inert: it holds no place, so it is the voidable one and the
-        operator's own live evidence is the protected one (kittrial-5bb.92 review
-        item 2). `operators` is the deployment allowlist; None keeps the raw ledger,
-        for direct library callers.
+        Acceptance evidence that is not `live` on the reader's definition
+        (`evidence_is_live`: its stored native author must be a live configured operator
+        AND equal the record's own `operator`) is inert: it holds no place, so it is the
+        voidable one and the operator's own live evidence is the protected one
+        (kittrial-5bb.92 review item 2). `operators` is the deployment allowlist; None
+        keeps the raw ledger, for direct library callers.
         """
         kind = payload['target_kind']
         if not kind.startswith(self.family):
@@ -398,12 +411,16 @@ class AnchoredKind:
                    and recovery.claims_kind(comment['text'], kind) and self.record_slot(kind, comment, row) == slot]
         place = ('revision %s' if slot[0] == 'revision' else 'the acceptance evidence for revision %s') % slot[1]
         if slot[0] == 'acceptance' and operators is not None:
-            # An inert evidence record (its native author is not on the deployment
-            # allowlist) is not a holder of the place: it cannot be the legitimate
-            # record, so a void of it applies, and it never outranks the live record.
+            # `live` is the reader's definition (`evidence_is_live`): the stored native
+            # author is a live configured operator AND equals the record's own
+            # `operator`. An inert evidence record - a contributor plant, evidence
+            # written by a since-removed operator, or one whose `operator` field names
+            # somebody else - is not a holder of the place: a void of it applies, and it
+            # never outranks the live record (kittrial-5bb.92 review item 2).
             allowlist = configured_operators(operators)
             live = [comment for comment in holders
-                    if isinstance(comment.get('author'), str) and comment['author'] in allowlist]
+                    if evidence_is_live(self.parse_acceptance(comment.get('text')) or {},
+                                        comment.get('author'), allowlist)]
             if target not in live:
                 return None
             holders = live
@@ -1131,7 +1148,7 @@ class AnchoredKind:
                                                        % number})
                     continue
                 live = [(item, author) for item, author in evidence
-                        if author == item['operator'] and author in allowlist]
+                        if evidence_is_live(item, author, allowlist)]
                 if live:
                     chosen = (number, live[0][0])
                     # An inert evidence record beside a live one is not silent: it holds

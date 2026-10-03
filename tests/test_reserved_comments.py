@@ -16,14 +16,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from reserved_comments import (
     PREFIXES,
-    carries_requirement_label,
     check_comment_body,
     check_raw_request,
     comment_target,
     first_reserved_label,
     is_legitimate_writer,
     is_record_anchor,
-    is_requirement_record_anchor,
     label_guard_request,
     operator_only_flag,
     operator_only_in_args,
@@ -1374,35 +1372,6 @@ class ReservedLabelMutationGuardTests(unittest.TestCase):
                      ['update', 'task-1', '--description', 'text']):
             with self.subTest(args=args):
                 self.assertIsNone(status_change_targets(args))
-
-    def test_requirement_record_anchor_predicate(self):
-        # kittrial-5bb.92 review item 1: requirement/brd-section records are their own
-        # anchor family, covered by the status guard but still visible as work items.
-        revision = 'Kind: requirement-revision-v1\n{"id": "req-1"}'
-        acceptance = 'Kind: requirement-acceptance-v1\n{"id": "req-1"}'
-        row = {'id': 'req-1', 'labels': ['requirement', 'requirement:draft'],
-               'comments': [{'id': 'c-1', 'text': revision}]}
-        self.assertTrue(is_requirement_record_anchor(row))
-        self.assertFalse(is_record_anchor(row))
-        self.assertTrue(carries_requirement_label(row))
-        # brd-section, an acceptance-only record, and the BOM/CRLF view all count.
-        self.assertTrue(is_requirement_record_anchor(
-            {'labels': ['brd-section'], 'comments': [{'id': 'c-1', 'text': revision}]}))
-        self.assertTrue(is_requirement_record_anchor(
-            {'labels': ['requirement', 'requirement:accepted'],
-             'comments': [{'id': 'c-1', 'text': acceptance}]}))
-        self.assertTrue(is_requirement_record_anchor(
-            {'labels': ['requirement'],
-             'comments': [{'id': 'c-1', 'text': '\ufeff' + revision}]}))
-        # The label alone is not evidence, and a lookalike of another family is not one.
-        self.assertFalse(is_requirement_record_anchor({'labels': ['requirement'], 'comments': []}))
-        self.assertFalse(is_requirement_record_anchor(
-            {'labels': ['requirement'],
-             'comments': [{'id': 'c-1', 'text': 'Kind: reference-entry-v1\n{}'}]}))
-        self.assertFalse(is_requirement_record_anchor(
-            {'labels': ['plain'], 'comments': [{'id': 'c-1', 'text': revision}]}))
-        self.assertFalse(is_requirement_record_anchor({'labels': ['requirement']}))
-        self.assertFalse(is_requirement_record_anchor(None))
 
     def test_guard_refuses_reserved_holder_before_native_write(self):
         # Mirror endpoint.execute's locked section: the read-before-write guard
