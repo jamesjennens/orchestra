@@ -64,7 +64,7 @@ class RecordSpec:
     `check_key_unique`, `create_revision`, `create_args`, `after_create`,
     `prepare_row`, `existing_revisions`, `require_selectable`, `build_record`,
     `require_bound_key`, `check_revision`, `check_acceptance`, `acceptance_evidence`,
-    `existing_acceptances`, `revision_comment`, `apply_labels`, `result`.
+    `existing_acceptances`, `live_acceptances`, `revision_comment`, `apply_labels`, `result`.
     """
 
     VALUES = ('kind', 'noun', 'type_labels', 'state_labels', 'revision_prefix',
@@ -75,7 +75,7 @@ class RecordSpec:
              'resolve_task', 'check_key_unique', 'create_revision', 'create_args',
              'after_create', 'prepare_row', 'existing_revisions', 'require_selectable',
              'build_record', 'require_bound_key', 'check_revision', 'check_acceptance',
-             'acceptance_evidence', 'existing_acceptances', 'revision_comment',
+             'acceptance_evidence', 'existing_acceptances', 'live_acceptances', 'revision_comment',
              'apply_labels', 'result')
 
     def __init__(self, **values):
@@ -232,13 +232,17 @@ def find(rows, task):
     return next((row for row in rows if row.get('id') == task), None)
 
 
-def existing_ledger(row, prefix, parse, noun, what, key, belongs=None):
+def existing_ledger(row, prefix, parse, noun, what, key, belongs=None, keep=None):
     """A validated ledger of one reserved record kind on one row, keyed by `key`.
 
     Malformed input fails closed: a comment that claims the prefix must parse with the
     kind's own strict parser, must belong to this row (`belongs(record, row)`; by
     default its `id` is the row id), and must not conflict with another record for
     the same key.
+
+    `keep(comment, record)`, when given, decides whether a well-formed record takes part
+    in the ledger at all (an acceptance whose native author is not a configured operator
+    does not). It runs after the strict parse, so a malformed comment still fails closed.
     """
     found = {}
     task = row.get('id')
@@ -255,6 +259,8 @@ def existing_ledger(row, prefix, parse, noun, what, key, belongs=None):
             raise ValueError('malformed %s %s comment on %s' % (noun, what, task))
         if not belongs(record, row):
             raise ValueError('%s %s comment on %s belongs to another record' % (noun, what, task))
+        if keep is not None and not keep(comment, record):
+            continue
         slot = record[key]
         prior = found.get(slot)
         if prior is not None and prior != record:
@@ -463,7 +469,12 @@ def apply_native(payload, actor, run, project, spec, operator=False, operators=N
     if bound is not None:
         evidence_record, candidate = spec.acceptance_evidence(
             bound, task, revision, record, actor)
-        prior_evidence = spec.existing_acceptances(row).get(revision)
+        # Only acceptance evidence whose stored native author is a live configured
+        # operator counts as a prior decision the writer must not rewrite; the reader
+        # applies the same author rule. A planted acceptance (a contributor cannot
+        # write one, but a raw nudge can) therefore never makes the operator's own
+        # apply return 0 without evidence (kittrial-5bb.92 item 1, p74 5c).
+        prior_evidence = spec.live_acceptances(row, operators).get(revision)
         if prior_evidence is not None:
             if (prior_evidence.get('record_sha256') != evidence_record['record_sha256']
                     or prior_evidence.get('decision') != evidence_record['decision']):

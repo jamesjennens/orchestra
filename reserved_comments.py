@@ -1002,6 +1002,10 @@ BD_LONG_VALUE_FLAGS = {
         '--set-labels', '--set-metadata', '--spec-id', '--status', '--title',
         '--type', '--unset-metadata',
     },
+    # Verbatim from the pinned bd 1.2.2 `close --help`/`reopen --help`, for the
+    # status-change guard on record anchors (kittrial-5bb.92 item 4).
+    'close': {'--reason', '--reason-file', '--session'},
+    'reopen': {'--reason'},
 }
 BD_LONG_BOOL_FLAGS = {
     'create': {
@@ -1012,6 +1016,7 @@ BD_LONG_BOOL_FLAGS = {
         '--allow-empty-description', '--claim', '--ephemeral', '--history',
         '--no-history', '--persistent', '--stdin',
     },
+    'close': {'--claim-next', '--continue', '--force', '--no-auto', '--suggest-next'},
 }
 # Label-replacing writes: `--set-labels` replaces the whole set and
 # `--remove-label` drops named labels, so either can take the reserved
@@ -1217,6 +1222,30 @@ def label_guard_request(args):
 # Backwards-compatible aliases for the previous flag tables.
 COMMENT_NO_VALUE_FLAGS = BD_GLOBAL_BOOL_FLAGS
 COMMENT_FLAGS_WITH_VALUE = {'-f', '--file'}
+
+
+def status_change_targets(args):
+    """The ids a `close`/`reopen`/`update --status` invocation names, for the guard.
+
+    Returns ``None`` when the invocation cannot move a status, else
+    ``(command, targets)``. ``targets`` is the positional issue ids, or ``None`` when
+    the scan is ambiguous (an unknown flag) or names no issue: bd would then act on the
+    last touched issue, which the record-anchor guard cannot verify, so the caller
+    fails closed. Verbatim pinned bd 1.2.2 close/reopen flag inventories are used, so a
+    flag value is never mistaken for an issue id (kittrial-5bb.92 item 4).
+    """
+    if not isinstance(args, list) or not args:
+        return None
+    command = args[0] if isinstance(args[0], str) else None
+    if command not in ('close', 'reopen', 'update'):
+        return None
+    flags, operands, unknown = _bd_scan(args, command)
+    if command == 'update' and not any(name == '--status' for name, _ in flags):
+        return None
+    if unknown:
+        return (command, None)
+    targets = [token for token in operands if not token.startswith('@attachment:')]
+    return (command, targets or None)
 
 
 # Machine records are canonical UTF-8 with `\n` line endings. A client that

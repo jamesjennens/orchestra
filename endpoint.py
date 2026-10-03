@@ -24,7 +24,8 @@ from version import report
 from reserved_comments import (carries_record_label, check_raw_request, comment_target,
                                first_reserved_label, is_record_anchor, label_guard_request,
                                operator_only_in_args, raw_file_flag_in_args,
-                               reserved_label_in_args, unresolved_bd_flags, refuse_http_actor)
+                               reserved_label_in_args, refuse_http_actor, status_change_targets,
+                               unresolved_bd_flags)
 from http_authority import AuthorityConfig, NativeRunner, http_actor_denial, journal_path, run_guarded
 
 ALLOWED={'list','show','ready','search','count','create','update','close','reopen','comments','dep','state','lint'}
@@ -105,6 +106,32 @@ def _guard_reserved_labels(root,path,args,actor):
             row['comments']=_native_comments(root,path,actor,canonical)
             if is_record_anchor(row):
                 raise ValueError('Refusing to replace labels on %s: it is a reference/proposal/settings/capability record anchor, whose labels only its record operations may change. --add-label remains available for ordinary labels.'%(canonical,))
+
+def _guard_record_anchor_status(root,path,args,actor):
+    """Read-before-write guard: a status change never moves a record anchor.
+
+    A reference/proposal/settings/capability anchor is created closed on purpose and is
+    hidden from work by `is_record_anchor`; the raw bd path let a contributor `reopen`
+    it (or `close` a forged open one), which the record operations own (kittrial-5bb.64,
+    kittrial-5bb.92 item 4). Runs under the same coordination lock as the write it
+    guards, like `_guard_reserved_labels`, and fails closed when the target cannot be
+    resolved: bd would otherwise act on the last touched issue, which this guard cannot
+    verify.
+    """
+    request=status_change_targets(args)
+    if request is None:return
+    command,targets=request
+    if targets is None:
+        raise ValueError('Refusing %s: name exactly the issue(s) to change; bd would otherwise act on the last '
+                         'touched issue, whose record-anchor status cannot be verified.'%command)
+    for token in targets:
+        canonical,labels=_native_labels(root,path,actor,token)
+        row={'labels':sorted(labels)}
+        if carries_record_label(row):
+            row['comments']=_native_comments(root,path,actor,canonical)
+            if is_record_anchor(row):
+                raise ValueError('Refusing to %s %s: it is a reference/proposal/settings/capability record anchor, '
+                                 'whose status only its record operations may change.'%(command,canonical))
 
 def execute(root,request,authority_config=None,require_authority=False):
     name=request['project'];path=project_dir(root,name)
@@ -420,6 +447,7 @@ def execute(root,request,authority_config=None,require_authority=False):
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             _guard_reserved_labels(root,path,args,actor)
+            _guard_record_anchor_status(root,path,args,actor)
             def bd_dispatch(argv):
                 p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*argv],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
                 return {'returncode':p.returncode,'stdout':p.stdout,'stderr':p.stderr}

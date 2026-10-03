@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 try:
     import endpoint
-    from endpoint import _guard_reserved_labels, _native_labels
+    from endpoint import _guard_record_anchor_status, _guard_reserved_labels, _native_labels
 except ImportError:  # pragma: no cover - endpoint needs fcntl (POSIX)
     endpoint = None
 
@@ -249,6 +249,42 @@ class NativeLabelResolutionTests(unittest.TestCase):
             _guard_reserved_labels(self.root, self.path,
                                    ['create', 'x', '--parent', 'plain'],
                                    'worker')
+
+    def _status_run(self, labels, comments):
+        """Stub the two reads `_guard_record_anchor_status` makes per target."""
+        def run(argv, **kwargs):
+            if 'show' in argv:
+                return _Proc(0, json.dumps([{'id': 'pp-3q2', 'labels': labels}]))
+            if 'comments' in argv:
+                return _Proc(0, json.dumps(comments))
+            raise AssertionError(argv)
+        return run
+
+    def test_status_guard_refuses_close_and_reopen_of_a_record_anchor(self):
+        # kittrial-5bb.92 item 4: a record anchor is created closed on purpose and is
+        # hidden from work; the raw endpoint must not reopen or close it.
+        comments = [{'id': 'c-1', 'text': 'Kind: reference-entry-v1\n{"bad":1}', 'author': 'mallory',
+                     'created_at': '2026-10-01T00:00:00Z'}]
+        for argv in (['close', 'pp-3q2', '--reason', 'done'],
+                     ['reopen', 'pp-3q2'],
+                     ['update', 'pp-3q2', '--status', 'open']):
+            with self.subTest(argv=argv), mock.patch.object(
+                    endpoint.subprocess, 'run', self._status_run(['reference'], comments)):
+                with self.assertRaisesRegex(ValueError, 'record anchor'):
+                    _guard_record_anchor_status(self.root, self.path, argv, 'worker')
+
+    def test_status_guard_allows_an_ordinary_task(self):
+        comments = [{'id': 'c-1', 'text': 'an ordinary note', 'author': 'worker'}]
+        for argv in (['close', 'pp-3q2', '--reason', 'done'], ['reopen', 'pp-3q2']):
+            with self.subTest(argv=argv), mock.patch.object(
+                    endpoint.subprocess, 'run', self._status_run(['plain'], comments)):
+                _guard_record_anchor_status(self.root, self.path, argv, 'worker')
+
+    def test_status_guard_fails_closed_without_a_named_target(self):
+        for argv in (['close', '--json'], ['close', 'pp-3q2', '--mystery']):
+            with self.subTest(argv=argv), mock.patch.object(endpoint.subprocess, 'run', _rows_run([])):
+                with self.assertRaises(ValueError):
+                    _guard_record_anchor_status(self.root, self.path, argv, 'worker')
 
     def test_guard_refuses_unresolved_token_before_any_read_use(self):
         rows = [{'id': 'pp-other', 'labels': []}]

@@ -157,6 +157,7 @@ class AnchoredKind:
             acceptance_evidence=lambda bound, task, revision, record, actor: self.acceptance_evidence(
                 bound, task, revision, record, actor),
             existing_acceptances=self.existing_acceptances,
+            live_acceptances=self.live_acceptances,
             revision_comment=self.entry_comment,
             apply_labels=self.apply_labels,
             result=self.result,
@@ -221,6 +222,29 @@ class AnchoredKind:
         return core.existing_ledger(row, self.acceptance_prefix, self.parse_acceptance, self.noun, 'acceptance',
                                     'revision', belongs=lambda record, row: record['id'] == row.get('id')
                                     and self.key_label(record['key']) in self.key_labels(row))
+
+    def live_acceptances(self, row, operators):
+        """The acceptance ledger the writer counts as prior decisions.
+
+        Only evidence whose stored native author is a live configured operator AND
+        equals the record's own `operator` counts, exactly as `entry_view` selects the
+        accepted revision. `operators is None` keeps the raw ledger, for direct
+        library callers. A contributor-planted acceptance (or one an operator wrote
+        before being removed) is inert on every read, so it must not make the
+        operator's own apply return 0 without writing its evidence
+        (kittrial-5bb.92 item 1, p74 5c).
+        """
+        if operators is None:
+            return self.existing_acceptances(row)
+        allowlist = configured_operators(operators)
+
+        def keep(comment, record):
+            author = comment.get('author')
+            return isinstance(author, str) and author == record.get('operator') and author in allowlist
+
+        return core.existing_ledger(row, self.acceptance_prefix, self.parse_acceptance, self.noun, 'acceptance',
+                                    'revision', belongs=lambda record, row: record['id'] == row.get('id')
+                                    and self.key_label(record['key']) in self.key_labels(row), keep=keep)
 
     def anchor_for(self, rows, key):
         """(row, status) for a key: status is `entry`, `incomplete` or None."""
@@ -341,10 +365,13 @@ class AnchoredKind:
         earlier live comment already holds (a conflicting or duplicated revision or
         acceptance). The earliest holder in native order is never voided: the writer
         never writes a second holder of a place, so only the first can be the legitimate
-        record, and a void cannot itself be voided (kittrial-5bb.74 review, P2). A record
-        the entry reads is the ledger itself, so a void of it is refused: withdrawing an
-        entry is a new revision or a retirement, which keeps revision numbers monotonic
-        for the writer and for an older kit.
+        record, and a void cannot itself be voided (kittrial-5bb.74 review, P2). The
+        earliest holder is established by BOTH bd's native order and comment-id
+        (UUIDv7) order; when the two disagree the history is conflicted and no void of
+        that place applies (kittrial-5bb.92 item 2). A record the entry reads is the
+        ledger itself, so a void of it is refused: withdrawing an entry is a new
+        revision or a retirement, which keeps revision numbers monotonic for the writer
+        and for an older kit.
         """
         kind = payload['target_kind']
         if not kind.startswith(self.family):
@@ -359,10 +386,21 @@ class AnchoredKind:
             return None
         holders = [comment for comment in comments if isinstance(comment.get('text'), str)
                    and recovery.claims_kind(comment['text'], kind) and self.record_slot(kind, comment, row) == slot]
+        place = ('revision %s' if slot[0] == 'revision' else 'the acceptance evidence for revision %s') % slot[1]
+        if len(holders) > 1:
+            # bd orders comments by the stored created_at, which direct SQL can rewrite; a
+            # comment id is UUIDv7, so id order is the real creation order. When the two
+            # orders disagree the history is conflicted and no void of this slot can be
+            # trusted to name the legitimate holder (kittrial-5bb.92 item 2).
+            by_id = sorted(holders, key=lambda comment: str(comment.get('id')))
+            if by_id[0] is not holders[0]:
+                return ('native comment order and comment-id order disagree about the earliest holder of %s: %s '
+                        'is first by bd order but %s is first by comment id, so the history is conflicted and no '
+                        'void of it can be trusted; repair the stored order natively'
+                        % (place, holders[0].get('id'), by_id[0].get('id')))
         if holders[0] is not target:
             return None
         if len(holders) > 1:
-            place = ('revision %s' if slot[0] == 'revision' else 'the acceptance evidence for revision %s') % slot[1]
             return ('record %s is the earliest holder of %s, so it is the only one the writer can have written; '
                     'void the later holder %s instead' % (payload['target'], place, holders[1].get('id')))
         return ('record %s is a well-formed %s record the entry reads; a void repairs a malformed, foreign or '

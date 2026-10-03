@@ -1404,6 +1404,7 @@ def _spec(operators, context):
         build_record=build_record, require_bound_key=require_bound_key, check_revision=check_revision,
         check_acceptance=lambda payload, existing, record, operator, row: None,
         acceptance_evidence=lambda *args: (None, None), existing_acceptances=lambda row: {},
+        live_acceptances=lambda row, operators: {},
         revision_comment=revision_comment, apply_labels=apply_state, result=result)
     return spec
 

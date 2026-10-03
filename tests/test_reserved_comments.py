@@ -28,6 +28,7 @@ from reserved_comments import (
     raw_file_flag_in_args,
     reserved_label_in_args,
     reserved_match,
+    status_change_targets,
     unresolved_bd_flags,
 )
 from briefing import PREFIX as CHECKPOINT_PREFIX
@@ -1310,6 +1311,24 @@ class ReservedLabelMutationGuardTests(unittest.TestCase):
         self.assertIsNone(first_reserved_label([]))
         self.assertIsNone(first_reserved_label(None))
         self.assertIsNone(first_reserved_label('request:x'))
+
+    def test_status_change_targets(self):
+        # kittrial-5bb.92 item 4: the record-anchor status guard resolves the named
+        # issue ids, consuming flag values, and fails closed when it cannot.
+        self.assertEqual(status_change_targets(['close', 'task-1', '--reason', 'done']),
+                         ('close', ['task-1']))
+        self.assertEqual(status_change_targets(['close', 'task-1', 'task-2', '-f']),
+                         ('close', ['task-1', 'task-2']))
+        self.assertEqual(status_change_targets(['reopen', 'task-1', '-r', 'needed']),
+                         ('reopen', ['task-1']))
+        self.assertEqual(status_change_targets(['update', 'task-1', '--status', 'open']),
+                         ('update', ['task-1']))
+        self.assertIsNone(status_change_targets(['update', 'task-1', '--title', 'x']))
+        self.assertIsNone(status_change_targets(['show', 'task-1']))
+        self.assertIsNone(status_change_targets(['list']))
+        # No named issue: bd would act on the last touched issue, which is unverifiable.
+        self.assertEqual(status_change_targets(['close', '--json']), ('close', None))
+        self.assertEqual(status_change_targets(['close', 'task-1', '--mystery']), ('close', None))
 
     def test_guard_refuses_reserved_holder_before_native_write(self):
         # Mirror endpoint.execute's locked section: the read-before-write guard

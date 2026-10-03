@@ -897,6 +897,18 @@ class AdminRevertRecordTests(unittest.TestCase):
             self.invoke(self.payload(integration_commit='9' * 40))
         self.assertEqual(self.writes, [])
 
+    def test_revert_record_reads_the_chain_through_an_applied_void(self):
+        # kittrial-5bb.92 item 5: a malformed review comment an operator already voided
+        # must not make revert-record fail with 'Malformed contribution-review history'.
+        malformed = dict(id='badreview', text=w.PREFIX + 'not-json', author='worker', created_at=STAMP)
+        self.rows[0]['comments'].append(malformed)
+        payload = void('badreview', malformed['text'], task=self.TASK_ID)
+        w.apply_void(self.rows, self.TASK_ID, 'operator', payload, self.run_as('operator'),
+                     operator=True, operators=['operator'], journal=self.project())
+        result = self.invoke(self.payload())
+        self.assertEqual(result['contribution'], '1')
+        self.assertEqual(len(self.writes), 1)
+
     def test_operator_cli_refuses_an_unintegrated_contribution(self):
         # A second, superseding contribution with no scoped integration of its own:
         # the named commit is not the one the shared projection reports as passing
