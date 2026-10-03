@@ -275,8 +275,7 @@ class ReferenceVoidTests(VoidCase):
         bound = rr.core.bind_acceptance(acceptance(), future)
         _, body = rr.acceptance_evidence(bound, 'ref-1', 2, future, 'mallory')
         self.native.add_comment('ref-1', body, author='mallory')
-        planted_view = self.get()
-        self.assertEqual((planted_view['state'], planted_view['acceptance_inert']), ('draft-only', True))
+        self.assertEqual(self.get()['state'], 'draft-only')   # evidence for a revision that does not exist yet
         self.assertEqual(self.accept(1, draft['sha256'])['revision'], 2)
         view = self.get()
         self.assertEqual((view['state'], view['acceptance']['operator'], view['acceptance_inert']),

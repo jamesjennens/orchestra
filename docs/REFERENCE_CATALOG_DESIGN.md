@@ -419,11 +419,20 @@ two rules the review voids already follow:
 - a void applies only to a comment the entry cannot read: malformed (a BOM or CRLF
   lookalike included), another anchor's or key's, or the later holder of a revision an
   earlier comment already holds. The earliest holder is never voided, because the writer
-  never writes a second one, and a void cannot itself be voided. A well-formed record the
+  never writes a second one, and a void cannot itself be voided. The earliest holder is
+  established by **both** bd's native (stored `created_at`) order and comment-id
+  (UUIDv7) order; when the two disagree the history is conflicted and no void of that
+  place applies, so a directly backdated forgery cannot hand the ledger to itself
+  (kittrial-5bb.92). A well-formed record the
   entry reads is refused at write and ignored on read, because a void repairs history
   and never withdraws a decision; replacing an entry is a new revision or a retirement;
 - readers and writers both leave out a voided comment, so `ref revise` sees what
-  `ref get` shows.
+  `ref get` shows;
+- acceptance evidence counts as a prior decision the writer must not rewrite only when
+  its stored native author is a live configured operator and matches the record's own
+  `operator`, exactly as the reader selects the accepted revision. An inert acceptance
+  (a contributor-planted one, or one written by a since-removed operator) does not stop
+  the operator's `apply` from writing its own evidence (kittrial-5bb.92).
 
 An anchor left with no live record, by an interrupted propose whose payload is lost or
 because every record it held is voided, is closed and its key freed by the operator's

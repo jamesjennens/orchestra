@@ -345,7 +345,7 @@ not the author field.
   with a newer accepted revision, or retire the key.
   The coordinator ran this scan on all seven live projects on 2026-10-02 and found none.
 
-A row is hidden as a record anchor only when it carries one of the labels `reference`, `proposal`, `contribution-settings` or `capability` **and** a v1 record comment of the same family. A project's own task that merely uses one of those words as a label (for example jjbp-j03.20's `proposal`) stays visible and editable.
+A row is hidden as a record anchor only when it carries one of the labels `reference`, `proposal`, `contribution-settings` or `capability` **and** a v1 record comment of the same family. A project's own task that merely uses one of those words as a label (for example jjbp-j03.20's `proposal`) stays visible and editable. The endpoint also refuses a raw `bd close`, `bd reopen` or `bd update --status` aimed at a record anchor (kittrial-5bb.92): an anchor's status belongs to its record operations, and a status change through the raw path is refused before the native write.
 
 **The `verifiers` list.** The deployment configuration may carry a `verifiers` list beside `operators`. It is a second, narrow deployment-wide authority: an actor on it may run `admin.py capability-verify`, and readers then count that actor's capability checks as `verified`. It grants nothing else. Keep it empty unless a host-side verifier other than an operator exists; the coordinator's integration step verifies as an operator.
 
@@ -615,7 +615,9 @@ from `bd export --all`, as in the scan above.
   Without `--confirm-revoke`, `operators remove` counts the operator's voids of
   reference and capability records that apply today and names the entries whose
   reading changes (for example `example/reference calendar.trading draft-only ->
-  malformed`).
+  malformed`). Each list is capped at five entries with `(+N more)`; add
+  `--all-revoked` to the same command to name every affected entry
+  (kittrial-5bb.92).
 - **Reconcile agrees.** `reference-reconcile` and `capability-reconcile --disposition
   complete` read the allowlist too, and refuse an anchor whose every record is voided,
   as they refuse one whose propose never posted its record.
@@ -669,7 +671,7 @@ On an older kit a released row holds no key either, and it is never claimable:
 
 #### Operator removal and restore policy
 
-`admin.py operators remove OPERATOR` is a revocation, not a cleanup: voids that operator authored stop applying on read, the incident is reported as unreconciled again, and re-adding the operator restores those dispositions. The same holds for the requirement-proposal dispositions, owner decisions and contribution settings they recorded; the refusal names the proposals and settings that change (see "Requirement proposals" above). Because that destroys recorded dispositions, `remove` refuses unless `--confirm-revoke` acknowledges the consequence.
+`admin.py operators remove OPERATOR` is a revocation, not a cleanup: voids that operator authored stop applying on read, the incident is reported as unreconciled again, and re-adding the operator restores those dispositions. The same holds for the requirement-proposal dispositions, owner decisions and contribution settings they recorded; the refusal names the proposals and settings that change (see "Requirement proposals" above). Every affected list in that refusal is capped at five entries with `(+N more)`; `operators remove OPERATOR --all-revoked` names all of them instead. Because that destroys recorded dispositions, `remove` refuses unless `--confirm-revoke` acknowledges the consequence.
 
 The allowlist is deployment configuration rather than a native Beads object, so each project's complete coordination sidecar records the allowlist in force at backup time. **A restore does not re-grant it by default.** The allowlist is authority for *every* project on the deployment, so a backup taken before `operators remove ACTOR --confirm-revoke` would otherwise silently restore that actor's authority deployment-wide — including for projects the backup has nothing to do with. `restore-new` therefore restores the native records, the coordination sidecar and the operation journal, but leaves the deployment allowlist untouched. When the backup records operators this host does not list, the command prints them by name, states that they were **NOT** restored, and explains that void records they authored stay inert on the restored project until authority is granted again. Nothing is deleted: the void comments and their `original` bytes are intact, and they apply again as soon as the actor is deliberately re-added.
 
