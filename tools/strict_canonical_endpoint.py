@@ -333,6 +333,20 @@ def main():
         print(json.dumps(envelope(2, stderr='bad request: %s\n' % error)))
         return
     root = Path(arguments.root)
+    if os.environ.get('STRICT_ENDPOINT_PROJECTS') == '1':
+        # endpoint.py's project rule (kittrial-5bb.80): admin.project_dir refuses a name
+        # outside [a-z][a-z0-9]{1,23}, then an uninitialized project is refused, both
+        # before any native call. Initialized means <root>/projects/<name>/.beads/metadata.json,
+        # exactly as admin.py add-project leaves it.
+        import re as _re
+        name = request.get('project')
+        if not isinstance(name, str) or not _re.fullmatch(r'[a-z][a-z0-9]{1,23}', name):
+            print(json.dumps(envelope(2, stderr='ValueError: Project: 2-24 lowercase letters/digits, beginning '
+                                                'with a letter\n')))
+            return
+        if not (root / 'projects' / name / '.beads' / 'metadata.json').is_file():
+            print(json.dumps(envelope(2, stderr='ValueError: Unknown/uninitialized project\n')))
+            return
     canonical = Canonical(root, request.get('project', 'project'))
     journal_path = (http_authority.journal_path(canonical.path)
                     if http_authority is not None and hasattr(http_authority, 'journal_path')

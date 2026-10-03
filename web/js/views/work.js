@@ -86,12 +86,22 @@ export async function welcome(ctx) {
 
 export async function directory(ctx) {
   await ctx.refreshProjects();
+  const session = await ctx.api.current().catch(() => null);
+  const mode = (session && session.project_create) || 'create';
   const showArchived = h('input', { type: 'checkbox', id: 'show-archived' });
   const archivedToggle = h('label', { class: 'check', for: 'show-archived' }, showArchived, 'Show archived projects');
   const list = h('div');
   const draw = () => {
     const items = ctx.projects.filter((p) => showArchived.checked || !p.archived);
-    list.replaceChildren(items.length ? h('div', { class: 'cards' }, items.map((p) => h('a', { class: 'card', href: ctx.href('/p/' + p.id) },
+    list.replaceChildren(items.length ? h('div', { class: 'cards' }, items.map((p) => p.usable === false
+      // A project with no canonical Beads project behind it: never a link to task pages.
+      ? h('div', { class: 'card' },
+        h('div', { class: 'toolbar' }, h('h2', { class: 'small' }, p.name), roleTag(p.role), h('span', { class: 'chip warn' }, 'Not usable'), p.archived ? h('span', { class: 'chip plain' }, 'Archived') : null),
+        h('p', { class: 'small muted' }, p.unusable_reason || 'This project cannot be used on this server.'),
+        p.archived ? null : h('div', null, h('button', { type: 'button', onclick: async (event) => {
+          if (await act(event.currentTarget, () => ctx.api.archiveProject(p.id), { success: 'Project archived' })) { await ctx.refreshProjects(); draw(); }
+        } }, 'Archive')))
+      : h('a', { class: 'card', href: ctx.href('/p/' + p.id) },
       h('div', { class: 'toolbar' }, h('h2', { class: 'small' }, p.name), roleTag(p.role), p.archived ? h('span', { class: 'chip plain' }, 'Archived') : null),
       p.description ? h('p', { class: 'small muted' }, p.description) : null,
       h('div', { class: 'card-stats' }, h('span', null, h('b', null, (p.members || []).length), ' members'), h('span', null, 'Created ', time(p.created_at)))))) :
@@ -99,6 +109,34 @@ export async function directory(ctx) {
   };
   showArchived.addEventListener('change', draw);
   draw();
+
+  const hostLine = 'On this server a project is created on the coordination host by an operator, with admin.py add-project NAME.';
+  if (mode !== 'create') {
+    let panel;
+    if (mode === 'register') {
+      const register = h('form', { class: 'form', novalidate: true },
+        h('p', { class: 'small muted' }, hostLine + ' Register it here with that NAME to use it in the web interface. Registering makes you its owner and gives nobody else access: add members afterwards.'),
+        field({ id: 'project_id', label: 'Canonical project name', hint: 'The NAME given to admin.py add-project: 2–24 lowercase letters or digits, beginning with a letter.', required: true, maxlength: 24 }),
+        field({ id: 'name', label: 'Display name (optional)', hint: 'Defaults to the canonical name.', maxlength: 64 }),
+        h('div', null, h('button', { type: 'submit', class: 'primary' }, 'Register project')));
+      register.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const { project_id: projectId, name } = formValues(register);
+        if (!/^[a-z][a-z0-9]{1,23}$/.test(projectId.trim())) return setFieldError(register, 'project_id', 'Enter the canonical name: 2–24 lowercase letters or digits, beginning with a letter.');
+        setFieldError(register, 'project_id', '');
+        const created = await act(register.querySelector('button'), () => ctx.api.registerProject(projectId.trim(), name.trim()), { success: 'Project registered', onError: (e) => { if (e.status === 422 || e.status === 409) { setFieldError(register, 'project_id', e.message); return true; } return false; } });
+        if (created) { await ctx.refreshProjects(); ctx.go('/p/' + created.id + '/settings'); }
+      });
+      panel = register;
+    } else {
+      panel = h('p', { class: 'small muted' }, hostLine + ' A superuser then registers it in the web interface and adds members. Ask an operator or a superuser.');
+    }
+    return h('div', { class: 'stack' },
+      pageHead({ title: 'Projects', lede: ctx.me.superuser ? 'As a superuser you can see every project.' : 'Projects you are a member of.' }),
+      h('div', { class: 'toolbar' }, archivedToggle),
+      list,
+      h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, mode === 'register' ? 'Register a project' : 'New project')), h('div', { class: 'panel-body' }, panel)));
+  }
 
   const form = h('form', { class: 'form', novalidate: true },
     field({ id: 'name', label: 'Project name', hint: '2–64 characters: letters, digits, spaces, dot, dash or underscore.', required: true, maxlength: 64 }),

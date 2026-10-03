@@ -306,6 +306,13 @@ class UncertainOutcome(Exception):
     """A canonical mutation may have committed but its result was not observed."""
 
 
+# The canonical Beads project name rule, as admin.validate_name enforces it on the host
+# and endpoint.py on every request: 2-24 lowercase letters/digits, beginning with a letter.
+CANONICAL_PROJECT = re.compile(r'[a-z][a-z0-9]{1,23}')
+REGISTER_HINT = ('A project is created on the coordination host by an operator (admin.py add-project NAME); '
+                 'a superuser then registers it here with that name.')
+
+
 class InProcessBackend:
     """Disposable canonical operations used for local validation.
 
@@ -317,6 +324,8 @@ class InProcessBackend:
     ROUTES = ('tasks.create', 'tasks.update', 'tasks.claim', 'checkpoints.add',
               'reviews.add', 'feedback.add', 'projects.create', 'projects.archive',
               'members.set', 'members.remove', 'credentials.issue', 'credentials.revoke')
+    # Everything here is service-local, so a project is created by the HTTP route itself.
+    PROJECT_CREATE = 'create'
 
     def __init__(self, service):
         self.service = service
@@ -893,8 +902,36 @@ class EndpointBackend:
         return principal.actor or principal.user_id
 
     # -- transport -------------------------------------------------------------
+    # A project's tasks live in a canonical Beads project that only an operator creates on
+    # the host (admin.py add-project), so the HTTP route only REGISTERS an existing one
+    # (kittrial-5bb.80). The HTTP project id is the canonical project name.
+    PROJECT_CREATE = 'register'
+
+    def project_exists(self, project):
+        """Whether the canonical project `project` exists and is initialized on the host.
+
+        One cheap read through the endpoint: endpoint.py refuses an unknown or
+        uninitialized project with "Unknown/uninitialized project" before any native
+        call. Any other failure is raised as the read's own error, never read as absent.
+        """
+        if not isinstance(project, str) or not CANONICAL_PROJECT.fullmatch(project):
+            return False
+        reply = self._endpoint('bd', project, self.actor_namespace + '/read',
+                               ['list', '--limit', '1', '--json'])
+        if isinstance(reply, dict) and reply.get('returncode') == 2 \
+                and 'Unknown/uninitialized project' in (reply.get('stderr') or ''):
+            return False
+        self._checked(reply)
+        return True
+
     def _endpoint(self, action, project, actor, args, attachments=None, operation_id=None,
                   authority=None, require_authority=False, route=None):
+        if isinstance(project, str) and not CANONICAL_PROJECT.fullmatch(project):
+            # A project record from before kittrial-5bb.80 (a `proj_...` id) has no
+            # canonical project and can never have one: say so, instead of the
+            # endpoint's 422 for a malformed project name.
+            raise conflict('This project has no canonical Beads project behind it (it was created by an older '
+                           'kit), so its tasks cannot be used. Archive it; ' + REGISTER_HINT)
         if self.runner is not None:
             return self.runner(action=action, project=project, actor=actor, args=args,
                                attachments=attachments or {}, operation_id=operation_id,
@@ -2022,7 +2059,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                          'superuser': principal.superuser},
                 'via': principal.via,
                 'credential': principal.credential_id,
-                'project': principal.credential_project}
+                'project': principal.credential_project,
+                # How "New project" works here (kittrial-5bb.80): `create` (service-local
+                # backend), `register` (a superuser registers an existing canonical
+                # project) or `operator-only` (an operator creates it on the host).
+                'project_create': (
+                    'create' if getattr(self.backend, 'PROJECT_CREATE', 'create') == 'create' else
+                    'register' if principal.superuser and principal.via != 'credential' else 'operator-only')}
         # A browser keeps its CSRF token in memory only, so a reload re-reads it here.
         # It is returned only to the cookie session it belongs to; a cross-origin page
         # cannot read this same-origin response.
@@ -2120,6 +2163,8 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('POST', r'/v1/projects')
     def projects_create(self, ctx):
         payload = ctx.payload or {}
+        if getattr(self.backend, 'PROJECT_CREATE', 'create') == 'register':
+            return self._project_register(ctx, payload)
 
         def create():
             project_id = payload.get('project_id')
@@ -2131,14 +2176,60 @@ class ApiHandler(BaseHTTPRequestHandler):
         return self._mutate(ctx, 'projects.create', None, create,
                             status=201, capability=CAP_PROJECT_CREATE)
 
+    def _project_register(self, ctx, payload):
+        """`POST /v1/projects` on the endpoint backend: register an existing canonical project.
+
+        Superuser only, and the refusal for anyone else comes first and is the same
+        whatever the payload names, so the existence check below can never be used by a
+        non-superuser to probe for canonical project names. The id must be a canonical
+        project name; a second registration of the same name is refused with 409 (two
+        HTTP projects never map to one canonical project); the canonical project must
+        exist and be initialized on the host, checked with one endpoint read before any
+        store write. Only the registering superuser becomes a member (owner).
+        """
+        principal = ctx.principal
+        if principal is None or principal.via == 'credential' or not principal.superuser:
+            raise forbidden('Only a superuser registers a project on this server. ' + REGISTER_HINT)
+        project_id = payload.get('project_id')
+        if not isinstance(project_id, str) or not CANONICAL_PROJECT.fullmatch(project_id):
+            raise invalid('project_id must be the canonical project name: 2-24 lowercase letters or digits, '
+                          'beginning with a letter (the NAME given to admin.py add-project)')
+        name = payload.get('name') or project_id
+        existing = self.service.state['projects'].get(project_id)
+        if existing is not None:
+            raise conflict('Canonical project %s is already registered as project %r%s; one canonical project '
+                           'is registered once' % (project_id, existing.get('name'),
+                                                   ' (archived)' if existing.get('archived') else ''))
+        if not self.backend.project_exists(project_id):
+            raise invalid('No canonical project %s exists on the coordination host. An operator creates it there '
+                          'first (admin.py add-project %s), then you register it here.' % (project_id, project_id))
+
+        def register():
+            result = self.service.create_project(principal, name, project_id)
+            return result, result
+        return self._mutate(ctx, 'projects.create', None, register, status=201, capability=CAP_ACCOUNTS_ADMIN,
+                            reason='register ' + project_id)
+
+    def _usable(self, view):
+        """Mark a project the backend cannot serve (kittrial-5bb.80)."""
+        view = dict(view)
+        if getattr(self.backend, 'PROJECT_CREATE', 'create') == 'register' \
+                and not CANONICAL_PROJECT.fullmatch(str(view.get('id'))):
+            view['usable'] = False
+            view['unusable_reason'] = ('No canonical Beads project is behind this project (it was created by an '
+                                       'older kit); archive it. ' + REGISTER_HINT)
+        else:
+            view['usable'] = True
+        return view
+
     @route('GET', r'/v1/projects')
     def projects_list(self, ctx):
-        return 200, {'items': self.service.list_projects(ctx.principal)}
+        return 200, {'items': [self._usable(view) for view in self.service.list_projects(ctx.principal)]}
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')')
     def project_get(self, ctx):
         self._project(ctx, CAP_READ)
-        return 200, self.service.project_view(ctx.principal, ctx.params['pid'])
+        return 200, self._usable(self.service.project_view(ctx.principal, ctx.params['pid']))
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/archive')
     def project_archive(self, ctx):
