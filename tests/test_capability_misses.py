@@ -179,19 +179,33 @@ class RecordTests(MissLogCase):
 
     def test_the_entry_cap_evicts_the_lowest_count_then_the_oldest_last_seen(self):
         with patch.object(cm, 'ENTRIES_MAX', 3), patch.object(cm, 'NEW_PER_HOUR', 50):
-            self.record('alpha', stamp=at(0))
-            self.record('alpha', stamp=at(1))             # alpha: count 2, but the oldest last-seen
-            self.record('beta', stamp=at(2))
-            self.record('gamma', stamp=at(3))
-            self.assertEqual(self.record('delta', stamp=at(11)), 'recorded')
+            self.record('alpha', stamp=at(0, hour=0))
+            self.record('alpha', stamp=at(0, hour=1))     # alpha: count 2, but the oldest last-seen
+            self.record('beta', stamp=at(0, hour=2))
+            self.record('gamma', stamp=at(0, hour=3))
+            self.assertEqual(self.record('delta', stamp=at(0, hour=11)), 'recorded')
             log = self.stored()
             # beta and gamma have the lowest count; beta was seen longer ago.
             self.assertEqual(sorted(log['phrases']), ['alpha', 'delta', 'gamma'])
             self.assertEqual((log['evicted'], log['misses']), (1, 5))
-            self.assertEqual(self.record('epsilon', stamp=at(12)), 'recorded')
-            self.assertEqual(sorted(self.stored()['phrases']), ['alpha', 'delta', 'epsilon'])   # gamma next
+            self.assertEqual(self.record('epsilon', stamp=at(0, hour=12)), 'recorded')
+            # gamma goes next: delta (count 1 too) was seen within RECENT_HOURS, so it is protected.
+            self.assertEqual(sorted(self.stored()['phrases']), ['alpha', 'delta', 'epsilon'])
             self.assertEqual(self.stored()['evicted'], 2)
             self.assertEqual(self.stored()['phrases']['alpha']['count'], 2)   # never evicted for being old
+
+    def test_when_every_phrase_is_recent_the_one_seen_longest_ago_goes(self):
+        self.assertEqual(cm.RECENT_HOURS, 2)
+        with patch.object(cm, 'ENTRIES_MAX', 3), patch.object(cm, 'NEW_PER_HOUR', 50):
+            self.record('alpha', stamp=at(0))
+            self.record('alpha', stamp=at(1))             # count 2, oldest last-seen
+            self.record('beta', stamp=at(2))
+            self.record('gamma', stamp=at(3))
+            self.assertEqual(self.record('delta', stamp=at(4)), 'recorded')
+            self.assertEqual(sorted(self.stored()['phrases']), ['beta', 'delta', 'gamma'])
+            # Two hours on, all three are still (just) within the window: the oldest, beta, goes.
+            self.assertEqual(self.record('epsilon', stamp=at(2, hour=14)), 'recorded')
+            self.assertEqual(sorted(self.stored()['phrases']), ['delta', 'epsilon', 'gamma'])
 
     def test_a_repeated_phrase_survives_a_flood_of_one_off_phrases(self):
         # The review's case: a genuine phrase missed 41 times, then 60 new junk phrases
@@ -207,6 +221,30 @@ class RecordTests(MissLogCase):
         self.assertGreater(log['evicted'], 0)
         self.assertEqual(log['phrases']['genuine phrase']['count'], 41)
         self.assertTrue(cm._valid(log))
+
+    def recurring(self, old, old_count, old_hour, one_offs, hours=6):
+        """`old` phrases already stored, then a miss recurring hourly with `one_offs` new
+        one-off phrases between occurrences. Returns the log."""
+        log = cm._fresh(T0)
+        for number in range(old):
+            stamp = at(number % 60, hour=old_hour)
+            log['phrases']['old phrase %d' % number] = {'count': old_count, 'first': stamp, 'last': stamp}
+        for hour in range(old_hour + 1, old_hour + 1 + hours):
+            self.assertIn(cm.apply(log, 'recurring phrase', False, at(0, hour=hour)), ('recorded', 'counted'))
+            for number in range(one_offs):
+                self.assertEqual(cm.apply(log, 'one off %d %d' % (hour, number), False,
+                                          at(1 + number % 59, hour=hour)), 'recorded')
+        self.assertTrue(cm._valid(log))
+        return log
+
+    def test_a_recurring_newcomer_is_kept_in_a_full_log(self):
+        # The re-review's cases: with eviction by lowest count alone, every newcomer evicted
+        # the previous one (count 1), so a phrase recurring hourly was never kept.
+        for old, old_count, one_offs in ((500, 2, 30), (500, 2, 1), (450, 2, 55)):
+            with self.subTest(old=old, one_offs=one_offs):
+                log = self.recurring(old, old_count, 6, one_offs)
+                self.assertEqual(len(log['phrases']), min(cm.ENTRIES_MAX, old + 1 + 6 * one_offs))
+                self.assertEqual(log['phrases']['recurring phrase']['count'], 6)
 
     def test_the_real_cap_holds(self):
         with patch.object(cm, 'NEW_PER_HOUR', 10 ** 6):
@@ -631,6 +669,64 @@ class ReportTests(MissLogCase):
         self.assertEqual(cm.report(self.project, dict)['recording'], 'lock-unusable')
         self.assertEqual(cm.clear(self.project)['repaired'], {cm.LOCK_NAME: 'file'})
         self.assertEqual(self.record('merge slot'), 'recorded')
+
+    def bounded(self, function, *args, seconds=3.0):
+        result, raised = [], []
+
+        def call():
+            try:
+                result.append(function(*args))
+            except BaseException as error:
+                raised.append(error)
+        worker = threading.Thread(target=call, daemon=True)
+        worker.start()
+        worker.join(seconds)
+        if worker.is_alive():
+            self.fail('%s blocked for more than %s s' % (function.__name__, seconds))
+        if raised:
+            raise raised[0]
+        return result[0]
+
+    @unittest.skipUnless(hasattr(os, 'mkfifo'), 'needs FIFOs')
+    def test_a_fifo_lock_never_blocks_a_find_and_clear_repairs_it(self):
+        self.record('merge slot')
+        (self.project / cm.LOCK_NAME).unlink()
+        os.mkfifo(self.project / cm.LOCK_NAME)   # no writer: an O_RDONLY open would block forever
+        started = time.monotonic()
+        self.assertEqual(self.bounded(cm.record_find, self.project, 'reserved label guard', False, T0), 'error')
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(self.bounded(cm.report, self.project, dict)['recording'], 'lock-unusable')
+        self.assertEqual(self.bounded(cm.clear, self.project)['repaired'], {cm.LOCK_NAME: 'other'})
+        self.assertEqual(self.record('merge slot'), 'recorded')
+
+    @unittest.skipUnless(hasattr(os, 'mkfifo'), 'needs FIFOs')
+    def test_a_fifo_at_the_log_or_temp_name_does_not_stop_recording(self):
+        for name in (cm.FILE_NAME, cm.TEMP_NAME):
+            with self.subTest(name=name):
+                cm.clear(self.project)
+                os.mkfifo(self.project / name)
+                self.assertEqual(self.bounded(cm.report, self.project, dict)['recording'], 'ok')
+                self.assertEqual(self.bounded(cm.record_find, self.project, 'merge slot', False, T0), 'recorded')
+                self.assertEqual(self.stored()['finds'], 1)
+                self.assertTrue(stat.S_ISREG(os.lstat(self.file).st_mode))
+
+    def test_a_symlink_to_an_outside_directory_is_removed_and_the_directory_kept(self):
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        for name in (cm.FILE_NAME, cm.TEMP_NAME, cm.LOCK_NAME):
+            with self.subTest(name=name):
+                target = Path(outside.name) / ('dir-for' + name)
+                target.mkdir()
+                (target / 'keep.txt').write_text('keep me', encoding='utf-8')
+                if (self.project / name).exists():
+                    (self.project / name).unlink()   # the lock file clear keeps
+                try:
+                    (self.project / name).symlink_to(target, target_is_directory=True)
+                except (OSError, NotImplementedError):
+                    self.skipTest('symlinks unavailable')
+                self.assertEqual(cm.clear(self.project)['repaired'], {name: 'symlink'})
+                self.assertFalse((self.project / name).is_symlink())
+                self.assertEqual((target / 'keep.txt').read_text(encoding='utf-8'), 'keep me')
 
     def test_unsupported_platform_is_reported(self):
         with patch.object(cm, 'fcntl', None):

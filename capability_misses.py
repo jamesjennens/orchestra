@@ -52,6 +52,7 @@ import re
 import stat
 import time
 import unicodedata
+from datetime import datetime, timedelta
 from pathlib import Path
 
 try:
@@ -71,10 +72,13 @@ CONTRACT_VERSION = 'cli-contract-v1'
 PHRASE_CHARS_MAX = 80
 #: `find` refuses a longer raw phrase, so a longer one never reaches the log.
 RAW_CHARS_MAX = 200
-#: Phrases kept per project; when full, the one with the LOWEST count is dropped (the
-#: oldest last-seen among equal counts), so a burst of new one-off phrases cannot push
-#: out a phrase that keeps missing.
+#: Phrases kept per project. When full, a phrase seen within RECENT_HOURS is protected;
+#: among the others the LOWEST count goes (the oldest last-seen among equal counts), so a
+#: burst of one-off phrases cannot push out a phrase that keeps missing, and a phrase that
+#: keeps recurring is not evicted while it is still new. If every phrase is recent, the
+#: one seen longest ago goes.
 ENTRIES_MAX = 500
+RECENT_HOURS = 2
 #: New phrases stored per project per clock hour (UTC); the rest go to `overflow`.
 NEW_PER_HOUR = 60
 #: A larger file is not read: the log starts again. A full log of 80-character
@@ -254,24 +258,44 @@ def apply(log, phrase, found, stamp):
         _bump(log, 'overflow')
         return 'overflow'
     if len(phrases) >= ENTRIES_MAX:
-        weakest = min(phrases, key=lambda name: (phrases[name]['count'], phrases[name]['last'], name))
-        del phrases[weakest]
+        del phrases[_victim(phrases, stamp)]
         _bump(log, 'evicted')
     phrases[text] = {'count': 1, 'first': stamp, 'last': stamp}
     log['window']['new'] += 1
     return 'recorded'
 
 
+def _victim(phrases, stamp):
+    """The phrase to evict from a full log when a new one arrives at `stamp`.
+
+    Phrases seen within RECENT_HOURS are protected. Among the rest, the lowest count goes,
+    the oldest last-seen first among equal counts: a flood of one-off phrases evicts other
+    one-offs, never a phrase that keeps missing. Protecting recent phrases lets a newcomer
+    that recurs build up a count instead of being evicted by the next newcomer. When
+    every phrase is recent, the one seen longest ago goes.
+    """
+    cutoff = (datetime.strptime(stamp, STAMP) - timedelta(hours=RECENT_HOURS)).strftime(STAMP)
+    older = [name for name in phrases if phrases[name]['last'] < cutoff]
+    if older:
+        return min(older, key=lambda name: (phrases[name]['count'], phrases[name]['last'], name))
+    return min(phrases, key=lambda name: (phrases[name]['last'], phrases[name]['count'], name))
+
+
 def _lock_descriptor(project):
     """The miss-log lock, created 0600. Never through a symlink (O_NOFOLLOW). flock needs
     no write access, so it is opened read-only: a read-only lock file still works.
 
-    Where the platform has no O_NOFOLLOW (Windows, where the endpoint does not run) a
-    symlink is refused by an lstat check first, so behaviour is the same everywhere."""
+    Anything at the lock path but a regular file (a FIFO, a socket, a device, a
+    directory, a symlink) is refused by an lstat check first: opening a FIFO read-only
+    would otherwise block every find until a writer appeared. O_NONBLOCK guards the
+    race between that check and the open, and O_NOFOLLOW the symlink case (also on a
+    platform without O_NOFOLLOW, through the lstat check)."""
     path = Path(project) / LOCK_NAME
-    if not hasattr(os, 'O_NOFOLLOW') and _kind(path) == 'symlink':
-        raise OSError(errno.ELOOP, 'the miss-log lock is a symlink', str(path))
-    return os.open(Path(project) / LOCK_NAME, _flags('O_RDONLY', 'O_CREAT', 'O_NOFOLLOW', 'O_CLOEXEC'), 0o600)
+    kind = _kind(path)
+    if kind not in ('absent', 'file'):
+        raise OSError(errno.ELOOP if kind == 'symlink' else errno.EINVAL,
+                      'the miss-log lock is not a regular file (%s)' % kind, str(path))
+    return os.open(path, _flags('O_RDONLY', 'O_CREAT', 'O_NOFOLLOW', 'O_NONBLOCK', 'O_CLOEXEC'), 0o600)
 
 
 def _try_lock(flock, descriptor, flags):
@@ -355,10 +379,12 @@ def _kind(path):
 def recording_state(project):
     """Whether a find could record now, judged without writing anything.
 
-    'ok'; 'unsupported' (no flock on this platform); 'lock-unusable' (the lock path is a
-    symlink, a directory or another non-file, or cannot be opened); 'log-unwritable'
-    (the log or temp path is a directory or another non-file, or the project directory
-    cannot be written). `admin.py capability-misses-clear` repairs the first two kinds.
+    'ok'; 'unsupported' (no flock on this platform); 'lock-unusable' (the lock path is
+    not a regular file, or cannot be opened); 'log-unwritable' (the log or temp path is a
+    directory, which neither os.replace nor unlink can remove, or the project directory
+    cannot be written). Any other non-file at the log or temp path (a symlink, a FIFO) is
+    replaced or removed by the next write, so it does not stop recording.
+    `admin.py capability-misses-clear` repairs the first two kinds.
     """
     project = Path(project)
     if fcntl is None or not all(hasattr(fcntl, name) for name in ('flock', 'LOCK_EX', 'LOCK_NB')):
@@ -367,8 +393,7 @@ def recording_state(project):
         lock = _kind(project / LOCK_NAME)
         if lock not in ('absent', 'file') or (lock == 'file' and not os.access(project / LOCK_NAME, os.R_OK)):
             return 'lock-unusable'
-        if _kind(project / FILE_NAME) not in ('absent', 'file', 'symlink') \
-                or _kind(project / TEMP_NAME) not in ('absent', 'file', 'symlink') \
+        if _kind(project / FILE_NAME) == 'directory' or _kind(project / TEMP_NAME) == 'directory' \
                 or not os.access(project, os.W_OK | os.X_OK):
             return 'log-unwritable'
         if lock == 'absent' and not os.access(project, os.W_OK):

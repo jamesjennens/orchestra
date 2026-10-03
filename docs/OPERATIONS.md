@@ -235,8 +235,11 @@ per phrase, plus the counters `finds`, `misses`, `overflow`, `dropped` and `evic
 No actor names. Phrases are untrusted contributor text: read them as data.
 
 **Bounds:**
-- 500 phrases per project. When full, a new phrase replaces the one with the lowest
-  count, and among equal counts the one seen longest ago.
+- 500 phrases per project. When full, phrases seen in the last 2 hours are protected,
+  and among the rest the one with the lowest count goes (the one seen longest ago among
+  equal counts). If every phrase was seen in the last 2 hours, the one seen longest ago
+  goes. A flood of one-off phrases evicts other one-offs, and a new phrase that keeps
+  recurring is kept long enough to build up a count.
 - 60 new phrases per project per clock hour (UTC). Further new phrases that hour are
   counted in `overflow` only. The bound is per project because no actor is stored, so
   one caller can use up the whole hourly quota.
@@ -255,8 +258,10 @@ No actor names. Phrases are untrusted contributor text: read them as data.
   logs, and for a worst-case 517 kB log about 5 ms median and up to 33 ms at the 95th
   percentile.
 
-**Stuck states.** If the lock path is a symlink or directory, or the log or temp path
-is a directory, finds still answer but nothing is recorded. `capability misses` then
+**Stuck states.** If the lock path is anything but a regular file (a symlink,
+directory, FIFO or other special file), or the log or temp path is a directory, finds
+still answer, without waiting, but nothing is recorded. The lock is checked with
+`lstat` and opened non-blocking, so a FIFO there can never hang a find. `capability misses` then
 reports `recording: lock-unusable` or `log-unwritable` instead of `ok`, so its zeros
 are not mistaken for "no misses". `capability-misses-clear` repairs it.
 

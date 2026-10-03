@@ -718,10 +718,16 @@ either, because the client computes them and the endpoint never sees them.
   places a recorded phrase into an agent prompt, a briefing, a view or onboarding text.
 
 **Bounds** (fixed in this version):
-- at most 500 phrases per project; when full, a new phrase replaces the one with the
-  **lowest count**, and among equal counts the one seen longest ago (`evicted` counts
-  these). A burst of one-off phrases therefore cannot push out a phrase that keeps
-  missing;
+- at most 500 phrases per project (`evicted` counts the phrases dropped to make room).
+  When the log is full, a new phrase replaces:
+  - among the phrases **not** seen in the last 2 hours, the one with the **lowest
+    count**, the one seen longest ago among equal counts;
+  - or, when every phrase was seen in the last 2 hours, the one seen longest ago.
+
+  The count rule means a burst of one-off phrases evicts other one-offs, never a phrase
+  that keeps missing. The 2-hour protection means a new phrase that recurs (for example
+  hourly) is kept long enough to build up a count, instead of being evicted by the next
+  newcomer while older phrases with a count of 2 sit on every slot;
 - at most 60 **new** phrases per project per clock hour (UTC); further new phrases in
   that hour are counted in `overflow` and not stored. A phrase already in the log is
   always counted. The bound is per project, not per actor, because no actor is stored:
@@ -775,9 +781,11 @@ holds a phrase) the index once, as `find` does, to mark what would now resolve.
   is corrupt, oversized or of another schema; the next `find` starts a new log). With
   `absent` or `unreadable`, `since` is `null` and the counters are `0`.
 - `recording` says whether a find could record now, judged without writing: `ok`;
-  `lock-unusable` (the lock path is a symlink, a directory or another non-file, or
-  cannot be opened); `log-unwritable` (the log or temp path is a directory or another
-  non-file, or the project directory cannot be written); or `unsupported` (no `flock`).
+  `lock-unusable` (the lock path is not a regular file - a symlink, directory, FIFO or
+  other special file - or cannot be opened); `log-unwritable` (the log or temp path is a
+  directory, or the project directory cannot be written); or `unsupported` (no
+  `flock`). A symlink or FIFO at the log or temp path does not stop recording: the
+  next write replaces it.
   Anything but `ok` means finds still answer but nothing is counted, so zeros are not
   "no misses". `admin.py capability-misses-clear` repairs the first two.
 - `notice` comes immediately before `phrases`, and every row starts with
@@ -970,7 +978,7 @@ a clear refusal, not a wrong read.
 | `capability find` | phrase / `--limit` | <= 200 characters / 1..20 (default 5) |
 | `capability list` | `--limit` / `--offset` | 1..100 (default 20) / >= 0 |
 | `capability misses` | `--limit` | 1..100 (default 20) |
-| lookup-miss log | phrases / new phrases / phrase length | 500 per project (lowest count evicted, oldest last-seen first among equals) / 60 per project per clock hour (the rest counted in `overflow`) / <= 80 characters after normalising (else counted in `dropped`) |
+| lookup-miss log | phrases / new phrases / phrase length | 500 per project (phrases seen in the last 2 hours protected; otherwise lowest count evicted, oldest first among equals) / 60 per project per clock hour (the rest counted in `overflow`) / <= 80 characters after normalising (else counted in `dropped`) |
 | `capability` record | `name` / `summary` / `aliases` | <= 120 / <= 1,200 characters / <= 32 phrases of <= 80 |
 | `capability` record | `code` / `tests` / `anchors` / `requirements` / `tags` | <= 32 / 32 / 16 / 16 / 8, pointers <= 400 characters |
 | `capability propose-alias` | pending aliases | person 3 per capability and 50 per project; unverified pool 1 and 10; 20 per capability |
