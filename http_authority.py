@@ -133,6 +133,7 @@ Windows workstation and a Linux office host.
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -1714,6 +1715,55 @@ def _envelope(code, stderr='', **extra):
     payload = {'returncode': code, 'stdout': '', 'stderr': stderr}
     payload.update(extra)
     return payload
+
+
+#: The ids the HTTP service allocates (http_auth: ``usr_``/``agent_`` + 16 hex). As a
+#: declared actor the shape is reserved for that service (``reserved_comments.HTTP_ACTOR``).
+HTTP_ACTOR_ID = re.compile(r'(?:usr|agent)_[0-9a-f]{16}')
+
+
+def http_actor_id(actor):
+    """The account or agent id an actor label claims (``usr_...`` or ``usr_.../label``), or None."""
+    head = actor.split('/', 1)[0] if isinstance(actor, str) else None
+    return head if head and HTTP_ACTOR_ID.fullmatch(head) else None
+
+
+def http_actor_denial(request, authority_config):
+    """Why a request under an HTTP-shaped actor is refused, as the envelope, or None.
+
+    An actor with the shape of an account or agent id is what makes a record read as
+    written under HTTP authority, so EVERY endpoint action under one needs the verified
+    live-authority descriptor (kittrial-5bb.70 review 01a10262), whether or not the
+    process was launched with ``--require-authority``: the descriptor must be present,
+    must pass ``decide`` against the live store, and must name that actor (the account
+    itself, or the agent whose credential the descriptor carries). The denials are the
+    ones ``run_guarded`` returns, so the HTTP service maps them identically; a guarded
+    mutation is then re-validated under the authority lock as before.
+    """
+    head = http_actor_id(request.get('actor'))
+    if head is None:
+        return None
+    if authority_config is None:
+        return _envelope(126, stderr='Live authority is not configured\n', authority_status=401)
+    authority = request.get('authority')
+    if not isinstance(authority, dict):
+        return _envelope(126, stderr='Live authority descriptor required: an HTTP account or agent actor acts '
+                                     'only with one\n', authority_status=401)
+    descriptor = {key: value for key, value in authority.items() if key not in ('store', 'lock')}
+    try:
+        state = read_state(authority_config.store)
+        decide(state, descriptor)
+    except AuthorityDenied as denied:
+        return _envelope(126, stderr='%s\n' % denied.message, authority_status=denied.status)
+    allowed = {descriptor.get('user_id')}
+    credential = (state.get('credentials') or {}).get(descriptor.get('credential_id')) \
+        if descriptor.get('credential_id') else None
+    if isinstance(credential, dict) and credential.get('agent_id'):
+        allowed.add(credential['agent_id'])
+    if head not in allowed:
+        return _envelope(126, stderr='The actor is not the account or agent the live-authority descriptor '
+                                     'names\n', authority_status=403)
+    return None
 
 
 def run_guarded(request, journal_path, effect, authority_config=None,

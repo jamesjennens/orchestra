@@ -435,6 +435,11 @@ def main():
             refuse_http_actor = None
         if refuse_http_actor is not None:
             refuse_http_actor(request.get('actor'), config is not None)
+        denied = http_authority.http_actor_denial(request, config) \
+            if http_authority is not None and hasattr(http_authority, 'http_actor_denial') else None
+        if denied is not None:
+            print(json.dumps(denied))
+            return
         if http_authority is not None and hasattr(http_authority, 'run_guarded'):
             parameters = inspect.signature(http_authority.run_guarded).parameters
             kwargs = {}

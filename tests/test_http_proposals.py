@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 
 KIT = Path(__file__).resolve().parents[1]
@@ -376,6 +377,180 @@ class ReservationCase(ProposalHarness):
                 with self.subTest(actor=actor, action=action), \
                         self.assertRaisesRegex(ValueError, 'only the HTTP service acts under'):
                     endpoint.execute(root, {'project': 'trial', 'actor': actor, 'action': action, 'args': ['list']})
+
+
+class ReviewFixCase(ProposalHarness):
+    """kittrial-5bb.70 review 01a10262."""
+
+    def plain(self, actor, action, args, attachments=None, flags=(), authority=None):
+        """One request to the endpoint as a caller confined to its command line sends it."""
+        request = {'project': self.project, 'actor': actor, 'action': action, 'args': args,
+                   'attachments': attachments or {}}
+        if authority is not None:
+            request['authority'] = authority
+        done = subprocess.run([sys.executable, str(STUB), '--root', str(self.canonical_root), *flags],
+                              input=json.dumps(request), capture_output=True, text=True, timeout=60,
+                              env=dict(os.environ, STRICT_ENDPOINT_PROJECTS='1'))
+        return json.loads(done.stdout)
+
+    def revise_payload(self, key, **extra):
+        view = self.get(key)
+        return json.dumps(dict({'schema_version': 1, 'operation_id': 'ssh-revise-%d' % view['revision'], 'key': key,
+                                'revision': view['revision'] + 1, 'expected_sha256': view['sha256'],
+                                'submitter': 'account:' + self.uid('alex'), 'target': {'kind': 'requirement-new'},
+                                'text': "Mallory's text under alex's name.", 'rationale': None, 'evidence': [],
+                                'attachments': []}, **extra))
+
+    def test_an_ssh_caller_cannot_rewrite_a_web_submitted_proposal(self):
+        # P1 (the reviewer's p4.py A): alex submits over HTTP; mallory revises over SSH
+        # naming alex's account and the expected hash.
+        key = self.submit().data['key']
+        rows_before = json.dumps(stub_module().Canonical(self.canonical_root, self.project).rows(), sort_keys=True)
+        for state in ('submitted', 'needs-info'):
+            with self.subTest(state=state):
+                answer = self.plain('mallory', 'proposal', ['revise', '@attachment:0'],
+                                    {'0': {'flag': '--file', 'text': self.revise_payload(key)}})
+                self.assertEqual(answer['returncode'], 2, answer)
+                self.assertIn('Only the submitter may revise proposal %s: actor mallory is not server-bound as '
+                              'account:%s' % (key, self.uid('alex')), answer['stderr'])
+                view = self.get(key)
+                self.assertEqual((view['revision'], view['identity'], view['state']), (1, 'verified', state))
+            if state == 'submitted':
+                self.assertEqual(rows_before, json.dumps(
+                    stub_module().Canonical(self.canonical_root, self.project).rows(), sort_keys=True))
+                self.dispose(key, 'under-review')
+                self.assertEqual(201, self.dispose(key, 'needs-info', question='Which feed?').status)
+        # alex still answers over HTTP, and the proposal stays verified.
+        view = self.get(key, 'blair')
+        revised = self.request('POST', self.base(), {
+            'key': key, 'revision': 2, 'expected_sha256': view['sha256'], 'target': {'kind': 'requirement-new'},
+            'text': 'The pinned feed is A.', 'rationale': None, 'evidence': [], 'attachments': []},
+            token=self.token('alex'), key='alex-revise-0001')
+        self.assertEqual(200, revised.status, revised.data)
+        view = self.get(key)
+        self.assertEqual((view['revision'], view['identity'], view['state'], view['warnings']),
+                         (2, 'verified', 'under-review', []))
+
+    def test_a_revision_written_by_another_author_reads_unverified_everywhere(self):
+        # The reader half: what a kit without the writer rule accepted is not presented as alex's.
+        key = self.submit().data['key']
+        entry, row = pr.find_entry(pr.read_key_rows(self.native(), key), key, [])
+        record = pr.revision_record({'target': {'kind': 'requirement-new'}, 'text': "Mallory's text.",
+                                     'rationale': None, 'evidence': [], 'attachments': []}, row['id'], 2,
+                                    entry['first']['submitter'], key, None)
+        stub_module().Canonical(self.canonical_root, self.project, actor='mallory').run(
+            ['comments', 'add', row['id'], pr.revision_comment(record), '--json'])
+        view = self.get(key)
+        self.assertEqual((view['revision'], view['identity']), (2, 'unverified'))
+        self.assertEqual([w['code'] for w in view['warnings']], ['identity-broken'])
+        self.assertIn('revision 2 was written by mallory', view['warnings'][0]['detail'])
+        queue = self.request('GET', self.base(), token=self.token('blair')).data['items']
+        self.assertEqual([(item['key'], item['identity']) for item in queue], [(key, 'unverified')])
+        log = self.request('GET', '/v1/me/contributions', token=self.token('alex')).data
+        self.assertEqual((log['items'], log['total']), ([], 0))                  # mine requires verified
+        # ...and the account it names is no longer shown the coordinator's words on it.
+        self.dispose(key, 'under-review')
+        self.dispose(key, 'rejected', reason='Not what alex wrote.')
+        seen = self.get(key, 'alex')
+        self.assertEqual((seen['mine'], seen['disposition']['reason'], seen['disposition']['withheld']),
+                         (False, None, True))
+        self.assertNotIn('proposal mine', seen['coverage'])
+        self.assertIn('returned only to the submitter and to members who can approve', seen['coverage'])
+
+    def test_flag_like_values_never_reach_the_endpoint(self):
+        # P2: `?state=--help` returned 200 with the endpoint's help payload.
+        key = self.submit().data['key']
+        task = self.create_task(self.token('blair'), self.project, 'A task').data['id']
+        flags = ('--help', '-h', '--json', '--limit', '-x', '--state=accepted', '@attachment:0')
+        base = '/v1/projects/%s' % self.project
+        reads = [(self.base(), ('state', 'target', 'limit', 'cursor')),
+                 ('%s/%s' % (self.base(), key), ('history',)),
+                 ('/v1/me/contributions', ('limit',)),
+                 (base + '/references', ('tag', 'owner', 'state', 'due', 'limit', 'cursor')),
+                 (base + '/tasks', ('limit', 'cursor', 'status', 'review_state', 'assignee')),
+                 (base + '/tasks/%s/history' % task, ('limit', 'cursor')),
+                 (base + '/queue', ('state', 'limit', 'cursor'))]
+        from urllib.parse import quote
+        for path, names in reads:
+            for name in names:
+                for value in flags:
+                    with self.subTest(path=path.replace(self.project, 'P'), name=name, value=value):
+                        response = self.request('GET', '%s?%s=%s' % (path, name, quote(value)),
+                                                token=self.token('blair'))
+                        self.assertIn(response.status, (400, 409, 422), response.data)   # 409: Invalid cursor
+                        self.assertNotIn('usage', json.dumps(response.data).lower())
+                        self.assertNotIn('"action"', json.dumps(response.data))
+        # Path parameters cannot start with a dash at all: the route does not match.
+        for path in ('%s/--help' % self.base(), base + '/references/--help', base + '/tasks/--help'):
+            self.assertIn(self.request('GET', path, token=self.token('blair')).status, (400, 404), path)
+        # The good values still work.
+        for query in ('state=submitted', 'target=requirement-new-area', 'limit=5'):
+            self.assertEqual(200, self.request('GET', '%s?%s' % (self.base(), query),
+                                               token=self.token('blair')).status, query)
+        # A positional body value: a task title is never a flag.
+        for title in ('--help', '-h', '@attachment:0'):
+            made = self.request('POST', base + '/tasks', {'title': title}, token=self.token('blair'),
+                                key='title-' + title.strip('-@:0'))
+            self.assertEqual(422, made.status, made.data)
+        import http_service
+        for value in ('--help', '-h', '', '@attachment:0', 'a\0b', None, 7):
+            with self.subTest(value=value), self.assertRaises(http_service.HttpError):
+                http_service.caller_arg(value, 'state')
+        self.assertEqual(http_service.caller_arg('submitted', 'state'), 'submitted')
+
+    def test_an_http_shaped_actor_always_needs_the_verified_descriptor(self):
+        # P3: launched with --authority-store alone (as the service launches its reads), a
+        # raw write under a usr_ actor used to succeed with no descriptor.
+        task = self.create_task(self.token('blair'), self.project, 'A task').data['id']
+        store = ('--authority-store', str(self.store.path))
+        comment = ['comments', 'add', task, 'planted under an account id', '--json']
+        count = lambda: len(next(row for row in stub_module().Canonical(self.canonical_root, self.project).rows()
+                                 if row['id'] == task).get('comments') or [])
+        before = count()
+        for flags in (store, store + ('--require-authority',)):
+            for actor in (self.uid('alex'), self.uid('alex') + '/worker', 'agent_0123456789abcdef'):
+                with self.subTest(flags=len(flags), actor=actor[:6]):
+                    answer = self.plain(actor, 'bd', comment, flags=flags)
+                    self.assertEqual((answer['returncode'], answer.get('authority_status')), (126, 401), answer)
+                    self.assertIn('Live authority descriptor required', answer['stderr'])
+                    # A read under the shape is refused the same way.
+                    self.assertEqual(self.plain(actor, 'bd', ['list', '--json'], flags=flags)['returncode'], 126)
+        # A descriptor that does not pass the live store, and one that names another account.
+        forged = {'user_id': self.uid('alex'), 'via': 'session', 'session_id': 'sess_nope', 'project_id':
+                  self.project, 'capability': 'tasks.write'}
+        self.assertEqual(self.plain(self.uid('alex'), 'bd', comment, flags=store, authority=forged)['returncode'], 126)
+        self.assertEqual(count(), before)
+        state = {'credentials': {'cred_1': {'agent_id': 'agent_0123456789abcdef'}}}
+        with unittest.mock.patch.object(http_authority, 'read_state', return_value=state), \
+                unittest.mock.patch.object(http_authority, 'decide'):
+            config = http_authority.AuthorityConfig(str(self.store.path), None)
+            ok = {'user_id': 'usr_0123456789abcdef', 'credential_id': 'cred_1'}
+            for actor, authority, denied in (
+                    ('usr_0123456789abcdef', ok, None), ('usr_0123456789abcdef/label', ok, None),
+                    ('agent_0123456789abcdef', ok, None), ('usr_fedcba9876543210', ok, 403),
+                    ('agent_fedcba9876543210', ok, 403),
+                    ('agent_0123456789abcdef', {'user_id': 'usr_0123456789abcdef'}, 403),
+                    ('usr_0123456789abcdef', None, 401), ('alice', None, None), ('http/read', None, None)):
+                with self.subTest(actor=actor, authority=bool(authority)):
+                    answer = http_authority.http_actor_denial({'actor': actor, 'authority': authority}, config)
+                    self.assertEqual(answer and answer.get('authority_status'), denied, answer)
+            self.assertEqual(http_authority.http_actor_denial({'actor': 'usr_0123456789abcdef', 'authority': ok},
+                                                              None)['authority_status'], 401)
+        # The service's own writes still pass: they carry the descriptor.
+        self.assertEqual(201, self.create_task(self.token('alex'), self.project, 'Still works').status)
+
+    def test_a_credential_namespace_cannot_be_another_accounts_id(self):
+        url = '/v1/projects/%s/worker-credentials' % self.project
+        for actor in (self.uid('alex'), self.uid('alex') + '/worker', 'usr_0123456789abcdef',
+                      'agent_0123456789abcdef', 'agent_0123456789abcdef/x'):
+            with self.subTest(actor=actor[:8]):
+                refused = self.request('POST', url, {'label': 'w', 'actor': actor}, token=self.token('blair'))
+                self.assertEqual(422, refused.status, refused.data)
+                self.assertIn('other than your own account id', json.dumps(refused.data))
+        for actor in (self.uid('blair'), self.uid('blair') + '/worker', 'ci-bot', 'usr_short'):
+            with self.subTest(actor=actor[:8]):
+                self.assertEqual(201, self.request('POST', url, {'label': 'w', 'actor': actor},
+                                                   token=self.token('blair')).status)
 
 
 class InProcessCase(Harness):

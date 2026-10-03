@@ -1477,6 +1477,14 @@ class Service:
             if actor is not None and (not isinstance(actor, str) or not re.fullmatch(
                     r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,63}', actor)):
                 raise invalid('Invalid credential actor namespace')
+            # The id shapes are what make a record read as written by that account or
+            # agent (kittrial-5bb.70 review 01a10262): the only one an owner may name is
+            # their own account id.
+            claimed = actor.split('/', 1)[0] if actor is not None else None
+            if claimed is not None and re.fullmatch(r'(?:usr|agent)_[0-9a-f]{16}', claimed) \
+                    and claimed != principal.user_id:
+                raise invalid('A credential actor namespace cannot have the shape of an account or agent id '
+                              'other than your own account id')
             secret = new_token()
             # ``created_at`` is informational and stays on the raw clock; the credential's
             # expiry is stamped on the monotone clock, so a credential issued during a

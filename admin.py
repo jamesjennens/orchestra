@@ -3062,6 +3062,8 @@ def main():
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('proposal-decide',help='record the owner decision on an escalated requirement proposal (operator allowlist)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('proposal-http-records',help='list the proposal revisions and dispositions whose native author has an HTTP account or agent id shape, with their native creation time (read-only; run after an upgrade and after a rollback)')
+    a.add_argument('project');a.add_argument('--before',default=None,help='only records natively created before this UTC stamp (YYYY-MM-DDTHH:MM:SSZ), the deploy time of the kit with the reservation')
     a=sub.add_parser('proposal-settings',help='read or change the contribution settings: the actor map and the owner deciders (operator allowlist)')
     a.add_argument('project');a.add_argument('--actor',required=True)
     a.add_argument('--map-actor',dest='map_actor',metavar='ACTOR',help='map a session actor to a person, with --to')
@@ -3309,6 +3311,15 @@ def main():
                 yield
         print(json.dumps(capability_verification.verify_batch(payload,args.actor,run,operators=authority,
                                                               verifiers=listed,journal=path,lock=held)))
+    elif args.command=='proposal-http-records':
+        import proposal_records
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        if args.before is not None and not proposal_records.STAMP.fullmatch(args.before):
+            raise ValueError('--before is a UTC stamp, YYYY-MM-DDTHH:MM:SSZ')
+        # Read-only: no lock, no actor. It reads every proposal anchor with its comments.
+        rows=proposal_records.read_rows(lambda argv:run_bd(root,args.project,argv))
+        print(json.dumps(proposal_records.http_authored(rows,args.before),ensure_ascii=False))
     elif args.command in ('proposal-review','proposal-decide','proposal-settings'):
         # Requirement proposals (.58 slice 1a, kittrial-5bb.68). Everything that rests on
         # the operator allowlist is a host command, because over SSH the actor is

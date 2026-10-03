@@ -1149,6 +1149,10 @@ class EndpointBackend:
         task_id = payload.get('task_id')
         if route == 'tasks.create':
             title = str(payload.get('title') or '')
+            if title.startswith(('-', '@')):
+                # The title is a positional argument of the native create: a leading dash
+                # would be read as a flag, a leading @ as the attachment transport.
+                raise invalid('A task title cannot start with "-" or "@"')
             description = payload.get('description')
             if description:
                 return ('bd', project_id, ['create', title, '@attachment:0', '--json'],
@@ -1229,15 +1233,15 @@ class EndpointBackend:
         """One page of the reference catalog through the endpoint's read-only `ref list`."""
         args = ['list', '--limit', str(options['limit']), '--offset', str(options['offset'])]
         for tag in options.get('tags') or []:
-            args += ['--tag', tag]
+            args += ['--tag', caller_arg(tag, 'tag')]
         for name in ('owner', 'state', 'due'):
             if options.get(name):
-                args += ['--' + name, options[name]]
+                args += ['--' + name, caller_arg(options[name], name)]
         return self._ref_read(project_id, args)
 
     def reference(self, project_id, key):
         """One entry through `ref get`; an unknown or unfinished key is a 404."""
-        return self._ref_read(project_id, ['get', key], missing=True)
+        return self._ref_read(project_id, ['get', caller_arg(key, 'key')], missing=True)
 
     def proposal_read(self, project_id, args, missing=False):
         """One read-only `proposal get|list|mine` through the endpoint (.58 slice 1b).
@@ -1614,6 +1618,19 @@ def next_action(task):
     if task.get('assignee'):
         return {'who': 'assignee', 'text': 'Deliver a contribution'}
     return {'who': 'anyone', 'text': 'Claim this task'}
+
+
+def caller_arg(value, name):
+    """A caller-supplied value on its way into an endpoint argument list.
+
+    Never a flag and never the attachment transport: a query value such as `--help`
+    used to reach the endpoint's own option parser and came back as its help payload
+    (kittrial-5bb.70 review 01a10262). Each route validates its values against their
+    closed set or pattern first; this is the backstop every such value passes through.
+    """
+    if not isinstance(value, str) or not value or value.startswith(('-', '@')) or '\0' in value:
+        raise invalid('%s is not a valid value' % name)
+    return value
 
 
 def task_matches(task, filters):
@@ -3023,7 +3040,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         if isinstance(submitter, str) and submitter.startswith('account:'):
             account = submitter[len('account:'):]
             item['submitter_name'] = self.service.actor_names([account]).get(account, None)
-        mine = submitter == 'account:' + ctx.principal.user_id
+        # "Mine" needs the proposal to be verified as the account's: one that merely names
+        # it, or whose later revision someone else wrote, does not show its coordinator
+        # text to that account (review 01a10262).
+        mine = submitter == 'account:' + ctx.principal.user_id and item.get('identity') == 'verified'
         item['mine'] = mine
         if mine or CAP_APPROVE in capabilities:
             return item
@@ -3084,9 +3104,17 @@ class ApiHandler(BaseHTTPRequestHandler):
         pid = ctx.params['pid']
         limit, state = self._page(ctx, ctx.query)
         args = ['list', '--limit', str(limit), '--offset', str(state['o'])]
-        for name in ('state', 'target'):
-            if ctx.query.get(name):
-                args += ['--' + name, ctx.query[name]]
+        import proposal_records
+        wanted = ctx.query.get('state')
+        if wanted:
+            if wanted not in proposal_records.STATES:
+                raise invalid('state must be one of ' + ', '.join(proposal_records.STATES))
+            args += ['--state', caller_arg(wanted, 'state')]
+        target = ctx.query.get('target')
+        if target:
+            if not proposal_records.valid_target_filter(target):
+                raise invalid('target must be a requirement key or a requirement area')
+            args += ['--target', caller_arg(target, 'target')]
         result = dict(self.backend.proposal_read(pid, args))
         capabilities = self.service.capabilities_for(ctx.principal, pid)
         result['items'] = [self._proposal_view(ctx, capabilities, item) for item in result.get('items') or []]
@@ -3102,11 +3130,11 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._proposals_backend()
         self._project(ctx, CAP_READ)
         pid = ctx.params['pid']
-        args = ['get', ctx.params['key']]
+        args = ['get', caller_arg(ctx.params['key'], 'key')]
         if ctx.query.get('history'):
             if not re.fullmatch(r'[0-9]{1,2}', ctx.query['history']):
                 raise invalid('history must be a number from 1 to 50')
-            args += ['--history', ctx.query['history']]
+            args += ['--history', caller_arg(ctx.query['history'], 'history')]
         capabilities = self.service.capabilities_for(ctx.principal, pid)
         result = self._proposal_view(ctx, capabilities, self.backend.proposal_read(pid, args, missing=True))
         result['can_triage'] = CAP_APPROVE in capabilities

@@ -124,7 +124,18 @@ class EndpointDispatchTests(unittest.TestCase):
         self.assertEqual((view['state'], view['identity'], view['text']['trust']),
                          ('submitted', 'unverified', 'unreviewed'))
         self.assertEqual(self.execute(['list'])['total'], 1)
-        self.assertEqual(self.execute(['mine', '--submitter', 'person:alex'])['total'], 1)
+        # `mine` lists verified proposals only; this one merely names its submitter.
+        mine = self.execute(['mine', '--submitter', 'person:alex'])
+        self.assertEqual((mine['total'], mine['unverified_omitted']), (0, 1))
+        # Help is a command, never an option value (kittrial-5bb.70 review 01a10262).
+        self.assertEqual(self.execute(['list', '--help'])['action'], 'proposal')
+        for args, message in ((['list', '--state', '--help'], '--state must be one of'),
+                              (['list', '--target', '-h'], '--target is a requirement key'),
+                              (['list', '--limit', '--help'], '--limit must be a number'),
+                              (['get', made['key'], '--history', '-h'], '--history must be a number'),
+                              (['mine', '--submitter', '--help'], 'durable identity|submitter')):
+            with self.subTest(args=args), self.assertRaisesRegex(Exception, message):
+                self.execute(args)
         self.assertEqual(self.execute(['--help'])['action'], 'proposal')
         self.assertEqual((self.locks.call_count, self.guarded), (0, []))
         # A caller who names the allowlisted operator still cannot triage through the endpoint.
@@ -175,6 +186,33 @@ class HostCommandTests(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()) as out:
             admin.main()
         return json.loads(out.getvalue())
+
+    def test_the_http_records_scan_is_a_read_only_host_command(self):
+        # kittrial-5bb.70 review 01a10262: list proposal records with HTTP-shaped authors.
+        def scan(*argv):
+            with patch.object(sys, 'argv', ['admin.py', '--root', str(self.root), 'proposal-http-records', 'trial',
+                                            *argv]),                     patch.object(admin, 'root_path', return_value=self.root),                     patch.object(admin, 'run_bd', side_effect=self.run_native),                     contextlib.redirect_stdout(io.StringIO()) as out:
+                admin.main()
+            return json.loads(out.getvalue())
+        self.native.calls = []
+        self.assertEqual((scan()['total'], scan()['records']), (0, []))
+        row = self.native.rows[-1]
+        planted = pr.revision_record({'target': {'kind': 'requirement-new'}, 'text': 'Planted.', 'rationale': None,
+                                      'evidence': [], 'attachments': []}, row['id'], 2, 'person:alex',
+                                     self.made['key'], None)
+        row['comments'].append({'id': 'c-planted', 'author': 'usr_0123456789abcdef',
+                                'created_at': '2026-09-30T08:00:00Z', 'text': pr.revision_comment(planted)})
+        found = scan()
+        self.assertEqual([(item['proposal'], item['author'], item['native_created_at'], item['revision'])
+                          for item in found['records']],
+                         [(self.made['key'], 'usr_0123456789abcdef', '2026-09-30T08:00:00Z', 2)])
+        self.assertEqual(scan('--before', '2026-09-30T00:00:00Z')['total'], 0)
+        self.assertEqual(scan('--before', '2026-10-01T00:00:00Z')['total'], 1)
+        with self.assertRaisesRegex(ValueError, '--before is a UTC stamp'):
+            scan('--before', 'yesterday')
+        self.assertFalse([call for call in self.native.calls if call[0] in ('create', 'update', 'close')
+                          or call[:2] == ['comments', 'add']])
+        self.flock.assert_not_called()
 
     def payload(self, to_state, **fields):
         view = pr.read(['get', self.made['key']], self.native, COORD, [COORD, OWNER], self.project)

@@ -1152,12 +1152,24 @@ action unless the HTTP service launched the endpoint. Declare your own session a
   - `supersedes_chain` lists the keys this proposal supersedes, nearest first. The
     walk stops after 8 hops, at a cycle, or at a proposal that cannot be read, and
     `supersedes_warning` then says which; otherwise it is `null`.
-- **`identity`** is `verified` when the actor that submitted the proposal maps,
-  through the project's actor map, to its `submitter`; otherwise `unverified`. Over
-  SSH this is attribution, not authentication: the actor is self-declared, and no
-  authority rests on it. A proposal submitted through the web service is
-  server-bound and always reads `verified`: its author is the account itself, or the
-  agent that `submitted_by_agent` names.
+- **`identity`** is `verified` when the native author of **every** revision stands
+  for the proposal's `submitter`: the author maps to it through the project's actor
+  map, or the revision was written through the web service (its author is the account
+  itself, or the agent that the revision's `submitted_by_agent` names). Otherwise it
+  is `unverified`; when revision 1 was the submitter's and a later one was not, an
+  `identity-broken` warning names that revision. Over SSH this is attribution, not
+  authentication: the actor is self-declared, and no authority rests on it.
+- **Who may revise.** Only the submitter. Over the endpoint the declared actor must
+  resolve to the submitter through the actor map; for a submitter that is not an
+  `account:` identity, the actor that wrote every earlier revision may also revise
+  (an unmapped contributor revising their own proposal). Repeating the stored
+  `submitter` in the payload is not enough, and an `account:` submitter is never
+  revised on the actor's say-so.
+- **`mine` lists verified proposals only.** A proposal that merely names the
+  identity is counted in `unverified_omitted` and not shown: `mine` returns the
+  coordinator's reason and question, which are for the submitter.
+- **Help is a command.** `proposal --help` and `proposal list --help` return the help
+  payload. `--help` in an option's value position is that option's bad value.
 - **`linked_requirement`** is `{id, revision, sha256, acceptance_state,
   manifest_sha256}` for an incorporated proposal. `acceptance_state` is read live
   from the requirement record: `accepted`, `draft` or `missing`.

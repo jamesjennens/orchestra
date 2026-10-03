@@ -255,6 +255,11 @@ def valid_target(value):
     return value
 
 
+def valid_target_filter(value):
+    """Whether `value` can be a `--target` filter: a requirement key or an area slug."""
+    return isinstance(value, str) and bool(REQUIREMENT_KEY.fullmatch(value) or AREA.fullmatch(value))
+
+
 def valid_content(record):
     """The contributor-written part of a revision: the same rules at write and at read."""
     valid_target(record.get('target'))
@@ -615,6 +620,12 @@ def valid_namespace(name):
     return name
 
 
+def reserved_namespace(name):
+    """Whether a namespace has the shape of an HTTP account or agent id. The server binds
+    those ids to their account; a map entry for one could only re-attribute them."""
+    return isinstance(name, str) and bool(HTTP_ACCOUNT.fullmatch(name) or HTTP_AGENT.fullmatch(name))
+
+
 def parse_settings(body):
     if not isinstance(body, str) or not body.startswith(SETTINGS_PREFIX):
         return None
@@ -730,7 +741,10 @@ class Resolver:
     def __init__(self, settings, project=None, names=None):
         mapping = (settings or {}).get('contributions', default_contributions())['actor_map']
         self.actors = dict(mapping['actors'])
-        self.namespaces = sorted(mapping['namespaces'].items(), key=lambda item: (-len(item[0]), item[0]))
+        # A namespace with an HTTP id shape is never honoured (`reserved_namespace`): the
+        # server binds those ids, so no map entry may give them another identity.
+        self.namespaces = sorted(((name, identity) for name, identity in mapping['namespaces'].items()
+                                  if not reserved_namespace(name)), key=lambda item: (-len(item[0]), item[0]))
         self.names = session_names(project) if names is None else names
 
     def __call__(self, actor):
@@ -738,6 +752,8 @@ class Resolver:
             return None
         if HTTP_ACCOUNT.fullmatch(actor):
             return 'account:' + actor   # server-bound: the account is the identity (4.2)
+        if HTTP_AGENT.fullmatch(actor):
+            return None   # an agent is not a person; the record it wrote names its owner (`writes_as`)
         if actor in self.actors:
             return self.actors[actor]
         name = self.names.get(actor)
@@ -749,6 +765,52 @@ class Resolver:
             if name == namespace or name.startswith(namespace + '/') or name.startswith(namespace + '-'):
                 return identity
         return None
+
+
+def writes_as(author, submitter, resolve=None, agent=None):
+    """Whether a record's native author stands for `submitter` (review 01a10262, P1).
+
+    The one binding rule, used by the reader for every revision and by the writer before
+    a revise. Server-bound: an HTTP account that IS the submitter, or an HTTP agent that
+    the record itself names (`agent`, the record's `submitted_by_agent`; the endpoint
+    bound its submitter to the agent's owner when it wrote the record). Otherwise the
+    project's actor map must resolve the author to the submitter. A payload that merely
+    repeats the stored submitter string proves nothing.
+    """
+    if not isinstance(author, str) or not isinstance(submitter, str):
+        return False
+    if HTTP_ACCOUNT.fullmatch(author):
+        return submitter == 'account:' + author
+    if HTTP_AGENT.fullmatch(author):
+        return isinstance(agent, dict) and agent.get('agent_id') == author
+    return resolve is not None and resolve(author) == submitter
+
+
+def require_submitter(entry, key, actor, resolve, http=None):
+    """The writer half: only the submitter revises a proposal. Zero writes on a refusal.
+
+    Under HTTP authority the endpoint has bound the payload's submitter to the signed-in
+    account (`bind_http_submission`), so the account, or its agent, must be the stored
+    submitter. Over the plain endpoint the actor is self-declared: it must resolve to
+    the submitter through the actor map. For a submitter that is not an `account:`
+    identity, the native author of every earlier revision may also revise (an unmapped
+    contributor revising their own, unverified, proposal). An `account:` submitter is
+    never revised on the strength of the actor's own say-so.
+    """
+    first = entry.get('first')
+    if first is None:
+        return   # malformed or unsupported: the write path refuses it with its own message
+    submitter = first['submitter']
+    if http is not None:
+        allowed = http.submitter == submitter
+    else:
+        allowed = resolve(actor) == submitter or (
+            not submitter.startswith('account:') and entry.get('authors') == [actor])
+    if not allowed:
+        raise ValueError('Only the submitter may revise proposal %s: actor %s is not server-bound as %s and does '
+                         'not resolve to it through the actor map. Revise it from the account or session that '
+                         'submitted it, or submit a new proposal that supersedes it.'
+                         % (key, str(actor)[:60], submitter))
 
 
 # -- reading one proposal ------------------------------------------------------------------------
@@ -764,13 +826,21 @@ def entry_view(row, operators=None, resolve=None, verify_label=True):
     ledger asserts; `state` is the state the trusted records give. They differ only
     when a disposition is INERT (its author fails `authority`), which is reported and
     never moves state. The `proposal:<state>` label must equal `claimed`.
+
+    `identity` is `verified` only when the native author of EVERY revision stands for
+    the submitter (`writes_as`); a counted submitter-role disposition has the author of
+    the revision it follows, so it is covered by the same test. When revision 1 is
+    bound and a later revision is not, `identity_broken` names that revision and a
+    warning says so: the text a reader sees was not written by the submitter.
+    `authors` lists the distinct native authors of the revisions, in order.
     """
     view = {'key': None, 'native_id': row.get('id'), 'state': None, 'claimed': None, 'record': None,
             'first': None, 'revisions': 0, 'author': None, 'identity': 'unverified', 'timeline': [],
             'disposition': None, 'inert': 0, 'inert_authors': [], 'warnings': [], 'record_comment_id': None,
-            'disposition_comment_id': None, 'changed_at': None}
+            'disposition_comment_id': None, 'changed_at': None, 'authors': [], 'identity_broken': None}
     try:
         newest = first = None
+        unbound, unbound_dispositions = [], []
         claimed = state = None
         last_was_revision_by = None
         for comment in row.get('comments') or []:
@@ -802,6 +872,10 @@ def entry_view(row, operators=None, resolve=None, verify_label=True):
                     if claimed not in ('submitted', 'needs-info'):
                         raise ValueError('a revision was written while the proposal was %s' % claimed)
                 newest = record
+                if author not in view['authors']:
+                    view['authors'].append(author)
+                if not writes_as(author, record['submitter'], resolve, record['submitted_by_agent']):
+                    unbound.append((record['revision'], author))
                 view.update(record=record, revisions=record['revision'], record_comment_id=comment.get('id'),
                             changed_at=record['created_at'])
                 last_was_revision_by = author
@@ -827,6 +901,13 @@ def entry_view(row, operators=None, resolve=None, verify_label=True):
             claimed = record['to_state']
             if trusted and record['from_state'] == state:
                 state = record['to_state']
+                if record['role'] == 'submitter' and not writes_as(author, newest['submitter'], resolve,
+                                                                  newest['submitted_by_agent']):
+                    # The return-to-review record of someone who is not the submitter: it
+                    # follows the ledger, so it still moves the state, but the proposal is
+                    # not the submitter's any more and says so (review 01a10262, P1 step 4).
+                    unbound_dispositions.append((newest['revision'], author, comment.get('id'),
+                                                 record['to_state']))
                 view.update(disposition=entry, disposition_comment_id=comment.get('id'),
                             changed_at=record['at'])
             else:
@@ -853,15 +934,23 @@ def entry_view(row, operators=None, resolve=None, verify_label=True):
         if verify_label and not view['label_ok']:
             raise ValueError('the state label does not match the disposition ledger')
         view.update(key=newest['key'], state=state, claimed=claimed)
-        if resolve is not None and resolve(view['author']) == newest['submitter']:
+        # Verified: every revision was written by the submitter - under HTTP authority by
+        # the account itself or by an agent the record names (slice 1b), or by an actor the
+        # project's map resolves to the submitter.
+        if not unbound and not unbound_dispositions:
             view['identity'] = 'verified'
-        # Server-bound attribution (slice 1b): revision 1 was written under HTTP authority
-        # by the account itself, or by an agent the record names, for its owner.
-        author, agent = view['author'], first['submitted_by_agent']
-        if isinstance(author, str) and (
-                (HTTP_ACCOUNT.fullmatch(author) and newest['submitter'] == 'account:' + author)
-                or (HTTP_AGENT.fullmatch(author) and agent is not None and agent['agent_id'] == author)):
-            view['identity'] = 'verified'
+        elif (unbound or unbound_dispositions)[0][0] != 1:
+            revision, author = (unbound or unbound_dispositions)[0][:2]
+            moved = [item for item in unbound_dispositions if item[0] == revision]
+            view['identity_broken'] = {'revision': revision, 'author': author,
+                                       'disposition': moved[0][2] if moved else None}
+            view['warnings'].append({
+                'code': 'identity-broken',
+                'detail': 'revision %d was written by %s, who is not server-bound as and does not resolve to the '
+                          'submitter %s; the proposal reads unverified from that revision on%s'
+                          % (revision, str(author)[:60], newest['submitter'],
+                             '. The same author wrote the submitter-role disposition %s that moved it to %s'
+                             % (moved[0][2], moved[0][3]) if moved else '')})
     except (ValueError, TypeError, KeyError, AttributeError) as error:
         labels = [label for label in row.get('labels') or []
                   if isinstance(label, str) and label.startswith(KEY_LABEL)]
@@ -1382,6 +1471,11 @@ def apply_native(payload, actor, run, project, operators=None, http=None, from_f
     payload = validate_payload(payload)
     if http is not None:
         context['agent'] = bind_http_submission(payload, actor, http)
+    if payload['operation'] == 'revise':
+        rows = read_key_and_settings(run, payload['key'])
+        resolve = Resolver(settings_view(rows, operators), project)
+        entry, _ = find_entry(rows, payload['key'], operators, resolve, verify_label=False)
+        require_submitter(entry, payload['key'], actor, resolve, http)
     _check_target(payload, run)
     if payload['operation'] == 'submit' and payload.get('supersedes'):
         find_entry(read_key_rows(run, payload['supersedes']), payload['supersedes'], operators)
@@ -1599,6 +1693,56 @@ def dispose(payload, actor, run, project, operators=None, route='review', http=N
     return _disposed(key, task, record, core._comment_id(raw), False)
 
 
+def http_authored(rows, before=None):
+    """`admin.py proposal-http-records`: every proposal revision and disposition whose
+    native author has an HTTP account or agent id shape, with its native creation time.
+
+    Such a record reads as written under HTTP authority. A kit older than the actor-shape
+    reservation (any kit before kittrial-5bb.70, and any rollback to one) lets an SSH
+    caller write under such an actor, so a record created while such a kit was the
+    endpoint proves nothing. The operator compares the times with the deploy time;
+    `before` (a UTC stamp) keeps only the records natively created before it, and the
+    records with no readable native time, which cannot be cleared.
+    """
+    found = []
+    for row in rows or []:
+        if not isinstance(row, dict) or TYPE_LABEL not in (row.get('labels') or []):
+            continue
+        for comment in row.get('comments') or []:
+            body = comment.get('text') if isinstance(comment, dict) else None
+            kind = record_comment_kind(body)
+            author = comment.get('author') if isinstance(comment, dict) else None
+            if not kind or kind[0] not in ('requirement-proposal', 'proposal-disposition') \
+                    or not isinstance(author, str) or not (HTTP_ACCOUNT.fullmatch(author)
+                                                           or HTTP_AGENT.fullmatch(author)):
+                continue
+            revision = parse_revision(body) if kind[0] == 'requirement-proposal' else None
+            disposition = parse_disposition(body) if kind[0] == 'proposal-disposition' else None
+            created = comment.get('created_at')
+            created = created if isinstance(created, str) else None
+            if before is not None and created is not None and created[:19] >= before[:19]:
+                continue
+            keys = [label[len(KEY_LABEL):] for label in row.get('labels') or []
+                    if isinstance(label, str) and label.startswith(KEY_LABEL)]
+            item = {'proposal': keys[0] if len(keys) == 1 else None, 'task': row.get('id'),
+                    'comment_id': comment.get('id'), 'author': author, 'native_created_at': created,
+                    'kind': 'revision' if kind[0] == 'requirement-proposal' else 'disposition'}
+            if revision is not None:
+                item.update(revision=revision['revision'], submitter=revision['submitter'],
+                            record_at=revision['created_at'])
+            elif disposition is not None:
+                item.update(role=disposition['role'], to_state=disposition['to_state'], record_at=disposition['at'])
+            else:
+                item['unreadable'] = True
+            found.append(item)
+    found.sort(key=lambda item: (item['native_created_at'] or '', str(item['task']), str(item['comment_id'])))
+    return {'schema_version': 1, 'before': before, 'total': len(found), 'records': found,
+            'note': 'A record natively created while an endpoint without the actor-shape reservation was '
+                    'deployed (any kit before kittrial-5bb.70, or a rollback to one) is not proof of HTTP '
+                    'authority. Compare native_created_at with the deploy time. native_created_at comes from '
+                    'the tracker; record_at is the stamp the writer put in the record.'}
+
+
 def inert_refusal(key, entry):
     """Why no new disposition can be recorded on a proposal that carries inert ones, and
     what, if anything, an operator can do about it."""
@@ -1678,6 +1822,11 @@ def change_settings(changes, actor, run, operators=None):
     if 'map_actor' in changes:
         mapping['actors'][valid_actor_key(changes['map_actor'])] = valid_identity(changes['to'], '--to')
     if 'namespace' in changes:
+        if reserved_namespace(changes['namespace']):
+            raise ValueError('Namespace %s has the shape of an HTTP account or agent id. The server binds those ids '
+                             'to their account itself; a map entry for one is refused. To join an operator actor '
+                             'to a web account, map the operator actor: --namespace OPERATOR --to account:usr_<id>'
+                             % changes['namespace'])
         mapping['namespaces'][valid_namespace(changes['namespace'])] = valid_identity(changes['to'], '--to')
     if 'unmap_actor' in changes and mapping['actors'].pop(changes['unmap_actor'], None) is None:
         raise ValueError('That actor is not in the map')
@@ -1785,7 +1934,7 @@ def _coverage(entries, incomplete, scanned_all=True):
 
 
 def get(rows, key, operators, resolve, settings, requirements, actor, history=10, now=None, chain=None,
-        superseders_total=None, coordinator=None):
+        superseders_total=None, coordinator=None, http=False):
     """`rows` hold the proposal's own anchor and the anchors that supersede it. `chain` is
     `read_supersedes_chain`'s answer and `superseders_total` the count `read_superseders`
     found, when the caller made those reads."""
@@ -1827,8 +1976,11 @@ def get(rows, key, operators, resolve, settings, requirements, actor, history=10
             'timeline_total': len(entry['timeline']), 'inert_dispositions': entry['inert'],
             'warnings': entry['warnings'][:10], 'untrusted': UNTRUSTED_LINE,
             'coverage': 'the newest revision and the disposition timeline (newest %d of %d); a reason, a question '
-                        'and an escalation question are shown only to operators here and to the submitter in '
-                        'proposal mine' % (min(history, len(entry['timeline'])), len(entry['timeline']))}
+                        'and an escalation question are %s'
+                        % (min(history, len(entry['timeline'])), len(entry['timeline']),
+                           # Through the HTTP service the route withholds them per caller.
+                           'returned only to the submitter and to members who can approve' if http else
+                           'shown only to operators here and to the submitter in proposal mine')}
 
 
 def _matches(entry, options):
@@ -1850,6 +2002,12 @@ def list_entries(rows, options, operators, resolve, settings, requirements, acto
     entries, incomplete = catalog(rows, operators, resolve)
     scanned = entries[:PROPOSAL_SCAN_MAX]
     good = [entry for entry in scanned if entry['state'] not in ('malformed', 'unsupported') and _matches(entry, options)]
+    # `mine` is a person's own log, with the coordinator's words to them: a proposal that
+    # merely NAMES the submitter is not theirs. Only verified ones are listed; the rest
+    # are counted, never shown (review 01a10262).
+    unverified = [entry for entry in good if entry['identity'] != 'verified'] if mine else []
+    if mine:
+        good = [entry for entry in good if entry['identity'] == 'verified']
     good.sort(key=lambda entry: (entry['first']['created_at'], entry['key']))
     coordinator = authority(actor, operators) if coordinator is None else coordinator
     offset, limit = options.get('offset', 0), options.get('limit', 20)
@@ -1861,9 +2019,12 @@ def list_entries(rows, options, operators, resolve, settings, requirements, acto
     for item, entry in zip(page, shown):
         item.setdefault('disposition', _disposition_view(entry['disposition'], coordinator, mine)
                         if entry['disposition'] else None)
-    return {'schema_version': 1, 'total': len(good), 'items': page,
-            'next_offset': offset + limit if offset + limit < len(good) else None, 'untrusted': UNTRUSTED_LINE,
-            'coverage': _coverage(scanned, incomplete, len(entries) <= PROPOSAL_SCAN_MAX)}
+    result = {'schema_version': 1, 'total': len(good), 'items': page,
+              'next_offset': offset + limit if offset + limit < len(good) else None, 'untrusted': UNTRUSTED_LINE,
+              'coverage': _coverage(scanned, incomplete, len(entries) <= PROPOSAL_SCAN_MAX)}
+    if mine:
+        result['unverified_omitted'] = len(unverified)
+    return result
 
 
 # -- attention: `work` and `brief` ------------------------------------------------------------------
@@ -2025,8 +2186,9 @@ def help_payload():
                        'scan': PROPOSAL_SCAN_MAX},
             'notes': [UNTRUSTED_LINE,
                       'submitter is a durable identity, account:<uid> or person:<name>; a session actor is refused.',
-                      'identity is verified when the declared actor maps to the submitter in the actor map; over '
-                      'SSH that is attribution, not authentication.',
+                      'identity is verified when the author of every revision maps to the submitter in the actor '
+                      'map (or wrote it through the web service as that account); over SSH that is attribution, '
+                      'not authentication. Only the submitter revises; mine lists verified proposals only.',
                       'A reason, a question and an escalation question are returned by get and list only to an '
                       'actor on the operator allowlist, and by proposal mine --submitter IDENTITY to anyone who '
                       'names that identity. Over SSH the actor and the submitter are self-declared, so this is '
@@ -2080,7 +2242,9 @@ def read(args, run, actor, operators, project=None, full=False):
     them per caller from its server-bound identity (the submitter and members with
     `reviews.approve`, design 6.3 and 6.4)."""
     coordinator = True if full else None
-    if not args or args[0] == 'help' or any(token in ('--help', '-h') for token in args):
+    # Help is asked for in the command position (`proposal --help`, `proposal list --help`),
+    # never found among option VALUES: `list --state --help` is a bad state, not help.
+    if not args or args[0] in ('help', '--help', '-h') or args[1:2] in (['--help'], ['-h']):
         return help_payload()
     command, rest = args[0], args[1:]
     if command in HOST_ONLY:
@@ -2107,13 +2271,15 @@ def read(args, run, actor, operators, project=None, full=False):
         superseders, total = read_superseders(run, key, {row.get('id') for row in rows})
         chain = read_supersedes_chain(run, entry, operators)
         return get(rows + superseders, key, operators, resolve, settings, read_linked_requirements(run, [entry]),
-                   actor, history=history, chain=chain, superseders_total=total, coordinator=coordinator)
+                   actor, history=history, chain=chain, superseders_total=total, coordinator=coordinator, http=full)
     options = _options(rest, {'--state': 'state', '--target': 'target', '--submitter': 'submitter',
                               '--limit': 'limit', '--offset': 'offset'})
     if not 1 <= options['limit'] <= LIST_LIMIT_MAX:
         raise ValueError('proposal %s: --limit must be 1..%d' % (command, LIST_LIMIT_MAX))
     if 'state' in options:
         options['state'] = _state_name(options['state'])
+    if 'target' in options and not valid_target_filter(options['target']):
+        raise ValueError('proposal %s: --target is a requirement key or a requirement area' % command)
     if 'submitter' in options:
         valid_identity(options['submitter'], '--submitter')
     elif command == 'mine':

@@ -186,6 +186,17 @@ kit does**.
    agent-id shape and is the agent `submitted_by_agent` names, reads
    `identity: verified` on SSH as on HTTP. The resolver maps an account-id actor to
    `account:<id>` with no map entry, so the no-self rules compare people exactly.
+   - **Amended by review 01a10262 (kittrial-5bb.70 revision 2).** Identity is not
+     revision 1's author alone. `verified` needs the native author of EVERY revision to
+     stand for the submitter (server-bound, or resolved by the actor map), and a revise
+     is refused unless the caller does. Over the plain endpoint a payload that repeats
+     the stored submitter proves nothing. `mine` and `/v1/me/contributions` list
+     verified proposals only. Launched by the HTTP service, the endpoint needs the
+     verified descriptor for every action under an account- or agent-shaped actor.
+   - **The reservation is not retroactive.** A record written under such an actor while
+     a kit without the reservation was the endpoint reads as HTTP-written. The operator
+     scan `admin.py proposal-http-records` lists them with their native creation time
+     (docs/HTTP_DEPLOYMENT.md). A cut-over the reader honours is not built.
 5. **Who may submit over HTTP.** A member session, or an agent credential with the
    `proposals` scope (the submitter is the agent's owner and the agent is recorded).
    A worker credential is refused in this slice: its actor is a free-form namespace,

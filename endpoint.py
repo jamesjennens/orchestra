@@ -25,7 +25,7 @@ from reserved_comments import (carries_record_label, check_raw_request, comment_
                                first_reserved_label, is_record_anchor, label_guard_request,
                                operator_only_in_args, raw_file_flag_in_args,
                                reserved_label_in_args, unresolved_bd_flags, refuse_http_actor)
-from http_authority import AuthorityConfig, NativeRunner, journal_path, run_guarded
+from http_authority import AuthorityConfig, NativeRunner, http_actor_denial, journal_path, run_guarded
 
 ALLOWED={'list','show','ready','search','count','create','update','close','reopen','comments','dep','state','lint'}
 # Legacy name kept for operators reading this file; enforcement is the
@@ -111,6 +111,10 @@ def execute(root,request,authority_config=None,require_authority=False):
     if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
     actor=request.get('actor','')
     refuse_http_actor(actor,authority_config is not None)
+    # Launched by the HTTP service, an HTTP-shaped actor still needs the verified
+    # descriptor on every action, with or without --require-authority (review 01a10262).
+    denied=http_actor_denial(request,authority_config)
+    if denied is not None:return denied
     if request.get('action')=='session':
         from sessions import execute as session_execute
         args=request.get('args',[])

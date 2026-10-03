@@ -906,7 +906,14 @@ class ReadTests(ProposalCase):
                              (None, True, 'needs-info'))
         self.assertEqual(self.get(key)['disposition']['question']['text'],
                          'Which feed should the snapshot be pinned to?')
-        mine = self.read('mine', '--submitter', ALEX, actor='bob')['items'][0]
+        # `mine` lists verified proposals only (review 01a10262): until the submitter's
+        # session is mapped, the proposal merely names person:alex.
+        unmapped = self.read('mine', '--submitter', ALEX, actor='bob')
+        self.assertEqual((unmapped['items'], unmapped['total'], unmapped['unverified_omitted']), ([], 0, 1))
+        self.settings(namespace='alex', to=ALEX)
+        listed = self.read('mine', '--submitter', ALEX, actor='bob')
+        self.assertEqual((listed['total'], listed['unverified_omitted']), (1, 0))
+        mine = listed['items'][0]
         self.assertEqual((mine['disposition']['question']['text'], mine['next_actor'], mine['next_action']),
                          ('Which feed should the snapshot be pinned to?', 'submitter',
                           "Answer the coordinator's question with proposal revise."))
@@ -1136,3 +1143,176 @@ class AttentionTests(ProposalCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+MALLORY = 'session-00000000-0000-4000-8000-00000000000f'
+ALEX_ACCOUNT = 'account:usr_0123456789abcdef'
+
+
+class SubmitterBindingTests(ProposalCase):
+    """Review 01a10262, P1: identity is every revision's author, not a string in a payload."""
+
+    def forged_revision(self, key, author, revision=2):
+        """A well-formed next revision written natively by `author`, as a kit without the
+        writer rule accepted it."""
+        entry, row = pr.find_entry(pr.read_key_rows(self.native, key), key, OPS)
+        first = entry['first']
+        record = pr.revision_record({'target': {'kind': 'requirement-new'}, 'text': 'Text the submitter never wrote.',
+                                     'rationale': None, 'evidence': [], 'attachments': []}, row['id'], revision,
+                                    first['submitter'], key, first['supersedes'])
+        self.native.actor = author
+        self.native(['comments', 'add', row['id'], pr.revision_comment(record), '--json'])
+        return record
+
+    def test_only_the_submitter_revises(self):
+        key = self.submit()['key']
+        before = len(self.native.writes())
+        for state in ('submitted', 'needs-info'):
+            with self.subTest(state=state):
+                with self.assertRaisesRegex(ValueError, 'Only the submitter may revise proposal %s: actor %s is not '
+                                                        'server-bound as person:alex' % (key, MALLORY)):
+                    self.revise(key, actor=MALLORY, operation_id='mallory-' + state)
+                self.assertEqual(len(self.native.writes()), before)
+                self.assertEqual(self.get(key)['revision'], 1)
+            if state == 'submitted':
+                self.claim(key)
+                self.dispose(key, 'needs-info', question='Which feed?')
+                before = len(self.native.writes())
+        # The author of revision 1 still revises their own, unmapped, proposal.
+        self.assertEqual(self.revise(key)['revision'], 2)
+        self.assertEqual(self.get(key)['state'], 'under-review')      # the answer returns it to review
+        # Another session of the same person revises once the map resolves it to the submitter.
+        other = 'session-00000000-0000-4000-8000-000000000004'
+        self.sessions({SUBMITTER: 'alex/session7', other: 'alex/session8'})
+        key = self.submit(operation_id='alex-second')['key']
+        with self.assertRaisesRegex(ValueError, 'Only the submitter may revise'):
+            self.revise(key, actor=other, operation_id='other-1')
+        self.settings(namespace='alex', to=ALEX)
+        self.assertEqual(self.revise(key, actor=other, operation_id='other-1')['revision'], 2)
+        view = self.get(key)
+        self.assertEqual((view['identity'], view['warnings']), ('verified', []))
+
+    def test_an_account_submitter_is_never_revised_on_the_actors_say_so(self):
+        # Over the plain endpoint an actor that names an account as the submitter reads
+        # unverified, and even the same actor cannot revise it until the map resolves it.
+        key = self.submit(submitter=ALEX_ACCOUNT)['key']
+        self.assertEqual(self.get(key)['identity'], 'unverified')
+        before = len(self.native.writes())
+        for actor in (SUBMITTER, MALLORY):
+            with self.subTest(actor=actor), self.assertRaisesRegex(ValueError, 'Only the submitter may revise'):
+                self.revise(key, actor=actor, submitter=ALEX_ACCOUNT, operation_id='acct-' + actor[-1])
+        self.assertEqual(len(self.native.writes()), before)
+        self.map(SUBMITTER, ALEX_ACCOUNT)
+        self.assertEqual(self.revise(key, submitter=ALEX_ACCOUNT, operation_id='acct-ok')['revision'], 2)
+        self.assertEqual(self.get(key)['identity'], 'verified')
+
+    def test_a_revision_by_another_author_reads_unverified_and_is_named(self):
+        self.settings(namespace='alex', to=ALEX)
+        key = self.submit()['key']
+        self.assertEqual(self.get(key)['identity'], 'verified')
+        self.forged_revision(key, MALLORY)
+        view = self.get(key)
+        self.assertEqual((view['revision'], view['identity']), (2, 'unverified'))
+        self.assertEqual([(w['code'], 'revision 2 was written by %s' % MALLORY in w['detail'],
+                           'the proposal reads unverified from that revision on' in w['detail'])
+                          for w in view['warnings']], [('identity-broken', True, True)])
+        entry, _ = pr.find_entry(pr.read_key_and_settings(self.native, key), key, OPS,
+                                 pr.Resolver(pr.settings_view(pr.read_settings_rows(self.native), OPS), self.project))
+        self.assertEqual((entry['identity_broken'], entry['authors']),
+                         ({'revision': 2, 'author': MALLORY, 'disposition': None}, [SUBMITTER, MALLORY]))
+        self.assertEqual(self.read('list')['items'][0]['identity'], 'unverified')
+        mine = self.read('mine', '--submitter', ALEX)
+        self.assertEqual((mine['total'], mine['unverified_omitted']), (0, 1))
+        # The submitter cannot build on the forged revision by the same-author rule either.
+        self.sessions({SUBMITTER: 'someone-else/session7'})
+        with self.assertRaisesRegex(ValueError, 'Only the submitter may revise'):
+            self.revise(key, revision=3, operation_id='after-forgery')
+
+    def test_a_return_to_review_by_another_author_is_named_too(self):
+        # p4.py A step 4: after needs-info, the SSH revise also wrote the submitter-role
+        # return disposition, and it counted. What an older kit left behind still moves the
+        # state (it follows the ledger), but the proposal is no longer read as the submitter's.
+        self.settings(namespace='alex', to=ALEX)
+        key = self.submit()['key']
+        self.claim(key)
+        self.dispose(key, 'needs-info', question='Which feed?')
+        record = self.forged_revision(key, MALLORY)
+        row = pr.find_entry(pr.read_key_rows(self.native, key), key, OPS, verify_label=False)[1]
+        returned = pr.disposition_record(row['id'], record['sha256'], 'needs-info', 'under-review', 'submitter')
+        self.native(['comments', 'add', row['id'], pr.disposition_comment(returned), '--json'])
+        self.native(['update', row['id'], '--remove-label', pr.STATE_LABEL['needs-info'], '--add-label',
+                     pr.STATE_LABEL['under-review'], '--json'])
+        view = self.get(key)
+        self.assertEqual((view['state'], view['identity'], [w['code'] for w in view['warnings']]),
+                         ('under-review', 'unverified', ['identity-broken']))
+        self.assertIn('The same author wrote the submitter-role disposition', view['warnings'][0]['detail'])
+        self.assertIn('that moved it to under-review', view['warnings'][0]['detail'])
+        self.assertIn('shown only to operators here', view['coverage'])            # the SSH wording, over SSH
+        self.assertIn('returned only to the submitter and to members who can approve',
+                      pr.read(['get', key], self.native, COORD, OPS, self.project, full=True)['coverage'])
+        # A coordinator can still act on it: the ledger is consistent.
+        self.assertEqual(self.dispose(key, 'rejected', reason='Not the text the submitter wrote.')['state'],
+                         'rejected')
+
+    def test_the_binding_rule(self):
+        resolve = pr.Resolver({'contributions': {'actor_map': {
+            'actors': {SUBMITTER: ALEX}, 'namespaces': {'usr_0123456789abcdef': 'person:mallory',
+                                                        'agent_0123456789abcdef': 'person:mallory',
+                                                        'james': 'person:james'}}}}, names={})
+        agent = {'agent_id': 'agent_0123456789abcdef', 'on_behalf_of': ALEX_ACCOUNT}
+        for author, submitter, named, expected in (
+                (SUBMITTER, ALEX, None, True), (MALLORY, ALEX, None, False), ('james', 'person:james', None, True),
+                ('usr_0123456789abcdef', ALEX_ACCOUNT, None, True),
+                ('usr_0123456789abcdef', 'person:mallory', None, False),       # the map never re-attributes an account
+                ('usr_fedcba9876543210', ALEX_ACCOUNT, None, False),
+                ('agent_0123456789abcdef', ALEX_ACCOUNT, agent, True),
+                ('agent_0123456789abcdef', ALEX_ACCOUNT, None, False),         # the record must name the agent
+                ('agent_0123456789abcdef', 'person:mallory', None, False),
+                ('agent_fedcba9876543210', ALEX_ACCOUNT, agent, False), (None, ALEX, None, False)):
+            with self.subTest(author=author, submitter=submitter):
+                self.assertIs(pr.writes_as(author, submitter, resolve, named), expected)
+        self.assertFalse(pr.writes_as(SUBMITTER, ALEX))                        # no resolver: nothing is assumed
+        self.assertIsNone(resolve('agent_0123456789abcdef'))
+        self.assertEqual(resolve('usr_0123456789abcdef'), ALEX_ACCOUNT)
+
+    def test_a_namespace_with_an_http_id_shape_is_refused(self):
+        for name in ('usr_0123456789abcdef', 'agent_0123456789abcdef'):
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'has the shape of an HTTP account or '
+                                                                             'agent id'):
+                self.settings(namespace=name, to='person:mallory')
+        self.assertEqual(self.settings()['contributions']['actor_map']['namespaces'], {})
+        # Mapping an operator's own actor TO an account identity is the supported direction.
+        made = self.settings(namespace=OPERATOR, to=ALEX_ACCOUNT)
+        self.assertEqual(made['contributions']['actor_map']['namespaces'], {OPERATOR: ALEX_ACCOUNT})
+
+    def test_the_scan_lists_http_shaped_authors_with_their_native_time(self):
+        key = self.submit()['key']
+        self.claim(key)
+        row = pr.find_entry(pr.read_key_rows(self.native, key), key, OPS)[1]
+        planted = pr.revision_record({'target': {'kind': 'requirement-new'}, 'text': 'Planted.', 'rationale': None,
+                                      'evidence': [], 'attachments': []}, 'demo-99', 1, ALEX_ACCOUNT,
+                                     'p-0123456789ab', None)
+        self.native.rows.append({'id': 'demo-99', 'title': 'x', 'status': 'closed', 'issue_type': 'task',
+                                 'labels': [pr.TYPE_LABEL, pr.key_label('p-0123456789ab'), 'proposal:submitted'],
+                                 'comments': [{'id': 'c-planted', 'author': 'usr_0123456789abcdef',
+                                               'created_at': '2026-09-30T08:00:00Z',
+                                               'text': pr.revision_comment(planted)},
+                                              {'id': 'c-later', 'author': 'agent_0123456789abcdef',
+                                               'created_at': '2026-10-02T08:00:00.123Z',
+                                               'text': pr.REVISION_PREFIX + '{broken'},
+                                              {'id': 'c-note', 'author': 'usr_0123456789abcdef',
+                                               'created_at': '2026-09-30T09:00:00Z', 'text': 'an ordinary note'}]})
+        found = pr.http_authored(pr.read_rows(self.native))
+        self.assertEqual([(item['comment_id'], item['kind'], item['author'], item['native_created_at'],
+                           item.get('revision'), item.get('submitter'), item.get('unreadable', False))
+                          for item in found['records']],
+                         [('c-planted', 'revision', 'usr_0123456789abcdef', '2026-09-30T08:00:00Z', 1, ALEX_ACCOUNT,
+                           False),
+                          ('c-later', 'revision', 'agent_0123456789abcdef', '2026-10-02T08:00:00.123Z', None, None,
+                           True)])
+        self.assertEqual(found['records'][0]['proposal'], 'p-0123456789ab')
+        self.assertNotIn(row['id'], [item['task'] for item in found['records']])     # session authors are not listed
+        before = pr.http_authored(pr.read_rows(self.native), before='2026-10-01T00:00:00Z')
+        self.assertEqual(([item['comment_id'] for item in before['records']], before['before']),
+                         (['c-planted'], '2026-10-01T00:00:00Z'))
+        self.assertIn('is not proof of HTTP authority', found['note'])
