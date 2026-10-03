@@ -1527,6 +1527,37 @@ def initialized_projects(root):
         if (path/'.beads'/'metadata.json').is_file():found.append(path.name)
     return sorted(found)
 
+def revoked_proposal_records(root,actor,limit=5):
+    """Name the requirement-proposal effects of one operator's revocation.
+
+    A proposal disposition, an owner decision and a contribution-settings record count
+    only while their native author is on the operator allowlist. Removing an operator
+    therefore moves every proposal they decided back to its earlier trusted state, and
+    can make the settings chain read empty (the actor map and the deciders), which stops
+    triage. Both are named here, from the difference between a read under the live
+    allowlist and one without `actor`, with the reader every other read uses. Read-only
+    and best-effort, like `revoked_revert_records`.
+    """
+    import proposal_records
+    authority=operators(root)
+    changed=[];settings=[];unreadable=0
+    for name in initialized_projects(root):
+        path=project_dir(root,name)
+        try:
+            rows=[json.loads(line) for line in run_bd(root,name,['export','--all']).splitlines() if line.strip()]
+            moved,setting=proposal_records.revocation_effects(rows,authority,actor,path)
+            changed+=['%s/%s'%(name,item) for item in moved]
+            if setting:settings.append('%s: %s'%(name,setting))
+        except (OSError,ValueError,TypeError,KeyError,subprocess.CalledProcessError):
+            unreadable+=1
+    def listed(found):
+        return (', '.join(found[:limit])+(' (+%d more)'%(len(found)-limit) if len(found)>limit else '')) or 'none'
+    return (' Requirement proposals: dispositions, owner decisions and contribution settings they recorded stop '
+            'counting too (proposals whose state changes: %s; contribution settings that change: %s; projects that '
+            'could not be read: %d). Re-adding the operator restores them; otherwise re-enter the settings with '
+            'admin.py proposal-settings, and note that %s.'
+            %(listed(changed),listed(settings),unreadable,proposal_records.NO_REPAIR[0].lower()+proposal_records.NO_REPAIR[1:]))
+
 def revoked_revert_records(root,actor,limit=5):
     """Name the host-issued records one operator's revocation changes.
 
@@ -2613,8 +2644,11 @@ def main():
         def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
+            # A proposal reconcile checks the operator allowlist strictly (kittrial-5bb.68
+            # review 01a10180); the other kinds' reconciles do not yet take the list.
+            extra={'operators':operators(root,strict=True)} if kind=='proposal' else {}
             print(json.dumps(record_reconcile(path,args.operation_id,args.actor,args.reason,
-                                              args.disposition,run,issue_id=args.issue_id)))
+                                              args.disposition,run,issue_id=args.issue_id,**extra)))
     elif args.command=='void-record':
         import fcntl
         from review_workflow import apply_void
@@ -2661,7 +2695,8 @@ def main():
                 raise ValueError('operators remove revokes ' + actor + ': voids they authored stop applying on '
                                  'reads, and so do the host-issued integration revert records and retractions '
                                  'they authored' + revoked_revert_records(root,actor) +
-                                 ' (re-add restores them). Re-run with --confirm-revoke to acknowledge this.')
+                                 ' (re-add restores them).' + revoked_proposal_records(root,actor) +
+                                 ' Re-run with --confirm-revoke to acknowledge this.')
             if actor in current:current.remove(actor)
         if current:cfg['operators']=current
         else:cfg.pop('operators',None)

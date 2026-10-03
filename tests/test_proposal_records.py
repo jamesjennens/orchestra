@@ -257,17 +257,51 @@ class RecordTests(ProposalCase):
     def test_supersedes_is_recorded_once_and_the_reverse_is_derived(self):
         old = self.submit()
         new = self.submit(operation_id='alex-prop-2', supersedes=old['key'])
-        self.assertIn('Supersedes %s.' % old['key'], self.native.row(new['native_id'])['description'])
-        self.assertEqual(self.get(new['key'])['supersedes'], old['key'])
+        self.assertIn(pr.SUPERSEDES_LABEL + old['key'], self.native.row(new['native_id'])['labels'])
+        view = self.get(new['key'])
+        self.assertEqual((view['supersedes'], view['supersedes_chain'], view['supersedes_warning']),
+                         (old['key'], [old['key']], None))
         self.native.calls = []
         view = self.get(old['key'])
-        self.assertEqual(view['superseded_by'], [new['key']])
-        # get reads its own anchor with the settings, then the anchors that name it: no catalog scan.
+        self.assertEqual((view['superseded_by'], view['superseded_by_total']), ([new['key']], 1))
+        # get reads its own anchor with the settings, then the anchors labelled as superseding it: no scan.
         self.assertEqual(self.native.reads(), ['list', 'show', 'list', 'show'])
-        # A row that only CLAIMS the pointer in its description does not count: the record decides.
-        self.native.row(self.submit(operation_id='alex-prop-3')['native_id'])['description'] += \
-            ' Supersedes %s.' % old['key']
+
+    def test_superseded_by_cannot_be_hidden_or_crowded_out_by_a_contributor(self):
+        # Review 01a10180 (superseded-by-hidden). The relation is read from a value-reserved
+        # label, which the endpoint lets no contributor write, replace or remove.
+        old = self.submit()
+        new = self.submit(operation_id='alex-prop-2', supersedes=old['key'])
+        self.native.row(new['native_id'])['description'] = 'x'              # bd update --description x
+        for index in range(101):                                            # tasks that only name the key
+            self.native.seed('aaa-%03d' % index, labels=['proposal'])['description'] = 'see ' + old['key']
+        self.native.calls = []
+        view = self.get(old['key'])
+        self.assertEqual((view['superseded_by'], view['superseded_by_total']), ([new['key']], 1))
+        self.assertEqual(self.native.reads(), ['list', 'show', 'list', 'show'])
+        self.assertEqual(len(self.native.calls[-1]), len(['show', new['native_id'], '--include-comments', '--json']))
+        # A false relation cannot be added: a label the record does not back makes that
+        # one proposal malformed and it is not reported.
+        other = self.submit(operation_id='alex-prop-3')
+        self.native.row(other['native_id'])['labels'].append(pr.SUPERSEDES_LABEL + old['key'])
         self.assertEqual(self.get(old['key'])['superseded_by'], [new['key']])
+        self.assertEqual(self.get(other['key'])['state'], 'malformed')
+        # ... and a pointer whose label was lost reads malformed too, never silently unlinked.
+        self.native.row(new['native_id'])['labels'].remove(pr.SUPERSEDES_LABEL + old['key'])
+        self.assertEqual(self.get(new['key'])['state'], 'malformed')
+
+    def test_the_supersedes_chain_stops_at_eight_hops_with_a_warning(self):
+        keys = [self.submit()['key']]
+        for index in range(10):
+            keys.append(self.submit(operation_id='chain-%d' % index, supersedes=keys[-1])['key'])
+        view = self.get(keys[3])
+        self.assertEqual((view['supersedes_chain'], view['supersedes_warning']), (keys[2::-1], None))
+        self.native.calls = []
+        view = self.get(keys[-1])
+        self.assertEqual(view['supersedes_chain'], keys[-2:-10:-1])
+        self.assertIn('longer than 8', view['supersedes_warning'])
+        # One narrow read per hop: own key, superseders, then list+show for each of 8 hops.
+        self.assertEqual(self.native.reads(), ['list', 'show', 'list'] + ['list', 'show'] * 8)
 
     def test_revise_is_compare_and_swap_and_only_while_submitted_or_needs_info(self):
         made = self.submit()
@@ -397,6 +431,38 @@ class LifecycleTests(ProposalCase):
             self.claim(mine)
         self.assertEqual(self.dispose(mine, 'under-review', actor=OWNER)['state'], 'under-review')
 
+    def test_declaring_another_submitter_does_not_allow_a_self_review(self):
+        # Review 01a10180 P3 (1): the native author of revision 1 is compared too.
+        key = self.submit(actor=COORD, submitter='person:zed')['key']
+        with self.assertRaisesRegex(ValueError, 'or you wrote it'):
+            self.claim(key)
+        # The same person through another mapped actor is refused as well.
+        other = 'session-00000000-0000-4000-8000-000000000007'
+        self.map(other, 'person:coord')
+        with self.assertRaisesRegex(ValueError, 'or you wrote it'):
+            self.dispose(key, 'under-review', actor=other, operators=OPS + [other])
+        self.assertEqual(self.dispose(key, 'under-review', actor=OWNER)['state'], 'under-review')
+
+    def test_a_reconcile_checks_the_operator_allowlist_before_the_receipt(self):
+        # Review 01a10180 (reconcile-unchecked).
+        made = self.submit()
+        for operators in (OPS, None, []):
+            with self.subTest(operators=operators), \
+                    self.assertRaisesRegex(ValueError, 'not a server-side configured operator|No operator '
+                                                       'allowlist is configured'):
+                pr.reconcile(self.project, 'alex-prop-1', 'mallory', 'r', 'released', self.native,
+                             operators=operators)
+        # No list supplied authorizes nobody, on every proposal host command.
+        for call in (lambda: pr.reconcile(self.project, 'alex-prop-1', OPERATOR, 'r', 'released', self.native),
+                     lambda: pr.change_settings({'add_decider': 'person:x'}, OPERATOR, self.native),
+                     lambda: pr.dispose({}, OPERATOR, self.native, self.project)):
+            with self.assertRaisesRegex(ValueError, 'No operator allowlist is configured'):
+                call()
+        # A listed operator gets past the check and reaches the receipt (already complete here).
+        with self.assertRaisesRegex(ValueError, 'is already complete'):
+            pr.reconcile(self.project, 'alex-prop-1', OPERATOR, 'checked', 'complete', self.native,
+                         issue_id=made['native_id'], operators=OPS)
+
     def test_the_owner_decision_comes_from_a_different_person_than_the_escalator(self):
         key = self.submit()['key']
         self.claim(key)
@@ -445,6 +511,43 @@ class LifecycleTests(ProposalCase):
         # Read live: once the requirement is accepted (as its next revision), the link reads accepted.
         self.accept_requirement(requirement)
         self.assertEqual(self.get(key)['linked_requirement']['acceptance_state'], 'accepted')
+
+    def test_an_incorporation_stops_reading_accepted_when_different_content_is_accepted(self):
+        # Review 01a10180 (accepted-after-different-content).
+        requirement = self.requirement('R01')
+        first = self.submit()['key']
+        self.claim(first)
+        self.dispose(first, 'incorporated', incorporation=self.incorporation(requirement))      # r1, a draft
+        self.accept_requirement(requirement)                                                    # r2 accepts A
+        second = self.submit(operation_id='alex-prop-2')['key']
+        self.claim(second)
+        # The linked draft was accepted since: it is recorded as accepted, with the decision
+        # of the revision that accepted that content. (A draft claim is refused: it is not true.)
+        with self.assertRaisesRegex(ValueError, 'revision 1 is accepted today, not draft'):
+            self.dispose(second, 'incorporated', incorporation=self.incorporation(requirement))
+        with self.assertRaisesRegex(ValueError, 'F3 acceptance evidence of requirement .* revision 2'):
+            self.dispose(second, 'incorporated', incorporation=self.incorporation(
+                requirement, acceptance_state='accepted', acceptance_decision_id='dec-9'))
+        self.dispose(second, 'incorporated', incorporation=self.incorporation(
+            requirement, acceptance_state='accepted', acceptance_decision_id='dec-1'))
+        third = self.submit(operation_id='alex-prop-3')['key']
+        self.claim(third)
+        self.dispose(third, 'incorporated', incorporation=self.incorporation(
+            requirement, revision=2, acceptance_decision_id='dec-1'))
+        states = lambda: [self.get(key)['linked_requirement']['acceptance_state'] for key in (first, second, third)]
+        self.assertEqual(states(), ['accepted'] * 3)
+        # requirement-apply accepts r3 with DIFFERENT content: none of the three is the
+        # accepted requirement any more.
+        self.native.actor = OPERATOR
+        rq.apply_native({'schema_version': 1, 'operation_id': 'acc-R01-b', 'operation': 'revise',
+                         'kind': 'requirement', 'task': requirement, 'title': 'R01: Intent', 'key': 'R01',
+                         'description': 'A different statement.', 'revision': 3, 'acceptance_state': 'accepted',
+                         'acceptance': acceptance(decision_id='dec-1')},
+                        OPERATOR, self.native, self.project, operator=True, operators=OPS)
+        self.assertEqual(states(), ['draft'] * 3)
+        self.assertEqual(self.get(first)['text']['trust'], 'unreviewed')
+        block = pr.work_attention(self.rows(), COORD, OPS, 'demo', self.project)
+        self.assertEqual(block['counts']['incorporated_unaccepted'], 3)
 
     def test_an_accepted_incorporation_names_the_recorded_f3_decision(self):
         requirement = self.requirement('R01', accepted=True)
@@ -534,10 +637,24 @@ class AuthorityTests(ProposalCase):
         self.assertEqual((view['state'], view['inert_dispositions'], view['timeline'][0]['standing']),
                          ('submitted', 1, 'inert'))
         self.assertIn('disposition-inert', [warning['code'] for warning in view['warnings']])
-        with self.assertRaisesRegex(ValueError, 'no longer on the operator allowlist'):
+        # The refusal names the author, does not claim they were ever an operator, and says
+        # plainly that no repair command exists yet (review 01a10180, operator-revocation).
+        with self.assertRaises(ValueError) as refused:
             pr.dispose({'schema_version': 1, 'operation_id': 'o-1', 'key': key, 'previous': None,
                         'proposal_sha256': view['sha256'], 'to_state': 'under-review'}, OWNER, self.native,
                        self.project, remaining)
+        message = str(refused.exception)
+        for text in ('do not count, written by ' + COORD, 'If that author was an operator who has been removed',
+                     'If they never were an operator, nothing restores', 'No repair command exists',
+                     'submit a new proposal that supersedes'):
+            self.assertIn(text, message)
+        self.assertNotIn('Restore that operator', message)
+        self.assertEqual(pr.revocation_effects(self.rows(), OPS, COORD, self.project),
+                         ([key + ' under-review -> submitted'], None))
+        # Revoking the author of the settings records empties the map and the deciders.
+        moved, settings = pr.revocation_effects(self.rows(), OPS, OPERATOR, self.project)
+        self.assertEqual((moved, settings[:26]), ([], 'settings revision 2 -> 0 ('))
+        self.assertIn('read empty', settings)
         # Restoring the operator restores the reading: nothing was deleted.
         self.assertEqual(self.get(key)['state'], 'under-review')
         self.assertEqual(claimed['state'], 'under-review')
@@ -672,6 +789,42 @@ class SettingsTests(ProposalCase):
         # The next real write still chains from the last counted record.
         self.assertEqual(self.settings(add_decider='person:owner')['revision'], 3)
 
+    def test_a_row_that_only_carries_the_settings_label_is_not_a_settings_anchor(self):
+        # Review 01a10180 (settings-decoy): `bd create decoy --labels contribution-settings`
+        # is an ordinary task. It sorts before the real anchor here, and changes nothing.
+        current = self.settings()
+        self.native.seed('aaa-decoy', labels=[pr.SETTINGS_LABEL])
+        self.native.add_comment('aaa-decoy', 'an ordinary comment', author='mallory')
+        view = self.settings()
+        self.assertEqual((view['native_id'], view['revision'], view['warnings']),
+                         (current['native_id'], current['revision'], []))
+        self.assertEqual(self.settings(add_decider='person:owner')['revision'], current['revision'] + 1)
+        key = self.submit()['key']
+        self.assertEqual(self.claim(key)['state'], 'under-review')          # host triage still works
+        settings, resolve, _ = pr.project_context(self.rows(), OPS, self.project)
+        self.assertEqual((resolve(COORD), settings['deciders'], settings['warnings']),
+                         ('person:coord', ['person:owner'], []))
+        self.assertEqual(self.get(key)['state'], 'under-review')
+        # A pre-deploy forgery (the label and a settings record by a non-operator) on a lower
+        # id never displaces the anchor that holds counted records.
+        forged = {'schema_version': 1, 'id': 'aaa-forged', 'revision': 1, 'previous_sha256': None,
+                  'contributions': pr.default_contributions(), 'deciders': ['person:mallory'],
+                  'at': '2026-10-01T12:00:00Z'}
+        forged['sha256'] = pr.content_hash(forged)
+        self.native.seed('aaa-forged', labels=[pr.SETTINGS_LABEL])
+        self.plant('aaa-forged', pr.SETTINGS_PREFIX + pr.canonical_bytes(forged).decode('utf-8'), author='mallory')
+        view = self.settings()
+        self.assertEqual((view['native_id'], view['deciders']), (current['native_id'], ['person:owner']))
+        self.assertEqual(self.settings(add_decider='person:second')['native_id'], current['native_id'])
+        # In a project whose only labelled row is a decoy, the first write makes a real anchor.
+        fresh = ProposalNative()
+        fresh.seed('aaa-decoy', labels=[pr.SETTINGS_LABEL])
+        fresh.actor = OPERATOR
+        self.assertEqual(pr.change_settings({}, OPERATOR, fresh, OPS)['revision'], 0)
+        made = pr.change_settings({'add_decider': 'person:owner'}, OPERATOR, fresh, OPS)
+        self.assertEqual((made['revision'], made['native_id'] != 'aaa-decoy'), (1, True))
+        self.assertEqual(pr.change_settings({}, OPERATOR, fresh, OPS)['deciders'], ['person:owner'])
+
     def test_the_resolver_prefers_an_exact_actor_then_the_longest_namespace(self):
         self.settings(namespace='alex', to=ALEX)
         self.settings(namespace='alex-team', to='person:team')
@@ -724,6 +877,24 @@ class ReadTests(ProposalCase):
                 yield value
         self.assertFalse([text for text in strings(view) if SECRET in text])
         self.assertFalse([text for text in strings(listing) if SECRET in text])
+
+    def test_excerpts_drop_control_format_and_separator_characters(self):
+        # Review 01a10180 P3 (3): C1 controls, bidi overrides and zero-width characters.
+        hostile = 'Pay\u009b the\u202e owner\u2066 now\u200b\u2028next\tline\nsecond \u00a0paragraph\x1b[31m'
+        key = self.submit(text=hostile, rationale=hostile, evidence=[hostile])['key']
+        view = self.get(key)
+        self.assertEqual(view['text']['text'], 'Pay the owner now next line\nsecond  paragraph[31m')
+        self.assertEqual(view['rationale']['text'], view['text']['text'])
+        self.assertEqual(view['evidence'][0]['text'], 'Pay the owner now next line second  paragraph[31m')
+        title = self.read('list')['items'][0]['title']['text']
+        block = pr.work_attention(self.rows(), COORD, OPS, 'demo', self.project)
+        for text in (title, block['items'][0]['title']['text']):
+            self.assertEqual(text, 'Pay the owner now next line second  paragraph[31m')
+        import unicodedata
+        for text in (view['text']['text'].replace('\n', ''), title):
+            self.assertFalse([char for char in text if char != ' ' and unicodedata.category(char)[0] in 'CZ'])
+        # The stored record is untouched: only the read view is cleaned.
+        self.assertEqual(pr.find_entry(pr.read_key_rows(self.native, key), key, OPS)[0]['record']['text'], hostile)
 
     def test_a_reason_and_a_question_reach_operators_and_the_submitter_only(self):
         key = self.submit()['key']
@@ -861,7 +1032,7 @@ class AttentionTests(ProposalCase):
         writes = len(self.native.writes())
         rows = self.rows()
         result = work.queue(rows, COORD, [], operators=OPS, journal=self.project, reference_attention=True)
-        self.assertEqual(set(result['attention']), {'reference_review', 'proposal_queue'})
+        self.assertEqual(set(result['attention']), {'reference_review', 'proposal_queue', 'capability_index'})
         self.assertEqual(result['attention']['proposal_queue']['counts']['submitted'], 6)
         self.assertEqual(result['attention']['proposal_queue']['actions'][0]['project'], 'demo')
         paged = work.queue(rows, COORD, ['--proposal-limit', '2'], operators=OPS, journal=self.project,

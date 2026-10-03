@@ -214,6 +214,22 @@ class HostCommandTests(unittest.TestCase):
         for command, extra in (('proposal-reconcile', []), ('record-reconcile', ['--kind', 'proposal'])):
             with self.assertRaisesRegex(ValueError, 'No proposal operation receipt'):
                 self.admin(command, '--operation-id', 'nope', '--reason', 'r', *extra)
+            # The allowlist is checked first, strictly (review 01a10180, reconcile-unchecked):
+            # an unlisted actor learns nothing about the receipt and changes nothing.
+            before = {path.name: path.read_text(encoding='utf-8')
+                      for path in (self.project / '.proposal-requests').glob('*.json')}
+            with self.assertRaisesRegex(ValueError, 'not a server-side configured operator'):
+                self.admin(command, '--operation-id', 'alex-prop-1', '--reason', 'r', '--disposition', 'failed',
+                           *extra, actor='mallory')
+            self.assertEqual(before, {path.name: path.read_text(encoding='utf-8')
+                                      for path in (self.project / '.proposal-requests').glob('*.json')})
+        # `operators remove` names what a revocation does to proposals and to the settings.
+        with patch.object(admin, 'run_bd', side_effect=self.run_native), \
+                patch.object(admin, 'initialized_projects', return_value=['trial']):
+            warning = admin.revoked_proposal_records(self.root, COORD)
+        self.assertIn('proposals whose state changes: trial/%s approved -> submitted' % self.made['key'], warning)
+        self.assertIn('contribution settings that change: trial: settings revision 3 -> 0', warning)
+        self.assertIn('no repair command exists for proposal records yet', warning)
         receipts = {'.proposal-requests/' + path.name: json.loads(path.read_text(encoding='utf-8'))
                     for path in (self.project / '.proposal-requests').glob('*.json')}
         self.assertEqual(sorted(receipt['operation'] for receipt in receipts.values()),

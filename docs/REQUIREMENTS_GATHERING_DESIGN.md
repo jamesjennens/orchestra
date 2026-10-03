@@ -131,12 +131,19 @@ the kit does**; the first item changes 4.1 and 8.1 and was reported to the owner
 9. **Owner question 12.2 is closed.** `admin.py requirement-apply` checks the
    operator allowlist strictly since kittrial-5bb.65, so slice 1a adds nothing to it.
 10. **Three clarifications of derived values.**
-    - The reverse `superseded_by` relation is found by one narrow native read: a
-      superseding proposal also names the superseded key in its anchor description.
-      The record stays the authority (3.5).
+    - The reverse `superseded_by` relation is found by one narrow native read: the
+      anchor of a superseding proposal carries the label
+      `proposal:supersedes:<superseded key>`. The `proposal:` label prefix is
+      value-reserved, so a contributor can neither add that label to another row nor
+      remove it, and cannot hide or crowd out the relation (kittrial-5bb.68 review
+      01a10180). The record stays the authority (3.5): a label the record does not
+      back, or a pointer without its label, makes that one proposal read `malformed`.
     - Accepting a requirement writes its **next** revision. So the live acceptance of
-      a linked draft is `accepted` once it, or a later revision with the same title,
-      description and key, is accepted and the record is still accepted (6.2).
+      a linked revision is `accepted` only while the record is accepted, its **newest**
+      revision is the accepted one, and that newest revision has the same title,
+      description and key as the linked revision. Once a later revision with different
+      content exists, accepted or not, the link reads `draft` again and the proposal
+      is counted as `incorporated_unaccepted` (6.2; review 01a10180).
     - `brief` selects a proposal for a task when the task **is** the requirement
       record its target names, or when the task carries a label equal to the target's
       area (5.2).

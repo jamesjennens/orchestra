@@ -1037,8 +1037,8 @@ client refuses the three names with a message that says so.
 **Reading.** Reads take no lock and write nothing.
 - **`get KEY [--history N]`** returns `state`, `stale`, `due`, `next_actor`,
   `next_action`, `revision`, `sha256`, `record_comment_id`, `disposition_comment_id`,
-  `submitter`, `identity`, `target`, the excerpts, `supersedes`, `superseded_by`,
-  `submitted_at`, `age_days`, `time_to_disposition_days`, `linked_requirement`,
+  `submitter`, `identity`, `target`, the excerpts, `supersedes`, `supersedes_chain`,
+  `supersedes_warning`, `superseded_by`, `superseded_by_total`, `submitted_at`, `age_days`, `time_to_disposition_days`, `linked_requirement`,
   `disposition` (the newest counted one), `timeline` (the newest N, 1..50, default
   10), `inert_dispositions` and `warnings`.
 - **`list`** returns `{total, items, next_offset, coverage}`, oldest first. Filters:
@@ -1051,6 +1051,25 @@ client refuses the three names with a message that says so.
   `list` only to an actor on the operator allowlist; otherwise the field is `null`
   and `withheld` is `true`. `mine` returns them, because the submitter must be able
   to read the question they answer.
+  - **This is a filter, not confidentiality.** Over SSH the actor is self-declared,
+    and so is `--submitter`. Anyone with endpoint access who declares an operator's
+    actor name reads these fields on `get` and `list`, and `mine --submitter
+    IDENTITY` returns them to any actor that names that identity. Coordinators must
+    not put secrets in a reason, a question or an escalation question.
+- **Excerpts are cleaned.** Every excerpt drops the characters in Unicode categories C
+  (controls including C1, format characters such as bidi overrides and zero-width
+  characters, private use) and Z (separators) other than the plain space. A line
+  break, a tab or another separator becomes one space; the `text` and `rationale` of
+  `get` keep line feeds. `omitted_chars` counts the cleaned text. The stored record
+  is not changed.
+- **`supersedes` and `superseded_by`.**
+  - `superseded_by` lists the proposals whose records name this key. They are found
+    by the reserved label `proposal:supersedes:<key>` on their anchors, which a
+    contributor cannot write, replace or remove. At most 100 are read;
+    `superseded_by_total` is how many anchors carry the label.
+  - `supersedes_chain` lists the keys this proposal supersedes, nearest first. The
+    walk stops after 8 hops, at a cycle, or at a proposal that cannot be read, and
+    `supersedes_warning` then says which; otherwise it is `null`.
 - **`identity`** is `verified` when the actor that submitted the proposal maps,
   through the project's actor map, to its `submitter`; otherwise `unverified`. Over
   SSH this is attribution, not authentication: the actor is self-declared, and no
@@ -1058,6 +1077,11 @@ client refuses the three names with a message that says so.
 - **`linked_requirement`** is `{id, revision, sha256, acceptance_state,
   manifest_sha256}` for an incorporated proposal. `acceptance_state` is read live
   from the requirement record: `accepted`, `draft` or `missing`.
+  - `accepted` means the linked content is the accepted requirement today: the record
+    is accepted, its newest revision is the accepted one, and that revision has the
+    same title, description and key as the linked revision.
+  - `draft` covers everything else that still exists: never accepted, demoted, or
+    replaced by a later revision with different content (accepted or not).
 - **Inert records.** A disposition whose native author is not on the operator
   allowlist does not count: `timeline[].standing` is `inert`, `inert_dispositions`
   counts them, and the state is the one the trusted records give.
@@ -1065,7 +1089,9 @@ client refuses the three names with a message that says so.
   with the ledger, or a newer record version makes that one proposal read `malformed`
   or `unsupported`; lists and the queue keep working and name it in `coverage`.
 - **Read cost.** `get` reads its own anchor and the settings in one `bd list` and one
-  `bd show`, then one `bd list` for the proposals that supersede it. `list` and `mine`
+  `bd show`, then one `bd list` for the proposals that supersede it (and one `bd show`
+  when there are any). A proposal that itself supersedes another adds one `bd list`
+  and one `bd show` per hop, at most 8. `list` and `mine`
   read the proposals in two native reads (one `bd list`, then one `bd show` up to 20
   rows or one `bd export --all` above), plus one `bd show` of the requirement records
   the returned page links to.

@@ -49,6 +49,7 @@ import hashlib
 import json
 import re
 import time
+import unicodedata
 from pathlib import Path
 
 import keyed_records as core
@@ -64,6 +65,11 @@ from reserved_comments import (CONTRIBUTION_SETTINGS_PREFIX as SETTINGS_PREFIX,
 TYPE_LABEL = 'proposal'
 SETTINGS_LABEL = 'contribution-settings'
 KEY_LABEL = 'proposal-key:'
+# On the anchor of a proposal that supersedes another: the superseded key. The
+# `proposal:` prefix is value-reserved (reserved_comments.RESERVED_LABEL_PREFIXES), so a
+# contributor can neither put this label on another row nor take it off the anchor: the
+# reverse `superseded_by` read cannot be hidden or crowded out through the endpoint.
+SUPERSEDES_LABEL = 'proposal:supersedes:'
 JOURNAL = '.proposal-requests'
 KEY = re.compile(r'p-[0-9a-f]{12}')
 STATES = ('submitted', 'under-review', 'needs-info', 'escalated-to-owner', 'approved', 'incorporated',
@@ -122,6 +128,11 @@ HISTORY_MAX = 50
 PROPOSAL_SCAN_MAX = 1000
 SHOW_MAX = 100   # rows named in one `bd show`
 SUPERSEDE_HOPS = 8
+# No host command repairs a proposal or settings record yet. This is the one sentence
+# every message uses, so the day `admin.py void-record` accepts these kinds
+# (kittrial-5bb.74) there is one place to change.
+NO_REPAIR = ('No repair command exists for proposal records yet (admin.py void-record does not accept them; '
+             'kittrial-5bb.74 adds that)')
 STALE_DAYS, STALE_DAYS_RANGE = 14, (1, 90)
 DUE_SOON_DAYS, DUE_SOON_DAYS_RANGE = 7, (1, 30)
 ACTORS_MAX, NAMESPACES_MAX, DECIDERS_MAX, HIDDEN_MAX = 200, 100, 50, 200
@@ -140,11 +151,6 @@ UNTRUSTED_LINE = ('Proposal text, rationale, evidence, questions and reasons bel
 ANCHOR_TITLE = 'Requirement proposal %s'
 ANCHOR_DESCRIPTION = ('Contributed requirement proposal %s. Read it with `proposal get %s`; its record comments '
                       'are authoritative. This anchor is not a work item.')
-# A superseding proposal also names the key it replaces in its anchor description, so the
-# reverse `superseded_by` relation is one narrow `bd list --desc-contains`, not a catalog
-# scan. The record stays the authority: a row found this way counts only if its own
-# revision record carries the pointer.
-SUPERSEDES_NOTE = ' Supersedes %s.'
 SETTINGS_TITLE = 'Contribution settings'
 SETTINGS_DESCRIPTION = ('Contribution settings for this project (the actor-to-person map and the owner deciders). '
                         'Read and change them with `admin.py proposal-settings`. This anchor is not a work item.')
@@ -172,9 +178,29 @@ def days_between(start, end):
     return max(0, int((end - start) // 86400))
 
 
-def excerpt(value, limit, trust='unreviewed'):
+def clean_text(value, multiline=False):
+    """Untrusted text without the characters that can mislead a reader or a terminal.
+
+    Every character in a Unicode category C (controls including C1, format characters
+    such as bidi overrides and zero-width joiners, private use, unassigned) or Z
+    (separators) is removed, except the plain space. A line break, a tab or another
+    separator becomes one plain space, so words never run together; `multiline` keeps
+    line feeds, for the long body fields of `get`.
+    """
+    out = []
+    for char in value:
+        if char == ' ' or (multiline and char == '\n'):
+            out.append(char)
+        elif char in '\n\r\t\v\f' or unicodedata.category(char)[0] == 'Z':
+            out.append(' ')
+        elif unicodedata.category(char)[0] != 'C':
+            out.append(char)
+    return ''.join(out)
+
+
+def excerpt(value, limit, trust='unreviewed', multiline=False):
     """Untrusted text as the contract's bounded excerpt object, always trust-marked."""
-    value = '' if value is None else str(value)
+    value = clean_text('' if value is None else str(value), multiline)
     return {'text': value[:limit], 'omitted_chars': max(0, len(value) - limit), 'trust': trust}
 
 
@@ -534,20 +560,39 @@ def parse_settings(body):
     return record
 
 
+def settings_anchors(rows, operators):
+    """The settings anchors among `rows`, the one readers and the writer use first.
+
+    The bare `contribution-settings` label is not value-reserved (a project may use the
+    word), so the label alone is never evidence: any contributor can create a task with
+    it. A settings anchor is a row with the label AND a `contribution-settings` record
+    comment (`is_record_anchor`); the record prefix is reserved, so the endpoint cannot
+    write one. Among several, an anchor holding a record whose author passes `authority`
+    comes before one that holds none (a pre-deploy forgery), then the lowest native id.
+    """
+    def counted(row):
+        return any(isinstance(comment, dict) and authority(comment.get('author'), operators)
+                   and parse_settings(comment.get('text')) is not None for comment in row.get('comments') or [])
+    found = [row for row in rows or [] if isinstance(row, dict) and SETTINGS_LABEL in (row.get('labels') or [])
+             and is_record_anchor(row)]
+    trusted = [row for row in found if counted(row)]
+    return sorted(trusted or found, key=lambda row: str(row.get('id')))
+
+
 def settings_view(rows, operators):
     """The project's contribution settings as readers apply them.
 
-    `rows` are the native rows carrying the `contribution-settings` label, with their
-    comments. The current record is the newest one in a chain where every record's
+    `rows` are native rows with their comments; only the settings anchors among them
+    count (`settings_anchors`: a decoy row carrying just the label is ignored). The
+    current record is the newest one in a chain where every record's
     author passes `authority`, its `previous_sha256` is the record before it and its
     revision follows. Anything else is reported as a warning and never applied. A
     project with no settings record reads the defaults: an empty map, no deciders.
     Never raises.
     """
     view = {'native_id': None, 'revision': 0, 'sha256': None, 'contributions': default_contributions(),
-            'deciders': [], 'at': None, 'author': None, 'warnings': [], 'anchors': []}
-    anchors = sorted((row for row in rows or [] if isinstance(row, dict)
-                      and SETTINGS_LABEL in (row.get('labels') or [])), key=lambda row: str(row.get('id')))
+            'deciders': [], 'at': None, 'author': None, 'warnings': [], 'anchors': [], 'inert_authors': []}
+    anchors = settings_anchors(rows, operators)
     view['anchors'] = [row.get('id') for row in anchors]
     if len(anchors) > 1:
         view['warnings'].append({'code': 'duplicate-settings-anchor',
@@ -575,6 +620,8 @@ def settings_view(rows, operators):
             view['warnings'].append({'code': 'settings-inert',
                                      'detail': 'settings record %s was written by %s, who is not on the deployment '
                                                'operator allowlist' % (comment.get('id'), comment.get('author'))})
+            if comment.get('author') not in view['inert_authors']:
+                view['inert_authors'].append(comment.get('author'))
             continue
         expected = (current['revision'] + 1, current['sha256']) if current else (1, None)
         if (record['revision'], record['previous_sha256']) != expected:
@@ -649,7 +696,7 @@ def entry_view(row, operators=None, resolve=None, verify_label=True):
     """
     view = {'key': None, 'native_id': row.get('id'), 'state': None, 'claimed': None, 'record': None,
             'first': None, 'revisions': 0, 'author': None, 'identity': 'unverified', 'timeline': [],
-            'disposition': None, 'inert': 0, 'warnings': [], 'record_comment_id': None,
+            'disposition': None, 'inert': 0, 'inert_authors': [], 'warnings': [], 'record_comment_id': None,
             'disposition_comment_id': None, 'changed_at': None}
     try:
         newest = first = None
@@ -714,6 +761,8 @@ def entry_view(row, operators=None, resolve=None, verify_label=True):
             else:
                 entry['standing'] = 'inert'
                 view['inert'] += 1
+                if author not in view['inert_authors']:
+                    view['inert_authors'].append(author)
                 view['warnings'].append({
                     'code': 'disposition-inert',
                     'detail': 'disposition %s (%s -> %s) was written by %s and does not count: %s'
@@ -726,7 +775,10 @@ def entry_view(row, operators=None, resolve=None, verify_label=True):
             raise ValueError('no proposal revision record')
         labels = [label for label in row.get('labels') or []
                   if isinstance(label, str) and label.startswith('proposal:')]
-        view['label_ok'] = labels == [STATE_LABEL[claimed]]
+        pointers = [label for label in labels if label.startswith(SUPERSEDES_LABEL)]
+        if pointers != ([SUPERSEDES_LABEL + first['supersedes']] if first['supersedes'] else []):
+            raise ValueError('the supersedes label does not match the revision record')
+        view['label_ok'] = [label for label in labels if label not in pointers] == [STATE_LABEL[claimed]]
         if verify_label and not view['label_ok']:
             raise ValueError('the state label does not match the disposition ledger')
         view.update(key=newest['key'], state=state, claimed=claimed)
@@ -797,7 +849,7 @@ def live_acceptance(requirements, linked):
     row = (requirements or {}).get(linked['requirement_id'])
     if row is None:
         return 'missing'
-    from requirement_records import _current_acceptance, existing_revisions
+    from requirement_records import existing_revisions
     try:
         revisions = existing_revisions(row)
     except ValueError:
@@ -805,16 +857,30 @@ def live_acceptance(requirements, linked):
     record = revisions.get(linked['requirement_revision'])
     if record is None or record.get('sha256') != linked['requirement_sha256']:
         return 'missing'
-    if _current_acceptance(row, revisions) != 'accepted':
-        return 'draft'   # never accepted, or demoted since
-    # Accepting a requirement writes the NEXT revision with the same content, so the
-    # linked draft is accepted once it, or a later revision with the same title,
-    # description and key, is accepted.
-    same = lambda other: all(other.get(name) == record.get(name) for name in ('title', 'description', 'key'))
-    if any(number >= linked['requirement_revision'] and other.get('acceptance_state') == 'accepted' and same(other)
-           for number, other in revisions.items()):
-        return 'accepted'
-    return 'draft'
+    return 'accepted' if accepting_revision(row, revisions, record) is not None else 'draft'
+
+
+def accepting_revision(row, revisions, record):
+    """The number of the revision that makes `record`'s content the accepted requirement
+    TODAY, or None.
+
+    Accepting a requirement writes the NEXT revision with the same content. So the
+    linked content is accepted exactly when the record is accepted now, its NEWEST
+    revision is the accepted one, and that newest revision has the same title,
+    description and key as the linked revision. A later revision with different
+    content, accepted or not, means the linked content is no longer what is accepted
+    (review 01a10180, accepted-after-different-content).
+    """
+    from requirement_records import _current_acceptance
+    if not revisions or _current_acceptance(row, revisions) != 'accepted':
+        return None   # never accepted, or demoted since
+    newest = max(revisions)
+    other = revisions[newest]
+    if newest < record.get('revision', 0) or other.get('acceptance_state') != 'accepted':
+        return None
+    if any(other.get(name) != record.get(name) for name in ('title', 'description', 'key')):
+        return None
+    return newest
 
 
 def requirement_rows(rows):
@@ -855,9 +921,42 @@ def read_key_and_settings(run, key):
 
 
 def read_superseders(run, key, known):
-    """The proposal anchors whose description names `key` as superseded (see SUPERSEDES_NOTE)."""
-    ids = [task for task in _listed(run, '--label', TYPE_LABEL, '--desc-contains', key) if task not in known]
-    return AnchoredKind.shown(run, ids[:SHOW_MAX])
+    """(rows, total): the proposal anchors labelled as superseding `key` (SUPERSEDES_LABEL).
+
+    One narrow `bd list` on a value-reserved label, then one `bd show` of at most
+    SHOW_MAX rows. A row found this way still counts only if its own revision record
+    carries the pointer (`entry_view` checks the two agree).
+    """
+    ids = sorted(task for task in _listed(run, '--label', TYPE_LABEL, '--label', SUPERSEDES_LABEL + key)
+                 if task not in known)
+    return AnchoredKind.shown(run, ids[:SHOW_MAX]), len(ids)
+
+
+def read_supersedes_chain(run, entry, operators=None):
+    """(keys, warning): the proposals `entry` supersedes, nearest first (design 3.5).
+
+    One narrow read per hop, so a proposal that supersedes nothing costs nothing. The
+    walk stops at SUPERSEDE_HOPS, at a cycle, or at a key that cannot be read, and says
+    which in `warning`.
+    """
+    chain, seen, warning = [], {entry['key']}, None
+    current = entry
+    while current['record'] is not None and current['record']['supersedes']:
+        nxt = current['record']['supersedes']
+        if nxt in seen:
+            warning = 'supersedes cycle at %s' % nxt
+            break
+        if len(chain) >= SUPERSEDE_HOPS:
+            warning = 'supersedes chain longer than %d; the walk stopped' % SUPERSEDE_HOPS
+            break
+        chain.append(nxt)
+        seen.add(nxt)
+        try:
+            current, _ = find_entry(read_key_rows(run, nxt), nxt, operators)
+        except ValueError:
+            warning = 'superseded proposal %s cannot be read; the walk stopped' % nxt
+            break
+    return chain, warning
 
 
 def read_catalog(run):
@@ -992,10 +1091,11 @@ def _spec(operators, context):
 
     def create_args(payload, request_label, content_label):
         key = key_for(payload['operation_id'])
-        labels = sorted({TYPE_LABEL, STATE_LABEL['submitted'], key_label(key), request_label, content_label})
-        description = ANCHOR_DESCRIPTION % (key, key)
+        labels = {TYPE_LABEL, STATE_LABEL['submitted'], key_label(key), request_label, content_label}
         if payload.get('supersedes'):
-            description += SUPERSEDES_NOTE % payload['supersedes']
+            labels.add(SUPERSEDES_LABEL + payload['supersedes'])
+        labels = sorted(labels)
+        description = ANCHOR_DESCRIPTION % (key, key)
         return ['create', '--title', ANCHOR_TITLE % key, '--description', description,
                 '--type', 'task', '--no-inherit-labels', '--labels', ','.join(labels), '--json']
 
@@ -1142,8 +1242,14 @@ def apply_native(payload, actor, run, project, operators=None):
     return core.apply_native(payload, actor, run, project, _spec(operators, {}), operator=False)
 
 
-def reconcile(project, operation_id, actor, reason, disposition, run, issue_id=None):
-    """Operator-only: resolve a stuck `.proposal-requests/` receipt from native state."""
+def reconcile(project, operation_id, actor, reason, disposition, run, issue_id=None, operators=None):
+    """Operator-only: resolve a stuck `.proposal-requests/` receipt from native state.
+
+    A host command; the deployment operator allowlist is checked before the receipt is
+    read (`operators` is the strict list from admin.py; None authorizes nobody).
+    """
+    _require_operator(actor, operators, 'reconcile a proposal operation')
+
     def confirm(row):
         if not is_record_anchor(row):
             raise ValueError('Anchor %s has no proposal revision record yet; re-run the original proposal submit '
@@ -1153,6 +1259,13 @@ def reconcile(project, operation_id, actor, reason, disposition, run, issue_id=N
 
 
 # -- host writes: dispositions, decisions, settings -----------------------------------------------
+
+def _require_operator(actor, operators, action):
+    """The strict allowlist check of every proposal host command. `operators=None` (no
+    list supplied) authorizes nobody here, exactly as `authority()` reads it: these
+    commands have no contributor path that could rely on the shell boundary instead."""
+    core.require_configured_operator(actor, operators if operators is not None else (), action)
+
 
 def _require_mapped(resolve, actor, action):
     identity = resolve(actor)
@@ -1190,12 +1303,19 @@ def _check_incorporation(linked, run):
                          % (linked['requirement_id'], linked['requirement_revision'], live,
                             linked['acceptance_state']))
     if live == 'accepted':
-        from requirement_records import existing_acceptances
-        evidence = existing_acceptances(row).get(linked['requirement_revision']) or {}
+        # The evidence is bound to the revision that accepted this content: the linked
+        # revision itself, or the later same-content revision acceptance wrote. So a
+        # proposal linked to the draft that was then accepted is recorded as accepted
+        # with that acceptance's decision id.
+        from requirement_records import existing_acceptances, existing_revisions
+        revisions = existing_revisions(row)
+        accepted_in = accepting_revision(row, revisions, revisions[linked['requirement_revision']])
+        evidence = existing_acceptances(row).get(accepted_in) or {}
         recorded = (evidence.get('decision') or {}).get('decision_id')
         if recorded != linked['acceptance_decision_id']:
             raise ValueError('acceptance_decision_id does not match the F3 acceptance evidence of requirement %s '
-                             'revision %d' % (linked['requirement_id'], linked['requirement_revision']))
+                             'revision %d (the revision that accepted this content)'
+                             % (linked['requirement_id'], accepted_in))
 
 
 def validate_disposal(payload, route):
@@ -1235,7 +1355,7 @@ def dispose(payload, actor, run, project, operators=None, route='review'):
     not be the proposal's submitter, and an owner must not be the escalator.
     """
     role = 'owner' if route == 'decide' else 'coordinator'
-    core.require_configured_operator(actor, operators, 'record a proposal %s'
+    _require_operator(actor, operators, 'record a proposal %s'
                                      % ('decision' if route == 'decide' else 'disposition'))
     payload = validate_disposal(payload, route)
     key = payload['key']
@@ -1256,10 +1376,7 @@ def dispose(payload, actor, run, project, operators=None, route='review'):
         raise ValueError('Proposal %s cannot be read (%s); an operator must repair it first'
                          % (key, entry['state'] if entry['state'] in ('malformed', 'unsupported') else 'malformed'))
     if entry['inert']:
-        raise ValueError('Proposal %s carries %d disposition(s) whose author is no longer on the operator '
-                         'allowlist, so its ledger says %s while its trusted state is %s. Restore that operator '
-                         '(admin.py operators add) before a new disposition is recorded.'
-                         % (key, entry['inert'], entry['claimed'], entry['state']))
+        raise ValueError(inert_refusal(key, entry))
     task, newest = row['id'], entry['record']
     # An identical retry of a write that already landed: adopt it instead of refusing it as stale.
     if interrupted:
@@ -1282,9 +1399,11 @@ def dispose(payload, actor, run, project, operators=None, route='review'):
                             '' if entry['state'] != 'submitted' else
                             ' (claim it first with to_state under-review)'))
     mine = _require_mapped(resolve, actor, 're-run this command')
-    if mine == newest['submitter']:
-        raise ValueError('You are the submitter of proposal %s; a person never records a disposition or a '
-                         'decision on their own proposal. Another operator must do it.' % key)
+    # The declared submitter and the actor that actually wrote revision 1: declaring
+    # another person as submitter must not let the writer review their own proposal.
+    if mine == newest['submitter'] or entry['author'] == actor or resolve(entry['author']) == mine:
+        raise ValueError('You are the submitter of proposal %s, or you wrote it; a person never records a '
+                         'disposition or a decision on their own proposal. Another operator must do it.' % key)
     if role == 'owner':
         escalator = entry['disposition']['author']
         if escalator == actor or resolve(escalator) == mine:
@@ -1324,6 +1443,38 @@ def dispose(payload, actor, run, project, operators=None, route='review'):
     return _disposed(key, task, record, core._comment_id(raw), False)
 
 
+def inert_refusal(key, entry):
+    """Why no new disposition can be recorded on a proposal that carries inert ones, and
+    what, if anything, an operator can do about it."""
+    authors = ', '.join(str(author) for author in entry['inert_authors'][:5]) or 'an unknown author'
+    return ('Proposal %s carries %d disposition(s) that do not count, written by %s: its ledger says %s while its '
+            'trusted state is %s, so a new disposition cannot follow it. If that author was an operator who has '
+            'been removed, re-adding them (admin.py operators add ACTOR) makes those records count again. If they '
+            'never were an operator, nothing restores the records. %s; until then the submitter can submit a new '
+            'proposal that supersedes this one.'
+            % (key, entry['inert'], authors, entry['claimed'], entry['state'], NO_REPAIR))
+
+
+def revocation_effects(rows, operators, actor, project=None):
+    """What removing `actor` from the operator allowlist changes for this project's
+    proposals: (["KEY before -> after"], settings change or None). Read-only."""
+    remaining = [item for item in configured_operators(operators if operators is not None else ()) if item != actor]
+    before, after = settings_view(rows, operators), settings_view(rows, remaining)
+    settings = None
+    if (before['revision'], before['sha256']) != (after['revision'], after['sha256']):
+        settings = 'settings revision %d -> %d' % (before['revision'], after['revision'])
+        if not after['revision']:
+            settings += ' (the actor map and the owner deciders read empty; triage stops until they are entered again)'
+    was, _ = catalog(rows, operators, Resolver(before, project))
+    now, _ = catalog(rows, remaining, Resolver(after, project))
+    later = {entry['native_id']: entry for entry in now}
+    changed = sorted('%s %s -> %s' % (entry['key'] or entry['native_id'], entry['state'],
+                                      later[entry['native_id']]['state'])
+                     for entry in was if entry['native_id'] in later
+                     and entry['state'] != later[entry['native_id']]['state'])
+    return changed, settings
+
+
 def _same_disposition(record, payload, role):
     return record['role'] == role and record['to_state'] == payload['to_state'] \
         and record['proposal_sha256'] == payload['proposal_sha256'] \
@@ -1350,16 +1501,16 @@ def change_settings(changes, actor, run, operators=None):
     read and the write one step). Only the actor map and the deciders have a writer in
     this slice; every other field of the frozen v1 set is carried forward unchanged.
     """
-    core.require_configured_operator(actor, operators, 'change the contribution settings')
+    _require_operator(actor, operators, 'change the contribution settings')
     changes = {name: value for name, value in (changes or {}).items() if value is not None}
     unknown = sorted(set(changes) - set(SETTINGS_CHANGES))
     if unknown:
         raise ValueError('unknown settings change(s): ' + ', '.join(unknown))
     rows = read_settings_rows(run)
     current = settings_view(rows, operators)
-    if len(current['anchors']) > 1:
-        raise ValueError('More than one contribution-settings anchor exists (%s); an operator must resolve that '
-                         'before the settings are changed' % ', '.join(map(str, current['anchors'])))
+    # Decoy rows (the label without a settings record) are not anchors and never block
+    # this command. Several real anchors can only predate the reserved prefix; the first
+    # one is used, as every reader does, and the warning stays on the result.
     if not changes:
         return _settings_result(current, False)
     contributions = json.loads(json.dumps(current['contributions']))
@@ -1477,18 +1628,24 @@ def _coverage(entries, incomplete, scanned_all=True):
     return note
 
 
-def get(rows, key, operators, resolve, settings, requirements, actor, history=10, now=None):
-    """`rows` hold the proposal's own anchor and the anchors that may supersede it."""
+def get(rows, key, operators, resolve, settings, requirements, actor, history=10, now=None, chain=None,
+        superseders_total=None):
+    """`rows` hold the proposal's own anchor and the anchors that supersede it. `chain` is
+    `read_supersedes_chain`'s answer and `superseders_total` the count `read_superseders`
+    found, when the caller made those reads."""
     now = now if now is not None else calendar.timegm(time.gmtime())
     entry, _ = find_entry(rows, key, operators, resolve)
     if entry['state'] in ('malformed', 'unsupported'):
         return {'schema_version': 1, 'key': key, 'native_id': entry['native_id'], 'state': entry['state'],
                 'sha256': None, 'disposition_comment_id': None,
                 'warnings': entry['warnings'][:10], 'untrusted': UNTRUSTED_LINE,
-                'coverage': 'this proposal cannot be read; an operator repairs it with admin.py void-record'}
+                'coverage': 'this proposal cannot be read. ' + NO_REPAIR + '; the submitter can submit a new '
+                            'proposal that supersedes it'}
     record, extra = entry['record'], derived(entry, now, settings['contributions'], requirements)
     coordinator = authority(actor, operators)
     entries, _ = catalog(rows, operators, resolve)
+    superseded_by = sorted(other['key'] for other in entries
+                           if other['record'] and other['record']['supersedes'] == key)
     return {'schema_version': 1, 'key': key, 'native_id': entry['native_id'], 'state': entry['state'],
             'stale': extra['stale'], 'due': extra['due'], 'next_actor': extra['next_actor'],
             'next_action': extra['next_action'], 'revision': record['revision'], 'sha256': record['sha256'],
@@ -1496,15 +1653,16 @@ def get(rows, key, operators, resolve, settings, requirements, actor, history=10
             'disposition_comment_id': entry['disposition_comment_id'],
             'submitter': record['submitter'], 'identity': entry['identity'],
             'submitted_by_agent': record['submitted_by_agent'], 'target': _target_view(record['target']),
-            'text': excerpt(record['text'], TEXT_MAX, extra['trust']),
-            'rationale': excerpt(record['rationale'], RATIONALE_MAX, extra['trust'])
+            'text': excerpt(record['text'], TEXT_MAX, extra['trust'], multiline=True),
+            'rationale': excerpt(record['rationale'], RATIONALE_MAX, extra['trust'], multiline=True)
             if record['rationale'] is not None else None,
             'evidence': [excerpt(item, EVIDENCE_TEXT_MAX) for item in record['evidence']],
             'attachments': [{'name': excerpt(item['name'], ATTACHMENT_NAME_MAX), 'sha256': item['sha256']}
                             for item in record['attachments']],
             'origin': record['origin'], 'supersedes': record['supersedes'],
-            'superseded_by': sorted(other['key'] for other in entries
-                                    if other['record'] and other['record']['supersedes'] == key),
+            'superseded_by': superseded_by,
+            'superseded_by_total': max(superseders_total or 0, len(superseded_by)),
+            'supersedes_chain': (chain or ([], None))[0], 'supersedes_warning': (chain or ([], None))[1],
             'submitted_at': entry['first']['created_at'], 'age_days': extra['age_days'],
             'time_to_disposition_days': extra['time_to_disposition_days'],
             'linked_requirement': extra['linked_requirement'],
@@ -1515,25 +1673,6 @@ def get(rows, key, operators, resolve, settings, requirements, actor, history=10
             'coverage': 'the newest revision and the disposition timeline (newest %d of %d); a reason, a question '
                         'and an escalation question are shown only to operators here and to the submitter in '
                         'proposal mine' % (min(history, len(entry['timeline'])), len(entry['timeline']))}
-
-
-def supersede_chain(entries, key):
-    """The keys a proposal supersedes, oldest last; stops at 8 hops, a cycle or a gap."""
-    by_key = {entry['key']: entry for entry in entries if entry['record']}
-    chain, seen, warning = [], {key}, None
-    current = by_key.get(key)
-    while current and current['record']['supersedes']:
-        nxt = current['record']['supersedes']
-        if nxt in seen:
-            warning = 'supersedes cycle'
-            break
-        if len(chain) >= SUPERSEDE_HOPS:
-            warning = 'supersedes chain longer than %d' % SUPERSEDE_HOPS
-            break
-        chain.append(nxt)
-        seen.add(nxt)
-        current = by_key.get(nxt)
-    return chain, warning
 
 
 def _matches(entry, options):
@@ -1730,7 +1869,11 @@ def help_payload():
                       'identity is verified when the declared actor maps to the submitter in the actor map; over '
                       'SSH that is attribution, not authentication.',
                       'A reason, a question and an escalation question are returned by get and list only to an '
-                      'operator; the submitter reads them with proposal mine.'],
+                      'actor on the operator allowlist, and by proposal mine --submitter IDENTITY to anyone who '
+                      'names that identity. Over SSH the actor and the submitter are self-declared, so this is '
+                      'a filter, not confidentiality: do not put secrets in them.',
+                      'Excerpts drop control, format (bidi, zero-width) and separator characters; a line break '
+                      'becomes a space, except in the text and rationale of get, which keep line feeds.'],
             'operator': list(HOST_COMMANDS.values()) + [
                 'admin.py proposal-reconcile PROJECT --operation-id ID --actor OPERATOR --reason TEXT '
                 '--disposition complete|failed|released [--issue-id ID]']}
@@ -1790,14 +1933,16 @@ def read(args, run, actor, operators, project=None):
         if not KEY.fullmatch(key):
             raise ValueError('a proposal key looks like p-<12 hex>')
         # Its own anchor with the settings anchor (one list, one show), then the anchors
-        # that name it as superseded, then the one requirement record it points at.
+        # labelled as superseding it, the proposals it supersedes (one narrow read per
+        # hop, none for most), then the one requirement record it points at.
         rows = read_key_and_settings(run, key)
         settings = settings_view(rows, operators)
         resolve = Resolver(settings, project)
         entry, _ = find_entry(rows, key, operators, resolve)
-        rows = rows + read_superseders(run, key, {row.get('id') for row in rows})
-        return get(rows, key, operators, resolve, settings, read_linked_requirements(run, [entry]), actor,
-                   history=history)
+        superseders, total = read_superseders(run, key, {row.get('id') for row in rows})
+        chain = read_supersedes_chain(run, entry, operators)
+        return get(rows + superseders, key, operators, resolve, settings, read_linked_requirements(run, [entry]),
+                   actor, history=history, chain=chain, superseders_total=total)
     options = _options(rest, {'--state': 'state', '--target': 'target', '--submitter': 'submitter',
                               '--limit': 'limit', '--offset': 'offset'})
     if not 1 <= options['limit'] <= LIST_LIMIT_MAX:
