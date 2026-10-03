@@ -743,25 +743,53 @@ def native_restore(root,source,destination,client=None):
             # Inside the guard: a second stop cannot kill the interpreter before the
             # client's group is killed. A finished client is not signalled again.
             terminate_process_group(handle)
-    elapsed=time.monotonic()-started
-    identity=adopt_project_identity(root,destination)
+        elapsed=time.monotonic()-started
+        # Still inside the guard (kittrial-5bb.82 review): a SIGTERM during the identity
+        # step is an exception the caller reports, not a silent death between the
+        # restored database and its metadata.
+        identity=adopt_project_identity(root,destination)
     report='Restored backups/%s into %s through the Dolt SQL client in %.1f s.'%(source,destination,elapsed)
     if identity is not None:
         report+=' Adopted the restored project identity %s into .beads/metadata.json.'%identity
     return report
 
-def restore_failure_notice(destination,error):
-    """What an operator must do after the native step of ``restore-new`` did not complete."""
+def restore_destination_state(root,destination):
+    """``empty`` when the destination a failed restore left is still the clean project
+    ``add-project`` made (bd reads it and it holds nothing but its merge slot), else
+    ``partial``. A project that cannot be read is partial. Never raises."""
+    try:
+        rows=json.loads(run_bd(root,destination,['list','--all','--limit','0','--json']) or '[]')
+    except (subprocess.CalledProcessError,subprocess.TimeoutExpired,OSError,ValueError,TypeError):
+        return 'partial'
+    if not isinstance(rows,list):return 'partial'
+    slot=destination+'-merge-slot'
+    return 'empty' if all(isinstance(row,dict) and row.get('id')==slot for row in rows) else 'partial'
+
+def restore_failure_notice(destination,error,state='partial'):
+    """What an operator must do after the native step of ``restore-new`` did not complete.
+
+    ``state`` is ``restore_destination_state``'s answer: the notice says "partial" only
+    when the destination is partial (kittrial-5bb.82 review).
+    """
     if isinstance(error,subprocess.TimeoutExpired):
         cause='the native restore reached its %d s ceiling and its client was stopped'%RESTORE_TIMEOUT
     elif isinstance(error,(TerminatedBySignal,KeyboardInterrupt)):
         cause='the native restore was interrupted and its client was stopped'
     else:
         cause='the native restore failed'
+    retire=('admin.py retire-project %s --actor OPERATOR --reason TEXT'%destination)
+    if state=='empty':
+        return ('restore-new did not complete: %s. Project %s exists as an empty, working project: nothing '
+                'was restored into it (and its coordination sidecar, journals and operation journal were NOT '
+                'restored). Do not use it as a tracker. Retire it (%s --force; it has the backup pair '
+                'add-project made) and run restore-new again into another unused destination name; the '
+                'source backup was not modified.'%(cause,destination,retire))
     return ('restore-new did not complete: %s. Project %s exists but holds a partial restore (its '
             'coordination sidecar, journals and operation journal were NOT restored). Preserve it for '
             'inspection, do not use or back it up as a tracker, and run restore-new again into another '
-            'unused destination name; the source backup was not modified.'%(cause,destination))
+            'unused destination name; the source backup was not modified. While it stays in the runtime '
+            'its backup fails and the backup gate reports the runtime incomplete: retire it with %s.'
+            %(cause,destination,retire))
 
 def provision_merge_slot(root,name):
     """Create the project's merge slot once, tolerating an existing slot.
@@ -1073,6 +1101,133 @@ def scheduled_backup_coverage(root,name):
                   +(' ('+'; '.join(details)+')' if details else '')
                   +f'. A schedule that covers every project is:\n  {line} '+dropins)
 
+#: Where ``retire-project`` moves a project directory, and its append-only journal.
+RETIRED_DIR='retired'
+RETIRE_JOURNAL='journal.jsonl'
+#: The receipt journals whose ``pending`` entries are reservations still in flight.
+RESERVATION_JOURNALS=('.coordination-requests','.requirement-requests','.handoff-requests',
+                      '.reference-requests','.proposal-requests','.capability-requests')
+
+def retired_entries(root):
+    """``[(project name, entry directory name)]`` for every retired project, sorted.
+
+    An entry is ``retired/<name>-<UTC stamp>``, exactly what ``retire-project`` creates;
+    anything else in that directory is ignored. Read-only.
+    """
+    base=root/RETIRED_DIR
+    if base.is_symlink() or not base.is_dir():return []
+    found=[]
+    for path in sorted(base.iterdir(),key=lambda item:item.name):
+        match=re.fullmatch(r'([a-z][a-z0-9]{1,23})-[0-9]{8}T[0-9]{6}Z',path.name)
+        if match and path.is_dir() and not path.is_symlink():found.append((match.group(1),path.name))
+    return found
+
+def refuse_retired_name(root,name):
+    """A retired name is never reused: its Dolt database is still on the server, so a new
+    project of that name would silently adopt it."""
+    held=[entry for project,entry in retired_entries(root) if project==name]
+    if held:
+        raise ValueError('Project name %s is retired (%s/%s): its database is still on the server, so the '
+                         'name is not reused. Choose another name.'%(name,RETIRED_DIR,held[-1]))
+
+def retire_findings(root,name):
+    """What ``retire-project`` checks before it moves a project, read from disk and bd.
+
+    ``working`` is whether the project looks like a live tracker: bd reads it, its backup
+    pair is complete on disk and the last backup run did not record it as failed. A
+    project left by a stopped restore fails at least one of those. The merge slot holder
+    and the pending reservations are what a move would strand. Never raises.
+    """
+    path=project_dir(root,name)
+    complete,reason=backup_pair_state(root,name)
+    recorded=None
+    try:
+        recorded=next((entry['status'] for entry in read_backup_status(root)['projects']
+                       if entry['name']==name),None)
+    except (OSError,ValueError,KeyError,TypeError):pass
+    readable=False;holder=None;slot='unreadable'
+    try:
+        run_bd(root,name,['list','--limit','1','--json'])
+        readable=True
+        state=json.loads(run_bd(root,name,['merge-slot','check','--json']) or 'null')
+        if isinstance(state,dict) and 'available' in state and not state.get('error'):
+            holder=state.get('holder');slot='held' if holder else 'free'
+        else:slot='missing'
+    except (subprocess.CalledProcessError,subprocess.TimeoutExpired,OSError,ValueError,TypeError):pass
+    pending={}
+    for journal in RESERVATION_JOURNALS:
+        directory=path/journal
+        if directory.is_symlink() or not directory.is_dir():continue
+        count=0
+        for receipt in directory.glob('*.json'):
+            try:
+                if json.loads(receipt.read_text(encoding='utf-8')).get('status')=='pending':count+=1
+            except (OSError,ValueError,AttributeError):continue
+        if count:pending[journal]=count
+    working=readable and complete and recorded in (None,'complete')
+    return {'initialized':(path/'.beads'/'metadata.json').is_file(),'bd_readable':readable,
+            'backup_pair':'complete' if complete else reason,'last_backup_run':recorded,
+            'merge_slot':slot,'merge_slot_holder':holder,'pending_reservations':pending,'working':working}
+
+def retire_project(root,name,actor,reason,force=False):
+    """Retire one project: move its directory aside. Nothing is deleted.
+
+    For a project a stopped ``restore-new`` left behind, or a drill project. One rename
+    moves ``projects/NAME`` to ``retired/NAME-<UTC stamp>``, so the project is no longer
+    initialized: the backup gate stops counting it and the endpoint answers
+    "Unknown/uninitialized project". ``backups/`` is never touched (this project's or any
+    other's) and the Dolt database is not dropped; moving the directory back undoes it.
+    The name stays reserved (``refuse_retired_name``).
+
+    Refused, naming what was found, unless ``force``: a project that looks like a working
+    tracker, one whose merge slot is held, one with pending reservations. The operator
+    allowlist is checked first, strictly. Both steps are journaled in
+    ``retired/journal.jsonl`` (intent before the move, the result after it).
+    """
+    import fcntl
+    from keyed_records import require_configured_operator
+    require_configured_operator(actor,operators(root,strict=True),'retire a project')
+    path=project_dir(root,name)
+    if not path.is_dir():raise ValueError('Unknown project: there is no projects/%s'%name)
+    if not isinstance(reason,str) or not reason.strip():raise ValueError('A reason is required')
+    if (root/RETIRED_DIR).is_symlink():raise ValueError('The retired directory must not be a symlink')
+    (root/'backups').mkdir(exist_ok=True)
+    with backup_lock(root,name):
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            findings=retire_findings(root,name)
+            blockers=[]
+            if findings['working']:
+                blockers.append('it looks like a working tracker (bd reads it, its backup pair is complete and '
+                                'the last backup run did not fail on it)')
+            if findings['merge_slot']=='held':
+                blockers.append('its merge slot is held by %s'%findings['merge_slot_holder'])
+            if findings['pending_reservations']:
+                blockers.append('it has pending reservations (%s)'%', '.join(
+                    '%d in %s'%(count,journal) for journal,count in sorted(findings['pending_reservations'].items())))
+            if blockers and not force:
+                raise ValueError('Refusing to retire %s: %s. Nothing was changed. Resolve that first, or pass '
+                                 '--force to retire it anyway.'%(name,'; '.join(blockers)))
+            entry='%s-%s'%(name,time.strftime('%Y%m%dT%H%M%SZ',time.gmtime()))
+            destination=root/RETIRED_DIR/entry
+            (root/RETIRED_DIR).mkdir(mode=0o700,exist_ok=True)
+            if destination.exists():raise ValueError('A retired entry %s already exists; retry in a second'%entry)
+            record={'project':name,'actor':actor,'reason':reason.strip(),'forced':bool(force),
+                    'overrode':blockers,'findings':findings,'destination':'%s/%s'%(RETIRED_DIR,entry)}
+            append_retire_journal(root,dict(record,event='intent',at=utc_stamp()))
+            os.rename(path,destination)
+        append_retire_journal(root,dict(record,event='retired',at=utc_stamp()))
+    return record
+
+def append_retire_journal(root,record):
+    """Append one line to ``retired/journal.jsonl`` (0600), flushed to disk."""
+    path=root/RETIRED_DIR/RETIRE_JOURNAL
+    if path.is_symlink():raise ValueError('The retire journal must not be a symlink')
+    fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600)
+    with os.fdopen(fd,'a',encoding='utf-8') as handle:
+        handle.write(json.dumps(record,sort_keys=True,ensure_ascii=False)+'\n')
+        handle.flush();os.fsync(handle.fileno())
+
 def add_project(root,name):
     """Initialize one project, provision its merge slot and back it up once.
 
@@ -1087,6 +1242,7 @@ def add_project(root,name):
     deliberate choice, not a missed case, and it never edits, installs or enables a unit.
     """
     path=project_dir(root,name)
+    refuse_retired_name(root,name)
     if path.exists() and any(path.iterdir()): raise ValueError('Project already exists; use it rather than initializing again')
     path.mkdir(exist_ok=True)
     cfg=config(root)
@@ -1912,7 +2068,11 @@ def merged_backup_status(root,record):
     except ValueError:
         previous=None
     if previous is None:return record
-    entries={entry['name']:entry for entry in previous['projects']}
+    # A project retired since the previous run is not carried forward: its last entry
+    # (usually the failure that led to retiring it) would otherwise keep every later
+    # record, and the health line built on it, incomplete for good.
+    retired={name for name,_ in retired_entries(root)}-set(initialized_projects(root))
+    entries={entry['name']:entry for entry in previous['projects'] if entry['name'] not in retired}
     for entry in record['projects']:entries[entry['name']]=entry
     merged=dict(record)
     merged['projects']=[entries[name] for name in sorted(entries)]
@@ -1961,7 +2121,12 @@ def require_complete_problems(root,record):
     if record.get('scope')!='all':
         add('scope','the last run was a named run, so it does not cover every initialized project')
     entries={entry['name']:entry for entry in record['projects']}
+    live=set(initialized_projects(root))
+    retired={name for name,_ in retired_entries(root)}-live
     for entry in record['projects']:
+        # A project retired since the run is no longer part of the runtime: the entry the
+        # run recorded for it (often the failure that led to retiring it) is not a gap.
+        if entry['name'] in retired:continue
         complete,reason=backup_pair_state(root,entry['name'])
         if not complete:add(entry['name'],'%s: %s'%(entry['name'],reason))
     for name in initialized_projects(root):
@@ -2092,8 +2257,12 @@ def backup_copy(root,destination):
     try:
         # Stage every project first, each under its locks, so a copy error touches
         # nothing in the destination.
+        retired={name for name,_ in retired_entries(root)}-set(initialized_projects(root))
         for entry in sorted(record['projects'],key=lambda item:item['name']):
             name=entry['name']
+            # A project retired since the run is not part of the runtime any more: its
+            # recorded entry is neither a gap (the gate) nor something to copy.
+            if name in retired:continue
             native=backups/name
             sidecar=backups/(name+'.coordination.json')
             journal=journal_snapshot_path(root,name)
@@ -2181,6 +2350,8 @@ def backup_copy(root,destination):
                          'destination does not look complete. Re-run after fixing the cause.'%(error,destination))
     finally:
         shutil.rmtree(staging,ignore_errors=True)
+    if retired_entries(root):
+        print('Retired projects (not initialized, not copied): %s'%', '.join(entry for _,entry in retired_entries(root)))
     print('Copied %d complete project pair(s) and %d operation-journal snapshot(s) of %d initialized to %s.'
           %(len(copied),journals,len(initialized_projects(root)),destination))
     return copied
@@ -2602,6 +2773,10 @@ def main():
     a=sub.add_parser('backup');a.add_argument('projects',nargs='*',metavar='project')
     a.add_argument('--all',action='store_true',dest='all_projects',
                    help='back up every initialized project in this runtime in one run')
+    a=sub.add_parser('retire-project',help='retire a partial or drill project: move it to retired/; deletes nothing (operator allowlist)')
+    a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--reason',required=True)
+    a.add_argument('--force',action='store_true',
+                   help='retire it although it looks like a working tracker, holds the merge slot or has pending reservations')
     a=sub.add_parser('backup-status')
     a.add_argument('--require-complete',action='store_true',dest='require_complete',
                    help='exit non-zero unless the last run covered every project (--all) and every initialized '
@@ -2682,6 +2857,10 @@ def main():
     elif args.command=='reconcile-request':
         import fcntl
         from coordination import reconcile_request
+        from keyed_records import require_configured_operator
+        # Strict allowlist first (kittrial-5bb.85): every host command that writes on
+        # another actor's behalf checks it. The actor-binding rules still apply on top.
+        require_configured_operator(args.actor,operators(root,strict=True),'reconcile a coordination request')
         path=project_dir(root,args.project)
         if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
         with (path/'.coordination.lock').open('a') as lock:
@@ -2724,6 +2903,8 @@ def main():
     elif args.command=='requirement-reconcile':
         import fcntl
         from requirement_records import reconcile
+        from keyed_records import require_configured_operator
+        require_configured_operator(args.actor,operators(root,strict=True),'reconcile a requirement operation')
         path=project_dir(root,args.project)
         if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
         def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
@@ -2828,6 +3009,9 @@ def main():
         elif kind=='capability':from capability_records import reconcile as record_reconcile
         elif kind=='proposal':from proposal_records import reconcile as record_reconcile
         else:from requirement_records import reconcile as record_reconcile
+        from keyed_records import require_configured_operator
+        # Strict allowlist before the receipt is read (kittrial-5bb.85).
+        require_configured_operator(args.actor,operators(root,strict=True),'reconcile a %s operation'%kind)
         path=project_dir(root,args.project)
         if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
         def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
@@ -2945,9 +3129,19 @@ def main():
     elif args.command=='backup':backup_projects(root,args.projects,args.all_projects)
     elif args.command=='backup-copy':backup_copy(root,args.destination)
     elif args.command=='backup-repoint':print(json.dumps(repoint_backup(root,args.project),sort_keys=True))
+    elif args.command=='retire-project':
+        result=retire_project(root,args.project,args.actor,args.reason,force=args.force)
+        print(json.dumps(result,sort_keys=True))
+        print('Retired %s to %s. Nothing was deleted: backups/%s and the Dolt database are untouched, and the '
+              'name stays reserved. If this project is registered in the web interface, archive it there: '
+              'its task pages now answer "Unknown/uninitialized project".'
+              %(args.project,result['destination'],args.project),file=sys.stderr)
     elif args.command=='backup-status':
         record=read_backup_status(root)
-        print(json.dumps(record,sort_keys=True))
+        # Retired projects are not part of the gate; they are listed so an operator can
+        # see them (the key appears only when there are any, the record is unchanged).
+        retired=[entry for _,entry in retired_entries(root)]
+        print(json.dumps(dict(record,retired=retired) if retired else record,sort_keys=True))
         if args.require_complete:
             problems=require_complete_problems(root,record)
             if problems:
@@ -2990,6 +3184,7 @@ def main():
                   file=__import__('sys').stderr)
     elif args.command=='restore-new':
         validate_name(args.project);validate_name(args.destination)
+        refuse_retired_name(root,args.destination)
         backup=root/'backups'/args.project
         if not backup.is_dir():raise ValueError('Source backup missing')
         if args.project==args.destination:raise ValueError('Restore requires a different destination')
@@ -3017,7 +3212,8 @@ def main():
             try:
                 print(native_restore(root,args.project,args.destination))
             except BaseException as error:
-                print(restore_failure_notice(args.destination,error),file=sys.stderr)
+                print(restore_failure_notice(args.destination,error,
+                                             restore_destination_state(root,args.destination)),file=sys.stderr)
                 raise
             # The native restore brings the SOURCE project's backup configuration with the
             # restored database: `.beads/dolt-backup.json` and the restored `dolt_backups`
@@ -3038,7 +3234,8 @@ def main():
                 print('Backup has no operation-journal snapshot; the restored project starts with an empty identity journal.')
         print('Restored only into the newly created project; retained original issue IDs. Never use this clone as a second live tracker.')
 
-if __name__=='__main__':
+def run_main():
+    """``main()`` with the command-line exits: a failure is one line, never a traceback."""
     try: main()
     except subprocess.CalledProcessError as e:
         # Never echo credential-bearing command input or the environment.
@@ -3050,3 +3247,10 @@ if __name__=='__main__':
         # The guarded cleanup ran (previous pair kept, sync client's group stopped); exit
         # with the conventional 128+signal status instead of a traceback.
         raise SystemExit(128+e.signum)
+    except KeyboardInterrupt:
+        # Ctrl-C: the command's own notice (if it has one) is already printed; exit with the
+        # conventional status for SIGINT instead of a traceback.
+        raise SystemExit(128+signal.SIGINT)
+
+if __name__=='__main__':
+    run_main()

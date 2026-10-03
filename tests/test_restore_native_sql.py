@@ -372,8 +372,10 @@ class RestoreNewCommandCase(RuntimeCase):
                 self.assertIn('restore-new did not complete', notice)
                 self.assertIn('partial restore', notice)
                 self.assertIn('another unused destination', notice)
-                # No re-point, no sidecar, no identity adoption after a failed native step.
-                self.assertEqual([call[0] for call in self.calls], ['add_project'])
+                # No re-point, no sidecar, no identity adoption after a failed native step:
+                # only the read that tells an empty destination from a partial one.
+                self.assertEqual([call[0] for call in self.calls], ['add_project', 'bd'])
+                self.assertEqual(self.calls[1][2][:2], ['list', '--all'])
                 self.assertFalse((destination / '.merge-context.json').exists())
                 self.assertEqual(json.loads((destination / '.beads' / 'metadata.json').read_text(
                     encoding='utf-8'))['project_id'], FRESH_ID)

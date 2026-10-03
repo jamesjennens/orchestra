@@ -1,0 +1,362 @@
+"""Operator hygiene (kittrial-5bb.85).
+
+`admin.py retire-project` moves a partial or drill project aside without deleting
+anything, so the backup gate passes again; a retired name is never reused; the
+`restore-new` notice says what the destination really is; and every reconcile host
+command checks the deployment operator allowlist before it reads a receipt.
+"""
+import contextlib
+import io
+import json
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import admin
+from test_backup_multi import make_project, write_pair
+
+OPERATOR = 'ops-james'
+# The move renames a directory while its own coordination lock file is held open, which
+# POSIX allows and Windows refuses; the command itself is POSIX-only (it takes fcntl locks).
+moves = unittest.skipUnless(os.name == 'posix', 'retire-project renames a directory holding its open lock file '
+                                                '(POSIX only)')
+
+
+def tree(path):
+    """Every file under `path` with its bytes: what "untouched" means."""
+    return {str(item.relative_to(path)): item.read_bytes() for item in sorted(path.rglob('*'))
+            if item.is_file() and item.suffix != '.lock'}       # lock files are empty and made on first use
+
+
+class RetireCase(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / 'runtime'
+        (self.root / 'backups').mkdir(parents=True)
+        (self.root / 'projects').mkdir()
+        (self.root / 'deployment.private.json').write_text(json.dumps(
+            {'port': 13317, 'unit': 'beads-example.service', 'password': 'test-only-password', 'schema': 1,
+             'operators': [OPERATOR]}), encoding='utf-8')
+        # alpha is a healthy project; gamma is what a stopped restore-new leaves: an
+        # initialized project bd cannot read, beside the pair add-project made.
+        for name in ('alpha', 'gamma'):
+            make_project(self.root, name)
+            write_pair(self.root, name)
+            (self.root / 'backups' / name / 'manifest').write_text('native ' + name, encoding='utf-8')
+        self.flock = Mock()
+        self.unreadable = {'gamma'}
+        self.slot = {}
+        self.bd = []
+        for patcher in (patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=self.flock, LOCK_EX=2)}),
+                        patch.dict(os.environ, {'ORCHESTRA_OPERATORS': ''}),
+                        patch.object(admin, 'root_path', return_value=self.root),
+                        patch.object(admin, 'run_bd', side_effect=self.run_bd)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def run_bd(self, root, name, args):
+        self.bd.append((name, list(args)))
+        if name in self.unreadable:
+            raise subprocess.CalledProcessError(1, ['bd'], stderr='PROJECT IDENTITY MISMATCH')
+        if args[:2] == ['merge-slot', 'check']:
+            return json.dumps({'available': name not in self.slot, 'holder': self.slot.get(name), 'waiters': None,
+                               'id': name + '-merge-slot'})
+        return '[]'
+
+    def run_admin(self, *argv):
+        stdout, stderr, code = io.StringIO(), io.StringIO(), 0
+        with patch.object(sys, 'argv', ['admin.py', '--root', str(self.root), *argv]), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                admin.main()
+            except SystemExit as exit:
+                code = exit.code if isinstance(exit.code, int) else 1
+                if exit.code is not None and not isinstance(exit.code, int):
+                    stderr.write(str(exit.code))
+            except ValueError as refusal:
+                code = 1
+                stderr.write(str(refusal))
+        return stdout.getvalue(), stderr.getvalue(), code
+
+    def nightly(self, fail=('gamma',)):
+        """`backup --all` as the schedule runs it; gamma's sync fails as a partial project's does."""
+        def backup(root, name):
+            if name in fail:
+                raise RuntimeError("backup 'default' not found")
+            write_pair(root, name)
+            return 'native output for ' + name
+        with patch.object(admin, 'backup_project', side_effect=backup):
+            return self.run_admin('backup', '--all')
+
+    def retire(self, name='gamma', actor=OPERATOR, *extra):
+        return self.run_admin('retire-project', name, '--actor', actor, '--reason', 'left by a stopped restore',
+                              *extra)
+
+    def journal(self):
+        path = self.root / 'retired' / 'journal.jsonl'
+        return [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()] if path.exists() else []
+
+    # -- the gate ------------------------------------------------------------------------
+    @moves
+    def test_the_nightly_gate_passes_again_after_retiring_a_partial_project(self):
+        self.assertNotEqual(self.nightly()[2], 0)
+        stdout, stderr, code = self.run_admin('backup-status', '--require-complete')
+        self.assertNotEqual(code, 0)
+        self.assertIn('gamma: the last run recorded failed', stderr)
+        record_file = (self.root / 'backups' / admin.BACKUP_STATUS_NAME).read_bytes()
+        backups = tree(self.root / 'backups')
+        marker = (self.root / 'projects' / 'gamma' / '.beads' / 'metadata.json').read_bytes()
+
+        stdout, stderr, code = self.retire()                       # no --force: it is not a working tracker
+        self.assertEqual(code, 0, stderr)
+        result = json.loads(stdout)
+        entry = result['destination'].split('/', 1)[1]
+        self.assertRegex(entry, r'^gamma-[0-9]{8}T[0-9]{6}Z$')
+        self.assertEqual((result['forced'], result['overrode'], result['findings']['working'],
+                          result['findings']['bd_readable'], result['findings']['last_backup_run']),
+                         (False, [], False, False, 'failed'))
+        self.assertIn('Nothing was deleted', stderr)
+        self.assertIn('archive it there', stderr)                  # the web interface reminder
+        # Moved, not deleted; no backup directory was touched, gamma's own included.
+        self.assertFalse((self.root / 'projects' / 'gamma').exists())
+        self.assertEqual((self.root / 'retired' / entry / '.beads' / 'metadata.json').read_bytes(), marker)
+        self.assertEqual(tree(self.root / 'backups'), backups)
+        self.assertEqual(admin.initialized_projects(self.root), ['alpha'])
+        self.assertEqual([(line['event'], line['project'], line['actor'], line['reason'], line['destination'])
+                          for line in self.journal()],
+                         [(event, 'gamma', OPERATOR, 'left by a stopped restore', 'retired/' + entry)
+                          for event in ('intent', 'retired')])
+
+        # The gate passes at once, from the SAME run record, and names the retired project.
+        stdout, stderr, code = self.run_admin('backup-status', '--require-complete')
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)['retired'], [entry])
+        self.assertEqual((self.root / 'backups' / admin.BACKUP_STATUS_NAME).read_bytes(), record_file)
+        # ... and the next nightly run covers only what is left.
+        stdout, stderr, code = self.nightly()
+        self.assertEqual(code, 0, stderr)
+        record = admin.read_backup_status(self.root)
+        self.assertEqual(([item['name'] for item in record['projects']], record['status']), (['alpha'], 'complete'))
+
+    def test_backup_status_is_unchanged_while_nothing_is_retired(self):
+        self.nightly(fail=())
+        stdout, _, code = self.run_admin('backup-status', '--require-complete')
+        self.assertEqual((code, json.loads(stdout)), (0, admin.read_backup_status(self.root)))
+        self.assertNotIn('retired', json.loads(stdout))
+
+    @moves
+    def test_a_retired_project_with_a_broken_pair_is_no_longer_a_gap(self):
+        self.nightly()
+        self.retire()
+        (self.root / 'backups' / 'gamma.coordination.json').write_text(
+            json.dumps({'schema_version': 1, 'status': 'pending'}), encoding='utf-8')
+        self.assertEqual(admin.require_complete_problems(self.root, admin.read_backup_status(self.root)), [])
+
+    # -- refusals ------------------------------------------------------------------------
+    def test_only_a_listed_operator_retires_and_a_refusal_changes_nothing(self):
+        before = tree(self.root)
+        for actor, message in (('mallory', 'not a server-side configured operator'),):
+            stdout, stderr, code = self.retire('gamma', actor)
+            self.assertNotEqual(code, 0)
+            self.assertIn(message, stderr)
+        stdout, stderr, code = self.run_admin('retire-project', 'gamma', '--actor', OPERATOR, '--reason', '  ')
+        self.assertIn('A reason is required', stderr)
+        stdout, stderr, code = self.retire('nosuch')
+        self.assertIn('Unknown project', stderr)
+        self.assertEqual(tree(self.root), before)
+        self.assertEqual(self.bd, [])                               # refused before any native call
+        self.flock.assert_not_called()
+
+    @moves
+    def test_a_working_project_a_held_slot_and_pending_reservations_need_force(self):
+        self.nightly()                                              # alpha is recorded complete
+        stdout, stderr, code = self.retire('alpha')
+        self.assertNotEqual(code, 0)
+        self.assertIn('looks like a working tracker', stderr)
+        self.assertIn('Nothing was changed', stderr)
+        # A project that is not working can still strand a held slot or a reservation.
+        make_project(self.root, 'delta')
+        self.slot['delta'] = 'alice/session'
+        requests = self.root / 'projects' / 'delta' / '.coordination-requests'
+        requests.mkdir()
+        for index, status in enumerate(('pending', 'pending', 'complete')):
+            (requests / ('%064d.json' % index)).write_text(json.dumps({'status': status}), encoding='utf-8')
+        stdout, stderr, code = self.retire('delta')
+        self.assertNotEqual(code, 0)
+        self.assertIn('its merge slot is held by alice/session', stderr)
+        self.assertIn('it has pending reservations (2 in .coordination-requests)', stderr)
+        self.assertNotIn('working tracker', stderr)                 # delta has no backup pair
+        self.assertEqual(self.journal(), [])
+        self.assertTrue((self.root / 'projects' / 'delta').is_dir())
+
+        for name in ('alpha', 'delta'):
+            stdout, stderr, code = self.retire(name, OPERATOR, '--force')
+            self.assertEqual(code, 0, stderr)
+            result = json.loads(stdout)
+            self.assertTrue(result['forced'])
+            self.assertTrue(result['overrode'])
+        done = [line for line in self.journal() if line['event'] == 'retired']
+        self.assertEqual([(line['project'], line['forced'], len(line['overrode'])) for line in done],
+                         [('alpha', True, 1), ('delta', True, 2)])
+        self.assertTrue((self.root / 'backups' / 'alpha' / 'manifest').is_file())
+
+    # -- a retired name is never reused --------------------------------------------------
+    @moves
+    def test_a_retired_name_is_refused_by_add_project_and_restore_new(self):
+        self.nightly()
+        entry = json.loads(self.retire()[0])['destination']
+        self.bd.clear()
+        for argv in (('add-project', 'gamma'), ('restore-new', 'alpha', 'gamma')):
+            stdout, stderr, code = self.run_admin(*argv)
+            self.assertNotEqual(code, 0)
+            self.assertIn('Project name gamma is retired (%s)' % entry, stderr)
+            self.assertIn('Choose another name', stderr)
+        self.assertEqual(self.bd, [])                               # refused before anything is created
+        self.assertFalse((self.root / 'projects' / 'gamma').exists())
+        # Only real entries reserve a name: a stray file or directory in retired/ does not.
+        (self.root / 'retired' / 'notes.txt').write_text('x', encoding='utf-8')
+        (self.root / 'retired' / 'beta-latest').mkdir()
+        self.assertEqual([name for name, _ in admin.retired_entries(self.root)], ['gamma'])
+        admin.refuse_retired_name(self.root, 'beta')
+
+    @moves
+    def test_backup_copy_lists_the_retired_projects(self):
+        self.nightly()
+        entry = json.loads(self.retire()[0])['destination'].split('/', 1)[1]
+        stdout, stderr, code = self.run_admin('backup-copy', str(Path(self.temp.name) / 'off-machine'))
+        self.assertEqual(code, 0, stderr)
+        self.assertIn('Retired projects (not initialized, not copied): ' + entry, stdout)
+        self.assertFalse((Path(self.temp.name) / 'off-machine' / 'gamma').exists())
+
+
+class RestoreNoticeCase(unittest.TestCase):
+    """The kittrial-5bb.82 review items on `restore-new`."""
+
+    def test_the_notice_says_partial_only_when_the_destination_is_partial(self):
+        error = subprocess.CalledProcessError(1, ['dolt'], stderr='refused')
+        partial = admin.restore_failure_notice('beta', error, 'partial')
+        self.assertIn('holds a partial restore', partial)
+        self.assertIn('admin.py retire-project beta --actor OPERATOR --reason TEXT', partial)
+        empty = admin.restore_failure_notice('beta', error, 'empty')
+        self.assertIn('exists as an empty, working project: nothing was restored into it', empty)
+        self.assertNotIn('partial', empty)
+        self.assertIn('retire-project beta --actor OPERATOR --reason TEXT --force', empty)
+        self.assertIn('holds a partial restore', admin.restore_failure_notice('beta', error))   # the default
+
+    def test_the_destination_is_empty_only_when_bd_reads_it_and_it_holds_nothing(self):
+        for answer, expected in (('[]', 'empty'), (json.dumps([{'id': 'beta-merge-slot'}]), 'empty'),
+                                 (json.dumps([{'id': 'beta-merge-slot'}, {'id': 'beta-1'}]), 'partial'),
+                                 ('not json', 'partial'), ('{}', 'partial'),
+                                 (subprocess.CalledProcessError(1, ['bd'], stderr='PROJECT IDENTITY MISMATCH'),
+                                  'partial')):
+            with self.subTest(answer=str(answer)[:30]), patch.object(
+                    admin, 'run_bd', side_effect=[answer] if isinstance(answer, Exception) else None,
+                    return_value=None if isinstance(answer, Exception) else answer):
+                self.assertEqual(admin.restore_destination_state(Path('/unused'), 'beta'), expected)
+
+    def test_the_identity_step_runs_inside_the_termination_guard(self):
+        seen = {}
+
+        def adopt(root, name):
+            seen['handler'] = signal.getsignal(signal.SIGTERM)
+            return 'restored-identity'
+        before = signal.getsignal(signal.SIGTERM)
+        with patch.object(admin, 'project_server_metadata', return_value=('127.0.0.1', 13317, 'root', 'beta')), \
+                patch.object(admin, 'native_restore_url', return_value='file:///backups/alpha'), \
+                patch.object(admin, 'environment', return_value={}), \
+                patch.object(admin, 'spawn_sync_client', return_value=''), \
+                patch.object(admin, 'terminate_process_group'), \
+                patch.object(admin, 'adopt_project_identity', side_effect=adopt):
+            report = admin.native_restore(Path('/unused'), 'alpha', 'beta')
+        self.assertIs(seen['handler'], admin.raise_termination)     # a SIGTERM here raises, it does not kill
+        self.assertIs(signal.getsignal(signal.SIGTERM), before)
+        self.assertIn('Adopted the restored project identity restored-identity', report)
+
+    def test_ctrl_c_exits_with_the_sigint_status_and_no_traceback(self):
+        with patch.object(admin, 'main', side_effect=KeyboardInterrupt):
+            with self.assertRaises(SystemExit) as stopped:
+                admin.run_main()
+        self.assertEqual(stopped.exception.code, 128 + signal.SIGINT)
+
+
+class ReconcileAllowlistCase(unittest.TestCase):
+    """Every reconcile host command checks the allowlist, strictly, before the receipt."""
+
+    COMMANDS = (('requirement-reconcile', '--operation-id', ()),
+                ('reference-reconcile', '--operation-id', ()),
+                ('capability-reconcile', '--operation-id', ()),
+                ('record-reconcile', '--operation-id', ('--kind', 'requirement')),
+                ('record-reconcile', '--operation-id', ('--kind', 'reference')),
+                ('record-reconcile', '--operation-id', ('--kind', 'capability')),
+                ('reconcile-request', '--request-id', ()))
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.project = make_project(self.root, 'trial')
+        self.flock = Mock()
+        self.native = Mock(return_value='[]')
+        for patcher in (patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=self.flock, LOCK_EX=2)}),
+                        patch.dict(os.environ, {'ORCHESTRA_OPERATORS': ''}),
+                        patch.object(admin, 'root_path', return_value=self.root),
+                        patch.object(admin, 'run_bd', self.native)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def configure(self, operators):
+        config = {'password': 'x', 'unit': 'none'}
+        if operators is not None:
+            config['operators'] = operators
+        (self.root / 'deployment.private.json').write_text(json.dumps(config), encoding='utf-8')
+
+    def run_admin(self, command, flag, extra, actor):
+        with patch.object(sys, 'argv', ['admin.py', '--root', str(self.root), command, 'trial', flag, 'op-1',
+                                        '--actor', actor, '--reason', 'r', *extra]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            admin.main()
+
+    def test_an_unlisted_actor_is_refused_before_the_receipt_is_read(self):
+        self.configure([OPERATOR])
+        for command, flag, extra in self.COMMANDS:
+            with self.subTest(command=' '.join((command,) + extra)):
+                with self.assertRaisesRegex(ValueError, 'Actor mallory is not a server-side configured operator'):
+                    self.run_admin(command, flag, extra, 'mallory')
+        self.native.assert_not_called()
+        self.flock.assert_not_called()
+        self.assertEqual(sorted(path.name for path in self.project.iterdir()), ['.beads'])   # no journal made
+
+    def test_an_empty_allowlist_authorizes_nobody_and_says_what_to_do(self):
+        for operators in (None, []):
+            self.configure(operators)
+            for command, flag, extra in self.COMMANDS:
+                with self.subTest(operators=operators, command=' '.join((command,) + extra)):
+                    with self.assertRaisesRegex(ValueError, 'No operator allowlist is configured'):
+                        self.run_admin(command, flag, extra, OPERATOR)
+        self.native.assert_not_called()
+
+    def test_a_listed_operator_reaches_the_receipt(self):
+        self.configure([OPERATOR])
+        for command, flag, extra in self.COMMANDS:
+            with self.subTest(command=' '.join((command,) + extra)):
+                with self.assertRaisesRegex(ValueError, 'receipt|request'):
+                    self.run_admin(command, flag, extra, OPERATOR)
+
+    def test_a_shell_allowlist_that_disagrees_is_refused(self):
+        self.configure([OPERATOR])
+        with patch.dict(os.environ, {'ORCHESTRA_OPERATORS': 'mallory'}), \
+                self.assertRaisesRegex(ValueError, 'ORCHESTRA_OPERATORS is set in this shell'):
+            self.run_admin('reference-reconcile', '--operation-id', (), 'mallory')
+
+
+if __name__ == '__main__':
+    unittest.main()
