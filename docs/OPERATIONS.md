@@ -506,8 +506,9 @@ python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime anc
 - The row is not an anchor of that kind, was already released, or carries more than one key label.
 - The key is not duplicated. The anchors are counted exactly as every write counts them, so the last anchor of a key is never released this way.
 - The named anchor holds a record this kit cannot read (a newer record version).
-- The named anchor holds a readable record and no remaining anchor does. A record-less anchor, one whose records are all voided, and one whose records are malformed do not count as readable. A key is never left with nothing readable: deal with the other anchor first (release it; void its malformed records first if the plain mode asks for that), which leaves the readable one as the key's only anchor.
+- The named anchor holds a readable record and no remaining anchor does. "Readable" is what a reader would present: an anchor that is record-less, whose records are all voided, or that reads `malformed`, `unsupported` or incomplete does not count, even when its revisions themselves parse (one other bad comment on an anchor makes readers refuse the whole entry). A key is never left with nothing readable: deal with the other anchor first (release it; void its malformed records first if the plain mode asks for that), which leaves the readable one as the key's only anchor.
 - The named anchor carries acceptance evidence that no void names, **live or inert**. It needs the extra flag `--set-aside-evidence`. That covers the anchor readers currently select: among duplicates only live acceptance evidence selects an anchor. Inert evidence (its operator was removed from the allowlist) counts, because it would read live again if that operator were re-added.
+- The named anchor reads `malformed` and carries live acceptance evidence. It may be the key's accepted record behind one bad comment: void that comment first (`admin.py void-record`), then run the release again.
 - The named anchor reads an accepted record and no remaining anchor reads one. The key never loses its only accepted record; release the other anchor instead. Live acceptance evidence on a remaining anchor is not enough: an operator accept that stopped after writing its evidence and before the accepted revision leaves evidence on a draft.
 
 What a release does, in order: it settles the pending receipt the row's `request:` label names, closes the row if it is open, adds one audit comment as the operator, then removes the state, `request:` and `request-content:` labels and, last, the key label. The type label and every comment stay, so nothing is deleted and the row stays hidden from `work`. Each step is skipped when already done, so a re-run after an uncertain write finishes the release.
@@ -515,6 +516,22 @@ What a release does, in order: it settles the pending receipt the row's `request
 The audit comment names the operator, the reason, the key, the anchors that remain, which anchor readers selected before and select now, every record set aside (revision and hash), every piece of acceptance evidence set aside (revision, record hash, operator, decision id, live or inert), and the count of other records on the anchor (capability aliases and verifications) that stop counting for the key. The printed JSON carries the same facts: `remaining`, `selected_before`, `selected_after`, `records`, `evidence_set_aside`, `stop_counting`.
 
 A released row is no longer an anchor of any key and is never read for one again. **Evidence set aside stays set aside**: re-adding the operator who recorded it does not bring it back, and the key reads exactly as it did after the release. The release cannot be undone through the kit. Aliases and verifications on the released anchor stop counting; record them again on the remaining anchor if they are still wanted. Take a backup afterwards.
+
+Which anchor to name, by shape:
+
+| The key's anchors | The safe sequence |
+| --- | --- |
+| a genuine draft and a record-less anchor (orphan) | plain `anchor-release` of the orphan |
+| a genuine draft and a forged draft | `--duplicate` on the forged one |
+| two accepted anchors, both with live evidence | `--duplicate --set-aside-evidence` on the forged one |
+| an accepted anchor and a draft whose accept stopped after its evidence | `--duplicate --set-aside-evidence` on that draft |
+| a forged accepted anchor whose evidence is inert (or by an unlisted author) and a genuine draft | `--duplicate --set-aside-evidence` on the forged one |
+| an anchor that reads `malformed` beside a readable one | void the malformed comment, or `--duplicate` on the malformed anchor when it is the forged one and carries no live evidence |
+
+Two shapes have no clean kit path:
+
+- **A forged accepted anchor with LIVE evidence beside a genuine draft.** The forged anchor holds the key's only accepted record, so it is not released. Release the genuine draft with `--duplicate` (the forged anchor is readable, so this is allowed), then revise and accept the right content on top of the anchor that remains.
+- **A forged anchor that holds a `-v2` record or an unknown record kind of the family.** This kit cannot judge it, so it refuses to release it, and it refuses to release the genuine anchor beside it (nothing readable would remain). Use the host procedure below, or a kit that reads the record.
 
 When two anchors both have live acceptance evidence, the key reads `conflicted` and neither is selected. Decide which is wrong, with the project owner if it is not obvious, and release that one with `--duplicate --set-aside-evidence`; the other becomes the selected anchor, and the output shows it. Do not try to void the acceptance evidence first: that void is refused.
 

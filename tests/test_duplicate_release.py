@@ -140,6 +140,81 @@ class ReadableRecordRuleTests(ReleaseCase):
             native = self.native(orphan(module, 'a-one'), malformed(module, 'b-two'))
             self.assertEqual(self.release(module, native, 'b-two')['remaining'], ['a-one'])
 
+    def test_readable_is_what_the_reader_presents_not_what_the_ledger_parses(self):
+        # Review of b1b2b10: forged anchor B holds a well-formed draft and one more comment
+        # that makes the READER refuse the whole entry. Its revision ledger still parses, so
+        # releasing the genuine draft A left the key malformed or unsupported.
+        for module in (cr, rr):
+            family = module.KIND.family
+            extras = (('a CRLF lookalike', module.ENTRY_PREFIX.replace('\n', '\r\n') + '{}', 'malformed'),
+                      ('a malformed acceptance', module.KIND.acceptance_prefix + '{broken', 'malformed'),
+                      ('a -v2 record', 'Kind: %sentry-v2\n{}' % family, 'unsupported'),
+                      ('an unknown kind of the family', 'Kind: %sfuture-v1\n{}' % family, 'unsupported'))
+            for label, text, state in extras:
+                with self.subTest(kind=module.TYPE_LABEL, extra=label):
+                    forged = anchor(module, 'b-forged', state='draft')
+                    forged['comments'].append({'id': 'b-extra', 'text': text, 'author': 'mallory'})
+                    native = self.native(anchor(module, 'a-genuine', state='draft'), forged)
+                    row = native.row('b-forged')
+                    self.assertEqual((module.KIND.entry_view(row, OPS)['state'],
+                                      bool(module.KIND.readable_revisions(row, OPS)),
+                                      module.KIND.presents_record(row, OPS)), (state, True, False))
+                    native.calls = []
+                    for flags in ({}, {'set_aside_evidence': True}):
+                        with self.assertRaisesRegex(ValueError, r'No remaining anchor of .* holds a readable record '
+                                                                r'\(b-forged\), so releasing a-genuine would leave '
+                                                                'the key with nothing readable'):
+                            self.release(module, native, 'a-genuine', **flags)
+                    self.assertEqual(self.writes(native), [])
+                    if state == 'malformed':
+                        # The forged one is the one to release; the genuine draft then reads alone.
+                        self.assertEqual(self.release(module, native, 'b-forged')['remaining'], ['a-genuine'])
+                        view = module.get(native.rows, KEY, OPS)
+                        self.assertEqual((view['native_id'], view['warnings']), ('a-genuine', []))
+                    else:
+                        with self.assertRaisesRegex(ValueError, 'holds a record this kit cannot read'):
+                            self.release(module, native, 'b-forged')            # the host procedure, or a newer kit
+            self.assertTrue(module.KIND.presents_record(anchor(module, 'x', state='draft'), OPS))
+            self.assertTrue(module.KIND.presents_record(anchor(module, 'x'), OPS))
+            for other in (orphan, malformed, voided_only):
+                self.assertFalse(module.KIND.presents_record(other(module, 'x'), OPS), other.__name__)
+
+    def test_an_accepted_anchor_that_reads_malformed_is_not_set_aside(self):
+        # Review of b1b2b10: the genuine accepted anchor carries one unvoided malformed
+        # comment, so it reads no accepted record and neither rule protected it.
+        for module in (cr, rr):
+            with self.subTest(kind=module.TYPE_LABEL):
+                genuine = anchor(module, 'a-genuine')
+                genuine['comments'].append({'id': 'a-bad', 'text': module.KIND.acceptance_prefix + '{broken',
+                                            'author': 'mallory'})
+                native = self.native(genuine, anchor(module, 'b-forged', state='draft'))
+                self.assertEqual(module.KIND.entry_view(native.row('a-genuine'), OPS)['state'], 'malformed')
+                native.calls = []
+                for flags in ({}, {'set_aside_evidence': True}):
+                    with self.assertRaisesRegex(ValueError, 'a-genuine reads malformed and carries live acceptance '
+                                                            'evidence.*Void the malformed comment first'):
+                        self.release(module, native, 'a-genuine', **flags)
+                self.assertEqual(self.writes(native), [])
+                # After the void the same release is refused by the accepted-record rule.
+                bad = native.row('a-genuine')['comments'][-1]
+                module.KIND.apply_void({
+                    'schema_version': 1, 'operation': 'void-record', 'operation_id': 'void-a-bad', 'task': 'a-genuine',
+                    'target': bad['id'], 'target_kind': module.KIND.family + 'acceptance',
+                    'target_sha256': recovery.digest(bad['text']), 'original': bad['text'],
+                    'reason': 'Malformed record; repaired by the operator', 'disposition': 'void',
+                    'operator': OPERATOR}, OPERATOR, native, OPS)
+                self.assertEqual(module.KIND.entry_view(native.row('a-genuine'), OPS)['state'], 'accepted')
+                with self.assertRaisesRegex(ValueError, 'a-genuine holds the only accepted record of sample.fact'):
+                    self.release(module, native, 'a-genuine', set_aside_evidence=True)
+                done = self.release(module, native, 'b-forged')
+                self.assertEqual((done['remaining'], done['selected_after']), (['a-genuine'], 'a-genuine'))
+                # A malformed anchor WITHOUT live evidence is still releasable: it is the broken duplicate.
+                broken = anchor(module, 'c-broken', state='draft')
+                broken['comments'].append({'id': 'c-bad', 'text': module.KIND.acceptance_prefix + '{broken',
+                                           'author': 'mallory'})
+                native = self.native(anchor(module, 'a-genuine'), broken)
+                self.assertEqual(self.release(module, native, 'c-broken')['remaining'], ['a-genuine'])
+
     def test_live_evidence_on_a_remaining_anchor_is_not_an_accepted_record(self):
         # Anchor B is a draft whose accept died after its evidence; anchor A holds the key's
         # only accepted record. Releasing A took the key from accepted to draft-only.

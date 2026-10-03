@@ -873,6 +873,18 @@ class AnchoredKind:
         except ValueError:
             return []
 
+    def presents_record(self, row, operators):
+        """Whether a reader would present a record from this anchor: its `entry_view` is not
+        malformed, unsupported or incomplete and shows an accepted record or a proposed
+        revision. The revision ledger alone is not enough: one other bad comment on the
+        anchor (a malformed acceptance, a CRLF lookalike, a newer or unknown record kind)
+        makes the reader refuse the whole entry (review of b1b2b10)."""
+        if not self.has_live_record(row, operators):
+            return False
+        view = self.entry_view(row, operators)
+        return view['state'] not in (None, 'malformed', 'unsupported', 'incomplete') \
+            and (view.get('record') is not None or view.get('proposed') is not None)
+
     def acceptance_on(self, row, operators):
         """The acceptance evidence on one anchor that no applied void names:
         [{revision, record_sha256, operator, decision_id, at, live}]. `live` is the reader's
@@ -907,9 +919,14 @@ class AnchoredKind:
         - the row carries more than one lookup label;
         - the key is not duplicated (fewer than two anchors, counted as every write counts);
         - the named anchor holds a record this kit cannot read;
-        - the named anchor holds a readable record and no remaining anchor does (a
-          record-less, voided-only or malformed anchor does not count): the key is never
-          left with nothing readable. Release the other anchor first;
+        - the named anchor holds a readable record and the reader would present a record
+          from no remaining anchor (`presents_record`: a record-less, voided-only,
+          malformed, unsupported or incomplete anchor does not count, whatever its
+          revision ledger says): the key is never left with nothing readable. Release
+          the other anchor first;
+        - the named anchor reads malformed and carries live acceptance evidence: it may be
+          the key's accepted record behind one bad comment. Void that comment first; the
+          rules below then judge it as what it is;
         - the named anchor carries acceptance evidence that no void names, live or inert,
           unless `set_aside_evidence`. That covers the anchor the reader selects: among
           duplicates only one live acceptance selects an anchor (`select_entries`), so the
@@ -940,7 +957,7 @@ class AnchoredKind:
             raise ValueError('%s anchor %s holds a record this kit cannot read, so it cannot be judged; use a kit '
                              'that reads it' % (self.title, issue_id))
         if self.readable_revisions(row, operators) \
-                and not any(self.readable_revisions(other, operators) for other in remaining):
+                and not any(self.presents_record(other, operators) for other in remaining):
             raise ValueError('No remaining anchor of %s %s holds a readable record (%s), so releasing %s would leave '
                              'the key with nothing readable. Deal with the other anchor(s) first: release a '
                              'record-less one without --duplicate, or void its malformed records and then release '
@@ -948,6 +965,11 @@ class AnchoredKind:
                              % (self.noun, shown_key, ', '.join(str(item.get('id')) for item in remaining),
                                 issue_id, issue_id))
         evidence = self.acceptance_on(row, operators)
+        if view['state'] == 'malformed' and any(item['live'] for item in evidence):
+            raise ValueError('%s anchor %s reads malformed and carries live acceptance evidence: it may hold the '
+                             'accepted record of %s behind a malformed comment. Void the malformed comment first '
+                             '(admin.py void-record), then run this again; the anchor is then judged by what it '
+                             'really holds' % (self.title, issue_id, shown_key))
         before = self.selected_anchor(anchors, operators)
         after = self.selected_anchor(remaining, operators)
         if evidence and not set_aside_evidence:
