@@ -23,7 +23,9 @@ sys.path.insert(0, str(KIT))
 sys.path.insert(0, str(KIT / 'tests'))
 import admin
 import capability_records as cr
+import recovery
 import reference_records as rr
+from keyed_entries import content_hash
 from test_catalog_followups import anchor
 from test_reference_records import OPERATOR, RefNative, acceptance, entry as reference_payload
 
@@ -64,6 +66,106 @@ class ReleaseCase(unittest.TestCase):
 
     def rows(self, native):
         return native.rows
+
+
+def orphan(module, task):
+    return {'id': task, 'labels': [module.TYPE_LABEL, module.key_label(KEY)], 'status': 'closed', 'comments': []}
+
+
+def malformed(module, task):
+    return dict(orphan(module, task), comments=[{'id': task + '-bad', 'text': module.ENTRY_PREFIX + '{broken',
+                                                 'author': 'alice'}])
+
+
+def voided_only(module, task):
+    """An anchor whose only record is malformed and named by an applied operator void."""
+    native = RefNative()
+    native.actor = OPERATOR
+    native.rows = [dict(malformed(module, task), title='Seeded', description='', issue_type='task')]
+    bad = native.rows[0]['comments'][0]
+    module.KIND.apply_void({'schema_version': 1, 'operation': 'void-record', 'operation_id': 'void-' + task,
+                            'task': task, 'target': bad['id'], 'target_kind': module.KIND.family + 'entry',
+                            'target_sha256': recovery.digest(bad['text']), 'original': bad['text'],
+                            'reason': 'Malformed record; repaired by the operator', 'disposition': 'void',
+                            'operator': OPERATOR}, OPERATOR, native, OPS)
+    row = native.row(task)
+    assert not module.KIND.has_live_record(row, OPS), 'the fixture void must apply'
+    return row
+
+
+def accept_died(module, task):
+    """A draft whose operator accept wrote its evidence and died before the accepted revision."""
+    row = anchor(module, task, state='draft')
+    draft = module.parse_entry(row['comments'][0]['text'])
+    accepted = {name: value for name, value in draft.items() if name != 'sha256'}
+    accepted.update(revision=2, acceptance_state='accepted')
+    accepted['sha256'] = content_hash(accepted)
+    _, body = module.KIND.acceptance_evidence(dict(acceptance(), record_sha256=accepted['sha256']), task, 2,
+                                              accepted, OPERATOR, at='2026-10-01T12:00:00Z')
+    row['comments'].append({'id': task + '-accept', 'text': body, 'author': OPERATOR})
+    return row
+
+
+class ReadableRecordRuleTests(ReleaseCase):
+    """Review of febaad7: a release never leaves the key with no readable record, and
+    never takes its only accepted record away."""
+
+    def test_a_readable_anchor_is_not_released_beside_anchors_with_nothing_readable(self):
+        for module in (cr, rr):
+            for other in (orphan, malformed, voided_only):
+                for label, named, flags in (
+                        ('draft', anchor(module, 'a-named', state='draft'), {}),
+                        ('draft with the flag', anchor(module, 'a-named', state='draft'), {'set_aside_evidence': True}),
+                        ('inert accepted', evidence_by(module, anchor(module, 'a-named'), 'former-operator'),
+                         {'set_aside_evidence': True}),
+                        ('live accepted', anchor(module, 'a-named'), {'set_aside_evidence': True})):
+                    with self.subTest(kind=module.TYPE_LABEL, other=other.__name__, named=label):
+                        native = self.native(named, other(module, 'b-other'))
+                        self.assertEqual(module.KIND.readable_revisions(native.row('b-other'), OPS), [])
+                        native.calls = []
+                        with self.assertRaisesRegex(ValueError, r'No remaining anchor of .* sample.fact holds a '
+                                                                r'readable record \(b-other\), so releasing a-named '
+                                                                'would leave the key with nothing readable'):
+                            self.release(module, native, 'a-named', **flags)
+                        self.assertEqual(self.writes(native), [])
+                        self.assertIn(module.key_label(KEY), native.row('a-named')['labels'])
+                # The other direction is the repair: the anchor with nothing readable goes.
+                with self.subTest(kind=module.TYPE_LABEL, other=other.__name__, named='the other one'):
+                    native = self.native(anchor(module, 'a-named', state='draft'), other(module, 'b-other'))
+                    done = self.release(module, native, 'b-other')
+                    self.assertEqual((done['remaining'], done['records']), (['a-named'], []))
+                    with self.assertRaisesRegex(ValueError, 'is not duplicated: a-named is its only anchor'):
+                        self.release(module, native, 'a-named')            # so the key keeps an anchor
+            # Two anchors with nothing readable: either may go (nothing readable is lost).
+            native = self.native(orphan(module, 'a-one'), malformed(module, 'b-two'))
+            self.assertEqual(self.release(module, native, 'b-two')['remaining'], ['a-one'])
+
+    def test_live_evidence_on_a_remaining_anchor_is_not_an_accepted_record(self):
+        # Anchor B is a draft whose accept died after its evidence; anchor A holds the key's
+        # only accepted record. Releasing A took the key from accepted to draft-only.
+        for module in (cr, rr):
+            with self.subTest(kind=module.TYPE_LABEL):
+                native = self.native(anchor(module, 'a-accepted'), accept_died(module, 'b-died'))
+                died = native.row('b-died')
+                self.assertEqual([(item['revision'], item['live']) for item in module.KIND.acceptance_on(died, OPS)],
+                                 [(2, True)])
+                self.assertIsNone(module.KIND.entry_view(died, OPS)['record'])
+                before = module.get(native.rows, KEY, OPS)
+                self.assertEqual((before['native_id'], before['state']), ('a-accepted', 'accepted'))
+                native.calls = []
+                with self.assertRaisesRegex(ValueError, 'a-accepted holds the only accepted record of sample.fact: '
+                                                        'no remaining anchor reads an accepted record'):
+                    self.release(module, native, 'a-accepted', set_aside_evidence=True)
+                self.assertEqual(self.writes(native), [])
+                # The broken one is the one to release; its dangling evidence needs the flag.
+                with self.assertRaisesRegex(ValueError, 'released only with --set-aside-evidence'):
+                    self.release(module, native, 'b-died')
+                done = self.release(module, native, 'b-died', set_aside_evidence=True)
+                self.assertEqual((done['selected_after'], [item['revision'] for item in done['evidence_set_aside']]),
+                                 ('a-accepted', [2]))
+                after = module.get(native.rows, KEY, OPS)
+                self.assertEqual((after['native_id'], after['state'], after['warnings']),
+                                 ('a-accepted', 'accepted', []))
 
 
 class DuplicateReleaseTests(ReleaseCase):
@@ -135,7 +237,7 @@ class DuplicateReleaseTests(ReleaseCase):
                                'select' % OPERATOR),
                 ('b-inert', {}, r'carries acceptance evidence \(revision 1 by former-operator, inert\)\. It is '
                                 'released only with --set-aside-evidence'),
-                ('z-real', dict(set_aside_evidence=True), 'holds the only live acceptance evidence of sample.fact'),
+                ('z-real', dict(set_aside_evidence=True), 'holds the only accepted record of sample.fact'),
             )
             for task, options, message in cases:
                 with self.subTest(kind=module.TYPE_LABEL, task=task, options=sorted(options)):
@@ -221,15 +323,22 @@ class DuplicateReleaseTests(ReleaseCase):
                 with self.assertRaisesRegex(ValueError, 'is not duplicated: two is its only anchor'):
                     self.release(module, native, 'two')
 
-    def test_a_draft_beside_an_orphan_selects_nothing_until_the_orphan_is_released(self):
+    def test_the_key_is_never_left_with_nothing_readable(self):
         # Among duplicates only live acceptance evidence selects an anchor, so the anchor readers
-        # select always carries live evidence and is always behind --set-aside-evidence.
+        # select always carries live evidence and is always behind --set-aside-evidence. A draft
+        # beside a record-less anchor selects nothing; releasing the draft would leave the key
+        # with nothing readable, so it is refused, with or without the flag.
         for module in (cr, rr):
             with self.subTest(kind=module.TYPE_LABEL):
                 orphan = {'id': 'b-orphan', 'labels': [module.TYPE_LABEL, module.key_label(KEY)],
                           'status': 'closed', 'comments': []}
                 native = self.native(anchor(module, 'a-draft', state='draft'), orphan)
                 self.assertEqual(module.get(native.rows, KEY, OPS)['state'], 'conflicted')
+                native.calls = []
+                with self.assertRaisesRegex(ValueError, 'would leave the key with nothing readable'):
+                    self.release(module, native, 'a-draft')
+                self.assertEqual(self.writes(native), [])
+                # The safe order: the record-less anchor goes first (either mode releases it).
                 result = self.release(module, native, 'b-orphan')
                 self.assertEqual((result['selected_before'], result['selected_after'], result['records'],
                                   result['remaining']), (None, 'a-draft', [], ['a-draft']))

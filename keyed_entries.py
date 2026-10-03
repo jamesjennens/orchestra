@@ -864,6 +864,15 @@ class AnchoredKind:
         return key, sorted((item for item in rows if readable[item.get('id')] in (key, None)),
                            key=lambda item: str(item.get('id')))
 
+    def readable_revisions(self, row, operators):
+        """[{revision, sha256}] of the revisions one anchor holds that this kit reads and no
+        applied void names; [] when it holds none or they do not parse."""
+        try:
+            return [{'revision': number, 'sha256': record['sha256']}
+                    for number, record in sorted(self.existing_revisions(self.live_row(row, operators)[0]).items())]
+        except ValueError:
+            return []
+
     def acceptance_on(self, row, operators):
         """The acceptance evidence on one anchor that no applied void names:
         [{revision, record_sha256, operator, decision_id, at, live}]. `live` is the reader's
@@ -898,10 +907,17 @@ class AnchoredKind:
         - the row carries more than one lookup label;
         - the key is not duplicated (fewer than two anchors, counted as every write counts);
         - the named anchor holds a record this kit cannot read;
+        - the named anchor holds a readable record and no remaining anchor does (a
+          record-less, voided-only or malformed anchor does not count): the key is never
+          left with nothing readable. Release the other anchor first;
         - the named anchor carries acceptance evidence that no void names, live or inert,
-          unless `set_aside_evidence`; that also covers the anchor the reader selects;
-        - with `set_aside_evidence` and LIVE evidence on the named anchor: no remaining
-          anchor has live evidence, so the key would lose its only accepted record.
+          unless `set_aside_evidence`. That covers the anchor the reader selects: among
+          duplicates only one live acceptance selects an anchor (`select_entries`), so the
+          selected anchor always carries live evidence and needs no rule of its own;
+        - the named anchor READS an accepted record (its `entry_view`) and no remaining
+          anchor reads one, so the key would lose its only accepted record. Live evidence
+          on a remaining anchor is not enough: an accept that died after its evidence and
+          before the accepted revision leaves evidence and a draft (review of febaad7).
 
         At least one other anchor always remains: that is what "duplicated" means, and the
         caller holds the project coordination lock from this read to the label removal.
@@ -923,8 +939,15 @@ class AnchoredKind:
         if view['state'] == 'unsupported':
             raise ValueError('%s anchor %s holds a record this kit cannot read, so it cannot be judged; use a kit '
                              'that reads it' % (self.title, issue_id))
+        if self.readable_revisions(row, operators) \
+                and not any(self.readable_revisions(other, operators) for other in remaining):
+            raise ValueError('No remaining anchor of %s %s holds a readable record (%s), so releasing %s would leave '
+                             'the key with nothing readable. Deal with the other anchor(s) first: release a '
+                             'record-less one without --duplicate, or void its malformed records and then release '
+                             'it; %s is then the only anchor of the key'
+                             % (self.noun, shown_key, ', '.join(str(item.get('id')) for item in remaining),
+                                issue_id, issue_id))
         evidence = self.acceptance_on(row, operators)
-        live = [item for item in evidence if item['live']]
         before = self.selected_anchor(anchors, operators)
         after = self.selected_anchor(remaining, operators)
         if evidence and not set_aside_evidence:
@@ -936,19 +959,15 @@ class AnchoredKind:
                                                                      'live' if item['live'] else 'inert')
                                           for item in evidence[:5]),
                                 '; it is the anchor readers select for %s' % shown_key if before == issue_id else ''))
-        if before == issue_id and not set_aside_evidence:
-            raise ValueError('%s anchor %s is the anchor readers select for %s; it is released only with '
-                             '--set-aside-evidence' % (self.title, issue_id, shown_key))
-        if live and not any(item['live'] for other in remaining for item in self.acceptance_on(other, operators)):
-            raise ValueError('%s anchor %s holds the only live acceptance evidence of %s: releasing it would leave '
-                             'the key with no accepted record. Release the other anchor(s) instead (%s)'
+        if view['record'] is not None \
+                and not any(self.entry_view(other, operators)['record'] is not None for other in remaining):
+            raise ValueError('%s anchor %s holds the only accepted record of %s: no remaining anchor reads an '
+                             'accepted record, so releasing it would leave the key with none. Release the other '
+                             'anchor(s) instead (%s)'
                              % (self.title, issue_id, shown_key,
                                 ', '.join(str(item.get('id')) for item in remaining)))
-        try:
-            revisions = [{'revision': number, 'sha256': record['sha256']}
-                         for number, record in sorted(self.existing_revisions(self.live_row(row, operators)[0]).items())]
-        except ValueError:
-            revisions = []   # malformed records on the duplicate: it leaves the key anyway
+        # Malformed records on the duplicate read as none: it leaves the key anyway.
+        revisions = self.readable_revisions(row, operators)
         others = {}
         for comment in self.live_row(row, operators)[0].get('comments') or []:
             kind = record_comment_kind(comment.get('text') if isinstance(comment, dict) else None)
