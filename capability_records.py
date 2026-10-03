@@ -329,6 +329,9 @@ def read_key_and_retired(run, key):
 
 def check_successor(key, successor, rows, operators=None):
     """The successor is an existing capability, and following successors never returns to `key`."""
+    # A duplicated successor is ambiguous: every write on it is refused until an operator
+    # reconciles its anchors, and a retirement must not point at it either (kittrial-5bb.91).
+    KIND.require_unique_key(rows, successor)
     newest = newest_revisions(rows, operators)
     if successor not in newest:
         raise ValueError('Unknown successor capability %s' % successor)
@@ -970,6 +973,9 @@ def find(rows, phrase, operators, limit=5, trust=None):
     groups = {tuple(anchor['native_id'] for anchor in entry['duplicate_anchors']) for entry in conflicted}
     conflicted = [entry for entry in entries if entry['state'] == 'conflicted'
                   and tuple(anchor['native_id'] for anchor in entry['duplicate_anchors']) in groups]
+    # A conflicted anchor is listed once, in `records`, never also as a candidate.
+    listed = {entry['native_id'] for entry in conflicted}
+    scored = [pair for pair in scored if pair[1]['native_id'] not in listed]
     scored.sort(key=lambda pair: (-pair[0], pair[1]['record'] is None, pair[1]['key']))
 
     def shown(entry, score=None):

@@ -500,7 +500,9 @@ the index once, because its collision and cap rules span every capability.
   malformed alias or verification record is a warning on its entry. The operator's
   `void-record` repairs a malformed capability, alias or verification record, and
   `anchor-release --kind capability` frees a key held by an anchor with no record,
-  exactly as for references.
+  exactly as for references. `anchor-release --duplicate` releases a named anchor of a
+  duplicated key that holds well-formed records
+  ([operations](OPERATIONS.md#a-duplicated-record-key)).
 
 **`capability lookup` with `--config` and `--project`** runs the local code lookup,
 unchanged, then one endpoint `find`. It adds these fields to `capability-lookup-v1`:
@@ -790,6 +792,14 @@ uniquely accepted record remains readable. Records and evidence are never combin
 across anchors. Distinct readable keys sharing a lookup slug remain distinct;
 malformed or incomplete lookup-labelled rows participate in every plausible key's
 duplicate group because their exact key cannot be established from a lossy label.
+`capability-retire` also refuses a duplicated key as the successor. `capability find`
+lists each anchor of a conflicted key once, in `records`, never also as a candidate.
+The host command `admin.py anchor-release --duplicate` is the reconciliation: it
+releases one named anchor of the duplicated key, never the last anchor and never the
+key's only accepted record, and needs `--set-aside-evidence` for an anchor that carries
+acceptance evidence (live or inert) or that readers currently select. A typed row with
+no key label that carries the release audit comment is not read for any key
+([operations](OPERATIONS.md#a-duplicated-record-key)).
 
 ### `capability misses`: which phrases miss, and how often
 

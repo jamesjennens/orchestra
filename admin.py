@@ -3077,10 +3077,14 @@ def main():
                        help='with --disposition complete, the exact native record to confirm')
         if name=='record-reconcile':a.add_argument('--kind',choices=['requirement','reference','capability','proposal'],required=True)
     a=sub.add_parser('void-record');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
-    a=sub.add_parser('anchor-release',help='close a reference or capability anchor that holds no record and free its key (operator allowlist)')
+    a=sub.add_parser('anchor-release',help='close a reference or capability anchor that holds no record and free its key, or with --duplicate release a named duplicate anchor of a key (operator allowlist)')
     a.add_argument('project');a.add_argument('--kind',choices=['reference','capability'],required=True)
     a.add_argument('--issue-id',dest='issue_id',required=True);a.add_argument('--actor',required=True)
     a.add_argument('--reason',required=True)
+    a.add_argument('--duplicate',action='store_true',
+                   help='release a NAMED anchor of a duplicated key although it holds well-formed records; another anchor of the key must remain')
+    a.add_argument('--set-aside-evidence',action='store_true',dest='set_aside_evidence',
+                   help='with --duplicate: release an anchor that carries acceptance evidence; with live evidence, a remaining anchor must have live evidence too')
     a=sub.add_parser('revert-record');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('operators');a.add_argument('action',choices=['list','add','remove']);a.add_argument('actor',nargs='?')
     a.add_argument('--confirm-revoke',action='store_true',dest='confirm_revoke',
@@ -3364,7 +3368,8 @@ def main():
         def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            print(json.dumps(records.KIND.release(path,args.issue_id,args.actor,args.reason,run,operators=authority)))
+            print(json.dumps(records.KIND.release(path,args.issue_id,args.actor,args.reason,run,operators=authority,
+                                                  duplicate=args.duplicate,set_aside_evidence=args.set_aside_evidence)))
     elif args.command=='void-record':
         import fcntl
         from recovery import KEYED_KIND_PREFIXES

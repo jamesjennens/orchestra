@@ -744,8 +744,13 @@ class AnchoredKind:
         return core.reconcile(project, operation_id, actor, reason, disposition, run, self.spec,
                               issue_id=issue_id, confirm=lambda row: self.confirm_anchor(row, operators))
 
-    def release(self, project, issue_id, actor, reason, run, operators=None):
+    def release(self, project, issue_id, actor, reason, run, operators=None, duplicate=False,
+                set_aside_evidence=False):
         """`admin.py anchor-release` (operator): close an anchor that holds no record and free its key.
+
+        With `duplicate` it is the other mode, `release_duplicate`: a NAMED anchor of a
+        duplicated key that may hold well-formed records (kittrial-5bb.91). What follows
+        describes the plain mode.
 
         An anchor holds no record when its propose stopped between the create and the first
         record (still open if it stopped before the close), or when operator voids name
@@ -775,6 +780,8 @@ class AnchoredKind:
         if not isinstance(reason, str) or not reason.strip() or len(reason) > RELEASE_REASON_MAX \
                 or '\x00' in reason:
             raise ValueError('A release reason is required (at most %d characters)' % RELEASE_REASON_MAX)
+        if set_aside_evidence and not duplicate:
+            raise ValueError('--set-aside-evidence applies only with --duplicate')
         rows = self.shown(run, [issue_id])
         if len(rows) != 1:
             raise ValueError('Unknown %s anchor %s' % (self.noun, issue_id))
@@ -784,12 +791,21 @@ class AnchoredKind:
         if self.type_label not in labels or not keys:
             raise ValueError('%s carries no %s and %s labels: it is not a %s anchor, or it was already released'
                              % (issue_id, self.type_label, self.key_prefix, self.noun))
-        live, _ = self.live_row(row, operators)
-        for comment in live.get('comments') or []:
-            kind = record_comment_kind(comment.get('text') if isinstance(comment, dict) else None)
-            if kind and (kind[0].startswith(self.family) or kind[0] == 'unknown'):
-                raise ValueError('%s anchor %s still holds a record, so it is an entry, not an orphan; an operator '
-                                 'void (admin.py void-record) repairs a malformed record' % (self.title, issue_id))
+        extra = {}
+        if duplicate:
+            note, extra = self.duplicate_release(row, keys, actor, reason, run, operators, set_aside_evidence)
+            close_reason = '%s anchor released by the operator (duplicate of its key)' % self.title
+        else:
+            live, _ = self.live_row(row, operators)
+            for comment in live.get('comments') or []:
+                kind = record_comment_kind(comment.get('text') if isinstance(comment, dict) else None)
+                if kind and (kind[0].startswith(self.family) or kind[0] == 'unknown'):
+                    raise ValueError('%s anchor %s still holds a record, so it is an entry, not an orphan; an '
+                                     'operator void (admin.py void-record) repairs a malformed record; a duplicate '
+                                     'of its key is released with --duplicate' % (self.title, issue_id))
+            note = ('Released by operator %s: this %s anchor held no record, so %s no longer holds its key. '
+                    'Reason: %s' % (actor, self.noun, ', '.join(keys), reason))
+            close_reason = '%s anchor released by the operator (no record)' % self.title
         journal = Path(project) / self.journal
         pending = []
         for label in sorted(labels):
@@ -810,25 +826,149 @@ class AnchoredKind:
                      'released_anchor': issue_id}
             updated = {'sha256': prior.get('sha256'), 'status': 'released', 'actor': prior.get('actor'),
                        'reconciliation': audit,
-                       'error': 'Released by the operator with anchor %s, which held no record.' % issue_id}
+                       'error': 'Released by the operator with anchor %s, %s.'
+                                % (issue_id, 'a duplicate of its key' if duplicate else 'which held no record')}
             for name in ('operation', 'revision'):
                 if name in prior:
                     updated[name] = prior[name]
             atomic(receipt, updated)
         closed = row.get('status') != 'closed'
         if closed:
-            run(['close', issue_id, '--reason', '%s anchor released by the operator (no record)' % self.title,
-                 '--json'])
-        note = ('Released by operator %s: this %s anchor held no record, so %s no longer holds its key. Reason: %s'
-                % (actor, self.noun, ', '.join(keys), reason))
+            run(['close', issue_id, '--reason', close_reason, '--json'])
         if not any(isinstance(comment, dict) and comment.get('text') == note for comment in row.get('comments') or []):
             run(['comments', 'add', issue_id, note, '--json'])
         removed = sorted(label for label in labels if label in self.state_labels.values()
                          or label.startswith(('request:', 'request-content:'))) + keys
         for label in removed:
             run(['update', issue_id, '--remove-label', label, '--json'])
-        return {'released': issue_id, 'kind': self.noun, 'closed': closed, 'labels_removed': removed,
-                'receipts_released': [identity for identity, _, _ in pending]}
+        return dict({'released': issue_id, 'kind': self.noun, 'closed': closed, 'labels_removed': removed,
+                     'receipts_released': [identity for identity, _, _ in pending]}, **extra)
+
+    def key_anchors(self, run, row):
+        """(key, anchors): every anchor of the key the named `row` holds, counted exactly as
+        every write counts them (`require_unique_key`).
+
+        The rows carrying the type label and the row's lookup label, leaving out a record
+        anchor whose readable record names a different key (a slug collision). `key` is the
+        exact key when one of them can state it, else None.
+        """
+        label = self.key_labels(row)[0]
+        rows = self.shown(run, self.listed_ids(run, ['--label', label]))
+        rows = [item for item in rows if self.type_label in (item.get('labels') or [])
+                and label in self.key_labels(item)]
+        if not any(item.get('id') == row.get('id') for item in rows):
+            rows.append(row)
+        readable = {item.get('id'): self.entry_view(item, ())['key'] if is_record_anchor(item) else None
+                    for item in rows}
+        key = readable.get(row.get('id')) or next((value for value in readable.values() if value), None)
+        return key, sorted((item for item in rows if readable[item.get('id')] in (key, None)),
+                           key=lambda item: str(item.get('id')))
+
+    def acceptance_on(self, row, operators):
+        """The acceptance evidence on one anchor that no applied void names:
+        [{revision, record_sha256, operator, decision_id, at, live}]. `live` is the reader's
+        rule: the stored native author is the record's operator and is on the allowlist."""
+        allowlist = configured_operators(operators if operators is not None else ())
+        found = []
+        for comment in self.live_row(row, operators)[0].get('comments') or []:
+            record = self.parse_acceptance(comment.get('text') if isinstance(comment, dict) else None)
+            if record is None or record['id'] != row.get('id'):
+                continue
+            author = comment.get('author')
+            found.append({'revision': record['revision'], 'record_sha256': record['record_sha256'],
+                          'operator': record['operator'], 'decision_id': record['decision'].get('decision_id'),
+                          'at': record['at'], 'live': author == record['operator'] and author in allowlist})
+        return found
+
+    def selected_anchor(self, anchors, operators):
+        """The native id of the anchor a reader selects for the key among `anchors`, or None
+        when it reads conflicted (or nothing is left)."""
+        entries, _ = self.catalog(anchors, operators)
+        chosen = [entry for entry in entries if entry['state'] not in ('conflicted', 'incomplete')]
+        return chosen[0]['native_id'] if len(entries) == 1 and chosen else None
+
+    def duplicate_release(self, row, keys, actor, reason, run, operators, set_aside_evidence):
+        """The checks of `anchor-release --duplicate` (kittrial-5bb.91): (audit note, result fields).
+
+        Since kittrial-5bb.83 every write on a key with more than one anchor is refused. A
+        duplicate that holds no record is released by the plain mode; this mode releases a
+        NAMED duplicate that holds well-formed records, which a void cannot repair (a void
+        never withdraws a record the entry reads). Refused, before any write:
+
+        - the row carries more than one lookup label;
+        - the key is not duplicated (fewer than two anchors, counted as every write counts);
+        - the named anchor holds a record this kit cannot read;
+        - the named anchor carries acceptance evidence that no void names, live or inert,
+          unless `set_aside_evidence`; that also covers the anchor the reader selects;
+        - with `set_aside_evidence` and LIVE evidence on the named anchor: no remaining
+          anchor has live evidence, so the key would lose its only accepted record.
+
+        At least one other anchor always remains: that is what "duplicated" means, and the
+        caller holds the project coordination lock from this read to the label removal.
+        A released row is no longer an anchor of the key and is never read for it again,
+        so evidence set aside stays set aside even if its operator is re-added.
+        """
+        issue_id = row.get('id')
+        if len(keys) != 1:
+            raise ValueError('%s carries more than one %s label (%s), so the key it duplicates is ambiguous; '
+                             'use the host procedure' % (issue_id, self.key_prefix, ', '.join(keys)))
+        key, anchors = self.key_anchors(run, row)
+        remaining = [item for item in anchors if item.get('id') != issue_id]
+        shown_key = key or keys[0]
+        if not remaining:
+            raise ValueError('%s key %s is not duplicated: %s is its only anchor, and the last anchor of a key is '
+                             'never released this way. An orphan is released without --duplicate; an entry is '
+                             'withdrawn by a new revision or a retirement' % (self.title, shown_key, issue_id))
+        view = self.entry_view(row, operators)
+        if view['state'] == 'unsupported':
+            raise ValueError('%s anchor %s holds a record this kit cannot read, so it cannot be judged; use a kit '
+                             'that reads it' % (self.title, issue_id))
+        evidence = self.acceptance_on(row, operators)
+        live = [item for item in evidence if item['live']]
+        before = self.selected_anchor(anchors, operators)
+        after = self.selected_anchor(remaining, operators)
+        if evidence and not set_aside_evidence:
+            raise ValueError('%s anchor %s carries acceptance evidence (%s)%s. It is released only with '
+                             '--set-aside-evidence, which sets that evidence aside for good and lists it in the '
+                             'audit comment'
+                             % (self.title, issue_id,
+                                ', '.join('revision %d by %s, %s' % (item['revision'], item['operator'],
+                                                                     'live' if item['live'] else 'inert')
+                                          for item in evidence[:5]),
+                                '; it is the anchor readers select for %s' % shown_key if before == issue_id else ''))
+        if before == issue_id and not set_aside_evidence:
+            raise ValueError('%s anchor %s is the anchor readers select for %s; it is released only with '
+                             '--set-aside-evidence' % (self.title, issue_id, shown_key))
+        if live and not any(item['live'] for other in remaining for item in self.acceptance_on(other, operators)):
+            raise ValueError('%s anchor %s holds the only live acceptance evidence of %s: releasing it would leave '
+                             'the key with no accepted record. Release the other anchor(s) instead (%s)'
+                             % (self.title, issue_id, shown_key,
+                                ', '.join(str(item.get('id')) for item in remaining)))
+        try:
+            revisions = [{'revision': number, 'sha256': record['sha256']}
+                         for number, record in sorted(self.existing_revisions(self.live_row(row, operators)[0]).items())]
+        except ValueError:
+            revisions = []   # malformed records on the duplicate: it leaves the key anyway
+        others = {}
+        for comment in self.live_row(row, operators)[0].get('comments') or []:
+            kind = record_comment_kind(comment.get('text') if isinstance(comment, dict) else None)
+            if kind and kind[0] in self.extra_records:
+                others[kind[0]] = others.get(kind[0], 0) + 1
+        note = ('Released by operator %s: this %s anchor was a duplicate of key %s and no longer holds it. '
+                'Remaining anchor(s): %s. Readers selected %s before and select %s now. Records set aside: %s. '
+                'Acceptance evidence set aside: %s. Other records that stop counting for the key: %s. Reason: %s'
+                % (actor, self.noun, shown_key, ', '.join(str(item.get('id')) for item in remaining),
+                   before or 'no anchor (conflicted)', after or 'no anchor (conflicted)',
+                   '; '.join('revision %d sha256 %s' % (item['revision'], item['sha256']) for item in revisions)
+                   or 'none readable',
+                   '; '.join('revision %d record %s by %s, decision %s, %s'
+                             % (item['revision'], item['record_sha256'], item['operator'], item['decision_id'],
+                                'live' if item['live'] else 'inert') for item in evidence) or 'none',
+                   ', '.join('%d %s' % (count, kind) for kind, count in sorted(others.items())) or 'none', reason))
+        return note, {'duplicate': True, 'key': shown_key,
+                      'remaining': [item.get('id') for item in remaining],
+                      'selected_before': before, 'selected_after': after, 'records': revisions,
+                      'evidence_set_aside': evidence, 'stop_counting': others}
 
     # -- the reader view ------------------------------------------------------------------------
 
@@ -923,6 +1063,17 @@ class AnchoredKind:
             view['warnings'].append({'code': 'malformed', 'detail': str(error)[:200]})
         return view
 
+    def released(self, row):
+        """Whether a row with no lookup label carries the audit comment `anchor-release`
+        writes. Such a row was an anchor and is not one any more: it is not read for any
+        key. The record prefixes are reserved, so a contributor cannot make a typed row
+        that holds records and lacks its lookup label; anything else in that shape stays
+        visible as a malformed entry."""
+        marker = ': this %s anchor ' % self.noun
+        return any(isinstance(comment, dict) and isinstance(comment.get('text'), str)
+                   and comment['text'].startswith('Released by operator ') and marker in comment['text'][:200]
+                   for comment in row.get('comments') or [])
+
     def catalog(self, rows, operators, view=None):
         """(entries, incomplete ids) over the kind's labelled rows; ordinary labelled tasks are skipped.
 
@@ -935,6 +1086,8 @@ class AnchoredKind:
         for row in rows:
             if not isinstance(row, dict) or self.type_label not in (row.get('labels') or []):
                 continue
+            if not self.key_labels(row) and self.released(row):
+                continue   # released by an operator: no longer an anchor of any key
             if not self.has_live_record(row, operators):
                 if self.key_labels(row):
                     incomplete.append(row.get('id'))
