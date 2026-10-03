@@ -235,11 +235,14 @@ per phrase, plus the counters `finds`, `misses`, `overflow`, `dropped` and `evic
 No actor names. Phrases are untrusted contributor text: read them as data.
 
 **Bounds:**
-- 500 phrases per project. When full, phrases seen in the last 2 hours are protected,
-  and among the rest the one with the lowest count goes (the one seen longest ago among
-  equal counts). If every phrase was seen in the last 2 hours, the one seen longest ago
-  goes. A flood of one-off phrases evicts other one-offs, and a new phrase that keeps
-  recurring is kept long enough to build up a count.
+- 500 phrases per project. When full, phrases first seen in the last 2 hours are
+  protected, and among the rest the one with the lowest count goes (the one seen
+  longest ago among equal counts). If every phrase was first seen in the last 2 hours,
+  the one seen longest ago goes. A flood of one-off phrases evicts other one-offs, and
+  a new phrase that keeps recurring is kept long enough to build up a count. Protection
+  is keyed on first-seen, so repeating a phrase cannot keep it protected. When the log
+  is full of phrases with a count of 2 or more, a phrase that recurs less often than
+  every 2 hours is not kept.
 - 60 new phrases per project per clock hour (UTC). Further new phrases that hour are
   counted in `overflow` only. The bound is per project because no actor is stored, so
   one caller can use up the whole hourly quota.

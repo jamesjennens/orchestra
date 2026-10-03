@@ -72,11 +72,12 @@ CONTRACT_VERSION = 'cli-contract-v1'
 PHRASE_CHARS_MAX = 80
 #: `find` refuses a longer raw phrase, so a longer one never reaches the log.
 RAW_CHARS_MAX = 200
-#: Phrases kept per project. When full, a phrase seen within RECENT_HOURS is protected;
-#: among the others the LOWEST count goes (the oldest last-seen among equal counts), so a
-#: burst of one-off phrases cannot push out a phrase that keeps missing, and a phrase that
-#: keeps recurring is not evicted while it is still new. If every phrase is recent, the
-#: one seen longest ago goes.
+#: Phrases kept per project. When full, a phrase FIRST seen within RECENT_HOURS is
+#: protected; among the others the LOWEST count goes (the oldest last-seen among equal
+#: counts), so a burst of one-off phrases cannot push out a phrase that keeps missing, and
+#: a phrase that keeps recurring is not evicted while it is still new. Protection is keyed
+#: on first-seen, which no caller can refresh. If every phrase is new, the one seen
+#: longest ago goes.
 ENTRIES_MAX = 500
 RECENT_HOURS = 2
 #: New phrases stored per project per clock hour (UTC); the rest go to `overflow`.
@@ -268,14 +269,16 @@ def apply(log, phrase, found, stamp):
 def _victim(phrases, stamp):
     """The phrase to evict from a full log when a new one arrives at `stamp`.
 
-    Phrases seen within RECENT_HOURS are protected. Among the rest, the lowest count goes,
-    the oldest last-seen first among equal counts: a flood of one-off phrases evicts other
-    one-offs, never a phrase that keeps missing. Protecting recent phrases lets a newcomer
-    that recurs build up a count instead of being evicted by the next newcomer. When
-    every phrase is recent, the one seen longest ago goes.
+    Phrases FIRST seen within RECENT_HOURS are protected. Among the rest, the lowest count
+    goes, the oldest last-seen first among equal counts: a flood of one-off phrases evicts
+    other one-offs, never a phrase that keeps missing. Protecting new phrases lets a
+    newcomer that recurs build up a count instead of being evicted by the next newcomer.
+    Protection is keyed on first-seen, not last-seen: a caller can refresh last-seen by
+    repeating a phrase, which would keep its own junk protected forever. When every
+    phrase is new, the one seen longest ago goes.
     """
     cutoff = (datetime.strptime(stamp, STAMP) - timedelta(hours=RECENT_HOURS)).strftime(STAMP)
-    older = [name for name in phrases if phrases[name]['last'] < cutoff]
+    older = [name for name in phrases if phrases[name]['first'] < cutoff]
     if older:
         return min(older, key=lambda name: (phrases[name]['count'], phrases[name]['last'], name))
     return min(phrases, key=lambda name: (phrases[name]['last'], phrases[name]['count'], name))

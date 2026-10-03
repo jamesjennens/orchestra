@@ -237,6 +237,30 @@ class RecordTests(MissLogCase):
         self.assertTrue(cm._valid(log))
         return log
 
+    def test_repeating_junk_cannot_keep_it_protected(self):
+        # The rev-3 re-review's attack: 60 new junk phrases an hour, and every stored junk
+        # phrase repeated about hourly so its last-seen stays recent. With protection by
+        # last-seen it evicted every genuine phrase within 9 hours, the count-384 one too.
+        log = cm._fresh(T0)
+        genuine = ['genuine phrase %d' % number for number in range(380)]
+        for number, phrase in enumerate(genuine):
+            stamp = at(number % 60, hour=0)
+            log['phrases'][phrase] = {'count': 384 if number == 0 else 2 + number % 10, 'first': stamp,
+                                      'last': stamp}
+        junk = []
+        for hour in range(3, 12):
+            for phrase in junk:
+                if phrase in log['phrases']:
+                    self.assertEqual(cm.apply(log, phrase, False, at(0, hour=hour)), 'counted')
+            for number in range(cm.NEW_PER_HOUR):
+                junk.append('junk %d %d' % (hour, number))
+                cm.apply(log, junk[-1], False, at(1 + number % 58, hour=hour))
+        self.assertTrue(cm._valid(log))
+        self.assertEqual(len(log['phrases']), cm.ENTRIES_MAX)
+        self.assertEqual(log['phrases'][genuine[0]]['count'], 384)
+        kept = sum(phrase in log['phrases'] for phrase in genuine)
+        self.assertGreater(kept, len(genuine) // 2)   # last-seen protection kept none
+
     def test_a_recurring_newcomer_is_kept_in_a_full_log(self):
         # The re-review's cases: with eviction by lowest count alone, every newcomer evicted
         # the previous one (count 1), so a phrase recurring hourly was never kept.
@@ -702,6 +726,19 @@ class ReportTests(MissLogCase):
         self.assertEqual(self.bounded(cm.report, self.project, dict)['recording'], 'lock-unusable')
         self.assertEqual(self.bounded(cm.clear, self.project)['repaired'], {cm.LOCK_NAME: 'other'})
         self.assertEqual(self.record('merge slot'), 'recorded')
+
+    @unittest.skipUnless(hasattr(os, 'mkfifo') and hasattr(os, 'O_NONBLOCK'), 'needs FIFOs')
+    def test_a_fifo_swapped_in_after_the_check_still_does_not_block(self):
+        # The race the lstat check cannot close: the lock path becomes a FIFO between the
+        # check and the open. O_NONBLOCK is what keeps the open from waiting for a writer.
+        os.mkfifo(self.project / cm.LOCK_NAME)
+        real = cm._kind
+        with patch.object(cm, '_kind', side_effect=lambda path: 'file' if Path(path).name == cm.LOCK_NAME
+                          else real(path)):
+            started = time.monotonic()
+            status = self.bounded(cm.record_find, self.project, 'merge slot', False, T0)
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertIn(status, ('recorded', 'error', 'busy'))
 
     @unittest.skipUnless(hasattr(os, 'mkfifo'), 'needs FIFOs')
     def test_a_fifo_at_the_log_or_temp_name_does_not_stop_recording(self):

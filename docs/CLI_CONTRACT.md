@@ -720,14 +720,19 @@ either, because the client computes them and the endpoint never sees them.
 **Bounds** (fixed in this version):
 - at most 500 phrases per project (`evicted` counts the phrases dropped to make room).
   When the log is full, a new phrase replaces:
-  - among the phrases **not** seen in the last 2 hours, the one with the **lowest
+  - among the phrases **first** seen more than 2 hours ago, the one with the **lowest
     count**, the one seen longest ago among equal counts;
-  - or, when every phrase was seen in the last 2 hours, the one seen longest ago.
+  - or, when every phrase was first seen in the last 2 hours, the one seen longest ago.
 
   The count rule means a burst of one-off phrases evicts other one-offs, never a phrase
   that keeps missing. The 2-hour protection means a new phrase that recurs (for example
   hourly) is kept long enough to build up a count, instead of being evicted by the next
-  newcomer while older phrases with a count of 2 sit on every slot;
+  newcomer while older phrases with a count of 2 sit on every slot. It is keyed on
+  first-seen because repeating a phrase refreshes its last-seen: protection by
+  last-seen would let a caller keep its own junk protected while it evicts everything
+  else. When the log is full of phrases with a count of 2 or more, a new phrase that
+  recurs **less often than every 2 hours** is not kept: it is still at count 1 when its
+  protection ends, so it is the lowest count and the next newcomer evicts it;
 - at most 60 **new** phrases per project per clock hour (UTC); further new phrases in
   that hour are counted in `overflow` and not stored. A phrase already in the log is
   always counted. The bound is per project, not per actor, because no actor is stored:
@@ -978,7 +983,7 @@ a clear refusal, not a wrong read.
 | `capability find` | phrase / `--limit` | <= 200 characters / 1..20 (default 5) |
 | `capability list` | `--limit` / `--offset` | 1..100 (default 20) / >= 0 |
 | `capability misses` | `--limit` | 1..100 (default 20) |
-| lookup-miss log | phrases / new phrases / phrase length | 500 per project (phrases seen in the last 2 hours protected; otherwise lowest count evicted, oldest first among equals) / 60 per project per clock hour (the rest counted in `overflow`) / <= 80 characters after normalising (else counted in `dropped`) |
+| lookup-miss log | phrases / new phrases / phrase length | 500 per project (phrases first seen in the last 2 hours protected; otherwise lowest count evicted, oldest first among equals) / 60 per project per clock hour (the rest counted in `overflow`) / <= 80 characters after normalising (else counted in `dropped`) |
 | `capability` record | `name` / `summary` / `aliases` | <= 120 / <= 1,200 characters / <= 32 phrases of <= 80 |
 | `capability` record | `code` / `tests` / `anchors` / `requirements` / `tags` | <= 32 / 32 / 16 / 16 / 8, pointers <= 400 characters |
 | `capability propose-alias` | pending aliases | person 3 per capability and 50 per project; unverified pool 1 and 10; 20 per capability |
