@@ -5,6 +5,8 @@ the ast and Markdown index, exact and near matches, pointer resolution (the drif
 primitive), the versioned JSON/help/error shapes, the client routing, and the
 defensive handling of graphify's graph.json as untrusted input.
 """
+import ast
+import base64
 import io
 import json
 import os
@@ -263,7 +265,31 @@ class AstIndexTests(Checkout):
         write(self.root, 'pkg/nul.py', b'x = 1\x00\n')
         result = self.index()
         self.assertEqual(result['index']['skipped'].get('parse-error'), 2)
+        self.assertTrue(any('skipped 2 Python file(s) that could not be parsed' in warning
+                            for warning in result['warnings']))
         self.assertFalse(any(row['file'] in ('pkg/broken.py', 'pkg/nul.py') for row in result['entries']))
+
+    def test_memory_and_recursion_parse_errors_warn_with_counts(self):
+        # 3.10 raises MemoryError and 3.11+ RecursionError on an expression too deep for
+        # the interpreter; both are parse-error skips and both must be visible.
+        write(self.root, 'pkg/mem.py', 'x = 1\n')
+        write(self.root, 'pkg/rec.py', 'x = 2\n')
+        real = capabilities.ast.parse
+
+        def fake(source, filename=None, **kwargs):
+            if filename == 'pkg/mem.py':
+                raise MemoryError('too deep')
+            if filename == 'pkg/rec.py':
+                raise RecursionError('too deep')
+            return real(source, filename=filename, **kwargs)
+
+        with patch.object(capabilities.ast, 'parse', side_effect=fake):
+            code, result, _, stderr = call('index', '--repo', str(self.root), '--source', 'ast')
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(result['index']['skipped'].get('parse-error'), 2)
+        self.assertTrue(any('skipped 2 Python file(s) that could not be parsed' in warning
+                            for warning in result['warnings']))
+        self.assertIn('could not be parsed', stderr)
 
     def test_walk_fallback_skips_dependency_and_hidden_directories(self):
         write(self.root, 'node_modules/dep/x.py', 'def dependency():\n    pass\n')
@@ -823,18 +849,20 @@ def run_tool(*args):
 
 class NestingGuardTests(Checkout):
     """CPython 3.10 crashes (no RecursionError) converting a very deep expression, so
-    parsing runs on a big worker stack, with a per-line guard as the fallback."""
+    parsing runs on a big worker stack, with a per-logical-line guard as the fallback."""
 
     def index_in_child(self):
         run = run_tool('index', '--repo', str(self.root), '--source', 'ast')
         self.assertEqual(run.returncode, 0, run.stderr[-500:])
         return json.loads(run.stdout)
 
-    def test_deep_chains_parse_on_the_worker_stack(self):
-        # 300k levels crash a 3.10 main thread (8 MB on Linux, less on Windows); the
-        # worker stack parses them, in a child process so a regression fails one test.
-        write(self.root, 'pkg/deep.py', 'x = ' + '+'.join(['1'] * 300_000) + '\n')
-        write(self.root, 'pkg/attrs.py', 'x = a' + '.b' * 300_000 + '\n')
+    def test_chains_within_the_trusted_cap_parse_on_the_worker_stack(self):
+        # A chain under NESTING_MAX_BIG_STACK is still trusted; parsing it on the 3.10
+        # main thread (8 MB on Linux, less on Windows) would crash, so this pins the
+        # worker stack, in a child process so a regression fails one test.
+        depth = capabilities.NESTING_MAX_BIG_STACK // 2
+        write(self.root, 'pkg/deep.py', 'x = ' + '+'.join(['1'] * depth) + '\n')
+        write(self.root, 'pkg/attrs.py', 'x = a' + '.b' * depth + '\n')
         result = self.index_in_child()
         self.assertNotIn('too-complex', result['index']['skipped'])
         files = {row['file'] for row in result['entries']}
@@ -847,8 +875,28 @@ class NestingGuardTests(Checkout):
             parsed = {'pkg/deep.py', 'pkg/attrs.py'} & files
             self.assertEqual(result['index']['skipped'].get('parse-error', 0), 2 - len(parsed))
 
-    def test_resolve_parses_deep_files_on_the_worker_stack(self):
-        write(self.root, 'pkg/deep.py', 'def f():\n    return ' + '+'.join(['1'] * 300_000) + '\n')
+    def test_chains_past_the_trusted_cap_are_skipped_with_a_warning(self):
+        # The review's repro: one <2 MB file whose single-line chain was trusted up to
+        # 1,000,000 levels and cost ~1 GB RSS. It is now skipped cheaply, and the skip
+        # is not silent.
+        write(self.root, 'pkg/hostile.py', 'x = f' + '()' * 999_000 + '\n')
+        result = self.index_in_child()
+        self.assertEqual(result['index']['skipped'].get('too-complex'), 1)
+        self.assertNotIn('pkg/hostile.py', {row['file'] for row in result['entries']})
+        self.assertTrue(any('nest too deeply' in warning for warning in result['warnings']))
+
+    def test_shift_chains_are_caught_by_the_cheap_count(self):
+        # `<` and `>` were missing from NESTING, so a `1<<1<<...` chain reached ast.parse
+        # unchecked (~296 MB RSS for 300,000 levels); it uses the same guard now.
+        terms = capabilities.NESTING_MAX_BIG_STACK + 10
+        write(self.root, 'pkg/shift.py', 'x = 1' + '<<1' * terms + '\n')
+        result = self.index_in_child()
+        self.assertEqual(result['index']['skipped'].get('too-complex'), 1)
+        self.assertNotIn('pkg/shift.py', {row['file'] for row in result['entries']})
+
+    def test_resolve_parses_chains_within_the_trusted_cap(self):
+        depth = capabilities.NESTING_MAX_BIG_STACK // 2
+        write(self.root, 'pkg/deep.py', 'def f():\n    return ' + '+'.join(['1'] * depth) + '\n')
         run = run_tool('resolve', 'pkg/deep.py::f', '--repo', str(self.root))
         self.assertEqual(run.returncode, 0, run.stderr[-500:])
         row = json.loads(run.stdout)['results'][0]
@@ -856,6 +904,13 @@ class NestingGuardTests(Checkout):
             self.assertEqual((row['resolved'], row['kind']), (True, 'function'))
         else:
             self.assertIn((row['resolved'], row['reason']), {(True, None), (None, 'parse-error')})
+
+    def test_resolve_refuses_a_chain_past_the_trusted_cap(self):
+        write(self.root, 'pkg/deep.py', 'def f():\n    return ' + '+'.join(['1'] * 300_000) + '\n')
+        run = run_tool('resolve', 'pkg/deep.py::f', '--repo', str(self.root))
+        self.assertEqual(run.returncode, 0, run.stderr[-500:])
+        row = json.loads(run.stdout)['results'][0]
+        self.assertEqual((row['resolved'], row['reason']), (None, 'too-complex'))
 
     def test_dot_heavy_files_are_not_tokenized_on_the_worker_stack(self):
         lines = ''.join('VALUE_%d = "a.b.c.d.e.f.g.h.i.j" + x.y.z(1.5, 2.5)\n' % n for n in range(4000))
@@ -866,6 +921,36 @@ class NestingGuardTests(Checkout):
         self.assertEqual(code, 0, stderr)
         self.assertIn('pkg/dotty.py', {row['file'] for row in result['entries']})
 
+    def test_shallow_files_under_the_expression_budget_skip_tokenize(self):
+        # A ~180 KB dot-heavy file is well under the per-file expression budget, so no
+        # single logical line is deep and the file is parsed without tokenizing.
+        big = ('x = a' + '.b' * 900 + '\n') * 100
+        write(self.root, 'pkg/m00.py', big)
+        self.assertLessEqual(len(capabilities.NESTING.findall(big.encode())),
+                             capabilities.EXPRESSION_TOKENS_MAX)
+        with patch.object(capabilities, '_deepest_logical_line', side_effect=AssertionError('tokenized')):
+            code, result, _, stderr = call('index', '--repo', str(self.root), '--source', 'ast')
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn('too-complex', result['index']['skipped'])
+        self.assertIn('pkg/m00.py', {row['file'] for row in result['entries']})
+
+    def test_node_dense_files_over_the_expression_budget_are_skipped(self):
+        # Four ~2 MB shallow dot-heavy files (~990k dots each) are node-dense even though
+        # no logical line nests; the flat budget skips them with a warning, so one
+        # planted file cannot make ast.parse build hundreds of MB of sibling nodes.
+        big = ('x = a' + '.b' * 900 + '\n') * 1100
+        for number in range(4):
+            write(self.root, 'pkg/m%02d.py' % number, big)
+        self.assertGreater(len(capabilities.NESTING.findall(big.encode())),
+                           capabilities.EXPRESSION_TOKENS_MAX)
+        with patch.object(capabilities, '_deepest_logical_line', side_effect=AssertionError('tokenized')):
+            code, result, _, stderr = call('index', '--repo', str(self.root), '--source', 'ast')
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(result['index']['skipped'].get('too-complex'), 4)
+        self.assertTrue(any('too many expressions' in warning for warning in result['warnings']))
+        files = {row['file'] for row in result['entries']}
+        self.assertFalse({'pkg/m00.py', 'pkg/m03.py'} & files)
+
     def test_deep_chains_hidden_in_fstrings_brackets_and_keywords_are_caught(self):
         terms = capabilities.NESTING_MAX + 10
         sources = {
@@ -873,13 +958,99 @@ class NestingGuardTests(Checkout):
             'multiline': 'x = (\n' + '+\n'.join(['1'] * terms) + '\n)\n',
             'keywords': 'x = ' + 'not ' * terms + 'True\n',
             'attributes': 'x = a' + '.b' * terms + '\n',
+            'shift': 'x = 1' + '<<1' * terms + '\n',
         }
         for name, source in sources.items():
             with self.assertRaises(capabilities.TooComplex, msg=name):
                 capabilities.parse_python(source.encode('utf-8'), name + '.py')
 
+    def test_a_multiline_chain_on_one_logical_line_passes_the_cheap_count(self):
+        # The per-line pre-count must not split a logical line that spans physical lines
+        # inside brackets, or a chain like this would slip past the guard.
+        terms = capabilities.NESTING_MAX_BIG_STACK + 10
+        data = ('x = (\n' + '+\n'.join(['1'] * terms) + '\n)\n').encode('utf-8')
+        self.assertGreater(capabilities._logical_line_peak(data, capabilities.NESTING_MAX_BIG_STACK),
+                           capabilities.NESTING_MAX_BIG_STACK)
+
+    def test_flat_huge_expressions_are_caught_by_the_expression_budget(self):
+        # A chain that is flat (one AST node with a million children) is not deep, so the
+        # nesting cap cannot see it; the per-file expression budget refuses it before
+        # ast.parse can build hundreds of MB of sibling nodes.
+        terms = capabilities.EXPRESSION_TOKENS_MAX + 10
+        sources = {
+            'compare': 'x = ' + '1<' * terms + '1\n',
+            'equality': 'x = 1' + '==1' * terms + '\n',
+            'tuple': 'x = (' + ','.join(['1'] * terms) + ')\n',
+            'list': 'x = [' + ','.join(['1'] * terms) + ']\n',
+            'boolean': 'x = 1' + ' and 1' * terms + '\n',
+        }
+        for name, source in sources.items():
+            data = source.encode('utf-8')
+            self.assertGreater(capabilities._expression_tokens(data),
+                               capabilities.EXPRESSION_TOKENS_MAX, name)
+            with self.assertRaises(capabilities.TooComplex, msg=name):
+                capabilities.parse_python(data, name + '.py')
+
+    def test_a_large_generated_flat_table_is_parsed(self):
+        # 60,000-row generated tables are legitimate: they are one wide display, not a
+        # 60,000-level chain, so the exact pass must not count their commas or rows.
+        rows = 60_000
+        write(self.root, 'pkg/neg_table.py',
+              'T = [\n' + ''.join('    -%d,\n' % i for i in range(rows)) + ']\n')
+        write(self.root, 'pkg/dict_table.py',
+              'D = {\n' + ''.join('    "k%d": f(%d),\n' % (i, i) for i in range(rows)) + '}\n')
+        code, result, _, stderr = call('index', '--repo', str(self.root), '--source', 'ast')
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn('too-complex', result['index']['skipped'])
+        files = {row['file'] for row in result['entries']}
+        self.assertTrue({'pkg/neg_table.py', 'pkg/dict_table.py'} <= files)
+
+    def test_a_hostile_flat_expression_is_skipped_with_a_warning(self):
+        write(self.root, 'pkg/flat.py',
+              'x = ' + '1<' * (capabilities.EXPRESSION_TOKENS_MAX + 10) + '1\n')
+        code, result, _, stderr = call('index', '--repo', str(self.root), '--source', 'ast')
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(result['index']['skipped'].get('too-complex'), 1)
+        self.assertNotIn('pkg/flat.py', {row['file'] for row in result['entries']})
+        self.assertTrue(any('too many expressions' in warning for warning in result['warnings']))
+
+    def test_a_utf7_coding_cookie_cannot_hide_a_deep_chain(self):
+        # A `# coding: utf-7` cookie encodes the ASCII operators inside a base64 `+...-`
+        # shift sequence, so a scan of the raw bytes sees almost nothing. The gate decodes
+        # the source first, so the hidden chain is caught; before this fix it reached
+        # ast.parse and segfaulted CPython 3.10 on the no-worker fallback path.
+        hidden = b'+' + base64.b64encode(('.b' * 60_000).encode('utf-16-be')).rstrip(b'=') + b'-'
+        data = b'# coding: utf-7\nx = a' + hidden + b'\n'
+        self.assertLess(len(capabilities.NESTING.findall(data)), 10)
+        with self.assertRaises(capabilities.TooComplex):
+            capabilities.parse_python(data, 'hidden.py')
+
+    def test_a_utf7_file_that_cannot_be_decoded_is_a_parse_error(self):
+        for name, data in (('unknown codec', b'# coding: nosuchcodec\nx = 1\n'),
+                           ('bad ascii body', b'# coding: ascii\nx = "\xff"\n')):
+            with self.assertRaises(SyntaxError, msg=name) as caught:
+                capabilities.parse_python(data, 'bad.py')
+            self.assertNotIsInstance(caught.exception, capabilities.TooComplex, name)
+
+    def test_a_utf7_hostile_file_is_skipped_not_parsed(self):
+        hidden = b'+' + base64.b64encode(('.b' * 60_000).encode('utf-16-be')).rstrip(b'=') + b'-'
+        write(self.root, 'pkg/hidden.py', b'# coding: utf-7\nx = a' + hidden + b'\n')
+        code, result, _, stderr = call('index', '--repo', str(self.root), '--source', 'ast')
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(result['index']['skipped'].get('too-complex'), 1)
+        self.assertNotIn('pkg/hidden.py', {row['file'] for row in result['entries']})
+        self.assertTrue(any('nest too deeply' in warning for warning in result['warnings']))
+
+    def test_text_in_a_string_is_counted_but_does_not_hide_the_code(self):
+        # The cheap count deliberately over-counts string text, so this file is
+        # tokenized; the exact pass sees shallow code and it is indexed normally.
+        write(self.root, 'pkg/strings.py', 'value = "' + '+' * 200_000 + '"\n')
+        code, result, _, stderr = call('index', '--repo', str(self.root), '--source', 'ast')
+        self.assertEqual(code, 0, stderr)
+        self.assertIn('pkg/strings.py', {row['file'] for row in result['entries']})
+
     def test_tokenize_pass_returns_as_soon_as_a_line_passes_the_limit(self):
-        data = ('x = ' + '+'.join(['1'] * 50_000) + '\n').encode()
+        data = 'x = ' + '+'.join(['1'] * 50_000) + '\n'
         self.assertEqual(capabilities._deepest_logical_line(data, 100), 101)
 
     def test_many_ordinary_lines_are_still_parsed(self):
@@ -889,7 +1060,10 @@ class NestingGuardTests(Checkout):
         self.assertEqual(len(tree.body), 3000)
 
     def test_fallback_guard_spends_a_bounded_tokenize_budget(self):
-        body = ''.join('value_%d = a.b(c[1] + 2 - 3) if not d else e\n' % n for n in range(3000))
+        # A long string takes the cheap per-line count past the limit while the exact
+        # tokenize pass sees only shallow code, so both files enter the tokenize path;
+        # the second is refused once the patched budget is spent.
+        body = 'value = "' + '+' * 6_000 + '"\n'
         write(self.root, 'pkg/first.py', body)
         write(self.root, 'pkg/second.py', body)
         with patch.object(capabilities.threading, 'stack_size', side_effect=ValueError('refused')), \
@@ -912,6 +1086,147 @@ class NestingGuardTests(Checkout):
         self.assertEqual(result['index']['skipped'].get('too-complex'), 1)
         self.assertTrue(any('nest too deeply' in warning for warning in result['warnings']))
         self.assertIn('pkg/core.py', {row['file'] for row in result['entries']})
+
+    def test_a_failed_big_start_retries_the_next_size_before_the_guard(self):
+        # 512 MB is tried first, then 255 MB (Windows refuses 512 MB outright, so it
+        # only reaches the retry for sizes the platform grants).
+        self.assertEqual(capabilities.PARSE_STACK_BYTES,
+                         (512 * 1024 * 1024, 255 * 1024 * 1024))
+        depth = 10_000
+        write(self.root, 'pkg/deep.py', 'x = ' + '+'.join(['1'] * depth) + '\n')
+        sizes = (32 * 1024 * 1024, 16 * 1024 * 1024)
+        attempts = []
+        real_start = capabilities._start_worker
+
+        def flaky(target):
+            attempts.append(threading.stack_size())
+            if len(attempts) == 1:
+                raise RuntimeError("can't start new thread")
+            return real_start(target)
+
+        seen = []
+        real_execute = capabilities.execute
+
+        def probe(args):
+            seen.append(capabilities._parse['stack_bytes'])
+            return real_execute(args)
+
+        with patch.object(capabilities, 'PARSE_STACK_BYTES', sizes), \
+                patch.object(capabilities, '_start_worker', side_effect=flaky), \
+                patch.object(capabilities, 'execute', side_effect=probe):
+            code, result, _, stderr = call('index', '--repo', str(self.root), '--source', 'ast')
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(attempts, list(sizes))
+        self.assertEqual(seen[-1], sizes[1])
+        if sys.version_info < (3, 11):
+            self.assertIn('pkg/deep.py', {row['file'] for row in result['entries']})
+
+    def test_the_computed_depth_never_undercuts_the_real_ast_depth(self):
+        # The exact pass decides whether a file reaches ast.parse, so an undercount is
+        # the same failure class as the UTF-7 bypass. Real depth is the longest path of
+        # AST nodes from the statement's expression, walked iteratively. The computed
+        # depth may lag it by at most DEPTH_SLACK: the wrappers it does not model are
+        # fixed (the JoinedStr/FormattedValue pair of an f-string, the statement around
+        # the expression), so the lag must stay under the slack at every depth of every
+        # shape. A per-level undercount (the display-aware reset losing the prefix of
+        # `[-...]`, or a comprehension's `for`/`in` not counted) grows past the slack
+        # and fails here.
+        depth_slack = 6
+
+        def real_depth(node):
+            deepest = 0
+            stack = [(node, 0)]
+            while stack:
+                current, depth = stack.pop()
+                depth += 1
+                deepest = max(deepest, depth)
+                for child in ast.iter_child_nodes(current):
+                    stack.append((child, depth))
+            return deepest
+
+        def expression(source):
+            return ast.parse(source).body[0].value
+
+        def wrap(seed, times, patterns):
+            text = seed
+            for index in range(times):
+                text = patterns[index % len(patterns)] % text
+            return text
+
+        shapes = {
+            'nested displays, no commas': lambda n: '[' * n + '1' + ']' * n,
+            'nested displays, comma before the inner element':
+                lambda n: wrap('1', n, ['[0, %s]']),
+            'dict values': lambda n: wrap('1', n, ["{'k': %s}"]),
+            'mixed lambda, subscript, call and display':
+                lambda n: wrap('1', n, ['(lambda: %s)', 'f(%s)', 'a[%s]', '[%s]', '{%s: 1}']),
+            'postfix chains interleaved with displays':
+                lambda n: wrap('a', n, ['%s[0]', '%s(0)', '%s.b', '(%s)', '[%s]']),
+            'unary operators inside displays': lambda n: wrap('1', n, ['[-%s]']),
+            'comprehensions': lambda n: wrap('1', n, ['[i for i in [%s]]']),
+            'f-string replacement field': lambda n: 'f"{%s}"' % '+'.join(['1'] * (n + 1)),
+            'f-string format-spec replacement field':
+                lambda n: 'f"{1:>%s}"' % wrap('1', n, ['(%s + 1)']),
+            'nested f-string replacement field':
+                lambda n: 'f"{f\'{%s}\'}"' % '+'.join(['1'] * (n + 1)),
+        }
+        for name, shape in shapes.items():
+            for n in range(1, 26):
+                source = 'x = ' + shape(n) + '\n'
+                real = real_depth(expression(source))
+                computed = capabilities._deepest_logical_line(source, 10 ** 9)
+                self.assertLessEqual(
+                    real - computed, depth_slack,
+                    '%s at depth %d: computed %d is more than %d below real %d'
+                    % (name, n, computed, depth_slack, real))
+
+    def test_names_and_depth_zero_separators_count_toward_the_expression_budget(self):
+        # A NAME is a node and a statement is at least one, so both count. A newline
+        # inside brackets is a continuation, not a statement, and a newline inside a
+        # string is string text, so neither counts.
+        self.assertEqual(capabilities._expression_tokens(b'a\n'), 2)
+        self.assertEqual(capabilities._expression_tokens(b'a;b\n'), 4)
+        self.assertEqual(capabilities._expression_tokens(b'x = [\na,\n]\n'), 6)
+        self.assertEqual(capabilities._expression_tokens(b'x = """a\nb\n"""\n'), 3)
+
+    def test_statement_dense_files_are_skipped_by_the_expression_budget(self):
+        # Operators alone miss these: on the worker, 900,000 one-name lines (1.8 MB)
+        # reached 1,424 MB RSS, 190,000 calls 491 MB and a 190,000-name list 257 MB.
+        # The NAME tokens and the statement separators at bracket depth zero count
+        # toward the same budget, so all three are refused before ast.parse.
+        dense = {
+            'nine hundred thousand one-name lines': b'a\n' * 900_000,
+            'a hundred and ninety thousand calls': b'f()\n' * 190_000,
+            'a hundred and ninety thousand names': b'x = [' + b'a,' * 190_000 + b']\n',
+        }
+        for name, data in dense.items():
+            self.assertGreater(capabilities._expression_tokens(data),
+                               capabilities.EXPRESSION_TOKENS_MAX, name)
+            with self.assertRaises(capabilities.TooComplex, msg=name):
+                capabilities.parse_python(data, 'dense.py')
+        write(self.root, 'pkg/lines.py', dense['nine hundred thousand one-name lines'])
+        write(self.root, 'pkg/names.py', dense['a hundred and ninety thousand names'])
+        code, result, _, stderr = call('index', '--repo', str(self.root), '--source', 'ast')
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(result['index']['skipped'].get('too-complex'), 2)
+        self.assertFalse({'pkg/lines.py', 'pkg/names.py'}
+                         & {row['file'] for row in result['entries']})
+        self.assertTrue(any('too many expressions' in warning for warning in result['warnings']))
+
+    def test_the_budget_leaves_room_for_large_generated_tables(self):
+        # The largest legitimate shape the review measured is a 60,000-row generated
+        # table (~240,000 counted nodes in the dict form), so the budget must stay
+        # above it and both forms must still reach ast.parse.
+        rows = 60_000
+        tables = {
+            'neg_table': ('T = [\n' + ''.join('    -%d,\n' % i for i in range(rows)) + ']\n').encode(),
+            'dict_table': ('D = {\n' + ''.join('    "k%d": f(%d),\n' % (i, i)
+                                               for i in range(rows)) + '}\n').encode(),
+        }
+        for name, data in tables.items():
+            self.assertLessEqual(capabilities._expression_tokens(data),
+                                 capabilities.EXPRESSION_TOKENS_MAX, name)
+            self.assertEqual(len(capabilities.parse_python(data, name + '.py').body), 1, name)
 
 
 class MarkdownCostTests(unittest.TestCase):
