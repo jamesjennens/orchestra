@@ -268,17 +268,27 @@ def existing_revisions(row):
                                 'requirement', 'revision', 'revision')
 
 
-def existing_acceptances(row):
+def existing_acceptances(row, operators=None):
     """Validated durable acceptance ledger for one record; malformed fails closed.
 
     Keyed by the bound revision (None for a backfill record with no revision
     comment), so a retry recognises its own evidence and a second, different
     decision for the same revision is refused rather than silently rewriting
-    the operator's acceptance.
+    the operator's acceptance. When `operators` is given, only evidence whose
+    stored native author is on that allowlist and equals the record's `operator`
+    takes part; a contributor-planted acceptance must not stop the operator
+    writing their own (kittrial-5bb.92 item 1).
     """
     from reserved_comments import parse_acceptance_record
+    keep = None
+    if operators is not None:
+        allowed = set(core.configured_operators(operators))
+
+        def keep(comment, record):
+            author = comment.get('author')
+            return isinstance(author, str) and author == record.get('operator') and author in allowed
     return core.existing_ledger(row, ACCEPTANCE_PREFIX, parse_acceptance_record,
-                                'requirement', 'acceptance', 'revision')
+                                'requirement', 'acceptance', 'revision', keep=keep)
 
 
 def acceptance_evidence(bound, task, revision, acceptance_state, actor, at=None):
@@ -534,6 +544,7 @@ SPEC = core.RecordSpec(
     acceptance_evidence=lambda bound, task, revision, record, actor: acceptance_evidence(
         bound, task, revision, record['acceptance_state'], actor),
     existing_acceptances=lambda row: existing_acceptances(row),
+    live_acceptances=lambda row, operators: existing_acceptances(row, operators),
     revision_comment=revision_comment,
     apply_labels=lambda run, task, current, payload, record: apply_controlled_labels(
         run, task, current, payload['kind'], payload['acceptance_state']),
@@ -616,7 +627,7 @@ def backfill(payload, actor, run, project, operators=None):
                     'requirement-apply and F3 acceptance evidence (a new accepted revision), or '
                     'backfill it as a draft.' % (entry['task'], binding.get('acceptance_state')))
             record, body = backfill_evidence(entry['task'], entry['evidence'], binding, actor, at)
-            prior_evidence = existing_acceptances(row).get(record['revision'])
+            prior_evidence = existing_acceptances(row, operators).get(record['revision'])
             if prior_evidence is not None:
                 if prior_evidence.get('source') == 'requirement-apply':
                     # A real operator F3 decision is already recorded for this

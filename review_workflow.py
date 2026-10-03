@@ -355,6 +355,32 @@ def check_void(issue, payload, voided):
                          'malformed, duplicate or conflicting records')
 
 
+def applied_review_voids(issue, operators):
+    """(applied, invalid, refused): operator voids that apply to a review chain.
+
+    A valid void of a keyed record (kittrial-5bb.74) belongs to the anchor's kind
+    (keyed_entries), which applies or reports it; it is no part of a review history.
+    `applied` maps a voided comment id to its (payload, comment). Both `history` and
+    `apply_revert` read the chain through this filter, so a malformed review comment an
+    operator already voided no longer makes a later revert fail closed
+    (kittrial-5bb.92 item 5).
+    """
+    voids, targets, invalid = recovery.records(issue, operators)
+    voids = [(p, c) for p, c in voids if p['target_kind'] in recovery.REVIEW_KIND_PREFIXES]
+    targets = {target: entry for target, entry in targets.items()
+               if entry[0]['target_kind'] in recovery.REVIEW_KIND_PREFIXES}
+    applied = {}
+    refused = []
+    for p, c in voids:
+        try:
+            check_void(issue, p, set(targets))
+        except ValueError as exc:
+            refused.append((p, c, str(exc)))
+            continue
+        applied[p['target']] = (p, c)
+    return applied, invalid, refused
+
+
 def history(issue, operators=None, journal=None, reverts=None, invalid_reverts=None):
     """Apply operator voids; return the ordered chain and every derived list.
 
@@ -379,21 +405,7 @@ def history(issue, operators=None, journal=None, reverts=None, invalid_reverts=N
     Raises when the history cannot be reconciled even after applied voids,
     including when surviving records still reference a voided revision.
     """
-    voids, targets, invalid = recovery.records(issue, operators)
-    # A valid void of a keyed record (kittrial-5bb.74) belongs to the anchor's kind
-    # (keyed_entries), which applies or reports it; it is no part of a review history.
-    voids = [(p, c) for p, c in voids if p['target_kind'] in recovery.REVIEW_KIND_PREFIXES]
-    targets = {target: entry for target, entry in targets.items()
-               if entry[0]['target_kind'] in recovery.REVIEW_KIND_PREFIXES}
-    applied = {}
-    refused = []
-    for p, c in voids:
-        try:
-            check_void(issue, p, set(targets))
-        except ValueError as exc:
-            refused.append((p, c, str(exc)))
-            continue
-        applied[p['target']] = (p, c)
+    applied, invalid, refused = applied_review_voids(issue, operators)
     ordered = records(issue, set(applied))
     positions = {str(c.get('id')): i for i, c in enumerate(issue.get('comments') or [])}
     if reverts is None:
@@ -968,8 +980,11 @@ def apply_revert(rows, task, actor, payload, run, operator=False, operators=None
                              + payload['integration_commit'] + ' for contribution ' + payload['contribution'])
     # Validate the whole transition before the sole native mutation: the named
     # contribution must exist and the named commit must be the one the shared
-    # projection currently reports as its passing integration.
-    state = projection(records(issue))
+    # projection currently reports as its passing integration. The chain is read
+    # through the applied operator voids, exactly as every read is, so a malformed
+    # review comment an operator already voided no longer fails this command closed
+    # (kittrial-5bb.92 item 5).
+    state = projection(records(issue, set(applied_review_voids(issue, operators)[0])))
     known = [c for c in [state.get('contribution')] + list(state.get('prior_contributions') or [])
              if isinstance(c, dict) and c.get('comment_id') == payload['contribution']]
     if not known:

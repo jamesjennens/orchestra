@@ -21,6 +21,7 @@ from reserved_comments import (
     comment_target,
     first_reserved_label,
     is_legitimate_writer,
+    is_record_anchor,
     label_guard_request,
     operator_only_flag,
     operator_only_in_args,
@@ -28,6 +29,7 @@ from reserved_comments import (
     raw_file_flag_in_args,
     reserved_label_in_args,
     reserved_match,
+    status_change_targets,
     unresolved_bd_flags,
 )
 from briefing import PREFIX as CHECKPOINT_PREFIX
@@ -1310,6 +1312,66 @@ class ReservedLabelMutationGuardTests(unittest.TestCase):
         self.assertIsNone(first_reserved_label([]))
         self.assertIsNone(first_reserved_label(None))
         self.assertIsNone(first_reserved_label('request:x'))
+
+    def test_status_change_targets(self):
+        # kittrial-5bb.92 item 4: the record-anchor status guard resolves the named
+        # issue ids, consuming flag values, and fails closed when it cannot.
+        self.assertEqual(status_change_targets(['close', 'task-1', '--reason', 'done']),
+                         ('close', ['task-1']))
+        self.assertEqual(status_change_targets(['close', 'task-1', 'task-2', '-f']),
+                         ('close', ['task-1', 'task-2']))
+        self.assertEqual(status_change_targets(['reopen', 'task-1', '-r', 'needed']),
+                         ('reopen', ['task-1']))
+        self.assertEqual(status_change_targets(['update', 'task-1', '--status', 'open']),
+                         ('update', ['task-1']))
+        self.assertIsNone(status_change_targets(['update', 'task-1', '--title', 'x']))
+        self.assertIsNone(status_change_targets(['show', 'task-1']))
+        self.assertIsNone(status_change_targets(['list']))
+        # No named issue: bd would act on the last touched issue, which is unverifiable.
+        self.assertEqual(status_change_targets(['close', '--json']), ('close', None))
+        self.assertEqual(status_change_targets(['close', 'task-1', '--mystery']), ('close', None))
+
+    def test_status_change_targets_covers_every_status_and_assignee_spelling(self):
+        # kittrial-5bb.92 review item 1: only `--status` was matched, so the short flag,
+        # --claim, --defer and --assignee bypassed the record-anchor guard entirely.
+        for args, expected in (
+            (['update', 'task-1', '-s', 'open'], ('update', ['task-1'])),
+            (['update', 'task-1', '-sopen'], ('update', ['task-1'])),
+            (['update', 'task-1', '-s=open'], ('update', ['task-1'])),
+            (['update', '-s', 'open', 'task-1'], ('update', ['task-1'])),
+            (['update', 'task-1', 'task-2', '-s', 'in_progress'], ('update', ['task-1', 'task-2'])),
+            (['update', 'task-1', '--claim'], ('update', ['task-1'])),
+            (['update', 'task-1', '--claim=true'], ('update', ['task-1'])),
+            (['update', 'task-1', '--claim=1'], ('update', ['task-1'])),
+            (['update', 'task-1', '--defer', '+1d'], ('update', ['task-1'])),
+            (['update', 'task-1', '--defer=+1d'], ('update', ['task-1'])),
+            (['update', 'task-1', '--assignee', 'bob'], ('update', ['task-1'])),
+            (['update', 'task-1', '-a', 'bob'], ('update', ['task-1'])),
+            (['update', 'task-1', '-abob'], ('update', ['task-1'])),
+        ):
+            with self.subTest(args=args):
+                self.assertEqual(status_change_targets(args), expected)
+        # A last explicit false --claim means bd does not claim, so it cannot move a
+        # status; every unparseable value fails closed instead of guessing.
+        self.assertIsNone(status_change_targets(['update', 'task-1', '--claim=false']))
+        self.assertIsNone(status_change_targets(['update', 'task-1', '--claim=0']))
+        self.assertEqual(status_change_targets(['update', 'task-1', '--claim=false', '--claim']),
+                         ('update', ['task-1']))
+        self.assertIsNone(status_change_targets(['update', 'task-1', '--claim', '--claim=F']))
+        self.assertEqual(status_change_targets(['update', 'task-1', '--claim=maybe']),
+                         ('update', ['task-1']))
+        # The no-id forms fail closed: the guard cannot verify the last touched issue.
+        for args in (['update', '-s', 'open'], ['update', '-sopen'], ['update', '--claim'],
+                     ['update', '--defer', '+1d'], ['update', '--assignee', 'bob']):
+            with self.subTest(args=args):
+                self.assertEqual(status_change_targets(args), ('update', None))
+        # Ordinary title/label/description writes still move no status and stay free.
+        for args in (['update', 'task-1', '--title', 'x'],
+                     ['update', 'task-1', '-t', 'x'],
+                     ['update', 'task-1', '--add-label', 'bug'],
+                     ['update', 'task-1', '--description', 'text']):
+            with self.subTest(args=args):
+                self.assertIsNone(status_change_targets(args))
 
     def test_guard_refuses_reserved_holder_before_native_write(self):
         # Mirror endpoint.execute's locked section: the read-before-write guard

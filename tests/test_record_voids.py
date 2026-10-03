@@ -240,7 +240,13 @@ class ReferenceVoidTests(VoidCase):
         self.assertIn('void-refused', [warning['code'] for warning in view['warnings']])
 
     def test_the_earliest_acceptance_evidence_for_a_revision_is_never_voided(self):
-        # Review P2, case B: duplicate acceptance evidence for one revision.
+        # Review P2, case B: duplicate acceptance evidence for one revision. Evidence a
+        # non-operator planted is inert rather than a conflicting ledger entry
+        # (kittrial-5bb.92 item 1), so the writer records its own decision; the earliest
+        # holder among the records it counts is still never voidable. The plant is later
+        # and inert, so the operator's earliest live record is refused as a well-formed
+        # record rather than as an earliest holder with an inert alternative
+        # (kittrial-5bb.92 review item 2).
         self.propose()
         self.accept(1, self.sha(1))
         legitimate = self.comment('ref-1', 'Kind: reference-acceptance-v1')
@@ -250,15 +256,117 @@ class ReferenceVoidTests(VoidCase):
                                         accepted)
         _, body = rr.acceptance_evidence(bound, 'ref-1', 2, accepted, OPERATOR, at='2026-10-01T12:00:00Z')
         planted = self.native.add_comment('ref-1', body, author='mallory')
-        with self.assertRaisesRegex(ValueError, 'conflicting acceptance evidence'):
-            self.accept(2, accepted['sha256'])   # the writer fails closed on the duplicate
-        with self.assertRaisesRegex(ValueError, 'earliest holder of the acceptance evidence for revision 2'):
+        self.assertEqual(self.accept(2, accepted['sha256'])['revision'], 3)   # the inert copy is ignored
+        with self.assertRaisesRegex(ValueError, 'well-formed reference-acceptance record the entry reads'):
             self.void(void_payload('ref-1', legitimate['id'], legitimate['text'], kind='reference-acceptance'))
         self.void(void_payload('ref-1', planted['id'], planted['text'], kind='reference-acceptance'))
         view = self.get()
         self.assertEqual((view['state'], view['acceptance']['decision_id'], view['acceptance_inert']),
                          ('accepted', 'decision-42', False))
-        self.assertEqual(self.accept(2, accepted['sha256'])['revision'], 3)   # the writer agrees again
+        self.assertEqual(self.accept(3, self.sha(3))['revision'], 4)   # the writer agrees again
+
+    def test_an_inert_plant_is_the_voidable_holder_not_the_operators_evidence(self):
+        # kittrial-5bb.92 review item 2 (checkpoint `inert-dup-holder`): the plant is
+        # earliest in native order but its author is not a live operator, so it holds no
+        # place. Voiding the operator's own evidence would drop the entry to draft-only;
+        # the plant must be the voidable record and the operator's evidence the
+        # protected one, and the reader must warn about the inert pair.
+        self.propose()
+        draft = rr.existing_revisions(self.native.row('ref-1'))[1]
+        future = {name: value for name, value in draft.items() if name != 'sha256'}
+        future.update(revision=2, acceptance_state='accepted', successor=None)
+        future['sha256'] = rr.core.content_hash(future)
+        bound = rr.core.bind_acceptance(acceptance(), future)
+        _, plant_body = rr.acceptance_evidence(bound, 'ref-1', 2, future, 'mallory')
+        plant = self.native.add_comment('ref-1', plant_body, author='mallory')
+        self.accept(1, draft['sha256'])
+        live = next(comment for comment in self.native.row('ref-1')['comments']
+                    if comment['text'].startswith('Kind: reference-acceptance-v1\n')
+                    and comment['author'] == OPERATOR)
+        ids = [comment['id'] for comment in self.native.row('ref-1')['comments']]
+        self.assertLess(ids.index(plant['id']), ids.index(live['id']))   # the plant is earliest
+        view = self.get()
+        self.assertEqual(view['state'], 'accepted')
+        self.assertIn('inert-evidence', [warning['code'] for warning in view['warnings']])
+        # The operator's live evidence is protected; the inert plant is the voidable one.
+        with self.assertRaisesRegex(ValueError, 'well-formed reference-acceptance record the entry reads'):
+            self.void(void_payload('ref-1', live['id'], live['text'], kind='reference-acceptance'))
+        self.void(void_payload('ref-1', plant['id'], plant['text'], kind='reference-acceptance'))
+        self.assertEqual(self.get()['state'], 'accepted')
+
+    def test_evidence_whose_author_does_not_match_its_operator_is_not_a_holder(self):
+        # kittrial-5bb.92 review item 2 (`void-rule-live-definition`): the reader requires
+        # the author to equal the record's own `operator` as well as to be listed. The
+        # void rule counted any listed author as live, so evidence written by a listed
+        # operator whose record names ANOTHER operator (ops2) protected the inert first
+        # holder and told the operator to void their own real evidence. Both must use the
+        # reader's definition.
+        self.propose()
+        draft = rr.existing_revisions(self.native.row('ref-1'))[1]
+        future = {name: value for name, value in draft.items() if name != 'sha256'}
+        future.update(revision=2, acceptance_state='accepted', successor=None)
+        future['sha256'] = rr.core.content_hash(future)
+        bound = rr.core.bind_acceptance(acceptance(), future)
+        _, plant_body = rr.acceptance_evidence(bound, 'ref-1', 2, future, 'ops2')
+        plant = self.native.add_comment('ref-1', plant_body, author=OPERATOR)
+        self.accept(1, draft['sha256'])
+        live = next(comment for comment in self.native.row('ref-1')['comments']
+                    if comment['text'].startswith('Kind: reference-acceptance-v1\n')
+                    and comment['id'] != plant['id'])
+        ids = [comment['id'] for comment in self.native.row('ref-1')['comments']]
+        self.assertLess(ids.index(plant['id']), ids.index(live['id']))   # the mismatched one is earliest
+        view = self.get()
+        self.assertEqual((view['state'], view['acceptance']['operator']), ('accepted', OPERATOR))
+        self.assertIn('inert-evidence', [warning['code'] for warning in view['warnings']])
+        # The operator's real evidence is protected; the mismatched first holder is voidable.
+        with self.assertRaisesRegex(ValueError, 'well-formed reference-acceptance record the entry reads'):
+            self.void(void_payload('ref-1', live['id'], live['text'], kind='reference-acceptance'))
+        self.void(void_payload('ref-1', plant['id'], plant['text'], kind='reference-acceptance'))
+        self.assertEqual(self.get()['state'], 'accepted')
+
+    def test_a_planted_future_acceptance_does_not_replace_the_operators_own_evidence(self):
+        # kittrial-5bb.92 item 1 (p74 5c): a contributor plants evidence for the FUTURE
+        # revision the operator's accept will write, carrying the SAME decision. The
+        # writer's prior-evidence check must ignore a non-operator author and write its
+        # own evidence, so the entry reads accepted rather than draft-only.
+        self.propose()
+        draft = rr.existing_revisions(self.native.row('ref-1'))[1]
+        future = {name: value for name, value in draft.items() if name != 'sha256'}
+        future.update(revision=2, acceptance_state='accepted', successor=None)
+        future['sha256'] = rr.core.content_hash(future)
+        bound = rr.core.bind_acceptance(acceptance(), future)
+        _, body = rr.acceptance_evidence(bound, 'ref-1', 2, future, 'mallory')
+        self.native.add_comment('ref-1', body, author='mallory')
+        self.assertEqual(self.get()['state'], 'draft-only')   # evidence for a revision that does not exist yet
+        self.assertEqual(self.accept(1, draft['sha256'])['revision'], 2)
+        view = self.get()
+        self.assertEqual((view['state'], view['acceptance']['operator'], view['acceptance_inert']),
+                         ('accepted', OPERATOR, False))
+        authors = [comment['author'] for comment in self.native.row('ref-1')['comments']
+                   if comment['text'].startswith('Kind: reference-acceptance-v1\n')]
+        self.assertEqual(authors.count(OPERATOR), 1)
+        # A later accept still reads the ledger: the inert copy is no conflict.
+        self.assertEqual(self.accept(2, self.sha(2))['revision'], 3)
+
+    def test_a_backdated_holder_makes_the_history_conflicted_and_never_voidable(self):
+        # kittrial-5bb.92 item 2: bd orders comments by the stored created_at, which
+        # direct SQL can rewrite. A backdated forgery must not become "the earliest
+        # holder"; a disagreement between bd order and comment-id (UUIDv7) order is
+        # conflicted, so no void of that place applies.
+        self.native.actor = OPERATOR
+        rr.apply_native(dict(entry(operation_id='direct-1'), operation='draft', acceptance_state='accepted',
+                             acceptance=acceptance()), OPERATOR, self.native, self.project, operator=True,
+                        operators=[OPERATOR])
+        legitimate = self.comment('ref-1', 'Kind: reference-entry-v1')
+        forged = rr.entry_record(dict(entry(statement='A forged statement.'), operation='draft'), 1, 'accepted')
+        planted = self.native.add_comment('ref-1', rr.entry_comment(forged), author='mallory')
+        row = self.native.row('ref-1')
+        row['comments'] = [planted] + [c for c in row['comments'] if c['id'] != planted['id']]
+        for target, text, operation_id in ((legitimate, legitimate['text'], 'void-1'),
+                                           (planted, planted['text'], 'void-2')):
+            with self.subTest(target=target['id']):
+                with self.assertRaisesRegex(ValueError, 'history is conflicted'):
+                    self.void(void_payload('ref-1', target['id'], text, operation_id=operation_id))
 
     def test_a_bom_or_crlf_lookalike_record_can_be_voided_and_a_newer_version_cannot(self):
         # Review P3: the readers read these as malformed records, so the void matches its
@@ -607,6 +715,23 @@ class AdminCommandTests(VoidCase):
                                                 r'applying too \(1 void; entries whose reading changes: '
                                                 r'trial/reference calendar.trading draft-only -> malformed'):
             self.admin('operators', 'remove', OPERATOR)
+        self.assertEqual(admin.operators(self.root), frozenset({OPERATOR}))
+
+    def test_all_revoked_names_every_affected_entry(self):
+        # kittrial-5bb.92 item 3: the warning truncates at 5 entries with (+N more);
+        # --all-revoked names the rest.
+        for letter in 'abcdef':
+            proposed = self.propose(operation_id='p-' + letter, key='ref.' + letter)
+            bad = self.native.add_comment(proposed['native_id'], MALFORMED, author='mallory')
+            self.void(void_payload(proposed['native_id'], bad['id'], MALFORMED, operation_id='void-' + letter))
+        with self.assertRaisesRegex(ValueError, r'\(\+1 more\)'):
+            self.admin('operators', 'remove', OPERATOR)
+        with self.assertRaises(ValueError) as caught:
+            self.admin('operators', 'remove', OPERATOR, '--all-revoked')
+        message = str(caught.exception)
+        self.assertNotIn('more)', message)
+        for letter in 'abcdef':
+            self.assertIn('trial/reference ref.%s' % letter, message)
         self.assertEqual(admin.operators(self.root), frozenset({OPERATOR}))
 
     def test_reference_reconcile_gives_the_allowlist_to_complete(self):

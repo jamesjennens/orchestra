@@ -1976,6 +1976,17 @@ def initialized_projects(root):
         if (path/'.beads'/'metadata.json').is_file():found.append(path.name)
     return sorted(found)
 
+def _revoked_list(found,limit):
+    """One revocation list: the first `limit` entries, or every entry when limit is None.
+
+    `operators remove` truncates at 5 with `(+N more)`, which left an operator no way to
+    see the rest; `--all-revoked` passes limit=None and names them all
+    (kittrial-5bb.92 item 3).
+    """
+    if limit is None:
+        return ', '.join(found) or 'none'
+    return (', '.join(found[:limit])+(' (+%d more)'%(len(found)-limit) if len(found)>limit else '')) or 'none'
+
 def revoked_proposal_records(root,actor,limit=5):
     """Name the requirement-proposal effects of one operator's revocation.
 
@@ -2000,7 +2011,7 @@ def revoked_proposal_records(root,actor,limit=5):
         except (OSError,ValueError,TypeError,KeyError,subprocess.CalledProcessError):
             unreadable+=1
     def listed(found):
-        return (', '.join(found[:limit])+(' (+%d more)'%(len(found)-limit) if len(found)>limit else '')) or 'none'
+        return _revoked_list(found,limit)
     return (' Requirement proposals: dispositions, owner decisions and contribution settings they recorded stop '
             'counting too (proposals whose state changes: %s; contribution settings that change: %s; projects that '
             'could not be read: %d). Re-adding the operator restores them; otherwise re-enter the settings with '
@@ -2042,7 +2053,7 @@ def revoked_keyed_voids(root,actor,limit=5):
                 if before!=after:
                     changed.append('%s/%s %s %s -> %s'%(name,kind.noun,key or row.get('id'),before,after))
     changed.sort()
-    shown=(', '.join(changed[:limit])+(' (+%d more)'%(len(changed)-limit) if len(changed)>limit else '')) or 'none'
+    shown=_revoked_list(changed,limit)
     return (' Voids of reference and capability records they authored stop applying too (%d void%s; entries '
             'whose reading changes: %s; projects that could not be read: %d).'
             %(count,'' if count==1 else 's',shown,unreadable))
@@ -2070,8 +2081,7 @@ def revoked_revert_records(root,actor,limit=5):
     """
     from review_workflow import revert_records
     def listed(found):
-        shown=', '.join(found[:limit])
-        return shown+(' (+%d more)'%(len(found)-limit) if len(found)>limit else '')
+        return _revoked_list(found,limit)
     authority=operators(root)
     remaining=frozenset(item for item in authority if item!=actor)
     stopped=[];reapplied=[];unreadable=0
@@ -3092,6 +3102,8 @@ def main():
     a=sub.add_parser('operators');a.add_argument('action',choices=['list','add','remove']);a.add_argument('actor',nargs='?')
     a.add_argument('--confirm-revoke',action='store_true',dest='confirm_revoke',
                    help='with remove: acknowledge that this operator\'s earlier operator voids stop applying')
+    a.add_argument('--all-revoked',action='store_true',dest='all_revoked',
+                   help='with remove: name every affected entry instead of the first 5 (the warning truncates otherwise)')
     a=sub.add_parser('verifiers',help='the capability verifiers list: actors whose capability-verify records read verified')
     a.add_argument('action',choices=['list','add','remove']);a.add_argument('actor',nargs='?')
     a.add_argument('--confirm-revoke',action='store_true',dest='confirm_revoke',
@@ -3456,11 +3468,12 @@ def main():
             if actor not in current:current.append(actor)
         else:
             if not args.confirm_revoke:
+                limit=None if args.all_revoked else 5
                 raise ValueError('operators remove revokes ' + actor + ': voids they authored stop applying on '
                                  'reads, and so do the host-issued integration revert records and retractions '
-                                 'they authored' + revoked_revert_records(root,actor) +
-                                 ' (re-add restores them).' + revoked_keyed_voids(root,actor) +
-                                 revoked_proposal_records(root,actor) +
+                                 'they authored' + revoked_revert_records(root,actor,limit) +
+                                 ' (re-add restores them).' + revoked_keyed_voids(root,actor,limit) +
+                                 revoked_proposal_records(root,actor,limit) +
                                  ' Re-run with --confirm-revoke to acknowledge this.')
             if actor in current:current.remove(actor)
         if current:cfg['operators']=current

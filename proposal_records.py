@@ -1404,6 +1404,7 @@ def _spec(operators, context):
         build_record=build_record, require_bound_key=require_bound_key, check_revision=check_revision,
         check_acceptance=lambda payload, existing, record, operator, row: None,
         acceptance_evidence=lambda *args: (None, None), existing_acceptances=lambda row: {},
+        live_acceptances=lambda row, operators: {},
         revision_comment=revision_comment, apply_labels=apply_state, result=result)
     return spec
 
@@ -1537,7 +1538,7 @@ def _check_decision(decision_id, run):
                          'decision' % decision_id)
 
 
-def _check_incorporation(linked, run):
+def _check_incorporation(linked, run, operators=None):
     """The incorporation must describe the requirement record as it is, not as the caller says."""
     rows = AnchoredKind.shown(run, [linked['requirement_id']])
     row = rows[0] if rows else None
@@ -1561,7 +1562,10 @@ def _check_incorporation(linked, run):
         from requirement_records import existing_acceptances, existing_revisions
         revisions = existing_revisions(row)
         accepted_in = accepting_revision(row, revisions, revisions[linked['requirement_revision']])
-        evidence = existing_acceptances(row).get(accepted_in) or {}
+        # The same live filter the writer and the requirement readers use: a
+        # contributor-planted acceptance beside the operator's real evidence must not
+        # make this read fail or pick the wrong decision (kittrial-5bb.92 review item 3).
+        evidence = existing_acceptances(row, operators).get(accepted_in) or {}
         recorded = (evidence.get('decision') or {}).get('decision_id')
         if recorded != linked['acceptance_decision_id']:
             raise ValueError('acceptance_decision_id does not match the F3 acceptance evidence of requirement %s '
@@ -1690,7 +1694,7 @@ def dispose(payload, actor, run, project, operators=None, route='review', http=N
         if not (newest['rationale'] or '').strip():
             raise ValueError('Proposal %s has no rationale; ask for one (needs-info) before it is incorporated'
                              % key)
-        _check_incorporation(record['incorporation'], run)
+        _check_incorporation(record['incorporation'], run, operators)
     atomic(receipt, {'sha256': digest, 'status': 'pending', 'actor': actor, 'id': task, 'operation': route,
                      'revision': newest['revision']})
     spec = _spec(operators, {})

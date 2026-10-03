@@ -419,11 +419,56 @@ two rules the review voids already follow:
 - a void applies only to a comment the entry cannot read: malformed (a BOM or CRLF
   lookalike included), another anchor's or key's, or the later holder of a revision an
   earlier comment already holds. The earliest holder is never voided, because the writer
-  never writes a second one, and a void cannot itself be voided. A well-formed record the
-  entry reads is refused at write and ignored on read, because a void repairs history
-  and never withdraws a decision; replacing an entry is a new revision or a retirement;
+  never writes a second one, and a void cannot itself be voided. The earliest holder is
+  established by **both** bd's native (stored `created_at`) order and comment-id
+  (UUIDv7) order. This cross-check is a consistency check, **not** a security boundary
+  and not a closed hole: it catches an edit of `created_at` alone, but anyone who can
+  write the native database can rewrite the comment `id` as well, make the two orders
+  agree, and leave the legitimate record as the later - and therefore voidable - holder.
+  It raises the cost of a forgery and makes a partial one visible; it does not make a
+  forged ledger trustworthy. When the two orders disagree the history is conflicted and
+  **no** void of that place applies, so both holders stay. The kit has no command that
+  repairs that state: the operator stops, reads the anchor natively
+  (`bd show ANCHOR --include-comments`), decides which record is genuine, repairs the
+  stored order from a native backup or with the native tooling (recording the reason on
+  the project), and re-reads. Do not guess, and do not treat a repaired ledger as proof
+  of authorship (kittrial-5bb.92, review `order-check-limits-and-rollback`). A well-formed
+  record the entry reads is refused at write and ignored on read, because a void repairs
+  history and never withdraws a decision; replacing an entry is a new revision or a
+  retirement;
 - readers and writers both leave out a voided comment, so `ref revise` sees what
-  `ref get` shows.
+  `ref get` shows;
+- acceptance evidence counts as a prior decision the writer must not rewrite only when
+  its stored native author is a live configured operator and matches the record's own
+  `operator`, exactly as the reader selects the accepted revision. An inert acceptance
+  (a contributor-planted one, or one written by a since-removed operator) does not stop
+  the operator's `apply` from writing its own evidence (kittrial-5bb.92). It is also not
+  a holder of the revision's acceptance place: an inert record beside the operator's live
+  evidence is the voidable one and the live evidence is the protected one, and the reader
+  raises an `inert-evidence` warning for it (kittrial-5bb.92 review
+  `plant-protected-by-void-rule`). Two live evidence records for one revision that carry
+  the **same** decision are one decision recorded twice rather than a conflict - the
+  first in native order stands - so re-adding a removed operator does not wedge later
+  accepts; only a differing `record_sha256`/`decision` conflict (kittrial-5bb.92 review
+  `same-decision-evidence-conflicts`). The void rule (`keyed_entries.void_refusal`) uses
+  that same definition through `keyed_entries.evidence_is_live`, so the reader and the
+  operator repair agree about which evidence holds the place: evidence written by a
+  listed operator whose record names some other `operator` is inert on both surfaces, so
+  the mismatched record is the voidable one and the operator's real evidence is protected
+  (kittrial-5bb.92 review `void-rule-live-definition`).
+- **Removing and re-adding an accepting operator.** `operators remove` makes that
+  operator's evidence inert, so the entry reads `draft-only` with `acceptance_inert` and
+  their sole evidence is voidable by another operator while they are removed. Re-adding
+  the operator makes the evidence live again, so the void then names a well-formed record
+  the entry reads: it stops applying, the evidence returns, and the read carries a
+  `void-refused` warning. If, while the first operator is removed, a second operator
+  accepts the same revision with a **different** decision, the shown acceptance is the
+  second operator's; re-adding the first flips the shown acceptance back to theirs
+  (earliest in native order) and later accepts are refused with `conflicting acceptance
+  evidence for one revision` - the way out is to void the later evidence.
+  `requirement-backfill` reads the same live filter, so a backfill by another operator
+  while the first author is removed writes a second evidence comment (kittrial-5bb.92
+  review `void-rule-live-definition`).
 
 An anchor left with no live record, by an interrupted propose whose payload is lost or
 because every record it held is voided, is closed and its key freed by the operator's
@@ -1260,7 +1305,16 @@ together. That is an ordering choice, not a dependency, and it replaces revision
   `reference-key:` (3.7), so raw forging of `Kind: reference-*` comments and
   `reference:*` labels is allowed again;
 - an acceptance written under the catalog reads as ordinary prose, and the older
-  kit neither enforces the operator allowlist for it nor treats it as authority.
+  kit neither enforces the operator allowlist for it nor treats it as authority;
+- a pre-5bb.92 kit counts **every** acceptance evidence record with no author rule, so
+  on an entry where this kit wrote the operator's own evidence beside an inert plant for
+  one revision the older kit's ledger sees two records for one revision and refuses any
+  further accept with `conflicting acceptance evidence for one revision`; its
+  `void-record` also refuses the plant, because it does not know the author rule and
+  still reads the plant as a holder. That entry is then unrepairable with the older kit
+  and must be reconciled natively or restored from a backup; rolling forward to this kit
+  restores the repair with nothing to clean up (kittrial-5bb.92 review
+  `order-check-limits-and-rollback`).
 
 **The staged release.** Slice 0 is the tolerant reader and is the oldest kit a
 catalog deployment may roll back to:

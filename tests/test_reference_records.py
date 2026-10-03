@@ -460,6 +460,39 @@ class AcceptanceTests(ReferenceCase):
         # The item names the stored native author, not the name the payload claims.
         self.assertEqual(self.get(operators=(OPERATOR,))['inert_operator'], 'mallory')
 
+    def test_same_decision_evidence_from_two_operators_is_not_a_conflict(self):
+        # kittrial-5bb.92 review item 3: operator A writes evidence and is removed, B
+        # accepts and the kit writes a second evidence record for the same revision.
+        # Re-adding A must not wedge the same-operation retry or later accepts: the two
+        # records carry one decision, so the first in native order stands.
+        self.propose()
+        digest = self.sha(1)
+        self.accept(1, digest, actor='ops-ann', operators=['ops-ann'])
+        accepted = self.sha(2)
+        # A is removed from the allowlist, so A's evidence is inert and B writes its own
+        # (a new operation ID: one operation ID belongs to one actor).
+        self.accept(1, digest, actor=OPERATOR, operators=[OPERATOR], operation_id='owner-apply-b')
+        authors = [comment['author'] for comment in self.native.row('ref-1')['comments']
+                   if comment['text'].startswith('Kind: reference-acceptance-v1\n')]
+        self.assertEqual(authors, ['ops-ann', OPERATOR])
+        view = self.get(operators=(OPERATOR, 'ops-ann'))
+        self.assertEqual(view['state'], 'accepted')
+        self.assertEqual(view['acceptance']['operator'], 'ops-ann')   # first in native order stands
+        # The writer's ledger no longer raises, so a later accept still works.
+        self.assertEqual(self.accept(2, accepted, actor=OPERATOR,
+                                     operators=(OPERATOR, 'ops-ann'))['revision'], 3)
+
+    def test_differing_decision_evidence_for_one_revision_is_still_a_conflict(self):
+        # Only a differing decision conflicts (kittrial-5bb.92 review item 3).
+        self.propose()
+        digest = self.sha(1)
+        self.accept(1, digest, actor='ops-ann', operators=['ops-ann'])
+        self.accept(1, digest, actor=OPERATOR, operators=[OPERATOR], operation_id='owner-apply-b',
+                    acceptance=acceptance(decision_id='decision-2'))
+        row = self.native.row('ref-1')
+        with self.assertRaisesRegex(ValueError, 'conflicting acceptance evidence for one revision'):
+            rr.KIND.live_acceptances(row, [OPERATOR, 'ops-ann'])
+
 
 class CrashAndReconcileTests(ReferenceCase):
     def test_a_lost_create_response_is_finished_by_the_same_operation(self):

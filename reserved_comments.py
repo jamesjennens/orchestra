@@ -1002,6 +1002,10 @@ BD_LONG_VALUE_FLAGS = {
         '--set-labels', '--set-metadata', '--spec-id', '--status', '--title',
         '--type', '--unset-metadata',
     },
+    # Verbatim from the pinned bd 1.2.2 `close --help`/`reopen --help`, for the
+    # status-change guard on record anchors (kittrial-5bb.92 item 4).
+    'close': {'--reason', '--reason-file', '--session'},
+    'reopen': {'--reason'},
 }
 BD_LONG_BOOL_FLAGS = {
     'create': {
@@ -1012,6 +1016,7 @@ BD_LONG_BOOL_FLAGS = {
         '--allow-empty-description', '--claim', '--ephemeral', '--history',
         '--no-history', '--persistent', '--stdin',
     },
+    'close': {'--claim-next', '--continue', '--force', '--no-auto', '--suggest-next'},
 }
 # Label-replacing writes: `--set-labels` replaces the whole set and
 # `--remove-label` drops named labels, so either can take the reserved
@@ -1217,6 +1222,69 @@ def label_guard_request(args):
 # Backwards-compatible aliases for the previous flag tables.
 COMMENT_NO_VALUE_FLAGS = BD_GLOBAL_BOOL_FLAGS
 COMMENT_FLAGS_WITH_VALUE = {'-f', '--file'}
+
+
+# The `update` flags that move an anchor's status or assignee. `--status`/`-s` set the
+# status field in any spelling; `--claim` moves it to in_progress and assigns the acting
+# actor; `--defer` moves it to deferred; `--assignee`/`-a` changes the assignee. A record
+# anchor is created closed on purpose and hidden from work, so every one of these is
+# refused on one (kittrial-5bb.92 review item 1). The value-taking spellings are the
+# pinned bd 1.2.2 inventory already used by `_bd_scan`, so `-sopen`, `-s=open` and
+# `-s open` all resolve to the same flag and `-a` cannot be mistaken for a label flag.
+STATUS_ASSIGNEE_LONG_FLAGS = ('--status', '--defer', '--assignee')
+STATUS_ASSIGNEE_SHORT_FLAGS = ('-s', '-a')
+
+
+def _moves_status_or_assignee(flags):
+    """Whether an `update` flag list changes an anchor's status or assignee.
+
+    pflag decides a repeated boolean by its LAST occurrence, so `--claim` follows the
+    same rule as `--no-inherit-labels`: an explicit false last means bd does not claim.
+    An unparseable value makes bd reject the whole command, so the guard treats it as a
+    change and fails closed instead of guessing which spelling bd would have used. The
+    value-taking flags are unconditional: any occurrence moves the field.
+    """
+    move = False
+    claim = False
+    for name, value in flags:
+        if name in STATUS_ASSIGNEE_LONG_FLAGS or name in STATUS_ASSIGNEE_SHORT_FLAGS:
+            move = True
+        elif name == '--claim':
+            parsed = _parse_go_bool(value)
+            if parsed is None:
+                move = True
+            else:
+                claim = parsed
+    return move or claim
+
+
+def status_change_targets(args):
+    """The ids a status/assignee-moving invocation names, for the guard.
+
+    Covers `close`, `reopen`, and `update` with any flag that changes status or
+    assignee (`--status`/`-s` in every spelling, `--claim`, `--defer`,
+    `--assignee`/`-a`), so the record-anchor guard cannot be bypassed by the short
+    flag or by the claim/defer/assign shortcuts (kittrial-5bb.92 review item 1).
+
+    Returns ``None`` when the invocation cannot move a status or assignee, else
+    ``(command, targets)``. ``targets`` is the positional issue ids, or ``None`` when
+    the scan is ambiguous (an unknown flag) or names no issue: bd would then act on the
+    last touched issue, which the record-anchor guard cannot verify, so the caller
+    fails closed. Verbatim pinned bd 1.2.2 close/reopen flag inventories are used, so a
+    flag value is never mistaken for an issue id (kittrial-5bb.92 item 4).
+    """
+    if not isinstance(args, list) or not args:
+        return None
+    command = args[0] if isinstance(args[0], str) else None
+    if command not in ('close', 'reopen', 'update'):
+        return None
+    flags, operands, unknown = _bd_scan(args, command)
+    if command == 'update' and not _moves_status_or_assignee(flags):
+        return None
+    if unknown:
+        return (command, None)
+    targets = [token for token in operands if not token.startswith('@attachment:')]
+    return (command, targets or None)
 
 
 # Machine records are canonical UTF-8 with `\n` line endings. A client that

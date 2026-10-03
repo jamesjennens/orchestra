@@ -96,6 +96,19 @@ def all_missing(error):
     return 'no issue' in text and 'found' in text
 
 
+def evidence_is_live(record, author, allowlist):
+    """Whether one acceptance-evidence record is `live` on the reader's definition.
+
+    The stored native author must be on the deployment operator allowlist AND equal the
+    record's own `operator` field. The reader (`entry_view`), the writer's
+    prior-evidence check (`live_acceptances`) and the operator void rule
+    (`void_refusal`) all use this one rule, so they agree on which evidence holds the
+    revision's acceptance place; evidence whose author does not match its record is
+    inert on every surface (kittrial-5bb.92 review item 2).
+    """
+    return isinstance(author, str) and author == record.get('operator') and author in allowlist
+
+
 class AnchoredKind:
     """One keyed-entry kind: its names, its record parsers and its content hooks.
 
@@ -157,6 +170,7 @@ class AnchoredKind:
             acceptance_evidence=lambda bound, task, revision, record, actor: self.acceptance_evidence(
                 bound, task, revision, record, actor),
             existing_acceptances=self.existing_acceptances,
+            live_acceptances=self.live_acceptances,
             revision_comment=self.entry_comment,
             apply_labels=self.apply_labels,
             result=self.result,
@@ -221,6 +235,28 @@ class AnchoredKind:
         return core.existing_ledger(row, self.acceptance_prefix, self.parse_acceptance, self.noun, 'acceptance',
                                     'revision', belongs=lambda record, row: record['id'] == row.get('id')
                                     and self.key_label(record['key']) in self.key_labels(row))
+
+    def live_acceptances(self, row, operators):
+        """The acceptance ledger the writer counts as prior decisions.
+
+        Only evidence whose stored native author is a live configured operator AND
+        equals the record's own `operator` counts, exactly as `entry_view` selects the
+        accepted revision. `operators is None` keeps the raw ledger, for direct
+        library callers. A contributor-planted acceptance (or one an operator wrote
+        before being removed) is inert on every read, so it must not make the
+        operator's own apply return 0 without writing its evidence
+        (kittrial-5bb.92 item 1, p74 5c).
+        """
+        if operators is None:
+            return self.existing_acceptances(row)
+        allowlist = configured_operators(operators)
+
+        def keep(comment, record):
+            return evidence_is_live(record, comment.get('author'), allowlist)
+
+        return core.existing_ledger(row, self.acceptance_prefix, self.parse_acceptance, self.noun, 'acceptance',
+                                    'revision', belongs=lambda record, row: record['id'] == row.get('id')
+                                    and self.key_label(record['key']) in self.key_labels(row), keep=keep)
 
     def anchor_for(self, rows, key):
         """(row, status) for a key: status is `entry`, `incomplete` or None."""
@@ -332,7 +368,7 @@ class AnchoredKind:
             return None
         return ('record', str(comment.get('id')))
 
-    def void_refusal(self, row, payload, dropped=()):
+    def void_refusal(self, row, payload, dropped=(), operators=None):
         """Why a valid void of a comment on this anchor does not apply, else None.
 
         `dropped` are the comments earlier applied voids already name. A void applies to
@@ -341,10 +377,24 @@ class AnchoredKind:
         earlier live comment already holds (a conflicting or duplicated revision or
         acceptance). The earliest holder in native order is never voided: the writer
         never writes a second holder of a place, so only the first can be the legitimate
-        record, and a void cannot itself be voided (kittrial-5bb.74 review, P2). A record
-        the entry reads is the ledger itself, so a void of it is refused: withdrawing an
-        entry is a new revision or a retirement, which keeps revision numbers monotonic
-        for the writer and for an older kit.
+        record, and a void cannot itself be voided (kittrial-5bb.74 review, P2). The
+        earliest holder is established by BOTH bd's native order and comment-id
+        (UUIDv7) order; when the two disagree the history is conflicted and no void of
+        that place applies (kittrial-5bb.92 item 2). That cross-check is a consistency
+        check, not a security boundary: a writer who can rewrite the comment id as well
+        as created_at makes the orders agree again, so it cannot close a native-write
+        hole and a repaired ledger is not proof of authorship (kittrial-5bb.92 review
+        `order-check-limits-and-rollback`). A record the entry reads is the
+        ledger itself, so a void of it is refused: withdrawing an entry is a new
+        revision or a retirement, which keeps revision numbers monotonic for the writer
+        and for an older kit.
+
+        Acceptance evidence that is not `live` on the reader's definition
+        (`evidence_is_live`: its stored native author must be a live configured operator
+        AND equal the record's own `operator`) is inert: it holds no place, so it is the
+        voidable one and the operator's own live evidence is the protected one
+        (kittrial-5bb.92 review item 2). `operators` is the deployment allowlist; None
+        keeps the raw ledger, for direct library callers.
         """
         kind = payload['target_kind']
         if not kind.startswith(self.family):
@@ -359,10 +409,35 @@ class AnchoredKind:
             return None
         holders = [comment for comment in comments if isinstance(comment.get('text'), str)
                    and recovery.claims_kind(comment['text'], kind) and self.record_slot(kind, comment, row) == slot]
+        place = ('revision %s' if slot[0] == 'revision' else 'the acceptance evidence for revision %s') % slot[1]
+        if slot[0] == 'acceptance' and operators is not None:
+            # `live` is the reader's definition (`evidence_is_live`): the stored native
+            # author is a live configured operator AND equals the record's own
+            # `operator`. An inert evidence record - a contributor plant, evidence
+            # written by a since-removed operator, or one whose `operator` field names
+            # somebody else - is not a holder of the place: a void of it applies, and it
+            # never outranks the live record (kittrial-5bb.92 review item 2).
+            allowlist = configured_operators(operators)
+            live = [comment for comment in holders
+                    if evidence_is_live(self.parse_acceptance(comment.get('text')) or {},
+                                        comment.get('author'), allowlist)]
+            if target not in live:
+                return None
+            holders = live
+        if len(holders) > 1:
+            # bd orders comments by the stored created_at, which direct SQL can rewrite; a
+            # comment id is UUIDv7, so id order is the real creation order. When the two
+            # orders disagree the history is conflicted and no void of this slot can be
+            # trusted to name the legitimate holder (kittrial-5bb.92 item 2).
+            by_id = sorted(holders, key=lambda comment: str(comment.get('id')))
+            if by_id[0] is not holders[0]:
+                return ('native comment order and comment-id order disagree about the earliest holder of %s: %s '
+                        'is first by bd order but %s is first by comment id, so the history is conflicted and no '
+                        'void of it can be trusted; repair the stored order natively'
+                        % (place, holders[0].get('id'), by_id[0].get('id')))
         if holders[0] is not target:
             return None
         if len(holders) > 1:
-            place = ('revision %s' if slot[0] == 'revision' else 'the acceptance evidence for revision %s') % slot[1]
             return ('record %s is the earliest holder of %s, so it is the only one the writer can have written; '
                     'void the later holder %s instead' % (payload['target'], place, holders[1].get('id')))
         return ('record %s is a well-formed %s record the entry reads; a void repairs a malformed, foreign or '
@@ -405,7 +480,7 @@ class AnchoredKind:
                             'configured operator' % comment_id} for comment_id in invalid]
         applied, dropped = [], set()
         for payload, comment in voids:
-            reason = self.void_refusal(row, payload, dropped)
+            reason = self.void_refusal(row, payload, dropped, operators)
             if reason is not None:
                 notes.append({'code': 'void-refused',
                               'detail': 'void record %s is not applied: %s' % (comment.get('id'), reason)})
@@ -725,7 +800,7 @@ class AnchoredKind:
         if not recovery.preserves(raw, payload):
             raise ValueError('Operator void record must preserve the exact current bytes of ' + payload['target'])
         dropped = {applied['target'] for applied, _ in self.applied_voids(row, operators)[0]}
-        reason = self.void_refusal(row, payload, dropped)
+        reason = self.void_refusal(row, payload, dropped, operators)
         if reason is not None:
             raise ValueError('Operator void refused for %s: %s' % (payload['target'], reason))
         raw = run(['comments', 'add', row['id'], recovery.PREFIX + canonical_bytes(payload).decode('utf-8'), '--json'])
@@ -1073,9 +1148,20 @@ class AnchoredKind:
                                                        % number})
                     continue
                 live = [(item, author) for item, author in evidence
-                        if author == item['operator'] and author in allowlist]
+                        if evidence_is_live(item, author, allowlist)]
                 if live:
                     chosen = (number, live[0][0])
+                    # An inert evidence record beside a live one is not silent: it holds
+                    # no place, but the reader names it (kittrial-5bb.92 review item 2).
+                    live_items = [item for item, _ in live]
+                    for item, author in evidence:
+                        if any(item is kept for kept in live_items):
+                            continue
+                        view['warnings'].append({'code': 'inert-evidence',
+                                                 'detail': 'revision %d also carries acceptance evidence written by '
+                                                           '%s, who is not on the deployment operator allowlist; it '
+                                                           'is inert and the live evidence stands'
+                                                           % (number, author or item['operator'])})
                     break
                 if inert is None:
                     inert = (number, evidence[0][1] or evidence[0][0]['operator'])

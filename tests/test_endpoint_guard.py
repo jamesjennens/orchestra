@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 try:
     import endpoint
-    from endpoint import _guard_reserved_labels, _native_labels
+    from endpoint import _guard_record_anchor_status, _guard_reserved_labels, _native_labels
 except ImportError:  # pragma: no cover - endpoint needs fcntl (POSIX)
     endpoint = None
 
@@ -249,6 +249,157 @@ class NativeLabelResolutionTests(unittest.TestCase):
             _guard_reserved_labels(self.root, self.path,
                                    ['create', 'x', '--parent', 'plain'],
                                    'worker')
+
+    def _status_run(self, labels, comments, calls=None):
+        """Stub the ONE read `_guard_record_anchor_status` makes per call.
+
+        `bd show ID... --json --include-comments` returns labels and comments
+        together, so the whole guard is one native read however many ids the
+        invocation names (kittrial-5bb.92 review item 1). One row is returned per
+        named token, exactly as bd resolves each requested id.
+        """
+        def run(argv, **kwargs):
+            if calls is not None:
+                calls.append(list(argv))
+            if 'show' not in argv:
+                raise AssertionError(argv)
+            tokens = [a for a in argv[argv.index('show') + 1:] if not a.startswith('--')]
+            return _Proc(0, json.dumps([{'id': token, 'labels': labels, 'comments': comments}
+                                        for token in tokens]))
+        return run
+
+    def test_status_guard_refuses_close_and_reopen_of_a_record_anchor(self):
+        # kittrial-5bb.92 item 4: a record anchor is created closed on purpose and is
+        # hidden from work; the raw endpoint must not reopen or close it.
+        comments = [{'id': 'c-1', 'text': 'Kind: reference-entry-v1\n{"bad":1}', 'author': 'mallory',
+                     'created_at': '2026-10-01T00:00:00Z'}]
+        for argv in (['close', 'pp-3q2', '--reason', 'done'],
+                     ['reopen', 'pp-3q2'],
+                     ['update', 'pp-3q2', '--status', 'open']):
+            with self.subTest(argv=argv), mock.patch.object(
+                    endpoint.subprocess, 'run', self._status_run(['reference'], comments)):
+                with self.assertRaisesRegex(ValueError, 'record anchor'):
+                    _guard_record_anchor_status(self.root, self.path, argv, 'worker')
+
+    def test_status_guard_refuses_every_status_and_assignee_spelling(self):
+        # kittrial-5bb.92 review item 1: the short flag, --claim, --defer and
+        # --assignee each returned 0 and moved the anchor before this.
+        comments = [{'id': 'c-1', 'text': 'Kind: capability-entry-v1\n{"bad":1}', 'author': 'mallory',
+                     'created_at': '2026-10-01T00:00:00Z'}]
+        for argv in (['update', 'pp-3q2', '-s', 'open'],
+                     ['update', 'pp-3q2', '-sopen'],
+                     ['update', 'pp-3q2', '-s=open'],
+                     ['update', '-s', 'open', 'pp-3q2'],
+                     ['update', 'pp-3q2', 'task-9', '-s', 'in_progress'],
+                     ['update', 'pp-3q2', '--claim'],
+                     ['update', 'pp-3q2', '--defer', '+1d'],
+                     ['update', 'pp-3q2', '--assignee', 'bob'],
+                     ['update', 'pp-3q2', '-a', 'bob']):
+            with self.subTest(argv=argv), mock.patch.object(
+                    endpoint.subprocess, 'run', self._status_run(['capability'], comments)):
+                with self.assertRaisesRegex(ValueError, 'record anchor'):
+                    _guard_record_anchor_status(self.root, self.path, argv, 'worker')
+
+    def test_status_guard_allows_a_requirement_record_anchor(self):
+        # kittrial-5bb.92 review item 1 (coordinator correction): requirement/brd-section
+        # records stay visible as work items, so the guard must NOT freeze them - they
+        # behave exactly as on main. Only the reference/proposal/settings/capability
+        # anchors stay guarded.
+        comments = [{'id': 'c-1', 'text': 'Kind: requirement-revision-v1\n{"id": "pp-3q2"}',
+                     'author': 'ops-james', 'created_at': '2026-10-01T00:00:00Z'}]
+        for labels in (['requirement', 'requirement:draft'],
+                       ['requirement', 'requirement:accepted'],
+                       ['brd-section', 'requirement:accepted']):
+            for argv in (['close', 'pp-3q2', '--reason', 'done'],
+                         ['reopen', 'pp-3q2'],
+                         ['update', 'pp-3q2', '-s', 'open'],
+                         ['update', 'pp-3q2', '--claim'],
+                         ['update', 'pp-3q2', '--assignee', 'lane-a'],
+                         ['update', 'pp-3q2', '--defer', '+1d']):
+                with self.subTest(labels=labels, argv=argv), mock.patch.object(
+                        endpoint.subprocess, 'run', self._status_run(labels, comments)):
+                    self.assertIsNone(
+                        _guard_record_anchor_status(self.root, self.path, argv, 'worker'))
+
+    def test_an_accepted_requirement_record_is_claimed_and_closed_through_the_endpoint(self):
+        # kittrial-5bb.92 review item 1: on jjbp six requirement records are in_progress
+        # and assigned to worker lanes (three accepted). A contributor must still be able
+        # to claim, close, reopen, reassign and defer them through the endpoint, so each
+        # one reaches the native write instead of being refused by the status guard.
+        (self.path / '.beads').mkdir()
+        (self.path / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+        rows = [{'id': 'pp-req.1', 'status': 'in_progress', 'assignee': 'lane-a',
+                 'labels': ['requirement', 'requirement:accepted'],
+                 'comments': [{'id': 'c-1', 'author': 'ops-james',
+                               'created_at': '2026-10-01T00:00:00Z',
+                               'text': 'Kind: requirement-revision-v1\n{"id": "pp-req.1"}'},
+                              {'id': 'c-2', 'author': 'ops-james',
+                               'created_at': '2026-10-02T00:00:00Z',
+                               'text': 'Kind: requirement-acceptance-v1\n{"id": "pp-req.1"}'}]}]
+        writes = []
+
+        def run(argv, **kwargs):
+            if 'show' in argv:
+                tokens = [token for token in argv[argv.index('show') + 1:]
+                          if not token.startswith('--')]
+                return _Proc(0, json.dumps([row for row in rows if row['id'] in tokens]))
+            writes.append(list(argv))
+            return _Proc(0, json.dumps({'ok': True}))
+
+        for args in (['update', 'pp-req.1', '--claim'],
+                     ['close', 'pp-req.1', '--reason', 'done'],
+                     ['reopen', 'pp-req.1'],
+                     ['update', 'pp-req.1', '--assignee', 'lane-b'],
+                     ['update', 'pp-req.1', '--defer', '+1d']):
+            with self.subTest(args=args), mock.patch.object(endpoint.subprocess, 'run', run):
+                answer = endpoint.execute(self.root, {'project': 'pp', 'actor': 'worker',
+                                                      'action': 'bd', 'args': args})
+                self.assertEqual(answer['returncode'], 0, answer.get('stderr'))
+        self.assertEqual(len(writes), 5)
+
+    def test_status_guard_reads_every_target_in_one_native_read(self):
+        # kittrial-5bb.92 review item 1: keep the read-before-write to one read per
+        # call, whatever the number of named ids.
+        calls = []
+        comments = [{'id': 'c-1', 'text': 'an ordinary note', 'author': 'worker'}]
+        argv = ['close', 'pp-3q2', 'pp-4a1', 'pp-5b2', 'pp-6c3', 'pp-7d4', '--reason', 'done']
+        with mock.patch.object(endpoint.subprocess, 'run',
+                               self._status_run(['plain'], comments, calls=calls)):
+            _guard_record_anchor_status(self.root, self.path, argv, 'worker')
+        self.assertEqual(len(calls), 1)
+        self.assertIn('--include-comments', calls[0])
+
+    def test_status_guard_allows_an_ordinary_task(self):
+        comments = [{'id': 'c-1', 'text': 'an ordinary note', 'author': 'worker'}]
+        for argv in (['close', 'pp-3q2', '--reason', 'done'],
+                     ['reopen', 'pp-3q2'],
+                     ['update', 'pp-3q2', '-s', 'open'],
+                     ['update', 'pp-3q2', '--claim'],
+                     ['update', 'pp-3q2', '--defer', '+1d'],
+                     ['update', 'pp-3q2', '--assignee', 'bob']):
+            with self.subTest(argv=argv), mock.patch.object(
+                    endpoint.subprocess, 'run', self._status_run(['plain'], comments)):
+                _guard_record_anchor_status(self.root, self.path, argv, 'worker')
+
+    def test_status_guard_makes_no_read_when_no_status_or_assignee_moves(self):
+        # The flag scan itself is free: an ordinary title/description/label write
+        # must not pay for a status guard read.
+        with mock.patch.object(endpoint.subprocess, 'run') as run:
+            for argv in (['update', 'pp-3q2', '--title', 'x'],
+                         ['update', 'pp-3q2', '--description', 'text'],
+                         ['update', 'pp-3q2', '--add-label', 'bug'],
+                         ['update', 'pp-3q2', '--claim=false']):
+                with self.subTest(argv=argv):
+                    _guard_record_anchor_status(self.root, self.path, argv, 'worker')
+            run.assert_not_called()
+
+    def test_status_guard_fails_closed_without_a_named_target(self):
+        for argv in (['close', '--json'], ['close', 'pp-3q2', '--mystery'],
+                     ['update', '-s', 'open'], ['update', '--claim'],
+                     ['update', '--defer', '+1d'], ['update', '--assignee', 'bob']):
+            with self.subTest(argv=argv), mock.patch.object(endpoint.subprocess, 'run', _rows_run([])):
+                with self.assertRaises(ValueError):
+                    _guard_record_anchor_status(self.root, self.path, argv, 'worker')
 
     def test_guard_refuses_unresolved_token_before_any_read_use(self):
         rows = [{'id': 'pp-other', 'labels': []}]
