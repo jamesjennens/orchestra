@@ -163,7 +163,7 @@ def prepare(root, db_port):
     root.mkdir(parents=True, exist_ok=True)
     root.chmod(0o700)
     admin.install_binaries(root, asset_dir=assets)
-    for name in ('data', 'projects', 'backups', 'config', 'dolt-home'):
+    for name in ('data', 'projects', 'backups', 'config', 'dolt-home', 'home'):
         (root/name).mkdir(exist_ok=True)
     import secrets
     cfg = {'schema': 1, 'port': db_port, 'unit': 'office-foreground',

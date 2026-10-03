@@ -412,8 +412,22 @@ def atomic_private_write(path, text):
 
 
 def environment(root):
+    """Environment for the runtime's own binaries; every path stays under ``root``.
+
+    ``HOME`` is scoped here as well as ``XDG_CONFIG_HOME``. bd 1.2.2 resolves its
+    user-level config with ``UserConfigYamlPath()``: it prefers
+    ``$HOME/.config/bd/config.yaml`` and consults ``os.UserConfigDir()``
+    (``$XDG_CONFIG_HOME``) only when that file already exists, so a normal ``HOME``
+    lets every bd command - including ``bd metrics off`` in ``prepare`` - create or
+    rewrite ``~/.config/bd/config.yaml`` outside the runtime
+    (``internal/config/yaml_config.go``, ``internal/metrics/userconfig.go``).
+    Scoping ``HOME`` keeps that write, and bd's event data, inside the runtime so
+    several runtimes can share a login user. Dolt's own global config is already
+    pinned by ``DOLT_ROOT_PATH``.
+    """
     env=os.environ.copy()
-    env.update({'PATH':str(root/'bin')+os.pathsep+env.get('PATH',''),
+    env.update({'HOME':str(root/'home'),
+                'PATH':str(root/'bin')+os.pathsep+env.get('PATH',''),
                 'DOLT_ROOT_PATH':str(root/'dolt-home'),'XDG_CONFIG_HOME':str(root/'config'),
                 'BEADS_DOLT_PASSWORD':config(root)['password'],'DOLT_CLI_PASSWORD':config(root)['password'],
                 'BD_NON_INTERACTIVE':'1','BEADS_NO_DAEMON':'1'})
@@ -662,7 +676,7 @@ def install(root,port,unit):
     unit_path=Path.home()/'.config/systemd/user'/unit
     if unit_path.exists(): raise ValueError('Refusing to replace an existing service unit')
     install_binaries(root)
-    for name in ('data','projects','backups','config','dolt-home'):(root/name).mkdir(exist_ok=True)
+    for name in ('data','projects','backups','config','dolt-home','home'):(root/name).mkdir(exist_ok=True)
     cfg={'port':port,'unit':unit,'password':secrets.token_hex(24),'schema':1}
     fd=os.open(marker,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
     with os.fdopen(fd,'w') as f: json.dump(cfg,f)

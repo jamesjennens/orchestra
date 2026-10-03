@@ -160,6 +160,59 @@ else:
         with self.assertRaisesRegex(ValueError, 'Unknown'):
             service_config(self.config)
 
+    def test_prepare_keeps_bd_config_inside_the_runtime(self):
+        """prepare must not write under the login user's HOME.
+
+        bd 1.2.2 resolves its user config as ``$HOME/.config/bd/config.yaml`` and
+        creates it on every command, consulting ``XDG_CONFIG_HOME`` only when that
+        path already holds a file (``internal/config/yaml_config.go``
+        ``UserConfigYamlPath``). The fake bd below mirrors that write, so this
+        fails if prepare lets bd see the login user's HOME.
+        """
+        from office_service import prepare
+        runtime = self.base/'prepare-runtime'
+        user_home = self.base/'user-home'
+        user_home.mkdir()
+        calls = runtime/'bd-calls.log'
+
+        def fake_install(root, asset_dir=None):
+            binaries = root/'bin'
+            binaries.mkdir(parents=True, exist_ok=True)
+            bd = binaries/'bd'
+            bd.write_text('''#!__PYTHON__
+import os, sys
+from pathlib import Path
+with open(os.environ['FAKE_BD_LOG'], 'a') as stream:
+    stream.write('HOME=%s ARGS=%s\\n' % (os.environ.get('HOME'), ' '.join(sys.argv[1:])))
+home = os.environ.get('HOME')
+target = Path(home) / '.config' / 'bd' / 'config.yaml'
+target.parent.mkdir(parents=True, exist_ok=True)
+target.write_text('metrics:\\n  disabled: true\\n')
+'''.replace('__PYTHON__', sys.executable), encoding='utf-8')
+            bd.chmod(0o755)
+            dolt = binaries/'dolt'
+            dolt.write_text('#!__PYTHON__\nimport sys\nsys.exit(0)\n'.replace(
+                '__PYTHON__', sys.executable), encoding='utf-8')
+            dolt.chmod(0o755)
+
+        def snapshot():
+            return {str(path.relative_to(self.base)) for path in self.base.rglob('*')
+                    if path.is_file()}
+
+        with mock.patch.dict(os.environ, {'HOME': str(user_home),
+                                          'FAKE_BD_LOG': str(calls)}), \
+                mock.patch('office_service.admin.install_binaries', side_effect=fake_install):
+            before = snapshot()
+            prepare(runtime, self.free_port())
+            outside = [name for name in snapshot()-before
+                       if not name.startswith('prepare-runtime/')]
+
+        self.assertEqual(outside, [], 'prepare wrote outside the runtime: %s' % outside)
+        self.assertTrue((runtime/'home'/'.config'/'bd'/'config.yaml').is_file())
+        log = calls.read_text(encoding='utf-8')
+        self.assertIn('HOME=%s' % (runtime/'home'), log)
+        self.assertNotIn(str(user_home), log)
+
     def test_existing_log_directory_is_left_undisturbed(self):
         self.logs.mkdir(mode=0o700)
         os.chmod(self.logs, 0o755)
