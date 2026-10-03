@@ -90,6 +90,7 @@ export function createApi(transport) {
     projects: () => call('GET', '/v1/projects'),
     project: (pid) => call('GET', `/v1/projects/${pid}`),
     createProject: (name) => mutate('POST', '/v1/projects', { name }),
+    registerProject: (projectId, name) => mutate('POST', '/v1/projects', name ? { project_id: projectId, name } : { project_id: projectId }),
     archiveProject: (pid) => mutate('POST', `/v1/projects/${pid}/archive`, {}),
     members: (pid) => call('GET', `/v1/projects/${pid}/members`, { params: { limit: 100 } }),
     setMember: (pid, uid, role) => mutate('PUT', `/v1/projects/${pid}/members/${uid}`, { role }),
