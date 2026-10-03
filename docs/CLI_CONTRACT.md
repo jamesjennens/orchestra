@@ -1135,7 +1135,10 @@ action unless the HTTP service launched the endpoint. Declare your own session a
   10), `inert_dispositions` and `warnings`.
 - **`list`** returns `{total, items, next_offset, coverage}`, oldest first. Filters:
   `--state`, `--target` (a requirement key or an area), `--submitter`; `--limit`
-  1..100 (default 20) and `--offset`.
+  1..100 (default 20) and `--offset`. Each item, and `get`, carries
+  `incorporated_unaccepted`: the reader's own judgement that an incorporated proposal
+  is not the accepted requirement, so a caller never derives it from
+  `acceptance_state`.
 - **`mine --submitter IDENTITY`** is the same list for one person, with the full
   newest disposition, `next_action` and `linked_requirement`. A session actor is not
   a durable identity, so the identity is named.
@@ -1185,7 +1188,8 @@ action unless the HTTP service launched the endpoint. Declare your own session a
   (`verified` or `unverified`), so an unmapped contributor sees their own
   submissions. Through the HTTP service the same read lists verified proposals only
   and adds `unverified_omitted`: there the submitter is an authenticated account.
-  `list` and `mine` take `--order oldest|newest` (default oldest).
+  `list` and `mine` take `--order oldest|newest` (default oldest). `get` returns
+  `deciders`, the configured owner deciders.
 - **Help is a command.** `proposal --help` and `proposal list --help` return the help
   payload. `--help` in an option's value position is that option's bad value.
 - **`linked_requirement`** is `{id, revision, sha256, acceptance_state,

@@ -596,11 +596,11 @@ class ReviewFixCase(ProposalHarness):
         # A cursor the route did not issue is refused, not answered with an empty page.
         import base64
         forged = json.loads(base64.urlsafe_b64decode(first['next_cursor'] + '=' * (-len(first['next_cursor']) % 4)))
-        for offset in (4, 5, 99, 100, 10 ** 9):
+        for offset in (4, 5, 99, 100, 10 ** 9, True, '2', 1.0, None, -1):
             cursor = base64.urlsafe_b64encode(json.dumps(dict(forged, o=offset)).encode()).decode().rstrip('=')
             with self.subTest(offset=offset):
                 answer = self.request('GET', '/v1/me/contributions?limit=2&cursor=' + cursor, token=self.token('alex'))
-                self.assertEqual(answer.status, 200 if offset < 5 else 409, answer.data)
+                self.assertEqual(answer.status, 200 if type(offset) is int and offset == 4 else 409, answer.data)
         # A cursor belongs to its query and its account.
         self.assertEqual(409, self.request('GET', '/v1/me/contributions?limit=3&cursor=' + first['next_cursor'],
                                            token=self.token('alex')).status)
@@ -648,6 +648,13 @@ class ReviewFixCase(ProposalHarness):
                             {'0': {'flag': '--body-file', 'text': ''}})
         self.assertEqual(answer['returncode'], 2, answer)
         self.assertIn('An attached description is empty', answer['stderr'])
+        # On create, a blank description is no description (kittrial-5bb.70 A review, P3).
+        for index, text in enumerate(('   ', '\n', '')):
+            made = self.request('POST', base, {'title': 'Blank description %d' % index, 'description': text},
+                                token=self.token('blair'), key='blank-description-%d' % index)
+            self.assertEqual(201, made.status, made.data)
+            self.assertEqual(self.request('GET', '%s/%s' % (base, made.data['id']),
+                                          token=self.token('blair')).data.get('description') or '', '')
         # A task that already has such a title stays readable.
         path = self.canonical_root / 'canonical.json'
         state = json.loads(path.read_text(encoding='utf-8'))
@@ -669,6 +676,210 @@ class ReviewFixCase(ProposalHarness):
             with self.subTest(actor=actor[:8]):
                 self.assertEqual(201, self.request('POST', url, {'label': 'w', 'actor': actor},
                                                    token=self.token('blair')).status)
+
+
+class ScreenDataCase(ProposalHarness):
+    """What the web screens (delivery B) read from the routes."""
+
+    def test_the_views_carry_names_and_the_readers_own_flag(self):
+        key = self.submit().data['key']
+        self.dispose(key, 'under-review')
+        self.dispose(key, 'escalated-to-owner', escalation={
+            'question': 'Replace the baseline?', 'owner_identity': 'account:' + self.uid('dana'), 'due_by': None})
+        view = self.get(key)
+        self.assertEqual([entry['actor_name'] for entry in view['timeline']], ['blair', 'blair'])
+        self.assertEqual((view['disposition']['actor'], view['disposition']['escalation']['owner_name']),
+                         (self.uid('blair'), 'dana'))
+        self.assertIs(view['incorporated_unaccepted'], False)
+        row = self.request('GET', self.base(), token=self.token('blair')).data['items'][0]
+        self.assertEqual((row['incorporated_unaccepted'], row['submitter_name'], row['mine']), (False, 'alex', False))
+        # A viewer still learns who decides, never the question.
+        seen = self.request('GET', '%s/%s' % (self.base(), key), token=self.token('casey')).data['disposition']
+        self.assertEqual((seen['escalation']['owner_name'], seen['escalation']['question'], seen['withheld']),
+                         ('dana', None, True))
+
+
+class WebScreenTests(unittest.TestCase):
+    """The proposal screens exist and follow the rules (static checks; the browser
+    behaviour was exercised by hand against a local service, see the evidence)."""
+
+    def setUp(self):
+        web = KIT / 'web' / 'js'
+        self.proposals = (web / 'views' / 'proposals.js').read_text(encoding='utf-8')
+        self.project = (web / 'views' / 'project.js').read_text(encoding='utf-8')
+        self.work = (web / 'views' / 'work.js').read_text(encoding='utf-8')
+        self.api = (web / 'api.js').read_text(encoding='utf-8')
+        self.app = (web / 'app.js').read_text(encoding='utf-8')
+
+    def test_the_api_never_sends_a_submitter(self):
+        for text in ("proposals: (pid, params) => call('GET', `/v1/projects/${pid}/proposals`, { params })",
+                     "submitProposal: (pid, body) => mutate('POST', `/v1/projects/${pid}/proposals`, body)",
+                     "disposeProposal: (pid, key, body) => mutate('POST', `/v1/projects/${pid}/proposals/${key}/dispositions`, body)",
+                     "myContributions: (params) => call('GET', '/v1/me/contributions', { params })"):
+            self.assertIn(text, self.api)
+        # The two request bodies the screens build name only content fields.
+        for start in ('const body = { target, text:', 'const body = { key: view.key, revision:'):
+            body = self.proposals[self.proposals.index(start):]
+            body = body[:body.index('};')]
+            self.assertNotIn('submitter', body)
+            self.assertNotIn('actor', body)
+
+    def test_untrusted_text_is_never_markup_and_links_are_https_only(self):
+        for forbidden in ('innerHTML', 'outerHTML', 'insertAdjacentHTML', 'document.write', 'eval('):
+            self.assertNotIn(forbidden, self.proposals)
+        self.assertIn("url.protocol === 'https:'", self.proposals)
+        self.assertIn("rel: 'noopener noreferrer'", self.proposals)
+        self.assertIn('data.untrusted', self.proposals)            # the server's framing line is shown
+        # Revision 2 of delivery A: the identity-broken warning is shown on the detail, as text,
+        # and the contributions panel says when it shows only the newest page.
+        self.assertIn("w.code === 'identity-broken'", self.proposals)
+        self.assertIn("String(broken.detail || '')", self.proposals)      # a text node, never markup
+        self.assertIn("ctx.api.myContributions({ limit: PAGE, cursor })", self.proposals)   # it pages
+        # Review 01a103cc: an evidence link with userinfo is inert; a person: identity keeps its
+        # kind; a key is validated before it reaches a request path.
+        self.assertIn('!url.username && !url.password', self.proposals)
+        self.assertIn("(a named person, not a web account)", self.proposals)
+        self.assertIn('const KEY = /^p-[0-9a-f]{12}$/;', self.proposals)
+        self.assertIn('if (!validKey(key)) {', self.proposals)
+
+    def test_the_reviews_page_shows_the_queue_the_detail_and_the_form(self):
+        self.assertIn("import { queuePanel, detailPanel, proposeForm, myStrip } from './proposals.js';", self.project)
+        self.assertIn("ctx.query.get('proposal')", self.project)
+        self.assertIn("ctx.query.get('propose')", self.project)
+        # A route may carry a query; the path is what is matched.
+        self.assertIn("const [path, search] = route.split('?');", self.app)
+        self.assertIn('ctx.query = new URLSearchParams(search', self.app)
+        self.assertIn('matchRoute(path)', self.app)
+        for group in ("'submitted'", "'under-review'", "'needs-info'", "'escalated-to-owner'", "'approved'"):
+            self.assertIn(group, self.proposals[self.proposals.index('const GROUPS'):self.proposals.index('const TRANSITIONS')])
+        self.assertIn('Incorporated, awaiting acceptance', self.proposals)
+        # The awaiting-acceptance group is the server's own flag; nothing is compared here.
+        self.assertIn('p.incorporated_unaccepted', self.proposals)
+        self.assertNotIn("acceptance_state !== 'accepted'", self.proposals)
+
+    def test_an_older_server_degrades_and_my_contributions_is_on_my_work(self):
+        # Only a server without the routes is "not available"; a project 404 is "not found".
+        self.assertIn("error.status === 404 && /No such operation/i.test(error.message || '')", self.proposals)
+        self.assertIn('Not available on this server', self.proposals)
+        self.assertIn("import { myContributionsPanel } from './proposals.js';", self.work)
+        home = self.work[self.work.index('export async function home'):self.work.index('export function agentPromptPanel')]
+        self.assertLess(home.index('agentPromptPanel(ctx, data)'), home.index('contributions,'))
+        self.assertLess(home.index('contributions,'), home.index('agentsPanel,'))
+
+    def test_the_forms_follow_the_no_self_rules(self):
+        self.assertIn('view.can_triage && !view.mine && !escalatedByMe', self.proposals)
+        self.assertIn('You escalated this proposal: a different owner has to decide it.', self.proposals)
+        self.assertIn('This is your own proposal: another owner has to triage it.', self.proposals)
+        self.assertIn("m.user_id !== ctx.me.id", self.proposals)   # the escalator is not offered as the decider
+
+
+class ScreenBehaviourCase(ProposalHarness):
+    """web/js/views/proposals.js run under Node, with a small DOM shim, against this real
+    service (review 01a103cc). The three P2s and the small items that have behaviour."""
+
+    def seed(self, count, who='alex'):
+        """`count` proposals written as the web service writes them (same module, same
+        authority context), without one HTTP round trip each."""
+        uid = self.uid(who)
+        run = stub_module().Canonical(self.canonical_root, self.project, actor=uid).run
+        http = pr.HttpContext(uid, 'session', pr.CAP_PROPOSALS)
+        for index in range(count):
+            pr.apply_native({'schema_version': 1, 'operation_id': 'seed-%04d' % index, 'operation': 'submit',
+                             'submitter': 'account:' + uid, 'target': {'kind': 'requirement-new'},
+                             'text': 'Seeded proposal number %d.' % index, 'rationale': None, 'evidence': [],
+                             'attachments': []}, uid, run, self.canonical_root / self.project, [], http=http)
+
+    def test_the_screens_under_node_against_the_real_service(self):
+        import shutil
+        import time
+        from test_http_web import run_node_module
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node is not installed; the screen module is checked statically above')
+        self.seed(104)
+        time.sleep(1.1)                                    # the next ones are strictly newer
+        escalated = self.submit(text='Escalated to dana.').data['key']
+        self.dispose(escalated, 'under-review')
+        self.dispose(escalated, 'escalated-to-owner', escalation={
+            'question': 'Replace the baseline?', 'owner_identity': 'account:' + self.uid('dana'), 'due_by': None})
+        time.sleep(1.1)
+        fresh = self.submit(text='The newest proposal of all.').data['key']
+        erin = self.create_account(self.admin, 'erin', 'erin-password-1')          # not a member of the project
+        self.people['erin'] = (self.login('erin', 'erin-password-1')[0], erin)
+        web = KIT / 'web' / 'js'
+        people = ['%s=%s=%s' % (name, token, uid) for name, (token, uid) in self.people.items()]
+        done = run_node_module(self, node, 'await import(process.argv[1])',
+                               (KIT / 'tests' / 'web_proposal_screens.mjs').as_uri(), (web / 'api.js').as_uri(),
+                               (web / 'views' / 'proposals.js').as_uri(), 'http://127.0.0.1:%d' % self.port,
+                               self.project, escalated, fresh, *people)
+        self.assertEqual(0, done.returncode, done.stderr[-3000:])
+        seen = json.loads(done.stdout.strip().splitlines()[-1])
+
+        # P2 queue-shows-oldest-100: 105 open proposals (104 submitted + 1 submitted newest; one
+        # escalated). The newest is on the first page and paging reaches every row.
+        queue = seen['queue']
+        self.assertTrue(queue['hasNewest'], queue['text'])
+        self.assertEqual(queue['count'], 'Requirement proposals 106')
+        self.assertEqual((queue['rows'], queue['moreLeft']), ([51, 101, 106], 0))
+        self.assertIn('You have 106 requirement proposals here', seen['strip'])
+
+        # P2 uncertain-submit-retry-duplicates: the second press reuses the key; one proposal.
+        retry = seen['retry']
+        self.assertIn('cannot create a duplicate', retry['first']['message'])
+        self.assertEqual(retry['first']['went'], 0)                       # the page stayed on the form
+        self.assertEqual(len(retry['keys']), 2)
+        self.assertEqual(retry['keys'][0], retry['keys'][1])
+        self.assertTrue(retry['keys'][0])
+        self.assertEqual(retry['added'], 1)
+        self.assertEqual(len(retry['went']), 1)                           # then it went to the one proposal
+        self.assertNotEqual(retry['otherKey'], retry['keys'][0])          # other content, another key
+
+        # P2 rule-refusals-show-no-reason.
+        self.assertIn('Unknown decision alpha-nope', seen['refusal']['message'])
+        self.assertNotEqual(seen['refusal']['message'], 'Canonical command rejected the request')
+        self.assertEqual(seen['refusal']['rendered'], 0)
+        self.assertIn('Reload the page to see the current version', seen['stale']['message'])
+
+        # The smaller ones.
+        self.assertEqual(seen['badKey']['requests'], 0)
+        self.assertIn('That is not a proposal key', seen['badKey']['text'])
+        self.assertEqual(seen['lost']['lost'], 1)
+        self.assertNotIn('Not available on this server', seen['outsider'])
+        self.assertIn('Not found', seen['outsider'])
+
+    def test_the_queue_reads_newest_first_by_state_and_counts_the_callers_own(self):
+        # The server side of the same finding, which runs where node is not installed.
+        self.seed(104)
+        import time
+        time.sleep(1.1)
+        newest = self.submit(text='The newest proposal of all.').data['key']
+        mine = self.submit('blair', text="Blair's own.").data['key']
+        page = self.request('GET', self.base() + '?state=submitted&order=newest&limit=50', token=self.token('blair')).data
+        self.assertEqual((page['total'], len(page['items'])), (106, 50))
+        self.assertEqual({item['key'] for item in page['items'][:2]}, {newest, mine})
+        oldest = self.request('GET', self.base() + '?state=submitted&limit=50', token=self.token('blair')).data
+        self.assertNotIn(newest, [item['key'] for item in oldest['items']])           # the default order is unchanged
+        keys, cursor = [], None
+        for _ in range(4):
+            url = self.base() + '?state=submitted&order=newest&limit=50' + ('&cursor=' + cursor if cursor else '')
+            data = self.request('GET', url, token=self.token('blair')).data
+            keys += [item['key'] for item in data['items']]
+            cursor = data['next_cursor']
+            if not cursor:
+                break
+        self.assertEqual((len(keys), len(set(keys))), (106, 106))
+        own = self.request('GET', self.base() + '?mine=1&limit=1', token=self.token('alex')).data
+        self.assertEqual(own['total'], 105)
+        self.assertEqual(self.request('GET', self.base() + '?mine=1&limit=1', token=self.token('blair')).data['total'], 1)
+        for query in ('order=sideways', 'order=--help', 'mine=2', 'mine=account:x'):
+            self.assertEqual(422, self.request('GET', self.base() + '?' + query, token=self.token('blair')).status, query)
+        # The detail carries the configured deciders (none here), for the "Who decides" list.
+        self.assertEqual(self.get(newest)['deciders'], [])
+        (self.canonical_root / 'deployment.private.json').write_text(json.dumps({'operators': ['ops']}),
+                                                                      encoding='utf-8')
+        pr.change_settings({'add_decider': 'person:owner'}, 'ops',
+                           stub_module().Canonical(self.canonical_root, self.project, actor='ops').run, ['ops'])
+        self.assertEqual(self.get(newest)['deciders'], ['person:owner'])
 
 
 class InProcessCase(Harness):

@@ -66,19 +66,30 @@ export function loading(label = 'Loading…') {
 }
 
 // Explains an API failure in the user's terms, with the server request id for support.
+// The rule a refusal names. The server puts it in `detail` (one line, as text); a stale
+// read is told to reload, in the page's words rather than a command's.
+const STALE = /re-read|has moved on|does not match revision|changed by someone else/i;
+function reason(error, fallback) {
+  const message = error.message || fallback;
+  let detail = typeof error.detail === 'string' ? error.detail.replace(/^[A-Za-z]*Error: /, '').trim() : '';
+  if (!detail) return message;
+  if (STALE.test(detail)) return 'Someone else changed this while you had it open. Reload the page to see the current version, then try again. (' + detail + ')';
+  return /^Canonical command rejected the request$/.test(message) ? detail : message + ': ' + detail;
+}
+
 export function describe(error) {
   if (!error) return 'Something went wrong.';
   switch (error.status) {
-    case 0: return 'The server could not be reached. Your change may not have been saved — retry to check.';
+    case 0: return 'The server could not be reached. Your change may not have been saved. Press the same button again without changing anything: the same request is sent again, so it cannot create a duplicate.';
     case 401: return 'Your session has ended. Sign in again to continue.';
     case 403: return error.message || 'You do not have permission to do that.';
     case 404: return 'This item does not exist, or you do not have access to it.';
-    case 409: return error.message || 'This was changed by someone else. Reload to see the current version.';
+    case 409: return reason(error, 'This was changed by someone else. Reload to see the current version.');
     case 413: return 'That is too large to send.';
-    case 422: return error.message || 'Some details are not valid.';
+    case 422: return reason(error, 'Some details are not valid.');
     case 429: return 'Too many attempts. Wait a few minutes and try again.';
     case 501: return 'This server does not support that yet.';
-    default: return error.status >= 500 ? 'The server could not confirm whether this was saved. Retry — it is safe and will not create a duplicate.' : (error.message || 'Request failed.');
+    default: return error.status >= 500 ? 'The server could not confirm whether this was saved. Press the same button again without changing anything: the same request is sent again, so it cannot create a duplicate.' : (error.message || 'Request failed.');
   }
 }
 

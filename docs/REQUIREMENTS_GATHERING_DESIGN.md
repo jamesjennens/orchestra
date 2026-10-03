@@ -1,7 +1,6 @@
 # Contributed requirement proposals - design proposal
 
-Status: **revision 6. Slice 0, slice 1a and the routes of slice 1b are implemented;
-the web screens and the later slices are not.** Apart
+Status: **revision 6. Slices 0, 1a and 1b are implemented; slices 2 and 3 are not.** Apart
 from the revision 5 and 6 notes, this document describes the design as accepted and
 changes no code. It proposes a record kind, a lifecycle and authority model, a
 coordinator input queue, an escalation path, attribution and statistics, a
@@ -215,10 +214,20 @@ kit does**.
    `linked_requirement.acceptance_state` as the reader derives it and count nothing
    themselves, so a new live value (kittrial-5bb.87) needs no route change.
 
-Slices 0 and 1a are implemented by `proposal_records.py`, and the routes of slice 1b
-by `http_service.py` on the endpoint backend. The web screens of slice 1b and slices
-2 and 3 are not: there is no web screen, no statistics and no scoreboard in the kit.
-Every remaining change named below is a follow-up implementation slice (section 11).
+8. **The web screens, as built (delivery B).**
+   - The detail panel opens at `/p/{pid}/reviews?proposal=<key>` and the form at
+     `?propose=1`; the router matches the path and hands the query to the view (5.3).
+   - "Propose a requirement" is a button on the Reviews page. The project page carries a
+     one-line strip that links there, not a second copy of the form (8.6).
+   - "Incorporated, awaiting acceptance" lists the proposals the reader itself flags
+     (`incorporated_unaccepted` on each item); the page compares no acceptance value.
+   - Still to do, beyond what item 6 lists: creating the decision issue from the web, so
+     an owner's yes or no becomes a pure web action.
+
+Slices 0 and 1a are implemented by `proposal_records.py`, and slice 1b by
+`http_service.py` on the endpoint backend and `web/js/views/proposals.js`. Slices 2 and
+3 are not: there are no statistics and no scoreboard in the kit. Every remaining change
+named below is a follow-up implementation slice (section 11).
 
 The design is written against `main`
 `8e1f9ec6f4d818de8983f59f80aa896111a99712`, the base commit of this task. Every

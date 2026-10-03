@@ -251,8 +251,8 @@ The routes exist on the endpoint backend; the in-process backend answers 501.
 | Route | Who | What |
 | --- | --- | --- |
 | `POST /v1/projects/{id}/proposals` | `proposals.write`: contributors, owners, and an agent credential with the `proposals` scope | submit; with `key` in the body, revise your own proposal. Send an `Idempotency-Key` (or an `operation_id`): the proposal key derives from it |
-| `GET /v1/projects/{id}/proposals` | any member | the queue: `state`, `target`, `limit`, `cursor`. Also `can_propose` and `can_triage` for the caller |
-| `GET /v1/projects/{id}/proposals/{key}` | any member | the newest revision, the disposition timeline (`history` 1..50) and the derived links |
+| `GET /v1/projects/{id}/proposals` | any member | the queue: `state`, `target`, `order` (`oldest`, the default, or `newest`), `mine=1` (only the caller's own account), `limit`, `cursor`. `total` is the count for the filter, not for the page. Also `can_propose` and `can_triage` for the caller |
+| `GET /v1/projects/{id}/proposals/{key}` | any member | the newest revision, the disposition timeline (`history` 1..50), the derived links, and `deciders` (the configured owner deciders) |
 | `POST /v1/projects/{id}/proposals/{key}/dispositions` | `reviews.approve`: owners, in a signed-in session | triage (`operation: "review"`, the default) or the owner decision (`"decide"`), with `previous` and `proposal_sha256` from the detail read |
 | `GET /v1/me/contributions` | a signed-in session | your own **verified** proposals across your projects, newest first, `limit` per page with a `cursor` (`next_cursor`); it pages through the newest 100 and stops there: the last page has `truncated: true` and no `next_cursor`, and older proposals are read per project from the queue. A cursor the route did not issue is refused with 409. A proposal that only names your account, or whose later revision someone else wrote, is not listed |
 
@@ -359,10 +359,48 @@ The rules:
   - While the older kit is the endpoint, the actor-shape reservation is off. Run the
     scan above when you roll forward.
 
-Not built yet: the web screens (the next delivery), the scoreboard and statistics, the
-self-service scoreboard hide, and promoting a feedback entry from the web (the HTTP
-feedback routes are not canonical on the endpoint backend; `proposal submit
---from-feedback` on the client works).
+**In the web interface.**
+- **Reviews** shows the proposal queue above the contribution groups: Submitted, Under
+  review, Needs information, Escalated to the owner and Approved, and for members who can
+  triage, Incorporated but not yet the accepted requirement. A row opens the proposal on
+  the same page (`#/p/{id}/reviews?proposal={key}`): the text, why, evidence, what has
+  happened, and the form for whoever acts next.
+  - A member with `reviews.approve` gets the triage form, or the owner-decision form on
+    an escalated proposal. It is not offered on their own proposal, nor the decision to
+    the member who escalated.
+  - The submitter gets a revise form while the proposal is submitted or a coordinator
+    has asked a question.
+- **Propose a requirement** is a button on Reviews (`?propose=1`). The form never sends
+  a submitter.
+- **My work** has a "My contributions" panel, and a project's task page shows one line
+  about your own proposals there.
+- Proposal text is always rendered as plain text. An evidence entry is a link only when
+  it is a plain `https` URL with no user name or password in it.
+- A server without these routes shows "Not available on this server" in place of the
+  queue, and no My contributions panel. A project you are not a member of shows "Not
+  found", not that.
+- The queue reads each open state on its own, newest first, 50 at a time, with "Show
+  older"; the counts are the server's totals. So a new submission is on the first page
+  however many proposals the project has had. My contributions pages the same way.
+- A refusal shows the rule the server named (for example an unknown decision id). When
+  someone else changed the proposal while it was open, the form says to reload.
+- When the server cannot confirm a save (no answer, or a 5xx), the form says so and
+  stays. Pressing the same button again with nothing changed sends the same request
+  under the same `Idempotency-Key`, so it cannot create a duplicate; changing the
+  content makes it a new request. This holds for every form in the web interface, not
+  only these.
+- "Who decides" on an escalation offers the configured owner deciders that are web
+  accounts in the project. A decider configured as a `person:` identity cannot be chosen
+  from the web; the form says so, and an operator escalates with the host command. With
+  no deciders configured, the project's other owners are offered.
+- A `person:` submitter is shown as "a named person, not a web account".
+
+Not built yet:
+- creating the decision issue from the web, so an owner's yes or no still needs an
+  operator to file the decision issue first;
+- promoting a feedback entry from the web (the HTTP feedback routes are not canonical on
+  the endpoint backend; `proposal submit --from-feedback` on the client works);
+- the scoreboard, statistics and the self-service scoreboard hide (slice 2).
 
 ## 6. Worker clients
 

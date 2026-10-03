@@ -1,6 +1,7 @@
 import { h, time, copyButton, confirmDialog } from '../dom.js';
 import { pageHead, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, roleTag } from '../ui.js';
 import { agentCard, attentionOf } from './agents.js';
+import { myContributionsPanel } from './proposals.js';
 
 function workTable(ctx, rows, { showProject = true, emptyTitle, emptyBody }) {
   if (!rows.length) return empty(emptyTitle, emptyBody);
@@ -24,7 +25,7 @@ function workTable(ctx, rows, { showProject = true, emptyTitle, emptyBody }) {
 
 export async function home(ctx) {
   if (!ctx.projects.length) return welcome(ctx);
-  const data = await ctx.api.myWork();
+  const [data, contributions] = await Promise.all([ctx.api.myWork(), myContributionsPanel(ctx)]);
   const incomplete = data.truncated || (data.unavailable && data.unavailable.length);
   const revisions = data.assigned.filter((t) => t.review_state === 'changes-requested');
   const assigned = data.assigned.filter((t) => t.review_state !== 'changes-requested');
@@ -41,6 +42,7 @@ export async function home(ctx) {
     pageHead({ title: 'My work', lede: `Everything waiting on you across ${ctx.projects.filter((p) => !p.archived).length} active project(s). Opening a task never marks it done.` }),
     incomplete ? h('div', { class: 'banner' }, 'Some projects could not be read just now, or there is more work than one page shows. Open a project to see all of its tasks.') : null,
     agentPromptPanel(ctx, data),
+    contributions,
     agentsPanel,
     panel('Revisions requested', revisions.length, workTable(ctx, revisions, { emptyTitle: 'No revisions requested', emptyBody: 'When a reviewer asks for changes to your work, it appears here first.' })),
     panel('Waiting for your review', data.to_review.length, workTable(ctx, data.to_review, { emptyTitle: 'Nothing to review', emptyBody: 'Contributions to projects you own appear here until you approve them or request changes.' }), 'Stays here until you act — no reminder needed'),

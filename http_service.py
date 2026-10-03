@@ -272,7 +272,7 @@ def read_cursor(principal, project_id, query, cursor):
     if not isinstance(data, dict) or data.get('u') != principal.user_id or \
             data.get('p') != project_id or \
             data.get('q') != request_hash(cursor_scope(query))[:16] or \
-            not isinstance(data.get('o'), int) or data['o'] < 0:
+            type(data.get('o')) is not int or data['o'] < 0:      # a bool is not an offset
         raise conflict('Cursor is stale or belongs to a different query')
     return {'o': data['o'], 'x': data.get('x')}
 
@@ -1156,7 +1156,9 @@ class EndpointBackend:
                 # would be read as a flag, a leading @ as the attachment transport.
                 raise invalid('A task title cannot start with "-" or "@"')
             description = payload.get('description')
-            if description:
+            if description and str(description).strip():
+                # A blank description is no description (as PATCH treats it as "clear"):
+                # the endpoint refuses an empty body file.
                 return ('bd', project_id, ['create', title, '@attachment:0', '--json'],
                         {'0': {'flag': '--body-file', 'text': description}})
             return 'bd', project_id, ['create', title, '--json'], {}
@@ -3079,6 +3081,28 @@ class ApiHandler(BaseHTTPRequestHandler):
         # text to that account (review 01a10262).
         mine = submitter == 'account:' + ctx.principal.user_id and item.get('identity') == 'verified'
         item['mine'] = mine
+        # Display names for the people in the timeline (account ids), best effort.
+        entries = [entry for entry in [item.get('disposition')] + list(item.get('timeline') or [])
+                   if isinstance(entry, dict)]
+
+        def decider(entry):
+            identity = (entry.get('escalation') or {}).get('owner_identity')
+            return identity[len('account:'):] if isinstance(identity, str) and identity.startswith('account:')                 else None
+        names = self.service.actor_names([entry.get('actor') for entry in entries]
+                                         + [decider(entry) for entry in entries])
+
+        def named(disposition):
+            if not isinstance(disposition, dict):
+                return disposition
+            actor = disposition.get('actor')
+            shown = dict(disposition, actor_name=names.get(actor, actor) if isinstance(actor, str) else None)
+            if decider(disposition):
+                shown['escalation'] = dict(shown['escalation'], owner_name=names.get(decider(disposition)))
+            return shown
+        if 'disposition' in item:
+            item['disposition'] = named(item['disposition'])
+        if isinstance(item.get('timeline'), list):
+            item['timeline'] = [named(entry) for entry in item['timeline']]
         if mine or CAP_APPROVE in capabilities:
             return item
 
@@ -3149,6 +3173,17 @@ class ApiHandler(BaseHTTPRequestHandler):
             if not proposal_records.valid_target_filter(target):
                 raise invalid('target must be a requirement key or a requirement area')
             args += ['--target', caller_arg(target, 'target')]
+        order = ctx.query.get('order')
+        if order:
+            if order not in ('oldest', 'newest'):
+                raise invalid('order must be oldest or newest')
+            args += ['--order', caller_arg(order, 'order')]
+        if ctx.query.get('mine'):
+            # The caller's own proposals in this project: the identity is the session's
+            # account (for an agent, its owner's) and cannot be named.
+            if ctx.query['mine'] != '1':
+                raise invalid('mine must be 1')
+            args += ['--submitter', 'account:' + ctx.principal.user_id]
         result = dict(self.backend.proposal_read(pid, args))
         capabilities = self.service.capabilities_for(ctx.principal, pid)
         result['items'] = [self._proposal_view(ctx, capabilities, item) for item in result.get('items') or []]

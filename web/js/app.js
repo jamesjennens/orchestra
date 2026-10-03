@@ -26,7 +26,7 @@ export async function start(root, options = {}) {
   // Requirements, decisions and records are not served by the HTTP service yet
   // (slice 1): the production entry hides them; the prototype's mock turns them on.
   const features = { requirements: false, ...(options.features || {}) };
-  const ctx = { api, me: null, projects: [], root, dirty: false, options, features };
+  const ctx = { api, me: null, projects: [], root, dirty: false, options, features, query: new URLSearchParams('') };
   let memoryRoute = '/';
 
   const currentRoute = () => {
@@ -63,6 +63,7 @@ export async function start(root, options = {}) {
 
   let shell;
   function buildShell(route) {
+    route = route.split('?')[0];
     const pid = projectOf(route);
     const active = ctx.projects.filter((p) => !p.archived);
     const current = pid && ctx.projects.find((p) => p.id === pid);
@@ -118,7 +119,11 @@ export async function start(root, options = {}) {
     const mine = ++token;
     const main = buildShell(route);
     mount(root, ctx.options.banner ? [ctx.options.banner(ctx), shell] : shell);
-    const match = matchRoute(route);
+    // A route may carry a query, e.g. /p/{pid}/reviews?proposal=<key>: the path selects
+    // the view and the query is the view's own state.
+    const [path, search] = route.split('?');
+    ctx.query = new URLSearchParams(search || '');
+    const match = matchRoute(path);
     const view = match && VIEWS[match.name];
     if (view) {
       try {
