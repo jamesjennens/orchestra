@@ -241,6 +241,61 @@ With `--backend inprocess` (disposable local validation) everything is service-l
 "New project" still creates the project directly (`project_create: create`), and no record
 is ever unusable or listed for confirmation.
 
+### Requirement proposals
+
+A proposal says what the product should do. It is intake, not a task and not a
+requirement ([CLI contract](CLI_CONTRACT.md#proposal-contributed-requirement-proposals)).
+Over HTTP identity is server-bound, so what is a host command over SSH is a route here.
+The routes exist on the endpoint backend; the in-process backend answers 501.
+
+| Route | Who | What |
+| --- | --- | --- |
+| `POST /v1/projects/{id}/proposals` | `proposals.write`: contributors, owners, and an agent credential with the `proposals` scope | submit; with `key` in the body, revise your own proposal. Send an `Idempotency-Key` (or an `operation_id`): the proposal key derives from it |
+| `GET /v1/projects/{id}/proposals` | any member | the queue: `state`, `target`, `limit`, `cursor`. Also `can_propose` and `can_triage` for the caller |
+| `GET /v1/projects/{id}/proposals/{key}` | any member | the newest revision, the disposition timeline (`history` 1..50) and the derived links |
+| `POST /v1/projects/{id}/proposals/{key}/dispositions` | `reviews.approve`: owners, in a signed-in session | triage (`operation: "review"`, the default) or the owner decision (`"decide"`), with `previous` and `proposal_sha256` from the detail read |
+| `GET /v1/me/contributions` | a signed-in session | your own proposals across your projects, at most `limit` from each |
+
+The rules:
+- **The submitter is the account.** `submitter` is `account:<your user id>`; for an agent
+  it is the agent's owner, and `submitted_by_agent` names the agent. A body that carries
+  `submitter`, `submitted_by_agent`, `actor` or `origin` is refused. A worker credential
+  cannot propose.
+- **Who reads coordinator text.** A rejection reason, a coordinator question and an
+  escalation question are returned only to the submitter and to members with
+  `reviews.approve`. Everyone else gets `null` and `withheld: true`.
+- **Nobody triages their own proposal**, and the owner decision comes from a different
+  member than the one who escalated. An owner decision names an existing native decision
+  issue (`decision: {decision_id}`); the web service cannot create one, so an operator
+  files it.
+- **No credential triages.** `reviews.approve` is never granted to a worker or agent
+  credential.
+- **Refusals** from the canonical rules (a stale read, an illegal transition, a no-self
+  rule) answer 422 with the rule's message. Proposal text is never in an error body or
+  the audit log; the audit records the action and the proposal key.
+- **Authority is checked when a disposition is written.** The endpoint re-validates the
+  member's capability against the live authority store before the write. A reader later
+  counts that disposition because its author is an HTTP account; it does not re-check
+  the member's current role. So removing a member's owner role does not undo what they
+  triaged. An operator repairs a bad disposition with a void once `void-record` accepts
+  these records (kittrial-5bb.74); no repair command exists before that.
+- **The actor-shape reservation and its boundary.** Readers, SSH included, treat a
+  record authored under an HTTP account or agent id as written by this service. The
+  endpoint therefore refuses those shapes as a declared actor on every action unless
+  this service launched it, which it knows from its own `--authority-store`
+  command-line flag. That is airtight only for SSH callers confined to the endpoint
+  command (an `authorized_keys` `command=` entry that ignores the caller's command
+  line). A caller with a shell on the service account is inside the trust boundary and
+  can bypass it, like every other check in the kit.
+- **Rollback.** A kit from before this slice reads a web-written disposition as inert:
+  the proposal shows its earlier state there, with a warning. Nothing is lost, backups
+  and restores are unaffected, and the newer kit reads it as counted again.
+
+Not built yet: the web screens (the next delivery), the scoreboard and statistics, the
+self-service scoreboard hide, and promoting a feedback entry from the web (the HTTP
+feedback routes are not canonical on the endpoint backend; `proposal submit
+--from-feedback` on the client works).
+
 ## 6. Worker clients
 
 ```sh

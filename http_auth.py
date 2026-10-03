@@ -41,7 +41,7 @@ import time
 from pathlib import Path
 
 from http_authority import (ALL_CAPABILITIES, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CAP_APPROVE,
-                            CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROJECT_ADMIN,
+                            CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROJECT_ADMIN, CAP_PROPOSALS,
                             CAP_PROJECT_CREATE, CAP_READ, CAP_REVIEWS, CAP_TASKS,
                             CREDENTIAL_FORBIDDEN_CAPABILITIES, CREDENTIAL_SCOPES, RANK,
                             ROLE_CAPABILITIES, ROLES, SCOPE_CAPABILITIES, SCHEMA_VERSION,
@@ -1259,7 +1259,7 @@ class Service:
             return frozenset()
         caps = set()
         for capability in (CAP_READ, CAP_TASKS, CAP_CHECKPOINTS, CAP_REVIEWS, CAP_FEEDBACK,
-                           CAP_APPROVE, CAP_PROJECT_ADMIN):
+                           CAP_PROPOSALS, CAP_APPROVE, CAP_PROJECT_ADMIN):
             try:
                 decide(self.state, authority_request(principal, project_id, capability),
                        now=moment)

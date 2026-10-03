@@ -317,6 +317,11 @@ CAP_CHECKPOINTS = 'checkpoints.write'
 CAP_REVIEWS = 'reviews.write'
 CAP_FEEDBACK = 'feedback.write'
 CAP_APPROVE = 'reviews.approve'
+#: Submit or revise a contributed requirement proposal (.58 slice 1b, kittrial-5bb.70).
+#: Contributors and owners hold it, and the `proposals` credential scope grants it, so a
+#: member or an agent can propose. Triage and decisions need CAP_APPROVE, which no
+#: credential ever holds.
+CAP_PROPOSALS = 'proposals.write'
 CAP_PROJECT_ADMIN = 'project.admin'
 CAP_PROJECT_CREATE = 'project.create'
 CAP_ACCOUNTS_ADMIN = 'accounts.admin'
@@ -334,18 +339,18 @@ SCOPE_CAPABILITIES = {
     'checkpoints': frozenset({CAP_CHECKPOINTS}),
     'reviews': frozenset({CAP_REVIEWS}),
     'feedback': frozenset({CAP_FEEDBACK}),
-    # .58's agent-proposal scope (kittrial-5bb.64, slice 0): recognised so a slice-1b
-    # credential can be issued and read on this kit, but it grants nothing until a
-    # proposal route exists (.58 8.5, hazard 3).
-    'proposals': frozenset(),
+    # .58's agent-proposal scope: recognised since slice 0 (kittrial-5bb.64), it grants
+    # the proposal write capability since slice 1b (kittrial-5bb.70).
+    'proposals': frozenset({CAP_PROPOSALS}),
 }
 CREDENTIAL_SCOPES = tuple(sorted(SCOPE_CAPABILITIES))
 
 ROLE_CAPABILITIES = {
     'viewer': frozenset({CAP_READ}),
-    'contributor': frozenset({CAP_READ, CAP_TASKS, CAP_CHECKPOINTS, CAP_REVIEWS, CAP_FEEDBACK}),
+    'contributor': frozenset({CAP_READ, CAP_TASKS, CAP_CHECKPOINTS, CAP_REVIEWS, CAP_FEEDBACK,
+                              CAP_PROPOSALS}),
     'owner': frozenset({CAP_READ, CAP_TASKS, CAP_CHECKPOINTS, CAP_REVIEWS, CAP_FEEDBACK,
-                        CAP_APPROVE, CAP_PROJECT_ADMIN}),
+                        CAP_PROPOSALS, CAP_APPROVE, CAP_PROJECT_ADMIN}),
 }
 CREDENTIAL_FORBIDDEN_CAPABILITIES = frozenset({CAP_APPROVE, CAP_PROJECT_ADMIN,
                                                CAP_PROJECT_CREATE, CAP_ACCOUNTS_ADMIN,

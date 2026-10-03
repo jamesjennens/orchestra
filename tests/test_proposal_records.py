@@ -962,6 +962,77 @@ class ReadTests(ProposalCase):
         self.assertEqual(self.native.reads(), ['list', 'show'])                  # its key label, then the created row
 
 
+class FromFeedbackTests(ProposalCase):
+    """`proposal submit --from-feedback ENTRY_ID` (design 9.1; slice 1b, kittrial-5bb.70)."""
+
+    def setUp(self):
+        super().setUp()
+        import feedback
+        self.feedback = feedback
+        self.feed = self.project / '.feedback.jsonl'
+
+    def entry(self, operation_id='fb-1', body='The chart numbers differ between two runs.', kind='feedback',
+              supersedes=None):
+        payload = {'operation_id': operation_id, 'created_at': '2026-10-01T12:00:00Z', 'body': body,
+                   'source': {'task': None, 'version': 'v1'}, 'evidence': [],
+                   'triage': {'task': None, 'label': ''}, 'reminder': {'kind': 'none', 'text': ''},
+                   'supersedes': supersedes}
+        return self.feedback.add(self.feed, 'alice', payload, kind=kind)['entry']
+
+    def promote(self, entry_id, **extra):
+        self.native.actor = SUBMITTER
+        return pr.write(['submit', '--from-feedback', entry_id, '@attachment:0'],
+                        {'0': {'flag': '--file', 'text': json.dumps(proposal(**extra))}}, SUBMITTER, self.native,
+                        self.project, OPS)
+
+    def test_a_promotion_records_the_origin_and_never_touches_the_journal(self):
+        entry = self.entry()
+        before = self.feed.read_bytes()
+        made = self.promote(entry['entry_id'], text=...)
+        view = self.get(made['key'])
+        digest = pr.hashlib.sha256(pr.canonical_bytes(entry)).hexdigest()
+        self.assertEqual(view['origin'], {'type': 'feedback', 'entry_id': entry['entry_id'], 'digest': digest})
+        self.assertEqual(view['text']['text'], entry['body'])          # the text starts from the entry body
+        self.assertEqual(self.feed.read_bytes(), before)
+        # The submitter may word it differently; the origin is the same, and a revise keeps it.
+        worded = self.promote(entry['entry_id'], operation_id='alex-prop-2', text='Charts must be reproducible.')
+        self.assertEqual(self.get(worded['key'])['origin']['entry_id'], entry['entry_id'])
+        self.revise(worded['key'], operation_id='alex-rev-9')
+        self.assertEqual(self.get(worded['key'])['origin']['type'], 'feedback')
+        # An ordinary submit still records an authored origin.
+        self.assertEqual(self.get(self.submit(operation_id='alex-prop-3')['key'])['origin'], {'type': 'authored'})
+
+    def test_an_entry_that_cannot_be_promoted_is_refused_before_any_write(self):
+        entry = self.entry()
+        self.entry('fb-2', body='Corrected wording.', kind='correction', supersedes=entry['entry_id'])
+        self.entry('fb-3', body='x' * (pr.TEXT_MAX + 1))
+        long_entry = self.feedback._entry_id('fb-3')
+        writes = len(self.native.rows)
+        for entry_id, extra, message in (
+                ('feedback-' + '0' * 32, {}, 'Unknown feedback entry'),
+                (entry['entry_id'], {}, 'was corrected by'),
+                (long_entry, {'text': ...}, 'supply the proposal text'),
+                ('../x y', {}, '--from-feedback takes a feedback ENTRY_ID')):
+            with self.subTest(entry=entry_id[:20]), self.assertRaisesRegex(ValueError, message):
+                self.promote(entry_id, **extra)
+        self.feed.write_bytes(self.feed.read_bytes() + b'{"not": "an entry"}\n')
+        with self.assertRaisesRegex(ValueError, 'does not validate'):
+            self.promote(self.feedback._entry_id('fb-2'))
+        self.assertEqual(len(self.native.rows), writes)
+        (self.project / '.feedback.jsonl').unlink()
+        with self.assertRaisesRegex(ValueError, 'no feedback journal'):
+            self.promote(entry['entry_id'])
+        with self.assertRaisesRegex(ValueError, 'proposal submit --from-feedback ENTRY_ID'):
+            pr.write(['revise', '--from-feedback', 'x', '@attachment:0'], {}, SUBMITTER, self.native, self.project,
+                     OPS)
+
+    def test_review_and_decide_stay_host_commands_without_http_authority(self):
+        for command in ('review', 'decide'):
+            with self.assertRaisesRegex(ValueError, 'is a host command'):
+                pr.write([command, '@attachment:0'], {'0': {'flag': '--file', 'text': '{}'}}, COORD, self.native,
+                         self.project, OPS)
+
+
 class AttentionTests(ProposalCase):
     def block(self, actor=COORD, **options):
         return pr.work_attention(self.rows(), actor, OPS, 'demo', self.project, **options)
