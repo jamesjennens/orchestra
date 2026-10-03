@@ -24,8 +24,8 @@ from version import report
 from reserved_comments import (carries_record_label, check_raw_request, comment_target,
                                first_reserved_label, is_record_anchor, label_guard_request,
                                operator_only_in_args, raw_file_flag_in_args,
-                               reserved_label_in_args, unresolved_bd_flags)
-from http_authority import AuthorityConfig, NativeRunner, journal_path, run_guarded
+                               reserved_label_in_args, unresolved_bd_flags, refuse_http_actor)
+from http_authority import AuthorityConfig, NativeRunner, http_actor_denial, journal_path, run_guarded
 
 ALLOWED={'list','show','ready','search','count','create','update','close','reopen','comments','dep','state','lint'}
 # Legacy name kept for operators reading this file; enforcement is the
@@ -110,6 +110,11 @@ def execute(root,request,authority_config=None,require_authority=False):
     name=request['project'];path=project_dir(root,name)
     if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
     actor=request.get('actor','')
+    refuse_http_actor(actor,authority_config is not None)
+    # Launched by the HTTP service, an HTTP-shaped actor still needs the verified
+    # descriptor on every action, with or without --require-authority (review 01a10262).
+    denied=http_actor_denial(request,authority_config)
+    if denied is not None:return denied
     if request.get('action')=='session':
         from sessions import execute as session_execute
         args=request.get('args',[])
@@ -256,12 +261,15 @@ def execute(root,request,authority_config=None,require_authority=False):
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
     if action=='proposal':
-        # Contributed requirement proposals (.58 slice 1a, kittrial-5bb.68). get, list,
-        # mine and help are reads (no lock, not run_guarded); submit and revise are
-        # writes, under the lock and the operation journal. review, decide and settings
-        # are NOT reachable here: over SSH the actor is self-declared, so everything
-        # that rests on the operator allowlist is a host command (admin.py
-        # proposal-review, proposal-decide, proposal-settings).
+        # Contributed requirement proposals (.58 slices 1a and 1b, kittrial-5bb.68/.70).
+        # get, list, mine and help are reads (no lock, not run_guarded); submit and
+        # revise are writes, under the lock and the operation journal. Over SSH review,
+        # decide and settings are NOT reachable: the actor is self-declared there, so
+        # everything that rests on the operator allowlist is a host command (admin.py
+        # proposal-review, proposal-decide, proposal-settings). The HTTP service is the
+        # other authority: launched by it, with live authority required, review and
+        # decide run for a signed-in member whose reviews.approve the guard has just
+        # re-validated, and a submission's submitter is bound to the verified account.
         import proposal_records
         args=request.get('args',[])
         if not isinstance(args,list) or any(not isinstance(x,str) or '\0' in x for x in args):raise ValueError('Expected argument list')
@@ -271,12 +279,19 @@ def execute(root,request,authority_config=None,require_authority=False):
             if warnings:run_warnings.append(warnings)
             return stdout
         operators=configured_operators(root)
-        if not args or args[0] not in proposal_records.WRITE_COMMANDS:
-            result=proposal_records.read(args,run,actor,operators,project=path)
+        by_service=authority_config is not None and require_authority
+        writes=proposal_records.WRITE_COMMANDS+(proposal_records.HTTP_WRITE_COMMANDS if by_service else ())
+        if not args or args[0] not in writes:
+            # Launched by the HTTP service, a read returns the unfiltered view: the
+            # service withholds coordinator text per caller from its server-bound identity.
+            result=proposal_records.read(args,run,actor,operators,project=path,full=authority_config is not None)
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
         runner=NativeRunner(run)
         def proposal_effect():
-            result=proposal_records.write(args,request.get('attachments',{}),actor,runner,path,operators)
+            http=proposal_records.http_context(request,authority_config,require_authority)
+            if authority_config is not None and http is None:
+                raise ValueError('A proposal write through the HTTP service needs live authority')
+            result=proposal_records.write(args,request.get('attachments',{}),actor,runner,path,operators,http=http)
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
@@ -396,6 +411,9 @@ def execute(root,request,authority_config=None,require_authority=False):
                 key=a.partition(':')[2]
                 item=attachments.get(key)
                 if not isinstance(item,dict) or item.get('flag') not in FILE_FLAGS or not isinstance(item.get('text'),str):raise ValueError('Invalid attachment')
+                # bd refuses an empty body file; refuse it here, before any native call, so the
+                # caller gets a clear refusal and not an uncertain outcome (review 01a10352).
+                if item['flag']=='--body-file' and not item['text'].strip():raise ValueError('An attached description is empty; send an empty value inline to clear it')
                 dest=Path(tmp)/f'{i}.txt';dest.write_text(item['text'],encoding='utf-8')
                 final.extend([item['flag'],str(dest)])
             else: final.append(a)

@@ -60,9 +60,11 @@ def save(path, state):
 class Canonical:
     """Emulated ``bd`` over one JSON file; enforces the real transport rules."""
 
-    def __init__(self, root, project):
+    def __init__(self, root, project, actor=None):
         self.root = Path(root)
         self.project = project
+        # The native author of a comment is the acting actor, as with bd --actor.
+        self.actor = actor
         self.state_path = self.root / 'canonical.json'
         self.path = self.root / project
         self.path.mkdir(parents=True, exist_ok=True)
@@ -99,31 +101,62 @@ class Canonical:
             if command not in ALLOWED:
                 raise ValueError('Command is outside the contributor interface')
         if command == 'create':
-            title = rest[0] if rest else ''
-            description = ''
+            def option(flag, default):
+                return rest[rest.index(flag) + 1] if flag in rest and rest.index(flag) + 1 < len(rest) else default
+            title = option('--title', rest[0] if rest else '')
+            description = option('--description', '')
             if '--body-file' in rest:
                 source = Path(rest[rest.index('--body-file') + 1])
                 description = source.read_text(encoding='utf-8') if source.exists() else ''
+            labels = [label for label in option('--labels', '').split(',') if label]
+            issue_type = option('--type', 'task')
+            if '--dry-run' in rest:
+                # bd's own preflight (the record core runs it before a real create): no row.
+                return 0, json.dumps({'dry_run': True}), ''
 
             def change(state):
                 state['seq'] += 1
                 task_id = 'kittrial-5bb.%d' % state['seq']
                 state['rows'].append({
                     'id': task_id, 'title': title, 'description': description, 'status': 'open',
-                    'assignee': None, 'issue_type': 'task', 'comments': [],
-                    'labels': [], 'dependencies': [], 'created_at': '2026-01-01T00:00:00Z',
+                    'assignee': None, 'issue_type': issue_type, 'comments': [],
+                    'labels': labels, 'dependencies': [], 'created_at': '2026-01-01T00:00:00Z',
                 })
                 return task_id
             task_id = self._mutate(change)
             row = next(r for r in self.rows() if r['id'] == task_id)
             return 0, json.dumps(row), ''
         if command == 'list':
-            return 0, json.dumps(self.rows()), ''
+            listed = self.rows()
+            for index, token in enumerate(rest):
+                if token == '--label':
+                    listed = [row for row in listed if rest[index + 1] in (row.get('labels') or [])]
+                elif token == '--label-any':
+                    wanted = rest[index + 1].split(',')
+                    listed = [row for row in listed if any(label in (row.get('labels') or []) for label in wanted)]
+                elif token == '--id':
+                    listed = [row for row in listed if row.get('id') in rest[index + 1].split(',')]
+            return 0, json.dumps(listed), ''
         if command == 'show':
+            ids = [token for token in rest if not token.startswith('--')]
+            if '--include-comments' in rest or len(ids) > 1:
+                # The record modules' form: several ids, rows with their comments.
+                found = [r for r in self.rows() if r['id'] in ids]
+                if not found:
+                    return 1, '', 'no issues found matching the provided IDs'
+                return 0, json.dumps(found), ''
             row = next((r for r in self.rows() if r['id'] == (rest[0] if rest else '')), None)
             if row is None:
                 return 2, '', 'task not found'
             return 0, json.dumps(row), ''
+        if command == 'close':
+            task = rest[0] if rest else ''
+
+            def change(state):
+                row = self._row(state, task)
+                row['status'] = 'closed'
+                return row
+            return 0, json.dumps(self._mutate(change)), ''
         if command == 'export':
             text = '\n'.join(json.dumps(r) for r in self.rows()) + ('\n' if self.rows() else '')
             return 0, text, ''
@@ -135,13 +168,27 @@ class Canonical:
                 index = 1
                 while index < len(rest):
                     flag = rest[index]
-                    if flag == '--remove-label':
+                    if flag in ('--remove-label', '--add-label'):
+                        label = rest[index + 1]
+                        labels = [item for item in row.setdefault('labels', []) if item != label]
+                        row['labels'] = labels + ([label] if flag == '--add-label' else [])
                         index += 2
                         continue
                     if flag in ('--status', '--assignee', '--title', '--description'):
                         if index + 1 >= len(rest):
                             raise ValueError('Missing value for %s' % flag)
                         row[flag[2:].replace('-', '_')] = rest[index + 1]
+                        index += 2
+                        continue
+                    if flag == '--body-file':
+                        if index + 1 >= len(rest):
+                            raise ValueError('Missing value for %s' % flag)
+                        source = Path(rest[index + 1])
+                        text = source.read_text(encoding='utf-8') if source.exists() else ''
+                        if not text.strip():
+                            # As bd 1.2.2 does: an empty body file is refused.
+                            raise ValueError('empty description from stdin/file requires --allow-empty-description')
+                        row['description'] = text
                         index += 2
                         continue
                     if flag == '--json':
@@ -167,7 +214,7 @@ class Canonical:
             def change(state):
                 row = self._row(state, task)
                 state['comments'] += 1
-                comment = {'id': str(state['comments']), 'author': 'emulated',
+                comment = {'id': str(state['comments']), 'author': self.actor or 'emulated',
                            'created_at': '2026-01-01T00:00:%02dZ' % (state['comments'] % 60),
                            'text': text}
                 row.setdefault('comments', []).append(comment)
@@ -198,6 +245,8 @@ def materialize(args, attachments, tmp):
             if not isinstance(item, dict) or item.get('flag') not in FILE_FLAGS or \
                     not isinstance(item.get('text'), str):
                 raise ValueError('Invalid attachment')
+            if item['flag'] == '--body-file' and not item['text'].strip():   # as endpoint.py refuses it
+                raise ValueError('An attached description is empty; send an empty value inline to clear it')
             destination = Path(tmp) / ('%d.txt' % index)
             destination.write_text(item['text'], encoding='utf-8')
             final.extend([item['flag'], str(destination)])
@@ -317,6 +366,29 @@ def dispatch(canonical, request, tmp, run=None):
             if config.is_file() else []
         result = records.read(args, ref_run, operators)
         return envelope(0, json.dumps(result, ensure_ascii=False) + '\n')
+    if action == 'proposal':
+        # endpoint.py's proposal action (kittrial-5bb.68/.70), with the real
+        # proposal_records over the emulated native: reads are unfiltered when the HTTP
+        # service launched this process; submit and revise bind the verified account;
+        # review and decide run only under live HTTP authority.
+        try:
+            import proposal_records
+        except ImportError:  # a revision that predates the action
+            raise ValueError('Unknown action')
+        config = canonical.root / 'deployment.private.json'
+        operators = json.loads(config.read_text(encoding='utf-8')).get('operators') or [] \
+            if config.is_file() else []
+        launched = canonical.authority_config is not None
+        by_service = launched and canonical.require_authority
+        writes = proposal_records.WRITE_COMMANDS + (proposal_records.HTTP_WRITE_COMMANDS if by_service else ())
+        if not args or args[0] not in writes:
+            result = proposal_records.read(args, run, actor, operators, project=canonical.path, full=launched)
+            return envelope(0, json.dumps(result, ensure_ascii=False) + '\n')
+        http = proposal_records.http_context(request, canonical.authority_config, canonical.require_authority)
+        if launched and http is None:
+            raise ValueError('A proposal write through the HTTP service needs live authority')
+        result = proposal_records.write(args, attachments, actor, run, canonical.path, operators, http=http)
+        return envelope(0, json.dumps(result, ensure_ascii=False) + '\n')
     raise ValueError('Unknown action')
 
 
@@ -347,7 +419,9 @@ def main():
         if not (root / 'projects' / name / '.beads' / 'metadata.json').is_file():
             print(json.dumps(envelope(2, stderr='ValueError: Unknown/uninitialized project\n')))
             return
-    canonical = Canonical(root, request.get('project', 'project'))
+    canonical = Canonical(root, request.get('project', 'project'), actor=request.get('actor'))
+    canonical.authority_config = None
+    canonical.require_authority = arguments.require_authority
     journal_path = (http_authority.journal_path(canonical.path)
                     if http_authority is not None and hasattr(http_authority, 'journal_path')
                     else canonical.path / '.http-operations.json')
@@ -358,6 +432,7 @@ def main():
             arguments.authority_store:
         config = http_authority.AuthorityConfig(arguments.authority_store,
                                                 arguments.authority_lock)
+    canonical.authority_config = config
     # The instrumented runner is the effect's only route to native state: a refusal
     # raised before its first write is proven pre-effect and keeps rc=2.
     run_callable = canonical.run
@@ -366,6 +441,18 @@ def main():
         runner = http_authority.NativeRunner(canonical.run)
         run_callable = runner
     try:
+        try:
+            # endpoint.py's reservation of HTTP id shapes (kittrial-5bb.70), on every action.
+            from reserved_comments import refuse_http_actor
+        except ImportError:
+            refuse_http_actor = None
+        if refuse_http_actor is not None:
+            refuse_http_actor(request.get('actor'), config is not None)
+        denied = http_authority.http_actor_denial(request, config) \
+            if http_authority is not None and hasattr(http_authority, 'http_actor_denial') else None
+        if denied is not None:
+            print(json.dumps(denied))
+            return
         if http_authority is not None and hasattr(http_authority, 'run_guarded'):
             parameters = inspect.signature(http_authority.run_guarded).parameters
             kwargs = {}

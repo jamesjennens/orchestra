@@ -1,7 +1,8 @@
 # Contributed requirement proposals - design proposal
 
-Status: **revision 5. Slice 0 and slice 1a are implemented; the rest is not.** Apart
-from the revision 5 note, this document describes the design as accepted and
+Status: **revision 6. Slice 0, slice 1a and the routes of slice 1b are implemented;
+the web screens and the later slices are not.** Apart
+from the revision 5 and 6 notes, this document describes the design as accepted and
 changes no code. It proposes a record kind, a lifecycle and authority model, a
 coordinator input queue, an escalation path, attribution and statistics, a
 "my contributions" read, client commands, HTTP routes, backup/rollback coverage
@@ -148,9 +149,76 @@ the kit does**; the first item changes 4.1 and 8.1 and was reported to the owner
       record its target names, or when the task carries a label equal to the target's
       area (5.2).
 
-Slice 1a is implemented by `proposal_records.py`. Slices 1b, 2 and 3 are not: there
-is no HTTP route, no web screen, no statistics and no scoreboard in the kit. Every
-remaining change named below is a follow-up implementation slice (section 11).
+Revision 6 (2026-10-03, kittrial-5bb.70, slice 1b delivery A as built) records the
+coordinator's decisions on the implementer's five questions (task comment after plan
+`01a101f7-029c`). Where this note and the text below disagree, **this note is what the
+kit does**.
+
+1. **Two authorities write dispositions.** The host commands (operator allowlist), and
+   the HTTP service for a signed-in member who holds `reviews.approve`. The endpoint
+   runs `review` and `decide` only when it was launched by the HTTP service with live
+   authority required, and after it has re-validated that capability against the live
+   authority store. Over SSH both stay refused (revision 5, item 1).
+2. **How a reader counts an HTTP disposition.** A coordinator or owner disposition
+   counts when its native author is on the operator allowlist, or has the HTTP
+   account-id shape (`usr_` plus 16 hex digits). Settings records stay
+   allowlist-only.
+   - HTTP authority is checked at **write time only**. A later role change does not
+     make a past web disposition inert, unlike removing an operator.
+   - The repair for a bad web disposition is an operator void, once `void-record`
+     accepts these kinds (kittrial-5bb.74). Until then no repair command exists.
+   - Rejected alternatives: a per-deployment list of trusted approvers (an operator
+     would have to maintain it), and a sidecar proving each HTTP write (an older kit
+     would refuse to restore it).
+3. **HTTP id shapes are reserved.** The endpoint refuses, on every action, a declared
+   actor shaped like an HTTP account or agent id (`usr_` / `agent_` plus 16 hex
+   digits, also as the head of a sub-actor) unless it was launched by the HTTP
+   service.
+   - How the endpoint knows: its own command-line flag `--authority-store`, which the
+     HTTP service passes when it starts the endpoint. Request data cannot set it.
+   - **The boundary, stated plainly.** This holds for a caller confined to the endpoint
+     command, for example by an `authorized_keys` `command=` entry that ignores the
+     caller's command line. The kit ships no such wrapper yet (kittrial-5bb.89). A
+     caller with a shell on the service account can start the endpoint however it
+     likes and is inside the trust boundary of every check in this kit.
+4. **Server-bound attribution, for every reader.** A revision whose native author has
+   the account-id shape and whose `submitter` is that account, or whose author has the
+   agent-id shape and is the agent `submitted_by_agent` names, reads
+   `identity: verified` on SSH as on HTTP. The resolver maps an account-id actor to
+   `account:<id>` with no map entry, so the no-self rules compare people exactly.
+   - **Amended by review 01a10262 (kittrial-5bb.70 revision 2).** Identity is not
+     revision 1's author alone. `verified` needs the native author of EVERY revision to
+     stand for the submitter (server-bound, or resolved by the actor map), and a revise
+     is refused unless the caller does. Over the plain endpoint a payload that repeats
+     the stored submitter proves nothing. `mine` and `/v1/me/contributions` list
+     verified proposals only. Launched by the HTTP service, the endpoint needs the
+     verified descriptor for every action under an account- or agent-shaped actor.
+   - **Amended again by review 01a10308.** For an `account:` submitter the writer and
+     `verified` accept only server-bound authors. The actor map may name an account as
+     an SSH actor's identity, for the no-self rules only. A `person:` submitter keeps
+     resolving through the map, as in slice 1a.
+   - **The reservation is not retroactive.** A record written under such an actor while
+     a kit without the reservation was the endpoint reads as HTTP-written. The operator
+     scan `admin.py proposal-http-records` lists them with their native creation time
+     (docs/HTTP_DEPLOYMENT.md). A cut-over the reader honours is not built.
+5. **Who may submit over HTTP.** A member session, or an agent credential with the
+   `proposals` scope (the submitter is the agent's owner and the agent is recorded).
+   A worker credential is refused in this slice: its actor is a free-form namespace,
+   not a reserved shape.
+6. **Out of slice 1b.** `POST /v1/me/contributions/visibility` (revision 5 item 6
+   leaves the mechanism to slice 2); `contributions/summary`,
+   `/v1/agents/me/contributions`, the scoreboard panel and the agent card count
+   (slice 2). The web "Promote to proposal" button waits until the HTTP feedback
+   routes are canonical: on the endpoint backend they still answer 501.
+   `proposal submit --from-feedback` on the client ships now (9.1).
+7. **The acceptance value is the reader's.** The routes return each item's
+   `linked_requirement.acceptance_state` as the reader derives it and count nothing
+   themselves, so a new live value (kittrial-5bb.87) needs no route change.
+
+Slices 0 and 1a are implemented by `proposal_records.py`, and the routes of slice 1b
+by `http_service.py` on the endpoint backend. The web screens of slice 1b and slices
+2 and 3 are not: there is no web screen, no statistics and no scoreboard in the kit.
+Every remaining change named below is a follow-up implementation slice (section 11).
 
 The design is written against `main`
 `8e1f9ec6f4d818de8983f59f80aa896111a99712`, the base commit of this task. Every

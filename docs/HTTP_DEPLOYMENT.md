@@ -241,6 +241,129 @@ With `--backend inprocess` (disposable local validation) everything is service-l
 "New project" still creates the project directly (`project_create: create`), and no record
 is ever unusable or listed for confirmation.
 
+### Requirement proposals
+
+A proposal says what the product should do. It is intake, not a task and not a
+requirement ([CLI contract](CLI_CONTRACT.md#proposal-contributed-requirement-proposals)).
+Over HTTP identity is server-bound, so what is a host command over SSH is a route here.
+The routes exist on the endpoint backend; the in-process backend answers 501.
+
+| Route | Who | What |
+| --- | --- | --- |
+| `POST /v1/projects/{id}/proposals` | `proposals.write`: contributors, owners, and an agent credential with the `proposals` scope | submit; with `key` in the body, revise your own proposal. Send an `Idempotency-Key` (or an `operation_id`): the proposal key derives from it |
+| `GET /v1/projects/{id}/proposals` | any member | the queue: `state`, `target`, `limit`, `cursor`. Also `can_propose` and `can_triage` for the caller |
+| `GET /v1/projects/{id}/proposals/{key}` | any member | the newest revision, the disposition timeline (`history` 1..50) and the derived links |
+| `POST /v1/projects/{id}/proposals/{key}/dispositions` | `reviews.approve`: owners, in a signed-in session | triage (`operation: "review"`, the default) or the owner decision (`"decide"`), with `previous` and `proposal_sha256` from the detail read |
+| `GET /v1/me/contributions` | a signed-in session | your own **verified** proposals across your projects, newest first, `limit` per page with a `cursor` (`next_cursor`); it pages through the newest 100 and stops there: the last page has `truncated: true` and no `next_cursor`, and older proposals are read per project from the queue. A cursor the route did not issue is refused with 409. A proposal that only names your account, or whose later revision someone else wrote, is not listed |
+
+The rules:
+- **The submitter is the account.** `submitter` is `account:<your user id>`; for an agent
+  it is the agent's owner, and `submitted_by_agent` names the agent. A body that carries
+  `submitter`, `submitted_by_agent`, `actor` or `origin` is refused. A worker credential
+  cannot propose.
+- **Only the submitter revises, and `verified` covers every revision.** A proposal
+  with an `account:` submitter is written, revised and read as verified only through
+  this service (the account or its agent). No SSH actor writes as an account, even one
+  the actor map maps to that account. A `person:` submitter is revised over the plain
+  endpoint by an actor the map resolves to that person. Repeating the stored
+  `submitter` string in the payload proves nothing. A reader reports `identity: verified` only when the native author of
+  every revision stands for the submitter; otherwise the proposal reads `unverified`
+  and an `identity-broken` warning names the first revision someone else wrote.
+- **Query values are validated, never forwarded as flags.** `state` is one of the
+  proposal states and `target` a requirement key or area; anything else is 422. What
+  is guaranteed, exactly:
+  - enumerated values (`state`, `status`, `due`, ...) are checked against their closed
+    set, and patterned values (keys, ids, `target`, `owner`, tags, numbers) against
+    their pattern, before the endpoint is called;
+  - a task title cannot start with `-` or `@`, on create or on update (tasks that
+    already have such a title stay readable);
+  - free text (a task description on create and on update, proposal, checkpoint and
+    review bodies) travels as an attachment, never as an argument, so a text such as
+    `--help`, `- item` or `@attachment:0` is stored as written. The one exception is
+    clearing a description on update: the empty value is sent inline, because the
+    native tool refuses an empty body file and an empty value cannot be a flag.
+- **Who reads coordinator text.** A rejection reason, a coordinator question and an
+  escalation question are returned only to the submitter and to members with
+  `reviews.approve`. Everyone else gets `null` and `withheld: true`.
+- **Nobody triages their own proposal**, and the owner decision comes from a different
+  member than the one who escalated. An owner decision names an existing native decision
+  issue (`decision: {decision_id}`). Today's behaviour, stated exactly: the check is only
+  that the id names a native issue of type `decision` (or labelled `decision`). Any
+  contributor can create such an issue through the endpoint, and a web decide accepts
+  it; the owner the escalation named (`owner_identity`) is **not** enforced against the
+  member who decides. The web service has no route that creates a decision issue.
+  Tightening this rule is kittrial-5bb.87.
+- **An operator who also has a web account** must map their operator actor to their
+  account identity, or the no-self rules treat the two as different people: the same
+  person could submit on the web and triage with the host command.
+  `admin.py proposal-settings PROJECT --actor OPERATOR --namespace OPERATOR --to account:usr_<id>`.
+  A namespace that itself has the shape of an account or agent id is refused.
+  The mapping feeds the no-self rules and nothing else: it does not let that actor (or
+  any SSH caller who declares a name in that namespace) revise the account's proposals
+  or submit proposals that read as the account's.
+- **No credential triages.** `reviews.approve` is never granted to a worker or agent
+  credential.
+- **Refusals** from the canonical rules (a stale read, an illegal transition, a no-self
+  rule) answer 422 with the rule's message. Proposal text is never in an error body or
+  the audit log; the audit records the action and the proposal key.
+- **Authority is checked when a disposition is written.** The endpoint re-validates the
+  member's capability against the live authority store before the write. A reader later
+  counts that disposition because its author is an HTTP account; it does not re-check
+  the member's current role. So removing a member's owner role does not undo what they
+  triaged. An operator repairs a bad disposition with a void once `void-record` accepts
+  these records (kittrial-5bb.74); no repair command exists before that.
+- **The actor-shape reservation and its boundary.** Readers, SSH included, treat a
+  record authored under an HTTP account or agent id as written by this service. The
+  endpoint therefore refuses those shapes as a declared actor on every action unless
+  this service launched it, which it knows from its own `--authority-store`
+  command-line flag. That is airtight only for SSH callers confined to the endpoint
+  command (an `authorized_keys` `command=` entry that ignores the caller's command
+  line). A caller with a shell on the service account is inside the trust boundary and
+  can bypass it, like every other check in the kit.
+  - Launched by this service, the endpoint still requires the verified live-authority
+    descriptor for every action under such an actor, whether or not the process was
+    started with `--require-authority`, and the descriptor must name that actor (the
+    account, or the agent whose credential it carries).
+  - A worker credential's actor namespace cannot have the shape of an account or agent
+    id other than the issuer's own account id.
+- **The reservation does not reach back in time.** A kit from before this slice has no
+  reservation: on it, an SSH caller can declare `usr_<someone's id>` as its actor and
+  write a proposal (or a disposition) that this kit then reads as written under HTTP
+  authority. That covers every deployment up to the upgrade, and any later rollback.
+  - After the upgrade, and again after any rollback is rolled forward, run
+    `admin.py proposal-http-records PROJECT --before <UTC time this kit went live>` for
+    each project. It lists every proposal revision and disposition whose native author
+    has an account or agent id shape, with the tracker's own creation time. Before this
+    slice no web route wrote proposals, so on first upgrade the list should be empty;
+    anything listed was planted. After a rollback, compare each record's
+    `native_created_at` with the window in which the older kit was the endpoint:
+    `--after <rollback time> --before <roll-forward time>` lists exactly that window.
+  - The limit: the scan reports; it does not change how the records read. A planted
+    record keeps reading as verified (a revision) or counted (a disposition) until a
+    repair exists for these kinds (kittrial-5bb.74 for dispositions). Until then, treat
+    a listed proposal as unverified by hand and have its real submitter resubmit.
+    `native_created_at` is the tracker's time; an attacker with native access to the
+    database is outside this check, as everywhere in the kit.
+- **Rollback.** A kit from before this slice reads a web-written disposition as inert:
+  the proposal shows its earlier state there, with a warning. Nothing is lost, backups
+  and restores are unaffected, and the newer kit reads it as counted again.
+  - Do **not** follow the older kit's advice for such a disposition. Its refusal says
+    "re-adding them (`admin.py operators add ACTOR`) makes those records count again".
+    For a web disposition the author is an account id: adding `usr_...` to the operator
+    allowlist would make an HTTP account id an operator. Roll forward instead. This
+    kit's `operators add` refuses an account- or agent-shaped id. Only the exact shape
+    is reserved (`usr_` or `agent_` and 16 lowercase hex digits); a near miss such as
+    15 digits or `USR_...` is an ordinary name. An allowlist that already holds such an
+    id is not changed for you: `operators list` and the service at start print a warning
+    that names it; remove it with `operators remove NAME --confirm-revoke`.
+  - While the older kit is the endpoint, the actor-shape reservation is off. Run the
+    scan above when you roll forward.
+
+Not built yet: the web screens (the next delivery), the scoreboard and statistics, the
+self-service scoreboard hide, and promoting a feedback entry from the web (the HTTP
+feedback routes are not canonical on the endpoint backend; `proposal submit
+--from-feedback` on the client works).
+
 ## 6. Worker clients
 
 ```sh

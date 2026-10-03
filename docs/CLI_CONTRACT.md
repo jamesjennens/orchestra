@@ -1082,6 +1082,13 @@ No proposal text ever appears in an error message.
   - `supersedes`: optional, the key of an earlier proposal, which must exist.
   - The command writes `id`, `key`, `origin`, `created_at` and `sha256`. The key is
     `p-` plus the first 12 hex digits of `sha256(operation_id)`.
+- **`submit --from-feedback ENTRY_ID --file`** promotes one feedback entry
+  (`feedback list` shows the ids). The proposal records
+  `origin: {type: "feedback", entry_id, digest}`, where `digest` is the SHA-256 of the
+  entry. `text` may be omitted from the payload: it is then the entry body, which
+  must fit 4,000 characters. The feedback journal is read, never changed. Refused,
+  before any write: an unknown entry, an entry a later correction supersedes (promote
+  the correction), and a journal that does not validate.
 - **`revise --file`** writes the next revision of your own proposal. It adds `key`,
   the next `revision` and `expected_sha256` (the hash of the revision it replaces) to
   the content fields. It is allowed only while the proposal is `submitted` or
@@ -1095,6 +1102,17 @@ self-declared, so everything that rests on the operator allowlist is a host comm
 `admin.py proposal-review`, `admin.py proposal-decide` and
 `admin.py proposal-settings` ([operations](OPERATIONS.md#operator-commands)). The
 client refuses the three names with a message that says so.
+
+**The web service is the other authority.** A signed-in member with `reviews.approve`
+triages and decides through the HTTP routes
+([HTTP deployment](HTTP_DEPLOYMENT.md#requirement-proposals)), and a member or an
+agent submits there with the submitter bound to the account. The endpoint accepts
+`review` and `decide` only when the HTTP service launched it and it has re-validated
+that capability itself.
+
+**Reserved actor shapes.** An actor shaped like an HTTP account or agent id (`usr_`
+or `agent_` plus 16 hex digits, also as the head of `ID/...`) is refused on every
+action unless the HTTP service launched the endpoint. Declare your own session actor.
 
 **States.** `submitted`, `under-review`, `needs-info`, `escalated-to-owner`,
 `approved`, `incorporated`, `rejected`, `duplicate-of`. The last three are terminal.
@@ -1144,10 +1162,32 @@ client refuses the three names with a message that says so.
   - `supersedes_chain` lists the keys this proposal supersedes, nearest first. The
     walk stops after 8 hops, at a cycle, or at a proposal that cannot be read, and
     `supersedes_warning` then says which; otherwise it is `null`.
-- **`identity`** is `verified` when the actor that submitted the proposal maps,
-  through the project's actor map, to its `submitter`; otherwise `unverified`. Over
-  SSH this is attribution, not authentication: the actor is self-declared, and no
-  authority rests on it.
+- **`identity`** is `verified` when the native author of **every** revision stands
+  for the proposal's `submitter`.
+  - For a `person:` submitter: the author maps to it through the project's actor map.
+  - For an `account:` submitter: the revision was written through the web service (its
+    author is the account itself, or the agent that the revision's
+    `submitted_by_agent` names). Nothing else counts. An SSH actor that the actor map
+    maps to that account is still not the account: the map joins people for the
+    no-self rules and never makes a record read as written by a web account.
+  - Otherwise it is `unverified`; when revision 1 was the submitter's and a later one
+    was not, an `identity-broken` warning names that revision. Over SSH this is
+    attribution, not authentication: the actor is self-declared, and no authority
+    rests on it.
+- **Who may revise.** Only the submitter. A proposal with an `account:` submitter is
+  revised only through the web service, mapped actor or not. A proposal with a
+  `person:` submitter is revised over the endpoint by an actor the map resolves to
+  that person, or by the actor that wrote every earlier revision (an unmapped
+  contributor revising their own proposal). Repeating the stored `submitter` in the
+  payload is never enough.
+- **`mine` over the endpoint is a declared query**, as in slice 1a: it lists every
+  proposal whose `submitter` is the identity named, each with its `identity`
+  (`verified` or `unverified`), so an unmapped contributor sees their own
+  submissions. Through the HTTP service the same read lists verified proposals only
+  and adds `unverified_omitted`: there the submitter is an authenticated account.
+  `list` and `mine` take `--order oldest|newest` (default oldest).
+- **Help is a command.** `proposal --help` and `proposal list --help` return the help
+  payload. `--help` in an option's value position is that option's bad value.
 - **`linked_requirement`** is `{id, revision, sha256, acceptance_state,
   manifest_sha256}` for an incorporated proposal. `acceptance_state` is read live
   from the requirement record: `accepted`, `draft` or `missing`.
@@ -1156,9 +1196,12 @@ client refuses the three names with a message that says so.
     same title, description and key as the linked revision.
   - `draft` covers everything else that still exists: never accepted, demoted, or
     replaced by a later revision with different content (accepted or not).
-- **Inert records.** A disposition whose native author is not on the operator
-  allowlist does not count: `timeline[].standing` is `inert`, `inert_dispositions`
-  counts them, and the state is the one the trusted records give.
+- **Inert records.** A disposition counts when its native author is on the operator
+  allowlist (a host command wrote it) or is an HTTP account (the web service wrote it
+  for a member who held `reviews.approve` at that moment). Any other disposition does
+  not count: `timeline[].standing` is `inert`, `inert_dispositions` counts them, and
+  the state is the one the trusted records give. Web authority is checked when the
+  disposition is written, not when it is read.
 - **Failures stay per proposal.** A malformed record, a state label that disagrees
   with the ledger, or a newer record version makes that one proposal read `malformed`
   or `unsupported`; lists and the queue keep working and name it in `coverage`.

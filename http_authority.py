@@ -133,6 +133,7 @@ Windows workstation and a Linux office host.
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -317,6 +318,11 @@ CAP_CHECKPOINTS = 'checkpoints.write'
 CAP_REVIEWS = 'reviews.write'
 CAP_FEEDBACK = 'feedback.write'
 CAP_APPROVE = 'reviews.approve'
+#: Submit or revise a contributed requirement proposal (.58 slice 1b, kittrial-5bb.70).
+#: Contributors and owners hold it, and the `proposals` credential scope grants it, so a
+#: member or an agent can propose. Triage and decisions need CAP_APPROVE, which no
+#: credential ever holds.
+CAP_PROPOSALS = 'proposals.write'
 CAP_PROJECT_ADMIN = 'project.admin'
 CAP_PROJECT_CREATE = 'project.create'
 CAP_ACCOUNTS_ADMIN = 'accounts.admin'
@@ -334,18 +340,18 @@ SCOPE_CAPABILITIES = {
     'checkpoints': frozenset({CAP_CHECKPOINTS}),
     'reviews': frozenset({CAP_REVIEWS}),
     'feedback': frozenset({CAP_FEEDBACK}),
-    # .58's agent-proposal scope (kittrial-5bb.64, slice 0): recognised so a slice-1b
-    # credential can be issued and read on this kit, but it grants nothing until a
-    # proposal route exists (.58 8.5, hazard 3).
-    'proposals': frozenset(),
+    # .58's agent-proposal scope: recognised since slice 0 (kittrial-5bb.64), it grants
+    # the proposal write capability since slice 1b (kittrial-5bb.70).
+    'proposals': frozenset({CAP_PROPOSALS}),
 }
 CREDENTIAL_SCOPES = tuple(sorted(SCOPE_CAPABILITIES))
 
 ROLE_CAPABILITIES = {
     'viewer': frozenset({CAP_READ}),
-    'contributor': frozenset({CAP_READ, CAP_TASKS, CAP_CHECKPOINTS, CAP_REVIEWS, CAP_FEEDBACK}),
+    'contributor': frozenset({CAP_READ, CAP_TASKS, CAP_CHECKPOINTS, CAP_REVIEWS, CAP_FEEDBACK,
+                              CAP_PROPOSALS}),
     'owner': frozenset({CAP_READ, CAP_TASKS, CAP_CHECKPOINTS, CAP_REVIEWS, CAP_FEEDBACK,
-                        CAP_APPROVE, CAP_PROJECT_ADMIN}),
+                        CAP_PROPOSALS, CAP_APPROVE, CAP_PROJECT_ADMIN}),
 }
 CREDENTIAL_FORBIDDEN_CAPABILITIES = frozenset({CAP_APPROVE, CAP_PROJECT_ADMIN,
                                                CAP_PROJECT_CREATE, CAP_ACCOUNTS_ADMIN,
@@ -1709,6 +1715,62 @@ def _envelope(code, stderr='', **extra):
     payload = {'returncode': code, 'stdout': '', 'stderr': stderr}
     payload.update(extra)
     return payload
+
+
+#: The ids the HTTP service allocates (http_auth: ``usr_``/``agent_`` + 16 hex). As a
+#: declared actor the shape is reserved for that service (``reserved_comments.HTTP_ACTOR``).
+HTTP_ACTOR_ID = re.compile(r'(?:usr|agent)_[0-9a-f]{16}')
+
+
+def http_actor_id(actor):
+    """The account or agent id an actor label claims (``usr_...`` or ``usr_.../label``), or None."""
+    head = actor.split('/', 1)[0] if isinstance(actor, str) else None
+    return head if head and HTTP_ACTOR_ID.fullmatch(head) else None
+
+
+def http_shaped_names(names):
+    """The names in a list (an operator allowlist) that have the exact reserved shape of an
+    HTTP account or agent id. Only the exact shape is reserved: `usr_` or `agent_` and 16
+    lowercase hex digits. A near miss (15 digits, `USR_`) is an ordinary name."""
+    return [name for name in names or [] if isinstance(name, str) and http_actor_id(name) is not None]
+
+
+def http_actor_denial(request, authority_config):
+    """Why a request under an HTTP-shaped actor is refused, as the envelope, or None.
+
+    An actor with the shape of an account or agent id is what makes a record read as
+    written under HTTP authority, so EVERY endpoint action under one needs the verified
+    live-authority descriptor (kittrial-5bb.70 review 01a10262), whether or not the
+    process was launched with ``--require-authority``: the descriptor must be present,
+    must pass ``decide`` against the live store, and must name that actor (the account
+    itself, or the agent whose credential the descriptor carries). The denials are the
+    ones ``run_guarded`` returns, so the HTTP service maps them identically; a guarded
+    mutation is then re-validated under the authority lock as before.
+    """
+    head = http_actor_id(request.get('actor'))
+    if head is None:
+        return None
+    if authority_config is None:
+        return _envelope(126, stderr='Live authority is not configured\n', authority_status=401)
+    authority = request.get('authority')
+    if not isinstance(authority, dict):
+        return _envelope(126, stderr='Live authority descriptor required: an HTTP account or agent actor acts '
+                                     'only with one\n', authority_status=401)
+    descriptor = {key: value for key, value in authority.items() if key not in ('store', 'lock')}
+    try:
+        state = read_state(authority_config.store)
+        decide(state, descriptor)
+    except AuthorityDenied as denied:
+        return _envelope(126, stderr='%s\n' % denied.message, authority_status=denied.status)
+    allowed = {descriptor.get('user_id')}
+    credential = (state.get('credentials') or {}).get(descriptor.get('credential_id')) \
+        if descriptor.get('credential_id') else None
+    if isinstance(credential, dict) and credential.get('agent_id'):
+        allowed.add(credential['agent_id'])
+    if head not in allowed:
+        return _envelope(126, stderr='The actor is not the account or agent the live-authority descriptor '
+                                     'names\n', authority_status=403)
+    return None
 
 
 def run_guarded(request, journal_path, effect, authority_config=None,

@@ -124,7 +124,19 @@ class EndpointDispatchTests(unittest.TestCase):
         self.assertEqual((view['state'], view['identity'], view['text']['trust']),
                          ('submitted', 'unverified', 'unreviewed'))
         self.assertEqual(self.execute(['list'])['total'], 1)
-        self.assertEqual(self.execute(['mine', '--submitter', 'person:alex'])['total'], 1)
+        # Over SSH `mine` is the declared query of slice 1a: it lists by the named submitter.
+        mine = self.execute(['mine', '--submitter', 'person:alex'])
+        self.assertEqual((mine['total'], mine['items'][0]['identity'], 'unverified_omitted' in mine),
+                         (1, 'unverified', False))
+        # Help is a command, never an option value (kittrial-5bb.70 review 01a10262).
+        self.assertEqual(self.execute(['list', '--help'])['action'], 'proposal')
+        for args, message in ((['list', '--state', '--help'], '--state must be one of'),
+                              (['list', '--target', '-h'], '--target is a requirement key'),
+                              (['list', '--limit', '--help'], '--limit must be a number'),
+                              (['get', made['key'], '--history', '-h'], '--history must be a number'),
+                              (['mine', '--submitter', '--help'], 'durable identity|submitter')):
+            with self.subTest(args=args), self.assertRaisesRegex(Exception, message):
+                self.execute(args)
         self.assertEqual(self.execute(['--help'])['action'], 'proposal')
         self.assertEqual((self.locks.call_count, self.guarded), (0, []))
         # A caller who names the allowlisted operator still cannot triage through the endpoint.
@@ -175,6 +187,72 @@ class HostCommandTests(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()) as out:
             admin.main()
         return json.loads(out.getvalue())
+
+    def test_the_http_records_scan_is_a_read_only_host_command(self):
+        # kittrial-5bb.70 review 01a10262: list proposal records with HTTP-shaped authors.
+        def scan(*argv):
+            with patch.object(sys, 'argv', ['admin.py', '--root', str(self.root), 'proposal-http-records', 'trial',
+                                            *argv]),                     patch.object(admin, 'root_path', return_value=self.root),                     patch.object(admin, 'run_bd', side_effect=self.run_native),                     contextlib.redirect_stdout(io.StringIO()) as out:
+                admin.main()
+            return json.loads(out.getvalue())
+        self.native.calls = []
+        self.assertEqual((scan()['total'], scan()['records']), (0, []))
+        row = self.native.rows[-1]
+        planted = pr.revision_record({'target': {'kind': 'requirement-new'}, 'text': 'Planted.', 'rationale': None,
+                                      'evidence': [], 'attachments': []}, row['id'], 2, 'person:alex',
+                                     self.made['key'], None)
+        row['comments'].append({'id': 'c-planted', 'author': 'usr_0123456789abcdef',
+                                'created_at': '2026-09-30T08:00:00Z', 'text': pr.revision_comment(planted)})
+        found = scan()
+        self.assertEqual([(item['proposal'], item['author'], item['native_created_at'], item['revision'])
+                          for item in found['records']],
+                         [(self.made['key'], 'usr_0123456789abcdef', '2026-09-30T08:00:00Z', 2)])
+        self.assertEqual(scan('--before', '2026-09-30T00:00:00Z')['total'], 0)
+        self.assertEqual(scan('--before', '2026-10-01T00:00:00Z')['total'], 1)
+        with self.assertRaisesRegex(ValueError, '--before is a UTC stamp'):
+            scan('--before', 'yesterday')
+        self.assertEqual(scan('--after', '2026-09-30T00:00:00Z', '--before', '2026-10-01T00:00:00Z')['total'], 1)
+        self.assertEqual(scan('--after', '2026-10-01T00:00:00Z')['total'], 0)
+        with self.assertRaisesRegex(ValueError, '--after is a UTC stamp'):
+            scan('--after', 'last week')
+        with self.assertRaisesRegex(ValueError, '--after must be earlier than --before'):
+            scan('--after', '2026-10-02T00:00:00Z', '--before', '2026-10-01T00:00:00Z')
+        self.assertFalse([call for call in self.native.calls if call[0] in ('create', 'update', 'close')
+                          or call[:2] == ['comments', 'add']])
+        self.flock.assert_not_called()
+
+    def test_an_http_id_is_never_added_to_the_operator_allowlist(self):
+        # Review 01a10308: an older kit advises `operators add ACTOR` for an inert web disposition.
+        def operators(*argv):
+            with patch.object(sys, 'argv', ['admin.py', '--root', str(self.root), 'operators', *argv]), \
+                    patch.object(admin, 'root_path', return_value=self.root), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                admin.main()
+            return json.loads(out.getvalue())['operators']
+        before = operators('list')
+        for actor in ('usr_0123456789abcdef', 'agent_0123456789abcdef'):
+            with self.subTest(actor=actor), self.assertRaisesRegex(ValueError, 'never added to the operator allowlist'):
+                operators('add', actor)
+        self.assertEqual(operators('list'), before)
+        # Only the exact shape is reserved: near misses are ordinary names.
+        for near in ('usr_short', 'usr_0123456789abcde', 'USR_0123456789abcdef'):
+            self.assertIn(near, operators('add', near))
+        # An allowlist that already holds such an id is flagged, on the host and at service start.
+        import http_service
+        marker = self.root / 'deployment.private.json'
+        document = json.loads(marker.read_text(encoding='utf-8'))
+        self.assertEqual(http_service.operator_allowlist_warnings(str(self.root)), [])
+        document['operators'].append('usr_0123456789abcdef')
+        marker.write_text(json.dumps(document), encoding='utf-8')
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertIn('usr_0123456789abcdef', operators('list'))
+        self.assertIn('Warning: the operator allowlist holds usr_0123456789abcdef', stderr.getvalue())
+        warned = http_service.operator_allowlist_warnings(str(self.root))
+        self.assertEqual(len(warned), 1)
+        self.assertIn('holds usr_0123456789abcdef', warned[0])
+        self.assertEqual(http_service.operator_allowlist_warnings(None), [])
+        self.assertEqual(http_service.operator_allowlist_warnings(str(self.root / 'nowhere')), [])
 
     def payload(self, to_state, **fields):
         view = pr.read(['get', self.made['key']], self.native, COORD, [COORD, OWNER], self.project)

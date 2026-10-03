@@ -779,9 +779,18 @@ class AnchorReadCostTests(EndpointCase if EndpointCase else unittest.TestCase):
 
 
 class ScopeAndConfigTests(unittest.TestCase):
-    def test_the_proposals_scope_is_recognised_and_grants_nothing(self):
+    def test_the_proposals_scope_is_recognised_and_grants_only_the_proposal_write(self):
+        # Slice 0 recognised the scope with no capability; slice 1b (kittrial-5bb.70) maps
+        # it to the proposal write and to nothing else. No credential ever approves.
         self.assertIn('proposals', http_authority.CREDENTIAL_SCOPES)
-        self.assertEqual(http_authority.SCOPE_CAPABILITIES['proposals'], frozenset())
+        self.assertEqual(http_authority.SCOPE_CAPABILITIES['proposals'],
+                         frozenset({http_authority.CAP_PROPOSALS}))
+        self.assertEqual(http_authority.CAP_PROPOSALS, 'proposals.write')
+        self.assertNotIn(http_authority.CAP_PROPOSALS, http_authority.CREDENTIAL_FORBIDDEN_CAPABILITIES)
+        self.assertIn(http_authority.CAP_APPROVE, http_authority.CREDENTIAL_FORBIDDEN_CAPABILITIES)
+        self.assertNotIn(http_authority.CAP_PROPOSALS, http_authority.ROLE_CAPABILITIES['viewer'])
+        for role in ('contributor', 'owner'):
+            self.assertIn(http_authority.CAP_PROPOSALS, http_authority.ROLE_CAPABILITIES[role])
 
     def test_the_deployment_verifiers_key_is_tolerated_and_preserved(self):
         with tempfile.TemporaryDirectory() as temp:

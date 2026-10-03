@@ -3062,6 +3062,9 @@ def main():
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('proposal-decide',help='record the owner decision on an escalated requirement proposal (operator allowlist)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('proposal-http-records',help='list the proposal revisions and dispositions whose native author has an HTTP account or agent id shape, with their native creation time (read-only; run after an upgrade and after a rollback)')
+    a.add_argument('project');a.add_argument('--before',default=None,help='only records natively created before this UTC stamp (YYYY-MM-DDTHH:MM:SSZ), the deploy time of the kit with the reservation')
+    a.add_argument('--after',default=None,help='only records natively created at or after this UTC stamp; with --before, the window in which an older kit was the endpoint')
     a=sub.add_parser('proposal-settings',help='read or change the contribution settings: the actor map and the owner deciders (operator allowlist)')
     a.add_argument('project');a.add_argument('--actor',required=True)
     a.add_argument('--map-actor',dest='map_actor',metavar='ACTOR',help='map a session actor to a person, with --to')
@@ -3313,6 +3316,18 @@ def main():
                 yield
         print(json.dumps(capability_verification.verify_batch(payload,args.actor,run,operators=authority,
                                                               verifiers=listed,journal=path,lock=held)))
+    elif args.command=='proposal-http-records':
+        import proposal_records
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        for flag,value in (('--before',args.before),('--after',args.after)):
+            if value is not None and not proposal_records.STAMP.fullmatch(value):
+                raise ValueError('%s is a UTC stamp, YYYY-MM-DDTHH:MM:SSZ'%flag)
+        if args.before is not None and args.after is not None and args.after>=args.before:
+            raise ValueError('--after must be earlier than --before')
+        # Read-only: no lock, no actor. It reads every proposal anchor with its comments.
+        rows=proposal_records.read_rows(lambda argv:run_bd(root,args.project,argv))
+        print(json.dumps(proposal_records.http_authored(rows,args.before,args.after),ensure_ascii=False))
     elif args.command in ('proposal-review','proposal-decide','proposal-settings'):
         # Requirement proposals (.58 slice 1a, kittrial-5bb.68). Everything that rests on
         # the operator allowlist is a host command, because over SSH the actor is
@@ -3412,7 +3427,17 @@ def main():
         from recovery import identity
         cfg=config(root)
         current=stored_operators(cfg)
-        if args.action=='list':print(json.dumps({'operators':current}));return
+        if args.action=='list':
+            print(json.dumps({'operators':current}))
+            # An allowlist that already holds an HTTP account or agent id (added by hand, or
+            # by an older kit following its own advice) makes that id an operator.
+            from http_authority import http_shaped_names
+            shaped=http_shaped_names(current)
+            if shaped:
+                print('Warning: the operator allowlist holds %s, which has the shape of an HTTP account or agent '
+                      'id. Such an id must not be an operator; remove it with: admin.py operators remove NAME '
+                      '--confirm-revoke'%', '.join(shaped),file=sys.stderr)
+            return
         # Config is the single authority source; a shell-only ORCHESTRA_OPERATORS
         # that disagrees is refused before the change rather than applied here
         # and ignored by the endpoint.
@@ -3420,6 +3445,14 @@ def main():
         if not args.actor:raise ValueError('operators '+args.action+' requires an actor identity')
         actor=identity(args.actor,'Invalid operator identity')
         if args.action=='add':
+            # An HTTP account or agent id is never an operator (kittrial-5bb.70 review
+            # 01a10308): the web service acts under those ids, and an older kit's advice
+            # ("operators add ACTOR" for an inert web disposition) must not allowlist one.
+            from http_authority import http_actor_id
+            if http_actor_id(actor) is not None:
+                raise ValueError('%s has the shape of an HTTP account or agent id; such an id is never added to the '
+                                 'operator allowlist. A web disposition counts through the web service, not '
+                                 'through this list'%actor)
             if actor not in current:current.append(actor)
         else:
             if not args.confirm_revoke:

@@ -1403,3 +1403,30 @@ def check_comment_body(body, source, actor=None, task=None):
         'structured validation; use %s. Ordinary prose remains valid.'
         % (source, kind, kind, operation)
     )
+
+
+# ---------------------------------------------------------------------------
+# HTTP-allocated actor ids (kittrial-5bb.70)
+# ---------------------------------------------------------------------------
+# The ids the HTTP service allocates and acts under (http_auth: `usr_` / `agent_` + 16
+# hex), also as the head of a credential's sub-actor. They are reserved for that
+# service: readers treat a proposal record authored under one as written with HTTP
+# authority (proposal_records.disposition_authority, entry_view).
+HTTP_ACTOR = re.compile(r'(?:usr|agent)_[0-9a-f]{16}(?:/.*)?')
+
+
+def refuse_http_actor(actor, launched_by_service):
+    """Refuse a declared actor that has an HTTP id shape, on every endpoint action,
+    unless the endpoint was launched by the HTTP service.
+
+    `launched_by_service` is the endpoint's `authority_config is not None`: it is true
+    only when the process was started with `--authority-store`, a command-line flag the
+    HTTP service passes and request data cannot set. A caller confined to the endpoint
+    command (an authorized_keys `command=` entry that ignores the caller's command
+    line) therefore cannot assert it. A caller with a shell on the service account can
+    start the endpoint however it likes; that caller is inside the trust boundary of
+    every check in this kit.
+    """
+    if not launched_by_service and isinstance(actor, str) and HTTP_ACTOR.fullmatch(actor):
+        raise ValueError('Actor %s has the shape of an HTTP account or agent id, which only the HTTP service '
+                         'acts under; declare your own session actor' % actor[:40])

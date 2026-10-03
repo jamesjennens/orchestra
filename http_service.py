@@ -35,7 +35,7 @@ import agent_prompts
 from reserved_comments import (ANCHOR_READ_IDS_MAX, carries_record_label, hide_records,
                                is_record_anchor)
 from http_auth import (AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CAP_APPROVE,
-                       CAP_CHECKPOINTS, CAP_FEEDBACK,
+                       CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROPOSALS,
                        CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_READ, CAP_REVIEWS,
                        CAP_TASKS, RESULT_RETENTION_SECONDS, HttpError, Service, Store,
                        authority_request, conflict, forbidden, invalid, not_found,
@@ -68,6 +68,8 @@ AGENT_CLAIMABLE_LIMIT = MAX_PAGE
 #: Bound on the projects one ``GET /v1/me/work`` read walks (the caller's own
 #: memberships, each read once). Reaching it reports ``truncated``.
 ME_WORK_MAX_PROJECTS = 50
+#: How far back `/v1/me/contributions` pages: the endpoint's own list ceiling per read.
+ME_CONTRIBUTIONS_MAX = 100
 #: Bound on the per-task detail reads one ``GET /v1/me/work`` adds on a backend whose
 #: queue lacks request ids, review times and checkpoint state (the canonical binding:
 #: one ``brief`` subprocess per task, cached per principal like the queue).
@@ -87,6 +89,7 @@ ATTACHMENT_MEDIA_TYPES = ('text/plain', 'text/markdown')
 ID = r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}'
 # A reference catalog key (reference_records.KEY): lowercase and dotted.
 REFERENCE_KEY = r'[a-z][a-z0-9]*(?:\.[a-z0-9][a-z0-9-]*)+'
+PROPOSAL_KEY = r'p-[0-9a-f]{12}'
 SAFE_ID = re.compile(r'^' + ID + r'$')
 REQUEST_ID = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
 IDEMPOTENCY_KEY = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$')
@@ -376,7 +379,11 @@ class InProcessBackend:
 
     ROUTES = ('tasks.create', 'tasks.update', 'tasks.claim', 'checkpoints.add',
               'reviews.add', 'feedback.add', 'projects.create', 'projects.archive',
-              'members.set', 'members.remove', 'credentials.issue', 'credentials.revoke')
+              'members.set', 'members.remove', 'credentials.issue', 'credentials.revoke',
+              'proposals.submit', 'proposals.dispose')
+    # Contributed requirement proposals are native records behind the canonical endpoint;
+    # this service-local backend has no store for them (the routes answer 501).
+    PROPOSALS = False
     # Everything here is service-local, so a project is created by the HTTP route itself.
     PROJECT_CREATE = 'create'
 
@@ -914,6 +921,7 @@ class EndpointBackend:
     READ_UNRESOLVED = {
         'list_feedback': 'the canonical feedback command ships with kittrial-5bb.13',
     }
+    PROPOSALS = True
 
     def __init__(self, python, endpoint, root, *, service, actor_namespace='http',
                  timeout=150, runner=None):
@@ -1143,6 +1151,10 @@ class EndpointBackend:
         task_id = payload.get('task_id')
         if route == 'tasks.create':
             title = str(payload.get('title') or '')
+            if title.startswith(('-', '@')):
+                # The title is a positional argument of the native create: a leading dash
+                # would be read as a flag, a leading @ as the attachment transport.
+                raise invalid('A task title cannot start with "-" or "@"')
             description = payload.get('description')
             if description:
                 return ('bd', project_id, ['create', title, '@attachment:0', '--json'],
@@ -1150,13 +1162,26 @@ class EndpointBackend:
             return 'bd', project_id, ['create', title, '--json'], {}
         if route == 'tasks.update':
             args = ['update', str(task_id), '--json']
+            if str(payload.get('title') or '').startswith(('-', '@')):
+                # Same rule as create (review 01a10308).
+                raise invalid('A task title cannot start with "-" or "@"')
             if payload.get('title') is not None:
                 args[2:2] = ['--title', str(payload['title'])]
             if payload.get('status') in ('open', 'closed'):
                 args[2:2] = ['--status', payload['status']]
-            if payload.get('description') is not None:
-                args[2:2] = ['--description', str(payload['description'])]
-            return 'bd', project_id, args, {}
+            attachments = {}
+            if payload.get('description') is not None and not str(payload['description']).strip():
+                # Clearing the description: bd refuses an empty body file, and an empty
+                # value cannot be mistaken for a flag, so it goes inline (review 01a10352).
+                args[2:2] = ['--description', '']
+            elif payload.get('description') is not None:
+                # Free text never travels as a free-standing argument: like create, the
+                # description goes through the attachment transport, so a text that looks
+                # like a flag ("--help"), a list ("- item") or the transport itself
+                # ("@attachment:0") is stored as written whatever the native parser does.
+                args[2:2] = ['@attachment:0']
+                attachments = {'0': {'flag': '--body-file', 'text': str(payload['description'])}}
+            return 'bd', project_id, args, attachments
         if route == 'tasks.claim':
             actor = payload.get('actor') or self._actor(principal)
             return ('bd', project_id,
@@ -1196,6 +1221,16 @@ class EndpointBackend:
             body['task'] = task_id
             return ('review', project_id, [str(task_id), '@attachment:0'],
                     {'0': {'flag': '--file', 'text': json.dumps(body)}})
+        if route in ('proposals.submit', 'proposals.dispose'):
+            # Contributed requirement proposals (.58 slice 1b). The body was composed by
+            # the route from server-bound values; the endpoint re-verifies them against
+            # the live authority it re-validates (proposal_records.HttpContext).
+            body = dict(payload['body'])
+            body['operation_id'] = body.get('operation_id') or operation_id
+            if not body['operation_id']:
+                raise invalid('Send an Idempotency-Key header or an operation_id')
+            return ('proposal', project_id, [payload['command'], '@attachment:0'],
+                    {'0': {'flag': '--file', 'text': json.dumps(body)}})
         raise invalid('Backend route is not implemented for the canonical endpoint: %s' % route)
 
     # -- reads (no canonical mutation) ----------------------------------------
@@ -1213,15 +1248,34 @@ class EndpointBackend:
         """One page of the reference catalog through the endpoint's read-only `ref list`."""
         args = ['list', '--limit', str(options['limit']), '--offset', str(options['offset'])]
         for tag in options.get('tags') or []:
-            args += ['--tag', tag]
+            args += ['--tag', caller_arg(tag, 'tag')]
         for name in ('owner', 'state', 'due'):
             if options.get(name):
-                args += ['--' + name, options[name]]
+                args += ['--' + name, caller_arg(options[name], name)]
         return self._ref_read(project_id, args)
 
     def reference(self, project_id, key):
         """One entry through `ref get`; an unknown or unfinished key is a 404."""
-        return self._ref_read(project_id, ['get', key], missing=True)
+        return self._ref_read(project_id, ['get', caller_arg(key, 'key')], missing=True)
+
+    def proposal_read(self, project_id, args, missing=False):
+        """One read-only `proposal get|list|mine` through the endpoint (.58 slice 1b).
+
+        Launched by this service, the endpoint returns the unfiltered view (coordinator
+        text included); the ROUTE withholds it per caller. An unknown key is a 404.
+        """
+        reply = self._endpoint('proposal', project_id, self.actor_namespace + '/read', args)
+        code = reply.get('returncode') if isinstance(reply, dict) else None
+        stderr = (reply.get('stderr') or '') if isinstance(reply, dict) else ''
+        if code == 2 and 'Unknown action' in stderr:
+            raise not_implemented('The canonical endpoint is older than this HTTP service and has '
+                                  'no requirement proposals; install the same kit for both')
+        if code == 2 and missing and ('Unknown proposal key' in stderr or 'no revision record yet' in stderr):
+            raise not_found('Proposal not found')
+        payload = self._checked(reply)
+        if not isinstance(payload, dict):
+            raise uncertain('Canonical proposal read returned an unexpected shape')
+        return payload
 
     def _ref_read(self, project_id, args, missing=False):
         reply = self._endpoint('ref', project_id, self.actor_namespace + '/read', args)
@@ -1579,6 +1633,38 @@ def next_action(task):
     if task.get('assignee'):
         return {'who': 'assignee', 'text': 'Deliver a contribution'}
     return {'who': 'anyone', 'text': 'Claim this task'}
+
+
+def caller_arg(value, name):
+    """A caller-supplied value on its way into an endpoint argument list.
+
+    Never a flag and never the attachment transport: a query value such as `--help`
+    used to reach the endpoint's own option parser and came back as its help payload
+    (kittrial-5bb.70 review 01a10262). Each route validates its values against their
+    closed set or pattern first; this is the backstop every such value passes through.
+    """
+    if not isinstance(value, str) or not value or value.startswith(('-', '@')) or '\0' in value:
+        raise invalid('%s is not a valid value' % name)
+    return value
+
+
+def operator_allowlist_warnings(root):
+    """What to say at service start when the runtime's operator allowlist holds a name
+    with the shape of an HTTP account or agent id: that id would be an operator for every
+    host-command check, and this service acts under such ids. Never raises."""
+    if not root:
+        return []
+    try:
+        document = json.loads((Path(root) / 'deployment.private.json').read_text(encoding='utf-8'))
+        names = document.get('operators')
+        names = [names] if isinstance(names, str) else names
+    except (OSError, ValueError, AttributeError):
+        return []
+    from http_authority import http_shaped_names
+    shaped = http_shaped_names(names if isinstance(names, list) else [])
+    return ['Warning: the operator allowlist of %s holds %s, which has the shape of an HTTP account or agent id. '
+            'Remove it with admin.py operators remove NAME --confirm-revoke.' % (root, ', '.join(shaped))] \
+        if shaped else []
 
 
 def task_matches(task, filters):
@@ -2945,6 +3031,235 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._project(ctx, CAP_READ)
         return 200, self.backend.reference(ctx.params['pid'], ctx.params['key'])
 
+    # -- contributed requirement proposals (.58 slice 1b, kittrial-5bb.70) -----------
+    #
+    # Identity is server-bound here, so what is a host command over SSH is a route:
+    # a member proposes (`proposals.write`), a member with `reviews.approve` triages and
+    # decides. Every write goes through the canonical endpoint, which re-validates the
+    # live authority and applies the same rules as the host commands (compare-and-swap,
+    # the state machine, the no-self rules). Proposal text is untrusted: it is returned
+    # only as bounded excerpt objects and never enters an error body or an audit record.
+    PROPOSAL_SUBMIT_FIELDS = ('target', 'text', 'rationale', 'evidence', 'attachments', 'supersedes')
+    PROPOSAL_REVISE_FIELDS = ('key', 'revision', 'expected_sha256', 'target', 'text', 'rationale', 'evidence',
+                              'attachments')
+    PROPOSAL_DISPOSE_FIELDS = ('previous', 'proposal_sha256', 'to_state', 'reason', 'question', 'duplicate_of',
+                               'escalation', 'decision', 'incorporation')
+
+    def _proposals_backend(self):
+        if not getattr(self.backend, 'PROPOSALS', False):
+            raise not_implemented('Requirement proposals are native records; they are not available on this '
+                                  'backend')
+
+    def _proposal_body(self, ctx, allowed, where):
+        payload = dict(ctx.payload or {})
+        operation_id = payload.pop('operation_id', None)
+        unknown = sorted(set(payload) - set(allowed))
+        if unknown:
+            # Field names only: a value may be proposal text.
+            raise invalid('%s does not take: %s' % (where, ', '.join(unknown)[:200]))
+        if operation_id is not None and (not isinstance(operation_id, str) or not SAFE_ID.match(operation_id)):
+            raise invalid('operation_id must be a short identifier')
+        return payload, operation_id
+
+    def _proposal_view(self, ctx, capabilities, item):
+        """One proposal item or record as THIS caller may see it (design 6.3, 6.4).
+
+        A rejection reason, a coordinator question and an escalation question are
+        returned only to the submitter and to members with `reviews.approve`; everyone
+        else gets `null` and `withheld: true`. The comparison uses server-bound
+        identity: the caller's account (for an agent, its owner's).
+        """
+        item = dict(item)
+        submitter = item.get('submitter')
+        if isinstance(submitter, str) and submitter.startswith('account:'):
+            account = submitter[len('account:'):]
+            item['submitter_name'] = self.service.actor_names([account]).get(account, None)
+        # "Mine" needs the proposal to be verified as the account's: one that merely names
+        # it, or whose later revision someone else wrote, does not show its coordinator
+        # text to that account (review 01a10262).
+        mine = submitter == 'account:' + ctx.principal.user_id and item.get('identity') == 'verified'
+        item['mine'] = mine
+        if mine or CAP_APPROVE in capabilities:
+            return item
+
+        def withhold(disposition):
+            if not isinstance(disposition, dict):
+                return disposition
+            shown = dict(disposition)
+            hidden = shown.get('reason') is not None or shown.get('question') is not None
+            shown['reason'] = shown['question'] = None
+            if isinstance(shown.get('escalation'), dict):
+                hidden = hidden or shown['escalation'].get('question') is not None
+                shown['escalation'] = dict(shown['escalation'], question=None)
+            shown['withheld'] = bool(hidden or shown.get('withheld'))
+            return shown
+        if 'disposition' in item:
+            item['disposition'] = withhold(item['disposition'])
+        if isinstance(item.get('timeline'), list):
+            item['timeline'] = [withhold(entry) for entry in item['timeline']]
+        return item
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/proposals')
+    def proposals_submit(self, ctx):
+        """Submit a proposal, or revise your own (a body with `key`).
+
+        `submitter` is bound to the signed-in account; for an agent credential it is the
+        agent's owner and the agent is recorded. Neither is caller-supplied. A worker
+        credential cannot propose.
+        """
+        self._proposals_backend()
+        self._project(ctx, CAP_PROPOSALS)
+        principal = ctx.principal
+        if principal.via == 'credential' and not principal.agent_id:
+            raise forbidden('A worker credential cannot submit a proposal; a member session or an agent '
+                            'credential can')
+        revise = 'key' in (ctx.payload or {})
+        fields, operation_id = self._proposal_body(
+            ctx, self.PROPOSAL_REVISE_FIELDS if revise else self.PROPOSAL_SUBMIT_FIELDS,
+            'A proposal %s (submitter is bound to the signed-in account)' % ('revision' if revise else 'submission'))
+        body = dict(fields, schema_version=1, operation='revise' if revise else 'submit',
+                    submitter='account:' + principal.user_id, operation_id=operation_id)
+        pid = ctx.params['pid']
+
+        def submit():
+            result = self.backend.invoke('proposals.submit', principal, pid,
+                                         {'command': body['operation'], 'body': body}, ctx.idempotency_key,
+                                         target=ctx.route_target, authorize=ctx.authorize,
+                                         capability=CAP_PROPOSALS)
+            return result, result
+        return self._mutate(ctx, 'proposals.submit', pid, submit, status=200 if revise else 201,
+                            capability=CAP_PROPOSALS, serialize=False, canonical=True)
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/proposals')
+    def proposals_list(self, ctx):
+        """The proposal queue at CAP_READ: `state`, `target`, `limit` and the page `cursor`."""
+        self._proposals_backend()
+        self._project(ctx, CAP_READ)
+        pid = ctx.params['pid']
+        limit, state = self._page(ctx, ctx.query)
+        args = ['list', '--limit', str(limit), '--offset', str(state['o'])]
+        import proposal_records
+        wanted = ctx.query.get('state')
+        if wanted:
+            if wanted not in proposal_records.STATES:
+                raise invalid('state must be one of ' + ', '.join(proposal_records.STATES))
+            args += ['--state', caller_arg(wanted, 'state')]
+        target = ctx.query.get('target')
+        if target:
+            if not proposal_records.valid_target_filter(target):
+                raise invalid('target must be a requirement key or a requirement area')
+            args += ['--target', caller_arg(target, 'target')]
+        result = dict(self.backend.proposal_read(pid, args))
+        capabilities = self.service.capabilities_for(ctx.principal, pid)
+        result['items'] = [self._proposal_view(ctx, capabilities, item) for item in result.get('items') or []]
+        result['next_cursor'] = (make_cursor(ctx.principal, pid, ctx.query, result['next_offset'])
+                                 if result.get('next_offset') is not None else None)
+        result['can_triage'] = CAP_APPROVE in capabilities
+        result['can_propose'] = CAP_PROPOSALS in capabilities
+        return 200, result
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/proposals/(?P<key>' + PROPOSAL_KEY + r')')
+    def proposals_get(self, ctx):
+        """One proposal: the newest revision, the disposition timeline and the derived links."""
+        self._proposals_backend()
+        self._project(ctx, CAP_READ)
+        pid = ctx.params['pid']
+        args = ['get', caller_arg(ctx.params['key'], 'key')]
+        if ctx.query.get('history'):
+            if not re.fullmatch(r'[0-9]{1,2}', ctx.query['history']):
+                raise invalid('history must be a number from 1 to 50')
+            args += ['--history', caller_arg(ctx.query['history'], 'history')]
+        capabilities = self.service.capabilities_for(ctx.principal, pid)
+        result = self._proposal_view(ctx, capabilities, self.backend.proposal_read(pid, args, missing=True))
+        result['can_triage'] = CAP_APPROVE in capabilities
+        return 200, result
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/proposals/(?P<key>' + PROPOSAL_KEY + r')/dispositions')
+    def proposals_dispose(self, ctx):
+        """Triage (`operation: review`, the default) or the owner decision (`decide`).
+
+        A signed-in member with `reviews.approve`; no credential ever holds it. The body
+        carries the compare-and-swap pair the detail read returned (`previous`,
+        `proposal_sha256`) and `to_state` with its one required field. The endpoint
+        applies the rules of the host commands: the transition must be legal, the caller
+        is not the submitter or the author, and a decider is not the escalator.
+        """
+        self._proposals_backend()
+        self._project(ctx, CAP_APPROVE)
+        principal = ctx.principal
+        if principal.via == 'credential':
+            raise forbidden('A credential cannot record a proposal disposition')
+        payload = dict(ctx.payload or {})
+        command = payload.pop('operation', 'review')
+        if command not in ('review', 'decide'):
+            raise invalid('operation must be review or decide')
+        ctx.payload = payload
+        fields, operation_id = self._proposal_body(ctx, self.PROPOSAL_DISPOSE_FIELDS, 'A proposal disposition')
+        body = dict(fields, schema_version=1, operation=command, key=ctx.params['key'], operation_id=operation_id)
+        pid = ctx.params['pid']
+
+        def dispose():
+            result = self.backend.invoke('proposals.dispose', principal, pid, {'command': command, 'body': body},
+                                         ctx.idempotency_key, target=ctx.route_target,
+                                         authorize=ctx.authorize, capability=CAP_APPROVE)
+            return result, result
+        return self._mutate(ctx, 'proposals.dispose', pid, dispose, status=201, capability=CAP_APPROVE,
+                            serialize=False, canonical=True, reason='%s %s' % (command, ctx.params['key']))
+
+    @route('GET', r'/v1/me/contributions')
+    def me_contributions(self, ctx):
+        """The signed-in person's own proposals across their projects (design 7.1).
+
+        Session only: the identity is the session's account and cannot be named. One
+        read per project, at most ME_WORK_MAX_PROJECTS projects. Newest first, with a
+        page `cursor`: each read takes the newest `offset + limit` of a project, and the
+        merged list is sliced, so the order is exact across projects. The log pages
+        through the newest ME_CONTRIBUTIONS_MAX proposals; beyond that it says
+        `truncated`. Reading changes nothing.
+        """
+        self._proposals_backend()
+        principal = ctx.principal
+        if principal.via == 'credential':
+            raise forbidden('Session authority required')
+        limit, state = self._page(ctx, ctx.query)
+        offset = state['o']
+        if offset >= ME_CONTRIBUTIONS_MAX:
+            # Not a cursor this route issued: it never points past the newest
+            # ME_CONTRIBUTIONS_MAX (a cursor is not signed, so the offset is checked).
+            raise conflict('Cursor is stale or belongs to a different query')
+        wanted = min(offset + limit, ME_CONTRIBUTIONS_MAX)
+        projects = [p for p in self.service.list_projects(principal)
+                    if not p.get('archived') and principal.user_id in (p.get('members') or [])]
+        truncated = len(projects) > ME_WORK_MAX_PROJECTS
+        items, unavailable, total = [], [], 0
+        for project in projects[:ME_WORK_MAX_PROJECTS]:
+            capabilities = self.service.capabilities_for(principal, project['id'])
+            if CAP_READ not in capabilities:
+                continue
+            try:
+                read = self.backend.proposal_read(project['id'], [
+                    'mine', '--submitter', 'account:' + principal.user_id, '--limit', str(wanted),
+                    '--order', 'newest'])
+            except HttpError as error:
+                unavailable.append({'project': project['id'], 'reason': error.code})
+                continue
+            total += read.get('total') or 0
+            for item in read.get('items') or []:
+                items.append(dict(self._proposal_view(ctx, capabilities, item), project=project['id'],
+                                  project_name=project['name']))
+        items.sort(key=lambda item: (item.get('submitted_at') or '', item.get('key') or ''), reverse=True)
+        if offset and offset >= total and not unavailable:
+            raise conflict('Cursor is stale or belongs to a different query')
+        more = offset + limit < total
+        reachable = offset + limit < ME_CONTRIBUTIONS_MAX
+        truncated = truncated or (more and not reachable)
+        return 200, {'items': items[offset:offset + limit], 'total': total, 'truncated': truncated,
+                     'next_cursor': make_cursor(principal, None, ctx.query, offset + limit)
+                     if more and reachable else None,
+                     'unavailable': unavailable,
+                     'identity': 'account:' + principal.user_id,
+                     'generated_at': now_iso(self.service._now())}
+
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/brief')
     def tasks_brief(self, ctx):
         """The task page in one read: row, current checkpoint, review chain, facts.
@@ -3382,6 +3697,8 @@ def main(argv=None):
         trusted.append('localhost')
     service = Service(store, public_url=args.public_url)
     backend = build_backend(service, args)
+    for line in operator_allowlist_warnings(args.root if args.backend == 'endpoint' else None):
+        print(line, file=sys.stderr)
     httpd = create_server(service, backend, host=args.host, port=args.port,
                           trusted_proxies=trusted, max_body=args.max_body,
                           certfile=args.cert, keyfile=args.key,
