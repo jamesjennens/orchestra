@@ -283,6 +283,13 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
     items.sort(key=lambda r:(priority.get(r['review_state'],4),r['task']))
     result={'owner':owner,'total':len(items),'items':items[a.offset:a.offset+a.limit],'next_offset':a.offset+a.limit if a.offset+a.limit<len(items) else None,
             'coverage':'Fresh current view; structured review takes precedence over legacy review-ready labels. Lifecycle facts remain independent; malformed handoff journals are surfaced as errors.'}
+    if journal is not None:
+        # The standing guidance channel (kittrial-5bb.99): every work queue page
+        # carries the current guidance version, so a worker that only runs `work`
+        # still sees that the coordinator's guidance changed. A project with no
+        # guidance reads as present: false, never an error.
+        from guidance import brief_block
+        result['guidance']=brief_block(journal,actor)
     warnings=[]
     for item in items:
         for warning in item['integration_warnings']:

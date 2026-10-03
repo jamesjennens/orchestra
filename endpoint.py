@@ -220,6 +220,29 @@ def execute(root,request,authority_config=None,require_authority=False):
     if action in ('onboard','docs'):
         from onboarding import execute as onboard
         return {'returncode':0,'stdout':onboard(Path(__file__).resolve().parent,path,name,actor,action,request.get('args',[]),endpoint=Path(__file__).resolve()),'stderr':''}
+    if action=='guidance':
+        # The standing guidance channel (kittrial-5bb.99 slice 1). Reads (get,
+        # version) take no coordination lock; `ack` records the calling actor's own
+        # acknowledgement, so it holds the lock like feedback. The write route is
+        # the operator host command (admin.py set-guidance) only; `status` is the
+        # operator read of who has acknowledged what.
+        import guidance
+        args=request.get('args',[])
+        if not isinstance(args,list) or any(not isinstance(a,str) or '\0' in a for a in args):
+            raise ValueError('Expected argument list')
+        if args[:1]==['ack']:
+            if len(args)!=1:raise ValueError('Use guidance ack without arguments')
+            with (path/'.coordination.lock').open('a') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX)
+                result=guidance.acknowledge(path,actor)
+        elif args[:1]==['status']:
+            if len(args)!=1:raise ValueError('Use guidance status without arguments')
+            result=guidance.status(path,actor,configured_operators(root))
+        elif args[:1]==['version']:
+            result=guidance.state(path,actor)
+        else:
+            result=guidance.read(path,args,actor)
+        return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False,indent=2)+'\n','stderr':''}
     if action=='anchors':
         # Read-only (kittrial-5bb.71): which rows are record anchors, by the predicate
         # every surface uses (reserved_comments.is_record_anchor), in ONE native read:

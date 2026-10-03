@@ -477,7 +477,7 @@ def main():
     if args[:1]==['refresh']:action='refresh';args=[]
     elif args[:1]==['view']:
         action='view';path=args[1] if len(args)>1 else 'CURRENT.md';args=[]
-    elif args[:1] in (['brief'],['history'],['checkpoint'],['onboard'],['docs'],['session'],['handoff'],['review'],['work'],['feedback'],['requirement'],['ref'],['capability'],['proposal']):action=args.pop(0)
+    elif args[:1] in (['brief'],['history'],['checkpoint'],['onboard'],['docs'],['session'],['handoff'],['review'],['work'],['feedback'],['requirement'],['ref'],['capability'],['proposal'],['guidance']):action=args.pop(0)
     result=request(json.loads(Path(a.config).read_text()),a.project,a.actor,args,action,path)
     output = result['stdout']
     if action == 'session' and args[:1] == ['resume'] and result['returncode'] == 0:

@@ -168,6 +168,7 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     deps=[d for d in (issue.get('dependencies') or []) if d.get('type')!='parent-child']
     from work import workflow
     from review_state import is_integration_warning, scopes_for
+    from guidance import brief_block
     review=workflow(issue,scopes_for(rows,task),operators=operators,journal=journal)
     # ORIGINAL meaning: does the scope currently shown in `lifecycle`/`lifecycle_scope`
     # (the newest recorded scope) belong to the current contribution? The ANY-scope
@@ -211,6 +212,7 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
                'attention_total':attention['attention_total']+capabilities['attention_total'],
                'attention_more':((attention['attention_more'] or 0)+(capabilities['attention_more'] or 0)) or None}
     return {**attention,'task':task,'title':clip(issue.get('title'),200),'owner':clip(issue.get('assignee') or 'unassigned',96),'status':issue.get('status'),
+            'guidance':brief_block(journal,actor) if journal is not None else None,
             'activity_cursor':activity_cursor(data),'checkpoint':None if p is None else {'comment_id':str(c['id']),'author':clip(c.get('author'),96),'timestamp':c.get('created_at'),'source_commit':p['source_commit'],'branch':p['branch'],'incorporated_activity_cursor':p['activity_cursor'],
                 'newer_activity':p['activity_cursor']!=activity_cursor(snapshot(rows,project,task,str(c['id'])))},
             'intent':clip(p['intent'] if p else issue.get('description'),600),'acceptance':clip(p['acceptance'] if p else issue.get('acceptance_criteria'),1000),
@@ -303,6 +305,13 @@ def format_brief(result):
            'Review/contribution: '+json.dumps(result['review'],ensure_ascii=False),
            'Intent: '+excerpt(result['intent']),'Acceptance: '+excerpt(result['acceptance']),
            'Current position: '+result['current_position'],'Next: '+result['next_action']]
+    guidance=result.get('guidance')
+    if guidance and guidance.get('present'):
+        lines.append('Guidance: version %s set by %s at %s | acknowledged: %s | attention: %s'%(
+            guidance['version'],guidance.get('set_by') or 'unknown',guidance.get('set_at') or 'unknown',
+            guidance.get('acknowledged'),guidance.get('attention')))
+    if guidance and guidance.get('warning'):
+        lines.append('Guidance warning: '+guidance['warning'])
     cp=result['checkpoint']
     if cp:lines += [f'Checkpoint: {cp["comment_id"]} by {excerpt(cp["author"])} at {cp["timestamp"]}',f'Branch: {cp["branch"] or "unknown"} | Source commit: {cp["source_commit"] or "unknown"}',
                     'Newer/changed activity: '+str(cp['newer_activity']), 'Incorporated activity cursor: '+cp['incorporated_activity_cursor']]

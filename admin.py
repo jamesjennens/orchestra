@@ -1442,7 +1442,7 @@ def validate_coordination_files(files):
     for name,record in files.items():
         quarantine = isinstance(name,str) and re.fullmatch(r'\.feedback\.jsonl\.(?:[a-f0-9]{16}|[a-f0-9]{64})\.incomplete',name)
         journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-backfills|\.integration-reverts|\.reference-requests|\.proposal-requests|\.capability-requests)/[a-f0-9]{64}\.json',name)
-        if name not in ('.merge-context.json','ONBOARDING.md','.sessions.json','.feedback.jsonl') and not quarantine and not journal:raise ValueError('Invalid coordination backup path')
+        if name not in ('.merge-context.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.sessions.json','.feedback.jsonl') and not quarantine and not journal:raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
         if name=='.sessions.json':
             from sessions import validate
@@ -1477,6 +1477,13 @@ def validate_coordination_files(files):
             validate_revert_journal_entry(record,name.partition('/')[2])
             if not name.startswith(JOURNAL_DIR+'/'):raise ValueError('Invalid coordination backup path')
         if name=='ONBOARDING.md' and (set(record)!={'text'} or not isinstance(record['text'],str) or not record['text'].strip() or len(record['text'].encode('utf-8'))>8000):raise ValueError('Invalid onboarding backup')
+        if name=='GUIDANCE.md':
+            from guidance import validate_text
+            if set(record)!={'text'}:raise ValueError('Invalid guidance backup')
+            validate_text(record['text'])
+        if name=='.guidance.json':
+            from guidance import validate_meta
+            validate_meta(record)
         if name=='.feedback.jsonl':
             from feedback import validate_feed_text
             if set(record) != {'text'}:raise ValueError('Invalid feedback backup')
@@ -1869,6 +1876,20 @@ def backup_project(root,name):
         if (path/'ONBOARDING.md').exists() or (path/'ONBOARDING.md').is_symlink():
             from onboarding import read_document, PROJECT_LIMIT
             files['ONBOARDING.md']={'text':read_document(path,'ONBOARDING.md',PROJECT_LIMIT)}
+        if (path/'GUIDANCE.md').exists() or (path/'GUIDANCE.md').is_symlink():
+            # The standing guidance channel (kittrial-5bb.99): the text and its audit
+            # record are one generation, so a backup that could not read the audit
+            # refuses rather than silently dropping who set the guidance and the acks.
+            from guidance import (META_NAME as GUIDANCE_META, read_meta as read_guidance_meta,
+                                  read_text as read_guidance_text, validate_meta as validate_guidance_meta)
+            guidance_text=read_guidance_text(path)
+            guidance_meta=read_guidance_meta(path)
+            if guidance_meta is None:
+                raise ValueError('Guidance text exists without readable audit metadata; ask the operator to set '
+                                 'the guidance again before backing up')
+            validate_guidance_meta(guidance_meta)
+            files['GUIDANCE.md']={'text':guidance_text}
+            files[GUIDANCE_META]=guidance_meta
         feedback=path/'.feedback.jsonl'
         if feedback.exists() or feedback.is_symlink():
             if feedback.is_symlink():raise ValueError('Feedback feed must not be a symlink')
@@ -2758,6 +2779,13 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
             validate_revert_journal_entry(record,name.partition('/')[2])
         elif name.startswith(tuple(journal+'/' for journal in RECORD_JOURNALS)):
             validate_record_receipt(name,record)
+        elif name=='GUIDANCE.md':
+            from guidance import validate_text
+            if set(record)!={'text'}:raise ValueError('Invalid guidance backup')
+            validate_text(record['text'])
+        elif name=='.guidance.json':
+            from guidance import validate_meta
+            validate_meta(record)
     for name,record in files.items():
         target=project_dir(root,destination)/name
         target.parent.mkdir(exist_ok=True)
@@ -2768,6 +2796,13 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
         if name=='ONBOARDING.md':
             from onboarding import write_project
             write_project(target,record['text'])
+        elif name=='GUIDANCE.md':
+            from guidance import write_text as write_guidance_text
+            write_guidance_text(target,record['text'])
+        elif name=='.guidance.json':
+            from guidance import validate_meta
+            validate_meta(record)
+            atomic(target,record)
         elif name=='.feedback.jsonl':
             temporary=target.with_suffix('.tmp')
             temporary.write_text(record['text'],encoding='utf-8',newline='\n')
@@ -3048,6 +3083,10 @@ def main():
     a=sub.add_parser('install');a.add_argument('--port',type=int,default=13317);a.add_argument('--unit',default='beads-team.service')
     a=sub.add_parser('add-project');a.add_argument('project')
     a=sub.add_parser('set-onboarding');a.add_argument('project');a.add_argument('--file',required=True)
+    a=sub.add_parser('set-guidance',help='set the standing coordinator guidance every actor reads each run (operator allowlist, audited)')
+    a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('guidance-status',help='which actors have acknowledged which guidance version (operator allowlist)')
+    a.add_argument('project');a.add_argument('--actor',required=True)
     a=sub.add_parser('handoff');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('requirement-backfill');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('requirement-apply');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
@@ -3185,6 +3224,32 @@ def main():
         for warning in probe_endpoints(text,args.project,Path(__file__).resolve().parent):
             print(warning,file=sys.stderr)
         print('Project onboarding installed; back up the project after changes.')
+    elif args.command=='set-guidance':
+        import fcntl
+        from guidance import write_guidance
+        from keyed_records import require_configured_operator
+        # The operator allowlist is checked before the project is read or any file
+        # is written, so a contributor actor cannot set guidance even if it reaches
+        # the host command line.
+        require_configured_operator(args.actor,operators(root,strict=True),'set the project guidance')
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        text=Path(args.file).read_text(encoding='utf-8-sig')
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            result=write_guidance(path,text,args.actor)
+        print('Project guidance %s (version %s); back up the project after changes.'
+              %('installed' if result['changed'] else 'unchanged',result['version']))
+        print(json.dumps(result,sort_keys=True))
+    elif args.command=='guidance-status':
+        import fcntl
+        from guidance import status as guidance_status
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            guidance_report=guidance_status(path,args.actor,operators(root,strict=True))
+        print(json.dumps(guidance_report,sort_keys=True,indent=2))
     elif args.command=='service':print(service(root,args.action))
     elif args.command=='record-store':
         try:
