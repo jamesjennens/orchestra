@@ -366,7 +366,7 @@ class AuthorizedKeysCommandTests(unittest.TestCase):
         self.assertIn('ssh_forced_command.py', payload['contributor'])
         self.assertTrue(payload['contributor'].startswith('command="'))
         self.assertEqual(payload['operator'], KEY_LINE)
-        self.assertIn('unrestricted', payload['operator_note'])
+        self.assertIn('Unrestricted', payload['operator_note'])
         self.assertIn('warning', err)
 
     def test_role_contributor_omits_the_operator_line(self):
@@ -425,7 +425,8 @@ class EndToEndTests(unittest.TestCase):
                                                                           self.state))
         self.assertEqual(completed.returncode, 2)
         self.assertEqual(completed.stdout, '')
-        self.assertIn('may not run', completed.stderr)
+        self.assertTrue(completed.stderr.startswith('ssh_forced_command: '))
+        self.assertIn('refused', completed.stderr)
 
     def test_flags_are_refused(self):
         completed = self.run_wrapper('%s --root /srv/other' % self.endpoint)
