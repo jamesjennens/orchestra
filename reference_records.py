@@ -419,20 +419,26 @@ def get(rows, key, operators, current=None):
             'acceptance': entry['acceptance'], 'acceptance_inert': entry['acceptance_inert'],
             'inert_operator': entry['inert_operator'],
             'replaces': [], 'proposed': _record_view(entry['proposed']),
-            'proposed_comment_id': entry['proposed_comment_id'], 'due': entry['due'], 'resolved': None,
-            'warnings': entry['warnings'][:10], 'trust': 'accepted' if entry['record'] else 'draft',
+            'proposed_comment_id': entry['proposed_comment_id'],
+            'due': 'conflicted' if entry['state'] == 'conflicted' else entry['due'], 'resolved': None,
+            'warnings': entry['warnings'][:10],
+            'trust': 'conflicted' if entry['state'] == 'conflicted' else 'accepted' if entry['record'] else 'draft',
+            'anchors': entry.get('duplicate_anchors', []),
             'coverage': 'newest accepted revision and its acceptance evidence; unresolved drafts are returned '
                         'in proposed'}
 
 
 def _list_item(entry):
-    source = entry['record'] or entry['proposed'] or {}
-    return {'key': entry['key'], 'title': (source.get('title') or '')[:TITLE_MAX], 'state': entry['state'],
+    source = entry.get('candidate') or entry['record'] or entry['proposed'] or {}
+    item = {'key': entry['key'], 'title': (source.get('title') or '')[:TITLE_MAX], 'state': entry['state'],
             'owner': source.get('owner'), 'review_by': source.get('review_by') if entry['record'] else None,
             'proposed_review_by': (entry['proposed'] or {}).get('review_by'),
-            'due': entry['due'], 'tags': source.get('tags') or [],
+            'due': 'conflicted' if entry['state'] == 'conflicted' else entry['due'], 'tags': source.get('tags') or [],
             'revision': source.get('revision'), 'native_id': entry['native_id'],
             'acceptance_inert': entry['acceptance_inert']}
+    if entry['state'] == 'conflicted':
+        item.update(trust='conflicted', anchor_trust=entry['anchor_trust'])
+    return item
 
 
 def list_entries(rows, options, operators, current=None):
@@ -468,9 +474,19 @@ def work_attention(rows, actor, operators, current=None, limit=20, offset=0):
     entries are counted as `unset` and listed only by `ref list --state draft-only`.
     """
     entries, incomplete = catalog(rows, operators, current)
-    counts = {'expired': 0, 'due_soon': 0, 'unset': 0, 'acceptance_inert': 0, 'malformed': 0, 'total': 0}
+    counts = {'conflicted': 0, 'expired': 0, 'due_soon': 0, 'unset': 0, 'acceptance_inert': 0, 'malformed': 0, 'total': 0}
     candidates = []
+    conflict_groups = set()
     for entry in entries:
+        if entry['state'] == 'conflicted':
+            group = tuple(anchor['native_id'] for anchor in entry['duplicate_anchors'])
+            if group in conflict_groups:
+                continue
+            conflict_groups.add(group)
+            counts['conflicted'] += 1
+            counts['total'] += 1
+            candidates.append(dict(_attention_item(entry), due='conflicted', anchors=entry['duplicate_anchors']))
+            continue
         if entry['state'] in ('malformed', 'unsupported'):
             counts['malformed'] += 1
             continue
@@ -491,8 +507,8 @@ def work_attention(rows, actor, operators, current=None, limit=20, offset=0):
             flagged = True
         counts['total'] += flagged
     approver = actor in configured_operators(operators if operators is not None else ())
-    order = {'acceptance-inert': 0, 'expired': 1, 'due-soon': 2}
-    candidates.sort(key=lambda item: (order.get(item['due'], 9), item['key']))
+    order = {'conflicted': -1, 'acceptance-inert': 0, 'expired': 1, 'due-soon': 2}
+    candidates.sort(key=lambda item: (order.get(item['due'], 9), item['key'] or ''))
     items = candidates[offset:offset + limit] if approver else []
     block = dict(counts, items=items,
                  truncated=(not approver and bool(candidates)) or offset + limit < len(candidates),

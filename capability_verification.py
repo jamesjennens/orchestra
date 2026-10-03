@@ -408,6 +408,7 @@ def verify(payload, actor, run, operators=None, verifiers=None, journal=None, op
     validate_payload(payload)
     key = payload['key']
     rows = records.KIND.read_key_rows(run, key)
+    records.KIND.require_unique_key(rows, key)
     entry = records.KIND.find_entry(rows, key, operators, view=records.entry_view)
     if entry['state'] in ('malformed', 'unsupported'):
         raise ValueError('Capability %s cannot be read (%s); it cannot be verified' % (key, entry['state']))
@@ -471,7 +472,8 @@ def _check_failing_caps(run, operators, trusted, journal):
     for entry in entries:
         if entry['state'] in ('malformed', 'unsupported', 'superseded'):
             continue
-        block = derive(entry.get('verification_records') or [], records._newest(entry), trusted, integrated)
+        revision = entry.get('candidate') or records._newest(entry)
+        block = derive(entry.get('verification_records') or [], revision, trusted, integrated)
         pool += sum(1 for item in block['open_failing'] if not item['trusted'])
     if pool >= CAP_UNVERIFIED_FAILING:
         raise ValueError('The shared pool of open failing reports from unverified submitters is full (%d per '

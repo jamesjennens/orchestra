@@ -339,7 +339,7 @@ def check_successor(key, successor, rows):
 
 def _newest(entry):
     """The revision a reader describes: the accepted one, else the newest draft, else the newest of any state."""
-    if not entry:
+    if not entry or entry['state'] == 'conflicted':
         return None
     return entry.get('record') or entry.get('proposed') or entry.get('newest')
 
@@ -541,8 +541,8 @@ def apply_batch(payload, actor, run, project, operators=None, lock=None):
     the exact item list, so a changed list under the same id is refused. Items run in
     list order, each through the single core write (evidence, then the revision, then
     the label) with its own receipt keyed `(operation_id, key)`; an item whose receipt is
-    complete is reported `already-accepted` without a native call, which is how a retry
-    resumes at the first incomplete item. A refusal before an item's writes is reported
+    complete rechecks its key for duplicate anchors before reporting `already-accepted`,
+    with no native write. A refusal before an item's writes is reported
     `refused` and the batch continues; an uncertain write stops the batch (`uncertain`,
     reconcile that item), and the rest stay `not-run` until a retry.
 
@@ -594,6 +594,10 @@ def _apply_item(payload, item, actor, run, project, operators, journal):
     item_receipt = core.receipt_path(journal, content_hash({'operation_id': operation_id}), 'capability')
     done = load_json(item_receipt) if item_receipt.exists() else None
     if isinstance(done, dict) and done.get('status') == 'complete':
+        try:
+            KIND.require_unique_key(KIND.read_key_rows(run, item['key']), item['key'])
+        except ValueError as error:
+            return {'key': item['key'], 'result': 'refused', 'reason': str(error)}
         return {'key': item['key'], 'result': 'already-accepted', 'revision': done.get('revision'),
                 'native_id': done.get('id')}
     single = {'schema_version': 1, 'operation_id': operation_id, 'operation': 'accept', 'key': item['key'],
@@ -613,7 +617,7 @@ def _apply_item(payload, item, actor, run, project, operators, journal):
             return {'key': item['key'], 'result': 'uncertain',
                     'reason': 'the native write did not confirm; reconcile %s with admin.py '
                               'capability-reconcile --operation-id %s' % (item['key'], operation_id)}
-        return {'key': item['key'], 'result': 'refused', 'reason': text[:300]}
+        return {'key': item['key'], 'result': 'refused', 'reason': text}
     # `accepted` when this run wrote (including finishing an earlier uncertain attempt);
     # `already-accepted` when the item's accepted revision and evidence were already there.
     return {'key': item['key'], 'result': 'accepted' if writes else 'already-accepted',
@@ -641,6 +645,7 @@ def propose_alias(key, alias, actor, run, operators, evidence=None, operator=Fal
     if evidence is not None:
         _pointers([evidence], 'evidence', 1, ('::', '#', ''))
     rows = KIND.read_rows(run)
+    KIND.require_unique_key(rows, key)
     entries, _ = catalog(rows, operators)
     target = next((entry for entry in entries if entry['key'] == key), None)
     if target is None or target['state'] in ('malformed', 'unsupported'):
@@ -703,6 +708,7 @@ def reject_alias(payload, actor, run, project, operators=None):
     valid_alias_text(payload.get('alias'))
     _bounded_text(payload.get('reason'), 'reason', REASON_MAX)
     rows = KIND.read_rows(run)
+    KIND.require_unique_key(rows, payload['key'])
     entries, _ = catalog(rows, operators)
     target = next((entry for entry in entries if entry['key'] == payload['key']), None)
     if target is None:
@@ -781,6 +787,10 @@ class Trust:
 def verification_of(entry, trust):
     """The `verification` block of the revision a reader describes (.60 section 5.2)."""
     trust = trust or Trust()
+    if entry['state'] == 'conflicted':
+        block = verification.derive([], None, trust.actors, trust.integrated)
+        block['state'] = 'conflicted'
+        return block
     return verification.derive(entry.get('verification_records') or [], _newest(entry), trust.actors,
                                trust.integrated)
 
@@ -820,9 +830,10 @@ def get(rows, key, operators, trust=None):
     entry = KIND.find_entry(rows, key, operators, view=entry_view)
     entries, _ = catalog(rows, operators)
     checked = verification.public(verification_of(entry, trust)) \
-        if entry['state'] not in ('malformed', 'unsupported') else None
+        if entry['state'] not in ('malformed', 'unsupported', 'conflicted') else None
     return {'schema_version': 1, 'key': key, 'state': entry['state'], 'native_id': entry['native_id'],
-            'trust': 'accepted' if entry['record'] else 'draft',
+            'trust': 'conflicted' if entry['state'] == 'conflicted' else 'accepted' if entry['record'] else 'draft',
+            'anchors': entry.get('duplicate_anchors', []),
             'record': _record_view(entry['record']), 'record_comment_id': entry['record_comment_id'],
             'acceptance': entry['acceptance'], 'acceptance_inert': entry['acceptance_inert'],
             'inert_operator': entry['inert_operator'], 'proposed': _record_view(entry['proposed']),
@@ -837,16 +848,20 @@ def get(rows, key, operators, trust=None):
 
 
 def _list_item(entry, trust=None, pointers=False):
-    source = entry['record'] or entry['proposed'] or {}
+    source = entry.get('candidate') or entry['record'] or entry['proposed'] or {}
     item = {'key': entry['key'], 'name': (source.get('name') or '')[:NAME_MAX], 'state': entry['state'],
-            'trust': 'accepted' if entry['record'] else 'draft', 'owner': source.get('owner'),
+            'trust': 'conflicted' if entry['state'] == 'conflicted' else 'accepted' if entry['record'] else 'draft',
+            'owner': source.get('owner'),
             'tags': source.get('tags') or [], 'revision': source.get('revision'), 'native_id': entry['native_id'],
             'aliases_pending': len(entry['aliases_pending']), 'acceptance_inert': entry['acceptance_inert'],
-            'verification': verification_of(entry, trust)['state']}
+            'verification': 'conflicted' if entry['state'] == 'conflicted' else verification_of(entry, trust)['state']}
+    if entry['state'] == 'conflicted':
+        item['anchor_trust'] = entry['anchor_trust']
     if pointers:
         # What `capability check` needs to verify this row's revision in a checkout.
-        item.update(record_sha256=source.get('sha256'), code=source.get('code') or [],
-                    tests=source.get('tests') or [], anchors=source.get('anchors') or [])
+        checked = source if entry['state'] != 'conflicted' else {}
+        item.update(record_sha256=checked.get('sha256'), code=checked.get('code') or [],
+                    tests=checked.get('tests') or [], anchors=checked.get('anchors') or [])
     return item
 
 
@@ -866,8 +881,8 @@ def list_entries(rows, options, operators, trust=None):
             'items': [_list_item(entry, trust, options.get('pointers', False))
                       for entry in good[offset:offset + limit]],
             'next_offset': offset + limit if offset + limit < len(good) else None,
-            'coverage': KIND.coverage(entries, incomplete, 'one row per key: the newest accepted revision, or the '
-                                                           'newest draft when none is accepted')}
+            'coverage': KIND.coverage(entries, incomplete, 'one row per unambiguous key; every conflicted anchor '
+                                                           'is shown without a selected record')}
 
 
 def _exact_phrases(entry):
@@ -876,7 +891,7 @@ def _exact_phrases(entry):
     The names are the key and the name of the revision a reader describes (the accepted
     one, else the newest draft); the aliases are those of the accepted revision only.
     """
-    record = _newest(entry) or {}
+    record = entry.get('candidate') or _newest(entry) or {}
     names = {normalize(entry['key']), normalize(record.get('name') or '')}
     accepted_aliases = {normalize(item) for item in ((entry.get('record') or {}).get('aliases') or [])}
     return names, accepted_aliases
@@ -890,7 +905,7 @@ def exact_index(rows, operators):
     """
     entries, _ = catalog(rows, operators)
     index = {}
-    for entry in sorted((entry for entry in entries if entry['state'] not in ('malformed', 'unsupported')),
+    for entry in sorted((entry for entry in entries if entry['state'] not in ('malformed', 'unsupported', 'conflicted')),
                         key=lambda entry: (entry['record'] is None, entry['key'])):
         names, accepted_aliases = _exact_phrases(entry)
         for phrase in sorted(names | accepted_aliases):
@@ -919,14 +934,14 @@ def find(rows, phrase, operators, limit=5, trust=None):
     key = normalize(text)
     wanted = stems(text)
     entries, incomplete = catalog(rows, operators)
-    exact, scored = [], []
+    exact, conflicted, scored = [], [], []
     for entry in entries:
-        if entry['state'] in ('malformed', 'unsupported'):
+        if entry['state'] in ('malformed', 'unsupported') or entry['key'] is None:
             continue
-        record = _newest(entry) or {}
+        record = entry.get('candidate') or _newest(entry) or {}
         names, accepted_aliases = _exact_phrases(entry)
         if text == entry['key'] or key in names | accepted_aliases:
-            exact.append(entry)
+            (conflicted if entry['state'] == 'conflicted' else exact).append(entry)
             continue
         pending = {item['normalized'] for item in entry['aliases_pending']}
         draft_aliases = {normalize(item) for item in record.get('aliases') or []} - accepted_aliases
@@ -941,28 +956,40 @@ def find(rows, phrase, operators, limit=5, trust=None):
         if score >= 0.2:
             scored.append((score, entry))
     exact.sort(key=lambda entry: (entry['record'] is None, entry['key']))
+    groups = {tuple(anchor['native_id'] for anchor in entry['duplicate_anchors']) for entry in conflicted}
+    conflicted = [entry for entry in entries if entry['state'] == 'conflicted'
+                  and tuple(anchor['native_id'] for anchor in entry['duplicate_anchors']) in groups]
     scored.sort(key=lambda pair: (-pair[0], pair[1]['record'] is None, pair[1]['key']))
 
     def shown(entry, score=None):
-        record = _newest(entry) or {}
-        item = {'key': entry['key'], 'trust': 'accepted' if entry['record'] else 'draft', 'state': entry['state'],
+        record = entry.get('candidate') or _newest(entry) or {}
+        item = {'key': entry['key'],
+                'trust': 'conflicted' if entry['state'] == 'conflicted' else 'accepted' if entry['record'] else 'draft',
+                'state': entry['state'],
                 'native_id': entry['native_id'], 'revision': record.get('revision'),
                 'name': _excerpt(record.get('name'), NAME_MAX),
                 'summary': _excerpt(record.get('summary'), 200), 'owner': record.get('owner'),
-                'tags': record.get('tags') or [], 'code': record.get('code') or [],
-                'tests': record.get('tests') or [], 'anchors': record.get('anchors') or [],
-                'requirements': record.get('requirements') or [],
+                'tags': record.get('tags') or [],
+                'code': record.get('code') or [] if entry['state'] != 'conflicted' else [],
+                'tests': record.get('tests') or [] if entry['state'] != 'conflicted' else [],
+                'anchors': record.get('anchors') or [] if entry['state'] != 'conflicted' else [],
+                'requirements': record.get('requirements') or [] if entry['state'] != 'conflicted' else [],
                 'aliases': (entry.get('record') or {}).get('aliases') or [],
                 'aliases_pending': _pending_view(entry),
-                'verification': verification_of(entry, trust)['state']}
+                'verification': 'conflicted' if entry['state'] == 'conflicted' else verification_of(entry, trust)['state']}
+        if entry['state'] == 'conflicted':
+            item['anchor_trust'] = entry['anchor_trust']
         if score is not None:
             item['score'] = round(score, 3)
         return item
 
     return {'schema_version': 1, 'phrase': _excerpt(text, PHRASE_MAX), 'normalized': key, 'found': bool(exact),
-            'match_type': 'exact' if exact else None, 'records': [shown(entry) for entry in exact[:limit]],
-            'total_records': len(exact), 'candidates': [shown(entry, score) for score, entry in scored[:limit]],
-            'hint': None if exact else ('No capability record matches exactly. If one of the candidates is what you '
+            'match_type': 'exact' if exact else 'conflicted' if conflicted else None,
+            'records': [shown(entry) for entry in (exact + conflicted)[:limit]],
+            'total_records': len(exact) + len(conflicted),
+            'candidates': [shown(entry, score) for score, entry in scored[:limit]],
+            'hint': None if exact else 'An operator must reconcile the duplicate anchors before any write.'
+            if conflicted else ('No capability record matches exactly. If one of the candidates is what you '
                                          'were looking for, run capability propose-alias KEY "%s"; if none is, '
                                          'capability propose a draft with the pointers you found.' % text[:80]),
             'coverage': KIND.coverage(entries, incomplete, 'records only; capability lookup with --config also '
@@ -1008,11 +1035,12 @@ def capabilities_view(rows, operators=None, verifiers=None, journal=None, banner
     accepted = [entry for entry in good if entry['state'] == 'accepted']
     drafts = [entry for entry in good if entry['state'] == 'draft-only' or entry['proposed']]
     retired = [entry for entry in good if entry['state'] == 'superseded']
+    conflicts = [entry for entry in good if entry['state'] == 'conflicted']
     pending = [(entry['key'], len(entry['aliases_pending'])) for entry in good if entry['aliases_pending']]
     lines = ['# Capabilities\n\n', banner, VIEW_HEADER + '\n\n',
              'Accepted: %d. Drafts awaiting acceptance: %d. Capabilities with pending aliases: %d. Retired: %d. '
-             'Unreadable: %d.\n\n' % (len(accepted), len(drafts), len(pending), len(retired),
-                                       len(entries) - len(good)),
+             'Unreadable: %d. Conflicted anchors: %d.\n\n' % (len(accepted), len(drafts), len(pending), len(retired),
+                                       len(entries) - len(good), len(conflicts)),
              'Read one with `capability get KEY`. `verified` means an operator or listed verifier recorded a '
              'passing check; `reported` is an unconfirmed report; `drifted` means a pointer was reported '
              'missing.\n\n']
@@ -1053,6 +1081,11 @@ def capabilities_view(rows, operators=None, verifiers=None, journal=None, banner
         lines.append('## Retired (keys only)\n\n'
                      + ''.join('- %s, replaced by %s\n' % (_md(entry['key']), _md(entry['record'].get('successor')))
                                for entry in retired[:VIEW_MAX]) + '\n')
+    if conflicts:
+        lines.append('## Conflicted anchors (no selected record)\n\n'
+                     + ''.join('- %s: %s (%s); operator reconciliation required\n' % (
+                         _md(entry['key']), _md(entry['native_id']), entry['anchor_trust'])
+                               for entry in conflicts[:VIEW_MAX]) + '\n')
     return ''.join(lines)
 
 
@@ -1064,6 +1097,8 @@ UNVERIFIED_STALE_DAYS = 30
 ATTENTION_SCAN_MAX = 1000
 BRIEF_MAX = 3
 CAPABILITY_ACTIONS = (  # (count key, priority, kind, reason)
+    ('conflicted', 0, 'capability-conflict', 'A capability key has ambiguous duplicate anchors; an operator '
+                                         'must reconcile them before any write.'),
     ('malformed', 1, 'capability-repair', 'A capability record cannot be read and needs an operator repair.'),
     ('drifted', 1, 'capability-drift', 'A capability pointer was reported missing; fix the record or the code, then '
                                        'verify it at an integrated commit.'),
@@ -1126,10 +1161,21 @@ def work_attention(rows, actor, operators, project_name, verifiers=None, project
     trust = Trust(None, operators, verifiers, project, export_rows=rows)
     entries, incomplete = catalog(rows, operators)
     scanned = sorted(entries, key=lambda entry: str(entry['key'] or entry['native_id']))[:ATTENTION_SCAN_MAX]
-    counts = {'drifted': 0, 'reported_only': 0, 'unverified_stale': 0, 'alias_pending': 0, 'draft_pending': 0,
+    counts = {'conflicted': 0, 'drifted': 0, 'reported_only': 0, 'unverified_stale': 0, 'alias_pending': 0, 'draft_pending': 0,
               'malformed': 0, 'total': 0}
     first, flagged = {}, []
+    conflict_groups = set()
     for entry in scanned:
+        if entry['state'] == 'conflicted':
+            group = tuple(anchor['native_id'] for anchor in entry['duplicate_anchors'])
+            if group in conflict_groups:
+                continue
+            conflict_groups.add(group)
+            counts['conflicted'] += 1
+            counts['total'] += 1
+            first.setdefault('conflicted', entry)
+            flagged.append((entry, {'state': 'conflicted'}, ['conflicted']))
+            continue
         if entry['state'] in ('malformed', 'unsupported'):
             counts['malformed'] += 1
             counts['total'] += 1
@@ -1161,17 +1207,18 @@ def work_attention(rows, actor, operators, project_name, verifiers=None, project
                             'label': {'text': command, 'omitted_chars': 0},
                             'token': 'capability.get' if key else 'capability.list'})
     actions.sort(key=lambda action: (action['priority'], str(action['project']), str(action['task'])))
-    state = ('malformed' if counts['malformed'] else 'drifted' if counts['drifted'] else
+    state = ('conflicted' if counts['conflicted'] else 'malformed' if counts['malformed'] else 'drifted' if counts['drifted'] else
              'pending' if counts['draft_pending'] or counts['alias_pending'] else
              'stale' if counts['unverified_stale'] or counts['reported_only'] else 'clear')
-    phrases = (('drifted', '{} capability(ies) drifted'), ('draft_pending', '{} draft(s) waiting for acceptance'),
+    phrases = (('conflicted', '{} key(s) with ambiguous duplicate anchors'),
+               ('drifted', '{} capability(ies) drifted'), ('draft_pending', '{} draft(s) waiting for acceptance'),
                ('alias_pending', '{} alias(es) waiting for an operator'),
                ('unverified_stale', '{} accepted but not verified for over %d days' % UNVERIFIED_STALE_DAYS),
                ('reported_only', '{} with reports but no trusted verification'), ('malformed', '{} unreadable'))
     parts = [text.format(counts[name]) for name, text in phrases if counts[name]]
     operator = actor in configured_operators(operators if operators is not None else ())
-    order = {'drifted': 0, 'draft_pending': 1, 'alias_pending': 2, 'unverified_stale': 3, 'reported_only': 4}
-    flagged.sort(key=lambda item: (min(order[flag] for flag in item[2]), item[0]['key']))
+    order = {'conflicted': -1, 'drifted': 0, 'draft_pending': 1, 'alias_pending': 2, 'unverified_stale': 3, 'reported_only': 4}
+    flagged.sort(key=lambda item: (min(order[flag] for flag in item[2]), item[0]['key'] or ''))
     page = flagged[offset:offset + limit] if operator else []
     items = []
     for entry, block, flags in page:
@@ -1183,6 +1230,9 @@ def work_attention(rows, actor, operators, project_name, verifiers=None, project
                       'accepted_days': _days_since((entry.get('acceptance') or {}).get('at'), now),
                       'title': dict(_attention_title(record.get('name')),
                                     trust='accepted' if entry['record'] else 'draft')})
+        if entry['state'] == 'conflicted':
+            items[-1]['anchors'] = entry['duplicate_anchors']
+            items[-1]['title']['trust'] = 'conflicted'
     result = {'state': state, 'summary': ('; '.join(parts) + '.') if parts else 'No capability needs attention.',
               'counts': counts, 'actions': actions,
               'truncated': (not operator and bool(flagged)) or offset + limit < len(flagged)
