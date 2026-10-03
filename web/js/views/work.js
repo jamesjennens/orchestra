@@ -1,4 +1,4 @@
-import { h, time, copyButton } from '../dom.js';
+import { h, time, copyButton, confirmDialog } from '../dom.js';
 import { pageHead, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, roleTag } from '../ui.js';
 import { agentCard, attentionOf } from './agents.js';
 
@@ -71,12 +71,20 @@ export function agentPromptPanel(ctx, data) {
 }
 
 export async function welcome(ctx) {
-  const create = h('a', { class: 'btn primary', href: ctx.href('/projects') }, 'Create a project');
+  // What "start a project" means depends on the server (session.project_create).
+  const session = await ctx.api.current().catch(() => null);
+  const mode = (session && session.project_create) || 'create';
+  const start = {
+    create: ['Create a project for a piece of work. You become its owner and can invite colleagues and agents with a role: viewer, contributor or owner.', 'Create a project'],
+    register: ['On this server an operator creates a project on the coordination host (admin.py add-project NAME). You then register it here: you become its owner and add colleagues and agents with a role.', 'Register a project'],
+    'operator-only': ['On this server an operator creates a project on the coordination host and a superuser registers it. Ask an operator or a superuser; they then add you as a member.', null],
+  }[mode] || [];
+  const create = start[1] ? h('a', { class: 'btn primary', href: ctx.href('/projects') }, start[1]) : null;
   return h('div', { class: 'stack' },
     pageHead({ title: `Welcome, ${ctx.me.display_name}`, lede: 'Orchestra keeps a team’s tasks, contributions and reviews in one shared record — for people and agents alike.' }),
     h('div', { class: 'steps' },
       h('section', { class: 'step' }, h('h2', { class: 'small' }, 'Start a project'),
-        h('p', { class: 'muted' }, 'Create a project for a piece of work. You become its owner and can invite colleagues and agents with a role: viewer, contributor or owner.'), h('div', null, create)),
+        h('p', { class: 'muted' }, start[0]), create ? h('div', null, create) : null),
       h('section', { class: 'step' }, h('h2', { class: 'small' }, 'Join an existing project'),
         h('p', { class: 'muted' }, 'Projects are private. Ask a project owner to add you — tell them your username:'),
         h('p', null, h('code', null, '@' + (ctx.me.username || ctx.me.id)))),
@@ -113,6 +121,34 @@ export async function directory(ctx) {
   const hostLine = 'On this server a project is created on the coordination host by an operator, with admin.py add-project NAME.';
   if (mode !== 'create') {
     let panel;
+    // A superuser's upgrade check: records this server will not serve, with who created
+    // each one and who its members are.
+    const review = h('div');
+    const drawReview = async () => {
+      const found = mode === 'register' ? await ctx.api.unconfirmedProjects().catch(() => null) : null;
+      const items = (found && found.items) || [];
+      const who = (u) => '@' + (u.username || u.id);
+      review.replaceChildren(items.length ? h('section', { class: 'panel' },
+        h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Projects to confirm or archive ', h('span', { class: 'nav-count' }, items.length))),
+        h('div', { class: 'panel-body stack' },
+          h('p', { class: 'small muted' }, 'These project records were made by an older kit and cannot be used until you decide. Confirming keeps the current members; archiving retires the record. Removing a member or revoking a credential still works on them.'),
+          items.map((p) => h('div', { class: 'card' },
+            h('div', { class: 'toolbar' }, h('h2', { class: 'small' }, p.name), h('span', { class: 'mono' }, p.id), h('span', { class: 'chip warn' }, p.kind === 'unconfirmed' ? 'Needs confirmation' : 'Not usable')),
+            h('p', { class: 'small muted' }, p.reason),
+            h('p', { class: 'small' }, 'Created by ', who(p.created_by), p.created_at ? [' ', time(p.created_at)] : null, '. Members: ', p.members.length ? p.members.map((m) => `${who(m)} (${m.role})`).join(', ') : 'none', '.'),
+            h('div', { class: 'actions' },
+              p.kind === 'unconfirmed' ? h('button', { type: 'button', class: 'primary', onclick: async (event) => {
+                const button = event.currentTarget;
+                const ok = await confirmDialog({ title: `Confirm “${p.name}” (${p.id})?`, body: `It will use the canonical project ${p.id} again. Created by ${who(p.created_by)}. These members keep their access: ${p.members.length ? p.members.map((m) => `${who(m)} (${m.role})`).join(', ') : 'none'}. Your confirmation is recorded.`, confirmLabel: 'Confirm project' });
+                if (ok && await act(button, () => ctx.api.confirmProject(p.id), { success: 'Project confirmed' })) { await ctx.refreshProjects(); draw(); drawReview(); }
+              } }, 'Confirm') : null,
+              h('button', { type: 'button', onclick: async (event) => {
+                const button = event.currentTarget;
+                const ok = await confirmDialog({ title: `Archive “${p.name}”?`, body: 'The record is retired. Members keep read access to it; nothing is deleted.', confirmLabel: 'Archive project', danger: true });
+                if (ok && await act(button, () => ctx.api.archiveProject(p.id), { success: 'Project archived' })) { await ctx.refreshProjects(); draw(); drawReview(); }
+              } }, 'Archive')))))) : '');
+    };
+    await drawReview();
     if (mode === 'register') {
       const register = h('form', { class: 'form', novalidate: true },
         h('p', { class: 'small muted' }, hostLine + ' Register it here with that NAME to use it in the web interface. Registering makes you its owner and gives nobody else access: add members afterwards.'),
@@ -135,6 +171,7 @@ export async function directory(ctx) {
       pageHead({ title: 'Projects', lede: ctx.me.superuser ? 'As a superuser you can see every project.' : 'Projects you are a member of.' }),
       h('div', { class: 'toolbar' }, archivedToggle),
       list,
+      review,
       h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, mode === 'register' ? 'Register a project' : 'New project')), h('div', { class: 'panel-body' }, panel)));
   }
 

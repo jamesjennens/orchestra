@@ -2101,7 +2101,11 @@ class CanonicalReadCostCase(EndpointCase):
         # B: alex's own claimed task whose latest checkpoint has an unresolved item.
         stuck = self.create_task(alex, project, 'stuck').data['id']
         self.post(alex, base + stuck + '/claim', {}, status=200)
-        history = self.request('GET', base + stuck + '/history?limit=5', token=alex).data
+        history = self.request('GET', base + stuck + '/history?limit=5', token=alex)
+        # Checked before the body is read, so a canonical failure reports itself (a 503
+        # seen on a loaded Windows machine surfaced as KeyError: activity_cursor).
+        self.assertEqual(200, history.status, history.data)
+        history = history.data
         self.post(alex, base + stuck + '/checkpoints',
                   {'schema_version': 1, 'previous': None,
                    'activity_cursor': history['activity_cursor'], 'source_commit': COMMIT,

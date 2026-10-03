@@ -18,8 +18,22 @@ function archivedBanner(project) {
   return project.archived ? h('div', { class: 'banner' }, 'This project is archived. Its records are kept and readable; new work cannot be added.') : null;
 }
 
+// A record this server will not serve (project.usable === false): its task pages answer
+// 409, so no page offers them. Only reading, removing access and archiving are left.
+export function unusableBanner(project) {
+  return project.usable === false ? h('div', { class: 'banner crit', role: 'alert' }, project.unusable_reason || 'This project cannot be used on this server.',
+    ' Nothing that grants access is accepted on it; removing a member, revoking a credential and archiving still work.') : null;
+}
+
 export async function overview(ctx, { pid }) {
   const project = await load(ctx, pid);
+  if (project.usable === false) {
+    return h('div', { class: 'stack' },
+      pageHead({ crumbs: crumbs(ctx, project), title: project.name }),
+      archivedBanner(project),
+      unusableBanner(project),
+      h('p', null, h('a', { href: ctx.href(`/p/${pid}/settings`) }, 'Members, credentials and archive')));
+  }
   const state = { status: 'active', q: '', review: '', cursor: null, stack: [] };
   const tableHost = h('div', { class: 'panel' });
 
@@ -75,6 +89,7 @@ export async function overview(ctx, { pid }) {
     pageHead({ crumbs: crumbs(ctx, project), title: project.name, lede: project.description || null,
       actions: canWrite(project) && !project.archived ? h('a', { class: 'btn primary', href: ctx.href(`/p/${pid}/new`) }, 'New task') : null }),
     archivedBanner(project),
+    unusableBanner(project),
     h('div', { class: 'toolbar' }, search, statusSeg, reviewSel),
     tableHost);
 }
@@ -256,5 +271,6 @@ export async function settings(ctx, { pid }) {
   return h('div', { class: 'stack' },
     pageHead({ crumbs: crumbs(ctx, project, 'Members & settings'), title: 'Members & settings', lede: owner ? 'Manage who can see and change this project.' : 'Only project owners can change membership.' }),
     archivedBanner(project),
+    unusableBanner(project),
     membersHost, credsHost, auditHost, danger);
 }

@@ -12,8 +12,8 @@ const ACTIONS = {
 
 export async function create(ctx, { pid }) {
   const project = await ctx.api.project(pid);
-  if (!canWrite(project) || project.archived) {
-    return h('div', { class: 'stack' }, pageHead({ title: 'New task' }), h('div', { class: 'banner crit', role: 'alert' }, project.archived ? 'This project is archived.' : 'Viewers cannot create tasks. Ask a project owner for contributor access.'));
+  if (!canWrite(project) || project.archived || project.usable === false) {
+    return h('div', { class: 'stack' }, pageHead({ title: 'New task' }), h('div', { class: 'banner crit', role: 'alert' }, project.usable === false ? (project.unusable_reason || 'This project cannot be used on this server.') : project.archived ? 'This project is archived.' : 'Viewers cannot create tasks. Ask a project owner for contributor access.'));
   }
   const form = h('form', { class: 'form', novalidate: true },
     field({ id: 'title', label: 'Title', hint: 'A short outcome, e.g. “Paginate order history”. 3–200 characters.', required: true, maxlength: 200 }),
