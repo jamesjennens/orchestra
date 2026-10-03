@@ -168,7 +168,7 @@ This kit is therefore the oldest one a deployment may roll back to once any of t
 - **Removing an operator reverses what they recorded.** `operators remove` (below) prints, before it acts, the proposals whose state changes and the projects whose contribution settings change.
   - A proposal the removed operator decided reads its earlier trusted state again, and no new disposition can be recorded on it while the ledger and the trusted state disagree.
   - If the removed operator wrote the first settings record, every later record in that chain stops counting: the actor map and the deciders read empty and triage stops. Enter them again with `proposal-settings`; the new record starts a fresh chain on the same anchor.
-  - Re-adding the operator restores both. There is no other repair yet: `void-record` does not accept proposal or settings records (kittrial-5bb.74 adds that). Until then the submitter can submit a new proposal that supersedes the stuck one.
+  - Re-adding the operator restores both. There is no other repair yet: `void-record` accepts reference and capability records (kittrial-5bb.74), but not proposal or settings records. Until then the submitter can submit a new proposal that supersedes the stuck one.
 - **After a restore,** re-check `operators list` and `proposal-settings` before recording anything: both the allowlist and the actor map decide what counts.
 
 **Acceptance evidence trusts the comment's native author.** A reference entry reads
@@ -368,6 +368,13 @@ from `bd export --all`, as in the scan above.
   revise` and `capability revise` see the same entry `get` shows once the void applies.
 - **Revocation.** After `operators remove`, that operator's voids stop applying here too
   and the entry reads `malformed` again; re-adding the operator restores the repair.
+  Without `--confirm-revoke`, `operators remove` counts the operator's voids of
+  reference and capability records that apply today and names the entries whose
+  reading changes (for example `example/reference calendar.trading draft-only ->
+  malformed`).
+- **Reconcile agrees.** `reference-reconcile` and `capability-reconcile --disposition
+  complete` read the allowlist too, and refuse an anchor whose every record is voided,
+  as they refuse one whose propose never posted its record.
 - **Rolling back below this kit.** An older kit's reference and capability readers do
   not read voids at all, so a repaired entry reads `malformed` again there (only that
   entry). The anchor stays hidden. A review read of the anchor, if one reaches it, lists
@@ -407,7 +414,12 @@ python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime anc
 - It is a host command only. Over SSH the endpoint actor is self-declared, so nothing
   that rests on the operator allowlist is offered there.
 
-An older kit reads a released row the same way: it holds no key and is never claimable.
+On an older kit a released row holds no key either, and it is never claimable:
+- a row that never held a record is the ordinary closed task it is on this kit;
+- an anchor whose records were voided stays hidden as a task, but that kit does not
+  read voids, so its catalog lists it as a `malformed` entry (with no key) in `coverage`
+  and counts it as `malformed` in the `work` attention block until the kit is rolled
+  forward.
 
 #### Operator removal and restore policy
 

@@ -129,10 +129,12 @@ PROPOSAL_SCAN_MAX = 1000
 SHOW_MAX = 100   # rows named in one `bd show`
 SUPERSEDE_HOPS = 8
 # No host command repairs a proposal or settings record yet. This is the one sentence
-# every message uses, so the day `admin.py void-record` accepts these kinds
-# (kittrial-5bb.74) there is one place to change.
+# every message uses, so the day `admin.py void-record` accepts these kinds there is one
+# place to change. kittrial-5bb.74 added reference and capability records only: the
+# proposal kinds join `recovery.PROPOSAL_KIND_PREFIXES` together with a reader here that
+# leaves out voided comments, as keyed_entries.AnchoredKind.live_row does.
 NO_REPAIR = ('No repair command exists for proposal records yet (admin.py void-record does not accept them; '
-             'kittrial-5bb.74 adds that)')
+             'it accepts reference and capability records only)')
 STALE_DAYS, STALE_DAYS_RANGE = 14, (1, 90)
 DUE_SOON_DAYS, DUE_SOON_DAYS_RANGE = 7, (1, 30)
 ACTORS_MAX, NAMESPACES_MAX, DECIDERS_MAX, HIDDEN_MAX = 200, 100, 50, 200

@@ -1679,6 +1679,46 @@ def revoked_proposal_records(root,actor,limit=5):
             'admin.py proposal-settings, and note that %s.'
             %(listed(changed),listed(settings),unreadable,proposal_records.NO_REPAIR[0].lower()+proposal_records.NO_REPAIR[1:]))
 
+def revoked_keyed_voids(root,actor,limit=5):
+    """Name the reference and capability repairs one operator's revocation undoes.
+
+    A void of a reference or capability record (kittrial-5bb.74) applies only while its
+    native author is on the operator allowlist, so removing that operator brings back
+    the record it voided: the entry reads malformed again, or an anchor whose every
+    record was voided holds a record again. The count is the voids the actor authored
+    that apply today; the entries are those whose reading changes between the live
+    allowlist and the allowlist without `actor`, read by the reader every other read
+    uses. Read-only and best-effort, like `revoked_revert_records`.
+    """
+    import capability_records,reference_records
+    authority=operators(root)
+    remaining=frozenset(item for item in authority if item!=actor)
+    count=0;changed=[];unreadable=0
+    for name in initialized_projects(root):
+        try:
+            rows=[json.loads(line) for line in run_bd(root,name,['export','--all']).splitlines() if line.strip()]
+        except (OSError,ValueError,TypeError,KeyError,subprocess.CalledProcessError):
+            unreadable+=1
+            continue
+        for kind in (reference_records.KIND,capability_records.KIND):
+            for row in rows:
+                if not isinstance(row,dict) or kind.type_label not in (row.get('labels') or []):continue
+                mine=[payload for payload,comment in kind.applied_voids(row,authority)[0] if comment.get('author')==actor]
+                if not mine:continue
+                count+=len(mine)
+                def reading(allowed):
+                    if not kind.has_live_record(row,allowed):return None,'no record'
+                    view=kind.entry_view(row,allowed)
+                    return view['key'],view['state']
+                (key,before),(_,after)=reading(authority),reading(remaining)
+                if before!=after:
+                    changed.append('%s/%s %s %s -> %s'%(name,kind.noun,key or row.get('id'),before,after))
+    changed.sort()
+    shown=(', '.join(changed[:limit])+(' (+%d more)'%(len(changed)-limit) if len(changed)>limit else '')) or 'none'
+    return (' Voids of reference and capability records they authored stop applying too (%d void%s; entries '
+            'whose reading changes: %s; projects that could not be read: %d).'
+            %(count,'' if count==1 else 's',shown,unreadable))
+
 def revoked_revert_records(root,actor,limit=5):
     """Name the host-issued records one operator's revocation changes.
 
@@ -2846,7 +2886,8 @@ def main():
                 raise ValueError('operators remove revokes ' + actor + ': voids they authored stop applying on '
                                  'reads, and so do the host-issued integration revert records and retractions '
                                  'they authored' + revoked_revert_records(root,actor) +
-                                 ' (re-add restores them).' + revoked_proposal_records(root,actor) +
+                                 ' (re-add restores them).' + revoked_keyed_voids(root,actor) +
+                                 revoked_proposal_records(root,actor) +
                                  ' Re-run with --confirm-revoke to acknowledge this.')
             if actor in current:current.remove(actor)
         if current:cfg['operators']=current

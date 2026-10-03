@@ -599,5 +599,31 @@ class AdminCommandTests(VoidCase):
         self.assertEqual(self.native.row('ref-1')['labels'], ['reference'])
 
 
+    def test_operators_remove_counts_keyed_voids_and_names_the_entries(self):
+        # Review P3: without --confirm-revoke the refusal names what reads malformed again.
+        _, bad = self.malformed_entry()
+        self.void(void_payload('ref-1', bad['id'], MALFORMED))
+        with self.assertRaisesRegex(ValueError, r'Voids of reference and capability records they authored stop '
+                                                r'applying too \(1 void; entries whose reading changes: '
+                                                r'trial/reference calendar.trading draft-only -> malformed'):
+            self.admin('operators', 'remove', OPERATOR)
+        self.assertEqual(admin.operators(self.root), frozenset({OPERATOR}))
+
+    def test_reference_reconcile_gives_the_allowlist_to_complete(self):
+        self.native.fail_comment_prefix = 'Kind: reference-entry-v1'
+        with self.assertRaises(ValueError):
+            self.propose()
+        self.native.fail_comment_prefix = None
+        bad = self.native.add_comment('ref-1', MALFORMED, author='mallory')
+        self.void(void_payload('ref-1', bad['id'], MALFORMED))
+        project = self.root / 'projects' / 'trial'
+        for path in (self.project / '.reference-requests').glob('*.json'):
+            (project / '.reference-requests').mkdir(exist_ok=True)
+            (project / '.reference-requests' / path.name).write_text(path.read_text(encoding='utf-8'),
+                                                                      encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'every record it held is voided'):
+            self.admin('reference-reconcile', 'trial', '--operation-id', 'alex-ref-1', '--actor', OPERATOR,
+                       '--reason', 'checked', '--disposition', 'complete', '--issue-id', 'ref-1')
+
 if __name__ == '__main__':
     unittest.main()
