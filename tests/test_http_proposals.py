@@ -596,11 +596,11 @@ class ReviewFixCase(ProposalHarness):
         # A cursor the route did not issue is refused, not answered with an empty page.
         import base64
         forged = json.loads(base64.urlsafe_b64decode(first['next_cursor'] + '=' * (-len(first['next_cursor']) % 4)))
-        for offset in (4, 5, 99, 100, 10 ** 9):
+        for offset in (4, 5, 99, 100, 10 ** 9, True, '2', 1.0, None, -1):
             cursor = base64.urlsafe_b64encode(json.dumps(dict(forged, o=offset)).encode()).decode().rstrip('=')
             with self.subTest(offset=offset):
                 answer = self.request('GET', '/v1/me/contributions?limit=2&cursor=' + cursor, token=self.token('alex'))
-                self.assertEqual(answer.status, 200 if offset < 5 else 409, answer.data)
+                self.assertEqual(answer.status, 200 if type(offset) is int and offset == 4 else 409, answer.data)
         # A cursor belongs to its query and its account.
         self.assertEqual(409, self.request('GET', '/v1/me/contributions?limit=3&cursor=' + first['next_cursor'],
                                            token=self.token('alex')).status)
@@ -648,6 +648,13 @@ class ReviewFixCase(ProposalHarness):
                             {'0': {'flag': '--body-file', 'text': ''}})
         self.assertEqual(answer['returncode'], 2, answer)
         self.assertIn('An attached description is empty', answer['stderr'])
+        # On create, a blank description is no description (kittrial-5bb.70 A review, P3).
+        for index, text in enumerate(('   ', '\n', '')):
+            made = self.request('POST', base, {'title': 'Blank description %d' % index, 'description': text},
+                                token=self.token('blair'), key='blank-description-%d' % index)
+            self.assertEqual(201, made.status, made.data)
+            self.assertEqual(self.request('GET', '%s/%s' % (base, made.data['id']),
+                                          token=self.token('blair')).data.get('description') or '', '')
         # A task that already has such a title stays readable.
         path = self.canonical_root / 'canonical.json'
         state = json.loads(path.read_text(encoding='utf-8'))

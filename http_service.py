@@ -272,7 +272,7 @@ def read_cursor(principal, project_id, query, cursor):
     if not isinstance(data, dict) or data.get('u') != principal.user_id or \
             data.get('p') != project_id or \
             data.get('q') != request_hash(cursor_scope(query))[:16] or \
-            not isinstance(data.get('o'), int) or data['o'] < 0:
+            type(data.get('o')) is not int or data['o'] < 0:      # a bool is not an offset
         raise conflict('Cursor is stale or belongs to a different query')
     return {'o': data['o'], 'x': data.get('x')}
 
@@ -1156,7 +1156,9 @@ class EndpointBackend:
                 # would be read as a flag, a leading @ as the attachment transport.
                 raise invalid('A task title cannot start with "-" or "@"')
             description = payload.get('description')
-            if description:
+            if description and str(description).strip():
+                # A blank description is no description (as PATCH treats it as "clear"):
+                # the endpoint refuses an empty body file.
                 return ('bd', project_id, ['create', title, '@attachment:0', '--json'],
                         {'0': {'flag': '--body-file', 'text': description}})
             return 'bd', project_id, ['create', title, '--json'], {}
