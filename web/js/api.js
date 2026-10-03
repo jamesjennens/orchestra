@@ -92,6 +92,9 @@ export function createApi(transport) {
     createProject: (name) => mutate('POST', '/v1/projects', { name }),
     registerProject: (projectId, name) => mutate('POST', '/v1/projects', name ? { project_id: projectId, name } : { project_id: projectId }),
     archiveProject: (pid) => mutate('POST', `/v1/projects/${pid}/archive`, {}),
+    // Superuser only: the records this server will not serve, to confirm or archive.
+    unconfirmedProjects: () => call('GET', '/v1/projects/unconfirmed'),
+    confirmProject: (pid) => mutate('POST', `/v1/projects/${pid}/confirm`, {}),
     members: (pid) => call('GET', `/v1/projects/${pid}/members`, { params: { limit: 100 } }),
     setMember: (pid, uid, role) => mutate('PUT', `/v1/projects/${pid}/members/${uid}`, { role }),
     removeMember: (pid, uid) => mutate('DELETE', `/v1/projects/${pid}/members/${uid}`),

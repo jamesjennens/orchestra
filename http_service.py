@@ -311,6 +311,59 @@ class UncertainOutcome(Exception):
 CANONICAL_PROJECT = re.compile(r'[a-z][a-z0-9]{1,23}')
 REGISTER_HINT = ('A project is created on the coordination host by an operator (admin.py add-project NAME); '
                  'a superuser then registers it here with that name.')
+NO_CANONICAL = ('This project has no canonical Beads project behind it (it was created by an older kit), so its '
+                'tasks cannot be used. Archive it; ' + REGISTER_HINT)
+UNCONFIRMED = ('This project was created before registering a project was limited to superusers, and no superuser '
+               'has confirmed it, so it cannot be used. A superuser confirms it (Projects page, or POST '
+               '/v1/projects/ID/confirm) or archives it.')
+
+
+def project_unusable(service, project_id):
+    """Why the endpoint backend will not serve a project record: (kind, reason), or None.
+
+    The one predicate behind `usable`, the route refusals and the backend guard
+    (kittrial-5bb.80 and .84), read at request time:
+
+    - `no-canonical`: the id is not a canonical project name (a `proj_...` record from an
+      older kit). No canonical project can ever be behind it.
+    - `unconfirmed`: the id is a canonical name, but nothing shows a superuser stood
+      behind the mapping. Before kittrial-5bb.80 any account could create a record with
+      such an id and so become owner of that canonical project. A record counts when the
+      register route wrote it (`registered_by`), a superuser confirmed it
+      (`confirmed_by`), or its creator is a superuser today.
+
+    An id with no record is not unusable here: that is the register route's own check.
+    """
+    if not isinstance(project_id, str) or not CANONICAL_PROJECT.fullmatch(project_id):
+        return 'no-canonical', NO_CANONICAL
+    state = getattr(service, 'state', None)
+    record = (state or {}).get('projects', {}).get(project_id)
+    if not isinstance(record, dict) or record.get('registered_by') or record.get('confirmed_by'):
+        return None
+    creator = (state.get('users') or {}).get(record.get('created_by'))
+    if isinstance(creator, dict) and creator.get('superuser'):
+        return None
+    return 'unconfirmed', UNCONFIRMED
+
+
+def unusable_projects(service):
+    """Every project record the endpoint backend will not serve and that is not archived,
+    for a superuser's review: who created it and who its members are."""
+    state = service.state
+    users = state.get('users') or {}
+
+    def person(user_id):
+        return {'id': user_id, 'username': (users.get(user_id) or {}).get('username')}
+    items = []
+    for project_id, record in sorted(state.get('projects', {}).items()):
+        verdict = project_unusable(service, project_id)
+        if verdict is None or record.get('archived'):
+            continue
+        members = state.get('memberships', {}).get(project_id, {})
+        items.append({'id': project_id, 'name': record.get('name'), 'kind': verdict[0], 'reason': verdict[1],
+                      'created_by': person(record.get('created_by')), 'created_at': record.get('created_at'),
+                      'members': [dict(person(user_id), role=role) for user_id, role in sorted(members.items())]})
+    return items
 
 
 class InProcessBackend:
@@ -917,7 +970,7 @@ class EndpointBackend:
         if not isinstance(project, str) or not CANONICAL_PROJECT.fullmatch(project):
             return False
         reply = self._endpoint('bd', project, self.actor_namespace + '/read',
-                               ['list', '--limit', '1', '--json'])
+                               ['list', '--limit', '1', '--json'], check_usable=False)
         if isinstance(reply, dict) and reply.get('returncode') == 2 \
                 and 'Unknown/uninitialized project' in (reply.get('stderr') or ''):
             return False
@@ -925,13 +978,17 @@ class EndpointBackend:
         return True
 
     def _endpoint(self, action, project, actor, args, attachments=None, operation_id=None,
-                  authority=None, require_authority=False, route=None):
-        if isinstance(project, str) and not CANONICAL_PROJECT.fullmatch(project):
-            # A project record from before kittrial-5bb.80 (a `proj_...` id) has no
-            # canonical project and can never have one: say so, instead of the
-            # endpoint's 422 for a malformed project name.
-            raise conflict('This project has no canonical Beads project behind it (it was created by an older '
-                           'kit), so its tasks cannot be used. Archive it; ' + REGISTER_HINT)
+                  authority=None, require_authority=False, route=None, check_usable=True):
+        if isinstance(project, str):
+            # A record the backend will not serve is refused here, before any endpoint
+            # process starts: a `proj_...` id (no canonical project can be behind it;
+            # this replaces the endpoint's 422 for a malformed name) or a canonical id
+            # no superuser stands behind (kittrial-5bb.84). `project_exists` passes
+            # check_usable=False: it is the read that registration and confirmation rest on.
+            verdict = project_unusable(self.service, project) if check_usable else (
+                None if CANONICAL_PROJECT.fullmatch(project) else ('no-canonical', NO_CANONICAL))
+            if verdict is not None:
+                raise conflict(verdict[1])
         if self.runner is not None:
             return self.runner(action=action, project=project, actor=actor, args=args,
                                attachments=attachments or {}, operation_id=operation_id,
@@ -2197,34 +2254,127 @@ class ApiHandler(BaseHTTPRequestHandler):
         name = payload.get('name') or project_id
         existing = self.service.state['projects'].get(project_id)
         if existing is not None:
-            raise conflict('Canonical project %s is already registered as project %r%s; one canonical project '
-                           'is registered once' % (project_id, existing.get('name'),
-                                                   ' (archived)' if existing.get('archived') else ''))
+            # An exact retry of the registration that made this record replays its 201
+            # (kittrial-5bb.84); anything else is the conflict.
+            return self._refuse_unless_replay(ctx, 'projects.create', conflict(
+                'Canonical project %s is already registered as project %r%s; one canonical project '
+                'is registered once' % (project_id, existing.get('name'),
+                                        ' (archived)' if existing.get('archived') else '')))
         if not self.backend.project_exists(project_id):
             raise invalid('No canonical project %s exists on the coordination host. An operator creates it there '
                           'first (admin.py add-project %s), then you register it here.' % (project_id, project_id))
 
         def register():
-            result = self.service.create_project(principal, name, project_id)
+            self.service.create_project(principal, name, project_id)
+            # The mark that a superuser registered this mapping; `project_unusable` reads it.
+            self.service.state['projects'][project_id]['registered_by'] = principal.user_id
+            result = self._usable(self.service.project_view(principal, project_id))
             return result, result
         return self._mutate(ctx, 'projects.create', None, register, status=201, capability=CAP_ACCOUNTS_ADMIN,
                             reason='register ' + project_id)
 
+    def _refuse_unless_replay(self, ctx, route_name, error):
+        """Raise `error`, unless this request is an exact idempotent retry of one that
+        already committed on this route: then its stored response is replayed.
+
+        For a superuser route whose own pre-checks would otherwise refuse the retry of
+        its success ("already registered", "needs no confirmation"). The reservation
+        is released again when the refusal is raised.
+        """
+        if ctx.idempotency_key is None:
+            raise error
+
+        def refuse():
+            raise error
+        return self._mutate(ctx, route_name, None, refuse, capability=CAP_ACCOUNTS_ADMIN)
+
+    def _superuser_session(self, ctx, message):
+        principal = ctx.principal
+        if principal is None or principal.via == 'credential' or not principal.superuser:
+            raise forbidden(message)
+        return principal
+
+    def _unusable(self, project_id):
+        """`project_unusable` for this backend: only the endpoint backend has the rule."""
+        if getattr(self.backend, 'PROJECT_CREATE', 'create') != 'register':
+            return None
+        return project_unusable(self.service, project_id)
+
+    def _require_usable(self, project_id):
+        """Refuse granting or extending access on a record the backend will not serve
+        (kittrial-5bb.84): adding or changing a member, issuing a worker credential, a
+        new agent grant. Whatever REMOVES access stays open on such a record (removing
+        a member, revoking a credential or an agent grant, archiving), so cleaning one
+        up never requires confirming it first. Called after the route's authority
+        check, so it never tells a caller without access that the record exists."""
+        verdict = self._unusable(project_id)
+        if verdict is not None:
+            raise conflict(verdict[1] + ' Until then nothing that grants access is accepted on it; removing a '
+                           'member, revoking a credential or an agent grant, and archiving still work.')
+
     def _usable(self, view):
-        """Mark a project the backend cannot serve (kittrial-5bb.80)."""
+        """Mark a project the backend cannot serve (kittrial-5bb.80, .84)."""
         view = dict(view)
-        if getattr(self.backend, 'PROJECT_CREATE', 'create') == 'register' \
-                and not CANONICAL_PROJECT.fullmatch(str(view.get('id'))):
-            view['usable'] = False
+        verdict = self._unusable(view.get('id'))
+        view['usable'] = verdict is None
+        if verdict is not None:
             view['unusable_reason'] = ('No canonical Beads project is behind this project (it was created by an '
-                                       'older kit); archive it. ' + REGISTER_HINT)
-        else:
-            view['usable'] = True
+                                       'older kit); archive it. ' + REGISTER_HINT) \
+                if verdict[0] == 'no-canonical' else verdict[1]
+            view['needs_confirmation'] = verdict[0] == 'unconfirmed'
         return view
 
     @route('GET', r'/v1/projects')
     def projects_list(self, ctx):
         return 200, {'items': [self._usable(view) for view in self.service.list_projects(ctx.principal)]}
+
+    # Registered before `/v1/projects/{pid}` so the literal path always wins.
+    @route('GET', r'/v1/projects/unconfirmed')
+    def projects_unconfirmed(self, ctx):
+        """The upgrade check (kittrial-5bb.84): every record this backend will not serve,
+        for a superuser to confirm or archive, with who created it and who its members
+        are (the ordinary list shows a superuser every project, but not those)."""
+        self._superuser_session(ctx, 'Only a superuser reviews unconfirmed projects on this server.')
+        self.require(ctx, CAP_ACCOUNTS_ADMIN)
+        register = getattr(self.backend, 'PROJECT_CREATE', 'create') == 'register'
+        items = unusable_projects(self.service) if register else []
+        return 200, {'items': items, 'total': len(items)}
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/confirm')
+    def project_confirm(self, ctx):
+        """A superuser confirms a legacy record with a canonical id (kittrial-5bb.84).
+
+        Superuser session only; the refusal for anyone else comes first and is the same
+        whatever id is named. The canonical project must exist on the host (one endpoint
+        read). Memberships are not changed: the response lists them for review.
+        """
+        principal = self._superuser_session(ctx, 'Only a superuser confirms a project on this server.')
+        project_id = ctx.params['pid']
+        record = self.service.state['projects'].get(project_id)
+        if record is None:
+            raise not_found('Project not found')
+        verdict = self._unusable(project_id)
+        if verdict is None:
+            return self._refuse_unless_replay(ctx, 'projects.confirm',
+                                              conflict('This project needs no confirmation'))
+        if verdict[0] != 'unconfirmed':
+            raise conflict(verdict[1])
+        if record.get('archived'):
+            raise conflict('This project is archived')
+        if not self.backend.project_exists(project_id):
+            raise invalid('No canonical project %s exists on the coordination host, so this record cannot be '
+                          'confirmed. Archive it.' % project_id)
+
+        def confirm():
+            item = next(item for item in unusable_projects(self.service) if item['id'] == project_id)
+            record['confirmed_by'] = principal.user_id
+            record['confirmed_at'] = now_iso(self.service._now())
+            result = {'id': project_id, 'name': record.get('name'), 'usable': True,
+                      'confirmed_by': principal.user_id, 'confirmed_at': record['confirmed_at'],
+                      'created_by': item['created_by'], 'members': item['members']}
+            return result, result
+        return self._mutate(ctx, 'projects.confirm', None, confirm, capability=CAP_ACCOUNTS_ADMIN,
+                            reason='confirm ' + project_id)
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')')
     def project_get(self, ctx):
@@ -2244,6 +2394,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         payload = ctx.payload or {}
 
         def set_member():
+            self._require_usable(ctx.params['pid'])
             result = self.service.set_member(ctx.principal, ctx.params['pid'],
                                              ctx.params['uid'], payload.get('role'),
                                              request_id=ctx.request_id)
@@ -2280,6 +2431,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         payload = ctx.payload or {}
 
         def issue():
+            self._require_usable(ctx.params['pid'])
             result = self.service.issue_credential(ctx.principal, ctx.params['pid'],
                                                    label=payload.get('label'),
                                                    scopes=payload.get('scopes'),
@@ -2338,6 +2490,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         payload = dict(ctx.payload or {})
 
         def create():
+            self._require_grantable(ctx.principal, payload.get('projects'), ())
             result = self.service.create_agent(
                 ctx.principal, name=payload.get('name'), tool=payload.get('tool'),
                 working_directory=payload.get('working_directory'),
@@ -2377,9 +2530,25 @@ class ApiHandler(BaseHTTPRequestHandler):
         payload = dict(ctx.payload or {})
 
         def update():
+            held = (self.service.state['agents'].get(ctx.params['aid']) or {}).get('projects') or ()
+            self._require_grantable(ctx.principal, payload.get('projects'), held)
             result = self.service.update_agent(ctx.principal, ctx.params['aid'], payload)
             return result, result
         return self._mutate(ctx, 'agents.update', None, update, capability=CAP_AGENTS)
+
+    def _require_grantable(self, principal, projects, held):
+        """Refuse a NEW agent grant on a record the backend will not serve (kittrial-5bb.84).
+
+        Only projects the caller is a member of are judged here, so the refusal never
+        reveals a record the caller cannot see (the service refuses those itself); a
+        grant the agent already holds is left alone, so its other fields stay editable.
+        """
+        if not isinstance(projects, (list, tuple)):
+            return
+        for project_id in projects:
+            if isinstance(project_id, str) and project_id not in held \
+                    and principal.user_id in self.service.state['memberships'].get(project_id, {}):
+                self._require_usable(project_id)
 
     @route('POST', r'/v1/agents/(?P<aid>' + ID + r')/disable')
     def agents_disable(self, ctx):
@@ -3174,6 +3343,9 @@ def main(argv=None):
                         help='canonical base URL of this service, used only to render '
                              'copyable agent setup/resume snippets (e.g. https://host)')
     parser.add_argument('--bootstrap-user', help='one-time operator bootstrap superuser')
+    parser.add_argument('--list-unconfirmed-projects', action='store_true',
+                        help='print the project records the endpoint backend will not serve (an upgrade '
+                             'check: a superuser confirms or archives each one), then exit; read-only')
     web = parser.add_mutually_exclusive_group()
     web.add_argument('--web-root', default=str(DEFAULT_WEB_ROOT),
                      help='directory holding the browser interface served at / '
@@ -3182,6 +3354,19 @@ def main(argv=None):
                      help='serve only the JSON API; do not serve the browser interface')
     args = parser.parse_args(argv)
 
+    if args.list_unconfirmed_projects:
+        # Read-only: the state document is read as JSON, without opening the store (which
+        # may migrate or write), so it is safe beside a running service and never
+        # creates a state file from a mistyped path.
+        if not Path(args.state).is_file():
+            parser.error('--list-unconfirmed-projects needs an existing --state file')
+        document = json.loads(Path(args.state).read_text(encoding='utf-8'))
+        if not isinstance(document, dict) or not isinstance(document.get('projects'), dict):
+            parser.error('--state is not a service state document')
+        import types
+        items = unusable_projects(types.SimpleNamespace(state=document))
+        print(json.dumps({'items': items, 'total': len(items)}, indent=2))
+        return 0
     store = Store(args.state)
     if args.bootstrap_user:
         import getpass

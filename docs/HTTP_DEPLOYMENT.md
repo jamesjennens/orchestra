@@ -186,6 +186,8 @@ The rules:
   so the check that the canonical project exists cannot be used to probe for names.
 - The project id is the canonical name. One canonical project is registered once; a
   second registration is refused with 409, naming the existing record (archived or not).
+  An exact retry of a successful registration with the same `Idempotency-Key` replays
+  its 201.
 - If no initialized canonical project `NAME` exists, the request is refused with 422 and
   nothing is stored.
 - Registering makes the superuser the project's only member (owner). Add members
@@ -202,8 +204,42 @@ task routes answer 409 instead of an endpoint error. Nothing is deleted. Archive
 (the Archive button, or `POST /v1/projects/{id}/archive`), then create and register the
 real project as above.
 
+**Records with a canonical id from before this rule (the upgrade check).** Before
+registration was limited to superusers, any account could create a record whose id was a
+canonical project name and so become owner of that canonical project. Such a record is
+served only when something shows a superuser stood behind it: the register route wrote it,
+a superuser confirmed it, or its creator is a superuser today. Otherwise it is
+**unconfirmed**: listed `usable: false` with `needs_confirmation: true`, and refused like
+a `proj_...` record until a superuser decides. After every upgrade to this kit or later:
+
+1. On the host, list the records the service will not serve. This reads the state file
+   only, so it is safe beside a running service:
+   `python3 http_service.py --state <STATE> --list-unconfirmed-projects`
+   A superuser sees the same list in the web interface (Projects, "Projects to confirm
+   or archive") and at `GET /v1/projects/unconfirmed`. Each entry names who created the
+   record and every current member with their role. An empty list means nothing to do.
+2. For each `unconfirmed` entry, a superuser either:
+   - **confirms** it (`POST /v1/projects/{id}/confirm`, or Confirm on the page, which
+     shows the creator and the members first). The canonical project must exist on the
+     host. The members keep their access, so review them; the confirmation is recorded
+     on the record (`confirmed_by`, `confirmed_at`) and in the audit log
+     (`projects.confirm`); or
+   - **archives** it (`POST /v1/projects/{id}/archive`).
+3. Archive each `no-canonical` entry (a `proj_...` id).
+
+**What an unusable record still allows.** While a record is unconfirmed or has no
+canonical project:
+- Reads of the record, its members and its credentials work. Its task, review and queue
+  routes answer 409 before any endpoint call.
+- Nothing that grants or extends access is accepted (409): adding a member or changing a
+  role, issuing a worker credential, a new agent grant.
+- Everything that removes access works: removing a member, revoking a worker credential,
+  revoking an agent's grant, archiving. Cleaning up a suspicious record never requires
+  confirming it first.
+
 With `--backend inprocess` (disposable local validation) everything is service-local, so
-"New project" still creates the project directly (`project_create: create`).
+"New project" still creates the project directly (`project_create: create`), and no record
+is ever unusable or listed for confirmation.
 
 ## 6. Worker clients
 
