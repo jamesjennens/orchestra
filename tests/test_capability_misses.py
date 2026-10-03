@@ -363,7 +363,11 @@ class RecordTests(MissLogCase):
                 raise BlockingIOError(11, 'Resource temporarily unavailable')
             return real(descriptor, flags)
         self.fcntl.flock = flock
-        self.assertEqual(self.record('merge slot'), 'recorded')
+        # Sleeps are not taken for real: a coarse platform timer (Windows rounds 3 ms up to
+        # about 15 ms) would otherwise use the whole 10 ms budget on the first retry. The
+        # real-time bound has its own test.
+        with patch.object(cm.time, 'sleep'):
+            self.assertEqual(self.record('merge slot'), 'recorded')
         self.assertEqual(len(attempts), 3)
 
     def test_the_retry_wait_is_bounded_in_real_time(self):
