@@ -1675,6 +1675,18 @@ class Service:
                     names[actor] = actor
         return names
 
+    def actor_person(self, actor):
+        """The account behind a task actor: an agent's owner, or the account itself.
+
+        Anything that is neither a known agent nor a known account is its own label, so
+        two unknown labels are the same person only when they are equal.
+        """
+        with self.store.lock:
+            agent = self.state['agents'].get(actor) if isinstance(actor, str) else None
+            if isinstance(agent, dict) and agent.get('owner'):
+                return agent['owner']
+        return actor
+
     def username_of(self, user_id):
         """The account's username, read under the store lock (``None`` if unknown)."""
         with self.store.lock:

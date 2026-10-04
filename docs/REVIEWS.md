@@ -365,6 +365,13 @@ Sent with `review TASK --file payload.json`, like the other review operations. I
 
 **Who may write one.** Anyone who may write on the task, except the contribution's author and the task's assignee (compared with the name rule of the follow-on gate, so an agent of the same owner under another session id is the same author). The rule is applied when it is written **and again every time it is read**.
 
+**Independence by person, over HTTP only.** The rule above compares actor names. A person and their agent have different names, so over SSH the kit cannot tell that a recommender is the owner of the agent that delivered the work. The web service knows who owns each agent, and it also refuses (403) a recommendation from:
+
+* the person who owns the agent that authored the contribution or is the task's assignee;
+* another agent owned by the same person as the author or the assignee.
+
+The web service applies the same rule when it reads: such a record is left out of the brief's `recommendations` and of a row's `recommended_by`. Two limits follow. If the newest standing recommendation is left out this way, the brief's `recommendation` is null even when an older one by an independent reviewer stands (that reviewer is still named in `recommendations`, and the text is in the task history). The queue compares with the task's assignee only, because its rows do not carry the contribution's author. `review`, `brief` and `work` over SSH show every recommendation that passes the name rule.
+
 **When it stands.** A recommendation is shown only while all of these hold:
 
 * the task is `awaiting-review` and not closed;

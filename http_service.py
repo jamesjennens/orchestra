@@ -2326,6 +2326,35 @@ class ApiHandler(BaseHTTPRequestHandler):
         names = self.service.actor_names([t.get('assignee') for t in tasks])
         return [self._task_view(t, names) for t in tasks]
 
+    #: Said when a recommendation is refused because it is not independent of the author.
+    NOT_INDEPENDENT = ('A recommendation must be independent of the author: the contribution\'s author, the '
+                       'task\'s assignee, the person who owns the agent that delivered it, and that person\'s '
+                       'other agents cannot recommend it')
+
+    def _independent(self, actors, parties):
+        """The ``actors`` who are a different PERSON from every one of ``parties``.
+
+        The canonical rule compares actor names, and a person and their agents are
+        different names. The web service knows who owns each agent, so here a person,
+        their agent, and two agents of one person are all the same party
+        (kittrial-5bb.115).
+        """
+        persons = {self.service.actor_person(party) for party in parties if isinstance(party, str) and party}
+        return [actor for actor in actors
+                if isinstance(actor, str) and self.service.actor_person(actor) not in persons]
+
+    def _independent_queue(self, read):
+        """Drop from each row's ``recommended_by`` anyone who is the assignee's person."""
+        changed = False
+        for item in read.get('items') or []:
+            names = item.get('recommended_by') or []
+            kept = self._independent(names, [item.get('assignee')]) if names else names
+            if len(kept) != len(names):
+                item['recommended_by'], item['recommended'], changed = kept, bool(kept), True
+        if changed:
+            read['items'].sort(key=queue_order)
+        return read
+
     def _review_queue(self, project_id, shared=False):
         """One review-queue read of a project per request (and, when ``shared`` and the
         backend allows it, reused for ``READ_CACHE_SECONDS`` by the same principal).
@@ -2333,7 +2362,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         Authorization is never cached: callers re-check live authority first.
         """
         return self._cached_read('queue', project_id,
-                                 lambda: self.backend.review_queue(project_id), shared)
+                                 lambda: self._independent_queue(self.backend.review_queue(project_id)), shared)
 
     def _cached_read(self, kind, project_id, load, shared=False):
         """One canonical read per request, optionally reused across requests.
@@ -3625,6 +3654,16 @@ class ApiHandler(BaseHTTPRequestHandler):
         actors += [checkpoint.get('author')] if checkpoint else []
         actors += [contribution.get('author')] if contribution else []
         actors += [r.get('author') for r in review.get('requests') or []]
+        # Only a recommendation by a different person from the author and the assignee is
+        # shown (see _independent). The canonical read gives the newest one in full; when
+        # that one is dropped here the full text of an older one is not available, so the
+        # list still names who else recommends and `recommendation` is null.
+        parties = [brief['task'].get('assignee'), (contribution or {}).get('author')]
+        standing = review.get('recommendations') or []
+        kept = set(self._independent([entry.get('author') for entry in standing], parties))
+        review['recommendations'] = [entry for entry in standing if entry.get('author') in kept]
+        if review.get('recommendation') and review['recommendation'].get('author') not in kept:
+            review['recommendation'] = None
         advice = [review.get('recommendation')] if review.get('recommendation') else []
         advice += review.get('recommendations') or []
         actors += [entry.get('author') for entry in advice]
@@ -3694,6 +3733,16 @@ class ApiHandler(BaseHTTPRequestHandler):
             payload['actor'] = self.service.bind_actor(ctx.principal, payload.get('actor'))
 
         def add():
+            if payload.get('operation') == 'recommend':
+                # Independence by PERSON, which only the web service can know; the
+                # canonical write then applies the name rule and every other rule.
+                current = self.backend.task_brief(ctx.params['pid'], ctx.params['tid'])
+                parties = [(current.get('task') or {}).get('assignee'),
+                           ((current.get('review') or {}).get('contribution') or {}).get('author')]
+                actor = payload.get('actor') or ctx.principal.actor or ctx.principal.user_id
+                if not self._independent([actor], parties) or \
+                        not self._independent([ctx.principal.user_id], parties):
+                    raise forbidden(self.NOT_INDEPENDENT)
             if payload.get('operation') == 'respond':
                 # Only the task's assignee (the contributor of the current revision)
                 # may respond to requested changes. Both backends enforce it at the

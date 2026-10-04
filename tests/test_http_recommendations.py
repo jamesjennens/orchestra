@@ -33,6 +33,27 @@ class Shared:
     def queue(self, token):
         return self.request('GET', '/v1/projects/%s/queue' % self.project, token=token).data['items']
 
+    def test_a_recommendation_must_come_from_another_person(self):
+        """The delivering agent's owner, and that person's other agents, are not independent."""
+        commit = test_http_agents.COMMIT
+        task, contribution = self.deliver('first', commit)
+        made = self.request('POST', '/v1/agents', {'name': 'Merlin', 'working_directory': '/home/carl/m',
+                                                   'projects': [self.project]}, token=self.contributor)
+        self.assertEqual(201, made.status, made.data)
+        sibling = made.data['credential']['secret']
+        for label, token in (('the agent\'s owner', self.contributor), ('another agent of the same person', sibling),
+                             ('the delivering agent', self.agent)):
+            with self.subTest(refused=label):
+                answer = self.recommend(token, task, contribution, commit)
+                self.assertEqual(403, answer.status, answer.data)
+                self.assertIn('must be independent of the author', answer.data['error']['message'])
+        review = self.review(self.owner, task)
+        self.assertEqual((review['recommendation'], review['recommendations']), (None, []))
+        # Another person, and another person's agent, may.
+        self.assertEqual(201, self.recommend(self.reviewer, task, contribution, commit).status)
+        self.assertEqual(201, self.recommend(self.reviewer_agent, task, contribution, commit).status)
+        self.assertEqual(len(self.review(self.owner, task)['recommendations']), 2)
+
     def check_the_scenario(self, task, other, contribution, commit, approve):
         """`task` has a contribution by the agent; `other` has one too, with no recommendation."""
         before = self.review(self.owner, task)
@@ -95,6 +116,7 @@ class InProcessTests(Shared, test_http_agents.AgentHarness):
             self.request('PUT', '/v1/projects/%s/members/%s' % (self.project, user_id), {'role': role}, token=admin)
             tokens[name] = self.login(name, name + '-password-1')[0]
         self.owner, self.reviewer, self.viewer = tokens['olive'], tokens['rita'], tokens['vera']
+        self.contributor = tokens['carl']
         made = self.request('POST', '/v1/agents', {'name': 'Kestrel', 'working_directory': '/home/carl/k',
                                                    'projects': [self.project]}, token=tokens['carl'])
         self.agent = made.data['credential']['secret']
@@ -144,6 +166,25 @@ class InProcessTests(Shared, test_http_agents.AgentHarness):
         self.assertEqual(201, revised.status, revised.data)
         self.assertIsNone(self.review(self.owner, task)['recommendation'])
 
+    def test_a_stored_one_by_the_authors_own_person_is_not_shown(self):
+        """The read applies the same rule: such a record can reach the task over SSH, where only names are compared."""
+        commit = test_http_agents.COMMIT
+        task, contribution = self.deliver('first', commit)
+        self.assertEqual(201, self.recommend(self.reviewer_agent, task, contribution, commit).status)
+        carl = next(uid for uid, user in self.service.state['users'].items() if user.get('username') == 'carl')
+        stored = self.backend.state['recommendations'][task]
+        stored.append(dict(stored[0], id='rec_owner', actor=carl, created_at='2099-01-01T00:00:00Z', summary='my own agent did well'))
+        review = self.review(self.owner, task)
+        # The newest is the owner's: it is dropped, and the other reviewer is still named.
+        self.assertIsNone(review['recommendation'])
+        self.assertEqual([entry['author'] for entry in review['recommendations']], [self.reviewer_actor])
+        row = next(row for row in self.queue(self.owner) if row['id'] == task)
+        self.assertEqual((row['recommended'], row['recommended_by']), (True, [self.reviewer_actor]))
+        del stored[0]
+        row = next(row for row in self.queue(self.owner) if row['id'] == task)
+        self.assertEqual((row['recommended'], row['recommended_by']), (False, []))
+        self.assertEqual(self.review(self.owner, task)['recommendations'], [])
+
     def test_one_written_before_a_request_does_not_come_back_when_the_request_is_resolved(self):
         task, contribution = self.deliver('first', test_http_agents.COMMIT)
         self.assertEqual(201, self.recommend(self.reviewer_agent, task, contribution, test_http_agents.COMMIT).status)
@@ -182,6 +223,7 @@ class EndpointTests(Shared, fixes.EndpointCase):
             self.assertIn(added.status, (200, 201), added.data)
             tokens[name] = self.login(name, name + '-password-1')[0]
         self.owner, self.reviewer, self.viewer = tokens['olive'], tokens['rita'], tokens['vera']
+        self.contributor = tokens['carl']
         made = self.request('POST', '/v1/agents', {'name': 'Kestrel', 'working_directory': '/home/carl/k',
                                                    'projects': [self.project]}, token=tokens['carl'])
         self.assertEqual(201, made.status, made.data)
