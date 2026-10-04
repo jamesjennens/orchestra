@@ -109,6 +109,19 @@ def evidence_is_live(record, author, allowlist):
     return isinstance(author, str) and author == record.get('operator') and author in allowlist
 
 
+def inert_reason(record, author, allowlist):
+    """Why one acceptance-evidence record is not live, in the reader's words. There are two
+    different reasons (`evidence_is_live` needs both): the native author is not on the
+    operator allowlist, or the author is listed but is not the operator the record itself
+    names (kittrial-5bb.92 review). Saying "not on the allowlist" for the second sent an
+    operator looking in the wrong place."""
+    named = record.get('operator')
+    if isinstance(author, str) and author in allowlist and author != named:
+        return ('written by %s, who is on the deployment operator allowlist but is not the operator the record '
+                'names (%s)' % (author, named))
+    return 'written by %s, who is not on the deployment operator allowlist' % (author or named)
+
+
 class AnchoredKind:
     """One keyed-entry kind: its names, its record parsers and its content hooks.
 
@@ -953,13 +966,21 @@ class AnchoredKind:
         applied voids and its `entry_view` state is not malformed, unsupported or
         incomplete. The revision ledger alone is not enough: one other bad comment on the
         anchor (a malformed acceptance, a CRLF lookalike, a newer or unknown record kind)
-        makes the reader refuse the whole entry (review of b1b2b10). The state is the
-        whole test: an entry accepted by an operator who was later removed reads
-        `draft-only` with no record and no proposed revision shown, and is still the
-        genuine entry (review of 3531a05); superseded and drifted entries count too."""
+        makes the reader refuse the whole entry (review of b1b2b10). Accepted, superseded
+        and drifted entries count. A `draft-only` entry counts when it shows a proposed
+        revision, or when its acceptance is inert: an entry accepted by an operator who
+        was later removed shows no record and no proposed revision and is still the
+        genuine entry (review of 3531a05). A `draft-only` entry that shows neither is a
+        record that says accepted with NO acceptance evidence at all: a contributor has
+        no hash to revise from, so it does not count (kittrial-5bb.101)."""
         if not self.has_live_record(row, operators):
             return False
-        return self.entry_view(row, operators)['state'] not in (None, 'malformed', 'unsupported', 'incomplete')
+        view = self.entry_view(row, operators)
+        if view['state'] in (None, 'malformed', 'unsupported', 'incomplete'):
+            return False
+        if view['state'] == 'draft-only':
+            return view.get('proposed') is not None or bool(view.get('acceptance_inert'))
+        return True
 
     def acceptance_on(self, row, operators):
         """The acceptance evidence on one anchor that no applied void names:
@@ -974,7 +995,7 @@ class AnchoredKind:
             author = comment.get('author')
             found.append({'revision': record['revision'], 'record_sha256': record['record_sha256'],
                           'operator': record['operator'], 'decision_id': record['decision'].get('decision_id'),
-                          'at': record['at'], 'live': author == record['operator'] and author in allowlist})
+                          'at': record['at'], 'live': evidence_is_live(record, author, allowlist)})
         return found
 
     def selected_anchor(self, anchors, operators):
@@ -1158,13 +1179,13 @@ class AnchoredKind:
                         if any(item is kept for kept in live_items):
                             continue
                         view['warnings'].append({'code': 'inert-evidence',
-                                                 'detail': 'revision %d also carries acceptance evidence written by '
-                                                           '%s, who is not on the deployment operator allowlist; it '
+                                                 'detail': 'revision %d also carries acceptance evidence %s; it '
                                                            'is inert and the live evidence stands'
-                                                           % (number, author or item['operator'])})
+                                                           % (number, inert_reason(item, author, allowlist))})
                     break
                 if inert is None:
-                    inert = (number, evidence[0][1] or evidence[0][0]['operator'])
+                    inert = (number, evidence[0][1] or evidence[0][0]['operator'],
+                             inert_reason(evidence[0][0], evidence[0][1], allowlist))
             if chosen is not None:
                 number, item = chosen
                 record, comment_id = revisions[number]
@@ -1176,8 +1197,7 @@ class AnchoredKind:
             if inert is not None and (chosen is None or inert[0] > chosen[0]):
                 view.update(acceptance_inert=True, inert_operator=inert[1])
                 view['warnings'].append({'code': 'acceptance-inert',
-                                         'detail': 'revision %d carries acceptance evidence written by %s, who '
-                                                   'is not on the deployment operator allowlist' % inert})
+                                         'detail': 'revision %d carries acceptance evidence %s' % (inert[0], inert[2])})
             floor = chosen[0] if chosen is not None else 0
             drafts = [number for number, (record, _) in revisions.items()
                       if record['acceptance_state'] == 'draft' and number > floor]

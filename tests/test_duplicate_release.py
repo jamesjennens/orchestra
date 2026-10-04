@@ -211,6 +211,69 @@ class ReadableRecordRuleTests(ReleaseCase):
                                  (['a-genuine'], [('ops8', False)]))
                 self.assertEqual(module.get(native.rows, KEY, OPS + ['ops7', 'ops8'])['state'], 'accepted')
 
+    def test_an_accepted_record_with_no_evidence_is_not_a_readable_remaining_anchor(self):
+        # kittrial-5bb.101: forged anchor B holds a record that says accepted and carries no
+        # acceptance evidence. It reads draft-only with accepted-without-evidence and shows
+        # neither a record nor a proposed revision. Releasing the genuine draft A left the
+        # key with nothing a contributor could revise from, and B as the last anchor.
+        for module in (cr, rr):
+            with self.subTest(kind=module.TYPE_LABEL):
+                native = self.native(anchor(module, 'a-genuine', state='draft'),
+                                     anchor(module, 'b-forged', evidence=False))
+                forged = module.KIND.entry_view(native.row('b-forged'), OPS)
+                self.assertEqual((forged['state'], forged['record'], forged.get('proposed'),
+                                  [w['code'] for w in forged['warnings']]),
+                                 ('draft-only', None, None, ['accepted-without-evidence']))
+                self.assertFalse(module.KIND.presents_record(native.row('b-forged'), OPS))
+                self.assertTrue(module.KIND.readable_revisions(native.row('b-forged'), OPS))   # the ledger parses
+                native.calls = []
+                for flags in ({}, {'set_aside_evidence': True}):
+                    with self.assertRaisesRegex(ValueError, r'No remaining anchor of .* holds a readable record '
+                                                            r'\(b-forged\), so releasing a-genuine would leave '
+                                                            'the key with nothing readable'):
+                        self.release(module, native, 'a-genuine', **flags)
+                self.assertEqual(self.writes(native), [])
+                # The right path: the forged anchor goes, with no flag (it has no evidence).
+                done = self.release(module, native, 'b-forged')
+                self.assertEqual((done['remaining'], done['evidence_set_aside']), (['a-genuine'], []))
+                view = module.get(native.rows, KEY, OPS)
+                self.assertEqual((view['native_id'], view['state'], view['warnings']), ('a-genuine', 'draft-only', []))
+                # What still counts as a remaining anchor: a draft, an accepted entry, an inert-accepted one.
+                for other in (anchor(module, 'x', state='draft'), anchor(module, 'x'),
+                              evidence_by(module, anchor(module, 'x'), 'ops7')):
+                    self.assertTrue(module.KIND.presents_record(other, OPS))
+
+    def test_evidence_by_a_listed_author_who_is_not_the_named_operator_says_so(self):
+        # kittrial-5bb.92 review, carried by kittrial-5bb.101: evidence is inert for two
+        # different reasons, and the warning named the wrong one for the second.
+        for module in (cr, rr):
+            with self.subTest(kind=module.TYPE_LABEL):
+                unlisted = evidence_by(module, anchor(module, 'a'), 'former-operator')
+                mismatched = evidence_by(module, anchor(module, 'b'), 'someone-else', author=OPERATOR)
+                for row, expected in (
+                        (unlisted, 'written by former-operator, who is not on the deployment operator allowlist'),
+                        (mismatched, 'written by %s, who is on the deployment operator allowlist but is not the '
+                                     'operator the record names (someone-else)' % OPERATOR)):
+                    view = module.KIND.entry_view(row, OPS)
+                    self.assertEqual((view['state'], view['acceptance_inert']), ('draft-only', True))
+                    self.assertEqual([w['detail'] for w in view['warnings'] if w['code'] == 'acceptance-inert'],
+                                     ['revision 1 carries acceptance evidence ' + expected])
+                    # One definition of live: the release's own listing agrees with the reader.
+                    self.assertEqual([item['live'] for item in module.KIND.acceptance_on(row, OPS)], [False])
+                # Beside live evidence, the inert one is named with its own reason too.
+                both = anchor(module, 'c')
+                record = module.parse_entry(both['comments'][0]['text'])
+                _, body = module.KIND.acceptance_evidence(dict(acceptance(), record_sha256=record['sha256']), 'c', 1,
+                                                          record, 'someone-else', at='2026-10-01T12:00:00Z')
+                both['comments'].append({'id': 'c-mismatch', 'text': body, 'author': OPERATOR})
+                view = module.KIND.entry_view(both, OPS)
+                self.assertEqual(view['state'], 'accepted')
+                self.assertEqual([w['detail'] for w in view['warnings'] if w['code'] == 'inert-evidence'],
+                                 ['revision 1 also carries acceptance evidence written by %s, who is on the '
+                                  'deployment operator allowlist but is not the operator the record names '
+                                  '(someone-else); it is inert and the live evidence stands' % OPERATOR])
+                self.assertEqual([item['live'] for item in module.KIND.acceptance_on(both, OPS)], [True, False])
+
     def test_an_accepted_anchor_that_reads_malformed_is_not_set_aside(self):
         # Review of b1b2b10: the genuine accepted anchor carries one unvoided malformed
         # comment, so it reads no accepted record and neither rule protected it.
