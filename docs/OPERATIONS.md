@@ -219,9 +219,9 @@ history](#malformed-structured-history) (`void-record`).
 | `anchor-release PROJECT --kind reference\|capability --issue-id ID --actor OPERATOR --reason TEXT` | close a reference or capability anchor that holds no record and free its key, when the propose that created it cannot be re-run ([orphan anchors](#orphan-anchors)). With `--duplicate` (and, for an anchor that carries acceptance evidence, `--set-aside-evidence`) it releases a named anchor of a [duplicated key](#a-duplicated-record-key) although it holds well-formed records | the deployment operator allowlist, checked before any read |
 | `handoff PROJECT --actor ACTOR --file handoff.json` | transfer a claim when the current owner cannot act | an owner decision/evidence pointer in the payload's `approval` |
 | `set-guidance PROJECT --actor OPERATOR --file FILE` | install the project's [standing guidance](#standing-guidance) text (bounded plain text, 8000 bytes) and its audit record. A set with the same text repairs a missing or mismatched audit record (`repaired: true`) | the deployment operator allowlist, checked before any write |
-| `guidance-status PROJECT --actor OPERATOR` | print who has acknowledged which guidance version, with the previous text, `up_to_date`, `behind` and `stale` | the deployment operator allowlist |
-| `clear-guidance PROJECT --actor OPERATOR` | remove `GUIDANCE.md` and `.guidance.json`; guidance then reads `present: false` | the deployment operator allowlist |
-| `compact-guidance-acks PROJECT --actor OPERATOR` | drop acknowledgements for versions other than the current and previous one; the record keeps `acks_compacted_by`/`acks_compacted_at` as the audit trail | the deployment operator allowlist |
+| `guidance-status PROJECT --actor OPERATOR` | print who has acknowledged which guidance version, with the current text, the previous text, the history, `up_to_date`, `behind` and `stale` (the authoritative read; the endpoint's `guidance status` shows no guidance text) | the deployment operator allowlist |
+| `clear-guidance PROJECT --actor OPERATOR` | remove `GUIDANCE.md` and `.guidance.json` and write the local `.guidance-clear.json` record (who, when, cleared version); guidance then reads `present: false`. A symlinked `GUIDANCE.md` is refused and needs a manual delete | the deployment operator allowlist |
+| `compact-guidance-acks PROJECT --actor OPERATOR` | drop acknowledgements for versions other than the current and previous one; the record keeps `acks_compacted_by`/`acks_compacted_at` (also kept across later sets) as the audit trail | the deployment operator allowlist |
 
 All five are shell-trusted: access to the service account's shell is the boundary.
 `requirement-apply`, `requirement-backfill`, `void-record` and `anchor-release` also
@@ -245,25 +245,52 @@ The standing guidance channel (kittrial-5bb.99) stores one operator-set instruct
 per project in `projects/PROJECT/GUIDANCE.md` plus its audit record
 `projects/PROJECT/.guidance.json`. The version is the SHA-256 of the exact text
 bytes, computed by every reader. Only `admin.py set-guidance` writes it (operator
-allowlist, checked before any file is read). The endpoint can read it and record a
-registered session's own acknowledgement of the exact version it names; it cannot
-write it, and every other guidance subcommand is refused.
+allowlist, checked before any file is read). The endpoint can read it and record an
+actor's own acknowledgement of the exact version it names; it cannot write it, and
+every other guidance subcommand is refused. The endpoint's `guidance status` shows
+versions and actor names but no guidance text; `admin.py guidance-status` is the
+authoritative operator read and adds the current text, the previous text and the
+history.
 
-* A hand edit of `GUIDANCE.md`, or a crash between the two writes, is reported as a
-  mismatch: readers show `present: true` with `set_by: null` and a `warning`, never
-  crediting the text to the previous setter. Setting the same text again repairs the
-  record and prints `repaired`. A project backup refuses a mismatched pair, and so
-  does a restore.
-* Acknowledgement requires the version the caller read and a registered session (or
-  a configured operator name). The acknowledgement table is bounded (500): a new
-  lane evicts the oldest entry rather than being refused, acks for versions other
-  than the current and previous one are dropped at every set, and
-  `compact-guidance-acks` drops stale ones on demand. An acknowledgement does not
-  prove a read: actors are self-declared, so any caller that can reach the endpoint
-  can name another actor.
-* `clear-guidance` removes both files and guidance reads `present: false`; the
-  removed record stays in the project's most recent coordination backup, if one was
-  taken.
+* A hand edit of `GUIDANCE.md`, or a crash between the two writes, is reported as an
+  **unbound** record: the version block shows `present: true`, `set_by: null`,
+  `unbound: true` and a `warning`, and `guidance get` returns `text: null` with the
+  warning and a `next_action` saying the guidance is being repaired by the operator.
+  Text without a setter is never delivered to a worker and never followed. Setting
+  the same text again repairs the record and prints `repaired`; the generation the
+  old audit record named is kept in `history`, so `get --since` still knows it. A
+  `GUIDANCE.md` that is a symlink is refused (readers and `clear-guidance` do not
+  follow it): that state needs a manual delete of the link.
+* **A mismatched or unreadable guidance pair degrades its project's backup instead
+  of failing it.** `backup --all` still backs up every other project and still
+  completes the tracker backup of the affected one, leaving the bad guidance pair
+  out of the sidecar; the run records that project `complete` with a `degraded`
+  message (and prints it), and the entry stays in `backup-status`. The process exits
+  0 because the tracker backup is complete and usable - the daily timer must not
+  report a broken backup for a two-file instruction fault - and the operator repairs
+  the pair with a same-text `set-guidance` and takes a fresh backup. `restore-new` on
+  a backup with no guidance pair restores the tracker with the project reading
+  `present: false` (no guidance), never a mismatched pair.
+* Acknowledgement requires the version the caller read, given as
+  `--version VERSION`; the endpoint refuses a bare positional version and refuses a
+  stale version **without naming the current one**, so a caller must run
+  `guidance get` first. **Acks are unauthenticated:** actors are self-declared, any
+  actor the endpoint accepts may ack for itself, and a caller can name another
+  actor. A flood can fill the bounded table and evict a real lane's ack; that fails
+  safe because an evicted lane re-reads and re-acks. The table is bounded (500): a
+  new lane evicts the oldest entry rather than being refused, acks for versions
+  other than the current and previous one are dropped at every set, and
+  `compact-guidance-acks` drops stale ones on demand (its
+  `acks_compacted_by`/`acks_compacted_at` audit is kept across later sets). An
+  acknowledgement does not prove a read.
+* Guidance is bounded (8000 bytes) plain text. C0, C1, bidi, word-joiner, BOM and
+  Unicode tag (`U+E0000`-`U+E007F`) characters are refused; ZWNJ/ZWJ are allowed
+  between letters so legitimate Persian text is not blocked.
+* `clear-guidance` removes both files, writes the small local
+  `.guidance-clear.json` audit record (who cleared it, when, the cleared version,
+  bounded to the last 10 clears) and guidance reads `present: false`. That local
+  record is not part of the coordination backup; the removed guidance record itself
+  stays in the project's most recent coordination backup, if one was taken.
 
 **Rollback gap and the exact step.** An older kit (at or before
 `dca96b9d`) validates the coordination sidecar against a fixed path set that does

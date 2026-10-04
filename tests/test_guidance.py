@@ -4,9 +4,10 @@ import io
 import json
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import admin
@@ -102,11 +103,24 @@ class GuidanceRecordTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             guidance.validate_text('escape\x1b[31m')
 
-    def test_bidi_zero_width_and_c1_characters_are_refused(self):
-        # kittrial-5bb.99 review `small` 7: these rendered as harmless text while
-        # reordering or hiding what a reader sees.
-        for bad in ['safe\u202eevil', 'a\u200bb', 'a\u0085b', 'a\u2066b', 'a\ufeffb', 'a\u2028b']:
+    def test_bidi_zero_width_tag_and_c1_characters_are_refused(self):
+        # kittrial-5bb.99 review `small` 4/7: these rendered as harmless text while
+        # reordering or hiding what a reader sees. The U+E0000 tag block is a known
+        # invisible-instruction vector and is refused too.
+        for bad in ['safe\u202eevil', 'a\u200bb', 'a\u0085b', 'a\u2066b', 'a\ufeffb', 'a\u2028b',
+                    'a\U000E0041b', '\U000E0001', 'a\U000E007Fb']:
             with self.subTest(bad=repr(bad)), self.assertRaisesRegex(ValueError, 'plain text'):
+                guidance.validate_text(bad)
+
+    def test_zwnj_and_zwj_are_allowed_between_letters_only(self):
+        # kittrial-5bb.99 review `small` 4: ZWNJ/ZWJ are legitimate in Persian text
+        # (and emoji), so a blanket refusal blocked real prose. They are allowed
+        # between letters and refused anywhere else.
+        for good in ['می\u200cروم', 'a\u200cb', 'a\u200db', 'می\u200dروم']:
+            with self.subTest(good=repr(good)):
+                self.assertEqual(guidance.validate_text(good), good)
+        for bad in ['\u200ca', 'a\u200c', 'a \u200cb', 'a\u200c1', '1\u200cb', 'a\u200c.']:
+            with self.subTest(bad=repr(bad)), self.assertRaisesRegex(ValueError, 'joiner'):
                 guidance.validate_text(bad)
 
     def test_acknowledge_records_actor_and_clears_attention(self):
@@ -129,12 +143,25 @@ class GuidanceRecordTests(unittest.TestCase):
         v2 = guidance.version_of('Second')
         with self.assertRaisesRegex(ValueError, 'Name the guidance version'):
             guidance.acknowledge(self.project, 'worker-1')
-        with self.assertRaisesRegex(ValueError, 'not current'):
+        # A stale version is refused WITHOUT naming the current one, so a caller
+        # cannot ack a version it never read by copying it out of the refusal
+        # (kittrial-5bb.99 review `small` 2): it must call `guidance get` first.
+        with self.assertRaisesRegex(ValueError, 'not the current version') as stale:
             guidance.acknowledge(self.project, 'worker-1', v1)
-        with self.assertRaisesRegex(ValueError, 'current version is ' + v2):
-            guidance.acknowledge(self.project, 'worker-1', v1)
+        self.assertNotIn(v2, str(stale.exception))
+        with self.assertRaisesRegex(ValueError, 'sha256'):
+            guidance.acknowledge(self.project, 'worker-1', 'not-a-version')
         self.assertTrue(guidance.acknowledge(self.project, 'worker-1', v2)['acknowledged'])
         self.assertEqual(guidance.state(self.project, 'worker-1')['acknowledged_version'], v2)
+
+    def test_any_actor_may_ack_its_own_read_without_a_registration(self):
+        # kittrial-5bb.99 review `registration-gate-locks-out-unregistered-lanes`:
+        # live lanes include legacy actors with no session record. Their attention
+        # flag must be clearable, so the ack has no registration requirement.
+        guidance.write_guidance(self.project, 'Text', 'operator-1')
+        version = guidance.version_of('Text')
+        self.assertTrue(guidance.acknowledge(self.project, 'legacy-lane', version)['acknowledged'])
+        self.assertFalse(guidance.state(self.project, 'legacy-lane')['attention'])
 
     def test_new_guidance_returns_attention_to_an_acknowledged_actor(self):
         guidance.write_guidance(self.project, 'First', 'operator-1')
@@ -189,11 +216,19 @@ class GuidanceRecordTests(unittest.TestCase):
         # A set already drops acks older than the current and previous version; a
         # record from an older revision can still carry one, which status marks stale.
         inject_stale_ack(self.project, 'stale-lane', guidance.version_of('v1'))
-        report = guidance.status(self.project, 'operator-1', ['operator-1'])
+        report = guidance.status(self.project, 'operator-1', ['operator-1'], host=True)
+        self.assertEqual(report['text'], 'v3')
         self.assertEqual(report['previous_text'], 'v2')
         self.assertEqual(report['behind'], ['behind-lane'])
         self.assertEqual(report['stale'], ['stale-lane'])
         self.assertIn('compact-guidance-acks', report['compact_hint'])
+        # The endpoint view (no host) shows the classification but no guidance content.
+        endpoint_report = guidance.status(self.project, 'operator-1', ['operator-1'])
+        self.assertEqual(endpoint_report['behind'], ['behind-lane'])
+        self.assertEqual(endpoint_report['stale'], ['stale-lane'])
+        self.assertNotIn('text', endpoint_report)
+        self.assertNotIn('previous_text', endpoint_report)
+        self.assertNotIn('history', endpoint_report)
 
     def test_brief_block_never_raises_and_marks_unreadable_guidance(self):
         self.assertIsNone(guidance.brief_block(None))
@@ -220,9 +255,22 @@ class GuidanceRecordTests(unittest.TestCase):
         state = guidance.state(self.project, 'worker-1')
         self.assertTrue(state['present']); self.assertIsNone(state['set_by'])
         self.assertIn('warning', state); self.assertTrue(state['attention'])
+        self.assertTrue(state['unbound'])
+        # The text is withheld, never delivered on an unreadable record.
         result = guidance.read(self.project, ['get'])
-        self.assertTrue(result['present']); self.assertIsNone(result['set_by'])
-        self.assertIn('warning', result)
+        self.assertFalse(result['present']); self.assertIsNone(result['text'])
+        self.assertTrue(result['unbound'])
+        self.assertIsNone(result['set_by']); self.assertIn('warning', result)
+
+    def test_documented_limits_are_literal(self):
+        # kittrial-5bb.99 review `tests`: asserting the module constants let a
+        # mutation of 500 to 600 pass, so the literal documented limits are asserted.
+        self.assertEqual(guidance.LIMIT, 8000)
+        self.assertEqual(guidance.HISTORY_LIMIT, 50)
+        self.assertEqual(guidance.ACK_LIMIT, 500)
+        with self.assertRaisesRegex(ValueError, '8000 bytes'):
+            guidance.validate_text('x' * 8001)
+        self.assertEqual(guidance.validate_text('x' * 8000), 'x' * 8000)
 
     def test_set_by_and_set_at_are_validated_and_never_injected(self):
         guidance.write_guidance(self.project, 'Text', 'operator-1')
@@ -251,24 +299,62 @@ class GuidanceRecordTests(unittest.TestCase):
             guidance.read_text(self.project)
         self.assertNotIn(str(self.project), str(caught.exception))
 
-    def test_mismatch_is_reported_on_every_reader_and_not_attributed(self):
+    def test_mismatch_withholds_the_text_and_is_not_attributed(self):
         guidance.write_guidance(self.project, 'original text', 'op-james')
         (self.project / 'GUIDANCE.md').write_text('hand edited text\n', encoding='utf-8')
         state = guidance.state(self.project, 'worker-1')
         self.assertTrue(state['present']); self.assertIsNone(state['set_by'])
-        self.assertIn('warning', state)
+        self.assertTrue(state['unbound']); self.assertTrue(state['attention'])
+        self.assertIn('warning', state); self.assertIn('repaired by the operator', state['next_action'])
+        # The endpoint must NEVER deliver unbound text: text null with the warning,
+        # as the unreadable states do, and attention stays raised with the repair
+        # action (kittrial-5bb.99 review `unbound-text-is-still-delivered`).
         result = guidance.read(self.project, ['get'])
+        self.assertFalse(result['present']); self.assertIsNone(result['text'])
+        self.assertTrue(result['unbound']); self.assertTrue(result['attention'])
         self.assertIsNone(result['set_by']); self.assertIn('warning', result)
-        report = guidance.status(self.project, 'op-james', ['op-james'])
+        self.assertIn('repaired by the operator', result['next_action'])
+        self.assertNotIn('hand edited text', json.dumps(result))
+        # The host guidance-status read may still show the text to the operator.
+        report = guidance.status(self.project, 'op-james', ['op-james'], host=True)
         self.assertIsNone(report['set_by']); self.assertIn('warning', report)
+        self.assertTrue(report['text_unbound']); self.assertEqual(report['text'], 'hand edited text\n')
+        # The endpoint status view does not show guidance text at all.
+        endpoint_report = guidance.status(self.project, 'op-james', ['op-james'])
+        self.assertNotIn('text', endpoint_report); self.assertNotIn('previous_text', endpoint_report)
+        self.assertNotIn('history', endpoint_report)
         block = guidance.brief_block(self.project, 'worker-1')
         self.assertIsNone(block['set_by']); self.assertIn('warning', block)
-        # A crash between the two writes is the same: the new text is not credited
-        # to the previous setter.
+        self.assertTrue(block['unbound'])
+        # A crash between the two writes is the same: the new text is withheld and is
+        # never credited to the previous setter.
         guidance.write_text(self.project / 'GUIDANCE.md', 'op-two text')
         crashed = guidance.read(self.project, ['get'])
-        self.assertEqual(crashed['text'], 'op-two text')
+        self.assertIsNone(crashed['text']); self.assertTrue(crashed['unbound'])
         self.assertIsNone(crashed['set_by']); self.assertIn('warning', crashed)
+
+    def test_same_text_repair_keeps_the_replaced_generation_known(self):
+        # kittrial-5bb.99 review `audit-gaps` 1: a crashed set leaves the file at the
+        # new text while the record still names the previous generation. Repairing
+        # with the same text must not write previous_version == version, must not
+        # write the current text as previous_text, and must keep the replaced
+        # generation in history so `get --since` knows it.
+        guidance.write_guidance(self.project, 'first generation', 'op-james')
+        v1 = guidance.version_of('first generation')
+        # op-two's set reached the file, then crashed before the metadata write.
+        guidance.write_text(self.project / 'GUIDANCE.md', 'second generation')
+        v2 = guidance.version_of('second generation')
+        repaired = guidance.write_guidance(self.project, 'second generation', 'op-two')
+        self.assertTrue(repaired['repaired']); self.assertFalse(repaired['changed'])
+        meta = guidance.read_meta(self.project)
+        self.assertEqual(meta['version'], v2)
+        self.assertNotEqual(meta['previous_version'], v2)
+        self.assertIsNone(meta['previous_text'])
+        self.assertIn(v1, [entry['version'] for entry in meta['history']])
+        result = guidance.read(self.project, ['get', '--since', v1])
+        self.assertTrue(result['since_known'])
+        self.assertTrue(result['changed'])
+        self.assertEqual(result['text'], 'second generation')
 
     def test_same_text_set_repairs_a_missing_record(self):
         # Crash on the first set: text written, no metadata.
@@ -280,6 +366,9 @@ class GuidanceRecordTests(unittest.TestCase):
         self.assertEqual(meta['set_by'], 'op-james')
         self.assertEqual(meta['version'], guidance.version_of('crashed first set'))
         self.assertEqual(meta['history'], [])
+        # A repair with no earlier generation must not become its own previous
+        # version or name the current text as the previous text.
+        self.assertIsNone(meta['previous_version']); self.assertIsNone(meta['previous_text'])
         self.assertTrue(guidance.acknowledge(self.project, 'worker-1',
                                              meta['version'])['acknowledged'])
 
@@ -336,12 +425,42 @@ class GuidanceRecordTests(unittest.TestCase):
         self.assertEqual(meta['acks_compacted_by'], 'operator-1')
         self.assertTrue(meta['acks_compacted_at'])
 
-    def test_clear_removes_both_files(self):
+    def test_clear_removes_both_files_and_keeps_a_local_audit_record(self):
         guidance.write_guidance(self.project, 'Text', 'operator-1')
+        version = guidance.version_of('Text')
         result = guidance.clear(self.project, 'operator-1')
         self.assertEqual(result['removed'], sorted([guidance.GUIDANCE_NAME, guidance.META_NAME]))
         self.assertIsNone(guidance.read_text(self.project))
         self.assertIsNone(guidance.read_meta(self.project))
+        # kittrial-5bb.99 review `audit-gaps` 2: clearing is no longer recorded only
+        # on stdout. The local record keeps who, when and the cleared version and is
+        # itself strictly valid.
+        self.assertEqual(result['cleared_version'], version)
+        record = guidance.read_clear_record(self.project)
+        self.assertTrue((self.project / guidance.CLEAR_NAME).is_file())
+        self.assertEqual(record['clears'][0]['cleared_by'], 'operator-1')
+        self.assertEqual(record['clears'][0]['cleared_version'], version)
+        self.assertTrue(record['clears'][0]['cleared_at'])
+        guidance.validate_clear_record(record)
+        # A second clear keeps the earlier one in the bounded history.
+        guidance.write_guidance(self.project, 'Second', 'operator-2')
+        guidance.clear(self.project, 'operator-2')
+        record = guidance.read_clear_record(self.project)
+        self.assertEqual([entry['cleared_by'] for entry in record['clears']], ['operator-2', 'operator-1'])
+
+    def test_compaction_audit_survives_later_sets(self):
+        # kittrial-5bb.99 review `audit-gaps` 3: a set dropped acks_compacted_by and
+        # acks_compacted_at, losing who compacted the table and when.
+        guidance.write_guidance(self.project, 'v1', 'operator-1')
+        guidance.write_guidance(self.project, 'v2', 'operator-1')
+        guidance.write_guidance(self.project, 'v3', 'operator-1')
+        inject_stale_ack(self.project, 'stale-lane', guidance.version_of('v1'))
+        guidance.compact(self.project, 'operator-1')
+        guidance.write_guidance(self.project, 'v4', 'operator-1')
+        meta = guidance.read_meta(self.project)
+        self.assertEqual(meta['acks_compacted_by'], 'operator-1')
+        self.assertTrue(meta['acks_compacted_at'])
+
 
     def test_symlinked_guidance_is_refused(self):
         secret = self.root / 'secret'; secret.write_text('secret', encoding='utf-8')
@@ -351,6 +470,11 @@ class GuidanceRecordTests(unittest.TestCase):
             self.skipTest('No symlink privilege')
         with self.assertRaisesRegex(ValueError, 'symlink'):
             guidance.read_text(self.project)
+        # clear does not follow a symlink either, so that state needs a manual delete
+        # (kittrial-5bb.99 review `audit-gaps` 2).
+        with self.assertRaisesRegex(ValueError, 'symlink'):
+            guidance.clear(self.project, 'operator-1')
+        self.assertTrue((self.project / 'GUIDANCE.md').is_symlink())
 
     def test_brief_and_work_and_resume_carry_the_version_block(self):
         guidance.write_guidance(self.project, 'Standing instruction', 'operator-1')
@@ -392,6 +516,18 @@ class GuidanceBackupTests(unittest.TestCase):
         self.assertEqual(guidance.state(dest, 'worker-1')['version'], guidance.version_of('Be careful with X'))
         self.assertTrue(guidance.state(dest, 'worker-1')['acknowledged'])
 
+    def test_restore_new_with_a_backup_that_has_no_guidance_pair_reads_as_no_guidance(self):
+        # kittrial-5bb.99 review `guidance-fault-skips-the-project-backup`: a degraded
+        # backup carries no guidance pair. restore-new restores the tracker and the
+        # project reads `present: false`, never a mismatched pair.
+        files = {'.sessions.json': {'schema_version': 1, 'records': {}}}
+        dest = self.root / 'projects' / 'noguidance'; dest.mkdir(parents=True)
+        with patch.object(admin, 'coordination_backup', return_value=files):
+            admin.restore_coordination(self.root, 'source', 'noguidance')
+        self.assertIsNone(guidance.read_text(dest))
+        self.assertIsNone(guidance.read_meta(dest))
+        self.assertFalse(guidance.state(dest, 'worker-1')['present'])
+
     def test_malformed_guidance_records_are_refused(self):
         for bad in [{'GUIDANCE.md': {'text': ''}}, {'GUIDANCE.md': {'text': 'x', 'other': 1}},
                     {'.guidance.json': {'schema_version': 2}},
@@ -410,6 +546,73 @@ class GuidanceBackupTests(unittest.TestCase):
             admin.validate_coordination_files({'GUIDANCE.md': {'text': 'text'}})
         with self.assertRaisesRegex(ValueError, 'together'):
             admin.validate_coordination_files({'.guidance.json': meta})
+
+    def backup(self, names=(), all_projects=False):
+        fake = types.SimpleNamespace(flock=Mock(), LOCK_EX=2)
+        with patch.dict(sys.modules, {'fcntl': fake}), patch.object(admin, 'run_bd', return_value='synced'):
+            admin.backup_projects(self.root, list(names), all_projects=all_projects)
+
+    def make_second_project(self, name='second'):
+        project = self.root / 'projects' / name
+        (project / '.beads').mkdir(parents=True)
+        (project / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+        guidance.write_guidance(project, 'Second guidance', 'operator-1')
+        return project
+
+    def test_mismatched_pair_degrades_but_does_not_skip_the_tracker_backup(self):
+        # kittrial-5bb.99 review `guidance-fault-skips-the-project-backup`: the whole
+        # project (including its tracker backup) was skipped for a two-file guidance
+        # fault. Now everything else is backed up, the bad pair is left out, and the
+        # project is marked degraded.
+        (self.root / 'backups' / 'example').mkdir(parents=True)
+        (self.project / 'GUIDANCE.md').write_text('hand edited text\n', encoding='utf-8')
+        degraded = []
+        fake = types.SimpleNamespace(flock=Mock(), LOCK_EX=2)
+        with patch.dict(sys.modules, {'fcntl': fake}), patch.object(admin, 'run_bd', return_value='synced'):
+            self.assertEqual(admin.backup_project(self.root, 'example', degraded=degraded), 'synced')
+        self.assertEqual(len(degraded), 1)
+        self.assertIn('guidance is degraded', degraded[0])
+        self.assertIn('set-guidance', degraded[0])
+        sidecar = json.loads((self.root / 'backups' / 'example.coordination.json').read_text(encoding='utf-8'))
+        self.assertEqual(sidecar['status'], 'complete')
+        self.assertNotIn('GUIDANCE.md', sidecar['files'])
+        self.assertNotIn('.guidance.json', sidecar['files'])
+
+    def test_backup_all_marks_the_degraded_project_and_keeps_the_status_complete(self):
+        self.make_second_project()
+        (self.root / 'backups' / 'example').mkdir(parents=True)
+        (self.root / 'backups' / 'second').mkdir(parents=True)
+        (self.project / 'GUIDANCE.md').write_text('hand edited text\n', encoding='utf-8')
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.backup(all_projects=True)
+        # The run exits 0 (no SystemExit above) because every tracker backup is usable.
+        self.assertIn('degraded', err.getvalue())
+        record = json.loads((self.root / 'backups' / admin.BACKUP_STATUS_NAME).read_text(encoding='utf-8'))
+        self.assertEqual(record['status'], 'complete')
+        entries = {entry['name']: entry for entry in record['projects']}
+        self.assertEqual(entries['example']['status'], 'complete')
+        self.assertIn('degraded', entries['example'])
+        self.assertEqual(entries['second']['status'], 'complete')
+        self.assertNotIn('degraded', entries['second'])
+        # The healthy project's guidance pair still round-trips.
+        second = json.loads((self.root / 'backups' / 'second.coordination.json').read_text(encoding='utf-8'))
+        self.assertIn('GUIDANCE.md', second['files'])
+        self.assertIn('.guidance.json', second['files'])
+
+    def test_backup_status_degraded_entry_is_validated(self):
+        stamp = admin.utc_stamp()
+        entry = {'name': 'example', 'status': 'complete', 'completed_at': stamp,
+                 'pair': {'native': 'backups/example', 'coordination': 'backups/example.coordination.json'},
+                 'degraded': 'guidance is degraded: repair it'}
+        record = {'schema_version': 1, 'scope': 'all', 'generated_at': stamp, 'status': 'complete',
+                  'projects': [entry]}
+        admin.validate_backup_status(record)
+        with self.assertRaises(ValueError):
+            admin.validate_backup_status(dict(record, projects=[dict(entry, degraded='')]))
+        with self.assertRaises(ValueError):
+            admin.validate_backup_status(dict(record, projects=[dict(entry, status='failed', reason='x',
+                                                                     degraded='x')]))
 
 
 class GuidanceAdminTests(unittest.TestCase):
@@ -461,6 +664,8 @@ class GuidanceAdminTests(unittest.TestCase):
         stdout, _ = self.run_admin(['guidance-status', 'example', '--actor', 'operator-1'])
         report = json.loads(stdout)
         self.assertEqual(report['up_to_date'], ['worker-1'])
+        # The host read is authoritative and shows the text (the endpoint view does not).
+        self.assertEqual(report['text'], 'Guidance')
 
     @unittest.skipIf(sys.platform == 'win32', 'admin.py host commands take the POSIX lock')
     def test_clear_and_compact_host_commands_need_the_operator_allowlist(self):
@@ -523,30 +728,78 @@ class GuidanceEndpointTests(unittest.TestCase):
             self.call('guidance', ['status'], actor='worker-1')
         report = json.loads(self.call('guidance', ['status'], actor='operator-1')['stdout'])
         self.assertEqual(report['up_to_date'], [SESSION_ACTOR])
+        # kittrial-5bb.99 review `small` 1: endpoint status shows versions and actor
+        # names, never guidance text; the host read is the one that shows the text.
+        for absent in ('text', 'previous_text', 'history'):
+            self.assertNotIn(absent, report)
 
     @unittest.skipIf(sys.platform == 'win32', 'endpoint.py uses the POSIX coordination lock')
-    def test_ack_names_the_current_version_and_needs_a_registered_session(self):
+    def test_ack_requires_the_flag_and_serves_every_accepted_actor(self):
         import endpoint  # noqa: F401
         with self.assertRaisesRegex(ValueError, 'Name the guidance version'):
             self.call('guidance', ['ack'])
-        with self.assertRaisesRegex(ValueError, 'not current'):
+        # kittrial-5bb.99 review `small` 3: a bare positional version is refused
+        # though it used to be accepted.
+        with self.assertRaisesRegex(ValueError, 'Use guidance ack --version VERSION'):
+            self.call('guidance', ['ack', self.version])
+        # A stale version is refused without naming the current one.
+        with self.assertRaisesRegex(ValueError, 'not the current version') as stale:
             self.call('guidance', ['ack', '--version', 'a' * 64])
-        with self.assertRaisesRegex(ValueError, 'registered session'):
-            self.call('guidance', ['ack', '--version', self.version], actor='made-up-lane')
-        # A configured operator name is also accepted.
+        self.assertNotIn(self.version, str(stale.exception))
+        # kittrial-5bb.99 review `registration-gate-locks-out-unregistered-lanes`:
+        # any actor the endpoint accepts may ack for itself; no session record needed.
         acked = json.loads(self.call('guidance', ['ack', '--version', self.version],
-                                     actor='operator-1')['stdout'])
+                                     actor='made-up-lane')['stdout'])
         self.assertTrue(acked['acknowledged'])
+        self.assertFalse(json.loads(self.call('guidance', ['version'],
+                                              actor='made-up-lane')['stdout'])['attention'])
 
     @unittest.skipIf(sys.platform == 'win32', 'endpoint.py uses the POSIX coordination lock')
     def test_every_write_shaped_endpoint_subcommand_is_refused_and_files_unchanged(self):
         import endpoint  # noqa: F401
-        for args in [['set'], ['set-guidance', '--text', 'x'], ['write'], ['edit'], ['update'],
+        for args in [['set'], ['set-guidance', '--text', 'x'], ['write'], ['edit'], ['update'], ['put'],
                      ['clear'], ['clear-guidance'], ['compact'], ['compact-guidance-acks'],
-                     ['remove'], ['delete'], ['reset'], ['frobnicate'], ['']]:
+                     ['remove'], ['delete'], ['reset'], ['install'], ['unset'], ['append'],
+                     ['frobnicate'], ['get-text'], ['']]:
             with self.subTest(args=args), self.assertRaisesRegex(ValueError, 'Unknown guidance action'):
                 self.call('guidance', args)
             self.assert_files_unchanged()
+
+    @unittest.skipIf(sys.platform == 'win32', 'endpoint.py uses the POSIX coordination lock')
+    def test_accepted_guidance_subcommands_are_exactly_the_read_and_ack_set(self):
+        # kittrial-5bb.99 review `tests`: a write route under a name the refusal test
+        # does not list ('put') passed all tests, so this test (1) reads every string
+        # literal the endpoint compares against `subcommand` out of the AST and fails
+        # on any that is not in the known read+ack set, and (2) probes the live
+        # endpoint with write-shaped candidates so a route installed through a name
+        # not written as a literal is caught by behaviour too.
+        import ast
+        import endpoint
+        known = {'get', 'version', 'ack', 'status'}
+        tree = ast.parse(Path(endpoint.__file__).read_text(encoding='utf-8'))
+        accepted = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Compare) and isinstance(node.left, ast.Name) and node.left.id == 'subcommand':
+                for comparator in node.comparators:
+                    values = comparator.elts if isinstance(comparator, (ast.Tuple, ast.List, ast.Set)) else [comparator]
+                    for value in values:
+                        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                            accepted.add(value.value)
+        self.assertLessEqual(accepted, known,
+                             'the endpoint compares `subcommand` with names outside the read+ack set: %s'
+                             % sorted(accepted - known))
+        for candidate in sorted({'set', 'put', 'write', 'edit', 'update', 'clear', 'remove', 'delete', 'reset',
+                                 'append', 'install', 'unset', 'drop', 'revoke', 'compact', 'purge', 'replace',
+                                 'create', 'add', 'get-text', 'frobnicate', '', 'GET', 'Ack'} - known):
+            with self.subTest(candidate=candidate):
+                try:
+                    self.call('guidance', [candidate])
+                except ValueError as error:
+                    self.assertIn('Unknown guidance action', str(error))
+                else:
+                    self.fail('guidance subcommand %r is accepted by the endpoint but is not in the read+ack set'
+                              % candidate)
+                self.assert_files_unchanged()
 
     @unittest.skipIf(sys.platform == 'win32', 'endpoint.py uses the POSIX coordination lock')
     def test_write_shaped_guidance_actions_do_not_exist(self):
@@ -570,7 +823,7 @@ class GuidanceEndpointTests(unittest.TestCase):
     @unittest.skipIf(sys.platform == 'win32', 'endpoint.py uses the POSIX coordination lock')
     def test_bad_guidance_arguments_are_refused(self):
         import endpoint  # noqa: F401
-        for args in [['ack', '--version'], ['ack', '--version', 'a' * 64, 'extra'],
+        for args in [['ack', '--version'], ['ack', '--version', 'a' * 64, 'extra'], ['ack', self.version],
                      ['--since'], ['--since', 'nope'],
                      ['get', '--since', 'a' * 64, '--since', 'b' * 64]]:
             with self.subTest(args=args), self.assertRaises(ValueError):
@@ -590,10 +843,16 @@ class GuidanceEndpointTests(unittest.TestCase):
         (self.project / '.guidance.json').write_text('[' * 4000 + ']' * 4000, encoding='utf-8')
         answer = json.loads(self.call('guidance', [])['stdout'])
         self.assertTrue(answer['present']); self.assertIn('warning', answer)
+        # An unreadable record makes the text unbound, so the endpoint withholds it
+        # (kittrial-5bb.99 review `unbound-text-is-still-delivered`).
+        self.assertIsNone(answer['text']); self.assertTrue(answer['unbound'])
+        self.assertTrue(answer['attention'])
+        self.assertIn('repaired by the operator', answer['next_action'])
         (self.project / 'GUIDANCE.md').write_text('x' * 9000, encoding='utf-8')
         answer = json.loads(self.call('guidance', [])['stdout'])
         self.assertIsNone(answer['present']); self.assertTrue(answer['unreadable'])
         self.assertTrue(answer['attention']); self.assertIn('warning', answer)
+        self.assertIsNone(answer['text'])
 
     @unittest.skipIf(sys.platform == 'win32', 'endpoint.py uses the POSIX coordination lock')
     def test_client_routes_guidance_as_an_endpoint_action(self):

@@ -1813,7 +1813,7 @@ def last_complete_guard(root,name):
                 pass
         raise
 
-def backup_project(root,name):
+def backup_project(root,name,degraded=None):
     import fcntl
     from coordination import atomic
     path=project_dir(root,name)
@@ -1888,22 +1888,36 @@ def backup_project(root,name):
             files['ONBOARDING.md']={'text':read_document(path,'ONBOARDING.md',PROJECT_LIMIT)}
         if (path/'GUIDANCE.md').exists() or (path/'GUIDANCE.md').is_symlink():
             # The standing guidance channel (kittrial-5bb.99): the text and its audit
-            # record are one generation, so a backup that could not read the audit
-            # refuses rather than silently dropping who set the guidance and the acks.
+            # record are one generation. A mismatched or unreadable pair is handled
+            # below as a DEGRADED backup rather than a failed project.
             from guidance import (META_NAME as GUIDANCE_META, read_meta as read_guidance_meta,
                                   read_text as read_guidance_text, validate_meta as validate_guidance_meta,
                                   version_of as guidance_version)
-            guidance_text=read_guidance_text(path)
-            guidance_meta=read_guidance_meta(path)
-            if guidance_meta is None:
-                raise ValueError('Guidance text exists without readable audit metadata; ask the operator to set '
-                                 'the guidance again before backing up')
-            validate_guidance_meta(guidance_meta)
-            if guidance_meta['version']!=guidance_version(guidance_text):
-                raise ValueError('Guidance audit metadata does not match the guidance text (a hand edit or a '
-                                 'crashed set); ask the operator to set the guidance again before backing up')
-            files['GUIDANCE.md']={'text':guidance_text}
-            files[GUIDANCE_META]=guidance_meta
+            try:
+                guidance_text=read_guidance_text(path)
+                guidance_meta=read_guidance_meta(path)
+                if guidance_meta is None:
+                    raise ValueError('the guidance text has no readable audit metadata')
+                validate_guidance_meta(guidance_meta)
+                if guidance_meta['version']!=guidance_version(guidance_text):
+                    raise ValueError('the audit record does not match the guidance text (a hand edit or a '
+                                     'crashed set)')
+            except ValueError as error:
+                # A two-file sidecar fault must not stop the tracker backup (live
+                # installations run `backup --all` on a daily timer): leave the
+                # mismatched pair out, mark the project degraded here and in the
+                # status record, and keep the tracker backup complete and usable
+                # (kittrial-5bb.99 review `guidance-fault-skips-the-project-backup`).
+                fault=('guidance is degraded: %s. The tracker backup is complete but carries no guidance pair; '
+                       'ask the operator to repair it with `admin.py set-guidance PROJECT --actor OPERATOR '
+                       '--file FILE` (a set with the same text repairs it) and then take a fresh backup.'
+                       %(error,))
+                if degraded is not None:
+                    degraded.append(fault)
+                print('backup degraded for %s: %s'%(name,fault),file=sys.stderr)
+            else:
+                files['GUIDANCE.md']={'text':guidance_text}
+                files[GUIDANCE_META]=guidance_meta
         feedback=path/'.feedback.jsonl'
         if feedback.exists() or feedback.is_symlink():
             if feedback.is_symlink():raise ValueError('Feedback feed must not be a symlink')
@@ -2180,6 +2194,8 @@ def backup_status_record(results,scope,generated_at):
     projects=[]
     for item in results:
         entry={'name':item['name'],'status':item['status']}
+        if item.get('degraded'):
+            entry['degraded']=item['degraded']
         if item['status']=='complete':
             entry['completed_at']=item['completed_at']
             entry['pair']={'native':'backups/'+item['name'],
@@ -2230,12 +2246,17 @@ def validate_backup_status(record):
                 raise ValueError('Complete backup status for %s must name the pair %s'%(name,expected))
             if 'reason' in entry:
                 raise ValueError('Complete backup status for %s must not carry a failure reason'%name)
+            degraded=entry.get('degraded')
+            if degraded is not None and (not isinstance(degraded,str) or not degraded.strip()):
+                raise ValueError('Degraded backup status for %s needs a nonempty message'%name)
         else:
             reason=entry.get('reason')
             if not isinstance(reason,str) or not reason.strip():
                 raise ValueError('Backup status for %s must say why it is not complete'%name)
             if 'completed_at' in entry or 'pair' in entry:
                 raise ValueError('Incomplete backup status for %s must not carry a completion'%name)
+            if 'degraded' in entry:
+                raise ValueError('Incomplete backup status for %s must not carry a degraded message'%name)
     expected='complete' if complete==len(projects) else 'incomplete'
     if record.get('status')!=expected:
         raise ValueError('Backup status run status must be %s for its project entries'%expected)
@@ -2562,7 +2583,10 @@ def backup_projects(root,names,all_projects=False):
     project does not stop the others, and the run exits non-zero when any target's
     pair is not complete. The status file is written (and validated) before that
     decision, so a failed or skipped project is recorded NOT complete instead of
-    being lost with the process.
+    being lost with the process. A project whose GUIDANCE pair is mismatched or
+    unreadable is recorded COMPLETE plus ``degraded``: the tracker backup is
+    restorable and usable, so it does not fail the run or the daily timer, and the
+    actionable repair message is in the entry and on stderr.
     """
     if all_projects:
         targets=initialized_projects(root);scope='all'
@@ -2589,14 +2613,17 @@ def backup_projects(root,names,all_projects=False):
         # One project's failure must not abandon the rest of the run, and the run's
         # status file must still record the truth; the reason is reported and the
         # process exits non-zero below. KeyboardInterrupt/SystemExit still propagate.
+        degraded=[]
         try:
-            native=backup_project(root,name)
+            native=backup_project(root,name,degraded=degraded)
         except Exception as error:
             results.append({'name':name,'status':'failed','reason':failure_reason(error)})
             incomplete.append(name);continue
         complete,reason=backup_pair_state(root,name)
         if complete:
-            results.append({'name':name,'status':'complete','completed_at':utc_stamp()})
+            entry={'name':name,'status':'complete','completed_at':utc_stamp()}
+            if degraded:entry['degraded']=' '.join(degraded)
+            results.append(entry)
             print(native)
         else:
             results.append({'name':name,'status':'failed','reason':reason})
@@ -3280,8 +3307,10 @@ def main():
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             result=guidance_clear(path,args.actor)
-        print('Project guidance cleared (%s); back up the project after changes. The removed record stays in the '
-              'most recent coordination backup, if one was taken.'%(', '.join(result['removed']) or 'nothing was set'))
+        print('Project guidance cleared (%s); back up the project after changes. A small local record in %s keeps '
+              'who cleared it, when and the cleared version; the removed guidance record itself stays in the most '
+              'recent coordination backup, if one was taken.'
+              %(', '.join(result['removed']) or 'nothing was set',result.get('clear_record','the project directory')))
         print(json.dumps(result,sort_keys=True))
     elif args.command=='compact-guidance-acks':
         import fcntl
@@ -3303,7 +3332,7 @@ def main():
         if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            guidance_report=guidance_status(path,args.actor,operators(root,strict=True))
+            guidance_report=guidance_status(path,args.actor,operators(root,strict=True),host=True)
         print(json.dumps(guidance_report,sort_keys=True,indent=2))
     elif args.command=='service':print(service(root,args.action))
     elif args.command=='record-store':

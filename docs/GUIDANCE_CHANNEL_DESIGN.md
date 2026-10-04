@@ -32,50 +32,63 @@ workers to re-run `onboard`; that is the interim this channel replaces.
   the new version, the previous version and the previous text. The history is
   bounded (50 entries); the acknowledgement table is bounded (500 actors). The
   text is attributed to a setter only when the stored version is the hash of the
-  exact text read, so a hand edit or a crash between the two writes reads as a
-  mismatch with no setter (`warning`, `set_by: null`), never as the previous
-  setter's work. An operator set with the same text repairs a missing or
-  mismatched record, and the writer never credits an unbound generation to the
-  previous operator in the history.
+  exact text read and both setter fields are valid, so a hand edit or a crash
+  between the two writes reads as unbound with no setter (`warning`, `set_by: null`,
+  `unbound: true`), never as the previous setter's work, and its text is withheld
+  from `guidance get`. An operator set with the same text repairs a missing or
+  mismatched record, the generation the old record named is kept in `history` (so
+  `get --since` still knows it), and the writer never credits an unbound generation
+  to the previous operator in the history.
 * The **version is the SHA-256 of the guidance text**, computed by every reader
   from the text it actually read. A crash between the text write and the metadata
   write therefore cannot advertise a version that does not describe the text; it
   leaves an unbound record that the next set (even with the same text) repairs.
 * Every **work**, **brief** and session **resume** response carries a compact
-  guidance block: `present`, `version`, `set_at`, `set_by`, `previous_version`,
-  `acknowledged`, and `attention` (true exactly when guidance is set, or cannot be
-  read, and the calling actor has not acknowledged the current version).
-  `guidance get` returns the full text and what changed since a named version;
-  `guidance ack --version VERSION` records the calling actor's own read of that
-  exact version (a stale or unnamed version is refused, naming the current one);
-  `guidance status` (operator only) lists which lanes have acknowledged which
-  version. An unreadable record is reported (`unreadable: true`, `attention:
-  true`, a `warning`), never as an error.
+  guidance block: `present`, `version`, `set_at`, `set_by`, `unbound`,
+  `previous_version`, `acknowledged`, and `attention` (true exactly when guidance is
+  set, or cannot be read, and the calling actor has not acknowledged the current
+  version). `guidance get` returns the full text and what changed since a named
+  version; `guidance ack --version VERSION` records the calling actor's own read of
+  that exact version (the explicit flag is required, and a stale or unnamed version
+  is refused **without naming the current one**, so a caller must call
+  `guidance get`); `guidance status` lists which lanes have acknowledged which
+  version but shows no guidance text. An unreadable record is reported
+  (`unreadable: true`, `attention: true`, a `warning`), never as an error. Text
+  whose audit record does not bind it to a valid operator set is **withheld**
+  (`text: null`, `unbound: true`, `attention: true`, a warning and a repair
+  `next_action`): an instruction no setter stands behind is never delivered to a
+  worker or followed, and a same-text set repairs it.
 * The **endpoint never writes guidance**. Its subcommands are an explicit allowlist
-  (`get`, `version`, `ack`, `status`); every write-shaped subcommand is refused,
-  and the tests assert that.
+  (`get`, `version`, `ack`, `status`); every write-shaped subcommand is refused, the
+  test enumerates the accepted subcommands and fails on any not in that read+ack
+  set, and the endpoint status read shows no guidance text.
 * The **acknowledgement table is bounded and pruned**: acks for versions other than
   the current and previous one are dropped at every set; a new lane evicts the
   oldest entry when the table is full rather than being refused; and the operator
   can drop stale acks with `admin.py compact-guidance-acks` (audited in the record
-  as `acks_compacted_by`/`acks_compacted_at`). An acknowledgement is **not
-  authentication**: actors are self-declared, so naming another actor is always
-  possible and an ack proves only that *some* caller named that actor and version.
-  The endpoint therefore requires a registered session (or a configured operator
-  name) for an ack, which removes unregistered made-up names as the cheap way to
-  fill the table; a future composed prompt must not treat an ack as proof that the
-  text was read or followed.
+  as `acks_compacted_by`/`acks_compacted_at`, kept across later sets). An
+  acknowledgement is **not authentication**: actors are self-declared, so naming
+  another actor is always possible and an ack proves only that *some* caller named
+  that actor and version. The endpoint therefore does NOT require a session
+  registration for an ack (legacy lanes have none): any actor the endpoint accepts
+  may ack for itself. A flood can fill the bounded table and evict a real lane's
+  ack; that fails safe because an evicted lane re-reads and re-acks, and a future
+  composed prompt must not treat an ack as proof that the text was read or followed.
+* The endpoint **refuses invisible instruction vectors**: C0/C1, bidi controls, word
+  joiners, BOM and the Unicode tag block `U+E0000`-`U+E007F`. ZWNJ/ZWJ are allowed
+  between letters, so legitimate Persian text is not blocked.
 
 ## Trust boundary
 
 Guidance is an **instruction channel to agents**, so the trust rules are the
 strict ones:
 
-* Only the operator host route writes it. The endpoint can read it and record a
-  registered actor's own acknowledgement of the version it names and nothing else.
+* Only the operator host route writes it. The endpoint can read it and record an
+  actor's own acknowledgement of the version it names and nothing else.
 * Every read marks who set the current text and when **only when the stored version
-  is the hash of the text read**; a mismatched or missing record is reported as
-  unattributed with a warning.
+  is the hash of the text read and both setter fields are valid**; a mismatched,
+  missing or unattributed record is reported as unbound with a warning, and its text
+  is withheld rather than delivered.
 * The host route is protected by the operator allowlist plus host shell access, and
   `--actor` is a typed string checked against a file the host user can edit. Until
   SSH keys are confined under kittrial-5bb.89, host shell access is the only real
@@ -95,8 +108,17 @@ strict ones:
 * `GUIDANCE.md` and `.guidance.json` are included in the project coordination
   backup and restored as one generation; `validate_coordination_files` and
   `restore_coordination` validate both individually and that the record's version
-  is the hash of the text, so a malformed or mismatched pair refuses the backup or
-  restore rather than silently dropping or misattributing acks.
+  is the hash of the text, so a malformed or mismatched pair refuses a RESTORE
+  rather than silently dropping or misattributing acks. A BACKUP treats the same
+  fault as **degraded**: the tracker backup still completes, the bad pair is left
+  out, the project's status entry is `complete` with a `degraded` repair message,
+  and the run exits 0 so the daily timer is not failed by a two-file instruction
+  fault. `restore-new` on a backup with no guidance pair restores the tracker with
+  no guidance (`present: false`).
+* `clear-guidance` leaves a small local `.guidance-clear.json` record (who, when,
+  the cleared version; the last 10 clears), which is not part of the coordination
+  backup. A symlinked `GUIDANCE.md` is refused by `clear-guidance` and needs a
+  manual delete.
 * **Rollback gap:** an older kit (at or before `dca96b9d`) validates the
   coordination sidecar against a fixed path set that does not include the two
   guidance files, so `restore-new` by that kit on a backup that contains them fails
@@ -107,12 +129,13 @@ strict ones:
   (`admin.py clear-guidance PROJECT --actor OPERATOR`) and take the backup before
   rolling back, then re-set the guidance after rolling forward.
 * Tolerant readers: a missing `GUIDANCE.md` reads as `present: false`; a missing,
-  older or malformed `.guidance.json` leaves the text and its computed version
-  readable with `set_by: null` and a warning, and unknown metadata keys are
-  ignored. A worker whose server or guidance cannot be read keeps following the
-  version it last acknowledged, names that version when it reports the failure,
-  does not invent rules, and reads and acknowledges the current version when the
-  server is reachable again.
+  older or malformed `.guidance.json` shows the unbound block (`set_by: null`,
+  `unbound: true`, a warning) and WITHHOLDS the text from `guidance get` until an
+  operator set repairs it, and unknown metadata keys are ignored. A worker whose
+  server or guidance cannot be read keeps following the version it last
+  acknowledged, names that version when it reports the failure, does not invent
+  rules, and reads and acknowledges the current version when the server is
+  reachable again.
 * The operator can roll the text back by re-running `set-guidance` with the
   previous text (the previous text is kept in the audit record, and the history
   keeps the earlier versions), or by restoring the project's previous backup.

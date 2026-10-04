@@ -358,7 +358,9 @@ def help_notes(action):
                 'Every endpoint brief carries a guidance block (kittrial-5bb.99): the current coordinator '
                 'guidance version, who set it and whether this actor has acknowledged it; read it with '
                 '`guidance get` and record the read with `guidance ack --version VERSION`, naming the version '
-                'you read. An unreadable or mismatched guidance record carries attention true and a warning.',
+                'you read. An unreadable or unbound guidance record carries attention true and a warning, and '
+                'unbound text is withheld (`text: null`, `unbound: true`) with a next action saying the '
+                'guidance is being repaired by the operator; text without a setter is never followed.',
                 '--limit/--offset are not brief options; use --items-limit/--items-offset.',
                 'attention lists at most 3 reference-review items (entries tagged with the task\'s labels, '
                 'then expired and due-soon), expired first, then at most 3 proposal-review items (proposals '
