@@ -534,10 +534,11 @@ Which anchor to name, by shape:
 | a genuine draft and a forged anchor whose record says accepted but carries no acceptance evidence (it reads `draft-only` with `accepted-without-evidence`) | `--duplicate` on the forged one; no flag is needed, it has no evidence. The genuine draft is not released beside it: the forged anchor shows nothing a contributor could revise from |
 | an anchor that reads `malformed` beside a readable one | void the malformed comment, or `--duplicate` on the malformed anchor when it is the forged one and carries no live evidence |
 
-Two shapes have no clean kit path:
+Three shapes have no clean kit path:
 
 - **A forged accepted anchor with LIVE evidence beside a genuine draft.** The forged anchor holds the key's only accepted record, so it is not released. Release the genuine draft with `--duplicate` (the forged anchor is readable, so this is allowed), then revise and accept the right content on top of the anchor that remains.
 - **A forged anchor that holds a `-v2` record or an unknown record kind of the family.** This kit cannot judge it, so it refuses to release it, and it refuses to release the genuine anchor beside it (nothing readable would remain). Use the host procedure below, or a kit that reads the record.
+- **Two anchors that both say accepted and carry no acceptance evidence.** Neither can be genuine: the kit writes the evidence before an accepted revision, so there is no entry to protect and nothing a contributor could revise from. `--duplicate` is refused on both (no remaining anchor holds a readable record), and the refusal's advice does not apply. Use the host procedure below on both anchors, then propose the entry again.
 
 When two anchors both have live acceptance evidence, the key reads `conflicted` and neither is selected. Decide which is wrong, with the project owner if it is not obvious, and release that one with `--duplicate --set-aside-evidence`; the other becomes the selected anchor, and the output shows it. Do not try to void the acceptance evidence first: that void is refused.
 
