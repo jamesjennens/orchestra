@@ -73,7 +73,8 @@ def help_payload(action='work'):
             'top_level': ['owner', 'total', 'items', 'next_offset', 'coverage', 'attention', 'guidance'],
             'guidance': 'guidance: the project\'s current standing guidance version (kittrial-5bb.99), '
                         'with present, version (null for unbound text), set_at, set_by (null when the audit record does not bind to '
-                        'the text), unbound (true when the text is withheld), previous_version, the calling '
+                        'the text), repaired_by and repaired_at (only when a same-text repair kept that setter), '
+                        'unbound (true when the text is withheld), previous_version, the calling '
                         'actor\'s acknowledged state and attention (true when guidance is set, or cannot be '
                         'read, and this actor has not acknowledged the current version); next_action names '
                         '`guidance get`, or, for unbound text, says the guidance is being repaired by the '

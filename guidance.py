@@ -40,6 +40,12 @@ from coordination import atomic
 GUIDANCE_NAME = 'GUIDANCE.md'
 META_NAME = '.guidance.json'
 CLEAR_NAME = '.guidance-clear.json'
+# The audit of a same-text repair (kittrial-5bb.121 review): who repaired the record and
+# when, beside the record rather than in it. A kit before this one validates the record
+# strictly and refused ack, compaction, backup and restore on unknown fields there; it
+# never parses this file, and the backup does not carry it (the sidecar names its files).
+REPAIR_NAME = '.guidance-repair.json'
+REPAIR_FIELDS = {'schema_version', 'version', 'set_by', 'set_at', 'repaired_by', 'repaired_at'}
 CLEAR_INVALID_NAME = '.guidance-clear.json.invalid'
 LIMIT = 8000
 HISTORY_LIMIT = 50
@@ -73,8 +79,13 @@ HIDDEN = re.compile('[\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u2800\u3
 # still accepted). Two exceptions. ZWNJ and ZWJ have the joiner rule below. And the
 # prepended concatenation marks are Cf but VISIBLE (the Arabic number signs and end of
 # ayah, the Syriac abbreviation mark, the Kaithi number signs), so they are allowed -
-# but only next to a character of their own script (kittrial-5bb.121): a terminal often
-# draws them with zero width, so one inside a Latin word split a keyword without showing.
+# but only directly BEFORE a letter or digit of their own script (kittrial-5bb.121): all
+# thirteen are prepended marks (Unicode Prepended_Concatenation_Mark; the Unicode Standard,
+# chapters 9.2 Arabic, 9.3 Syriac and 15.2 Kaithi), written in front of the number or word
+# they span. A terminal often draws them with zero width, so one inside a Latin word split
+# a keyword without showing, and so did one followed by anything that is not itself a
+# visible base of that script - a combining mark, tatweel, a presentation form or an
+# unassigned code point ("ig" + U+0600 + U+064E + "nore" no longer passes).
 # The lists above remain for what is not Cf: variation selectors and the Khitan filler
 # (marks), the Hangul fillers (letters), the braille blank and U+FFFC (symbols).
 #
@@ -82,27 +93,37 @@ HIDDEN = re.compile('[\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u2800\u3
 # depend on them where they differ. The only characters whose category differs between
 # those versions are U+0890, U+0891 (Arabic pound and piastre marks above, Cf from 14.0)
 # and U+13439-U+1343F (Egyptian hieroglyph format controls, Cf from 15.0); in 3.10 they
-# are unassigned. So the allowed marks and their scripts are this explicit table, the
-# script of a neighbour is decided by code-point block, and the late Egyptian controls
-# are refused by name in LATE_FORMAT. Every supported Python gives the same answer.
-_ARABIC_BLOCKS = ((0x0600, 0x06FF), (0x0750, 0x077F), (0x0870, 0x08FF), (0xFB50, 0xFDFF), (0xFE70, 0xFEFF),
-                  (0x10E60, 0x10E7F), (0x1EC70, 0x1ECBF), (0x1ED00, 0x1ED4F), (0x1EE00, 0x1EEFF))
-_SYRIAC_BLOCKS = ((0x0700, 0x074F), (0x0860, 0x086F))
-_KAITHI_BLOCKS = ((0x11080, 0x110CF),)
-VISIBLE_FORMAT = {character: _ARABIC_BLOCKS for character in '\u0600\u0601\u0602\u0603\u0604\u0605\u06dd'
+# are unassigned. So the allowed marks are this explicit table, and the late Egyptian
+# controls are refused by name in LATE_FORMAT. The character after a mark must be L* or N*
+# and in one of the ranges listed for its script; those ranges leave out every code point
+# whose L*/N* status changed between Unicode 13.0 and 18.0 (U+0870-U+089F and U+08B5,
+# U+08C8-U+08FF, all assigned or reassigned from 14.0), so every supported Python gives
+# the same answer. Presentation forms (U+FB50-U+FDFF, U+FE70-U+FEFF) are compatibility
+# characters, not text a number sign is written before, and tatweel (U+0640) only
+# stretches a joining letter, so neither counts.
+_ARABIC_FOLLOWING = ((0x0600, 0x063F), (0x0641, 0x06FF), (0x0750, 0x077F), (0x08A0, 0x08B4), (0x08B6, 0x08C7),
+                     (0x10E60, 0x10E7F), (0x1EC70, 0x1ECBF), (0x1ED00, 0x1ED4F), (0x1EE00, 0x1EEFF))
+_SYRIAC_FOLLOWING = ((0x0700, 0x074F), (0x0860, 0x086F))
+# Kaithi has no digits of its own: Unicode's ScriptExtensions.txt (UCD 14.0 to 18.0) lists
+# the Devanagari digits U+0966-U+096F with scx {Deva Dogr Kthi Mahj}, and the Unicode
+# Standard's Kaithi section (15.2) says Kaithi uses them, so the Kaithi number signs
+# U+110BD and U+110CD are written before Devanagari digits in real text.
+_KAITHI_FOLLOWING = ((0x11080, 0x110CF), (0x0966, 0x096F))
+VISIBLE_FORMAT = {character: _ARABIC_FOLLOWING for character in '\u0600\u0601\u0602\u0603\u0604\u0605\u06dd'
                   '\u0890\u0891\u08e2'}
-VISIBLE_FORMAT.update({'\u070f': _SYRIAC_BLOCKS, '\U000110BD': _KAITHI_BLOCKS, '\U000110CD': _KAITHI_BLOCKS})
+VISIBLE_FORMAT.update({'\u070f': _SYRIAC_FOLLOWING, '\U000110BD': _KAITHI_FOLLOWING,
+                       '\U000110CD': _KAITHI_FOLLOWING})
 LATE_FORMAT = frozenset(chr(code) for code in range(0x13439, 0x13440))
 
 
-def _in_script(character, blocks):
-    """A character of the mark's own script that is itself visible: in one of its blocks,
-    and neither another allowed mark nor any other format character."""
-    if not character or character in VISIBLE_FORMAT or character in LATE_FORMAT:
+def _starts_script(character, ranges):
+    """A visible base that a prepended mark of this script may stand before: a letter or
+    digit (category L* or N*) in one of the script's ranges."""
+    if not character:
         return False
     code = ord(character)
-    return (any(low <= code <= high for low, high in blocks)
-            and unicodedata.category(character) != 'Cf')
+    return (any(low <= code <= high for low, high in ranges)
+            and unicodedata.category(character)[0] in 'LN')
 
 
 def _format_character(text):
@@ -112,11 +133,9 @@ def _format_character(text):
     for index, character in enumerate(text):
         if character in '\u200c\u200d':
             continue
-        blocks = VISIBLE_FORMAT.get(character)
-        if blocks is not None:
-            before = text[index - 1] if index else ''
-            after = text[index + 1] if index + 1 < len(text) else ''
-            if _in_script(before, blocks) or _in_script(after, blocks):
+        ranges = VISIBLE_FORMAT.get(character)
+        if ranges is not None:
+            if _starts_script(text[index + 1:index + 2], ranges):
                 continue
             return character
         if character in LATE_FORMAT or unicodedata.category(character) == 'Cf':
@@ -136,7 +155,7 @@ JOINER_SCRIPTS = frozenset(('ARABIC', 'SYRIAC', 'MONGOLIAN', 'NKO', 'DEVANAGARI'
 STAMP = re.compile(r'[0-9A-Za-z:+.\- ]{1,64}')
 META_FIELDS = {'schema_version', 'version', 'set_by', 'set_at', 'previous_version',
                'previous_text', 'history', 'acknowledged', 'acks_compacted_by',
-               'acks_compacted_at', 'repaired_by', 'repaired_at'}
+               'acks_compacted_at'}
 HISTORY_FIELDS = {'version', 'set_by', 'set_at', 'previous_version'}
 CLEAR_FIELDS = {'schema_version', 'clears'}
 CLEAR_ENTRY_FIELDS = {'cleared_by', 'cleared_at', 'cleared_version'}
@@ -190,8 +209,8 @@ def validate_text(text):
                          'variation selector, filler, letter mark or similar)' % ord(hidden.group()))
     formatting = _format_character(text)
     if formatting in VISIBLE_FORMAT:
-        raise ValueError('Guidance must be plain text (the format character U+%04X is only allowed next to a '
-                         'character of its own script, such as an Arabic digit after an Arabic number sign)'
+        raise ValueError('Guidance must be plain text (the format character U+%04X is only allowed directly before a '
+                         'letter or digit of its own script, such as an Arabic number sign before an Arabic digit)'
                          % ord(formatting))
     if formatting:
         raise ValueError('Guidance must be plain text (no invisible or blank-looking character: U+%04X, a '
@@ -367,11 +386,6 @@ def validate_meta(meta):
     if 'acks_compacted_by' in meta:
         if not _valid_actor(meta['acks_compacted_by']) or not _valid_stamp(meta['acks_compacted_at']):
             raise ValueError('Invalid guidance record: compaction audit')
-    if ('repaired_by' in meta) != ('repaired_at' in meta):
-        raise ValueError('Invalid guidance record: repair audit needs both fields')
-    if 'repaired_by' in meta:
-        if not _valid_actor(meta['repaired_by']) or not _valid_stamp(meta['repaired_at']):
-            raise ValueError('Invalid guidance record: repair audit')
     return meta
 
 
@@ -428,13 +442,32 @@ def _attribution(meta, current):
     return set_by, set_at, True, None
 
 
-def _repair_audit(meta, bound):
-    """``repaired_by``/``repaired_at`` of a bound record, if a same-text repair kept the
-    original setter and recorded itself beside it (kittrial-5bb.121); else nothing."""
-    if bound and isinstance(meta, dict) and _valid_actor(meta.get('repaired_by')) \
-            and _valid_stamp(meta.get('repaired_at')):
-        return {'repaired_by': meta['repaired_by'], 'repaired_at': meta['repaired_at']}
-    return {}
+def read_repair(path):
+    """The same-text repair audit file, or None when absent, a symlink or not one this kit wrote."""
+    target = Path(path) / REPAIR_NAME
+    if target.is_symlink() or not target.is_file():
+        return None
+    try:
+        value = record_json.loads(target.read_text(encoding='utf-8'))
+    except (OSError, UnicodeError, ValueError, RecursionError):
+        return None
+    if (not isinstance(value, dict) or set(value) != REPAIR_FIELDS or value.get('schema_version') != 1
+            or not isinstance(value.get('version'), str) or not VERSION.fullmatch(value['version'])
+            or not _valid_actor(value.get('set_by')) or not _valid_stamp(value.get('set_at'))
+            or not _valid_actor(value.get('repaired_by')) or not _valid_stamp(value.get('repaired_at'))):
+        return None
+    return value
+
+
+def _repair_audit(path, meta, bound):
+    """``repaired_by``/``repaired_at`` when a same-text repair kept the original setter of
+    this exact, bound version and recorded itself beside the record (kittrial-5bb.121). The
+    file names the generation it repaired (version, setter, time); any later set, including
+    a same-text set by an older kit that never reads this file, changes one of them."""
+    repair = read_repair(path) if bound and isinstance(meta, dict) else None
+    if repair is None or any(repair[key] != meta.get(key) for key in ('version', 'set_by', 'set_at')):
+        return {}
+    return {'repaired_by': repair['repaired_by'], 'repaired_at': repair['repaired_at']}
 
 
 def _history_entries(meta):
@@ -529,7 +562,7 @@ def state(path, actor=None):
               'acknowledged_at': entry.get('acknowledged_at') if entry else None,
               'unbound': bool(current is not None and not bound),
               'attention': bool(current is not None and not acknowledged)}
-    result.update(_repair_audit(meta, bound))
+    result.update(_repair_audit(path, meta, bound))
     if warning:
         result['warning'] = warning
     if result['attention']:
@@ -595,7 +628,7 @@ def read(path, args, actor=None):
     changed = since is not None and since != current
     entry = _acknowledgement(meta, actor)
     result = {'schema_version': 1, 'present': True, 'version': current,
-              'set_at': set_at, 'set_by': set_by, **_repair_audit(meta, True), 'text': text, 'changed': changed,
+              'set_at': set_at, 'set_by': set_by, **_repair_audit(path, meta, True), 'text': text, 'changed': changed,
               'since': since, 'since_known': since_known,
               'meta_version': meta.get('version') if isinstance(meta, dict) else None,
               'previous_version': previous,
@@ -716,8 +749,6 @@ def write_guidance(path, text, actor, now=None):
             'previous_text': previous_text,
             'history': history[-HISTORY_LIMIT:],
             'acknowledged': _prune_acks(old_meta, {current, previous_version})}
-    if rewrite:
-        meta['repaired_by'], meta['repaired_at'] = actor, stamp
     # Keep the last compaction audit across a set: dropping it lost who compacted
     # the table and when (kittrial-5bb.99 review `audit-gaps` 3).
     if isinstance(old_meta, dict) and 'acks_compacted_by' in old_meta and 'acks_compacted_at' in old_meta:
@@ -729,6 +760,20 @@ def write_guidance(path, text, actor, now=None):
     # audit fields, which a set with the same text repairs (see above).
     write_text(target, text)
     atomic(meta_path, meta)
+    repair_path = Path(path) / REPAIR_NAME
+    if rewrite:
+        if repair_path.is_symlink():
+            raise ValueError('The guidance record was repaired, but %s is a symlink, so the repair audit was not '
+                             'written; ask the operator to check it' % REPAIR_NAME)
+        atomic(repair_path, {'schema_version': 1, 'version': current, 'set_by': set_by, 'set_at': set_at,
+                             'repaired_by': actor, 'repaired_at': stamp})
+    elif repair_path.exists() and not repair_path.is_symlink():
+        # A new generation, or a repair of an unbound record that names its own setter:
+        # an earlier repair audit no longer describes the record.
+        try:
+            repair_path.unlink()
+        except OSError:
+            pass   # readers ignore an audit whose version is not the record's
     result = {'version': current, 'set_by': set_by, 'set_at': set_at,
               'previous_version': previous_version,
               'changed': previous != current, 'repaired': needs_repair}
@@ -910,7 +955,7 @@ def clear(path, actor):
     except ValueError:
         cleared_version = None
     removed = []
-    for target in (text, meta, meta.with_suffix('.tmp')):
+    for target in (text, meta, meta.with_suffix('.tmp'), Path(path) / REPAIR_NAME):
         if target.exists() or target.is_symlink():
             try:
                 target.unlink()
@@ -1040,7 +1085,7 @@ def status(path, actor, operators=None, host=False):
     behind = sorted(row['actor'] for row in rows if not row['current'] and row['version'] == previous)
     stale = sorted(row['actor'] for row in rows if not row['current'] and row['version'] != previous)
     result = {'schema_version': 1, 'present': text is not None, 'version': current,
-              'set_by': set_by, 'set_at': set_at, **_repair_audit(meta, bound),
+              'set_by': set_by, 'set_at': set_at, **_repair_audit(path, meta, bound),
               'meta_version': meta.get('version') if isinstance(meta, dict) else None,
               'previous_version': previous,
               'acknowledged': rows, 'acknowledged_total': len(rows),
