@@ -305,7 +305,10 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         # the task's current contribution (a release can ship a superseded
         # revision). Additive fields (kittrial-5bb.95).
         deployed_scope=scope if (fact.get('deployed') or {}).get('value')=='passed' else None
-        deployed_delivery=None if deployed_scope is None else {key:deployed_scope.get(key) for key in ('release_id','environment','source_commit','integration_commit')}
+        # Clipped exactly as `lifecycle_scope` (and brief's `deployed_delivery`) is, so
+        # an oversized/hostile release_id cannot pass through unclipped (.107 item 7).
+        from briefing import clip
+        deployed_delivery=None if deployed_scope is None else {key:clip(deployed_scope.get(key),160) for key in ('release_id','environment','source_commit','integration_commit')}
         deployed_current=None if (deployed_scope is None or not contribution.get('commit')) else deployed_scope.get('source_commit','').lower()==contribution['commit'].lower()
         handoff_requests=[{'request_id':request['request_id'],'from_actor':request['from_actor'],
                            'to_actor':request['to_actor'],'requester':request['requester'],

@@ -171,10 +171,11 @@ Each `items[]` entry has `task` (the **native task ID**, e.g. `kittrial-5bb.7`),
 record's comment ID**, not a Git SHA and not `latest_comment_id`), `commit`,
 `pending_review_items`, `pending_handoff_requests`, `pending_handoff_total`,
 `pending_handoff_next_offset`, `lifecycle`, `lifecycle_scope`,
-`lifecycle_matches_contribution`, `error`, and the additive `workflow_state` and
-`integration` fields from the shared review-state projection. `review_state` may be
-`integrated`; `workflow_state` keeps the raw workflow state. See
-[REVIEWS.md](REVIEWS.md) for their meaning.
+`lifecycle_matches_contribution`, `deployed_delivery`,
+`deployed_delivery_is_current_contribution`, `error`, and the additive
+`workflow_state` and `integration` fields from the shared review-state projection.
+`review_state` may be `integrated`; `workflow_state` keeps the raw workflow state.
+See [REVIEWS.md](REVIEWS.md) for their meaning.
 
 `work` also returns an additive `attention.proposal_queue` block, the contributed
 requirement proposal queue; see [`proposal`](#proposal-contributed-requirement-proposals).
@@ -233,6 +234,18 @@ objects**:
 a bare string; treat `omitted_chars > 0` as "read `show`/`history` for the full value".
 Opaque cursor fields (`activity_cursor`, `next_cursor`) are never excerpted: they are
 complete tokens.
+
+`brief` and each `work` item also carry two additive lifecycle delivery fields
+(kittrial-5bb.107 item 7). `deployed_delivery` is the delivery a passed
+`deployed` fact belongs to, or `null` when the task has no trusted `deployed=passed`
+fact. It is an object with the four scope fields `release_id`, `environment`,
+`source_commit` and `integration_commit`, each an excerpt object (`text` +
+`omitted_chars`) clipped at 160 characters exactly as `lifecycle_scope` is, so an
+oversized or hostile `release_id` is bounded. `deployed_delivery_is_current_contribution`
+is `true` when `deployed_delivery.source_commit` equals the current contribution's
+`commit`, `false` when it does not, and `null` when either the delivery or the
+current contribution is absent. A deployed release may ship a superseded revision,
+so the two are independent of `lifecycle_matches_contribution`.
 
 `brief` adds an `attention` array, plus `attention_total` and `attention_more`. It
 holds at most 3 items of each kind: `reference-review` items first, then `reference`

@@ -179,7 +179,9 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     # and say plainly when it is not the task's current contribution (the release
     # may have shipped a superseded revision). Additive fields (kittrial-5bb.95).
     deployed_scope=facts['scope'] if facts['facts']['deployed']['value']=='passed' else None
-    deployed_delivery=None if deployed_scope is None else {key:deployed_scope.get(key) for key in ('release_id','environment','source_commit','integration_commit')}
+    # The four scope fields are clipped exactly as `lifecycle_scope` is, so a hostile
+    # or oversized release_id/environment cannot flow through unclipped (.107 item 7).
+    deployed_delivery=None if deployed_scope is None else {key:clip(deployed_scope.get(key),160) for key in ('release_id','environment','source_commit','integration_commit')}
     current_commit=(review.get('contribution') or {}).get('commit')
     deployed_current=None if (deployed_scope is None or not current_commit) else deployed_scope.get('source_commit','').lower()==current_commit.lower()
     pending=review.get('pending_requests',[])

@@ -6,6 +6,7 @@ any real deployment.
 import contextlib
 import io
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -16,14 +17,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import lifecycle
+import review_workflow as rw
 from lifecycle import (DEFECT_VALUE, ENABLED, RELEASE, RELEASE_TARGETS_MAX, apply_native,
                        derived_id, enabled_states, evidence_owed, git_ancestry,
                        integration_evidence, project_facts, release_selection, release_targets,
                        reverted_integrations, scoped_evidence, validate_payload,
                        validate_release_payload)
-from requirements import content_hash
+from requirements import canonical_bytes, content_hash
 
 ACTOR = 'alice/session'
+OPERATOR = 'coordinator-1'
 SOURCE_A = '1' * 40
 SOURCE_B = '2' * 40
 MERGE_A = '3' * 40
@@ -424,7 +427,7 @@ class EvidenceOwedTests(unittest.TestCase):
 
 class ReleaseCommandTests(unittest.TestCase):
     """The release command resolves targets locally, then sends one payload."""
-    def run_cli(self, argv, client=None):
+    def run_cli(self, argv, client=None, catch=False):
         previous = sys.modules.get('client')
         if client is not None:
             sys.modules['client'] = client
@@ -432,9 +435,14 @@ class ReleaseCommandTests(unittest.TestCase):
         lifecycle.git_ancestry = lambda repo: (lambda commit, release: commit == MERGE_A)
         sys.argv = argv
         out = io.StringIO()
+        error = None
         try:
             with contextlib.redirect_stdout(out):
                 lifecycle.main()
+        except SystemExit as exc:
+            if not catch:
+                raise
+            error = str(exc)
         finally:
             sys.argv, lifecycle.git_ancestry = original_argv, original_ancestry
             if client is not None:
@@ -442,7 +450,7 @@ class ReleaseCommandTests(unittest.TestCase):
                     sys.modules.pop('client', None)
                 else:
                     sys.modules['client'] = previous
-        return out.getvalue()
+        return (out.getvalue(), error) if catch else out.getvalue()
 
     def fixture(self, root, store, live_verified=False):
         export = Path(root) / 'issues.jsonl'
@@ -580,17 +588,55 @@ class ReselectionTests(unittest.TestCase):
             return commit == release or (commit, release) in pairs
         return is_ancestor
 
-    def test_a_second_release_selects_only_the_task_that_is_new(self):
-        store = (NativeStore(tasks=('trial-a', 'trial-b')).seed('trial-a')
-                 .seed('trial-b', integration=MERGE_B, source=SOURCE_B))
+    def test_a_same_release_is_not_recorded_twice(self):
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
         self.deployed(store, 'trial-a', 'r-1', 'production')
         selection = release_selection(
-            store.rows, self.release_scope(),
-            self.ancestry({(MERGE_A, RELEASE_1), (MERGE_A, RELEASE_2), (MERGE_B, RELEASE_2),
+            store.rows, self.release_scope(integration=RELEASE_1, release='r-1'),
+            self.ancestry({(MERGE_A, RELEASE_1)}))
+        self.assertEqual(selection['targets'], [])
+        self.assertIn('already deployed', selection['skipped'][0]['reason'])
+
+    def test_a_different_release_id_reselects_a_task_deployed_earlier(self):
+        # .107 item 4: deployed is per (environment, release id). A new release id
+        # must record even a task already deployed at an earlier release, so a
+        # rollback and a later roll-forward can both be recorded.
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        self.deployed(store, 'trial-a', 'r-1', 'production')
+        selection = release_selection(
+            store.rows, self.release_scope(integration=RELEASE_2, release='r-2'),
+            self.ancestry({(MERGE_A, RELEASE_1), (MERGE_A, RELEASE_2),
                            (RELEASE_1, RELEASE_2)}))
-        self.assertEqual([item['task'] for item in selection['targets']], ['trial-b'])
-        reasons = {item['task']: item['reason'] for item in selection['skipped']}
-        self.assertIn('already deployed', reasons['trial-a'])
+        self.assertEqual([item['task'] for item in selection['targets']], ['trial-a'])
+
+    def test_a_rollback_and_a_roll_forward_are_both_recordable(self):
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        def always(commit, release):
+            return True
+        store.record(release_payload([target('trial-a')], operation='release-r1', release='r-1'))
+        store.record(release_payload([target('trial-a')], operation='release-r3', release='r-3'))
+        rollback = release_selection(store.rows,
+                                     self.release_scope(release='r-1', integration=RELEASE_COMMIT),
+                                     always)
+        self.assertEqual([item['task'] for item in rollback['targets']], ['trial-a'],
+                         'a rollback to R1 must be recordable after R3')
+        store.record(release_payload([target('trial-a')], operation='release-r1-again', release='r-1'))
+        again = release_selection(store.rows,
+                                  self.release_scope(release='r-3', integration=RELEASE_COMMIT),
+                                  always)
+        self.assertEqual([item['task'] for item in again['targets']], ['trial-a'],
+                         'rolling forward to R3 again must be recordable')
+
+    def test_a_deployment_in_another_environment_is_not_already_deployed(self):
+        # Kills the mutation that drops the environment from the already-deployed
+        # decision (.107 item 8): staging is not production.
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        self.deployed(store, 'trial-a', 'r-1', 'staging')
+        selection = release_selection(
+            store.rows, self.release_scope(integration=RELEASE_1, release='r-1',
+                                           environment='production'),
+            self.ancestry({(MERGE_A, RELEASE_1)}))
+        self.assertEqual([item['task'] for item in selection['targets']], ['trial-a'])
 
     def test_a_new_integration_is_selected_even_when_an_older_one_was_deployed(self):
         store = NativeStore(tasks=('trial-a',)).seed('trial-a')
@@ -642,32 +688,109 @@ class ReselectionTests(unittest.TestCase):
 
 
 class RevertAndDeliveryTests(unittest.TestCase):
-    """Reverted integrations are excluded; a stale delivery is flagged (item 3)."""
+    """Reverted integrations follow the REVIEW rule; a stale delivery is flagged."""
+
+    def setUp(self):
+        journal = None
+        try:
+            journal = Path(tempfile.mkdtemp())
+            (journal / rw.JOURNAL_DIR).mkdir()
+        except OSError as exc:
+            if journal is not None:
+                shutil.rmtree(journal, ignore_errors=True)
+            self.skipTest('no writable host revert journal: ' + str(exc))
+        self.journal = journal
+        self.addCleanup(shutil.rmtree, journal, ignore_errors=True)
 
     def seeded(self, task='trial-a'):
         return NativeStore(tasks=(task,)).seed(task)
 
-    def revert(self, store, task, commit):
-        store.rows[0].setdefault('comments', []).append(
-            {'id': 'revert-1', 'author': ACTOR, 'created_at': '',
-             'text': lifecycle.REVERT_PREFIX + json.dumps({'operation': 'revert-record',
-                                                           'integration_commit': commit})})
+    def revert_payload(self, task, commit=MERGE_A, author=OPERATOR, operation_id='revert-1',
+                       contribution='1'):
+        return dict(schema_version=1, operation='revert-record', operation_id=operation_id,
+                    task=task, contribution=contribution, integration_commit=commit,
+                    revert_commit='b' * 40, reason='Re-merge dropped the change',
+                    operator=author)
 
-    def test_a_reverted_integration_is_not_selected(self):
+    def revert(self, store, task, commit=MERGE_A, author=OPERATOR, journaled=True,
+               operation_id='revert-1'):
+        """Append a native revert comment and, unless ``journaled`` is False, its host entry."""
+        payload = self.revert_payload(task, commit, author, operation_id)
+        row = next(item for item in store.rows if item['id'] == task)
+        cid = str(len(row.get('comments') or []) + 1)
+        row.setdefault('comments', []).append(
+            {'id': cid, 'author': author, 'created_at': '2026-01-01T00:00:00Z',
+             'text': lifecycle.REVERT_PREFIX + canonical_bytes(payload).decode()})
+        if journaled:
+            entry = rw.revert_journal_entry(rw.JOURNAL_REVERT, payload, cid, author, task=task,
+                                            contribution='1', integration_commit=commit,
+                                            revert_commit='b' * 40)
+            rw.publish_revert_journal(self.journal, entry)
+        return cid
+
+    def read_reverts(self, store):
+        return reverted_integrations(store.rows, [OPERATOR], self.journal)
+
+    def test_a_host_issued_revert_is_read_by_the_review_rule(self):
         store = self.seeded()
         self.revert(store, 'trial-a', MERGE_A)
-        self.assertEqual(reverted_integrations(store.rows), {('trial-a', MERGE_A)})
+        self.assertEqual(self.read_reverts(store), {('trial-a', MERGE_A)})
         selection = release_selection(store.rows, {'source_commit': '', 'integration_commit': RELEASE_COMMIT,
                                                    'release_id': 'release-1', 'environment': 'production'},
-                                      lambda commit, release: True)
+                                      lambda commit, release: True,
+                                      operators=[OPERATOR], journal=self.journal)
         self.assertEqual(selection['targets'], [])
         self.assertIn('reverted', selection['skipped'][0]['reason'])
+
+    def test_a_revert_without_a_host_journal_entry_is_ignored(self):
+        # A comment written through host bd by a non-operator (or with no journal
+        # entry) is not a revert to review, so it must not exclude the task (.107 item 2).
+        store = self.seeded()
+        self.revert(store, 'trial-a', MERGE_A, author='mallory', journaled=False)
+        self.assertEqual(self.read_reverts(store), set())
+        selection = release_selection(store.rows, {'source_commit': '', 'integration_commit': RELEASE_COMMIT,
+                                                   'release_id': 'release-1', 'environment': 'production'},
+                                      lambda commit, release: True,
+                                      operators=[OPERATOR], journal=self.journal)
+        self.assertEqual([item['task'] for item in selection['targets']], ['trial-a'])
+
+    def test_a_journaled_revert_by_a_non_operator_is_ignored(self):
+        store = self.seeded()
+        self.revert(store, 'trial-a', MERGE_A, author='mallory', journaled=True)
+        self.assertEqual(self.read_reverts(store), set())
+
+    def test_a_retracted_revert_is_read_as_passed_again(self):
+        # A host-journaled operator void retracts the revert; review reads passed
+        # again and the release must select the task (.107 item 2).
+        store = self.seeded()
+        cid = self.revert(store, 'trial-a', MERGE_A)
+        row = store.rows[0]
+        original = next(c['text'] for c in row['comments'] if str(c['id']) == cid)
+        void = dict(schema_version=1, operation='void-record', operation_id='void-revert-1',
+                    task='trial-a', target=cid, target_kind='integration-revert',
+                    target_sha256=rw.recovery.digest(original), original=original,
+                    reason='mistaken revert', disposition='void', operator=OPERATOR)
+        def operator_run(args):
+            comment_id = str(len(row.get('comments') or []) + 1)
+            row.setdefault('comments', []).append(
+                {'id': comment_id, 'author': OPERATOR, 'created_at': '2026-01-01T00:00:00Z',
+                 'text': args[3]})
+            return json.dumps({'id': comment_id})
+        rw.apply_void(store.rows, 'trial-a', OPERATOR, void, operator_run, operator=True,
+                      operators=[OPERATOR], journal=self.journal)
+        self.assertEqual(self.read_reverts(store), set())
+        selection = release_selection(store.rows, {'source_commit': '', 'integration_commit': RELEASE_COMMIT,
+                                                   'release_id': 'release-1', 'environment': 'production'},
+                                      lambda commit, release: True,
+                                      operators=[OPERATOR], journal=self.journal)
+        self.assertEqual([item['task'] for item in selection['targets']], ['trial-a'])
 
     def test_a_reverted_integration_is_refused_by_the_endpoint(self):
         store = self.seeded()
         self.revert(store, 'trial-a', MERGE_A)
         with self.assertRaisesRegex(ValueError, 'reverted'):
-            store.record(release_payload([target('trial-a')]))
+            apply_native(release_payload([target('trial-a')]), ACTOR, store.run,
+                         operators=[OPERATOR], journal=self.journal)
 
     def test_selection_flags_a_delivery_that_is_not_the_current_contribution(self):
         store = self.seeded()
@@ -728,6 +851,22 @@ class EvidenceOwedHistoryTests(unittest.TestCase):
                      if item['id'] == 'trial-a')
         releases = [item['scope']['release_id'] for item in entry['scopes'] if item['deployed']]
         self.assertEqual(releases, ['r-10'])
+
+    def test_evidence_owed_keeps_the_enabled_flag_per_scope(self):
+        # .107 item 8: a historical row must not show the task's CURRENT enabled
+        # flag; it shows the flag recorded for that row's scope.
+        store = NativeStore(tasks=('trial-a', 'fixing-task')).seed('trial-a')
+        self.release(store, 'r-10', 'production', RELEASE_1)
+        self.release(store, 'r-11', 'production', RELEASE_2)
+        later = scope(source=SOURCE_A, integration=RELEASE_2, release='r-11', environment='production')
+        store.record(payload('trial-a', ENABLED, value=DEFECT_VALUE, operation='enabled-11',
+                             scope_value=later, defect_task='fixing-task'))
+        rows = {(group['environment'], group['release_id']): group['tasks'][0]
+                for group in evidence_owed(store.rows)}
+        self.assertEqual(rows[('production', 'r-10')]['enabled'], 'unknown')
+        self.assertIsNone(rows[('production', 'r-10')]['defect_task'])
+        self.assertEqual(rows[('production', 'r-11')]['enabled'], DEFECT_VALUE)
+        self.assertEqual(rows[('production', 'r-11')]['defect_task'], 'fixing-task')
 
 
 class NoteOnOlderKitTests(unittest.TestCase):
@@ -898,7 +1037,21 @@ class ReleaseCommandChunkTests(ReleaseCommandTests):
 
 
 class ReaderDeliveryTests(unittest.TestCase):
-    """brief/work name the delivery a deployed fact belongs to (item 3)."""
+    """brief/work name the delivery a deployed fact belongs to (item 3, .107 item 7)."""
+
+    def add_contribution(self, store, task, commit):
+        payload = dict(schema_version=1, operation='contribute', operation_id='contribute-1',
+                       task=task, previous=None, repository='ssh://git/example', commit=commit,
+                       base_commit='b' * 40,
+                       delivery=dict(kind='bundle', path='server:/rev.bundle', sha256='c' * 64),
+                       summary='Contribution delivered', supersedes=None)
+        row = next(item for item in store.rows if item['id'] == task)
+        row.setdefault('comments', []).append(
+            {'id': 'contribution-1', 'author': ACTOR, 'created_at': '2026-01-01T00:00:00Z',
+             'text': rw.PREFIX + canonical_bytes(payload).decode()})
+
+    def clipped(self, value):
+        return {'text': value, 'omitted_chars': 0}
 
     def test_brief_and_work_name_the_deployed_delivery(self):
         import briefing
@@ -907,13 +1060,176 @@ class ReaderDeliveryTests(unittest.TestCase):
         store.record(release_payload([target('trial-a')]))
         brief = briefing.brief(store.rows, 'trial', 'trial-a')
         self.assertEqual(brief['deployed_delivery'],
-                         {'release_id': 'release-1', 'environment': 'production',
-                          'source_commit': SOURCE_A, 'integration_commit': MERGE_A})
+                         {'release_id': self.clipped('release-1'),
+                          'environment': self.clipped('production'),
+                          'source_commit': self.clipped(SOURCE_A),
+                          'integration_commit': self.clipped(MERGE_A)})
         self.assertIsNone(brief['deployed_delivery_is_current_contribution'])
         queue = work.queue(store.rows, ACTOR, ['--mine'])
         item = next(entry for entry in queue['items'] if entry['task'] == 'trial-a')
-        self.assertEqual(item['deployed_delivery']['release_id'], 'release-1')
-        self.assertEqual(item['deployed_delivery']['environment'], 'production')
+        self.assertEqual(item['deployed_delivery']['release_id'], self.clipped('release-1'))
+        self.assertEqual(item['deployed_delivery']['environment'], self.clipped('production'))
+
+    def test_deployed_delivery_is_current_contribution_answers_both_ways(self):
+        # Kills the mutation that inverts this answer in brief (.107 item 8).
+        import briefing
+        same = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        same.record(release_payload([target('trial-a')]))
+        self.add_contribution(same, 'trial-a', SOURCE_A)
+        self.assertIs(briefing.brief(same.rows, 'trial', 'trial-a')
+                      ['deployed_delivery_is_current_contribution'], True)
+        other = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        other.record(release_payload([target('trial-a')]))
+        self.add_contribution(other, 'trial-a', SOURCE_B)
+        self.assertIs(briefing.brief(other.rows, 'trial', 'trial-a')
+                      ['deployed_delivery_is_current_contribution'], False)
+
+    def test_work_omits_deployed_delivery_when_deployed_is_not_passed(self):
+        # Kills the mutation that shows the delivery in work regardless of deployed (.107 item 8).
+        import work
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        queue = work.queue(store.rows, ACTOR, ['--mine'])
+        item = next(entry for entry in queue['items'] if entry['task'] == 'trial-a')
+        self.assertIsNone(item['deployed_delivery'])
+        self.assertIsNone(item['deployed_delivery_is_current_contribution'])
+
+    def test_an_oversized_release_id_is_clipped(self):
+        import briefing
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        store.record(release_payload([target('trial-a')], release='r' * 3657))
+        brief = briefing.brief(store.rows, 'trial', 'trial-a')
+        release = brief['deployed_delivery']['release_id']
+        self.assertEqual(len(release['text']), 160)
+        self.assertEqual(release['omitted_chars'], 3657 - 160)
+
+
+class LaterLiveVerifiedTests(unittest.TestCase):
+    """A later --live-verified selects tasks deployed at that release (.107 item 1)."""
+
+    def release_scope(self, release='r-1', environment='production'):
+        return {'source_commit': '', 'integration_commit': RELEASE_COMMIT,
+                'release_id': release, 'environment': environment}
+
+    def test_a_plain_reselection_is_empty_but_live_verified_selects(self):
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        store.record(release_payload([target('trial-a')], release='r-1'))
+        plain = release_selection(store.rows, self.release_scope(), lambda commit, release: True)
+        self.assertEqual(plain['targets'], [])
+        later = release_selection(store.rows, self.release_scope(), lambda commit, release: True,
+                                  live_verified=True)
+        self.assertEqual([item['task'] for item in later['targets']], ['trial-a'])
+        self.assertEqual(later['verify_only'], ['trial-a'])
+
+    def test_the_later_write_records_live_verified_without_duplicating_deployed(self):
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        store.record(release_payload([target('trial-a')], release='r-1'))
+        result = store.record(release_payload([target('trial-a')], release='r-1', live_verified=True))
+        recorded = result['targets'][0]
+        self.assertTrue(recorded['already_deployed'])
+        self.assertIsNone(recorded['deployed'])
+        self.assertIsNotNone(recorded['live_verified'])
+        self.assertEqual(store.facts('trial-a')['facts']['live-verified']['value'], 'passed')
+        deployed_events = [row for row in store.rows if row.get('issue_type') == 'event'
+                           and 'deployed' in row.get('title', '')]
+        self.assertEqual(len(deployed_events), 1)
+        # Once it is passed, a further --live-verified is a no-op.
+        again = store.record(release_payload([target('trial-a')], release='r-1', live_verified=True))
+        self.assertIsNone(again['targets'][0]['live_verified'])
+        self.assertTrue(again['targets'][0]['reconciled'])
+
+
+class PreviousReleaseValidationTests(ReleaseCommandTests):
+    """--previous-release-commit is validated before git is used (.107 item 5)."""
+
+    def test_a_non_commit_short_commit_or_uppercase_commit_is_refused(self):
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        for value in ('HEAD', '6' * 7, 'A' * 40):
+            with scratch() as root:
+                argv = self.fixture(root, store) + ['--dry-run', '--previous-release-commit', value]
+                _out, error = self.run_cli(argv, catch=True)
+            self.assertIn('full lowercase 40-character commit', error or '')
+
+    def test_a_commit_that_is_not_an_ancestor_of_the_release_is_refused(self):
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        with scratch() as root:
+            argv = self.fixture(root, store) + ['--dry-run', '--previous-release-commit', 'a' * 40]
+            _out, error = self.run_cli(argv, catch=True)
+        self.assertIn('must be an ancestor of the release commit', error or '')
+
+    def test_the_release_commit_itself_is_refused(self):
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        with scratch() as root:
+            argv = self.fixture(root, store) + ['--dry-run', '--previous-release-commit', RELEASE_COMMIT]
+            _out, error = self.run_cli(argv, catch=True)
+        self.assertIn('must not be the release commit itself', error or '')
+
+
+class ReleaseGroupReportingTests(ReleaseCommandTests):
+    """A multi-group release is checked as one operation (.107 item 3)."""
+
+    def store(self):
+        return (NativeStore(tasks=('trial-a', 'trial-b', 'trial-c'))
+                .seed('trial-a').seed('trial-b').seed('trial-c'))
+
+    def test_a_conflict_in_the_last_group_writes_nothing(self):
+        store = self.store()
+        planted = derived_id('release-1', 'deployed', 'trial-c')
+        store.record(payload('trial-c', 'tested', operation=planted))
+        sent = []
+        client = types.ModuleType('client')
+        client.request = lambda *args, **kwargs: sent.append(args) or {
+            'returncode': 0, 'stdout': '{}', 'stderr': ''}
+        with scratch() as root:
+            argv = self.fixture(root, store) + ['--chunk-size', '1']
+            _out, error = self.run_cli(argv, client, catch=True)
+        self.assertEqual(sent, [], 'no group may be sent after the whole-release check fails')
+        self.assertIn('operation ID already used for different content', error or '')
+
+    def test_a_group_failure_reports_which_groups_completed(self):
+        store = self.store()
+        sent = []
+        client = types.ModuleType('client')
+        def fake_request(config, project, actor, args, action=None):
+            sent.append(args)
+            if len(sent) == 2:
+                return {'returncode': 2, 'stdout': '', 'stderr': 'endpoint refused group two'}
+            return {'returncode': 0, 'stderr': '', 'stdout': json.dumps({'targets': []})}
+        client.request = fake_request
+        with scratch() as root:
+            argv = self.fixture(root, store) + ['--chunk-size', '1']
+            out, error = self.run_cli(argv, client, catch=True)
+        report = json.loads(out)
+        self.assertEqual(report['groups_completed'], 1)
+        self.assertEqual(report['groups_total'], 3)
+        self.assertEqual(report['chunks'], [1, 1, 1])
+        self.assertIn('endpoint refused group two', report['failure'])
+        self.assertIn('failed after 1 of 3 group(s)', error or '')
+
+
+class ReleaseCostEstimateTests(unittest.TestCase):
+    """expected_seconds is an upper bound and the default group is small (.107 item 6)."""
+
+    def test_the_estimate_covers_the_measured_cost(self):
+        self.assertLessEqual(lifecycle.RELEASE_CHUNK_DEFAULT, 25)
+        self.assertGreaterEqual(
+            round(lifecycle.DRY_RUN_FIXED_SECONDS + lifecycle.DRY_RUN_SECONDS_PER_TARGET * 201, 1),
+            335.0)
+        self.assertGreaterEqual(
+            round(lifecycle.DRY_RUN_FIXED_SECONDS + lifecycle.DRY_RUN_SECONDS_PER_TARGET * 50, 1),
+            86.0)
+
+    def test_the_dry_run_uses_the_upper_bound_formula(self):
+        store = (NativeStore(tasks=('trial-a', 'trial-b', 'trial-c'))
+                 .seed('trial-a').seed('trial-b').seed('trial-c'))
+        client = types.ModuleType('client')
+        client.request = lambda *args, **kwargs: {'returncode': 0, 'stdout': '{}', 'stderr': ''}
+        with scratch() as root:
+            argv = ReleaseCommandTests.fixture(self, root, store) + ['--dry-run']
+            report = json.loads(ReleaseCommandTests.run_cli(self, argv, client))
+        self.assertEqual(report['total_chunks'], 1)
+        self.assertEqual(report['expected_seconds'],
+                         round(lifecycle.DRY_RUN_FIXED_SECONDS
+                               + lifecycle.DRY_RUN_SECONDS_PER_TARGET * 3, 1))
 
 
 if __name__ == '__main__':
