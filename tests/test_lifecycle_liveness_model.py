@@ -49,6 +49,7 @@ class Scenario:
             if p['targets'] or rollback:self.write(p)
         except ValueError as exc:
             assert self.store.rows==before,'refused operation wrote native state'
+            assert any(reason in str(exc) for reason in ('never deployed','nothing is deployed','operation ID already used','new operation ID')),str(exc)
             self.commands.append((r,e,verified,rollback,op,str(exc)))
             return str(exc)
         for t in self.DELIVERIES:
@@ -88,6 +89,25 @@ class RuleTests(unittest.TestCase):
         s=Scenario()
         for r in ('R1','R2','R3'):self.step(s,r)
         self.step(s,'R1',rollback=True);self.assertIsNone(s.expected['production']['tx'])
+    def test_two_release_scopes_of_one_delivery_have_distinct_receipts(self):
+        s=Scenario();self.step(s,'R1')
+        target={'task':'tx','source_commit':commit(25),'integration_commit':commit(5)}
+        for r in ('R2','R3'):
+            s.write(release_payload([target],operation='direct-'+r,release=r))
+        s.expected['production']['tx']=(5,'R3');s.check(self)
+        self.step(s,'R1',rollback=True)
+        self.assertIsNone(s.expected['production']['tx'])
+    def test_stale_verification_binding_refuses_before_writes(self):
+        s=Scenario();self.step(s,'R1')
+        sc=dict(source_commit='',integration_commit=commit(6),release_id='R2',environment='production')
+        selected=lifecycle.release_selection(s.store.rows,sc,s.ancestor,live_verified=True)
+        bound=next(t for t in selected['targets'] if t['task']=='ta')
+        self.assertEqual(bound['verify_scope']['release_id'],'R1')
+        self.step(s,'H');self.step(s,'H',rollback=True)
+        before=copy.deepcopy(s.store.rows)
+        with self.assertRaisesRegex(ValueError,'no longer live'):
+            s.write(release_payload([bound],operation='stale-binding',release='R2',live_verified=True))
+        self.assertEqual(s.store.rows,before)
     def test_stale_deploy_and_rollback_ids_refuse_before_writes(self):
         s=Scenario();self.step(s,'R1');self.step(s,'R3',op='A');self.step(s,'R1',rollback=True,op='B')
         self.assertIn('new operation ID',self.step(s,'R3',op='A'))

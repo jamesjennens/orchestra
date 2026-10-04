@@ -396,6 +396,8 @@ For each task/environment, the newest recorded liveness event wins, including
 `live=superseded`. An older positive event cannot revive a task dropped by a newer
 negative event. A scope with no explicit live fact uses its legacy
 `deployed=passed` event as positive evidence. Evidence for every historical scope
-remains readable; all other deployed scopes read superseded in `evidence-owed`.
+remains readable; other scopes with explicit positive liveness read superseded in
+`evidence-owed`. Legacy rows retain the documented `live=unknown` field while
+release-query reports their legacy deployment as `liveness=deployed`.
 Readers use event order, not scope creation order. Membership selection uses the
 newest passing integration event contained in the requested Git release.

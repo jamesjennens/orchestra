@@ -869,23 +869,13 @@ def require_rollback_target_deployed(rows,scope):
 
 def rollback_selection(rows,scope,is_ancestor,reverted=None,current_commits=None,
                        operators=None,journal=None):
-    """The explicit rollback plan: who R carries, and who it supersedes.
+    """Explicit full membership switch to a previously deployed release.
 
-    A rollback to release R (rev2 item 2) is not a normal deploy: it must also say
-    that tasks shipped only after R are no longer live. ``targets`` are the tasks
-    in R's membership - their chosen trusted integrated commit is an ancestor of R
-    and is not host-reverted - which the endpoint re-records live at R.
-    ``supersede`` names tasks live in THIS ENVIRONMENT (decided from the scope
-    history, rev3 item 1) that are NOT in R's membership, so they read not live
-    instead of silently passing. ``supersede_scopes`` names the exact recorded
-    SCOPES the rollback moves past for the tasks it DOES carry (rev4 item 2): a task
-    delivered twice and live at a newer R2 keeps R2's own ``live=live`` fact, so
-    ``evidence-owed`` would show two live rows for it and a later deploy of R2 would
-    read it as already deployed and lose the second delivery. Each named scope gets
-    its own ``live=superseded`` fact, which is what makes the roll forward restore
-    it. Every other omission is in ``skipped`` with a cause. The environment must
-    already have a deployment of the rollback target, or the whole rollback is
-    refused (rev3 item 3.1).
+    Choose the newest passing integration event contained in R. Targets are
+    re-lived at R; tasks R does not carry get a negative liveness event. Historical
+    deployed scopes outside R are named for both carried and dropped tasks.
+    Negative writes precede final target positives, so an old positive cannot
+    revive dropped membership and the carried rollback target wins last.
     """
     release=scope['integration_commit'];environment=scope['environment']
     if reverted is None:reverted=reverted_integrations(rows,operators,journal)
@@ -1062,31 +1052,14 @@ def _apply_fact(payload,actor,rows,run,current_scope,op_index,issues,recorded=No
 
 
 def _release_plan(rows,payload,operators=None,journal=None):
-    """Read-only: resolve every target and the exact per-task write plan.
+    """Resolve and verify the complete target write plan without writes.
 
-    Shared by the endpoint write (``apply_release``) and the client's whole-release
-    pre-check, so both decide targets, already-deployed suppression and derived
-    operation IDs the same way, against the same export and with no native write.
-    Raises on an unknown, stale or host-reverted target before returning, which is
-    what lets the client check the WHOLE release before the first group request.
-
-    Returns ``(selected,plans,issues,evidence)``. ``selected`` entries are dicts
-    carrying ``target``, ``release_scope``, ``already``, ``verified`` and
-    ``verify_only``; ``plans[task]`` is an ordered list of ``(fact_scope,planned_payload)``
-    where ``fact_scope`` is the scope the endpoint must have current (or, for a
-    verify-only target, the task's current scope against which the release scope
-    must already be recorded) before that fact; ``None`` for the scope write.
-    ``evidence`` is the per-scope read shared with ``_supersede_plan``.
-
-    A target already deployed at this release/environment whose live-verification
-    is not yet passed is VERIFY-ONLY: its plan is the single ``live-verified`` fact
-    under the scope that really carries the deployment (the release's own scope when
-    it is the one deployed there, otherwise the recorded deployment scope), so the
-    task's current scope never moves (rev2 item 3, rev4 item 3 (3)). Every other
-    target gets the scope (only when it differs), the ``deployed=passed`` fact (only
-    when the current scope is not already deployed) and the ``live=live`` liveness
-    fact (only when the current scope is not already live), so a plain deploy and a
-    roll-forward both end live.
+    Every target must have passing integration evidence at the named source and
+    integration commits. An optional client verify_scope must still be the live
+    recorded deployment. Historical explicit verification keeps its evidence
+    contract without moving the current scope; a superseded deployment instead
+    receives a new live fact before verification. Target positives are planned
+    after any negative scope writes for the same task.
     """
     issues={row['id']:row for row in rows if row.get('issue_type')!='event'}
     facts={state['id']:state for state in project_facts(rows)}
@@ -1221,12 +1194,9 @@ def derived_scope_id(operation_id,task,scope):
     A rollback may move the same task past more than one recorded deployment, so the
     scope-level supersede needs an ID that names the SCOPE as well as the task.
     """
-    commit=scope.get('integration_commit') or ''
-    label='superseded-scope'
-    if COMMIT.fullmatch(commit):
-        token=operation_id+'/'+label+'/'+task+'/'+commit[:12]
-        if len(token)<=161:return token
-    return derived_id(operation_id,label,task)+'/'+content_hash(scope)[:12]
+    token=operation_id+'/superseded-scope/'+task+'/'+content_hash(scope)[:24]
+    if len(token)<=161:return token
+    return operation_id+'/superseded-scope/'+content_hash({'task':task,'scope':scope})[:32]
 
 
 def _supersede_scope_plan(rows,payload,issues=None,evidence=None):
@@ -1284,56 +1254,35 @@ def _check_release_identity(payload,op_index):
 
 def _check_release_operations(plans,negative,op_index,evidence):
     """Check every receipt before writing, including historical liveness retries."""
+    identities={}
     for planned in [p for plan in plans.values() for _,p in plan]+[p for _,p in negative]:
+        earlier=identities.setdefault(planned['operation_id'],planned)
+        if earlier!=planned:raise ValueError('operation ID already used for different content in the same plan; a new operation ID is needed')
         prior=op_index.get(planned['operation_id'])
         if prior is None:continue
         if prior[0]!=planned:
-            raise ValueError('operation ID already used for different content: '+planned['operation_id'])
+            raise ValueError('operation ID already used for different content; a new operation ID is needed: '+planned['operation_id'])
         if planned['dimension']!=LIVE:continue
         current,value=environment_liveness(evidence.get(planned['task'],{}).get('scopes',[]),
                                            planned['scope']['environment'])
         effective=(current is not None and current['scope']==planned['scope'] and value==planned['value'])
+        if planned['value']=='live' and any(p['task']==planned['task'] for _,p in negative):effective=False
         if not effective:
             raise ValueError('operation ID was already used for a state that has since changed; a new operation ID is needed: '+planned['operation_id'])
 
 
 def apply_release(payload,actor,run,operators=None,journal=None):
-    """One release-level write: record deployed (and optionally live-verified).
+    """Preflight one release against one native export, then apply its facts.
 
-    One export serves the whole request. Every target is verified against it
-    before the first native write, and every derived operation ID is checked for a
-    conflicting planted fact before the first write too, so a stale target or a
-    used ID refuses the whole release and nothing is written. Each target then gets
-    the release scope recorded only when it differs from the task's current scope,
-    followed by ``deployed=passed`` carrying the shared evidence block and the
-    target's optional note (ONLY on the deployed fact: the scope event keeps
-    exactly the four scope fields, so an older strict reader still reads it) and
-    ``live-verified=passed`` when the payload asks for it. A target already
-    recorded deployed=passed at this release and environment is a verify-only
-    target (rev2 item 3): only the live-verified evidence is recorded, under the
-    release's already recorded scope, so the task's current scope never moves. A
-    target whose current scope is already deployed and live needs neither a scope
-    nor a deployed nor a live write. Deterministic per-task operation IDs make an
-    exact retry reconcile; changed content needs a new ID.
-
-    Reverted integrations are read with the SAME host-journal and operator rule as
-    every ``review`` read (``operators``/``journal``), so an unjournaled comment or
-    a retracted revert no longer refuses a target by itself.
-
-    ``live=live`` is recorded for every non-verify-only target (rev2 item 4), so
-    readers can tell a live release from one the environment has been rolled back
-    out of; every task named in ``supersede`` gets ``live=superseded`` under its
-    live scope IN THIS ENVIRONMENT (rev3 item 1) with its evidence untouched, on a
-    plain deploy and on an explicit rollback alike, and every scope named in
-    ``supersede_scopes`` gets the same fact under EXACTLY that scope (rev4 item 2).
-    An explicit ``rollback`` is additionally refused unless the environment already
-    has a deployment of the rollback target (rev3 item 3.1).
-
-    Ancestry is NOT decided here. The endpoint re-verifies that each target is
-    integrated at the commits named in its own export; whether that commit is an
-    ancestor of the release commit is decided by git in the caller's checkout (see
-    ``release_selection``), exactly like ``commit``/``base_commit`` in contribution
-    review.
+    Validate all target/supersede identities, integrations, scopes and derived
+    operation receipts before the first write. Historical liveness receipts whose
+    state changed are refused with a new-ID instruction. Negative facts are written
+    first, then target scopes/deployed/live facts and optional verification. All
+    native facts keep the old payload shape; verify_scope exists only on requests.
+    Git membership is decided in the client's checkout; the endpoint rechecks
+    integration evidence, the live verification binding, and recorded scopes.
+    Retries of interrupted native writes reconcile still-current facts. A backend
+    failure may leave partial writes, so callers take a fresh export before retry.
     """
     validate_release_payload(payload,require_targets=not (payload.get('rollback')
                                                           or payload.get('supersede')
