@@ -172,7 +172,14 @@ record's comment ID**, not a Git SHA and not `latest_comment_id`), `commit`,
 `pending_review_items`, `pending_handoff_requests`, `pending_handoff_total`,
 `pending_handoff_next_offset`, `lifecycle`, `lifecycle_scope`,
 `lifecycle_matches_contribution`, `error`, and the additive `workflow_state` and
-`integration` fields from the shared review-state projection. `review_state` may be
+`integration` fields from the shared review-state projection. Four more additive
+fields (kittrial-5bb.114) carry what an agent's attention read needs:
+`pending_change_requests` (the ids of the request-changes records still unresolved, at
+most 20), `open_items` (how many open items the task's latest valid checkpoint lists;
+`0` with none or no checkpoint, `null` when its checkpoint history cannot be read),
+`checkpoint_at` (when that checkpoint was written, or `null`) and `newer_activity`
+(`true` when any comment or record was written on the task after that checkpoint,
+`false` when none was, `null` with no checkpoint). `review_state` may be
 `integrated`; `workflow_state` keeps the raw workflow state. See
 [REVIEWS.md](REVIEWS.md) for their meaning.
 

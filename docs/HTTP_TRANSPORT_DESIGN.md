@@ -195,7 +195,9 @@ own machine and pull work over the API without SSH or shared directories.
   suggestion list rather than a blind first page. `GET /v1/agents/me` returns the
   agent record; `GET /v1/agents/me/next` returns the stable JSON
   `attention`/`next_actions` contract with task/brief (task-detail) links,
-  prioritised as changes-requested, blocked, claimable task, then awaiting review.
+  prioritised as changes-requested, blocked, in-progress, claimable task, then
+  awaiting review and awaiting integration (see HTTP_DEPLOYMENT.md, "What an agent
+  is told to do next").
   There is no scheduler, background job, poller or timer: the owner resumes the
   agent manually and re-reads the route.
 - **Owner API.** Session routes `POST /v1/agents`, `GET /v1/agents`,
