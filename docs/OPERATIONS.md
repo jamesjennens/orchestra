@@ -402,6 +402,20 @@ hazard as the `assignee_at_approval` snapshot): reconcile with
 `admin.py void-record` on each affected record, or stay forward. Turning the switch
 off again does not remove records already written; it only stops new ones.
 
+### Rollback of the release/liveness change
+
+Rolling the deployment back below the kit that reads the additive `live` dimension
+is **fail-open for liveness**: the older kit ignores the unknown `live` events
+entirely and keeps reporting a task the environment was rolled back out of as
+`deployed=passed` at its old release, with `deployed_delivery` still naming it,
+until the kit is rolled forward. Its release selection likewise cannot tell that
+the current environment no longer carries a task. Nothing is lost or rewritten (the
+`live` events, the `lifecycle-scope` events and the deployed evidence all stay in
+the native history), and no review chain is refused or needs `admin.py
+void-record`: the dimension is additive for readers. The same limit applies to a
+restore of pre-change data, which has no `live` facts at all. Roll forward to
+recover the per-environment reading; do not "repair" it by deleting `live` events.
+
 Validate a payload before writing. Each command is fail-closed and refuses before
 any native write, and the same validator can be run with no native read or write
 from the kit directory:

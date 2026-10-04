@@ -320,10 +320,17 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         scope=facts.get(row['id'],{}).get('scope') or {}
         # Name the delivery a passed deployed fact belongs to, and whether it is
         # the task's current contribution (a release can ship a superseded
-        # revision). Additive fields (kittrial-5bb.95).
+        # revision). Additive fields (kittrial-5bb.95). A superseded release reads
+        # deployed=unknown, so the delivery is None and `deployed_live` says why
+        # (kittrial-5bb.107 rev2 item 2).
         deployed_scope=scope if (fact.get('deployed') or {}).get('value')=='passed' else None
-        deployed_delivery=None if deployed_scope is None else {key:deployed_scope.get(key) for key in ('release_id','environment','source_commit','integration_commit')}
+        # The four values stay PLAIN STRINGS clipped to 160 characters, the shape the
+        # field shipped with a version ago (rev2 item 6.1), so an oversized release_id
+        # still cannot pass through unclipped.
+        from briefing import clip
+        deployed_delivery=None if deployed_scope is None else {key:str(deployed_scope.get(key) or '')[:160] for key in ('release_id','environment','source_commit','integration_commit')}
         deployed_current=None if (deployed_scope is None or not contribution.get('commit')) else deployed_scope.get('source_commit','').lower()==contribution['commit'].lower()
+        deployed_live=facts.get(row['id'],{}).get('live','unknown')
         handoff_requests=[{'request_id':request['request_id'],'from_actor':request['from_actor'],
                            'to_actor':request['to_actor'],'requester':request['requester'],
                            'reason':request['reason']}
@@ -370,6 +377,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                       'lifecycle_matches_contribution':None if not contribution else scope.get('source_commit','').lower()==contribution['commit'].lower(),
                       'deployed_delivery':deployed_delivery,
                       'deployed_delivery_is_current_contribution':deployed_current,
+                      'deployed_live':deployed_live,
                       'integration':review.get('integration'),'workflow_state':review.get('workflow_state'),'error':error,
                       # Additive (kittrial-5bb.94 item 4): the caller's open review
                       # requests, and whether this row is in their queue because they

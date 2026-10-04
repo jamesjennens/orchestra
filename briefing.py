@@ -185,10 +185,16 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     # A passed deployed fact is always scoped to a release; name that delivery,
     # and say plainly when it is not the task's current contribution (the release
     # may have shipped a superseded revision). Additive fields (kittrial-5bb.95).
+    # A superseded release reads deployed=unknown through project_facts, so the
+    # delivery is None and `deployed_live` says why (rev2 item 2).
     deployed_scope=facts['scope'] if facts['facts']['deployed']['value']=='passed' else None
-    deployed_delivery=None if deployed_scope is None else {key:deployed_scope.get(key) for key in ('release_id','environment','source_commit','integration_commit')}
+    # The four scope fields stay PLAIN STRINGS clipped to 160 characters: the field
+    # shipped a version ago as strings, and changing it to excerpt objects was a
+    # shape change for a released field (rev2 item 6.1).
+    deployed_delivery=None if deployed_scope is None else {key:str(deployed_scope.get(key) or '')[:160] for key in ('release_id','environment','source_commit','integration_commit')}
     current_commit=(review.get('contribution') or {}).get('commit')
     deployed_current=None if (deployed_scope is None or not current_commit) else deployed_scope.get('source_commit','').lower()==current_commit.lower()
+    deployed_live=facts.get('live','unknown')
     pending=review.get('pending_requests',[])
     priors=review.get('prior_contributions') or []
     # The bounded slice keeps its PRIOR_BRIEF_LIMIT bound and adds the per-prior
@@ -245,6 +251,7 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
             'lifecycle_matches_contribution':matches_contribution,
             'deployed_delivery':deployed_delivery,
             'deployed_delivery_is_current_contribution':deployed_current,
+            'deployed_live':deployed_live,
             'dependencies':{'total':len(deps),'items':[{k:clip(d.get(k),160) for k in ('depends_on_id','type')} for d in deps[:8]],'omitted':max(0,len(deps)-8)},
             'lifecycle':{dim:dict(value=f['value'],event_id=f['event_id']) for dim,f in facts['facts'].items()},
             'lifecycle_scope':{k:clip(v,160) for k,v in (facts['scope'] or {}).items()},
