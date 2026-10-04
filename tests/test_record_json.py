@@ -204,6 +204,7 @@ class NoUnguardedParseTests(unittest.TestCase):
         'proposal_records.py': (7, 'bd output, the host session file, and a copy of a structure the kit built'),
         'record_json.py': (1, 'the guard itself'),
         'reference_records.py': (2, 'bd output'),
+        'review_recommendations.py': (1, 'bd output (the answer of comments add)'),
         'review_workflow.py': (4, 'bd output and the revert journal the kit writes'),
         'sessions.py': (2, 'bd output'),
         'version.py': (1, "the kit's own version file"),
@@ -232,7 +233,7 @@ class NoUnguardedParseTests(unittest.TestCase):
         self.assertEqual({name: count for name, count in uses.items() if count}, {
             'briefing.py': 3, 'endpoint.py': 2, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 2,
             'handoff.py': 1, 'http_service.py': 2, 'lifecycle.py': 2, 'recovery.py': 1, 'requirements.py': 1,
-            'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
+            'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
 
     def test_the_parsers_that_do_not_call_it_directly_reach_it(self):
         # Review of 7c14f6a: the capability and proposal record parsers, and load_json.

@@ -34,6 +34,8 @@ ITEM_FIELDS = {
     'workflow_state', 'integration',
     # Additive integration disagreement signal (kittrial-5bb.52).
     'integration_disagreements', 'integration_warnings',
+    # Additive: a standing reviewer recommendation on the current contribution (kittrial-5bb.115).
+    'recommended', 'recommended_by',
     # Additive deployed-delivery identification (kittrial-5bb.95).
     'deployed_delivery', 'deployed_delivery_is_current_contribution',
     # Additive review-request identification (kittrial-5bb.94 item 4).
