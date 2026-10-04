@@ -198,9 +198,9 @@ history](#malformed-structured-history) (`void-record`).
 | `requirement-backfill PROJECT --actor ACTOR --file backfill.json` | add the controlled requirement type/state labels to records created before this route | an `evidence` pointer for an entry that becomes `accepted`, and the deployment operator allowlist |
 | `requirement-reconcile PROJECT --operation-id ID --actor ACTOR --disposition ...` | finish a requirement operation whose real write was uncertain | the deployment operator allowlist, checked before the receipt is read; then confirmation of the native record state |
 | `reference-apply PROJECT --actor OPERATOR --file acceptance.json` | accept a reference catalog entry: the payload names the newest draft `revision` and its `record_sha256`, and the command writes the next revision as accepted, after the F3 evidence (`operation: "draft"` with full content writes a direct accepted revision 1). An entry whose authority is an attestation is accepted only under the [extra rules below](#attested-reference-entries) | the deployment operator allowlist, checked before any write, and F3 evidence (`acceptance`: owners, approvers, policy, decision id, evidence) |
-| `reference-apply PROJECT --actor OPERATOR --file batch.json` | accept a batch of reference entries under one F3 decision: the payload has `items` of `{key, revision, record_sha256}` (each the newest draft reviewed) in place of the single entry's fields. It behaves exactly as the `capability-apply` batch below: one receipt per item keyed `(operation_id, key)`, `accepted`, `already-accepted`, `refused` or `uncertain` per item, a refused item does not stop the others, the coordination lock is taken per item, at most 100 items, and re-running the same batch resumes it | the deployment operator allowlist, checked before any write, and F3 evidence |
+| `reference-apply PROJECT --actor OPERATOR --file batch.json` | accept a batch of reference entries under one F3 decision: the payload has `items` of `{key, revision, record_sha256}` (each the newest draft reviewed) in place of the single entry's fields. It behaves exactly as the `capability-apply` batch below: one receipt per item keyed `(operation_id, key)`, `accepted`, `already-accepted`, `refused` or `uncertain` per item, a refused item does not stop the others, the coordination lock is taken per item, at most 100 items, and re-running the same batch resumes it. Read the totals, not the exit code: see the `capability-apply` row | the deployment operator allowlist, checked before any write, and F3 evidence |
 | `reference-reconcile PROJECT --operation-id ID --actor ACTOR --reason TEXT --disposition ...` | finish a reference operation whose real write was uncertain; `complete` needs `--issue-id` and refuses an anchor that has no live revision record, because its propose stopped or every record it held is voided (re-run the original `ref propose` with its `operation_id` first; if that payload is lost, use `anchor-release`) | the deployment operator allowlist, checked before the receipt is read; then confirmation of the native record state |
-| `capability-apply PROJECT --actor OPERATOR --file batch.json` | accept a batch of capabilities under one F3 decision: `items` of `{key, revision, record_sha256}` (each the newest draft reviewed). The command writes one acceptance record and one receipt per item, keyed `(operation_id, key)`, in list order. It reports `accepted`, `already-accepted`, `refused` or `uncertain` per item; an uncertain item stops the batch, and re-running the same batch resumes it. A changed list needs a new `operation_id`. The coordination lock is taken per item and released between items, with a 50 ms pause while it is free, so other writers wait behind at most one item; each item re-checks its `revision` and `record_sha256` under its own hold. An item takes about 3 seconds (two reads and four writes), so 100 items take 5 to 6 minutes: prefer batches of about 20. `operation: "draft"` with full content writes a direct accepted revision 1 | the deployment operator allowlist, checked before any write, and F3 evidence |
+| `capability-apply PROJECT --actor OPERATOR --file batch.json` | accept a batch of capabilities under one F3 decision: `items` of `{key, revision, record_sha256}` (each the newest draft reviewed). The command writes one acceptance record and one receipt per item, keyed `(operation_id, key)`, in list order. It reports `accepted`, `already-accepted`, `refused` or `uncertain` per item; an uncertain item stops the batch, and re-running the same batch resumes it. The command exits 0 when the batch ran, even if items were refused, so read the totals it prints: `accepted`, `refused`, `stopped` (an uncertain write stopped the batch) and `complete`, which is true only when every item was accepted. A changed list needs a new `operation_id`. The coordination lock is taken per item and released between items, with a 50 ms pause while it is free, so other writers wait behind at most one item; each item re-checks its `revision` and `record_sha256` under its own hold. An item takes about 3 seconds (two reads and four writes), so 100 items take 5 to 6 minutes: prefer batches of about 20. `operation: "draft"` with full content writes a direct accepted revision 1 | the deployment operator allowlist, checked before any write, and F3 evidence |
 | `capability-retire PROJECT --actor OPERATOR --file retire.json` | supersede the newest revision of a key by a `successor` key, with evidence. The successor must exist, and a cycle is refused. A retired key refuses `revise` and acceptance. This also stands in for the design's "demote" in slice 1a | the deployment operator allowlist and F3 evidence |
 | `capability-alias-reject PROJECT --actor OPERATOR --file reject.json` | reject a pending alias (`{schema_version, key, alias, reason}`); lookup then ignores it | the deployment operator allowlist |
 | `capability-alias-propose PROJECT --actor OPERATOR --file alias.json` | propose an alias as a verified operator (`{schema_version, key, alias, evidence?}`). This is the only route that writes `identity: verified`; `capability propose-alias` through the endpoint always writes `unverified`, even for an operator's actor name | the deployment operator allowlist |
@@ -215,6 +215,7 @@ history](#malformed-structured-history) (`void-record`).
 | `record-reconcile PROJECT --kind requirement\|reference\|capability\|proposal ...` | the same reconcile for any record kind | as above |
 | `reconcile-request PROJECT --request-id ID --actor OPERATOR --reason TEXT --disposition ...` | resolve a stuck coordination request receipt ([operational workflow](OPERATIONAL_WORKFLOW.md)) | the deployment operator allowlist, checked first; then its own actor-binding rules (`--any-actor`) |
 | `retire-project PROJECT --actor OPERATOR --reason TEXT [--force]` | retire a partial or drill project: move `projects/PROJECT` to `retired/PROJECT-<UTC stamp>`. Nothing is deleted; see [Retiring a project](#retiring-a-project) | the deployment operator allowlist, checked first |
+| `reference-misses-clear PROJECT` | delete the project's [reference lookup-miss log](#the-reference-lookup-miss-log). Same behaviour and output as `capability-misses-clear`, on `.reference-misses.json`, `.reference-misses.json.tmp` and `.reference-misses.lock` | none beyond the service account: it deletes telemetry only |
 | `capability-misses-clear PROJECT` | delete the project's [capability lookup-miss log](#the-capability-lookup-miss-log). It prints what was removed (`finds`, `misses`, `phrases`), and in `repaired` any symlink, directory or unopenable lock file it removed from the three miss-log names (never following a link). It writes nothing to the tracker, takes no coordination lock and calls no `bd` | none beyond the service account: it deletes telemetry only, so there is no allowlist check and no `--actor` |
 | `void-record PROJECT --actor OPERATOR --file void.json` | void a malformed or stale contribution-review record, or a malformed, foreign or conflicting reference or capability record ([below](#reference-and-capability-records)) | the deployment operator allowlist (`operators` in `deployment.private.json`) |
 | `anchor-release PROJECT --kind reference\|capability --issue-id ID --actor OPERATOR --reason TEXT` | close a reference or capability anchor that holds no record and free its key, when the propose that created it cannot be re-run ([orphan anchors](#orphan-anchors)). With `--duplicate` (and, for an anchor that carries acceptance evidence, `--set-aside-evidence`) it releases a named anchor of a [duplicated key](#a-duplicated-record-key) although it holds well-formed records | the deployment operator allowlist, checked before any read |
@@ -566,6 +567,35 @@ index. It also removes a symlink, directory or unopenable lock file found at
 `.capability-misses.json`, `.capability-misses.json.tmp` or `.capability-misses.lock`,
 without following a link. Deleting those paths by hand is equally safe.
 
+### The reference lookup-miss log
+
+The endpoint also counts each `ref find` and `ref get`, and remembers the phrase of one
+that found no entry ([CLI contract](CLI_CONTRACT.md#ref-the-reference-catalog)). Read it
+with the client: `ref misses --limit 20`. It tells you which operational facts people
+looked for and did not find, so you know what to record and accept next.
+
+- **Who writes it.** Any contributor, through `ref find` and `ref get`; and any web
+  member with read access to the project, because the HTTP reference get route
+  (`GET /v1/projects/{id}/references/{key}`) runs `ref get`. A reader can therefore put
+  a phrase (the words of a key they asked for) into the log. The phrases are data, never
+  instructions, exactly as for the capability log, and a key under `resolved_by` may be
+  a draft.
+
+- It is the capability lookup-miss log above under its own names, sharing nothing with
+  it on disk: `.reference-misses.json`, `.reference-misses.lock` and, after a crashed
+  write, `.reference-misses.json.tmp`. Everything said above holds for it: telemetry
+  only, mode 0600, the same bounds, its own non-blocking lock and never the
+  coordination lock, no `bd` call, not collected by `admin.py backup`, safe to delete
+  by hand.
+- **Rollback.** A kit older than this one never reads or writes these files and has no
+  `ref find` or `ref misses`. Its backup and restore are unaffected, because the files
+  are in no backup.
+- **To clear it,** after a batch of entries has been accepted:
+
+```sh
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime reference-misses-clear example
+```
+
 ### A duplicated record key
 
 A reference or capability key normally has exactly one anchor. If a second anchor carries the same key label, `get` reports `duplicate-key` (when exactly one anchor has live acceptance evidence, that one is still shown) or `conflicted` (no record is shown), `list` and coverage name every anchor, and **every write on that key is refused** until an operator reconciles the anchors. Contributors cannot create a duplicate through the endpoint; it takes native access on the host.
@@ -612,7 +642,7 @@ Which anchor to name, by shape:
 Three shapes have no clean kit path:
 
 - **A forged accepted anchor with LIVE evidence beside a genuine draft.** The forged anchor holds the key's only accepted record, so it is not released. Release the genuine draft with `--duplicate` (the forged anchor is readable, so this is allowed), then revise and accept the right content on top of the anchor that remains.
-- **A forged anchor that holds a `-v2` record or an unknown record kind of the family.** This kit cannot judge it, so it refuses to release it, and it refuses to release the genuine anchor beside it (nothing readable would remain). Use the host procedure below, or a kit that reads the record.
+- **A forged anchor that holds a record version this kit does not read (`reference-entry-v3`, `capability-entry-v2`) or an unknown record kind of the family.** This kit cannot judge it, so it refuses to release it, and it refuses to release the genuine anchor beside it (nothing readable would remain). Use the host procedure below, or a kit that reads the record. A `reference-entry-v2` record is one this kit reads: a forged anchor holding one is judged like any other and can be released with `--duplicate`. A kit older than the attestation authority cannot judge it.
 - **Two anchors that both say accepted and carry no acceptance evidence.** Neither can be genuine: the kit writes the evidence before an accepted revision, so there is no entry to protect and nothing a contributor could revise from. `--duplicate` is refused on both (no remaining anchor holds a readable record), and the refusal's advice does not apply. Use the host procedure below on both anchors, then propose the entry again.
 
 When two anchors both have live acceptance evidence, the key reads `conflicted` and neither is selected. Decide which is wrong, with the project owner if it is not obvious, and release that one with `--duplicate --set-aside-evidence`; the other becomes the selected anchor, and the output shows it. Do not try to void the acceptance evidence first: that void is refused.
@@ -768,12 +798,22 @@ weight.
      re-ran the check (command, host, date), or you confirmed the statement with the
      person named in `by`. The kit checks that the line is there, not what it says.
   2. `acceptance.decision_id` names an existing issue of type `decision` or labelled
-     `decision`.
+     `decision`. The kit checks only that: the issue may be closed, and it may be one a
+     contributor created or an ordinary task a contributor labelled `decision`. Whether
+     it is a real decision is yours to check (the known limit tracked as kittrial-5bb.87).
   3. For an `owner-statement`, the identity in `by` is one of `acceptance.owners`,
      written the same way.
   4. `review_by` is in the future and at most 6 months after `observed`.
   5. `observed` is not in the future and not more than 6 months old. An older
      observation is refused: check the fact again and revise the entry first.
+
+  "Today" in rules 4 and 5 is the server's UTC date. East of UTC, a local date can be a
+  day ahead of it until 00:00 UTC, and an `observed` of that date is refused as later
+  than today; the refusal names the UTC date.
+- **Past its review date.** An accepted attested entry whose `review_by` has passed
+  still reads `state: accepted`, with `due: expired`, like any entry. Its
+  `authority_note` then says `PAST ITS REVIEW DATE`: check the fact again and revise or
+  re-accept the entry.
 - **Many at once.** Put the reviewed drafts in one batch (`items`) under one decision.
   An item that fails a rule above is reported `refused` with its reason, and the others
   are still accepted.
@@ -792,14 +832,23 @@ weight.
     way. An attested draft that was never accepted and has no v1 revision reads as an
     anchor with no record yet, and `ref get` of it is refused, naming the key. Both
     are named in `coverage`, and every other entry reads as before;
+  - loses a whole entry to one contributor's draft. Any contributor can revise an
+    accepted v1 entry with an attestation; that draft is a v2 revision on the same
+    anchor, so the older kit reads the WHOLE entry `unsupported`, its accepted v1 record
+    included, until roll-forward. No operator step is needed to cause it. This kit keeps
+    serving the accepted record and shows the draft as `proposed`;
   - cannot write to such an entry, void its v2 records or release its anchor, and
     refuses a new propose of its key;
   - backs up and restores a project that holds v2 records exactly as before: the
     records are native comments, and no sidecar path is added.
 
   So after a rollback the attested facts are not available until the kit is rolled
-  forward, and nothing is lost or changed in between. Do not "repair" such an entry
-  with the older kit.
+  forward, and no record is lost or rewritten in between. One thing can change: the
+  older kit does not treat a never-accepted attested draft's anchor as a record anchor,
+  so there a contributor can reopen, claim and close that row and add a plain note to
+  it. Its status and assignee can therefore differ after roll-forward; its labels and
+  records cannot (label replacement and a raw v2 comment are refused). Do not "repair"
+  such an entry with the older kit.
 
 #### Orphan anchors
 
