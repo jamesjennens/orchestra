@@ -643,6 +643,10 @@ project, not barring the agent from being re-granted.
 
 Revoke an agent credential, disable the agent, disable the owner or remove the
 owner's project membership and the agent stops on its next request. The
+agent's disable action revokes every credential; enable restores none, so issue a
+new credential after enabling. This is the settled personal-agent decision from
+2026-09-27 (design decision `01a0e2f2-569c-7d03-94ee-36b8dd61940a`).
+The
 `working_directory` hint is returned only to the owner or a superuser. The browser
 screens that display the directory and the copyable resume prompt are
 kittrial-5bb.20 and consume these JSON responses; they are not part of this service

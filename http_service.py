@@ -3169,7 +3169,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         about those, so they never sit ahead of work the agent can do. ``in_progress`` counts own open tasks with no
         contribution that are NOT blocked. A blocked action
         carries ``blocked_since`` (when the checkpoint was written) and
-        ``newer_activity`` (whether anything was written on the task after it), so an
+        ``newer_activity`` (whether another actor wrote after it), so an
         agent can leave a blocked task with nothing new alone instead of re-reading it
         and writing another checkpoint on every wake. The counts are independent of the
         actions: a task with changes requested AND open checkpoint items counts in both.
