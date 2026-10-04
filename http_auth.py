@@ -2230,9 +2230,10 @@ class Service:
         # Where each granted project's repository is, as its owner recorded it
         # (kittrial-5bb.118). A label for the person setting the agent up: it is listed
         # beside the setup text, never inside the commands, and nothing runs it.
-        repositories = [{'project': pid, 'repository': self.stored_repository(self.state['projects'].get(pid))[0]}
-                        for pid in config['projects']
-                        if self.stored_repository(self.state['projects'].get(pid))[0]]
+        # Read once per project, as today's rule reads it: a stored value that no longer
+        # passes is left out (kittrial-5bb.123).
+        readable = ((pid, self.stored_repository(self.state['projects'].get(pid))[0]) for pid in config['projects'])
+        repositories = [{'project': pid, 'repository': value} for pid, value in readable if value]
         return {
             'config_path': AGENT_CONFIG_PATH,
             'config': config,

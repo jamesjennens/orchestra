@@ -513,6 +513,12 @@ class OnboardingTests(Case):
             with self.subTest(refused=label):
                 self.assertNotEqual(answer['returncode'], 0, answer)
         self.assertFalse(self.file.exists())
+        # A descriptor that is good for ANOTHER project of the same owner does not write to this one.
+        self.assertEqual(201, self.create(self.olive, 'beta').status)
+        crossed = call(for_project='beta')
+        self.assertEqual(crossed['returncode'], 2, crossed)
+        self.assertIn('set-onboarding needs a descriptor for this project', crossed['stderr'])
+        self.assertFalse(self.file.exists())
         self.assertEqual(call()['returncode'], 0)
         self.assertTrue(self.file.exists())
 
