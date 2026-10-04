@@ -3166,6 +3166,8 @@ def main():
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('capability-misses-clear',help='delete a project\'s capability lookup-miss log (telemetry; not backed up)')
     a.add_argument('project')
+    a=sub.add_parser('reference-misses-clear',help='delete a project\'s reference lookup-miss log (telemetry; not backed up)')
+    a.add_argument('project')
     a=sub.add_parser('reference-apply',help='accept a reference catalog entry, or a batch of them with items (operator allowlist, F3 evidence)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('proposal-review',help='record a coordinator disposition on a requirement proposal (operator allowlist)')
@@ -3472,13 +3474,15 @@ def main():
                 else:
                     result=capability_records.apply_native(payload,args.actor,run,path,operator=True,operators=authority)
         print(json.dumps(result))
-    elif args.command=='capability-misses-clear':
-        # Telemetry only (kittrial-5bb.77): no tracker write, no coordination lock, no bd
-        # call and no allowlist. The log is not in any backup, so nothing else changes.
+    elif args.command in ('capability-misses-clear','reference-misses-clear'):
+        # Telemetry only (kittrial-5bb.77; the reference log, kittrial-5bb.98): no tracker
+        # write, no coordination lock, no bd call and no allowlist. The log is not in any
+        # backup, so nothing else changes.
         import capability_misses
         path=project_dir(root,args.project)
         if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
-        print(json.dumps(dict(capability_misses.clear(path),project=args.project)))
+        which=capability_misses.REFERENCE if args.command=='reference-misses-clear' else capability_misses.CAPABILITY
+        print(json.dumps(dict(capability_misses.clear(path,which),project=args.project)))
     elif args.command=='capability-verify':
         import contextlib
         import fcntl

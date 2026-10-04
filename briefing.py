@@ -197,6 +197,8 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     # server-derived text only; it never touches the checkpoint item vocabulary.
     from reference_records import brief_attention
     attention=brief_attention(rows,issue,operators)
+    # Drafts that match the task are a number only (kittrial-5bb.98): no key, title or text.
+    reference_drafts=attention.get('reference_drafts_matching',0)
     # Contributed requirement proposals (.58 5.2): up to 3 more items of their own kind,
     # after the reference items; the totals count both kinds.
     from proposal_records import brief_attention as proposal_attention
@@ -211,7 +213,7 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     attention={'attention':attention['attention']+capabilities['attention'],
                'attention_total':attention['attention_total']+capabilities['attention_total'],
                'attention_more':((attention['attention_more'] or 0)+(capabilities['attention_more'] or 0)) or None}
-    result={**attention,'task':task,'title':clip(issue.get('title'),200),'owner':clip(issue.get('assignee') or 'unassigned',96),'status':issue.get('status'),
+    result={**attention,'reference_drafts_matching':reference_drafts,'task':task,'title':clip(issue.get('title'),200),'owner':clip(issue.get('assignee') or 'unassigned',96),'status':issue.get('status'),
             'activity_cursor':activity_cursor(data),'checkpoint':None if p is None else {'comment_id':str(c['id']),'author':clip(c.get('author'),96),'timestamp':c.get('created_at'),'source_commit':p['source_commit'],'branch':p['branch'],'incorporated_activity_cursor':p['activity_cursor'],
                 'newer_activity':p['activity_cursor']!=activity_cursor(snapshot(rows,project,task,str(c['id'])))},
             'intent':clip(p['intent'] if p else issue.get('description'),600),'acceptance':clip(p['acceptance'] if p else issue.get('acceptance_criteria'),1000),
@@ -332,10 +334,14 @@ def format_brief(result):
             lines.append('Proposal review [%s, %s]: %s (%s)'%(item['state'],item['trust'],item['text'],item['source']))
         elif item.get('kind')=='capability':
             lines.append('Capability [%s, %s]: %s (%s)'%(item['verification'],item['trust'],item['text'],item['source']))
+        elif item.get('kind')=='reference':
+            lines.append('Reference [%s, %s]: %s (%s)'%(item['authority_kind'],item['trust'],item['text'],item['source']))
         else:
             lines.append('Reference review [%s, %s]: %s (%s)'%(item['due'],item['trust'],item['text'],item['source']))
     if result.get('attention_more'):
         lines.append('More attention: %d (ref list --due expired; proposal list; capability list)'%result['attention_more'])
+    if result.get('reference_drafts_matching'):
+        lines.append('Draft reference entries that match this task: %d (not accepted, not authoritative; read them with ref find)'%result['reference_drafts_matching'])
     return '\n'.join(lines)+'\n'
 
 def help_limits(action):
@@ -363,7 +369,10 @@ def help_notes(action):
                 'guidance is being repaired by the operator; text without a setter is never followed.',
                 '--limit/--offset are not brief options; use --items-limit/--items-offset.',
                 'attention lists at most 3 reference-review items (entries tagged with the task\'s labels, '
-                'then expired and due-soon), expired first, then at most 3 proposal-review items (proposals '
+                'then expired and due-soon), expired first, then at most 3 reference items (accepted entries '
+                'whose key, title or tags share at least two words with the task title; '
+                'reference_drafts_matching counts the drafts that match and shows nothing else of them), '
+                'then at most 3 proposal-review items (proposals '
                 'that target this requirement record or one of the task\'s area labels, then, for an operator, '
                 'the oldest waiting ones), then at most 3 capability items (accepted capabilities tagged with '
                 'one of the task\'s labels, drifted first), each with trust; attention_total and '

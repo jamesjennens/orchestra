@@ -215,6 +215,7 @@ history](#malformed-structured-history) (`void-record`).
 | `record-reconcile PROJECT --kind requirement\|reference\|capability\|proposal ...` | the same reconcile for any record kind | as above |
 | `reconcile-request PROJECT --request-id ID --actor OPERATOR --reason TEXT --disposition ...` | resolve a stuck coordination request receipt ([operational workflow](OPERATIONAL_WORKFLOW.md)) | the deployment operator allowlist, checked first; then its own actor-binding rules (`--any-actor`) |
 | `retire-project PROJECT --actor OPERATOR --reason TEXT [--force]` | retire a partial or drill project: move `projects/PROJECT` to `retired/PROJECT-<UTC stamp>`. Nothing is deleted; see [Retiring a project](#retiring-a-project) | the deployment operator allowlist, checked first |
+| `reference-misses-clear PROJECT` | delete the project's [reference lookup-miss log](#the-reference-lookup-miss-log). Same behaviour and output as `capability-misses-clear`, on `.reference-misses.json`, `.reference-misses.json.tmp` and `.reference-misses.lock` | none beyond the service account: it deletes telemetry only |
 | `capability-misses-clear PROJECT` | delete the project's [capability lookup-miss log](#the-capability-lookup-miss-log). It prints what was removed (`finds`, `misses`, `phrases`), and in `repaired` any symlink, directory or unopenable lock file it removed from the three miss-log names (never following a link). It writes nothing to the tracker, takes no coordination lock and calls no `bd` | none beyond the service account: it deletes telemetry only, so there is no allowlist check and no `--actor` |
 | `void-record PROJECT --actor OPERATOR --file void.json` | void a malformed or stale contribution-review record, or a malformed, foreign or conflicting reference or capability record ([below](#reference-and-capability-records)) | the deployment operator allowlist (`operators` in `deployment.private.json`) |
 | `anchor-release PROJECT --kind reference\|capability --issue-id ID --actor OPERATOR --reason TEXT` | close a reference or capability anchor that holds no record and free its key, when the propose that created it cannot be re-run ([orphan anchors](#orphan-anchors)). With `--duplicate` (and, for an anchor that carries acceptance evidence, `--set-aside-evidence`) it releases a named anchor of a [duplicated key](#a-duplicated-record-key) although it holds well-formed records | the deployment operator allowlist, checked before any read |
@@ -565,6 +566,28 @@ of aliases or capabilities has been accepted, so the next window measures the im
 index. It also removes a symlink, directory or unopenable lock file found at
 `.capability-misses.json`, `.capability-misses.json.tmp` or `.capability-misses.lock`,
 without following a link. Deleting those paths by hand is equally safe.
+
+### The reference lookup-miss log
+
+The endpoint also counts each `ref find` and `ref get`, and remembers the phrase of one
+that found no entry ([CLI contract](CLI_CONTRACT.md#ref-the-reference-catalog)). Read it
+with the client: `ref misses --limit 20`. It tells you which operational facts people
+looked for and did not find, so you know what to record and accept next.
+
+- It is the capability lookup-miss log above under its own names, sharing nothing with
+  it on disk: `.reference-misses.json`, `.reference-misses.lock` and, after a crashed
+  write, `.reference-misses.json.tmp`. Everything said above holds for it: telemetry
+  only, mode 0600, the same bounds, its own non-blocking lock and never the
+  coordination lock, no `bd` call, not collected by `admin.py backup`, safe to delete
+  by hand.
+- **Rollback.** A kit older than this one never reads or writes these files and has no
+  `ref find` or `ref misses`. Its backup and restore are unaffected, because the files
+  are in no backup.
+- **To clear it,** after a batch of entries has been accepted:
+
+```sh
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime reference-misses-clear example
+```
 
 ### A duplicated record key
 
