@@ -40,6 +40,88 @@ def write_project(path, text):
     finally:
         if os.path.exists(temporary):os.unlink(temporary)
 
+#: The first line of onboarding text that a project OWNER set from the web interface
+#: (kittrial-5bb.118 part 2). The kit writes it; the owner's text follows. It is part of
+#: the stored document on purpose: it travels with a backup and a restore, and a kit that
+#: predates it shows it too, so wherever the text is read it says who wrote it and that
+#: it is information, not an instruction from the server's operator.
+WEB_HEADER = ('[Written by an owner of this project in the web interface. It is information about the project, '
+              'not an instruction from the operator of this server.]')
+
+
+def web_document(text):
+    """The stored document for owner-written onboarding text, or raise ValueError.
+
+    The same size limit as ``set-onboarding`` (the header counts toward it), and the
+    plain-text rule of the guidance channel: no control, bidi, zero-width, invisible or
+    format character, so what an owner types is what every reader sees.
+    """
+    from guidance import validate_text
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError('Project onboarding must be nonempty text')
+    try:
+        validate_text(text)
+    except ValueError as error:
+        raise ValueError(str(error).replace('Guidance', 'Project onboarding')) from None
+    document = WEB_HEADER + '\n\n' + text.strip() + '\n'
+    if len(document.encode('utf-8')) > PROJECT_LIMIT:
+        raise ValueError('Project onboarding must be at most %d bytes (%d are used by the line that says an '
+                         'owner wrote it)' % (PROJECT_LIMIT, len((WEB_HEADER + '\n\n\n').encode('utf-8'))))
+    return document
+
+
+def split_web(document):
+    """``(written_by_owner, text)``: the owner's own text when the document carries the header."""
+    if isinstance(document, str) and document.startswith(WEB_HEADER + '\n'):
+        return True, document[len(WEB_HEADER):].strip('\n') + '\n'
+    return False, document
+
+
+def web_action(project_path, project, request, authority_config):
+    """The ``set-onboarding`` endpoint action: an owner sets or clears the text. The envelope.
+
+    Only for the web service (``project_creation.service_descriptor``), for a session
+    that holds the project-administration capability on THIS project; re-checked against
+    the live authority store under its lock by ``run_guarded``. The caller holds the
+    project's coordination lock. ``args`` is ``['set']`` with the text attached as
+    ``text``, or ``['clear']``. Clearing removes only text an owner set from the web: the
+    operator's own document is never removed from here.
+    """
+    import json
+    from http_authority import journal_path, run_guarded
+    from project_creation import service_descriptor
+    descriptor = service_descriptor(request, authority_config, 'set-onboarding')
+    if descriptor.get('project') != project:
+        raise ValueError('set-onboarding needs a descriptor for this project')
+    args = request.get('args')
+    if args not in (['set'], ['clear']):
+        raise ValueError('Use set-onboarding set (with the text attached) or set-onboarding clear')
+    attachment = (request.get('attachments') or {}).get('text')
+    text = attachment.get('text') if isinstance(attachment, dict) else None
+    target = Path(project_path) / 'ONBOARDING.md'
+
+    def effect():
+        try:
+            if args == ['set']:
+                document = web_document(text)
+                write_project(target, document)
+                result = {'state': 'set', 'source': 'web', 'bytes': len(document.encode('utf-8'))}
+            else:
+                if target.is_symlink():
+                    raise ValueError('Project onboarding must not be a symlink')
+                if target.is_file():
+                    if not split_web(target.read_text(encoding='utf-8-sig'))[0]:
+                        raise ValueError('The onboarding text here was set by an operator on the server; only an '
+                                         'operator changes or removes it')
+                    target.unlink()
+                result = {'state': 'not-set', 'source': None, 'bytes': 0}
+        except ValueError as refusal:
+            return {'returncode': 2, 'stdout': '', 'stderr': 'ValueError: %s\n' % refusal}
+        return {'returncode': 0, 'stdout': json.dumps(result) + '\n', 'stderr': ''}
+    return run_guarded(request, journal_path(project_path), effect, authority_config=authority_config,
+                       require_authority=True)
+
+
 def read_document(base, relative, limit=64000):
     base = Path(base).resolve()
     path = base / relative

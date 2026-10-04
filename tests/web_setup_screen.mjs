@@ -73,4 +73,25 @@ const steps = (root) => root.all((e) => e.tagName === 'LI').map((li) => ({
 out.routes = { members: setup.stepRoute('members', 'p1'), task: setup.stepRoute('first-task', 'p1'),
   agent: setup.stepRoute('agent', 'p1'), guidance: setup.stepRoute('guidance', 'p1') };
 out.summary = [setup.summary({ remaining: 0 }), setup.summary({ remaining: 1 }), setup.summary({ remaining: 4 })];
+// A step the server could not check is said, never hidden behind "nothing is left".
+out.unchecked = [setup.summary({ remaining: 0, unchecked: 1 }), setup.summary({ remaining: 0, unchecked: 2 }),
+  setup.summary({ remaining: 2, unchecked: 1 })];
+// The hint on the project page appears for an unchecked step too. The API is a stand-in here.
+{
+  const fake = (data) => ({ api: { projectSetup: async () => data }, href: (path) => '#' + path });
+  const hint = await setup.setupHint(fake({ remaining: 0, unchecked: 1 }), { id: 'p1', role: 'owner' });
+  out.uncheckedHint = hint ? hint.textContent : null;
+  out.noHintWhenAllDone = await setup.setupHint(fake({ remaining: 0, unchecked: 0 }), { id: 'p1', role: 'owner' });
+}
+// A value that begins like a token is shown with its warning, on the repository step.
+{
+  const ctx = who.owner;
+  await ctx.api.setRepository(project, 'ssh://ghp_0123456789abcdef@git.example/team/alpha.git');
+  const page = await setup.page(ctx, { pid: project });
+  const step = page.all((e) => e.tagName === 'LI').find((li) => li.attributes['data-step'] === 'repository');
+  out.warning = step.all((e) => e.tagName === 'DIV' && e.attributes['data-warning'] === 'repository').map((e) => e.textContent);
+  await ctx.api.setRepository(project, 'git@git.example:team/alpha.git');
+  const again = await setup.page(ctx, { pid: project });
+  out.noWarning = again.all((e) => e.tagName === 'DIV' && e.attributes['data-warning']).length;
+}
 console.log(JSON.stringify(out));

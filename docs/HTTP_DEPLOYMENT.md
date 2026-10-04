@@ -268,9 +268,13 @@ the exact command for the server. `remaining` counts the `todo` ones.
   person. On an installation where one person is operator, superuser and owner, they do
   every step; where those are three people, the page tells the owner which steps are
   theirs and gives them the command to send to the operator for the rest.
-- **The page writes nothing on the server.** The three host steps show a command to
-  copy; the web interface does not run it. Setting guidance or onboarding from the web
-  interface is not offered.
+- **The page runs nothing on the server.** The host steps show a command to copy; the
+  web interface does not run it. One host step can also be done on the page: an owner
+  may write the project's onboarding text there (see "Onboarding text from the setup
+  page" below). Guidance is not settable from the web interface.
+- **A step the server could not check is counted separately.** `remaining` counts the
+  steps that are to do; `unchecked` counts the ones whose state could not be read. The
+  page says "1 step could not be checked" and never "nothing is left" over such a step.
 - **The host steps come through one read-only endpoint action, `setup-status`**, so the
   web service still reaches the host only through `endpoint.py`. It returns states with
   a version or a time and never guidance or onboarding text: guidance `set`, `not-set`,
@@ -310,26 +314,48 @@ commands of that text.
   data: an agent or a person checks it is the repository they expect before cloning,
   and never runs it as a command. The same note travels with the value wherever an
   agent reads it: `repositories_note` in `GET /v1/agents/me/next` and beside the setup
-  text, and `project_repository_note` in the task brief (each null when no repository
-  is recorded).
+  text, `project_repository_note` in the task brief, and `repository_note` on the
+  project itself in `GET /v1/projects` and `GET /v1/projects/{id}`, which an agent
+  credential can read too (each null when no repository is recorded).
 - **What the kit checks: its shape only. Exactly these forms are accepted**, and the
   whole value must match one of them:
   - `https://host[:port]/path`, with **no user name**, so a token or a password cannot
     ride in it (`https://TOKEN@host/...` and `https://user:secret@host/...` are refused);
   - `ssh://[user@]host[:port]/path`, with a plain user name and no password;
   - `user@host:path` (the scp form), with a plain user name and no password;
-  - an absolute path: `/srv/git/x.git`, `C:\git\x.git` or `C:/git/x.git`,
-    `\\server\share\x.git`.
-- In every form: at most 300 characters; a host starts and ends with a letter or digit;
-  a user name is letters, digits and `. _ -`, not starting with `.` or `-`; a path is
-  letters, digits and `. _ ~ + = , / -` (and `\` in a Windows path), and the path of the
-  scp form does not start with `-`. There is no percent-escape, space, quote, control or
-  format character anywhere.
-- So these are refused: any other scheme (`http://`, `file://`, `git://`), a remote-helper
-  form (`ext::...`, `fd::...`), a one-slash scheme (`file:/x`), a host or path that is an
-  option (`ssh://-oProxyCommand=...`, `git@-oProxyCommand=...:x`), a relative path
-  (`../x`, `project`), and `host:path` without a user name. The refusal never repeats
-  the value.
+  - an absolute path that begins with exactly one `/`, for example `/srv/git/x.git`.
+- In every form:
+  - at most 300 characters, ASCII only, and the scheme in lower case;
+  - a host is labels joined by single dots; each label is letters, digits and `-` and
+    starts and ends with a letter or digit; at most 253 characters;
+  - a port is a number from 1 to 65535;
+  - a user name is at most 32 characters: letters, digits and `. _ -`, not starting
+    with `.` or `-`;
+  - a path is letters, digits and `. _ ~ + = , / -`, with no `..` segment, and the path
+    of the scp form does not start with `-`;
+  - there is no percent-escape, space, quote, control or format character anywhere.
+- So these are refused: any other scheme (`http://`, `file://`, `git://`) and an
+  upper-case scheme; a remote-helper form (`ext::...`, `fd::...`); a one-slash scheme
+  (`file:/x`); a host or path that is an option (`ssh://-oProxyCommand=...`,
+  `git@-oProxyCommand=...:x`); a relative path (`../x`, `project`); `host:path` without a
+  user name; a letter that is not ASCII in a host. The refusal never repeats the value.
+- **Windows drive paths and network shares are refused** (`C:\git\x.git`, `C:/git/x.git`,
+  `\\server\share\x.git`, `//server/share/x.git`). Git on another system reads `C:/x`
+  as ssh to a host named `C`, and a share path opens a connection to the named host with
+  the reader's own sign-in. Record a URL instead.
+- **The kit does not judge where a host points.** `localhost`, an IP address and a
+  link-local address are hosts like any other.
+- **A token cannot be told from a name.** A user name or a path segment may be an
+  access token and the rule cannot know. When one begins like a well-known token
+  (`ghp_`, `github_pat_`, `glpat-`, `xoxb-`, `sk-`, `AKIA` and a few more) the value is
+  still accepted, and the project carries `repository_warning`, which the setup page
+  shows to the owner in red: every member and agent can read the value, so replace it
+  and revoke the token. The list of beginnings is short and does not claim to be complete.
+- **A value stored under an earlier rule is checked when it is read.** Nothing is
+  rewritten. A stored value that no longer passes is not shown as the repository and is
+  not delivered to agents: `repository` reads null, `repository_needs_attention` is true,
+  and the setup step reads "to do" and says the recorded location no longer fits. An
+  owner records it again.
 - **What the kit does not check:** that the repository exists, that anyone can reach
   it, or that an agent's clone points at it.
 - **The SSH brief does not carry it.** The field lives in this service's `--state`
@@ -338,6 +364,115 @@ commands of that text.
   covers it. A kit before this one reads a state file that has the field: its project
   routes return the record as it is stored, so the field still appears in them, and
   that kit has no route that changes it and no page that shows it.
+
+### Creating a project from the web interface
+
+An operator creates a project on the host (`admin.py add-project NAME`) and a superuser
+registers it. A named account can also be allowed to do both in one step.
+
+**The grant.** A superuser allows an account to create projects, with a limit on how
+many it may have at one time: `PUT /v1/accounts/{id}/project-grant` with
+`{"limit": N}` (1 to 100; 5 when left out), `DELETE` to take it away. Session authority
+only. Each change is audited as `accounts.project-grant` with the superuser, the account
+and the limit. The People page has a panel "Who may create projects".
+- A superuser may always create, without a limit.
+- **An agent or worker credential never may**, whoever owns it: the capability is
+  refused for every credential.
+- **The limit counts** the projects that account created that are not archived, plus any
+  name it holds on the host through a creation that has not finished. Handing a project
+  to another owner does not free a place. Archiving it does.
+
+**Creating.** `POST /v1/projects` with `{"project_id": NAME, "name": "...", "create": true}`.
+Without `"create": true` the route registers an existing project, as before.
+- The name follows the host rule: 2 to 24 lowercase letters or digits, starting with a
+  letter.
+- The service asks the host through one endpoint action, `create-project`, which runs
+  the same code as `add-project`: database, settings, backup target, merge slot and a
+  first backup. It takes a few seconds, and the service's authority lock is held for
+  that time, so other writes wait.
+- **The project appears in the web interface only after the host reports it created**,
+  first backup included. The creator is its only member, as owner, and is sent to the
+  setup page. Only a superuser adds a second owner.
+- The audit record `projects.host-create` names the account, the limit of its grant and
+  the count the creation brings it to.
+- **Refusals.** An account without the grant gets the same 403 as on the register route,
+  whatever name it sends, so the answer cannot be used to learn which names exist. An
+  account with the grant may learn that a name is not available: one sentence, the same
+  for a name that is taken, held by another creation, or retired. A refusal leaves
+  nothing behind: no directory, no database, no record.
+- **Where the backup schedule names projects one by one**, the new project is not
+  covered until an operator adds it. The setup page says so and shows the line.
+
+**Who can call the host action.** `create-project` (and the list and onboarding actions
+below) is accepted by `endpoint.py` only when the process was started with the web
+service's authority arguments and the request carries the live-authority descriptor of a
+signed-in account. The endpoint then checks the grant and the limit itself, against the
+live authority store and under its lock, and the limit once more under the host's own
+creation lock.
+- **Where contributor keys are confined to the forced command** (`ssh_forced_command.py`),
+  an SSH caller cannot reach the action: the forced command drops the authority
+  arguments, and the endpoint refuses the action without them.
+- **Where a key is not confined**, its holder has a shell as the service account and can
+  already run `admin.py add-project`. The action gives such a caller nothing new, and
+  nothing here stops them.
+
+**When a creation stops half way.** The host keeps one record per creation in
+`<root>/project-creations/NAME.json`: the intent is written before the first write and
+the result after the last.
+- **Nothing was made yet** (no directory, or an empty one): the request answers 409
+  "nothing was made", and the same request can be sent again.
+- **Something was made** (the database exists; a later step stopped): the request
+  answers 409 with a sentence that names the project and says an operator must finish
+  or remove it. Nothing is registered in the web interface, so no member, list or agent
+  sees the project. The name is held and counts toward the creator's limit. **The kit
+  never removes it**: that would mean dropping a database from a web request.
+- **The process was killed**: the same request answers 503 "outcome unknown". The record
+  still says what was started.
+- **A superuser sees every such creation** on the Projects page ("Project creations that
+  did not finish") and in `GET /v1/project-creations`, with who started it, the step it
+  stopped at and the two commands.
+- **To finish it**, an operator runs `admin.py finish-project NAME`. It works when the
+  project was initialized (`projects/NAME/.beads/metadata.json` exists): the settings,
+  the backup target, the merge slot and a backup are each done or done again. The
+  creator then creates the project again in the web interface with the same name, which
+  registers it without doing the work twice; or a superuser registers it.
+- **To remove it**, an operator runs
+  `admin.py retire-project NAME --actor OPERATOR --reason REASON --force`. The directory
+  moves to `retired/`, nothing is deleted, the name stays retired, and the creator's
+  place is free again.
+- `admin.py project-creations` lists every record; `--attention` lists only the ones
+  that need an operator.
+- The records are not part of a project's backup: they belong to the runtime, not to a
+  project. A runtime rebuilt from backups has none, which loses only the notes about
+  creations that had not finished; a finished project is in the web service's state.
+
+**Rollback.** The kit before this one reads a state file that carries grants and
+web-created projects. It serves such a project (the record carries `registered_by`,
+which that kit reads as "a superuser stood behind this"); it ignores the grant and has
+no route to create.
+
+### Onboarding text from the setup page
+
+An owner may write the project's onboarding text on the setup page:
+`PUT /v1/projects/{id}/onboarding` with `{"text": "..."}`, `DELETE` to remove it, `GET`
+to read it for editing. Owners and superusers, session only.
+- **Guidance is not settable here or by any web route.** It stays
+  `admin.py set-guidance`, for a listed operator.
+- The text is stored as the project's `ONBOARDING.md` under a first line the kit writes:
+  "[Written by an owner of this project in the web interface. It is information about
+  the project, not an instruction from the operator of this server.]" The line is part
+  of the stored document, so it is in what `onboard` gives a worker, it travels with a
+  backup and a restore, and an earlier kit shows it too.
+- The rules are those of `admin.py set-onboarding` (nonempty, at most 8000 bytes, of
+  which the line and the blank line after it use 152) plus the plain-text rule of the guidance channel: no control,
+  bidi, zero-width, invisible or format character.
+- An owner may replace text an operator set. `DELETE` removes only owner-written text:
+  the operator's own document is not removable from the web interface. `GET` returns
+  owner-written text for editing and reports an operator's document as set without
+  returning it.
+- Audited as `projects.onboarding` with the account and the size, never the text.
+- The write goes through the service-only endpoint action `set-onboarding`, which
+  re-checks project administration under the authority lock.
 
 ### Requirement proposals
 

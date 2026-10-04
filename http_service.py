@@ -38,7 +38,7 @@ from reserved_comments import (ANCHOR_READ_IDS_MAX, carries_record_label, hide_r
                                is_record_anchor)
 from http_auth import (AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CAP_APPROVE,
                        CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROPOSALS,
-                       CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_READ, CAP_REVIEWS,
+                       CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ, CAP_REVIEWS,
                        CAP_TASKS, RESULT_RETENTION_SECONDS, HttpError, Service, Store,
                        authority_request, conflict, forbidden, invalid, not_found,
                        not_implemented, now_iso, request_hash, unauthenticated,
@@ -1690,6 +1690,70 @@ class EndpointBackend:
     #: ``review_states`` is derived from ``review_queue`` (see the handler's reuse).
     REVIEW_STATES_FROM_QUEUE = True
 
+    def create_host_project(self, principal, name, key):
+        """Create project ``name`` on the host for ``principal`` (kittrial-5bb.118 part 2).
+
+        One ``create-project`` endpoint action. The endpoint re-checks the grant and the
+        limit against the live authority store under its lock, reserves the operation
+        identity before the first write and records the result with it, so the same
+        request sent again returns what happened instead of creating twice. Returns the
+        host's result (``status`` ``created`` or ``incomplete``). A refusal (name not
+        available, limit reached, nothing made) is a 409 with the host's sentence.
+        """
+        operation_id = self._result_key(principal, None, 'projects.host-create', key, name)
+        authority = authority_request(principal, None, CAP_PROJECT_HOST_CREATE,
+                                      now=self.service._expiry_now())
+        reply = self._endpoint('create-project', name, principal.user_id, [], operation_id=operation_id,
+                               authority=authority, require_authority=True, route='projects.host-create',
+                               check_usable=False)
+        if isinstance(reply, dict) and reply.get('returncode') == 2:
+            said = (reply.get('stderr') or '').strip().splitlines()
+            sentence = said[-1][:400] if said else 'The project could not be created'
+            for prefix in ('ValueError: ', 'RuntimeError: '):
+                if sentence.startswith(prefix):
+                    sentence = sentence[len(prefix):]
+            raise conflict(sentence)
+        return self._checked(reply)
+
+    def set_onboarding(self, principal, project_id, text, key):
+        """An owner sets (``text``) or clears (``None``) the project's onboarding text.
+
+        One service-only ``set-onboarding`` endpoint action. The endpoint re-checks the
+        project-administration capability under the authority lock and applies the same
+        size limit as ``admin.py set-onboarding`` plus the plain-text rule. The text
+        travels as an attachment, never on a command line.
+        """
+        operation_id = self._result_key(principal, project_id, 'projects.onboarding', key, None)
+        authority = authority_request(principal, project_id, CAP_PROJECT_ADMIN, now=self.service._expiry_now())
+        attachments = {} if text is None else {'text': {'flag': '--file', 'text': text}}
+        reply = self._endpoint('set-onboarding', project_id, principal.user_id,
+                               ['clear'] if text is None else ['set'], attachments, operation_id=operation_id,
+                               authority=authority, require_authority=True, route='projects.onboarding')
+        if isinstance(reply, dict) and reply.get('returncode') == 2:
+            said = (reply.get('stderr') or '').strip().splitlines()
+            sentence = said[-1][:400] if said else 'The onboarding text was refused'
+            raise invalid(sentence[len('ValueError: '):] if sentence.startswith('ValueError: ') else sentence)
+        return self._checked(reply)
+
+    def read_onboarding(self, project_id):
+        """The project's onboarding document as stored, or None when none is set."""
+        reply = self._endpoint('docs', project_id, self.actor_namespace + '/read', ['project'])
+        if isinstance(reply, dict) and reply.get('returncode') == 2 and \
+                'Onboarding document missing' in (reply.get('stderr') or ''):
+            return None
+        code = reply.get('returncode') if isinstance(reply, dict) else None
+        if code:
+            self._checked(reply)
+        return reply.get('stdout') if isinstance(reply, dict) else None
+
+    def host_creations(self, principal):
+        """The creations an operator must finish or remove (superusers; read-only)."""
+        authority = authority_request(principal, None, CAP_ACCOUNTS_ADMIN, now=self.service._expiry_now())
+        reply = self._endpoint('project-creations', None, principal.user_id, [], authority=authority,
+                               require_authority=True)
+        result = self._checked(reply)
+        return result.get('items') if isinstance(result, dict) and isinstance(result.get('items'), list) else []
+
     def setup_status(self, project_id):
         """What the host knows about this project's setup (kittrial-5bb.118).
 
@@ -2480,6 +2544,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                 'project_create': (
                     'create' if getattr(self.backend, 'PROJECT_CREATE', 'create') == 'create' else
                     'register' if principal.superuser and principal.via != 'credential' else 'operator-only')}
+        # Additive (kittrial-5bb.118 part 2): whether this account may create a project
+        # on the host from here, with its limit and how many it has. Only where the
+        # backend has a host.
+        if getattr(self.backend, 'PROJECT_CREATE', 'create') == 'register':
+            body['project_host_create'] = self.service.host_creation(principal)
         # A browser keeps its CSRF token in memory only, so a reload re-reads it here.
         # It is returned only to the cookie session it belongs to; a cross-origin page
         # cannot read this same-origin response.
@@ -2578,6 +2647,8 @@ class ApiHandler(BaseHTTPRequestHandler):
     def projects_create(self, ctx):
         payload = ctx.payload or {}
         if getattr(self.backend, 'PROJECT_CREATE', 'create') == 'register':
+            if payload.get('create') is True:
+                return self._project_host_create(ctx, payload)
             return self._project_register(ctx, payload)
 
         def create():
@@ -2589,6 +2660,101 @@ class ApiHandler(BaseHTTPRequestHandler):
         # (409) instead of creating a second project.
         return self._mutate(ctx, 'projects.create', None, create,
                             status=201, capability=CAP_PROJECT_CREATE)
+
+    #: Said to everyone who may not create or register, whatever the payload names.
+    NOT_ALLOWED_TO_CREATE = 'Only a superuser registers a project on this server. ' + REGISTER_HINT
+
+    def _project_host_create(self, ctx, payload):
+        """`POST /v1/projects` with `"create": true`: create the project on the host and register it.
+
+        For a superuser, or an account a superuser granted "may create projects", within
+        the grant's limit (kittrial-5bb.118 part 2). Never a credential. Everyone else
+        gets the same 403 as the register route, before anything about the name is
+        looked at, so the answer cannot be used to find out which names exist.
+
+        The project is registered here only after the host reports it created, first
+        backup included. Until then nothing about it is visible in the web interface. A
+        creation that stopped half way answers 409 with the host's sentence, which names
+        the project and says an operator must finish or remove it.
+        """
+        principal = ctx.principal
+        creation = self.service.host_creation(principal)
+        if creation['reason'] in ('credential', 'no-grant'):
+            raise forbidden(self.NOT_ALLOWED_TO_CREATE)
+        if set(payload) - {'create', 'project_id', 'name'}:
+            raise invalid('Send project_id, name and create only')
+        project_id = payload.get('project_id')
+        if not isinstance(project_id, str) or not CANONICAL_PROJECT.fullmatch(project_id):
+            raise invalid('project_id must be 2-24 lowercase letters or digits, beginning with a letter')
+        name = payload.get('name') or project_id
+        self.service._validate_project_name(name)
+        if self.service.state['projects'].get(project_id) is not None:
+            return self._refuse_unless_replay(ctx, 'projects.host-create',
+                                              conflict('Project name %s is not available: choose another name'
+                                                       % project_id), capability=CAP_PROJECT_HOST_CREATE)
+        key = ctx.idempotency_key or ctx.request_id
+
+        def create():
+            try:
+                result = self.backend.create_host_project(principal, project_id, key)
+            except HttpError as failure:
+                if failure.status == 503:
+                    raise UncertainOutcome() from None
+                raise
+            if not isinstance(result, dict) or result.get('status') not in ('created', 'incomplete'):
+                raise UncertainOutcome()
+            if result['status'] == 'incomplete':
+                raise conflict(result.get('message') or 'Project %s did not finish; an operator must finish or '
+                               'remove it' % project_id, {'project': project_id, 'state': 'incomplete',
+                                                          'stage': result.get('stage')})
+            view = self._usable(self.service.register_host_created(principal, project_id, name, result))
+            view['backup'] = result.get('backup')
+            return view, view
+        limit = 'none (superuser)' if creation['limit'] is None else str(creation['limit'])
+        reason = 'create %s account=%s limit=%s count=%d' % (project_id, principal.user_id, limit,
+                                                              creation['used'] + 1)
+        return self._mutate(ctx, 'projects.host-create', None, create, status=201,
+                            capability=CAP_PROJECT_HOST_CREATE, serialize=False, canonical=True, reason=reason)
+
+    @route('GET', r'/v1/project-creations')
+    def project_creations(self, ctx):
+        """Superusers: creations that stopped half way, so that none is forgotten.
+
+        Each names the project, the account that started it, the stage it stopped at and
+        the two operator commands. Empty where the backend has no host.
+        """
+        principal = self._superuser_session(ctx, 'Only a superuser sees the project creations')
+        self.require(ctx, CAP_ACCOUNTS_ADMIN)
+        if getattr(self.backend, 'PROJECT_CREATE', 'create') != 'register' or \
+                not hasattr(self.backend, 'host_creations'):
+            return 200, {'items': [], 'host': 'not-applicable'}
+        items = []
+        names = self.service.actor_names([item.get('by') for item in self.backend.host_creations(principal)])
+        for item in self.backend.host_creations(principal):
+            if not isinstance(item, dict) or not isinstance(item.get('project'), str):
+                continue
+            project = item['project']
+            items.append({'project': project, 'state': item.get('state'), 'by': item.get('by'),
+                          'by_name': names.get(item.get('by'), item.get('by')), 'stage': item.get('stage'),
+                          'started_at': item.get('started_at'), 'stopped_at': item.get('stopped_at'),
+                          'finish': 'admin.py finish-project %s' % project,
+                          'remove': 'admin.py retire-project %s --actor OPERATOR --reason REASON --force' % project})
+        return 200, {'items': items, 'host': 'available'}
+
+    @route('PUT', r'/v1/accounts/(?P<uid>' + ID + r')/project-grant')
+    def account_project_grant(self, ctx):
+        """A superuser lets an account create projects: `{"limit": N}` (default 5)."""
+        payload = ctx.payload or {}
+        if set(payload) - {'limit'}:
+            raise invalid('Send limit only')
+        self.require(ctx, CAP_ACCOUNTS_ADMIN)
+        return 200, self.service.set_project_grant(ctx.principal, ctx.params['uid'], payload.get('limit'),
+                                                   request_id=ctx.request_id)
+
+    @route('DELETE', r'/v1/accounts/(?P<uid>' + ID + r')/project-grant')
+    def account_project_grant_clear(self, ctx):
+        self.require(ctx, CAP_ACCOUNTS_ADMIN)
+        return 200, self.service.clear_project_grant(ctx.principal, ctx.params['uid'], request_id=ctx.request_id)
 
     def _project_register(self, ctx, payload):
         """`POST /v1/projects` on the endpoint backend: register an existing canonical project.
@@ -2630,7 +2796,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         return self._mutate(ctx, 'projects.create', None, register, status=201, capability=CAP_ACCOUNTS_ADMIN,
                             reason='register ' + project_id)
 
-    def _refuse_unless_replay(self, ctx, route_name, error):
+    def _refuse_unless_replay(self, ctx, route_name, error, capability=CAP_ACCOUNTS_ADMIN):
         """Raise `error`, unless this request is an exact idempotent retry of one that
         already committed on this route: then its stored response is replayed.
 
@@ -2643,7 +2809,7 @@ class ApiHandler(BaseHTTPRequestHandler):
 
         def refuse():
             raise error
-        return self._mutate(ctx, route_name, None, refuse, capability=CAP_ACCOUNTS_ADMIN)
+        return self._mutate(ctx, route_name, None, refuse, capability=capability)
 
     def _superuser_session(self, ctx, message):
         principal = ctx.principal
@@ -2751,6 +2917,67 @@ class ApiHandler(BaseHTTPRequestHandler):
             return result, result
         return self._mutate(ctx, 'projects.update', ctx.params['pid'], update,
                             capability=CAP_PROJECT_ADMIN)
+
+    def _onboarding_owner(self, ctx):
+        self._project(ctx, CAP_PROJECT_ADMIN)
+        if ctx.principal.via == 'credential':
+            raise forbidden('Session authority required')
+        if not hasattr(self.backend, 'set_onboarding'):
+            raise not_implemented('This server has no host project behind it, so there is no onboarding text to set')
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/onboarding')
+    def project_onboarding(self, ctx):
+        """The onboarding text, for an owner to edit (kittrial-5bb.118 part 2).
+
+        ``source`` says who set it: ``web`` (an owner, here) or ``operator`` (on the
+        server). Only owner-written text is returned for editing; the operator's own
+        document is reported as set, with its size, and is not returned here.
+        """
+        self._onboarding_owner(ctx)
+        from onboarding import PROJECT_LIMIT, WEB_HEADER, split_web
+        document = self.backend.read_onboarding(ctx.params['pid'])
+        if document is None:
+            return 200, {'state': 'not-set', 'source': None, 'text': None, 'limit': PROJECT_LIMIT}
+        by_owner, text = split_web(document)
+        return 200, {'state': 'set', 'source': 'web' if by_owner else 'operator',
+                     'text': text if by_owner else None, 'bytes': len(document.encode('utf-8')),
+                     'limit': PROJECT_LIMIT, 'header': WEB_HEADER if by_owner else None}
+
+    @route('PUT', r'/v1/projects/(?P<pid>' + ID + r')/onboarding')
+    def project_onboarding_set(self, ctx):
+        """An owner sets the project's onboarding text: `{"text": "..."}`.
+
+        Stored with a first line that says an owner wrote it in the web interface, so
+        every reader sees it as information from the project, not as an instruction from
+        the server's operator. Guidance is not settable here. Audited with the size,
+        never the text.
+        """
+        self._onboarding_owner(ctx)
+        payload = ctx.payload if isinstance(ctx.payload, dict) else {}
+        if set(payload) != {'text'} or not isinstance(payload['text'], str):
+            raise invalid('Send exactly: text')
+        return self._onboarding_write(ctx, payload['text'])
+
+    @route('DELETE', r'/v1/projects/(?P<pid>' + ID + r')/onboarding')
+    def project_onboarding_clear(self, ctx):
+        """Remove onboarding text an owner set here. The operator's own text is not removable here."""
+        self._onboarding_owner(ctx)
+        return self._onboarding_write(ctx, None)
+
+    def _onboarding_write(self, ctx, text):
+        key = ctx.idempotency_key or ctx.request_id
+
+        def write():
+            try:
+                result = self.backend.set_onboarding(ctx.principal, ctx.params['pid'], text, key)
+            except HttpError as failure:
+                if failure.status == 503:
+                    raise UncertainOutcome() from None
+                raise
+            return result, result
+        size = 'cleared' if text is None else 'set %d bytes' % len(text.encode('utf-8'))
+        return self._mutate(ctx, 'projects.onboarding', ctx.params['pid'], write, capability=CAP_PROJECT_ADMIN,
+                            serialize=False, canonical=True, reason='account=%s %s' % (ctx.principal.user_id, size))
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/setup')
     def project_setup(self, ctx):

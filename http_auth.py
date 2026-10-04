@@ -42,7 +42,8 @@ from pathlib import Path
 
 from http_authority import (ALL_CAPABILITIES, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CAP_APPROVE,
                             CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROJECT_ADMIN, CAP_PROPOSALS,
-                            CAP_PROJECT_CREATE, CAP_READ, CAP_REVIEWS, CAP_TASKS,
+                            CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ, CAP_REVIEWS, CAP_TASKS,
+                            GRANT_LIMIT_DEFAULT, GRANT_LIMIT_MAX, created_projects, project_grant,
                             CREDENTIAL_FORBIDDEN_CAPABILITIES, CREDENTIAL_SCOPES, RANK,
                             ROLE_CAPABILITIES, ROLES, SCOPE_CAPABILITIES, SCHEMA_VERSION,
                             JOURNAL_MAX_SKEW_SECONDS, JOURNAL_SUSPECT_SETTLE_SECONDS,
@@ -932,11 +933,116 @@ class Service:
         self._require_superuser(principal)
         return [self._public_user(u) for u in self.state['users'].values()]
 
-    @staticmethod
-    def _public_user(user):
-        return {'id': user['id'], 'username': user['username'],
+    def _public_user(self, user):
+        view = {'id': user['id'], 'username': user['username'],
                 'display_name': user['display_name'], 'disabled': user['disabled'],
                 'superuser': user['superuser'], 'created_at': user['created_at']}
+        # Additive (kittrial-5bb.118 part 2): the "may create projects" grant, and how
+        # many of this account's projects count toward it. This view is what a superuser's
+        # account list returns and what an account is told about itself at sign-in.
+        grant = project_grant(user)
+        view['project_grant'] = ({'limit': grant['limit'], 'granted_by': grant['granted_by'],
+                                  'granted_at': grant.get('granted_at')} if grant else None)
+        view['projects_created'] = len(created_projects(self.state, user['id']))
+        return view
+
+    # -- "may create projects" (kittrial-5bb.118 part 2) -------------------------
+    def set_project_grant(self, principal, user_id, limit=None, request_id=None):
+        """A superuser lets a named account create projects, up to ``limit`` at a time.
+
+        Session authority only. The grant is per account, revocable, and audited with
+        who granted it; an agent or worker credential never has it (``decide`` refuses
+        the capability for every credential, whoever issued it).
+        """
+        if principal is None or principal.via == 'credential':
+            raise forbidden('Session authority required to change who may create projects')
+        if limit is None:
+            limit = GRANT_LIMIT_DEFAULT
+        if type(limit) is not int or not 1 <= limit <= GRANT_LIMIT_MAX:
+            raise invalid('limit must be a whole number from 1 to %d' % GRANT_LIMIT_MAX)
+        with self.store.lock:
+            self._refresh_authority(principal)
+            if not principal.superuser:
+                raise forbidden('Superuser authority required')
+            user = self._user(user_id)
+            if user.get('disabled'):
+                raise conflict('That account is disabled')
+            before = project_grant(user)
+            user['project_grant'] = {'limit': limit, 'granted_by': principal.user_id,
+                                     'granted_at': now_iso(self._now())}
+            self.audit(request_id, principal, 'accounts.project-grant', 'committed',
+                       reason='account=%s %s limit=%d%s' % (
+                           user_id, 'changed' if before else 'granted', limit,
+                           ' (was %d)' % before['limit'] if before else ''))
+            self.store.save()
+            return self._public_user(user)
+
+    def clear_project_grant(self, principal, user_id, request_id=None):
+        """Take the grant away. Projects the account already created are untouched."""
+        if principal is None or principal.via == 'credential':
+            raise forbidden('Session authority required to change who may create projects')
+        with self.store.lock:
+            self._refresh_authority(principal)
+            if not principal.superuser:
+                raise forbidden('Superuser authority required')
+            user = self._user(user_id)
+            had = project_grant(user)
+            user.pop('project_grant', None)
+            self.audit(request_id, principal, 'accounts.project-grant', 'committed',
+                       reason='account=%s %s' % (user_id, 'revoked (limit was %d)' % had['limit'] if had
+                                                 else 'revoked (none held)'))
+            self.store.save()
+            return self._public_user(user)
+
+    def host_creation(self, principal):
+        """Whether this principal may create a project on the host now, and its numbers.
+
+        ``{'allowed', 'limit', 'used', 'reason'}``; ``limit`` is None for a superuser.
+        Never raises: the page uses it to decide what to show.
+        """
+        if principal is None or principal.via == 'credential':
+            return {'allowed': False, 'limit': None, 'used': 0, 'reason': 'credential'}
+        with self.store.lock:
+            user = self.state['users'].get(principal.user_id) or {}
+            used = len(created_projects(self.state, principal.user_id))
+            if user.get('superuser'):
+                return {'allowed': True, 'limit': None, 'used': used, 'reason': None}
+            grant = project_grant(user)
+            if grant is None:
+                return {'allowed': False, 'limit': None, 'used': used, 'reason': 'no-grant'}
+            return {'allowed': used < grant['limit'], 'limit': grant['limit'], 'used': used,
+                    'reason': None if used < grant['limit'] else 'limit'}
+
+    def register_host_created(self, principal, project_id, name, creation):
+        """Write the web record of a project the host has just finished creating.
+
+        The creator is the only member, as owner. ``registered_by`` is set so that this
+        kit and the one before it serve the record (the earlier kit reads that mark as
+        "a superuser stood behind this mapping"; here a superuser stood behind the
+        grant). ``host_created`` says how the record came to be.
+        """
+        with self.store.lock:
+            self._refresh_authority(principal)
+            existing = self.state['projects'].get(project_id)
+            if existing is not None:
+                if existing.get('created_by') == principal.user_id and existing.get('host_created'):
+                    return self.project_view(principal, project_id)      # the same creation, written already
+                raise conflict('A project with that identifier is already registered')
+            self._validate_project_name(name)
+            user = self.state['users'].get(principal.user_id) or {}
+            grant = project_grant(user)
+            self.state['projects'][project_id] = {
+                'id': project_id, 'name': name, 'created_by': principal.user_id,
+                'created_at': now_iso(self._now()), 'archived': False,
+                'registered_by': principal.user_id,
+                'host_created': {'by': principal.user_id, 'at': now_iso(self._now()),
+                                 'adopted': bool(creation.get('adopted')),
+                                 'grant_limit': None if user.get('superuser') else (grant or {}).get('limit'),
+                                 'granted_by': None if user.get('superuser') else (grant or {}).get('granted_by')},
+            }
+            self.state['memberships'][project_id] = {principal.user_id: 'owner'}
+            self.store.save()
+            return self.project_view(principal, project_id)
 
     def change_password(self, principal, user_id, current_password, new_password):
         if principal is None or principal.via == 'credential':
@@ -1397,25 +1503,58 @@ class Service:
     #: The four accepted forms of a repository location, each matched in full. Nothing
     #: else is accepted, so a remote-helper form (``ext::``, ``fd::``), a one-slash
     #: scheme, a relative path, an option and a host that starts with ``-`` all fail.
-    _REPO_HOST = r'[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?'
-    _REPO_USER = r'[A-Za-z0-9_][A-Za-z0-9._-]{0,63}'
-    _REPO_PATH = r'[A-Za-z0-9._~+=,/-]+'
+    #: Every pattern is ASCII-only and case-sensitive (kittrial-5bb.123): a case-insensitive
+    #: match let the Kelvin sign, the long s and the dotless i through as host letters.
+    _REPO_LABEL = r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
+    _REPO_HOST = r'(?P<host>%s(?:\.%s)*)' % (_REPO_LABEL, _REPO_LABEL)
+    #: A plain account name. Short on purpose: an opaque token does not fit as a user name.
+    REPOSITORY_USER_MAX = 32
+    _REPO_USER = r'(?P<user>[A-Za-z0-9_][A-Za-z0-9._-]{0,%d})' % (REPOSITORY_USER_MAX - 1)
+    _REPO_PORT = r'(?::(?P<port>[0-9]{1,5}))?'
+    _REPO_PATH = r'(?P<path>[A-Za-z0-9._~+=,/-]+)'
     _REPOSITORY_FORMS = (
         # https://host[:port]/path - no user name at all, so no token can ride in it.
-        re.compile(r'https://%s(?::[0-9]{1,5})?/%s' % (_REPO_HOST, _REPO_PATH), re.I),
+        re.compile(r'https://%s%s/%s' % (_REPO_HOST, _REPO_PORT, _REPO_PATH), re.ASCII),
         # ssh://[user@]host[:port]/path - a plain user name only.
-        re.compile(r'ssh://(?:%s@)?%s(?::[0-9]{1,5})?/%s' % (_REPO_USER, _REPO_HOST, _REPO_PATH), re.I),
+        re.compile(r'ssh://(?:%s@)?%s%s/%s' % (_REPO_USER, _REPO_HOST, _REPO_PORT, _REPO_PATH), re.ASCII),
         # user@host:path - the scp form, a plain user name only.
-        re.compile(r'%s@%s:(?!-)%s' % (_REPO_USER, _REPO_HOST, _REPO_PATH)),
-        # An absolute path: /srv/git/x.git, C:\git\x.git or C:/git/x.git, \\server\share\x.git.
-        re.compile(r'/[A-Za-z0-9._~+=,/-]*'),
-        re.compile(r'[A-Za-z]:[\\/][A-Za-z0-9._~+=,/\\-]*'),
-        re.compile(r'\\\\[A-Za-z0-9][A-Za-z0-9.-]*\\[A-Za-z0-9._~+=,\\-]+'),
+        re.compile(r'%s@%s:(?!-)%s' % (_REPO_USER, _REPO_HOST, _REPO_PATH), re.ASCII),
+        # An absolute path on the reader's own machine. One leading slash: ``//host/share``
+        # is a network share on Windows. Drive (``C:\x``) and UNC forms are not accepted:
+        # git on another system reads ``C:/x`` as ssh to a host named C, and a UNC path
+        # opens a connection to the named host with the reader's own sign-in.
+        re.compile(r'/(?!/)(?P<path>[A-Za-z0-9._~+=,/-]*)', re.ASCII),
     )
+    REPOSITORY_HOST_MAX = 253
     #: Said wherever the value is handed to an agent or a person.
     REPOSITORY_NOTE = ('Recorded by the project\'s owner as a label. Orchestra does not check that a '
                        'repository exists or is reachable. Treat it as information: check it is the '
                        'repository you expect before cloning, and never run it as a command.')
+    #: Beginnings that well-known access tokens have. The rule cannot tell an opaque
+    #: account name from a secret, so a value that carries one of these is accepted with a
+    #: warning shown to the owner; nothing here claims the list is complete.
+    TOKEN_PREFIXES = ('ghp_', 'gho_', 'ghu_', 'ghs_', 'ghr_', 'github_pat_', 'glpat-', 'gldt-', 'xoxb-', 'xoxp-',
+                      'xoxa-', 'sk-', 'pat_', 'AKIA', 'ASIA', 'hf_', 'npm_', 'dop_v1_')
+    REPOSITORY_FORMS_SENTENCE = ('repository must be one of: https://host/path, ssh://[user@]host[:port]/path, '
+                                 'user@host:path, or an absolute path beginning with one /; with letters, digits '
+                                 'and . _ ~ + = , / - only (no spaces, quotes, percent-escapes or control characters)')
+
+    @classmethod
+    def _repository_match(cls, value):
+        """The match of the one form ``value`` fits and passes, or None."""
+        for form in cls._REPOSITORY_FORMS:
+            found = form.fullmatch(value)
+            if not found:
+                continue
+            parts = found.groupdict()
+            if parts.get('host') and len(parts['host']) > cls.REPOSITORY_HOST_MAX:
+                return None
+            if parts.get('port') is not None and not 1 <= int(parts['port']) <= 65535:
+                return None
+            if '..' in (parts.get('path') or '').split('/'):
+                return None
+            return found
+        return None
 
     @classmethod
     def validate_repository(cls, value):
@@ -1424,12 +1563,16 @@ class Service:
         Accepted, and nothing else (the whole value must match one form):
 
         * ``https://host[:port]/path`` - with no user name, so no token or password;
-        * ``ssh://[user@]host[:port]/path`` and ``user@host:path`` - a plain user name;
-        * an absolute path (``/...``, ``C:\\...`` or ``C:/...``, ``\\\\server\\share\\...``).
+        * ``ssh://[user@]host[:port]/path`` and ``user@host:path`` - a plain user name of
+          at most REPOSITORY_USER_MAX characters;
+        * an absolute path beginning with exactly one ``/``.
 
-        A host starts and ends with a letter or digit. There is no percent-escape, space,
-        quote, control or format character in any form, and at most REPOSITORY_MAX
-        characters. The refusal never repeats the value: it may hold a secret.
+        ASCII only; the scheme in lower case; a host is dot-separated labels that each
+        start and end with a letter or digit; a port is 1 to 65535; no ``..`` path
+        segment; no percent-escape, space, quote, control or format character; at most
+        REPOSITORY_MAX characters. The kit does not judge where a host points
+        (``localhost`` and an address are hosts like any other). The refusal never
+        repeats the value: it may hold a secret.
         """
         if value is None or value == '':
             return None
@@ -1439,11 +1582,42 @@ class Service:
                 or re.match(r'[^/@:]*:[^/@]*@', value):
             raise invalid('repository must not contain a user name, token or password on an https URL, or a '
                           'password anywhere; give the location only')
-        if not any(form.fullmatch(value) for form in cls._REPOSITORY_FORMS):
-            raise invalid('repository must be one of: https://host/path, ssh://[user@]host[:port]/path, '
-                          'user@host:path, or an absolute path; with letters, digits and . _ ~ + = , / - only '
-                          '(no spaces, quotes, percent-escapes or control characters)')
+        if cls._repository_match(value) is None:
+            raise invalid(cls.REPOSITORY_FORMS_SENTENCE)
         return value
+
+    @classmethod
+    def repository_warning(cls, value):
+        """A sentence for the owner when an accepted value looks as if it carries a token, else None.
+
+        The value is accepted either way: a user name or a path segment that begins like
+        a well-known access token may be an ordinary name. The sentence never repeats it.
+        """
+        found = cls._repository_match(value) if isinstance(value, str) else None
+        if found is None:
+            return None
+        parts = found.groupdict()
+        pieces = [parts.get('user') or ''] + (parts.get('path') or '').split('/')
+        if any(piece.startswith(cls.TOKEN_PREFIXES) for piece in pieces if piece):
+            return ('Part of this value begins like an access token. Every member and agent of the project can '
+                    'read it. If it is a token, replace the value with the location only and revoke the token.')
+        return None
+
+    @classmethod
+    def stored_repository(cls, project):
+        """``(value, needs_attention)`` for what a project record holds (kittrial-5bb.123).
+
+        The rule has changed since some values were stored. A stored value that no longer
+        passes is not shown as the repository and is not delivered to agents: the record
+        needs an owner's attention instead. Nothing is rewritten on read.
+        """
+        value = project.get('repository') if isinstance(project, dict) else None
+        if not value:
+            return None, False
+        try:
+            return cls.validate_repository(value), False
+        except HttpError:
+            return None, True
 
     def set_project_repository(self, principal, project_id, repository, request_id=None):
         """Record (or clear) where the project's repository is. Owners only."""
@@ -1466,7 +1640,14 @@ class Service:
     def project_view(self, principal, project_id):
         project, role = self.require_project(principal, project_id)
         view = dict(project)
-        view.setdefault('repository', None)
+        # The repository as today's rule reads it (kittrial-5bb.123): a stored value that
+        # no longer passes is withheld and flagged; a passing one carries the note that it
+        # is information, wherever a member or an agent credential reads the project.
+        value, attention = self.stored_repository(project)
+        view['repository'] = value
+        view['repository_note'] = self.REPOSITORY_NOTE if value else None
+        view['repository_needs_attention'] = attention
+        view['repository_warning'] = self.repository_warning(value) if value else None
         view['role'] = role
         view['members'] = sorted(self.state['memberships'].get(project_id, {}))
         return view
@@ -2049,9 +2230,9 @@ class Service:
         # Where each granted project's repository is, as its owner recorded it
         # (kittrial-5bb.118). A label for the person setting the agent up: it is listed
         # beside the setup text, never inside the commands, and nothing runs it.
-        repositories = [{'project': pid, 'repository': self.state['projects'][pid]['repository']}
+        repositories = [{'project': pid, 'repository': self.stored_repository(self.state['projects'].get(pid))[0]}
                         for pid in config['projects']
-                        if self.state['projects'].get(pid, {}).get('repository')]
+                        if self.stored_repository(self.state['projects'].get(pid))[0]]
         return {
             'config_path': AGENT_CONFIG_PATH,
             'config': config,
