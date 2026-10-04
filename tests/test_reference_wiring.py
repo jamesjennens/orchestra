@@ -228,7 +228,8 @@ class OperatorCommandTests(unittest.TestCase):
                          [('calendar.trading', 'accepted'), ('office.server.check', 'accepted'),
                           ('calendar.missing', 'refused')])
         self.assertIn('Unknown reference key', result['items'][2]['reason'])
-        self.assertTrue(result['complete'])
+        self.assertEqual((result['complete'], result['stopped'], result['accepted'], result['refused']),
+                         (False, False, 2, 1))
         # The batch receipt, three items, the batch receipt again: five separate holds.
         self.assertEqual(flock.call_count, 5)
         for key in ('calendar.trading', 'office.server.check'):

@@ -240,12 +240,19 @@ class AcceptanceRuleTests(AttestationCase):
         self.native.seed('task-9')
         self.native.seed('labelled-1', labels=['decision'])
         before = len(self.native.writes())
-        for decision in ('decision-404', 'task-9', '--all', 'a b'):
+        for decision in ('decision-404', 'task-9'):
             with self.subTest(decision=decision), self.assertRaisesRegex(
-                    ValueError, 'acceptance.decision_id must (name an existing issue of type decision|be a native '
-                                'decision issue id)'):
-                self.accept(1, self.sha(1), operation_id='apply-' + decision.strip('-').replace(' ', ''),
+                    ValueError, 'acceptance.decision_id must name an existing issue of type decision'):
+                self.accept(1, self.sha(1), operation_id='apply-' + decision, acceptance=acceptance(decision_id=decision))
+        # An id that is not an issue id never becomes a native argument: it is refused by its
+        # shape, before the lookup.
+        for number, decision in enumerate(('--all', 'a b', '-', 'x' * 162)):
+            lookups = [call for call in self.native.calls if '--id' in call]
+            with self.subTest(decision=decision[:8]), self.assertRaisesRegex(
+                    ValueError, 'acceptance.decision_id must be a native decision issue id'):
+                self.accept(1, self.sha(1), operation_id='apply-shape-%d' % number,
                             acceptance=acceptance(decision_id=decision))
+            self.assertEqual([call for call in self.native.calls if '--id' in call], lookups)
         self.assertEqual(len(self.native.writes()), before)
         self.accept(1, self.sha(1), acceptance=acceptance(decision_id='labelled-1'))
         # A repository entry keeps today's rule: its decision id is not looked up.
@@ -286,6 +293,42 @@ class AcceptanceRuleTests(AttestationCase):
             self.accept(1, self.sha(1))
         with patch('time.gmtime', return_value=time.struct_time((2026, 9, 29, 12, 0, 0, 1, 272, 0))):
             self.assertEqual(self.accept(1, self.sha(1), operation_id='in-time')['state'], 'accepted')
+        # The common case: a stale draft with no review date. The operator is told to check
+        # the fact again, not only that a review date is missing (review of 28c6d95).
+        self.propose(**attested(operation_id='stale', key='office.stale', review_by=None,
+                                authority=attestation(observed='2026-01-10')))
+        with self.assertRaisesRegex(ValueError, 'authority.observed 2026-01-10 is more than 6 months old; check '
+                                                'the fact again'):
+            self.accept(1, self.sha(1, 'office.stale'), key='office.stale', operation_id='apply-stale')
+        # A fresh observation with no review date still gets the schema's own message.
+        self.propose(**attested(operation_id='undated', key='office.undated', review_by=None))
+        with self.assertRaisesRegex(ValueError, 'an accepted revision needs review_by'):
+            self.accept(1, self.sha(1, 'office.undated'), key='office.undated', operation_id='apply-undated')
+
+    def test_today_is_the_utc_date_and_the_refusal_says_so(self):
+        with self.assertRaisesRegex(ValueError, r'authority.observed must not be later than today \(the UTC date, '
+                                                r'2026-10-01\)'):
+            self.propose(**attested(authority=attestation(observed='2026-10-02')))
+        with self.assertRaisesRegex(ValueError, r'authority.retrieved must not be later than today \(the UTC date, '
+                                                r'2026-10-01\)'):
+            self.propose(operation_id='page', key='identity.registry', authority={
+                'type': 'url', 'url': 'https://example.invalid/page', 'retrieved': '2026-10-02'})
+
+    def test_an_accepted_attestation_past_its_review_date_says_so_in_its_note(self):
+        self.propose(**attested(review_by='2026-10-10'))
+        self.accept(1, self.sha(1))
+        self.assertNotIn('PAST ITS REVIEW DATE', self.get()['record']['authority_note'])
+        with patch('time.gmtime', return_value=time.struct_time((2026, 10, 11, 12, 0, 0, 6, 284, 0))):
+            view = self.get()
+            self.assertEqual((view['state'], view['due']), ('accepted', 'expired'))
+            self.assertEqual(view['record']['authority_note'],
+                             'Attested by person:james on 2026-09-20 (host-check), accepted by an operator, and '
+                             'PAST ITS REVIEW DATE (2026-10-10): check the fact again before relying on it. It is '
+                             'provenance, not a pointer: it cannot be checked against a repository.')
+            (item,) = rr.read(['list'], self.native, [OPERATOR])['items']
+            self.assertIn('PAST ITS REVIEW DATE (2026-10-10)', item['authority_note'])
+            self.assertIn('PAST ITS REVIEW DATE', rr.read(['find', KEY], self.native, [OPERATOR])['records'][0][
+                'authority_note'])
 
     def test_a_direct_accepted_attestation_is_checked_before_its_anchor_is_created(self):
         self.native.actor = OPERATOR
@@ -346,7 +389,8 @@ class BatchTests(AttestationCase):
                          [(KEY, 'accepted'), ('owner.instruction.proceed', 'refused'),
                           ('calendar.trading', 'accepted')])
         self.assertIn('among acceptance.owners', result['items'][1]['reason'])
-        self.assertEqual((result['complete'], result['decision_id']), (True, DECISION))
+        self.assertEqual((result['complete'], result['stopped'], result['accepted'], result['refused'],
+                          result['decision_id']), (False, False, 2, 1, DECISION))
         self.assertEqual([self.get(key)['state'] for key in (KEY, 'owner.instruction.proceed', 'calendar.trading')],
                          ['accepted', 'draft-only', 'accepted'])
         # A retry of the same batch writes nothing for the accepted items.
@@ -393,7 +437,7 @@ class BatchTests(AttestationCase):
 
         with patch.object(keyed_entries.time, 'sleep') as sleep:
             result = self.batch([self.item(KEY), self.item('calendar.trading')], lock=lock)
-        self.assertTrue(result['complete'])
+        self.assertEqual((result['complete'], result['accepted'], result['refused']), (True, 2, 0))
         # The batch receipt, each item, the batch receipt again: four holds, never nested.
         self.assertEqual(events, ['lock', 'unlock after 0 write(s)', 'lock', 'unlock after 4 write(s)',
                                   'lock', 'unlock after 4 write(s)', 'lock', 'unlock after 0 write(s)'])

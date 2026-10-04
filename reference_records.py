@@ -328,7 +328,8 @@ def _validate_content(payload):
 
 
 def _write_time_rules(record):
-    """Rules that depend on today's date, checked only when a revision is written."""
+    """Rules that depend on today's date, checked only when a revision is written. "Today"
+    is the server's UTC date: a local date east of UTC can be a day ahead of it."""
     current = today()
     limit = _months_ahead(current, REVIEW_BY_MAX_MONTHS)
     authority = record['authority']
@@ -337,15 +338,15 @@ def _write_time_rules(record):
         # date a past one, and the refusal should name the cause.
         observed = _date(authority['observed'], 'authority.observed')
         if observed > current:
-            raise ValueError('authority.observed must not be later than today')
+            raise ValueError('authority.observed must not be later than today (the UTC date, %s)' % current)
         stale = _months_ahead(observed, ATTESTED_REVIEW_MONTHS)
-        if record['review_by'] is not None and _date(record['review_by'], 'review_by') > stale:
-            raise ValueError('review_by must be at most %d months after authority.observed (%s) for an '
-                             'attestation' % (ATTESTED_REVIEW_MONTHS, stale))
         if record['acceptance_state'] == 'accepted' and stale < current:
             raise ValueError('authority.observed %s is more than %d months old; check the fact again and '
                              'revise the entry with the new observation before it is accepted'
                              % (authority['observed'], ATTESTED_REVIEW_MONTHS))
+        if record['review_by'] is not None and _date(record['review_by'], 'review_by') > stale:
+            raise ValueError('review_by must be at most %d months after authority.observed (%s) for an '
+                             'attestation' % (ATTESTED_REVIEW_MONTHS, stale))
     if record['review_by'] is not None:
         review_by = _date(record['review_by'], 'review_by')
         if review_by > limit:
@@ -354,7 +355,7 @@ def _write_time_rules(record):
             raise ValueError('review_by %s is in the past; an accepted revision needs a future review date'
                              % record['review_by'])
     if authority['type'] == 'url' and _date(authority['retrieved'], 'authority.retrieved') > current:
-        raise ValueError('authority.retrieved must not be later than today')
+        raise ValueError('authority.retrieved must not be later than today (the UTC date, %s)' % current)
 
 
 def _months_ahead(day, months):
@@ -422,6 +423,7 @@ def attestation_acceptance_rules(record, acceptance, run):
                          '(authority.by) among acceptance.owners')
     decision = acceptance['decision_id']
     if not ISSUE_ID.fullmatch(decision):
+        # The id becomes a native argument, so its shape is checked before any native read.
         raise ValueError('acceptance.decision_id must be a native decision issue id for an attested entry')
     shown = json.loads(run(['list', '--id', decision, '--all', '--limit', '0', '--json']) or '[]')
     found = next((row for row in shown or [] if isinstance(row, dict) and row.get('id') == decision), None)
@@ -525,18 +527,23 @@ def authority_kind(record):
     return AUTHORITY_KINDS.get(((record or {}).get('authority') or {}).get('type'))
 
 
-def authority_note(record, accepted):
+def authority_note(record, accepted, current=None):
     """The sentence every read shows beside an attestation, else None.
 
-    Server-derived from validated fields only (the identity, the date and the basis), never
+    Server-derived from validated fields only (the identity, the dates and the basis), never
     the free-text `how` or `source`. `accepted` is whether the reader is presenting this
-    revision as the accepted record; a draft attestation is always marked not accepted.
+    revision as the accepted record; a draft attestation is always marked not accepted,
+    and an accepted one past its review date says so in the same sentence.
     """
     if record is None or not attested(record):
         return None
     authority = record['authority']
     who = 'Attested by %s on %s (%s)' % (authority['by'], authority['observed'], authority['basis'])
     if accepted:
+        if due(record.get('review_by'), current) == 'expired':
+            return (who + ', accepted by an operator, and PAST ITS REVIEW DATE (%s): check the fact again before '
+                    'relying on it. It is provenance, not a pointer: it cannot be checked against a repository.'
+                    % record['review_by'])
         return who + ', accepted by an operator. It is provenance, not a pointer: it cannot be checked against a repository.'
     return ('NOT ACCEPTED. ' + who + '; no operator has accepted it, so it is a lead and not authority. '
             'It cannot be checked against a repository.')
