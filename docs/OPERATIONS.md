@@ -298,7 +298,7 @@ history.
   `compact-guidance-acks` drops stale ones on demand (its
   `acks_compacted_by`/`acks_compacted_at` audit is kept across later sets). An
   acknowledgement does not prove a read.
-* Guidance is bounded (8000 bytes) plain text. C0, C1, bidi, word-joiner, BOM and Unicode tag (`U+E0000`-`U+E007F`) characters are refused, and so are the other characters that render as nothing or as a blank (kittrial-5bb.105): variation selectors (`U+FE00`-`U+FE0F`, `U+E0100`-`U+E01EF`, and the Mongolian `U+180B`-`U+180D`, `U+180F`), the Hangul fillers (`U+115F`, `U+1160`, `U+3164`, `U+FFA0`), the Khitan filler `U+16FE4`, `U+034F`, `U+17B4`, `U+17B5`, `U+2800`, `U+FFFC`, and every format character (Unicode category Cf: `U+061C`, `U+180E`, `U+FFF9`-`U+FFFB`, the musical, shorthand and Egyptian format controls and the rest), so the rule does not depend on a list. The only format characters allowed are the visible ones that are part of real text (the Arabic number signs and end of ayah `U+0600`-`U+0605`, `U+06DD`, `U+0890`, `U+0891`, `U+08E2`, the Syriac abbreviation mark `U+070F`, the Kaithi number signs) and ZWNJ/ZWJ under the rule below. The same check runs when the text is read, so a hand-edited file that carries one reads `unreadable` until an operator sets clean text. One `set-guidance` repairs any file that cannot be read as guidance (a refused character, over the limit, not UTF-8): `guidance-status` (and the endpoint's `guidance status`) answers in that state instead of failing: `unreadable: true`, `unreadable_reason` naming the character or the limit, `audit_record` (the version, setter and time of the last generation an operator set), the acknowledgement table and the `repair` sentence, never the unreadable text. The set replaces the file, prints that it did, answers `replaced_unreadable: true`, copies nothing of the unreadable file into the record, and keeps the history and the acknowledgement rules of any other set. (Before kittrial-5bb.105 that set was refused with the old file's error and the repair was `clear-guidance`, which drops both.) ZWNJ and ZWJ are allowed only between two letters or combining marks of one script that uses them (Arabic, including Persian and Urdu; Syriac; Mongolian; N'Ko; Devanagari, Bengali, Gurmukhi, Gujarati, Oriya, Tamil, Telugu, Kannada, Malayalam, Sinhala); anywhere else, including inside a Latin word and in an emoji sequence, they are refused. An emoji that needs `U+FE0F` is therefore refused: check the text with `guidance-status` before upgrading a project whose guidance holds one.
+* Guidance is bounded (8000 bytes) plain text. C0, C1, bidi, word-joiner, BOM and Unicode tag (`U+E0000`-`U+E007F`) characters are refused, and so are the other characters that render as nothing or as a blank (kittrial-5bb.105): variation selectors (`U+FE00`-`U+FE0F`, `U+E0100`-`U+E01EF`, and the Mongolian `U+180B`-`U+180D`, `U+180F`), the Hangul fillers (`U+115F`, `U+1160`, `U+3164`, `U+FFA0`), the Khitan filler `U+16FE4`, `U+034F`, `U+17B4`, `U+17B5`, `U+2800`, `U+FFFC`, and every format character (Unicode category Cf: `U+061C`, `U+180E`, `U+FFF9`-`U+FFFB`, the musical, shorthand and Egyptian format controls and the rest), so the rule does not depend on a list. The only format characters allowed are the visible ones that are part of real text, and only directly before a letter or digit of their own script (kittrial-5bb.121: a terminal often draws them with zero width, so one inside a Latin word could split a keyword without showing; all thirteen are prepended marks, written in front of the number or word they span): the Arabic number signs, end of ayah, pound and piastre marks and supertitle sign (`U+0600`-`U+0605`, `U+06DD`, `U+0890`, `U+0891`, `U+08E2`) before an Arabic letter or digit, the Syriac abbreviation mark `U+070F` before a Syriac letter, and the Kaithi number signs (`U+110BD`, `U+110CD`) before a Kaithi letter or digit or a Devanagari digit (`U+0966`-`U+096F`; Kaithi has no digits of its own and Unicode's ScriptExtensions.txt lists those digits for Kaithi); and ZWNJ/ZWJ under the rule below. Only the FOLLOWING character counts, and it must be of Unicode category L* or N* inside that script's code-point ranges: a mark at the end of the text or before a space, another mark, a combining mark, tatweel `U+0640`, an Arabic presentation form (`U+FB50`-`U+FDFF`, `U+FE70`-`U+FEFF`), punctuation or an unassigned code point is refused. Arabic letters assigned or changed after Unicode 13.0 (`U+0870`-`U+089F`, `U+08B5`, `U+08C8`-`U+08FF`) do not count either, so that every supported Python gives the same answer. The answer is the same on Python 3.10 to 3.13 even though their Unicode tables differ (13.0 to 15.1): `U+0890` and `U+0891` are unassigned in 3.10 and Cf from 3.11, and the Egyptian format controls `U+13439`-`U+1343F` are unassigned in 3.10 and Cf from 3.12, so the allowed marks, their scripts and those Egyptian controls are listed explicitly in the kit rather than read from the interpreter's tables. Blank characters that render as a visible space are accepted on purpose: the no-break spaces `U+00A0` and `U+202F`, `U+2000`-`U+200A`, `U+205F`, the ideographic space `U+3000` and the Ogham space mark `U+1680`. They do not hide text, they are common in pasted French and CJK text, and an acknowledgement names the exact version, so two texts that differ only in such a space are never confused for one another. The same check runs when the text is read, so a hand-edited file that carries one reads `unreadable` until an operator sets clean text. One `set-guidance` repairs any file that cannot be read as guidance (a refused character, over the limit, not UTF-8): `guidance-status` (and the endpoint's `guidance status`) answers in that state instead of failing: `unreadable: true`, `unreadable_reason` naming the character or the limit, `audit_record` (the version, setter and time of the last generation an operator set), the acknowledgement table and the `repair` sentence, never the unreadable text. The set replaces the file, prints that it did, answers `replaced_unreadable: true`, copies nothing of the unreadable file into the record, and keeps the history and the acknowledgement rules of any other set. (Before kittrial-5bb.105 that set was refused with the old file's error and the repair was `clear-guidance`, which drops both.) ZWNJ and ZWJ are allowed only between two letters or combining marks of one script that uses them (Arabic, including Persian and Urdu; Syriac; Mongolian; N'Ko; Devanagari, Bengali, Gurmukhi, Gujarati, Oriya, Tamil, Telugu, Kannada, Malayalam, Sinhala); anywhere else, including inside a Latin word and in an emoji sequence, they are refused. An emoji that needs `U+FE0F` is therefore refused: check the text with `guidance-status` before upgrading a project whose guidance holds one.
 * `clear-guidance` removes both files, writes the small local
   `.guidance-clear.json` audit record (who cleared it, when, the cleared version,
   bounded to the last 10 clears) and guidance reads `present: false`.
@@ -338,8 +338,43 @@ has an effect in both directions.
 * **Rolling back.** This kit accepts some text the kit before it refuses: a zero-width
   joiner or non-joiner after a combining mark (the common Indic use after a virama) is
   accepted here and reads `unreadable` there, and that project's backup is recorded
-  degraded there. Before rolling back a project whose guidance uses one, set text
-  without it, or clear the guidance, on this kit.
+  degraded there. **Check for it before every rollback.** For each project, on the
+  coordination host:
+
+  ```sh
+  python3 -c "import sys,unicodedata as u;t=open(sys.argv[1],encoding='utf-8').read();print([i for i,c in enumerate(t) if c in '\u200c\u200d' and i and u.category(t[i-1]).startswith('M')] or 'none')" /home/beads/beads-runtime/projects/PROJECT/GUIDANCE.md
+  ```
+
+  It prints `none`, or the positions of a joiner that follows a combining mark. If it
+  prints positions, set text without them, or clear the guidance, on this kit before
+  rolling back.
+
+**Upgrading to, and rolling back from, kittrial-5bb.121.**
+
+* **Upgrading.** A visible format character (the list above) that is not directly
+  followed by a letter or digit of its own script - for example an Arabic number sign
+  before ASCII digits, at the end of a word, or before a combining mark or tatweel - was
+  accepted before and reads `unreadable` after the upgrade. Run `guidance-status` with
+  the new kit on each project before upgrading, as above.
+* **A same-text repair keeps the original setter.** A set with the same text that
+  rewrites a record failing the strict check (the check acknowledge, compaction and
+  backup apply) used to replace `set_by` and `set_at` with the repairing operator and
+  time, and the original setter was kept nowhere. It now keeps `set_by` and `set_at` in
+  `.guidance.json` and records the repair in a separate local file beside it,
+  `.guidance-repair.json` (`schema_version`, the repaired generation's `version`,
+  `set_by` and `set_at`, and `repaired_by`, `repaired_at`). `guidance get`/`state`,
+  `brief` (JSON and the text `Guidance:` line) and `guidance-status` show
+  `repaired_by`/`repaired_at` from that file only while it names the record's current
+  version, setter and time and the record is intact; a file for another generation or of
+  any other shape is ignored. The next set of different text, and `clear-guidance`,
+  remove it. The file is local: `backup` does not carry it, so a restored project shows
+  the original setter without the repair note.
+* **Rolling back below kittrial-5bb.121.** Nothing to do for the repair audit. The
+  record keeps exactly the fields the older kit validates, so `guidance ack`,
+  `compact-guidance-acks`, `backup` and `restore-new` work there unchanged; the older kit
+  never reads `.guidance-repair.json`. A set there that rewrites the record (new text,
+  or its own same-text repair) changes the version or the setter and leaves the file
+  behind, where this kit then ignores it.
 
 **Rollback gap and the exact step.** An older kit (at or before
 `dca96b9d`) validates the coordination sidecar against a fixed path set that does

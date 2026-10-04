@@ -336,8 +336,11 @@ def format_brief(result):
         # Unbound text has no version anyone may follow (kittrial-5bb.105); the warning line below says why.
         lines.append('Guidance: present but withheld until the operator repairs it | attention: True')
     elif guidance and guidance.get('present'):
-        lines.append('Guidance: version %s set by %s at %s | acknowledged: %s | attention: %s'%(
-            guidance['version'],guidance.get('set_by') or 'unknown',guidance.get('set_at') or 'unknown',
+        # A same-text repair keeps the original setter; show the repair beside it (kittrial-5bb.121).
+        repaired=(' (repaired by %s at %s)'%(guidance['repaired_by'],guidance.get('repaired_at') or 'unknown')
+                  if guidance.get('repaired_by') else '')
+        lines.append('Guidance: version %s set by %s at %s%s | acknowledged: %s | attention: %s'%(
+            guidance['version'],guidance.get('set_by') or 'unknown',guidance.get('set_at') or 'unknown',repaired,
             guidance.get('acknowledged'),guidance.get('attention')))
     if guidance and guidance.get('warning'):
         lines.append('Guidance warning: '+guidance['warning'])

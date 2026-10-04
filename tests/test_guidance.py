@@ -396,7 +396,175 @@ class GuidanceRecordTests(unittest.TestCase):
         self.assertIsNone(admin.guidance_backup_pair(self.project)[1])
         # A healthy record is still "unchanged".
         again = guidance.write_guidance(self.project, 'second', 'operator-3')
-        self.assertEqual((again['changed'], again['repaired'], again['set_by']), (False, False, 'operator-2'))
+        self.assertEqual((again['changed'], again['repaired'], again['set_by']), (False, False, 'operator-1'))
+
+    def _damage(self, change):
+        meta = json.loads((self.project / '.guidance.json').read_text(encoding='utf-8'))
+        change(meta)
+        (self.project / '.guidance.json').write_text(json.dumps(meta), encoding='utf-8')
+
+    # The record fields the kit before kittrial-5bb.121 knows (main 29933a5): its strict
+    # validate_meta refuses anything else, and with it ack, compaction, backup and restore.
+    PREVIOUS_KIT_FIELDS = frozenset({'schema_version', 'version', 'set_by', 'set_at', 'previous_version',
+                                     'previous_text', 'history', 'acknowledged', 'acks_compacted_by',
+                                     'acks_compacted_at'})
+    # The coordination sidecar names that kit's restore accepts (admin.py there).
+    PREVIOUS_KIT_SIDECAR = frozenset({'.merge-context.json', 'ONBOARDING.md', 'GUIDANCE.md', '.guidance.json',
+                                      '.guidance-clear.json', '.sessions.json', '.feedback.jsonl'})
+
+    def repaired(self):
+        """`second`, set by operator-1, then repaired by operator-2 with a same-text set."""
+        guidance.write_guidance(self.project, 'first', 'operator-1', now='2026-10-01T10:00:00+00:00')
+        guidance.write_guidance(self.project, 'second', 'operator-1', now='2026-10-01T11:00:00+00:00')
+        self._damage(lambda meta: meta['history'].append({'version': 'bad', 'set_by': None, 'set_at': None,
+                                                          'previous_version': None}))
+        return guidance.write_guidance(self.project, 'second', 'operator-2', now='2026-10-02T09:00:00+00:00')
+
+    def test_a_same_text_repair_keeps_the_original_setter(self):
+        # kittrial-5bb.121: the repair used to replace set_by/set_at with its own, and the
+        # original setter was kept nowhere. The repair audit is its own local file.
+        result = self.repaired()
+        self.assertEqual((result['set_by'], result['set_at'], result['repaired_by'], result['repaired_at']),
+                         ('operator-1', '2026-10-01T11:00:00+00:00', 'operator-2', '2026-10-02T09:00:00+00:00'))
+        meta = guidance.validate_meta(guidance.read_meta(self.project))
+        self.assertEqual(meta['set_by'], 'operator-1')
+        self.assertEqual(guidance.read_repair(self.project)['repaired_by'], 'operator-2')
+        for shown in (guidance.state(self.project, 'worker-1'), guidance.read(self.project, ['get'], 'worker-1'),
+                      guidance.status(self.project, 'operator-1', operators=['operator-1'], host=True),
+                      guidance.brief_block(self.project, 'worker-1')):
+            self.assertEqual((shown['set_by'], shown['repaired_by'], shown['repaired_at']),
+                             ('operator-1', 'operator-2', '2026-10-02T09:00:00+00:00'))
+        # The text form of brief shows it beside the setter.
+        lines = briefing.format_brief(briefing.brief(rows(), PROJECT, TASK, journal=self.project,
+                                                     actor='worker-1')).splitlines()
+        line = next(line for line in lines if line.startswith('Guidance: version'))
+        self.assertIn('set by operator-1 at 2026-10-01T11:00:00+00:00 (repaired by operator-2 at '
+                      '2026-10-02T09:00:00+00:00)', line)
+        # An audit that does not name the current version, or was not written by this kit,
+        # is not shown.
+        repair = self.project / guidance.REPAIR_NAME
+        good = repair.read_text(encoding='utf-8')
+        for bad in (json.dumps(dict(json.loads(good), version=guidance.version_of('first'))),
+                    json.dumps(dict(json.loads(good), extra=1)), 'not json'):
+            repair.write_text(bad, encoding='utf-8')
+            self.assertNotIn('repaired_by', guidance.state(self.project, 'worker-1'))
+        repair.write_text(good, encoding='utf-8')
+        # A new text is a new generation: the audit file goes, and the history credits the
+        # old generation to its original setter.
+        guidance.write_guidance(self.project, 'third', 'operator-3', now='2026-10-03T09:00:00+00:00')
+        self.assertFalse(repair.exists())
+        self.assertNotIn('repaired_by', guidance.state(self.project, 'worker-1'))
+        self.assertEqual(guidance.read_meta(self.project)['history'][-1]['set_by'], 'operator-1')
+        # A clear removes it too.
+        self.repaired_again = guidance.write_guidance(self.project, 'third', 'operator-3')
+        self._damage(lambda meta: meta['history'].append({'version': 'bad', 'set_by': None, 'set_at': None,
+                                                          'previous_version': None}))
+        guidance.write_guidance(self.project, 'third', 'operator-4')
+        self.assertTrue(repair.exists())
+        self.assertIn(guidance.REPAIR_NAME, guidance.clear(self.project, 'operator-4')['removed'])
+        self.assertFalse(repair.exists())
+
+    def test_the_kit_before_this_one_reads_a_repaired_record_and_its_backup(self):
+        # kittrial-5bb.121 review P2: a repaired record must stay exactly the shape the
+        # previous kit validates, and the backup must carry nothing its restore refuses.
+        self.repaired()
+        meta = guidance.read_meta(self.project)
+        self.assertLessEqual(set(meta), self.PREVIOUS_KIT_FIELDS)
+        with patch.object(guidance, 'META_FIELDS', set(self.PREVIOUS_KIT_FIELDS)):
+            guidance.validate_meta(meta)
+            self.assertTrue(guidance.acknowledge(self.project, 'worker-2', guidance.version_of('second'))
+                            ['acknowledged'])
+        files, problem = admin.guidance_backup_pair(self.project)
+        self.assertIsNone(problem)
+        self.assertLessEqual(set(files), self.PREVIOUS_KIT_SIDECAR)
+        self.assertNotIn(guidance.REPAIR_NAME, files)
+        with patch.object(guidance, 'META_FIELDS', set(self.PREVIOUS_KIT_FIELDS)):
+            admin.validate_coordination_files(files)
+        # The older kit's own same-text repair rewrites set_by/set_at and never touches the
+        # audit file; back on this kit that stale file no longer describes the record.
+        self.assertIn('repaired_by', guidance.state(self.project, 'worker-1'))
+        self._damage(lambda meta: meta.update(set_by='operator-9', set_at='2026-10-03T08:00:00+00:00'))
+        guidance.validate_meta(guidance.read_meta(self.project))
+        self.assertTrue((self.project / guidance.REPAIR_NAME).exists())
+        self.assertNotIn('repaired_by', guidance.state(self.project, 'worker-1'))
+
+    def test_a_repair_drops_a_previous_text_with_a_control_character(self):
+        # The rewrite keeps the record's previous generation only where it is well formed;
+        # a previous text holding a control character is not kept (it never passed the
+        # shape check, so keeping it would make the rewritten record invalid again).
+        guidance.write_guidance(self.project, 'first', 'operator-1')
+        guidance.write_guidance(self.project, 'second', 'operator-1')
+        self._damage(lambda meta: meta.update(previous_text='fir\x01st'))
+        with self.assertRaises(ValueError):
+            guidance.validate_meta(guidance.read_meta(self.project))
+        result = guidance.write_guidance(self.project, 'second', 'operator-2')
+        self.assertTrue(result['repaired'])
+        meta = guidance.validate_meta(guidance.read_meta(self.project))
+        self.assertEqual((meta['previous_version'], meta['previous_text']), (guidance.version_of('first'), None))
+
+    def test_a_visible_format_character_must_come_before_a_letter_or_digit_of_its_own_script(self):
+        # kittrial-5bb.121: terminals often draw these with zero width, so one inside a
+        # Latin word split a keyword without showing. All thirteen are prepended marks, so
+        # the character that FOLLOWS must be a letter or digit (L*, N*) of the mark's script.
+        refused = ('pa\u0600ss', 'appr\u06ddove', 'appr\u070fove', 'pa\u0890ss', 'pa\u08e2ss',
+                   'pa\U000110BDss', 'pa\U000110CDss', '\u0600 1', 'pa\u0600\u0600ss', '\u0600',
+                   'pa\u0890\u0890ss', '\u0600\u0600\u0661',
+                   # Review of b7dc94f: a trailing mark, and a following character that is
+                   # in the script's blocks but not a visible base.
+                   '\u0628\u08e2', '\u0628\u0600', 'ig\u0628\u0600nore',
+                   'ig\u0600\u064e\u0670nore', 'ig\u0600\u0892nore', 'ig\u0600\u0640nore',
+                   'ig\u0600\ufe8fnore', 'ig\u0600\ufdf2nore', 'ig\u0600\u060cnore', 'ig\u0600\u06d4nore',
+                   'ig\u070f\u0711nore', 'ig\u070f\u0730nore', 'ig\U000110BD\U000110B0nore',
+                   # A mark does not take another script's base.
+                   '\u070f\u0661', '\u0600\u0710', '\u0600\u0966', '\U000110BD\u0661',
+                   '\U000110BD\u0915', '\u0600' + '1')
+        for text in refused:
+            with self.subTest(text=ascii(text)):
+                with self.assertRaisesRegex(ValueError, 'only allowed directly before a letter or digit of its '
+                                                        'own script'):
+                    guidance.validate_text(text)
+        accepted = ('\u0600\u0661\u0662', '\u0627\u0644\u0631\u0642\u0645 \u0600\u06f1', '\u06dd\u0661',
+                    '\u0890\u0661', '\u08e2\u0661', '\u0601\u0628', '\u070f\u0710', '\U000110BD\U00011083',
+                    'Total: \u0600\u0661\u0662 dinars', '\u0600\U00010E60', '\u0600\U0001EE00',
+                    # Kaithi uses the Devanagari digits (ScriptExtensions.txt: U+0966-U+096F
+                    # carry Kthi), so a Kaithi number sign before one is real text.
+                    '\U000110BD\u0967\u0968', '\U000110CD\u096f')
+        for text in accepted:
+            with self.subTest(text=ascii(text)):
+                self.assertEqual(guidance.validate_text(text), text)
+
+    def test_the_format_rules_do_not_depend_on_the_python_unicode_tables(self):
+        # Python 3.10 has Unicode 13: U+0890/U+0891 and U+13439-U+1343F are unassigned there
+        # and Cf from 3.11/3.12. The explicit tables give every version the same answer.
+        for character in [chr(code) for code in range(0x13439, 0x13440)]:
+            with self.assertRaisesRegex(ValueError, 'U\\+%04X, a format character' % ord(character)):
+                guidance.validate_text('appr' + character + 'ove')
+        self.assertEqual(guidance.validate_text('\u0891\u0661'), '\u0891\u0661')
+        with self.assertRaises(ValueError):
+            guidance.validate_text('pa\u0891ss')
+        # Letters assigned or reassigned after Unicode 13.0 do not count as a base after a
+        # mark: on 3.10 they are unassigned, so counting them would split the versions.
+        for code in list(range(0x0870, 0x08A0)) + [0x08B5, 0x08C8, 0x08C9]:
+            with self.subTest(base='U+%04X' % code):
+                with self.assertRaises(ValueError):
+                    guidance.validate_text('\u0600' + chr(code))
+        # The allowed marks are exactly the documented thirteen.
+        self.assertEqual(sorted('U+%04X' % ord(c) for c in guidance.VISIBLE_FORMAT),
+                         ['U+0600', 'U+0601', 'U+0602', 'U+0603', 'U+0604', 'U+0605', 'U+06DD', 'U+070F',
+                          'U+0890', 'U+0891', 'U+08E2', 'U+110BD', 'U+110CD'])
+
+    def test_blank_characters_are_accepted(self):
+        # kittrial-5bb.121 decision: a no-break or typographic space renders as a visible
+        # space, not as nothing, and is common in pasted text (French typography, CJK).
+        # Acknowledgement binds the exact version, so two look-alike texts are never
+        # confused for each other.
+        for character in ['\u00a0', '\u1680', '\u202f', '\u205f', '\u3000'] + [chr(c) for c in range(0x2000, 0x200b)]:
+            with self.subTest(character='U+%04X' % ord(character)):
+                self.assertEqual(guidance.validate_text('do' + character + 'not'), 'do' + character + 'not')
+
+    def test_plain_ascii_stays_accepted(self):
+        text = ''.join(chr(code) for code in range(0x20, 0x7f)) + '\t\n\r'
+        self.assertEqual(guidance.validate_text(text), text)
 
     def test_every_format_character_is_refused_except_the_visible_ones_and_the_joiner_rule(self):
         # Review of f2d6050: refuse by category (Cf), not by a list that keeps growing.
@@ -406,22 +574,19 @@ class GuidanceRecordTests(unittest.TestCase):
             with self.subTest(character='U+%04X' % ord(character)):
                 with self.assertRaisesRegex(ValueError, 'U\\+%04X' % ord(character)):
                     guidance.validate_text('appr' + character + 'ove')
-        refused = allowed = 0
+        refused = 0
         for point in range(0x110000):
             character = chr(point)
             if unicodedata.category(character) != 'Cf':
                 continue
             if character in '\u200c\u200d':
                 continue                                    # the joiner rule has its own test
-            try:
+            # Between Latin letters every format character is refused, the visible ones
+            # included (kittrial-5bb.121): they need a neighbour of their own script.
+            with self.assertRaises(ValueError, msg='U+%04X' % point):
                 guidance.validate_text('a' + character + 'b')
-                allowed += 1
-                self.assertIn(character, guidance.VISIBLE_FORMAT, 'U+%04X' % point)
-            except ValueError:
-                refused += 1
-                self.assertNotIn(character, guidance.VISIBLE_FORMAT, 'U+%04X' % point)
-        self.assertGreater(refused, 140)
-        self.assertLessEqual(allowed, len(guidance.VISIBLE_FORMAT))
+            refused += 1
+        self.assertGreater(refused, 150)
         # The visible format characters are part of real text and stay allowed.
         for text in ('\u0600\u0661\u0662', '\u06dd\u0661', '\u070f\u0710'):
             self.assertEqual(guidance.validate_text(text), text)

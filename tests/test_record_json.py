@@ -231,7 +231,7 @@ class NoUnguardedParseTests(unittest.TestCase):
         uses = {path.name: path.read_text(encoding='utf-8').count('record_json.loads(')
                 for path in KIT.glob('*.py') if path.name != 'record_json.py'}
         self.assertEqual({name: count for name, count in uses.items() if count}, {
-            'briefing.py': 3, 'endpoint.py': 2, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 2,
+            'briefing.py': 3, 'endpoint.py': 2, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
             'handoff.py': 1, 'http_service.py': 2, 'lifecycle.py': 2, 'recovery.py': 1, 'requirements.py': 1,
             'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
 
