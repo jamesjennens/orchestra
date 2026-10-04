@@ -256,11 +256,17 @@ def trusted_payloads(rows,events=None):
 def project_facts(rows):
     events=events_by_dimension(rows)
     trusted=trusted_payloads(rows,events)
+    history={entry['id']:entry['scopes'] for entry in scoped_evidence(rows,('deployed',LIVE))}
     result=[]
     for row in rows:
         if row.get('issue_type')=='event':continue
         dimensions=trusted[row['id']]
         live=dimensions[LIVE]['value']
+        current_scope=dimensions[DIMENSIONS[0]]['scope']
+        if current_scope is not None and dimensions['deployed']['value']=='passed':
+            winner,value=environment_liveness(history.get(row['id'],[]),current_scope.get('environment',''))
+            if winner is not None and (value==LIVE_SUPERSEDED or winner['scope']!=current_scope):
+                live=LIVE_SUPERSEDED
         facts={}
         for dim in DIMENSIONS:
             state=dimensions[dim];payload=state['payload']
@@ -628,7 +634,7 @@ def validate_release_payload(p,require_targets=True):
             validate_scope(item['scope'])
             if item['scope']['environment']!=p['scope']['environment']:
                 raise ValueError('a release supersedes scopes in its own environment only')
-            key=content_hash(item['scope'])
+            key=(item['task'],content_hash(item['scope']))
             if key in filed:raise ValueError('duplicate release supersede scope')
             filed.add(key)
     return p
@@ -1271,8 +1277,9 @@ def _check_release_identity(payload,op_index):
     prefix=payload['operation_id']+'/'
     for operation,(prior,_event) in op_index.items():
         if not operation.startswith(prefix):continue
+        if prior['dimension'] not in ('lifecycle-scope','deployed'):continue
         if any(prior['scope'][key]!=payload['scope'][key] for key in ('release_id','environment')):
-            raise ValueError('operation ID already used for different release/environment: '+payload['operation_id'])
+            raise ValueError('operation ID already used for different content (release/environment); a new operation ID is needed: '+payload['operation_id'])
 
 
 def _check_release_operations(plans,negative,op_index,evidence):

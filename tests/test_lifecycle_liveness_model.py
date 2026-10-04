@@ -12,7 +12,7 @@ def commit(n):return ('%02x'%n)*20
 class Scenario:
     ENVIRONMENTS=('production','staging')
     RELEASES={'R1':4,'R2':6,'R3':8,'H':9}
-    DELIVERIES={'ta':[2],'tx':[5,7],'tc':[3],'th':[9]}
+    DELIVERIES={'ta':[2],'tx':[5,7],'td':[5],'tc':[3],'th':[9]}
     def __init__(self):
         self.store=NativeStore(tasks=tuple(self.DELIVERIES))
         self.expected={e:{t:None for t in self.DELIVERIES} for e in self.ENVIRONMENTS}
@@ -116,8 +116,8 @@ class RuleTests(unittest.TestCase):
         s=Scenario()
         for r in ('R1','R2','R3'):self.step(s,r)
         entry=next(x for x in lifecycle.scoped_evidence(s.store.rows,('deployed',lifecycle.LIVE)) if x['id']=='tx')
-        latest=max(entry['scopes'],key=lambda c:(c.get(lifecycle.LIVE) or {}).get('order',-1))
-        s.write(payload('tx',lifecycle.LIVE,'superseded',operation='negative',scope_value=latest['scope']))
+        older=next(c for c in entry['scopes'] if c['scope']['release_id']=='R2')
+        s.write(release_payload([],operation='negative',supersede_scopes=[{'task':'tx','scope':older['scope']}]))
         s.expected['production']['tx']=None;s.check(self)
 
 if __name__=='__main__':unittest.main()
