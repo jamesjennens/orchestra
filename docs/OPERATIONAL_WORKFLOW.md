@@ -143,6 +143,98 @@ Use a new operation ID for each new assertion or correction. After an uncertain 
 
 Raw `bd` labels alone are insufficient evidence: an old `tested:passed` label can remain after scope changes. The contextual `lifecycle.py list` output is the authoritative lifecycle view; it checks scope, native event order, payload attribution and label agreement. Missing, mismatched or ambiguous evidence becomes unknown.
 
+Three payload fields are optional and additive: `note` (a per-task note, any fact), `trigger` (a free-text next trigger, only on a `pending` fact) and `defect_task` (only on `enabled=enabled-with-known-defect`, below). Every payload that validated before still validates; a kit that does not know one of these fields reads that fact as `unknown`, never as `passed`.
+
+## Record one release deploy for many tasks
+
+A release covers every task already integrated into it, so one operation records the release scope and the deployed fact for all of them instead of one command per task. Save the canonical export as above, keep a Git checkout that can see the release commit, and save `release.json`:
+
+```json
+{
+  "schema_version": 1,
+  "operation_id": "alex/release-2026-10-05",
+  "dimension": "release-deploy",
+  "value": "passed",
+  "scope": {
+    "source_commit": "",
+    "integration_commit": "5555555555555555555555555555555555555555",
+    "release_id": "release-2026-10-05",
+    "environment": "production"
+  },
+  "evidence": ["https://example.org/builds/987"],
+  "provenance": "performed",
+  "actor": "alex/session1",
+  "live_verified": false,
+  "targets": []
+}
+```
+
+```sh
+python lifecycle.py release --config client.local.json --project example --actor alex/session1 --file release.json --export issues.jsonl --repo /path/to/checkout --dry-run
+python lifecycle.py release --config client.local.json --project example --actor alex/session1 --file release.json --export issues.jsonl --repo /path/to/checkout
+python lifecycle.py release --config client.local.json --project example --actor alex/session1 --file release.json --export issues.jsonl --repo /path/to/checkout --live-verified
+```
+
+Run `--dry-run` first: it prints the resolved `targets`, the tasks it `skipped` with a reason, any `flags`, the `total_targets`, the `chunks` plan and an `expected_seconds` estimate, and writes nothing. Selection is what is NEW in this release. A task is a target only when its chosen (newest) trusted `integrated=passed` scope is an ancestor of the release commit — decided by `git merge-base --is-ancestor` in `--repo` — is not named by an operator `Kind: integration-revert-v1` revert record, and has not already been recorded `deployed=passed` for this environment in a release that contains that integration commit and is itself contained in this release. That last rule is what stops a second release from rewriting the scope and deployed fact of every task ever integrated. A task whose integrated events cannot be trusted (raw native `set-state`, two `integrated:` labels, ambiguous event order, or an untrusted scope) is reported under `skipped` with that reason instead of being dropped; a task whose passing integration commit is missing from the checkout (a shallow clone), not a full lowercase commit, or undecidable is likewise listed under `skipped`, never guessed. `--previous-release-commit PREV` restricts the selection to integrations in `PREV..R`.
+
+Because the selection is a subset, `targets` in the input file is an optional caller subset: task names, or full `{task,source_commit,integration_commit}` entries the command checks against its resolution (a caller may also leave it empty). `--target TASK` adds one name and may repeat; `--page-size N --page P` page through a large resolution. One request still covers at most 200 targets, so the command splits the write into request groups of `--chunk-size` (default 50) and the project lock is released between groups: the whole operation can therefore cover more than 200 tasks, and no single request approaches the client's 150 s timeout. `--dry-run` prints `expected_seconds`, a conservative upper bound for the resolved page. Measured on the authoritative Linux host against a synthetic 900-row export (300 decoy tasks, 200 target tasks, 400 lifecycle events): 200 targets took **0.106 s with ONE export and 400 native writes** (0.0005 s per target), and the exact retry took 0.131 s and reconciled every target; the same 200 targets with `live_verified` took 0.123 s with one export and 600 writes. That harness replaces the `bd` binary, so it isolates the change that matters — the pre-fix path paid a full export per fact (measured by the reviewer at 731 s, 3.65 s per target, 249 s for the exact retry); with one export per request the remaining cost is the native writes themselves, now bounded per group.
+
+Each target keeps its own `source_commit`/`integration_commit` and adds the release `release_id` and `environment`, so the recorded scope is the one a hand-written scope event would have. Every target is verified against ONE export read once for the whole request, and every derived per-task operation ID is checked for a conflicting planted fact, before the first write: a stale target or a used ID refuses the whole group and nothing is written.
+
+The endpoint then records the scope event (only when it differs from the task's current scope), one `deployed=passed` fact carrying the shared evidence block and the target's optional `note`, and, with `--live-verified` or `"live_verified": true`, one `live-verified=passed` fact. The note rides the deployed fact ONLY: the scope event keeps exactly its four scope fields, so a kit that predates the optional fields (and rejects unknown ones) still reads the scope. Add `"note": "..."` (one line, up to 500 characters) to a target for a per-task note. Deterministic per-task operation IDs make an exact retry reconcile instead of duplicating; changed evidence or notes need a new operation ID.
+
+Because the release scope becomes each target's current scope, the six-fact readers (`brief`, `work`, `lifecycle.py list`) show `integrated=unknown` (and any earlier-scope fact unknown) for every target until it is recorded for the release scope; the per-scope integration evidence and the review reads are unaffected, and the command prints that reminder as `reader_note`.
+
+Ancestry is checked ONLY in the client: the endpoint re-verifies that each target's `source_commit`/`integration_commit` is a trusted `integrated=passed` scope in its own export, but it does not run git and cannot tell whether that commit is an ancestor of the release. The target list is therefore an assertion under the kit's existing trust model, like `commit`/`base_commit` in contribution review.
+
+When a selected target's `source_commit` is not the task's current contribution (a release shipping a superseded revision, or a revision replaced while its successor awaits review), the dry run and the result carry a `flags`/`flag` entry naming the delivery and the current contribution, and `brief`/`work` show `deployed_delivery` (release, environment, source commit) plus `deployed_delivery_is_current_contribution`.
+
+## Read what a deployed release still owes
+
+```sh
+python lifecycle.py evidence-owed --export issues.jsonl
+```
+
+Derives the list from the whole trusted scope history, not only each task's current scope, and groups it by environment and release. It prints, for every recorded scope whose `deployed` is `passed`, `pending` or `failed`, the task, `deployed`, the `enabled` flag (below), `remaining_evidence`, `responsible` and `next_trigger`. A later release or another environment therefore never hides an earlier debt: a task live-verified on staging but not on production and then released again to production still shows the production `live-verified` owed for the first release. `remaining_evidence` is `deployed`/`live-verified` when they are not `passed`/`not-applicable`, plus any dimension explicitly recorded `pending` or `failed` in that scope. `responsible` is the task's assignee, falling back to the actor that recorded the deployed fact. `next_trigger` is the free-text `trigger` carried by a pending fact:
+
+```json
+{
+  "schema_version": 1,
+  "operation_id": "alex/verify-001",
+  "task": "example-task",
+  "dimension": "live-verified",
+  "value": "pending",
+  "scope": {"source_commit": "1111111111111111111111111111111111111111", "integration_commit": "", "release_id": "release-2026-10-05", "environment": "production"},
+  "evidence": ["plan:nightly-job-42"],
+  "provenance": "performed",
+  "actor": "alex/session1",
+  "trigger": "after the nightly job on 2026-10-06"
+}
+```
+
+Reading changes nothing, and a deployed release with no trusted scope is never invented.
+
+## Switched on but not effective
+
+`deployed=passed` says the release is live; it does not say the feature works. Record that separately with the `enabled` dimension, whose values are `enabled`, `disabled` and `enabled-with-known-defect`. The defect value names the task that will fix the problem, so `deployed=passed` no longer reads as fully done while the flag is on and broken:
+
+```json
+{
+  "schema_version": 1,
+  "operation_id": "alex/enabled-001",
+  "task": "example-task",
+  "dimension": "enabled",
+  "value": "enabled-with-known-defect",
+  "scope": {"source_commit": "1111111111111111111111111111111111111111", "integration_commit": "", "release_id": "release-2026-10-05", "environment": "production"},
+  "evidence": ["issue:example-defect-7"],
+  "provenance": "performed",
+  "actor": "alex/session1",
+  "defect_task": "example-fix-task"
+}
+```
+
+`enabled` is deliberately outside the six facts, so `brief`, `work` and `lifecycle.py list` keep their documented shape; `evidence-owed` shows the flag and the fixing task beside `deployed=passed`. An `enabled` fact uses the same scope rules and the same trust rule as the six facts: unattributed, unscoped, ambiguous or tampered events read `unknown` rather than being guessed. `defect_task` must name an existing task: a fact that points at no task is refused before it is written. Nothing here infers `enabled` from `deployed`, and no release write records `enabled` on its own.
+
 ## Create children without guessing IDs
 
 Save `child.json`:

@@ -174,6 +174,13 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     # (the newest recorded scope) belong to the current contribution? The ANY-scope
     # answer is additive as `review.integration.matches_contribution`.
     matches_contribution=None if not review.get('contribution') else (facts['scope'] or {}).get('source_commit','').lower()==review['contribution']['commit'].lower()
+    # A passed deployed fact is always scoped to a release; name that delivery,
+    # and say plainly when it is not the task's current contribution (the release
+    # may have shipped a superseded revision). Additive fields (kittrial-5bb.95).
+    deployed_scope=facts['scope'] if facts['facts']['deployed']['value']=='passed' else None
+    deployed_delivery=None if deployed_scope is None else {key:deployed_scope.get(key) for key in ('release_id','environment','source_commit','integration_commit')}
+    current_commit=(review.get('contribution') or {}).get('commit')
+    deployed_current=None if (deployed_scope is None or not current_commit) else deployed_scope.get('source_commit','').lower()==current_commit.lower()
     pending=review.get('pending_requests',[])
     priors=review.get('prior_contributions') or []
     # The bounded slice keeps its PRIOR_BRIEF_LIMIT bound and adds the per-prior
@@ -226,6 +233,8 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
                           reverts=reverts[-REVERT_BRIEF_LIMIT:],reverts_total=len(reverts),
                           reverts_more='review '+task if len(reverts)>REVERT_BRIEF_LIMIT else None),
             'lifecycle_matches_contribution':matches_contribution,
+            'deployed_delivery':deployed_delivery,
+            'deployed_delivery_is_current_contribution':deployed_current,
             'dependencies':{'total':len(deps),'items':[{k:clip(d.get(k),160) for k in ('depends_on_id','type')} for d in deps[:8]],'omitted':max(0,len(deps)-8)},
             'lifecycle':{dim:dict(value=f['value'],event_id=f['event_id']) for dim,f in facts['facts'].items()},
             'lifecycle_scope':{k:clip(v,160) for k,v in (facts['scope'] or {}).items()},
