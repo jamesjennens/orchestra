@@ -76,7 +76,7 @@ class RecordVersionTests(AttestationCase):
         self.assertEqual(rr.parse_entry(plain)['schema_version'], 1)
         # This kit reads both versions as supported records, and a v2-only row is an anchor.
         self.assertEqual(reserved_comments.record_comment_kind(body), ('reference-entry', 2, 'supported'))
-        self.assertEqual(reserved_comments.record_comment_kind('Kind: reference-entry-v3\n{}')[2], 'unsupported')
+        self.assertEqual(reserved_comments.record_comment_kind('Kind: reference-entry-v4\n{}')[2], 'unsupported')
         self.assertEqual(reserved_comments.record_comment_kind('Kind: capability-entry-v2\n{}')[2], 'unsupported')
         self.assertTrue(reserved_comments.is_record_anchor(self.native.row('ref-1')))
 
@@ -134,7 +134,7 @@ class RecordVersionTests(AttestationCase):
         with self.assertRaisesRegex(ValueError, 'review_by must be at most 6 months after authority.observed '
                                                 r'\(2027-03-20\)'):
             self.propose(**attested(review_by='2027-03-21'))
-        with self.assertRaisesRegex(ValueError, 'authority.type must be repo-path, url or attestation'):
+        with self.assertRaisesRegex(ValueError, 'authority.type must be repo-path, url, attestation or decision'):
             self.propose(**attested(authority={'type': 'rumour'}))
         self.assertEqual(self.native.writes(), [])
         # The edge is allowed: review on the last day of the window, and an optional source.
@@ -193,9 +193,9 @@ class ReaderMarkingTests(AttestationCase):
         for kind, keys in (('attested', [KEY]), ('repository', ['calendar.trading']), ('url', ['identity.registry'])):
             listing = rr.read(['list', '--authority', kind], self.native, [OPERATOR])
             self.assertEqual([item['key'] for item in listing['items']], keys)
-        with self.assertRaisesRegex(ValueError, '--authority must be repository, url or attested'):
+        with self.assertRaisesRegex(ValueError, '--authority must be repository, url, attested or decision'):
             rr.read(['list', '--authority', 'attestation'], self.native, [OPERATOR])
-        self.assertIn('--authority repository|url|attested', rr.help_payload()['usage'][1])
+        self.assertIn('--authority repository|url|attested|decision', rr.help_payload()['usage'][1])
 
     def test_attention_items_carry_the_authority_kind(self):
         self.propose(**attested(review_by='2026-10-10'))
@@ -359,7 +359,7 @@ class VoidTests(AttestationCase):
         self.void(void_payload('ref-1', bad['id'], bad['text'], operation_id='void-2'))
         self.assertEqual(self.get()['state'], 'draft-only')
         self.assertTrue(recovery.claims_kind(V2 + '{}', 'reference-entry'))
-        self.assertFalse(recovery.claims_kind('Kind: reference-entry-v3\n{}', 'reference-entry'))
+        self.assertFalse(recovery.claims_kind('Kind: reference-entry-v4\n{}', 'reference-entry'))
         self.assertFalse(recovery.claims_kind('Kind: capability-entry-v2\n{}', 'capability-entry'))
 
 

@@ -1,7 +1,8 @@
 # Durable per-project reference catalog - design proposal
 
 Section 17 was added later, with its implementation (kittrial-5bb.98): an
-`attestation` authority for operational facts. The rest of the document is the
+`attestation` authority for operational facts. Section 18 adds the `decision`
+authority (kittrial-5bb.104). The rest of the document is the
 revision 3 proposal as it was reviewed.
 
 Status: **proposal, revision 3. Not implemented, not accepted.** This document
@@ -1772,7 +1773,7 @@ kit, and no reader may present it as if it could.
 nor stated by the owner. It needs a decision issue. The catalog has no authority
 type that points at a decision issue (an entry can cite decisions in `decisions`,
 but its authority must still be a path, a URL or an attestation); adding one is a
-separate follow-up.
+separate follow-up. (Section 18 is that follow-up.)
 
 ### 17.3 Who accepts, and what they must show
 
@@ -1797,14 +1798,14 @@ revision 1 is checked before its anchor is created.
 ### 17.4 What a reader sees
 
 - `authority_kind` on every `record`, `proposed`, list row and attention item:
-  `repository`, `url` or `attested`.
+  `repository`, `url` or `attested` (and `decision`, section 18).
 - `authority_note` beside every attestation, built by the server from validated
   fields only (identity, date, basis), never from `how` or `source`. For the
   accepted record it says the fact is attested, accepted by an operator, and
   cannot be checked against a repository. For a draft it starts `NOT ACCEPTED.`
 - `authority_accepted` on list rows and attention items: whether the row shows
   the accepted record.
-- `ref list --authority repository|url|attested` and the same HTTP query.
+- `ref list --authority repository|url|attested|decision` and the same HTTP query.
 
 `ref check` (6.6, 9.3) is not implemented. When it is, an attested entry belongs
 in its own group and must never be reported as "authority unchanged".
@@ -1840,3 +1841,86 @@ So a rollback withholds attested entries until roll-forward and loses nothing.
 decision. It is the batch `capability-apply` already had (.60 section 4), moved
 into the shared entry layer (12.1): one receipt per item, the coordination lock
 taken per item, a refused item reported without stopping the others.
+
+## 18. An authority that points at a decision (kittrial-5bb.104)
+
+A design note written with its implementation.
+
+### 18.1 The problem
+
+Section 17 left one kind of fact without an honest authority: a rule the project
+set for itself. "Take a backup before every release" was not observed on a host,
+and the owner did not state it. On the trial project five such entries stayed
+drafts for that reason.
+
+### 18.2 The type
+
+```json
+{"type": "decision", "id": "example-project-42"}
+```
+
+`id` is a native issue id and nothing else. It is checked the way each entry of
+`decisions` is (3.9): it must name an existing issue of type `decision` or
+labelled `decision`, on propose, on revise and again at acceptance. A malformed id
+never reaches a native read.
+
+### 18.3 Acceptance, and what is deliberately not required
+
+Operator host route only. The accept needs `authority.id` and
+`acceptance.decision_id` to name existing decision issues (they may be the same
+one) and one line of evidence. No date rule beyond `review_by`: a decision has no
+observation to go stale.
+
+The decision is NOT required to be closed, or to have been created by a listed
+operator. Over SSH the actor is self-declared, so a contributor can create a
+decision issue, close it and sign it as anyone. Either rule would be satisfied by
+exactly the person it is meant to stop, and would read as a control without being
+one. "Closed" would also contradict practice: decisions here stay open while they
+are in force. The control is the one section 4 already gives: only an allowlisted
+operator accepts, on the host route. The remaining weakness is the self-declared
+SSH actor, tracked as kittrial-5bb.87 and kittrial-5bb.106.
+
+### 18.4 Readers, and the decision issue afterwards
+
+`authority_kind: decision` and a server-written `authority_note` built from the id
+only. A read does not look the decision up again: `ref get` reads only its own
+key, and a second native read on every read was not worth a signal that is rare.
+The cost is stated: if the decision issue is deleted or retyped, an accepted
+entry keeps reading accepted. The next revise that keeps the id, and the next
+accept, are refused and name it.
+
+### 18.5 Record version: v3, and no version after it for an authority type
+
+A decision revision is `Kind: reference-entry-v3`, `schema_version` 3, for the
+reason 17.5 gives: inside v2, a kit at the previous release would read the entry
+as malformed and could void it. An older kit treats a v3 revision exactly as 17.5
+describes for v2.
+
+Two bumps for two types showed the cost of that rule: every new authority type
+needed a release in which older kits lose the entry. So version 3 changes the
+reader, once. **From v3 on, a record that is otherwise well formed and names an
+authority type the reader does not know makes its entry read `unsupported`**
+(`reference_records.unsupported_reason`, `AnchoredKind.unsupported_record`): not
+malformed, not a void target, not writable, not releasable. A later authority type
+is therefore written inside v3, and a kit from this release on fails safe for it
+without a new record version. The rule is tested with a made-up type.
+
+"Otherwise well formed" is exact, and it is the contract a later kit must keep:
+
+- the comment starts with the exact v3 kind line and is the canonical bytes of one
+  JSON object with the v3 field set;
+- every field outside `authority` passes its v3 rule, and the content hash matches;
+- `authority` is an object whose `type` is a non-empty string.
+
+**A later kit may put any fields inside `authority`. It must not change a v3 record
+anywhere else without a new record version**: a new top-level field, a different
+hash rule or a different meaning for an existing field needs v4.
+
+The tolerance is that narrow on purpose. The first implementation accepted any v3
+comment that parsed as JSON with an unknown type string; one host comment of
+`{"authority":{"type":"zz"}}` on a genuine accepted entry then froze the entry: it
+read `unsupported`, and void, revise, accept, release and reconcile were all
+refused. Now that comment is malformed and a void repairs it. What remains is a
+record somebody builds by hand, valid in every byte, with a made-up type. The
+reader cannot tell it from a later kit's record; no kit will ever read it; and the
+way out is the operator's host procedure, which OPERATIONS names.

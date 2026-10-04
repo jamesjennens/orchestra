@@ -642,7 +642,7 @@ Which anchor to name, by shape:
 Three shapes have no clean kit path:
 
 - **A forged accepted anchor with LIVE evidence beside a genuine draft.** The forged anchor holds the key's only accepted record, so it is not released. Release the genuine draft with `--duplicate` (the forged anchor is readable, so this is allowed), then revise and accept the right content on top of the anchor that remains.
-- **A forged anchor that holds a record version this kit does not read (`reference-entry-v3`, `capability-entry-v2`) or an unknown record kind of the family.** This kit cannot judge it, so it refuses to release it, and it refuses to release the genuine anchor beside it (nothing readable would remain). Use the host procedure below, or a kit that reads the record. A `reference-entry-v2` record is one this kit reads: a forged anchor holding one is judged like any other and can be released with `--duplicate`. A kit older than the attestation authority cannot judge it.
+- **A forged anchor that holds a record version this kit does not read (`reference-entry-v4`, `capability-entry-v2`), a `reference-entry-v3` record with an authority type this kit does not know, or an unknown record kind of the family.** This kit cannot judge it, so it refuses to release it, and it refuses to release the genuine anchor beside it (nothing readable would remain). Use the host procedure below, or a kit that reads the record. A `reference-entry-v2` record, or a v3 record with a `decision` authority, is one this kit reads: a forged anchor holding one is judged like any other and can be released with `--duplicate`. A kit older than that authority type cannot judge it.
 - **Two anchors that both say accepted and carry no acceptance evidence.** Neither can be genuine: the kit writes the evidence before an accepted revision, so there is no entry to protect and nothing a contributor could revise from. `--duplicate` is refused on both (no remaining anchor holds a readable record), and the refusal's advice does not apply. Use the host procedure below on both anchors, then propose the entry again.
 
 When two anchors both have live acceptance evidence, the key reads `conflicted` and neither is selected. Decide which is wrong, with the project owner if it is not obvious, and release that one with `--duplicate --set-aside-evidence`; the other becomes the selected anchor, and the output shows it. Do not try to void the acceptance evidence first: that void is refused.
@@ -775,11 +775,13 @@ from `bd export --all`, as in the scan above.
   up (kittrial-5bb.92 review `order-check-limits-and-rollback`). No sidecar path is
   added, so backups restore on either kit, and rolling forward restores the repair with
   nothing to clean up.
-- **Limits.** A record of a version this kit does not read (`Kind: reference-entry-v3`,
+- **Limits.** A record of a version this kit does not read (`Kind: reference-entry-v4`,
   `Kind: capability-entry-v2`) or of an unknown kind of the family cannot be a void
   target: the target must claim a prefix this kit reads for the declared kind (v1, and
-  v2 of `reference-entry`), exactly or through the BOM/CRLF view the readers use. It
-  stays `unsupported` (or `malformed`) until a kit that reads it handles it.
+  v2 and v3 of `reference-entry`), exactly or through the BOM/CRLF view the readers use.
+  It stays `unsupported` (or `malformed`) until a kit that reads it handles it. A
+  `reference-entry-v3` record whose authority type this kit does not know is not a void
+  target either ([below](#reference-entries-that-point-at-a-decision)).
 
 #### Attested reference entries
 A reference entry whose authority is an `attestation` records an operational fact: who
@@ -820,10 +822,9 @@ weight.
 - **Revising an older draft to an attestation.** A draft written with a `repo-path`
   authority and no commit cannot be accepted. Revise it with `ref revise`, giving the
   same content and an `attestation` authority, then accept that revision.
-- **What the kit does not have.** There is no authority type that points at a decision
-  issue. A working rule that nobody observed and the owner did not state is neither
-  basis: record it as a decision and cite it in the entry's `decisions`, with a
-  repository document as the authority.
+- **A rule nobody observed.** A working rule that nobody observed and the owner did not
+  state is neither basis. Record it as a decision issue and give the entry a `decision`
+  authority that points at it ([below](#reference-entries-that-point-at-a-decision)).
 - **Record version and rollback.** An attested revision is stored as
   `Kind: reference-entry-v2`; every other revision stays v1. A kit older than this one:
   - does not serve an entry that holds a v2 revision. Such an entry reads
@@ -849,6 +850,68 @@ weight.
   it. Its status and assignee can therefore differ after roll-forward; its labels and
   records cannot (label replacement and a raw v2 comment are refused). Do not "repair"
   such an entry with the older kit.
+
+#### Reference entries that point at a decision
+A reference entry whose authority is `{"type": "decision", "id": ISSUE}` records a rule
+the project set for itself: how a release is made, what runs first. Nobody observed it
+and the owner did not state it, so it is not an attestation; the decision issue is where
+it was set ([CLI contract](CLI_CONTRACT.md#ref-the-reference-catalog)).
+
+- **Who writes what.** Any contributor may propose or revise such a draft; the id must
+  name an existing issue of type `decision` or labelled `decision`. Only `admin.py
+  reference-apply` accepts one, singly or in a batch. Until then every read marks it
+  `state: draft-only`, `authority_kind: decision`, with a note starting `NOT ACCEPTED.`
+- **What the operator must show.** On top of the ordinary acceptance rules (`review_by`
+  set, in the future and at most 24 months ahead), each checked before any write:
+  1. `authority.id` still names an existing decision issue.
+  2. `acceptance.decision_id` names an existing decision issue. It may be the same
+     issue as `authority.id`.
+  3. `acceptance.evidence` is one line.
+- **What the kit does not check, and why.** It checks that the issue exists and is a
+  decision, and nothing about who wrote it or whether it is closed. Over SSH an actor
+  name is self-declared: a contributor can create a decision issue, close it, and do
+  both under an operator's name. A rule requiring "closed" or "created by an operator"
+  would look like a control without being one. The control is that only an allowlisted
+  operator accepts, on the host route: read the decision before you accept an entry
+  that points at it. The limit is tracked as kittrial-5bb.87 and kittrial-5bb.106.
+- **If the decision issue goes away.** A read never looks the issue up again, so an
+  accepted entry keeps reading `accepted` if its decision issue is later deleted or
+  loses its type. The next `ref revise` that keeps that id, and the next accept of a
+  draft that carries it, are refused, naming the id. Revise the entry to point at the
+  decision that sets the rule now, then accept that revision.
+- **Revising an older draft.** A draft written with a `repo-path` authority and no
+  commit cannot be accepted. Revise it with `ref revise`, giving the same content and a
+  `decision` authority, then accept that revision.
+- **Record version and rollback.** A decision revision is stored as
+  `Kind: reference-entry-v3`. Attested revisions stay v2 and the rest v1. A kit older
+  than this one behaves towards a v3 revision exactly as a kit older than the
+  attestation authority behaves towards a v2 revision
+  ([above](#attested-reference-entries)): it does not serve the entry (`unsupported`
+  when the anchor also holds a record it reads, an anchor with no record yet
+  otherwise); one contributor's v3 draft makes it read a whole accepted entry
+  `unsupported`; it cannot write to, void or release such an entry; and its backup and
+  restore are unaffected. Nothing is lost; roll forward to read them.
+- **No further version for a new authority type.** Version 3 is the last one an
+  authority type needs. A v3 revision whose authority type this kit does not know (one a
+  later kit added) makes its entry read `unsupported`, with the warning `authority type
+  NAME is newer than this kit`. It is not malformed: it cannot be a void target, the
+  entry takes no write, and its anchor cannot be released.
+  - **Only a record that is valid everywhere else counts.** The comment must start with
+    the exact `Kind: reference-entry-v3` line (a BOM or CRLF variant does not count) and
+    be the canonical bytes of a v3 record whose every field outside `authority`
+    validates, content hash included, with an `authority` object whose `type` is a
+    non-empty name this kit does not know. A later kit may put anything inside
+    `authority`; it may not change v3 anywhere else.
+  - **Everything else is malformed, and a void repairs it:** a stray or hand-typed
+    comment, a typo in the type of a broken record, a wrong hash, a BOM or CRLF variant.
+    So a line of garbage on a genuine entry never freezes it.
+  - **What to do with one.** If a later kit wrote it, install that kit. The warning
+    cannot tell such a record from one built by hand on the host to look like it, and
+    for a made-up type no kit will ever read it. If you have established that it is not
+    a later kit's record, this kit has no command for it: use the last-resort host
+    procedure under [a duplicated record key](#a-duplicated-record-key) (strip the
+    anchor's labels with the native tool, then propose the entry again), and record what
+    you did.
 
 #### Orphan anchors
 

@@ -1047,7 +1047,7 @@ never read more than they need:
 - **`ref get KEY`** returns these fields:
   - `key`, `state` and `native_id`.
   - `record`: the newest accepted revision. Its `title` and `statement` are excerpt
-    objects. It carries `authority` and `authority_kind` (`repository`, `url` or
+    objects. It carries `authority` and `authority_kind` (`repository`, `url`, `decision` or
     `attested`), and for an attested entry `authority_note`, a sentence saying who
     attested it, when, on what basis, and that it cannot be checked against a
     repository. Once the entry is past its review date the sentence also says
@@ -1077,7 +1077,7 @@ never read more than they need:
     `authority_note`, which starts `NOT ACCEPTED.` when it is a draft.
   - Options: `--tag` (repeatable; all tags must match), `--owner IDENTITY`,
     `--state draft-only|accepted|superseded|all`, `--due expired|due-soon|unset`,
-    `--authority repository|url|attested`, `--limit` and `--offset`.
+    `--authority repository|url|attested|decision`, `--limit` and `--offset`.
 - **Failures stay per entry.** A malformed entry, an unsupported newer record kind
   (`Kind: reference-entry-v3`), or an anchor left without its record by an interrupted
   propose fails only itself.
@@ -1162,6 +1162,8 @@ sets `operation`.
     - `url`: `https` only, no userinfo, with a `retrieved` date no later than today.
     - `attestation`: for an operational fact that no file or page states (which host
       runs what, what the owner said). See below.
+    - `decision`: for a rule the project set for itself, which nobody observed and the
+      owner did not state. See below.
   - `owner`: `account:<uid>` or `person:<name>`. A session actor is refused.
   - `review_by`: a real date at most 24 months ahead.
   - `tags`: at most 12 lowercase slugs.
@@ -1191,6 +1193,26 @@ sets `operation`.
   - An attested revision is stored as `Kind: reference-entry-v2`; every other revision
     stays `reference-entry-v1`. A kit older than this one does not serve an entry that
     holds a v2 revision ([operations](OPERATIONS.md#attested-reference-entries)).
+- **A decision authority** points at the decision issue that set the rule:
+
+  ```json
+  {"type": "decision", "id": "example-project-42"}
+  ```
+
+  - `id` is a native issue id and nothing else. The rule is the entry's statement; the
+    decision issue is where it was set and argued.
+  - On `propose` and `revise` the id must name an existing issue of type `decision` or
+    labelled `decision`, as each entry of `decisions` must. A refusal writes nothing.
+  - Any contributor may propose or revise such a draft. Only the operator accepts it
+    ([operations](OPERATIONS.md#reference-entries-that-point-at-a-decision)).
+  - Reads carry `authority_kind: decision` and an `authority_note`: `Set by decision
+    ID, accepted by an operator. ...` for the accepted record, and one starting `NOT
+    ACCEPTED.` for a draft.
+  - A read does not look the decision issue up again. If the issue is later deleted or
+    loses its type, readers still show the entry; the next `revise` or accept of it is
+    refused until it points at a decision that exists.
+  - A decision revision is stored as `Kind: reference-entry-v3`. A kit older than this
+    one does not serve an entry that holds one.
 - **Caller-written fields are refused.** `acceptance_state`, `successor`, `sha256`,
   `acceptance` and `labels` are written by the operation.
 - **`propose`** creates the entry's native anchor, closes it and posts revision 1 as a

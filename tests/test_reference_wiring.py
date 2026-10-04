@@ -320,7 +320,7 @@ class HttpReferenceRouteTests(EndpointCase if EndpointCase else unittest.TestCas
         # the list filters on it.
         self.assertEqual([(i['authority_kind'], i['authority_accepted']) for i in listed.data['items']],
                          [('repository', True)])
-        for kind, total in (('repository', 1), ('attested', 0)):
+        for kind, total in (('repository', 1), ('attested', 0), ('decision', 0)):
             filtered = self.request('GET', '/v1/projects/%s/references?authority=%s' % (project, kind), token=alex)
             self.assertEqual((200, total), (filtered.status, filtered.data['total']), filtered.data)
         self.assertIsNone(listed.data['next_cursor'])
@@ -339,7 +339,7 @@ class HttpReferenceRouteTests(EndpointCase if EndpointCase else unittest.TestCas
         alex, project = self.setup_project()
         self.backend.actions = []
         for query in ('state=open', 'due=soon', 'owner=session-4e40fde3', 'tag=Bad%20Tag', 'limit=0',
-                      'authority=attestation'):
+                      'authority=attestation', 'authority=rule'):
             with self.subTest(query=query):
                 bad = self.request('GET', '/v1/projects/%s/references?%s' % (project, query), token=alex)
                 self.assertEqual(422, bad.status, bad.data)
