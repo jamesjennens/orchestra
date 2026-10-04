@@ -4,6 +4,7 @@ import base64
 import binascii
 import hashlib
 import json
+import record_json
 import os
 import re
 import tempfile
@@ -62,7 +63,7 @@ def _cursor(value, path, current):
     if not isinstance(value, str) or not value:
         raise ValueError("Invalid feedback cursor")
     try:
-        data = json.loads(base64.urlsafe_b64decode(value.encode("ascii") + b"==="))
+        data = record_json.loads(base64.urlsafe_b64decode(value.encode("ascii") + b"==="))
     except (ValueError, UnicodeError, binascii.Error, json.JSONDecodeError):
         raise ValueError("Invalid feedback cursor") from None
     if (not isinstance(data, dict) or data.get("v") != 4 or data.get("feed_id") != _feed_id(path)
@@ -177,8 +178,8 @@ def validate_feed_text(text):
         if not line.strip():
             raise ValueError("Feedback feed contains a blank line")
         try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
+            entry = record_json.loads(line)
+        except ValueError:
             raise ValueError("Feedback feed contains invalid JSON") from None
         _validate_entry(entry, previous + 1)
         if entry["kind"] == "correction" and entry["supersedes"] not in entry_ids:
@@ -321,7 +322,7 @@ def _payload(args, attachments):
     if item.get("flag") not in ("--file", "-f") or not isinstance(item.get("text"), str):
         raise ValueError("Invalid feedback attachment")
     try:
-        payload = json.loads(item["text"])
+        payload = record_json.loads(item["text"])
     except json.JSONDecodeError:
         raise ValueError("Feedback payload must be JSON") from None
     if not isinstance(payload, dict):

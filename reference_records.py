@@ -337,7 +337,7 @@ def entry_prefix_for(record):
     return ENTRY_PREFIXES[record['schema_version']]
 
 
-def unsupported_reason(body):
+def unsupported_reason(body, row=None):
     """Why a `reference-entry-v3` comment is a record this kit does not support, or None.
 
     From version 3 on an authority type is not a reason for a new record version. A later
@@ -349,14 +349,18 @@ def unsupported_reason(body):
       canonical bytes of one JSON object;
     - everything outside `authority` passes the v3 schema: the closed field set,
       `schema_version` 3, every other field's own rule, and the content hash;
-    - `authority` is an object whose `type` is a non-empty string this kit does not know.
+    - `authority` is an object whose `type` this kit does not know and which has the shape
+      of a type name (lowercase letters, digits and hyphens, starting with a letter, at
+      most 32 characters): `Decision`, `repo-path ` with a trailing space, a blank, a
+      control character or markup is not something a kit would write (kittrial-5bb.108);
+    - the record's `key` belongs to the anchor it is on (`row`, when the reader has one),
+      as a known-type record's must.
 
     Anything else that fails the schema is malformed, as before, and a void repairs it: a
     stray comment, a typo, a wrong hash. Otherwise one line of garbage on a genuine entry
     would freeze it for good (review of 2d93a07). The warning cannot tell a record a later
     kit wrote from one somebody built by hand on the host to look like it; both need a kit
-    or a host step this kit does not have. The type is echoed only when it has the shape
-    of a type name.
+    or a host step this kit does not have.
     """
     if not isinstance(body, str) or not body.startswith(ENTRY_V3_PREFIX):
         return None
@@ -368,17 +372,18 @@ def unsupported_reason(body):
             return None
         authority = record['authority']
         kind = authority.get('type') if isinstance(authority, dict) else None
-        if not isinstance(kind, str) or not kind or kind in AUTHORITY_KINDS:
+        if not isinstance(kind, str) or kind in AUTHORITY_KINDS or not AUTHORITY_TYPE.fullmatch(kind):
             return None
         # Everything outside `authority`, the field set included: the same record with an
         # authority this kit knows must be a valid v3 record.
         probe = dict(record, authority={'type': 'decision', 'id': 'x'})
         probe['sha256'] = content_hash(probe)
         validate_entry(probe)
+        if row is not None and not KIND.entry_belongs(record, row):
+            return None
     except (ValueError, TypeError, KeyError, UnicodeDecodeError):
         return None
-    return ('authority type %s is newer than this kit' % kind if AUTHORITY_TYPE.fullmatch(kind)
-            else 'an authority type newer than this kit')
+    return 'authority type %s is newer than this kit' % kind
 
 
 # -- payloads ------------------------------------------------------------------------------
@@ -579,7 +584,7 @@ KIND = keyed_entries.AnchoredKind(
     pre_write=lambda payload, run, operators: (check_decisions(payload, run), check_authority_decision(payload, run)),
     entry_prefixes=tuple(ENTRY_PREFIXES.values()), entry_prefix_for=lambda record: entry_prefix_for(record),
     acceptance_rules=lambda record, acceptance, run: acceptance_rules(record, acceptance, run),
-    unsupported_reason=lambda body: unsupported_reason(body),
+    unsupported_reason=lambda body, row=None: unsupported_reason(body, row),
 )
 SPEC = KIND.spec
 PROPOSE_FIELDS, ACCEPT_FIELDS, DIRECT_FIELDS = KIND.propose_fields, KIND.accept_fields, KIND.direct_fields

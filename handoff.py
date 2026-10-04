@@ -1,5 +1,6 @@
 """Explicit owner/operator transfer, with a durable recoverable operation journal."""
 import json
+import record_json
 import re
 from datetime import datetime, timezone
 from coordination import atomic
@@ -53,7 +54,7 @@ def parse_identity(prefix, body):
     if not isinstance(body, str) or not body.startswith(prefix):
         return None
     try:
-        identity = json.loads(body[len(prefix):])
+        identity = record_json.loads(body[len(prefix):])
     except (ValueError, TypeError):
         return None
     if not isinstance(identity, dict):

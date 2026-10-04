@@ -38,6 +38,7 @@ current contribution chain is refused here.
 """
 import hashlib
 import json
+import record_json
 import os
 import re
 from requirements import canonical_bytes
@@ -272,7 +273,7 @@ def records(issue, operators=None):
             continue
         cid = str(comment.get('id'))
         try:
-            p = json.loads(raw[len(PREFIX):])
+            p = record_json.loads(raw[len(PREFIX):])
             issued(p, issue['id'])
             identity(cid, 'Invalid void record comment ID')
             author = text(comment.get('author'), 'void record author', 300)

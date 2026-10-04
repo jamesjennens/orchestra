@@ -21,6 +21,7 @@ import binascii
 import hashlib
 import ipaddress
 import json
+import record_json
 import re
 import secrets
 import ssl
@@ -266,7 +267,7 @@ def read_cursor(principal, project_id, query, cursor):
         raise conflict('Invalid cursor')
     try:
         padded = cursor + '=' * (-len(cursor) % 4)
-        data = json.loads(base64.urlsafe_b64decode(padded.encode('ascii')))
+        data = record_json.loads(base64.urlsafe_b64decode(padded.encode('ascii')))
     except (ValueError, binascii.Error, UnicodeError):
         raise conflict('Invalid cursor')
     if not isinstance(data, dict) or data.get('u') != principal.user_id or \
@@ -1869,7 +1870,10 @@ class ApiHandler(BaseHTTPRequestHandler):
             if content_type != 'application/json':
                 raise unsupported('Content-Type must be application/json')
             try:
-                payload = json.loads(body)
+                # Bounded nesting (kittrial-5bb.108): a body nested deeper than the kit ever
+                # writes is refused here, as bad JSON, and never reaches a route or the
+                # operation journal. It used to be an HTTP 500.
+                payload = record_json.loads(body)
             except (ValueError, UnicodeError):
                 raise invalid('Request body is not valid JSON')
             if not isinstance(payload, dict):

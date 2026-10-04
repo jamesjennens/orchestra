@@ -28,6 +28,7 @@ text again repairs the record.
 """
 import hashlib
 import json
+import record_json
 import os
 import re
 import tempfile
@@ -171,7 +172,7 @@ def read_meta(path):
     if not meta.exists():
         return None
     try:
-        value = json.loads(meta.read_text(encoding='utf-8'))
+        value = record_json.loads(meta.read_text(encoding='utf-8'))
     except (OSError, UnicodeError, ValueError, RecursionError):
         return None
     return value if _valid_meta(value) else None
@@ -656,7 +657,7 @@ def read_clear_record(path):
     if target.is_symlink() or not target.is_file():
         return None
     try:
-        value = json.loads(target.read_text(encoding='utf-8'))
+        value = record_json.loads(target.read_text(encoding='utf-8'))
     except (OSError, UnicodeError, ValueError, RecursionError):
         return None
     try:

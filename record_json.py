@@ -1,0 +1,85 @@
+"""One guard for every JSON text the kit parses that somebody else wrote (kittrial-5bb.108).
+
+A record comment, a `--file` attachment, a payload argument, a request body: each is
+text from a caller or from the tracker, and each used to go straight to `json.loads`.
+JSON nested about a thousand levels deep raises `RecursionError` there. That is a
+`RuntimeError`, not the `ValueError` every parser catches, so one such comment failed the
+whole read (`ref get`, `work` for every actor of the project, and `void-record`, the
+command meant to repair it), and one such request was answered "outcome unknown".
+
+`loads` refuses nesting deeper than NESTING_MAX before it parses, by counting brackets
+outside string literals in ONE pass over the text, so the result does not depend on the
+interpreter's recursion limit, on how deep the call stack already is, or on the Python
+version, and the cost is linear in the text whatever it holds. Deeper nesting
+raises `NestingError`, a `ValueError`: each reader's existing "this comment is malformed"
+path takes it, the entry reads malformed and is voidable, and a request is refused with
+one sentence. A `RecursionError` from the parse itself is turned into the same error, as
+a second line of defence.
+
+The deepest JSON the kit writes nests 4 levels. NESTING_MAX leaves room for a later
+record and is far below any interpreter limit.
+"""
+import json
+import re
+
+NESTING_MAX = 64
+MESSAGE = 'JSON nested too deeply (more than %d levels)' % NESTING_MAX
+# The only characters that matter to nesting: a backslash with the character it escapes
+# (so an escaped quote never closes a string), a quote, and the four brackets. Each match
+# consumes its characters and the scan never goes back, so it is one pass and linear
+# however malformed the text is. (The first version removed whole string literals with a
+# pattern that searched again from every quote of a literal that was never closed, which
+# was quadratic: review of 7c14f6a.)
+_TOKEN = re.compile(r'\\.|["\[\]{}]', re.DOTALL)
+
+
+class NestingError(ValueError):
+    """JSON text nested deeper than NESTING_MAX."""
+
+
+def nesting(text):
+    """The deepest bracket nesting of a JSON text, counted outside string literals, or
+    NESTING_MAX + 1 as soon as it is exceeded.
+
+    One pass, no recursion, linear in the text. A text with at most NESTING_MAX opening
+    brackets cannot nest deeper than that, so it is answered without a scan. Inside a
+    string literal brackets are text; a literal that is never closed makes the rest of
+    the text a string, which the parser then refuses as malformed. The scan stops at the
+    first bracket past the bound, so deep nesting is refused without reading the rest.
+    """
+    if text.count('[') + text.count('{') <= NESTING_MAX:
+        return 0
+    depth = deepest = 0
+    in_string = False
+    for match in _TOKEN.finditer(text):
+        token = match.group()
+        if token == '"':
+            in_string = not in_string
+        elif in_string or token[0] == '\\':
+            continue
+        elif token in '[{':
+            depth += 1
+            if depth > deepest:
+                deepest = depth
+                if deepest > NESTING_MAX:
+                    return deepest
+        elif depth:
+            depth -= 1
+    return deepest
+
+
+def check(text):
+    """Raise NestingError when `text` nests deeper than NESTING_MAX."""
+    if isinstance(text, (bytes, bytearray)):
+        text = text.decode('utf-8', 'replace')
+    if isinstance(text, str) and nesting(text) > NESTING_MAX:
+        raise NestingError(MESSAGE)
+
+
+def loads(text, **options):
+    """`json.loads` for text somebody else wrote: bounded nesting, and never a RecursionError."""
+    check(text)
+    try:
+        return json.loads(text, **options)
+    except RecursionError:
+        raise NestingError(MESSAGE) from None

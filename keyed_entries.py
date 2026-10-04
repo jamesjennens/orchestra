@@ -162,7 +162,7 @@ class AnchoredKind:
     are `entry_prefix`. `acceptance_rules(record, acceptance, run)` may refuse an
     acceptance of one record by what the record is (an attested reference needs more
     from its operator); it runs before the journal for a direct accepted revision and
-    before any write for an accept. `unsupported_reason(body)` says why a record comment
+    before any write for an accept. `unsupported_reason(body, row)` says why a record comment
     of a version this kit reads is nonetheless one it does not support (a reference
     revision whose authority type is newer than this kit, kittrial-5bb.104), or None; such
     a record makes its entry read `unsupported` exactly as a newer record version does:
@@ -268,19 +268,20 @@ class AnchoredKind:
             labels.append('request:' + content_hash({'operation_id': operation_id}))
         return self.shown(run, self.listed_ids(run, ['--label-any', ','.join(labels)]))
 
-    def unsupported_record(self, body):
+    def unsupported_record(self, body, row=None):
         """Why this kit does not support one record comment of this kind's family, or None:
-        a record version it does not read, or what `unsupported_reason` says."""
+        a record version it does not read, or what `unsupported_reason` says. `row` is the
+        anchor the comment is on, so the hook can check that the record belongs to it."""
         kind = record_comment_kind(body)
         if not kind or not kind[0].startswith(self.family):
             return None
         if kind[2] == 'unsupported':
             return '%s-v%s is newer than this kit' % (kind[0], kind[1])
-        return self.unsupported_reason(body) if self.unsupported_reason is not None else None
+        return self.unsupported_reason(body, row) if self.unsupported_reason is not None else None
 
     def existing_revisions(self, row):
         for comment in row.get('comments') or []:
-            reason = self.unsupported_record(comment.get('text')) if isinstance(comment, dict) else None
+            reason = self.unsupported_record(comment.get('text'), row) if isinstance(comment, dict) else None
             if reason is not None and comment['text'].startswith(self.entry_prefixes):
                 # Not "malformed": a newer kit wrote it, and this one must leave it alone.
                 raise ValueError('%s anchor %s carries a record this kit does not support (%s); an operator must '
@@ -461,7 +462,7 @@ class AnchoredKind:
         target = next((comment for comment in comments if str(comment.get('id')) == payload['target']), None)
         if target is None:
             return 'its target %s is not on the anchor' % payload['target']
-        unsupported = self.unsupported_record(target.get('text'))
+        unsupported = self.unsupported_record(target.get('text'), row)
         if unsupported is not None:
             return ('record %s is one this kit does not support (%s), so it cannot be judged here; use a kit that '
                     'reads it' % (payload['target'], unsupported))
@@ -1321,7 +1322,7 @@ class AnchoredKind:
                 kind = record_comment_kind(body)
                 if not kind or not kind[0].startswith(self.family):
                     continue
-                unsupported = self.unsupported_record(body)
+                unsupported = self.unsupported_record(body, row)
                 if unsupported is not None:
                     view.update(state='unsupported')
                     view['warnings'].append({'code': 'unsupported-record', 'detail': unsupported})

@@ -400,11 +400,20 @@ class LaterAuthorityTypeTests(DecisionCase):
         # A later kit may put anything inside authority, and name its type as it likes.
         self.assertEqual(rr.unsupported_reason(self.later_body(authority={'type': 'oracle'})),
                          'authority type oracle is newer than this kit')
-        self.assertEqual(rr.unsupported_reason(self.later_body(authority={'type': 'Bad Type\u202e', 'x': [1, {}]})),
-                         'an authority type newer than this kit')
+        self.assertEqual(rr.unsupported_reason(self.later_body(authority={'type': 'oracle-2', 'x': [1, {}]})),
+                         'authority type oracle-2 is newer than this kit')
         malformed = {
             'a wrong content hash': self.later_body(rehash=False),
             'an empty type': self.later_body(authority={'type': ''}),
+            # kittrial-5bb.108: a type no kit would write is not a later kit's record.
+            'a capitalised known type': self.later_body(authority={'type': 'Decision'}),
+            'a known type with a trailing space': self.later_body(authority={'type': 'repo-path '}),
+            'a single space': self.later_body(authority={'type': ' '}),
+            'a control character': self.later_body(authority={'type': 'ora\u0007cle'}),
+            'a bidi override': self.later_body(authority={'type': 'Bad Type\u202e'}),
+            'markup': self.later_body(authority={'type': '<b>oracle</b>'}),
+            'a type starting with a digit': self.later_body(authority={'type': '9oracle'}),
+            'a type of 33 characters': self.later_body(authority={'type': 'o' * 33}),
             'a type that is not a string': self.later_body(authority={'type': 7}),
             'no type': self.later_body(authority={'source': 'x'}),
             'authority not an object': self.later_body(authority='oracle'),
@@ -432,6 +441,35 @@ class LaterAuthorityTypeTests(DecisionCase):
         # And through the reader: the wrong-hash record makes the entry malformed, never unsupported.
         self.native.add_comment('ref-1', malformed['a wrong content hash'], author='mallory')
         self.assertEqual(self.get()['state'], 'malformed')
+
+    def test_a_made_up_type_no_kit_would_write_is_malformed_and_voidable(self):
+        self.propose(operation_id='plain')
+        self.accept(1, self.sha(1, 'calendar.trading'), key='calendar.trading', operation_id='apply-plain')
+        for number, kind in enumerate(('Decision', 'repo-path ', ' ', 'ora\u0007cle', '<b>oracle</b>')):
+            with self.subTest(type=kind):
+                body = self.later_body('ref-1', authority={'type': kind})
+                bad = self.native.add_comment('ref-1', body, author='mallory')
+                self.assertEqual(self.get('calendar.trading')['state'], 'malformed')
+                self.native.actor = OPERATOR
+                rr.KIND.apply_void(void_payload('ref-1', bad['id'], bad['text'], operation_id='void-t%d' % number),
+                                   OPERATOR, self.native, [OPERATOR])
+                self.assertEqual(self.get('calendar.trading')['state'], 'accepted')
+
+    def test_an_unknown_type_record_with_another_entrys_key_is_malformed(self):
+        # A known-type record with a foreign key is malformed; so is this one (kittrial-5bb.108).
+        self.propose(**decided())
+        self.propose(operation_id='plain')
+        foreign = self.later_body('ref-1', key='calendar.trading')
+        self.assertEqual(rr.unsupported_reason(foreign), 'authority type oracle is newer than this kit')   # no anchor given
+        self.assertIsNone(rr.unsupported_reason(foreign, self.native.row('ref-1')))
+        self.assertEqual(rr.unsupported_reason(self.later_body('ref-1'), self.native.row('ref-1')),
+                         'authority type oracle is newer than this kit')
+        bad = self.native.add_comment('ref-1', foreign, author='mallory')
+        self.assertEqual(self.get()['state'], 'malformed')
+        self.native.actor = OPERATOR
+        rr.KIND.apply_void(void_payload('ref-1', bad['id'], bad['text']), OPERATOR, self.native, [OPERATOR])
+        self.assertEqual(self.get()['state'], 'draft-only')
+        self.assertEqual(self.get('calendar.trading')['state'], 'draft-only')
 
     def test_a_write_on_an_entry_holding_one_is_refused_before_any_ledger_read_can_call_it_malformed(self):
         # The refusal comes from existing_revisions, the first thing every write reads.

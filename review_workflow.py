@@ -47,6 +47,7 @@ up and validated with the other coordination journals (``admin.py``), and the
 required deployment order is documented in ``docs/REVIEWS.md``.
 """
 import json
+import record_json
 import re
 from pathlib import Path
 import recovery
@@ -224,7 +225,7 @@ def records(issue, voided=None):
         if cid in voided:
             continue
         try:
-            p = json.loads(raw[len(PREFIX):]); validate(p, issue['id'])
+            p = record_json.loads(raw[len(PREFIX):]); validate(p, issue['id'])
             identity(cid)
             text(c.get('author'), 'native author', 300)
             text(c.get('created_at'), 'native timestamp', 100)
@@ -294,7 +295,7 @@ def effective(issue, voided):
         if cid in voided:
             continue
         try:
-            p = json.loads(raw[len(PREFIX):]); validate(p, issue['id'])
+            p = record_json.loads(raw[len(PREFIX):]); validate(p, issue['id'])
             identity(cid)
             text(c.get('author'), 'native author', 300)
             text(c.get('created_at'), 'native timestamp', 100)
@@ -744,7 +745,7 @@ def revert_comments(issue):
             continue
         cid = str(comment.get('id'))
         try:
-            p = json.loads(raw[len(REVERT_PREFIX):])
+            p = record_json.loads(raw[len(REVERT_PREFIX):])
             issued_revert(p, issue['id'])
             identity(cid)
             author = comment.get('author')
@@ -1363,7 +1364,7 @@ def _voided_operation_ids(issue, voids):
         if not raw.startswith(PREFIX):
             continue
         try:
-            body = json.loads(raw[len(PREFIX):])
+            body = record_json.loads(raw[len(PREFIX):])
         except (ValueError, TypeError):
             continue
         if isinstance(body, dict) and isinstance(body.get('operation_id'), str):

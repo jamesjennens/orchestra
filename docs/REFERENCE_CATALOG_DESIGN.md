@@ -1910,7 +1910,9 @@ without a new record version. The rule is tested with a made-up type.
 - the comment starts with the exact v3 kind line and is the canonical bytes of one
   JSON object with the v3 field set;
 - every field outside `authority` passes its v3 rule, and the content hash matches;
-- `authority` is an object whose `type` is a non-empty string.
+- `authority` is an object whose `type` is shaped like a type name (lowercase letters,
+  digits and hyphens, starting with a letter, at most 32 characters), and the record's
+  `key` belongs to the anchor it is on (kittrial-5bb.108).
 
 **A later kit may put any fields inside `authority`. It must not change a v3 record
 anywhere else without a new record version**: a new top-level field, a different

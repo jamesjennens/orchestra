@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import record_json
 import re
 import subprocess
 import sys
@@ -108,7 +109,7 @@ def native_event(row):
     payload=None
     if reason and reason.startswith(PREFIX):
         try:
-            payload=json.loads(reason[len(PREFIX):]);validate_payload(payload)
+            payload=record_json.loads(reason[len(PREFIX):]);validate_payload(payload)
             if canonical_bytes(payload).decode()!=reason[len(PREFIX):] or payload['task']!=parents[0] or payload['dimension']!=dimension or payload['value']!=value or payload['actor']!=row.get('created_by'):payload=None
         except (ValueError,TypeError):payload=None
     suffix=row['id'].removeprefix(parents[0]+'.')
@@ -419,7 +420,7 @@ def reverted_integrations(rows):
         for comment in row.get('comments') or []:
             text=comment.get('text') if isinstance(comment,dict) else None
             if not isinstance(text,str) or not text.startswith(REVERT_PREFIX):continue
-            try:record=json.loads(text[len(REVERT_PREFIX):])
+            try:record=record_json.loads(text[len(REVERT_PREFIX):])
             except ValueError:continue
             commit=str(record.get('integration_commit') or '').lower()
             if commit:result.add((task,commit))

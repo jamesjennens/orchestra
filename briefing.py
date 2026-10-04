@@ -2,6 +2,7 @@
 import argparse
 import base64
 import json
+import record_json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,7 +40,7 @@ def token(data):return base64.urlsafe_b64encode(canonical_bytes(data)).decode().
 def untoken(value):
     try:
         if not isinstance(value,str) or len(value)>4096 or not re.fullmatch(r'[A-Za-z0-9_-]+',value):raise ValueError()
-        return json.loads(base64.urlsafe_b64decode(value+'='*(-len(value)%4)))
+        return record_json.loads(base64.urlsafe_b64decode(value+'='*(-len(value)%4)))
     except (ValueError,TypeError,UnicodeError):raise ValueError('Invalid cursor') from None
 
 def identity(value):
@@ -135,7 +136,7 @@ def checkpoints(issue):
         body=comment.get('text','')
         if not body.startswith(PREFIX):continue
         try:
-            p=json.loads(body[len(PREFIX):]);validate_checkpoint(p,issue['id'])
+            p=record_json.loads(body[len(PREFIX):]);validate_checkpoint(p,issue['id'])
             cid=str(comment['id'])
             if cid in records:raise ValueError('Duplicate checkpoint comment')
             records[cid]=(p,comment)
@@ -411,7 +412,7 @@ def execute(root,path,project,actor,action,args,attachments,run,operators=None,v
         item=attachments.get(args[1].partition(':')[2],{})
         if item.get('flag') not in ('--file','-f') or not isinstance(item.get('text'),str):raise ValueError('Checkpoint needs a JSON file attachment')
         rows=[json.loads(x) for x in run(['export','--all']).splitlines() if x.strip()]
-        return json.dumps(save_checkpoint(rows,project,args[0],json.loads(item['text']),actor,run))+'\n'
+        return json.dumps(save_checkpoint(rows,project,args[0],record_json.loads(item['text']),actor,run))+'\n'
     a=parse_args(action,args)
     cache=path/'.history-snapshots'
     if cache.is_symlink():raise ValueError('History cache must not be a symlink')
