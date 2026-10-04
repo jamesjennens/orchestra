@@ -967,8 +967,10 @@ class TerminationGuardStressCase(unittest.TestCase):
                 continue
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         # About half the stops belong to SIG_DFL and end the child, so process start-up
-        # bounds the count; each ended child is one trial too.
-        self.assertGreater(trials + ended, 8)
+        # bounds the count; each ended child is one trial too. The count measures how fast
+        # the machine starts processes, not the guard: on one core shared with eleven busy
+        # processes it was 2 to 6 (kittrial-5bb.122 review), so only require that a trial ran.
+        self.assertGreater(trials + ended, 0)
 
 
 class LastCompletePairCase(RuntimeCase):
