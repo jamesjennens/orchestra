@@ -63,6 +63,7 @@ import record_json
 import re
 from pathlib import Path
 import recovery
+from field_limits import check_text, describe
 from requirements import canonical_bytes, content_hash
 
 PREFIX = 'Kind: contribution-review-v1\n'
@@ -160,9 +161,30 @@ JOURNAL_FILE_LIMIT = 256000
 COMMIT_TEXT = re.compile(r'(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})')
 
 
+#: The text limits of a review record, by the field name its error uses. The validator
+#: below and the `review` help both read this table (kittrial-5bb.97).
+TEXT_LIMITS = {'summary': 1200, 'repository': 1000, 'remote': 1000, 'branch': 300, 'bundle path': 1000,
+               'review text': 1000, 'resolution reason': 1000, 'resolution evidence': 1000,
+               'assignee snapshot': 300, 'decline reason': 1000, 'withdraw reason': 1000}
+ITEMS_MAX = 20
+PAYLOAD_MAX_BYTES = 24000
+
+
 def text(value, name, limit=500):
-    if not isinstance(value, str) or not value.strip() or len(value) > limit or '\x00' in value:
-        raise ValueError(f'{name}: expected nonempty text up to {limit} characters')
+    check_text(value, name, limit)
+
+
+def limited(value, name, where=''):
+    """A review-record field against TEXT_LIMITS; `where` names the item it sits in."""
+    check_text(value, where + name, TEXT_LIMITS[name])
+
+
+def help_limits():
+    """The limits for the machine-readable `review` help."""
+    limits = describe(TEXT_LIMITS)
+    limits['items / resolutions'] = '1..%d per record' % ITEMS_MAX
+    limits['payload'] = '<= %d KB canonical bytes' % (PAYLOAD_MAX_BYTES // 1000)
+    return limits
 
 
 def identity(value):
@@ -308,7 +330,7 @@ def validate(p, task):
         identity(p['previous'])
     op = p['operation']
     if op == 'contribute':
-        text(p['repository'], 'repository', 1000); text(p['summary'], 'summary', 1200)
+        limited(p['repository'], 'repository'); limited(p['summary'], 'summary')
         for key in ('commit', 'base_commit'):
             if not isinstance(p[key], str) or not re.fullmatch(r'(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})', p[key]):
                 raise ValueError(f'{key}: require exact 40/64 hexadecimal commit')
@@ -324,10 +346,10 @@ def validate(p, task):
             raise ValueError('Invalid delivery')
         if d.get('kind') == 'remote':
             fields(d, {'kind', 'remote', 'branch'})
-            text(d['remote'], 'remote', 1000); text(d['branch'], 'branch', 300)
+            limited(d['remote'], 'remote'); limited(d['branch'], 'branch')
         elif d.get('kind') == 'bundle':
             fields(d, {'kind', 'path', 'sha256'})
-            text(d['path'], 'bundle path', 1000)
+            limited(d['path'], 'bundle path')
             if not isinstance(d['sha256'], str) or not re.fullmatch(r'[a-fA-F0-9]{64}', d['sha256']):
                 raise ValueError('Require bundle SHA256')
         else:
@@ -335,21 +357,24 @@ def validate(p, task):
     else:
         identity(p['contribution'])
         if op == 'approve':
-            text(p['summary'], 'summary', 1200)
+            limited(p['summary'], 'summary')
             snapshot = p.get(ASSIGNEE_SNAPSHOT)
             if snapshot is not None:
-                text(snapshot, 'assignee snapshot', 300)
+                limited(snapshot, 'assignee snapshot')
         elif op == 'request-changes':
             # The summary is additive (kittrial-5bb.94 item 3): request-changes used
             # to reject it, so the reviewer's reasoning sat in an unlinked comment.
             if 'summary' in p:
-                text(p['summary'], 'summary', 1200)
+                limited(p['summary'], 'summary')
             values = p['items']
-            if not isinstance(values, list) or not 1 <= len(values) <= 20:
-                raise ValueError('Require 1..20 review items')
+            if not isinstance(values, list) or not 1 <= len(values) <= ITEMS_MAX:
+                raise ValueError('Require 1..%d review items' % ITEMS_MAX)
             seen = set()
-            for item in values:
-                item_fields(item); identity(item['id']); text(item['text'], 'review text', 1000)
+            for index, item in enumerate(values):
+                # The error names WHICH item is at fault: one over-long item used to fail
+                # the whole write with no pointer to it (kittrial-5bb.97).
+                item_fields(item); identity(item['id'])
+                limited(item['text'], 'review text', 'items[%d] (id %s) ' % (index, item['id']))
                 if item.get('severity', 'blocking') not in SEVERITIES:
                     raise ValueError('Review item severity must be blocking or note')
                 if item['id'] in seen:
@@ -357,13 +382,15 @@ def validate(p, task):
                 seen.add(item['id'])
         elif op == 'respond':
             values = p['resolutions']
-            if not isinstance(values, list) or not 1 <= len(values) <= 20:
-                raise ValueError('Require 1..20 review items')
+            if not isinstance(values, list) or not 1 <= len(values) <= ITEMS_MAX:
+                raise ValueError('Require 1..%d review items' % ITEMS_MAX)
             seen = set()
-            for item in values:
+            for index, item in enumerate(values):
                 fields(item, {'request', 'item', 'reason', 'evidence'})
                 identity(item['request']); identity(item['item'])
-                text(item['reason'], 'resolution reason', 1000); text(item['evidence'], 'resolution evidence', 1000)
+                where = 'resolutions[%d] (item %s) ' % (index, item['item'])
+                limited(item['reason'], 'resolution reason', where)
+                limited(item['evidence'], 'resolution evidence', where)
                 key = (item['request'], item['item'])
                 if key in seen:
                     raise ValueError('Duplicate review item')
@@ -371,21 +398,22 @@ def validate(p, task):
         elif op == 'request-review':
             reviewer(p['reviewer'])
             if 'summary' in p:
-                text(p['summary'], 'summary', 1200)
+                limited(p['summary'], 'summary')
         elif op == 'decline-review':
             identity(p['request'])
-            text(p['reason'], 'decline reason', 1000)
+            limited(p['reason'], 'decline reason')
         elif op == 'withdraw':
-            text(p['reason'], 'withdraw reason', 1000)
+            limited(p['reason'], 'withdraw reason')
             if p.get('disposition') is not None and p['disposition'] not in WITHDRAW_DISPOSITIONS:
                 raise ValueError('withdraw disposition must be withdrawn or superseded')
         elif op == 'resolve-item':
             identity(p['request']); identity(p['item'])
-            text(p['reason'], 'resolution reason', 1000)
+            limited(p['reason'], 'resolution reason')
             if p.get('disposition') is not None and p['disposition'] not in RESOLVE_DISPOSITIONS:
                 raise ValueError('resolve-item disposition must be resolved or note')
-    if len(canonical_bytes(p)) > 24000:
-        raise ValueError('Review workflow payload exceeds 24 KB')
+    if len(canonical_bytes(p)) > PAYLOAD_MAX_BYTES:
+        raise ValueError('Review workflow payload: %d canonical bytes, the limit is %d (24 KB)'
+                         % (len(canonical_bytes(p)), PAYLOAD_MAX_BYTES))
 
 
 def records(issue, voided=None):

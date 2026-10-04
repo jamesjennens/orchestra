@@ -510,6 +510,10 @@ def execute(root,request,authority_config=None,require_authority=False):
     args=request.get('args',[])
     if not isinstance(args,list) or not args or any(not isinstance(a,str) or '\0' in a for a in args):raise ValueError('Expected argument list')
     if args[0] not in ALLOWED:raise ValueError('Command is outside the contributor interface; use admin.py for setup/maintenance')
+    if args[:2]==['comments','list']:
+        # The native tool answers this with its whole usage text (kittrial-5bb.97).
+        raise ValueError('There is no `comments list`. Use `comments TASK` to list the comments of a task, and '
+                         '`comments add TASK ...` to add one.')
     # Identity/connection/file flags in every pflag spelling (short, joined,
     # =value, boolean cluster) are operator-only. Shorthand knowledge is
     # per-command, so -a is --assignee on list/ready/search/count/create/update

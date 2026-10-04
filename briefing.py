@@ -7,6 +7,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 from activity import build_entries, parse_moment, utc_text
+from field_limits import check_text
 from lifecycle import project_facts
 from requirements import canonical_bytes, content_hash
 
@@ -14,6 +15,9 @@ PREFIX='Kind: task-checkpoint-v1\n'
 KINDS={'blocker','question','decision','correction','dependency'}
 CHECKPOINT_ITEMS_MAX=100
 CHECKPOINT_TEXT_LIMIT=400
+#: The top-level text fields of a checkpoint and their limits; the validator and the
+#: `checkpoint` help both read this list (kittrial-5bb.97).
+CHECKPOINT_FIELD_LIMITS=(('source_commit',128),('branch',200),('intent',600),('acceptance',1000),('summary',1000),('next_action',600))
 CHECKPOINT_SOURCE_LIMIT=240
 CHECKPOINT_MAX_BYTES=80000
 BRIEF_ITEM_OFFSET_MIN=0
@@ -74,7 +78,8 @@ def snapshot(rows,project,task,exclude=None):
 def activity_cursor(data):return token({'v':1,'kind':'activity','project':data['project'],'task':data['task'],'sha256':content_hash(data)})
 
 def text(value,label,limit,empty=False):
-    if not isinstance(value,str) or len(value)>limit or (not empty and not value.strip()):raise ValueError(f'{label}: expected text up to {limit} characters')
+    # Names the field, the length it had and the limit (kittrial-5bb.97).
+    check_text(value,label,limit,empty=empty,nul=False)
 
 def field_names(values):
     """Bounded, sorted caller-supplied field names for an error message.
@@ -97,7 +102,7 @@ def validate_checkpoint(p,task):
     if details:raise ValueError('Invalid checkpoint: '+'; '.join(details))
     if p['task']!=task:raise ValueError('Checkpoint task mismatch')
     if p['previous'] is not None:identity(p['previous'])
-    for key,limit in [('source_commit',128),('branch',200),('intent',600),('acceptance',1000),('summary',1000),('next_action',600)]:text(p[key],key,limit,empty=key in ('source_commit','branch'))
+    for key,limit in CHECKPOINT_FIELD_LIMITS:text(p[key],key,limit,empty=key in ('source_commit','branch'))
     cursor=untoken(p['activity_cursor'])
     if not isinstance(cursor,dict) or cursor.get('kind')!='activity' or cursor.get('task')!=task:raise ValueError('Expected task activity cursor from brief/history')
     for field in ('open_items','resolved'):
@@ -115,12 +120,14 @@ def validate_checkpoint(p,task):
             if missing:details.append('missing fields: '+field_names(missing))
             if details:raise ValueError('%s: %s; allowed fields: %s' % (path,'; '.join(details),', '.join(sorted(keys))))
             ids.append(identity(item['id']))
+            # The path form `open_items[0].text` is the existing contract; the id is added after it.
+            named=lambda name:'%s.%s (id %s)' % (path,name,item['id'])
             if field=='open_items':
                 if item['kind'] not in KINDS:raise ValueError('%s.kind: expected one of %s' % (path,', '.join(sorted(KINDS))))
-                text(item['text'],path+'.text',CHECKPOINT_TEXT_LIMIT);text(item['source'],path+'.source',CHECKPOINT_SOURCE_LIMIT)
-            else:text(item['reason'],path+'.reason',CHECKPOINT_TEXT_LIMIT);text(item['evidence'],path+'.evidence',CHECKPOINT_SOURCE_LIMIT)
+                text(item['text'],named('text'),CHECKPOINT_TEXT_LIMIT);text(item['source'],named('source'),CHECKPOINT_SOURCE_LIMIT)
+            else:text(item['reason'],named('reason'),CHECKPOINT_TEXT_LIMIT);text(item['evidence'],named('evidence'),CHECKPOINT_SOURCE_LIMIT)
         if len(set(ids))!=len(ids):raise ValueError('Duplicate item IDs')
-    if len(canonical_bytes(p))>CHECKPOINT_MAX_BYTES:raise ValueError('Checkpoint exceeds %d KB' % (CHECKPOINT_MAX_BYTES//1000))
+    if len(canonical_bytes(p))>CHECKPOINT_MAX_BYTES:raise ValueError('Checkpoint: %d canonical bytes, the limit is %d (%d KB)' % (len(canonical_bytes(p)),CHECKPOINT_MAX_BYTES,CHECKPOINT_MAX_BYTES//1000))
 
 def transition(previous,current):
     old={x['id'] for x in previous['open_items']} if previous else set()
@@ -366,11 +373,13 @@ def help_limits(action):
     if action=='history':
         return {'limit':'%d..%d'%(HISTORY_LIMIT_MIN,HISTORY_LIMIT_MAX),
                 'body-budget':'%d..%d encoded bytes'%(HISTORY_BUDGET_MIN,HISTORY_BUDGET_MAX)}
-    return {'open_items':'<= %d'%CHECKPOINT_ITEMS_MAX,'resolved':'<= %d'%CHECKPOINT_ITEMS_MAX,
+    limits={key:'<= %d characters'%limit for key,limit in CHECKPOINT_FIELD_LIMITS}
+    limits.update({'open_items':'<= %d'%CHECKPOINT_ITEMS_MAX,'resolved':'<= %d'%CHECKPOINT_ITEMS_MAX,
             'item text/reason':'<= %d characters'%CHECKPOINT_TEXT_LIMIT,
             'item source/evidence':'<= %d characters'%CHECKPOINT_SOURCE_LIMIT,
             'payload':'<= %d KB canonical bytes'%(CHECKPOINT_MAX_BYTES//1000),
-            'error field names':'<= %d names, each <= %d characters'%(FIELD_NAME_COUNT,FIELD_NAME_LIMIT)}
+            'error field names':'<= %d names, each <= %d characters'%(FIELD_NAME_COUNT,FIELD_NAME_LIMIT)})
+    return limits
 
 def help_notes(action):
     if action=='brief':

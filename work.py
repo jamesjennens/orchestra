@@ -118,15 +118,26 @@ def help_payload(action='work'):
             'item severity, a request-changes summary) is refused unless this installation has '
             'review_workflow_writes on; readers here understand them either way. An operator '
             'turns it on with `admin.py review-writes on --actor OPERATOR`.',
+            'A text field over its limit is refused with the field, its length and the limit; for a '
+            'review item or a resolution the error also names which one (its index and id). The limits '
+            'are listed in `limits`.',
         ]
+        payload['limits'] = review_workflow_limits()
     elif action == 'handoff':
         payload['operations'] = ['transfer (from_actor/to_actor)', 'request', 'disposition']
         payload['notes'] = ['A JSON file attachment is required; payload.task must equal TASK.']
+        import handoff
+        payload['limits'] = handoff.help_limits()
     elif action in ('brief', 'history', 'checkpoint'):
         import briefing
         payload['limits'] = briefing.help_limits(action)
         payload['notes'] = briefing.help_notes(action)
     return payload
+
+def review_workflow_limits():
+    import review_workflow
+    return review_workflow.help_limits()
+
 
 def help_options(action):
     common = [
