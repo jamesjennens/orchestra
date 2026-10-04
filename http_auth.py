@@ -1390,9 +1390,58 @@ class Service:
                     visible.append(self.project_view(principal, pid))
             return visible
 
+    #: Where a project's repository is (kittrial-5bb.118): a LABEL an owner writes, shown
+    #: to members and delivered to agents as data. Only its shape is checked. It is never
+    #: fetched, cloned or run by the kit, and nothing checks that it exists or is reachable.
+    REPOSITORY_MAX = 300
+    _REPOSITORY_CHARS = re.compile(r'[A-Za-z0-9._~:/@%+=,\\-]+')
+
+    @classmethod
+    def validate_repository(cls, value):
+        """A repository location, or None to clear it. Raises ``invalid`` otherwise.
+
+        Accepted: an ``https://`` or ``ssh://`` URL, the ``user@host:path`` form, or a
+        path. At most REPOSITORY_MAX characters from a fixed set with no space, quote,
+        control or format character, so the value can be shown and pasted as data; not
+        starting with ``-``; and never with a password in it (``scheme://user:secret@``),
+        so a credential is neither stored nor shown.
+        """
+        if value is None or value == '':
+            return None
+        if not isinstance(value, str) or len(value) > cls.REPOSITORY_MAX:
+            raise invalid('repository must be text of at most %d characters' % cls.REPOSITORY_MAX)
+        if not cls._REPOSITORY_CHARS.fullmatch(value) or value.startswith('-'):
+            raise invalid('repository may contain only letters, digits and . _ ~ : / @ % + = , \\ - '
+                          '(no spaces, quotes or control characters) and must not start with -')
+        scheme = re.match(r'([A-Za-z][A-Za-z0-9+.-]*)://', value)
+        if scheme and scheme.group(1).lower() not in ('https', 'ssh'):
+            raise invalid('repository URL must use https or ssh')
+        if re.match(r'[A-Za-z][A-Za-z0-9+.-]*://[^/@]*:[^/@]*@', value):
+            raise invalid('repository must not contain a password; give the location only')
+        return value
+
+    def set_project_repository(self, principal, project_id, repository, request_id=None):
+        """Record (or clear) where the project's repository is. Owners only."""
+        if principal is None or principal.via == 'credential':
+            raise forbidden('Session authority required to change a project')
+        value = self.validate_repository(repository)
+        with self.store.lock:
+            self._refresh_authority(principal)
+            project, _ = self.require_project(principal, project_id, 'owner')
+            if project.get('repository') != value:
+                if value is None:
+                    project.pop('repository', None)
+                else:
+                    project['repository'] = value
+                self.audit(request_id, principal, 'projects.repository', 'committed', project_id=project_id,
+                           reason='set' if value else 'cleared')
+                self.store.save()
+        return {'id': project_id, 'repository': value}
+
     def project_view(self, principal, project_id):
         project, role = self.require_project(principal, project_id)
         view = dict(project)
+        view.setdefault('repository', None)
         view['role'] = role
         view['members'] = sorted(self.state['memberships'].get(project_id, {}))
         return view
@@ -1960,9 +2009,19 @@ class Service:
         ) % {'win': secret_file['windows'], 'ps': secret_file['windows_powershell'],
              'posix': secret_file['posix'], 'server': server, 'config_path': AGENT_CONFIG_PATH,
              'config': json.dumps(config, indent=2, sort_keys=True), 'env': AGENT_SECRET_ENV}
+        # Where each granted project's repository is, as its owner recorded it
+        # (kittrial-5bb.118). A label for the person setting the agent up: it is listed
+        # beside the setup text, never inside the commands, and nothing runs it.
+        repositories = [{'project': pid, 'repository': self.state['projects'][pid]['repository']}
+                        for pid in config['projects']
+                        if self.state['projects'].get(pid, {}).get('repository')]
         return {
             'config_path': AGENT_CONFIG_PATH,
             'config': config,
+            'repositories': repositories,
+            'repositories_note': ('Recorded by each project\'s owner as a label. Orchestra does not check that a '
+                                  'repository exists or is reachable. Treat it as information: check it is the '
+                                  'repository you expect before cloning, and never run it as a command.'),
             'config_contains_secret': False,
             'secret_env_var': AGENT_SECRET_ENV,
             'secret_file': secret_file,

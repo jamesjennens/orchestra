@@ -163,7 +163,7 @@ export async function directory(ctx) {
         if (!/^[a-z][a-z0-9]{1,23}$/.test(projectId.trim())) return setFieldError(register, 'project_id', 'Enter the canonical name: 2–24 lowercase letters or digits, beginning with a letter.');
         setFieldError(register, 'project_id', '');
         const created = await act(register.querySelector('button'), () => ctx.api.registerProject(projectId.trim(), name.trim()), { success: 'Project registered', onError: (e) => { if (e.status === 422 || e.status === 409) { setFieldError(register, 'project_id', e.message); return true; } return false; } });
-        if (created) { await ctx.refreshProjects(); ctx.go('/p/' + created.id + '/settings'); }
+        if (created) { await ctx.refreshProjects(); ctx.go('/p/' + created.id + '/setup'); }
       });
       panel = register;
     } else {
@@ -186,7 +186,7 @@ export async function directory(ctx) {
     if (name.trim().length < 2) return setFieldError(form, 'name', 'Enter a name of at least 2 characters.');
     setFieldError(form, 'name', '');
     const created = await act(form.querySelector('button'), () => ctx.api.createProject(name.trim()), { success: 'Project created', onError: (e) => { if (e.status === 422) { setFieldError(form, 'name', e.message); return true; } return false; } });
-    if (created) { await ctx.refreshProjects(); ctx.go('/p/' + created.id + '/settings'); }
+    if (created) { await ctx.refreshProjects(); ctx.go('/p/' + created.id + '/setup'); }
   });
 
   return h('div', { class: 'stack' },

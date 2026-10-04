@@ -481,6 +481,16 @@ def environment(root):
     prepared the old way metrics-off without touching anything outside ``root``.
     """
     env=os.environ.copy()
+    # The account's own home, recorded before HOME is scoped into the runtime below: the
+    # scheduled-backup units are installed there, and the web service and the endpoint
+    # it starts run under this environment and must still find them (kittrial-5bb.118).
+    # The kit SETS the variable, from the home it is about to replace; a value a caller
+    # put in the environment is overwritten. Only a process that is already under the
+    # scoped home (a child of one that ran this) keeps the value its parent set.
+    if env.get('HOME') and Path(env['HOME'])!=root/'home':
+        env[ACCOUNT_HOME_ENV]=env['HOME']
+    elif not env.get('HOME'):
+        env.pop(ACCOUNT_HOME_ENV,None)
     env.update({'HOME':str(root/'home'),
                 'PATH':str(root/'bin')+os.pathsep+env.get('PATH',''),
                 'DOLT_ROOT_PATH':str(root/'dolt-home'),'XDG_CONFIG_HOME':str(root/'config'),
@@ -988,9 +998,25 @@ def worker_client_setup(root,name):
             f'Bootstrap command (replace ACTOR with the actor returned by worker.py start or session\n'
             f'register):\n  python client.py --config client.local.json --project {name} --actor ACTOR -- onboard')
 
+#: Set by ``environment`` to the account's home when it scopes HOME into the runtime.
+ACCOUNT_HOME_ENV='ORCHESTRA_ACCOUNT_HOME'
+
 def scheduled_backup_unit_dir():
     """The user systemd unit directory an operator installs the schedule into."""
     return Path.home()/'.config/systemd/user'
+
+def account_unit_dir(root):
+    """The account's unit directory, also for a process under the runtime's scoped home.
+
+    From a shell this is ``scheduled_backup_unit_dir()`` and the environment variable is
+    not looked at. Only when HOME is the runtime's own ``<root>/home`` (the web service
+    and the endpoint it starts run that way, and that home holds no units) is the
+    account's home taken from ``ORCHESTRA_ACCOUNT_HOME``, which ``environment`` set.
+    """
+    home=os.environ.get(ACCOUNT_HOME_ENV)
+    if home and os.environ.get('HOME') and Path(os.environ['HOME'])==Path(root)/'home':
+        return Path(home)/'.config/systemd/user'
+    return scheduled_backup_unit_dir()
 
 def scheduled_backup_unit_paths():
     """Every installed scheduled-backup candidate unit, sorted by path.
@@ -1087,6 +1113,76 @@ def scheduled_backup_unit_report(text,root):
         else:
             report['other_runtime']=True
     return report
+
+def scheduled_backup_covers(root,name):
+    """Whether the INSTALLED schedule backs up one project: True, False or None (unknown).
+
+    The same unit files and the same classification as ``scheduled_backup_coverage``,
+    reduced to one answer for the project setup page (kittrial-5bb.118): True when a
+    unit runs ``backup --all`` for this runtime or names this project, False when units
+    were read and none does (or none is installed), None when a unit could not be read
+    and nothing that was read covers the project. Drop-ins are not inspected.
+    """
+    # The same candidates as scheduled_backup_unit_paths(), looked up in account_unit_dir.
+    try:
+        paths=sorted(path for path in account_unit_dir(root).glob('beads-*backup*.service') if path.is_file())
+    except OSError:
+        return None
+    unreadable=False
+    for path in paths:
+        try:text=path.read_text(encoding='utf-8')
+        except OSError:
+            unreadable=True;continue
+        report=scheduled_backup_unit_report(text,root)
+        if report['all_line'] or name in report['named'] or name in report['wrapper_projects']:
+            return True
+    return None if unreadable else False
+
+def project_setup_status(root,name,path=None):
+    """What the host knows about one project's setup, for the web setup page.
+
+    Read-only, and no more than its caller may already read (kittrial-5bb.118): guidance
+    and onboarding as set or not set with a version or a time, never their text; backup
+    as covered, not covered or unknown, the line an operator would install, and how the
+    last backup run recorded the project. Each part is answered on its own: one that
+    cannot be read says ``unknown`` and never fails the others.
+    """
+    from datetime import datetime, timezone
+    path=project_dir(root,name) if path is None else Path(path)
+    result={'schema_version':1,'project':name}
+    try:
+        from guidance import state as guidance_state
+        block=guidance_state(path)
+        result['guidance']={'state':('unreadable' if block.get('unreadable') else 'unbound' if block.get('unbound')
+                                     else 'set' if block.get('present') else 'not-set'),
+                            'version':block.get('version'),'set_at':block.get('set_at')}
+    except (OSError,ValueError):
+        result['guidance']={'state':'unknown','version':None,'set_at':None}
+    try:
+        entry=path/'ONBOARDING.md'
+        if entry.is_symlink():raise ValueError('symlink')
+        present=entry.is_file() and bool(entry.read_text(encoding='utf-8').strip())
+        result['onboarding']={'state':'set' if present else 'not-set',
+                              'updated_at':(datetime.fromtimestamp(entry.stat().st_mtime,timezone.utc)
+                                            .strftime('%Y-%m-%dT%H:%M:%SZ') if present else None)}
+    except (OSError,ValueError,UnicodeError):
+        result['onboarding']={'state':'unknown','updated_at':None}
+    try:
+        covers=scheduled_backup_covers(root,name)
+    except OSError:
+        covers=None
+    backup={'scheduled':'covered' if covers else 'unknown' if covers is None else 'not-covered',
+            'line':scheduled_backup_execstart(root),'last_run':None}
+    try:
+        record=read_backup_status(root)
+        for item in record['projects']:
+            if item['name']==name:
+                backup['last_run']={'status':item['status'],'completed_at':item.get('completed_at'),
+                                    'degraded':bool(item.get('degraded')),'scope':record.get('scope')}
+    except (ValueError,OSError):
+        pass
+    result['backup']=backup
+    return result
 
 def scheduled_backup_coverage(root,name):
     """(durably_covers_every_project, message) for the INSTALLED schedule.

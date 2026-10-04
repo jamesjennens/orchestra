@@ -1,6 +1,7 @@
 import { h, time, confirmDialog, secretDialog, toast, shortSha } from '../dom.js';
 import { pageHead, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, errorState, describe } from '../ui.js';
 import { queuePanel, detailPanel, proposeForm, myStrip } from './proposals.js';
+import { setupHint } from './setup.js';
 
 const PAGE = 10;
 export const canWrite = (p) => ['owner', 'contributor', 'superuser'].includes(p.role);
@@ -90,12 +91,17 @@ export async function overview(ctx, { pid }) {
   // waits for it; it stays empty on a server without the proposal routes.
   const strip = h('div');
   myStrip(ctx, pid).then((node) => { if (node) strip.replaceChildren(node); }).catch(() => {});
+  // For owners, while setup steps are left: one line linking to them. Filled after the
+  // page is shown, and silent when the server has no setup route.
+  const setupLine = h('div');
+  setupHint(ctx, project).then((node) => { if (node) setupLine.replaceChildren(node); }).catch(() => {});
 
   return h('div', { class: 'stack' },
     pageHead({ crumbs: crumbs(ctx, project), title: project.name, lede: project.description || null,
       actions: canWrite(project) && !project.archived ? h('a', { class: 'btn primary', href: ctx.href(`/p/${pid}/new`) }, 'New task') : null }),
     archivedBanner(project),
     unusableBanner(project),
+    setupLine,
     strip,
     h('div', { class: 'toolbar' }, search, statusSeg, reviewSel),
     tableHost);

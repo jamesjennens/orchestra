@@ -10,11 +10,12 @@ import * as task from './views/task.js';
 import * as admin from './views/admin.js';
 import * as reqs from './views/requirements.js';
 import * as agents from './views/agents.js';
+import * as setup from './views/setup.js';
 
 // Route name -> view. Patterns live in routes.js (shared ID pattern, testable).
 const VIEWS = {
   home: work.home, welcome: work.welcome, projects: work.directory, agents: agents.list,
-  project: project.overview, reviews: project.reviews, feedback: project.feedback, settings: project.settings,
+  project: project.overview, reviews: project.reviews, feedback: project.feedback, settings: project.settings, setup: setup.page,
   newTask: task.create, task: task.detail,
   requirements: reqs.brd, requirement: reqs.requirement, decisions: reqs.decisions, decision: reqs.decision, record: reqs.record,
   users: admin.users, account: admin.account,
@@ -93,6 +94,7 @@ export async function start(root, options = {}) {
             ctx.features.requirements ? link('/p/' + pid + '/decisions', 'Decisions') : null,
             link('/p/' + pid + '/feedback', 'Feedback'),
             link('/p/' + pid + '/settings', 'Members & settings'),
+            ['owner', 'superuser'].includes(current.role) ? link('/p/' + pid + '/setup', 'Set up') : null,
           ] : null),
         ctx.me.superuser ? h('div', { class: 'rail-section' },
           h('span', { class: 'rail-label' }, 'Administration'),

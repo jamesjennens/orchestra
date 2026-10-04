@@ -241,6 +241,84 @@ With `--backend inprocess` (disposable local validation) everything is service-l
 "New project" still creates the project directly (`project_create: create`), and no record
 is ever unusable or listed for confirmation.
 
+### Setting a project up
+
+Registering a project makes it exist; it does not make it ready. The web interface has
+a page for what is left, **Set up** in the project's menu (`#/p/NAME/setup`), which an
+owner is taken to straight after registering and which stays reachable from the project
+(a line on the project page says how many steps are left while any is). It is for the
+project's owners and for superusers; anyone else gets `403`. Through the API it is
+`GET /v1/projects/{id}/setup`.
+
+Seven steps. Each has a state (`done`, `todo`, `optional`, `unknown`, `unavailable`,
+`not-applicable`), who can do it, and either where it is done in the web interface or
+the exact command for the server. `remaining` counts the `todo` ones.
+
+| Step | Read from | Who does it |
+| --- | --- | --- |
+| Members added | the project's members; `optional` while the caller is the only one | an owner (a superuser to add another owner) |
+| Repository location recorded | the project's `repository` field | an owner, on the setup page |
+| A first task defined | the task list (the project's merge slot row is not a task) | any member who may write tasks |
+| A personal agent granted the project | the enabled agents granted this project | each member, for their own agent |
+| Guidance set | the host | an operator: `admin.py set-guidance NAME --actor OPERATOR --file FILE` |
+| Onboarding set | the host | an operator: `admin.py set-onboarding NAME --file FILE` |
+| Covered by a scheduled backup | the host | an operator, with the `ExecStart` line shown |
+
+- **Who can do it holds for one person and for three.** Each step names a role, not a
+  person. On an installation where one person is operator, superuser and owner, they do
+  every step; where those are three people, the page tells the owner which steps are
+  theirs and gives them the command to send to the operator for the rest.
+- **The page writes nothing on the server.** The three host steps show a command to
+  copy; the web interface does not run it. Setting guidance or onboarding from the web
+  interface is not offered.
+- **The host steps come through one read-only endpoint action, `setup-status`**, so the
+  web service still reaches the host only through `endpoint.py`. It returns states with
+  a version or a time and never guidance or onboarding text: guidance `set`, `not-set`,
+  `unbound` or `unreadable` (the last two read as "to do", with the reason); onboarding
+  `set` or `not-set`; the backup schedule `covered`, `not-covered` or `unknown` (from
+  the installed `beads-*backup*.service` unit files; drop-ins are not inspected), the
+  line that covers every project, and how the last backup run recorded the project.
+  `endpoint.py` answers the action for any actor it accepts; `client.py` has no command
+  for it.
+- **Where the backup units are looked for.** The supervised service runs with `HOME`
+  pointed into the runtime (`<root>/home`), which holds no unit files. When the kit
+  scopes `HOME` it records the account's own home in `ORCHESTRA_ACCOUNT_HOME`, and the
+  setup read looks for `beads-*backup*.service` there. The kit sets that variable
+  itself, from the `HOME` it replaces, and overwrites any value it was started with; a
+  contributor's SSH command never carries it (the forced command passes only locale
+  variables, `PATH` and `HOME`). Run from a shell, `add-project`'s schedule report and
+  `backup-status` do not read the variable at all and behave as before.
+- **A server whose `endpoint.py` predates the action** refuses it; the three steps then
+  read `unavailable` ("Not available on this server") and the rest of the page works.
+  With `--backend inprocess` there is no host and they read `not-applicable`.
+- **The setup page never shows another member's agent setup.** The agent step says how
+  many agents may work in the project and whether one is the caller's.
+
+**Where the repository is.** `PATCH /v1/projects/{id}` with `{"repository": "..."}`
+(owners and superusers; `null` or an empty string clears it; audited as
+`projects.repository` without the value) records where the project's code lives. Every
+member reads it in `GET /v1/projects/{id}`. An agent reads it as `repository` on each
+project in `GET /v1/agents/me/next`, as `project_repository` in a task brief over HTTP,
+and listed beside the agent setup text (`setup.repositories`), never inside the
+commands of that text.
+- It is a **label written by another person**. Wherever it is shown or delivered it is
+  data: an agent or a person checks it is the repository they expect before cloning,
+  and never runs it as a command.
+- **What the kit checks: its shape only.** At most 300 characters from letters, digits
+  and `. _ ~ : / @ % + = , \ -`, so no space, quote, control or format character and no
+  shell character; not starting with `-`; an `https://` or `ssh://` URL, the
+  `user@host:path` form or a path; and no password in it (`https://user:secret@...` is
+  refused, so a credential is neither stored nor shown). The refusal never repeats the
+  value.
+- **What the kit does not check:** that the repository exists, that anyone can reach
+  it, or that an agent's clone points at it.
+- **The SSH brief does not carry it.** The field lives in this service's `--state`
+  document, not in the canonical project, so `brief TASK` over SSH has no such field.
+- It is part of the `--state` document, so the backup of that document in section 8
+  covers it. A kit before this one reads a state file that has the field: its project
+  routes return the record as it is stored, so the field still appears in them, and
+  that kit has no route that changes it and no page that shows it.
+
 ### Requirement proposals
 
 A proposal says what the product should do. It is intake, not a task and not a

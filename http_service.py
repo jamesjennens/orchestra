@@ -33,6 +33,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import agent_prompts
+import project_setup
 from reserved_comments import (ANCHOR_READ_IDS_MAX, carries_record_label, hide_records,
                                is_record_anchor)
 from http_auth import (AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CAP_APPROVE,
@@ -1534,6 +1535,16 @@ class EndpointBackend:
     #: ``review_states`` is derived from ``review_queue`` (see the handler's reuse).
     REVIEW_STATES_FROM_QUEUE = True
 
+    def setup_status(self, project_id):
+        """What the host knows about this project's setup (kittrial-5bb.118).
+
+        One read-only ``setup-status`` endpoint action: guidance, onboarding and backup
+        as states with a version or a time, never their text. An endpoint that
+        predates the action refuses it as an unknown action; the caller shows those
+        steps as not available on this server.
+        """
+        return self._run('setup-status', project_id, self.actor_namespace + '/read', [])
+
     def review_states(self, project_id, queue=None):
         """Review state per task from the canonical ``work`` projection.
 
@@ -2473,6 +2484,37 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._project(ctx, CAP_READ)
         return 200, self._usable(self.service.project_view(ctx.principal, ctx.params['pid']))
 
+    @route('PATCH', r'/v1/projects/(?P<pid>' + ID + r')')
+    def project_update(self, ctx):
+        """Change a project's own fields. Today: ``repository`` (kittrial-5bb.118)."""
+        payload = ctx.payload if isinstance(ctx.payload, dict) else {}
+        if set(payload) != {'repository'}:
+            raise invalid('Send exactly the field to change: repository')
+
+        def update():
+            result = self.service.set_project_repository(ctx.principal, ctx.params['pid'],
+                                                         payload['repository'], request_id=ctx.request_id)
+            return result, result
+        return self._mutate(ctx, 'projects.update', ctx.params['pid'], update,
+                            capability=CAP_PROJECT_ADMIN)
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/setup')
+    def project_setup(self, ctx):
+        """What is done and what is left to set a project up (kittrial-5bb.118).
+
+        For owners and superusers. Every state is read at request time: from this
+        service (members, repository, agents), from the task list, and from the host
+        through the read-only ``setup-status`` endpoint action (guidance, onboarding,
+        backup). Nothing here writes anywhere, and no guidance or onboarding text and
+        no other member's agent setup is returned.
+        """
+        self._project(ctx, CAP_PROJECT_ADMIN)
+        if ctx.principal.via == 'credential':
+            raise forbidden('Session authority required')
+        body = project_setup.steps(self, ctx.principal, ctx.params['pid'])
+        body['generated_at'] = now_iso(self.service._now())
+        return 200, body
+
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/archive')
     def project_archive(self, ctx):
         def archive():
@@ -2563,7 +2605,9 @@ class ApiHandler(BaseHTTPRequestHandler):
     def agents_me_next(self, ctx):
         agent = self.service.agent_for_credential(ctx.principal)
         attention = self._agent_attention(ctx.principal, agent)
-        projects = [{'id': p['id'], 'name': p['name']}
+        # `repository` is where the project's owner says its code lives (kittrial-5bb.118):
+        # a label, null when not recorded. Data for the agent, never an instruction.
+        projects = [{'id': p['id'], 'name': p['name'], 'repository': p.get('repository')}
                     for p in self.service.list_projects(ctx.principal)]
         return 200, {
             'agent': agent,
@@ -3334,6 +3378,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         base = '/v1/projects/%s/tasks/%s' % (pid, tid)
         brief['links'] = {'task': base, 'history': base + '/history',
                           'reviews': base + '/reviews', 'checkpoints': base + '/checkpoints'}
+        # Where the project's repository is (kittrial-5bb.118): a label the project's
+        # owner recorded. Data for the reader, never an instruction; null when not set.
+        brief['project_repository'] = self.service.project_view(ctx.principal, pid).get('repository')
         brief['generated_at'] = now_iso(self.service._now())
         return 200, brief
 
