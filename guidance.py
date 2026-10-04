@@ -46,6 +46,10 @@ CLEAR_NAME = '.guidance-clear.json'
 # never parses this file, and the backup does not carry it (the sidecar names its files).
 REPAIR_NAME = '.guidance-repair.json'
 REPAIR_FIELDS = {'schema_version', 'version', 'set_by', 'set_at', 'repaired_by', 'repaired_at'}
+# The file is local and unauthenticated (anyone who can write the project directory can
+# plant one), so it is read with a bound and shown only when it names the current
+# generation AND a configured operator as the repairer (kittrial-5bb.124).
+REPAIR_LIMIT = 4096
 CLEAR_INVALID_NAME = '.guidance-clear.json.invalid'
 LIMIT = 8000
 HISTORY_LIMIT = 50
@@ -443,12 +447,17 @@ def _attribution(meta, current):
 
 
 def read_repair(path):
-    """The same-text repair audit file, or None when absent, a symlink or not one this kit wrote."""
+    """The same-text repair audit file, or None when absent, a symlink, larger than
+    ``REPAIR_LIMIT`` bytes or not one this kit wrote."""
     target = Path(path) / REPAIR_NAME
     if target.is_symlink() or not target.is_file():
         return None
     try:
-        value = record_json.loads(target.read_text(encoding='utf-8'))
+        with target.open('rb') as handle:
+            raw = handle.read(REPAIR_LIMIT + 1)
+        if len(raw) > REPAIR_LIMIT:
+            return None
+        value = record_json.loads(raw.decode('utf-8'))
     except (OSError, UnicodeError, ValueError, RecursionError):
         return None
     if (not isinstance(value, dict) or set(value) != REPAIR_FIELDS or value.get('schema_version') != 1
@@ -459,13 +468,33 @@ def read_repair(path):
     return value
 
 
-def _repair_audit(path, meta, bound):
+def deployment_operators(path):
+    """The configured operators of the deployment a project directory belongs to
+    (``ROOT/projects/NAME``), or an empty set when it cannot be told: the repair audit
+    is then not shown, never shown unchecked."""
+    project = Path(path)
+    if project.parent.name != 'projects':
+        return frozenset()
+    try:
+        from admin import operators
+        return frozenset(operators(project.parent.parent))
+    except (OSError, ValueError, RecursionError):
+        return frozenset()
+
+
+def _repair_audit(path, meta, bound, operators=None):
     """``repaired_by``/``repaired_at`` when a same-text repair kept the original setter of
     this exact, bound version and recorded itself beside the record (kittrial-5bb.121). The
     file names the generation it repaired (version, setter, time); any later set, including
-    a same-text set by an older kit that never reads this file, changes one of them."""
+    a same-text set by an older kit that never reads this file, changes one of them. The
+    file is local and unauthenticated, so it is shown only when the repairer it names is a
+    configured operator (``operators``, or the deployment's when not given)."""
     repair = read_repair(path) if bound and isinstance(meta, dict) else None
     if repair is None or any(repair[key] != meta.get(key) for key in ('version', 'set_by', 'set_at')):
+        return {}
+    if operators is None:
+        operators = deployment_operators(path)
+    if repair['repaired_by'] not in operators:
         return {}
     return {'repaired_by': repair['repaired_by'], 'repaired_at': repair['repaired_at']}
 
@@ -532,7 +561,7 @@ def _withheld(meta, since, warning):
             'warning': warning + '. ' + REPAIR_NEXT_ACTION, 'next_action': REPAIR_NEXT_ACTION}
 
 
-def state(path, actor=None):
+def state(path, actor=None, operators=None):
     """The version block shared by the read, brief, work and resume responses.
 
     ``attention`` is true exactly when guidance is set (or cannot be read) and the
@@ -562,7 +591,7 @@ def state(path, actor=None):
               'acknowledged_at': entry.get('acknowledged_at') if entry else None,
               'unbound': bool(current is not None and not bound),
               'attention': bool(current is not None and not acknowledged)}
-    result.update(_repair_audit(path, meta, bound))
+    result.update(_repair_audit(path, meta, bound, operators))
     if warning:
         result['warning'] = warning
     if result['attention']:
@@ -570,7 +599,7 @@ def state(path, actor=None):
     return result
 
 
-def read(path, args, actor=None):
+def read(path, args, actor=None, operators=None):
     """``guidance get [--since VERSION]``: the text plus what changed since a version."""
     since = None
     index = 0
@@ -628,7 +657,7 @@ def read(path, args, actor=None):
     changed = since is not None and since != current
     entry = _acknowledgement(meta, actor)
     result = {'schema_version': 1, 'present': True, 'version': current,
-              'set_at': set_at, 'set_by': set_by, **_repair_audit(path, meta, True), 'text': text, 'changed': changed,
+              'set_at': set_at, 'set_by': set_by, **_repair_audit(path, meta, True, operators), 'text': text, 'changed': changed,
               'since': since, 'since_known': since_known,
               'meta_version': meta.get('version') if isinstance(meta, dict) else None,
               'previous_version': previous,
@@ -755,18 +784,26 @@ def write_guidance(path, text, actor, now=None):
         meta['acks_compacted_by'] = old_meta['acks_compacted_by']
         meta['acks_compacted_at'] = old_meta['acks_compacted_at']
     validate_meta(meta)
+    repair_path = Path(path) / REPAIR_NAME
+    if rewrite and (repair_path.is_symlink() or (repair_path.exists() and not repair_path.is_file())):
+        # Checked before anything is written (kittrial-5bb.124): the repair and its audit
+        # are one operation, so a path the audit cannot be written to refuses both.
+        raise ValueError('Nothing was changed: %s in the project directory is a symlink or not a regular file, so '
+                         'the repair audit could not be written; remove it and set the guidance again' % REPAIR_NAME)
     # The text is written first: a crash before the metadata replace leaves the new
     # version already authoritative (readers derive it from the text) with stale
     # audit fields, which a set with the same text repairs (see above).
     write_text(target, text)
     atomic(meta_path, meta)
-    repair_path = Path(path) / REPAIR_NAME
+    audit_warning = None
     if rewrite:
-        if repair_path.is_symlink():
-            raise ValueError('The guidance record was repaired, but %s is a symlink, so the repair audit was not '
-                             'written; ask the operator to check it' % REPAIR_NAME)
-        atomic(repair_path, {'schema_version': 1, 'version': current, 'set_by': set_by, 'set_at': set_at,
-                             'repaired_by': actor, 'repaired_at': stamp})
+        try:
+            atomic(repair_path, {'schema_version': 1, 'version': current, 'set_by': set_by, 'set_at': set_at,
+                                 'repaired_by': actor, 'repaired_at': stamp})
+        except OSError:
+            # The record is already repaired; say so in one sentence rather than fail.
+            audit_warning = ('The guidance record was repaired, but the repair audit %s could not be written, so '
+                             'readers show the original setter without the repair' % REPAIR_NAME)
     elif repair_path.exists() and not repair_path.is_symlink():
         # A new generation, or a repair of an unbound record that names its own setter:
         # an earlier repair audit no longer describes the record.
@@ -779,6 +816,8 @@ def write_guidance(path, text, actor, now=None):
               'changed': previous != current, 'repaired': needs_repair}
     if rewrite:
         result['repaired_by'], result['repaired_at'] = actor, stamp
+    if audit_warning:
+        result['warning'] = audit_warning
     if replaced_unreadable:
         result['replaced_unreadable'] = True
     return result
@@ -1085,7 +1124,7 @@ def status(path, actor, operators=None, host=False):
     behind = sorted(row['actor'] for row in rows if not row['current'] and row['version'] == previous)
     stale = sorted(row['actor'] for row in rows if not row['current'] and row['version'] != previous)
     result = {'schema_version': 1, 'present': text is not None, 'version': current,
-              'set_by': set_by, 'set_at': set_at, **_repair_audit(path, meta, bound),
+              'set_by': set_by, 'set_at': set_at, **_repair_audit(path, meta, bound, operators),
               'meta_version': meta.get('version') if isinstance(meta, dict) else None,
               'previous_version': previous,
               'acknowledged': rows, 'acknowledged_total': len(rows),
@@ -1113,12 +1152,12 @@ def status(path, actor, operators=None, host=False):
     return result
 
 
-def brief_block(path, actor=None):
+def brief_block(path, actor=None, operators=None):
     """The compact version block for brief/work/resume; never raises on old projects."""
     if path is None:
         return None
     try:
-        return state(path, actor)
+        return state(path, actor, operators)
     except (OSError, ValueError, RecursionError):
         # Guidance is an instruction channel: if it cannot be read reliably, say so
         # (and keep attention true) instead of silently reporting "no guidance".

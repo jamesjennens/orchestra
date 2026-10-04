@@ -413,12 +413,22 @@ class GuidanceRecordTests(unittest.TestCase):
                                       '.guidance-clear.json', '.sessions.json', '.feedback.jsonl'})
 
     def repaired(self):
-        """`second`, set by operator-1, then repaired by operator-2 with a same-text set."""
+        """`second`, set by operator-1, then repaired by operator-2 with a same-text set, in a
+        deployment that lists both as operators (the audit names a listed repairer)."""
+        self.project = self.root / 'projects' / 'example'
+        self.project.mkdir(parents=True)
+        self.operators(['operator-1', 'operator-2'])
         guidance.write_guidance(self.project, 'first', 'operator-1', now='2026-10-01T10:00:00+00:00')
         guidance.write_guidance(self.project, 'second', 'operator-1', now='2026-10-01T11:00:00+00:00')
         self._damage(lambda meta: meta['history'].append({'version': 'bad', 'set_by': None, 'set_at': None,
                                                           'previous_version': None}))
         return guidance.write_guidance(self.project, 'second', 'operator-2', now='2026-10-02T09:00:00+00:00')
+
+    def operators(self, names):
+        (self.root / 'deployment.private.json').write_text(json.dumps({'operators': names}), encoding='utf-8')
+
+    def shown(self):
+        return 'repaired_by' in guidance.state(self.project, 'worker-1')
 
     def test_a_same_text_repair_keeps_the_original_setter(self):
         # kittrial-5bb.121: the repair used to replace set_by/set_at with its own, and the
@@ -430,7 +440,7 @@ class GuidanceRecordTests(unittest.TestCase):
         self.assertEqual(meta['set_by'], 'operator-1')
         self.assertEqual(guidance.read_repair(self.project)['repaired_by'], 'operator-2')
         for shown in (guidance.state(self.project, 'worker-1'), guidance.read(self.project, ['get'], 'worker-1'),
-                      guidance.status(self.project, 'operator-1', operators=['operator-1'], host=True),
+                      guidance.status(self.project, 'operator-1', operators=['operator-1', 'operator-2'], host=True),
                       guidance.brief_block(self.project, 'worker-1')):
             self.assertEqual((shown['set_by'], shown['repaired_by'], shown['repaired_at']),
                              ('operator-1', 'operator-2', '2026-10-02T09:00:00+00:00'))
@@ -488,6 +498,125 @@ class GuidanceRecordTests(unittest.TestCase):
         self.assertTrue((self.project / guidance.REPAIR_NAME).exists())
         self.assertNotIn('repaired_by', guidance.state(self.project, 'worker-1'))
 
+    def test_the_audit_must_name_the_records_version_setter_and_time(self):
+        # kittrial-5bb.124: each of the three is checked on its own.
+        self.repaired()
+        self.assertTrue(self.shown())
+        good = guidance.read_meta(self.project)
+        for key, value in (('set_at', '2026-10-01T11:00:01+00:00'), ('set_by', 'operator-9')):
+            with self.subTest(changed=key):
+                self._damage(lambda meta: meta.update({key: value}))
+                guidance.validate_meta(guidance.read_meta(self.project))
+                self.assertFalse(self.shown())
+                (self.project / '.guidance.json').write_text(json.dumps(good), encoding='utf-8')
+                self.assertTrue(self.shown())
+
+    def test_the_audit_is_not_shown_for_an_unbound_record(self):
+        self.repaired()
+        guidance.write_text(self.project / 'GUIDANCE.md', 'second, edited by hand')
+        state = guidance.state(self.project, 'worker-1')
+        self.assertTrue(state['unbound'])
+        self.assertNotIn('repaired_by', state)
+        self.assertNotIn('repaired_by', guidance.status(self.project, 'operator-1', operators=['operator-1']))
+
+    @unittest.skipIf(sys.platform == 'win32', 'symlinks need privileges on Windows')
+    def test_a_symlinked_audit_file_is_not_read(self):
+        self.repaired()
+        audit = self.project / guidance.REPAIR_NAME
+        elsewhere = self.root / 'planted.json'
+        elsewhere.write_bytes(audit.read_bytes())
+        audit.unlink()
+        audit.symlink_to(elsewhere)
+        self.assertIsNone(guidance.read_repair(self.project))
+        self.assertFalse(self.shown())
+
+    def test_the_repair_never_writes_its_audit_into_the_record(self):
+        # The original P2 of kittrial-5bb.121: repaired_by in .guidance.json broke every older kit.
+        self.repaired()
+        for _ in range(2):
+            meta = guidance.read_meta(self.project)
+            self.assertEqual(set(meta), {'schema_version', 'version', 'set_by', 'set_at', 'previous_version',
+                                         'previous_text', 'history', 'acknowledged'})
+            self._damage(lambda meta: meta['history'].append({'version': 'bad', 'set_by': None, 'set_at': None,
+                                                              'previous_version': None}))
+            self.assertTrue(guidance.write_guidance(self.project, 'second', 'operator-2')['repaired'])
+
+    def test_the_audit_is_shown_only_for_a_configured_operator(self):
+        # kittrial-5bb.124: the file is local and unauthenticated. A well-formed file planted
+        # for the current generation that names someone off the allowlist is not shown.
+        self.repaired()
+        self.assertTrue(self.shown())
+        audit = self.project / guidance.REPAIR_NAME
+        planted = dict(json.loads(audit.read_text(encoding='utf-8')), repaired_by='intruder')
+        audit.write_text(json.dumps(planted), encoding='utf-8')
+        self.assertFalse(self.shown())
+        self.assertEqual(guidance.state(self.project, 'worker-1', operators={'intruder'})['repaired_by'], 'intruder')
+        # The deployment's allowlist decides when the caller gives none; operator-2 removed
+        # from it, its real repair is not shown either.
+        audit.write_text(json.dumps(dict(planted, repaired_by='operator-2')), encoding='utf-8')
+        self.assertTrue(self.shown())
+        self.operators(['operator-1'])
+        self.assertFalse(self.shown())
+        for shown in (guidance.read(self.project, ['get'], 'worker-1'), guidance.brief_block(self.project, 'worker-1'),
+                      guidance.status(self.project, 'operator-1', operators=['operator-1'])):
+            self.assertNotIn('repaired_by', shown)
+        # Outside a deployment layout (ROOT/projects/NAME) nothing says who the operators
+        # are, even next to a deployment configuration.
+        self.assertEqual(guidance.deployment_operators(self.project), frozenset({'operator-1'}))
+        self.assertEqual(guidance.deployment_operators(self.root / 'elsewhere' / 'example'), frozenset())
+
+    def test_an_oversized_audit_file_is_not_read(self):
+        self.repaired()
+        audit = self.project / guidance.REPAIR_NAME
+        value = audit.read_text(encoding='utf-8')
+        audit.write_text(value + ' ' * (guidance.REPAIR_LIMIT - len(value.encode('utf-8'))), encoding='utf-8')
+        self.assertTrue(self.shown())                    # exactly at the bound
+        audit.write_text(value + ' ' * (guidance.REPAIR_LIMIT + 1 - len(value.encode('utf-8'))), encoding='utf-8')
+        self.assertFalse(self.shown())
+
+    def test_an_audit_path_that_cannot_be_written_refuses_before_anything_changes(self):
+        # kittrial-5bb.124: the repair used to rewrite the record first and then fail (a raw
+        # IsADirectoryError for a directory). Now nothing is changed, with one sentence.
+        self.repaired()
+        audit = self.project / guidance.REPAIR_NAME
+        audit.unlink()
+        self._damage(lambda meta: meta['history'].append({'version': 'bad', 'set_by': None, 'set_at': None,
+                                                          'previous_version': None}))
+        before = (self.project / '.guidance.json').read_bytes()
+        audit.mkdir()
+        cases = [('directory', lambda: None)]
+        if sys.platform != 'win32':
+            def symlink():
+                audit.rmdir()
+                audit.symlink_to(self.root / 'anywhere.json')
+            cases.append(('symlink', symlink))
+        for name, make in cases:
+            with self.subTest(audit=name):
+                make()
+                with self.assertRaisesRegex(ValueError, r'^Nothing was changed: \.guidance-repair\.json .* not a '
+                                                        r'regular file'):
+                    guidance.write_guidance(self.project, 'second', 'operator-2')
+                self.assertEqual((self.project / '.guidance.json').read_bytes(), before)
+
+    def test_an_audit_write_that_fails_after_the_repair_is_reported_not_raised(self):
+        self.repaired()
+        self._damage(lambda meta: meta['history'].append({'version': 'bad', 'set_by': None, 'set_at': None,
+                                                          'previous_version': None}))
+        real = guidance.atomic
+
+        def atomic(target, value):
+            if Path(target).name == guidance.REPAIR_NAME:
+                raise PermissionError('denied')
+            return real(target, value)
+
+        with patch.object(guidance, 'atomic', atomic):
+            result = guidance.write_guidance(self.project, 'second', 'operator-2')
+        self.assertTrue(result['repaired'])
+        self.assertEqual(result['warning'], 'The guidance record was repaired, but the repair audit '
+                                            '.guidance-repair.json could not be written, so readers show the '
+                                            'original setter without the repair')
+        guidance.validate_meta(guidance.read_meta(self.project))
+
     def test_a_repair_drops_a_previous_text_with_a_control_character(self):
         # The rewrite keeps the record's previous generation only where it is well formed;
         # a previous text holding a control character is not kept (it never passed the
@@ -532,6 +661,12 @@ class GuidanceRecordTests(unittest.TestCase):
         for text in accepted:
             with self.subTest(text=ascii(text)):
                 self.assertEqual(guidance.validate_text(text), text)
+
+    def test_a_mark_before_a_visible_base_inside_a_latin_word_is_accepted_by_decision(self):
+        # kittrial-5bb.124: the base after the mark is a visible Arabic digit or letter, so
+        # the word visibly does not read as the keyword. Documented in OPERATIONS.
+        for text in ('ig\u0600\u0661nore', 'ig\u0601\u0628nore'):
+            self.assertEqual(guidance.validate_text(text), text)
 
     def test_the_format_rules_do_not_depend_on_the_python_unicode_tables(self):
         # Python 3.10 has Unicode 13: U+0890/U+0891 and U+13439-U+1343F are unassigned there
@@ -1256,6 +1391,29 @@ class GuidanceAdminTests(unittest.TestCase):
         stdout, _ = self.run_admin(['set-guidance', 'example', '--actor', 'operator-1', '--file', str(self.document)])
         self.assertIn('repaired', stdout)
         self.assertEqual(guidance.read_meta(self.project)['set_by'], 'operator-1')
+
+    @unittest.skipIf(sys.platform == 'win32', 'admin.py host commands take the POSIX lock')
+    def test_a_repair_with_a_directory_at_the_audit_path_is_one_line_and_changes_nothing(self):
+        # kittrial-5bb.124: this printed a raw IsADirectoryError naming a server path, after
+        # the record had been rewritten.
+        (self.root / 'deployment.private.json').write_text(
+            json.dumps({'operators': ['operator-1']}), encoding='utf-8')
+        self.run_admin(['set-guidance', 'example', '--actor', 'operator-1', '--file', str(self.document)])
+        meta = guidance.read_meta(self.project)
+        meta['history'].append({'version': 'bad', 'set_by': None, 'set_at': None, 'previous_version': None})
+        (self.project / '.guidance.json').write_text(json.dumps(meta), encoding='utf-8')
+        before = (self.project / '.guidance.json').read_bytes()
+        (self.project / guidance.REPAIR_NAME).mkdir()
+        argv = ['admin.py', '--root', str(self.root), 'set-guidance', 'example', '--actor', 'operator-1',
+                '--file', str(self.document)]
+        with patch.object(sys, 'argv', argv), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as stopped:
+                admin.run_main()
+        message = str(stopped.exception.code)
+        self.assertRegex(message, r'^ValueError: Nothing was changed: ')
+        self.assertNotIn('\n', message)
+        self.assertNotIn(str(self.root), message)
+        self.assertEqual((self.project / '.guidance.json').read_bytes(), before)
 
     @unittest.skipIf(sys.platform == 'win32', 'admin.py host commands take the POSIX lock')
     def test_guidance_status_cli_is_operator_only(self):
