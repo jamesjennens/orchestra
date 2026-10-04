@@ -276,7 +276,8 @@ the exact command for the server. `remaining` counts the `todo` ones.
   a version or a time and never guidance or onboarding text: guidance `set`, `not-set`,
   `unbound` or `unreadable` (the last two read as "to do", with the reason); onboarding
   `set` or `not-set`; the backup schedule `covered`, `not-covered` or `unknown` (from
-  the installed `beads-*backup*.service` unit files; drop-ins are not inspected), the
+  the installed `beads-*backup*.service` unit files; drop-ins are not inspected; with
+  `unknown` a `reason` of `no-account-home` or `unreadable`), the
   line that covers every project, and how the last backup run recorded the project.
   `endpoint.py` answers the action for any actor it accepts; `client.py` has no command
   for it.
@@ -288,6 +289,10 @@ the exact command for the server. `remaining` counts the `todo` ones.
   contributor's SSH command never carries it (the forced command passes only locale
   variables, `PATH` and `HOME`). Run from a shell, `add-project`'s schedule report and
   `backup-status` do not read the variable at all and behave as before.
+- **A service started without a usable `HOME`** (none set, or `HOME` already the
+  runtime's home with no recorded account home) cannot find the unit files. The backup
+  step then reads "Could not check", with that reason; it does not read "to do". Start
+  the service from the account's own environment to get an answer.
 - **A server whose `endpoint.py` predates the action** refuses it; the three steps then
   read `unavailable` ("Not available on this server") and the rest of the page works.
   With `--backend inprocess` there is no host and they read `not-applicable`.
@@ -303,13 +308,28 @@ and listed beside the agent setup text (`setup.repositories`), never inside the
 commands of that text.
 - It is a **label written by another person**. Wherever it is shown or delivered it is
   data: an agent or a person checks it is the repository they expect before cloning,
-  and never runs it as a command.
-- **What the kit checks: its shape only.** At most 300 characters from letters, digits
-  and `. _ ~ : / @ % + = , \ -`, so no space, quote, control or format character and no
-  shell character; not starting with `-`; an `https://` or `ssh://` URL, the
-  `user@host:path` form or a path; and no password in it (`https://user:secret@...` is
-  refused, so a credential is neither stored nor shown). The refusal never repeats the
-  value.
+  and never runs it as a command. The same note travels with the value wherever an
+  agent reads it: `repositories_note` in `GET /v1/agents/me/next` and beside the setup
+  text, and `project_repository_note` in the task brief (each null when no repository
+  is recorded).
+- **What the kit checks: its shape only. Exactly these forms are accepted**, and the
+  whole value must match one of them:
+  - `https://host[:port]/path`, with **no user name**, so a token or a password cannot
+    ride in it (`https://TOKEN@host/...` and `https://user:secret@host/...` are refused);
+  - `ssh://[user@]host[:port]/path`, with a plain user name and no password;
+  - `user@host:path` (the scp form), with a plain user name and no password;
+  - an absolute path: `/srv/git/x.git`, `C:\git\x.git` or `C:/git/x.git`,
+    `\\server\share\x.git`.
+- In every form: at most 300 characters; a host starts and ends with a letter or digit;
+  a user name is letters, digits and `. _ -`, not starting with `.` or `-`; a path is
+  letters, digits and `. _ ~ + = , / -` (and `\` in a Windows path), and the path of the
+  scp form does not start with `-`. There is no percent-escape, space, quote, control or
+  format character anywhere.
+- So these are refused: any other scheme (`http://`, `file://`, `git://`), a remote-helper
+  form (`ext::...`, `fd::...`), a one-slash scheme (`file:/x`), a host or path that is an
+  option (`ssh://-oProxyCommand=...`, `git@-oProxyCommand=...:x`), a relative path
+  (`../x`, `project`), and `host:path` without a user name. The refusal never repeats
+  the value.
 - **What the kit does not check:** that the repository exists, that anyone can reach
   it, or that an agent's clone points at it.
 - **The SSH brief does not carry it.** The field lives in this service's `--state`

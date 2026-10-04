@@ -155,6 +155,10 @@ def steps(handler, principal, project_id):
         if scheduled == 'not-covered':
             return 'todo', ('No scheduled backup on the server covers this project. An operator adds the line '
                             'shown to the backup schedule, or names this project in the existing one.' + ran)
+        if block.get('reason') == 'no-account-home':
+            return 'unknown', ('The server could not check its backup schedule: the web service was started without '
+                               'the account\'s home directory, so it cannot see the installed schedule. Ask an '
+                               'operator to check on the server.' + ran)
         return 'unknown', 'The server could not read its backup schedule, so ask an operator.' + ran
     line = (status or {}).get('backup', {}).get('line') if isinstance((status or {}).get('backup'), dict) else None
     result.append(host_step('backup', 'Make sure a scheduled backup covers this project', status, reason, backup,

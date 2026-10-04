@@ -1013,10 +1013,12 @@ def account_unit_dir(root):
     and the endpoint it starts run that way, and that home holds no units) is the
     account's home taken from ``ORCHESTRA_ACCOUNT_HOME``, which ``environment`` set.
     """
+    scoped=bool(os.environ.get('HOME')) and Path(os.environ['HOME'])==Path(root)/'home'
+    if not scoped:return scheduled_backup_unit_dir()
     home=os.environ.get(ACCOUNT_HOME_ENV)
-    if home and os.environ.get('HOME') and Path(os.environ['HOME'])==Path(root)/'home':
-        return Path(home)/'.config/systemd/user'
-    return scheduled_backup_unit_dir()
+    # Under the scoped home with no record of the account's own: the units cannot be
+    # found from here, and the scoped home never holds any. None, not a wrong directory.
+    return Path(home)/'.config/systemd/user' if home else None
 
 def scheduled_backup_unit_paths():
     """Every installed scheduled-backup candidate unit, sorted by path.
@@ -1124,8 +1126,10 @@ def scheduled_backup_covers(root,name):
     and nothing that was read covers the project. Drop-ins are not inspected.
     """
     # The same candidates as scheduled_backup_unit_paths(), looked up in account_unit_dir.
+    directory=account_unit_dir(root)
+    if directory is None:return None
     try:
-        paths=sorted(path for path in account_unit_dir(root).glob('beads-*backup*.service') if path.is_file())
+        paths=sorted(path for path in directory.glob('beads-*backup*.service') if path.is_file())
     except OSError:
         return None
     unreadable=False
@@ -1173,6 +1177,11 @@ def project_setup_status(root,name,path=None):
         covers=None
     backup={'scheduled':'covered' if covers else 'unknown' if covers is None else 'not-covered',
             'line':scheduled_backup_execstart(root),'last_run':None}
+    # Why the schedule could not be checked, when it could not: this process runs under
+    # the runtime's scoped home and was not told the account's own home (the service was
+    # started without a usable HOME), or a unit file could not be read.
+    if covers is None:
+        backup['reason']='no-account-home' if account_unit_dir(root) is None else 'unreadable'
     try:
         record=read_backup_status(root)
         for item in record['projects']:

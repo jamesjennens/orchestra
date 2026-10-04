@@ -266,7 +266,8 @@ export function createMock(options = {}) {
     if (!isOwner(p.pid)) return err(403, 'forbidden', 'Only a project owner can change a project');
     const value = b.repository;
     if (value && (value.length > 300 || !/^[A-Za-z0-9._~:\/@%+=,\\-]+$/.test(value) || value.startsWith('-'))) return err(422, 'invalid_payload', 'repository may contain only letters, digits and . _ ~ : / @ % + = , \\ - (no spaces, quotes or control characters) and must not start with -');
-    if (value && /^[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\/@]*:[^\/@]*@/.test(value)) return err(422, 'invalid_payload', 'repository must not contain a password; give the location only');
+    // The real service accepts four exact forms (HTTP_DEPLOYMENT); the prototype refuses the credential-carrying ones.
+    if (value && (/^https?:\/\/[^\/]*@/i.test(value) || /^[^\/@:]*:[^\/@]*@/.test(value) || /^[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\/@]*:[^\/@]*@/.test(value))) return err(422, 'invalid_payload', 'repository must not contain a user name, token or password on an https URL, or a password anywhere; give the location only');
     if (value) db.projects[p.pid].repository = value; else delete db.projects[p.pid].repository;
     log(p.pid, 'projects.repository');
     return ok({ id: p.pid, repository: value || null });

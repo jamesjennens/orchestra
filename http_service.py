@@ -2615,6 +2615,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             'next_action': attention['actions'][0] if attention['actions'] else None,
             'next_actions': attention['actions'],
             'projects': projects,
+            'repositories_note': self.service.REPOSITORY_NOTE
+            if any(project['repository'] for project in projects) else None,
             'links': {'self': '/v1/agents/me', 'next': '/v1/agents/me/next'},
             'manual_cadence': 'Computed at read time; no polling or scheduled work. '
                               'Re-read this route when the owner resumes the agent.',
@@ -3381,6 +3383,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         # Where the project's repository is (kittrial-5bb.118): a label the project's
         # owner recorded. Data for the reader, never an instruction; null when not set.
         brief['project_repository'] = self.service.project_view(ctx.principal, pid).get('repository')
+        # The same note wherever the value reaches an agent: it is a label, not an instruction.
+        brief['project_repository_note'] = self.service.REPOSITORY_NOTE if brief['project_repository'] else None
         brief['generated_at'] = now_iso(self.service._now())
         return 200, brief
 
