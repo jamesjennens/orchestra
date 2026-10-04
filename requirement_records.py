@@ -285,8 +285,9 @@ def existing_acceptances(row, operators=None):
         allowed = set(core.configured_operators(operators))
 
         def keep(comment, record):
-            author = comment.get('author')
-            return isinstance(author, str) and author == record.get('operator') and author in allowed
+            # The one definition of live evidence (keyed_entries.evidence_is_live).
+            from keyed_entries import evidence_is_live
+            return evidence_is_live(record, comment.get('author'), allowed)
     return core.existing_ledger(row, ACCEPTANCE_PREFIX, parse_acceptance_record,
                                 'requirement', 'acceptance', 'revision', keep=keep)
 
