@@ -10,6 +10,7 @@ import json
 import secrets
 import sys
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 KIT = Path(__file__).resolve().parents[1]
@@ -167,13 +168,64 @@ class EndpointAttentionTests(fixes.EndpointCase):
         self.assertEqual(sorted(kinds(data)[-2:]), [('awaiting-integration', third), ('awaiting-review', first)])
         self.assertEqual([action['priority'] for action in data['next_actions']], [2, 4, 5, 5])
 
-    def test_one_snapshot_read_and_one_owner_filtered_work_read_per_project(self):
+    def test_one_unfiltered_work_read_supplies_own_and_claimable_tasks(self):
         self.claim(self.tasks[0])
         actor = self.next()['agent']['actor']
         self.calls.clear()
         self.next()
-        reads = [(action, args[:2]) for action, args in self.calls]
-        self.assertEqual(sorted(reads), [('bd', ['list', '--all']), ('work', ['--owner', actor])], self.calls)
+        self.assertEqual(len(self.calls),1,self.calls)
+        self.assertEqual(self.calls[0][0],'work')
+        self.assertNotIn('--owner',self.calls[0][1])
+        self.assertEqual(self.calls[0][1],['--limit','100','--offset','0','--json'])
+
+    def test_conflicting_checkpoint_history_keeps_unknown_and_operator_action(self):
+        task=self.tasks[0];self.claim(task)
+        self.checkpoint(task,[])
+        run=self.native('blair');comments=json.loads(run(['comments',task,'--json']))
+        cp=next(c for c in comments if c['text'].startswith('Kind: task-checkpoint-v1\n'))
+        # A second valid root is an unreadable branch, not a claim of zero blockers.
+        run(['comments','add',task,cp['text']])
+        action=next(x for x in self.next()['next_actions'] if x['task']==task)
+        self.assertEqual((action['kind'],action['open_items'],action['who']),('checkpoint-error',None,'operator'))
+
+    def test_closed_delivered_task_disappears_from_attention(self):
+        task=self.tasks[0];self.claim(task);self.contribute(task)
+        self.native('blair')(['update',task,'--status','closed'])
+        data=self.next()
+        self.assertNotIn(task,[x['task'] for x in data['next_actions']])
+        self.assertEqual(data['attention']['counts']['claimed'],0)
+
+    def test_own_records_stay_quiet_but_other_actor_comment_wakes(self):
+        task=self.tasks[0];self.claim(task)
+        self.checkpoint(task,[dict(id='q',kind='blocker',text='Need a key.',source='build')])
+        actor=self.next()['agent']['actor']
+        self.native(actor)(['comments','add',task,'Own progress.'])
+        action=next(x for x in self.next()['next_actions'] if x['task']==task)
+        self.assertFalse(action['newer_activity'])
+        self.native('blair')(['comments','add',task,'Here is the key.'])
+        action=next(x for x in self.next()['next_actions'] if x['task']==task)
+        self.assertTrue(action['newer_activity'])
+
+    def test_malformed_review_reports_operator_action_instead_of_empty_work(self):
+        task=self.tasks[0];self.claim(task)
+        self.native('blair')(['comments','add',task,'Kind: contribution-review-v1\n{'])
+        data=self.next()
+        action=next(x for x in data['next_actions'] if x['task']==task)
+        self.assertEqual((action['kind'],action['review_state'],action['who']),('review-error','error','operator'))
+        self.assertIn('reconcile',action['reason'])
+        self.assertEqual((data['attention']['counts']['claimed'],data['attention']['counts']['in_progress']),(1,0))
+
+    def test_redelivery_does_not_answer_a_review_request(self):
+        task=self.tasks[0];self.claim(task);old=self.contribute(task)
+        request=self.review(self.people['blair'],task,'request-changes',previous=old,contribution=old,
+                            items=[{'id':'fix','text':'Fix this.'}])
+        new=self.review(self.secret,task,'contribute',previous=request,
+                        **dict(fixes.CONTRIBUTION,commit=COMMIT2,supersedes=old))
+        data=self.next();action=next(x for x in data['next_actions'] if x['task']==task)
+        self.assertEqual((action['kind'],action['requests']),('changes-requested',[request]))
+        self.review(self.secret,task,'respond',previous=new,contribution=new,
+                    resolutions=[{'request':request,'item':'fix','reason':'Fixed.','evidence':COMMIT2}])
+        self.assertIn(('awaiting-review',task),kinds(self.next()))
 
     def test_the_owners_list_reads_each_project_once_for_all_its_agents(self):
         for name in ('Merlin', 'Osprey'):
@@ -307,6 +359,82 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
         self.assertEqual(sorted(row), ['assignee', 'checkpoint_at', 'contribution_id', 'id', 'newer_activity',
                                        'open_items', 'pending_change_requests', 'review_state', 'status', 'title'])
         self.assertEqual(self.backend.agent_tasks(self.project)['tasks'], [row])   # unfiltered: every held task
+
+    def test_actor_filter_excludes_somebody_elses_work(self):
+        task=self.task('somebody else')
+        self.backend.state['tasks'][task]['assignee']='someone-else'
+        self.assertEqual(self.backend.agent_tasks(self.project,'me')['tasks'],[])
+        self.assertEqual([x['id'] for x in self.backend.agent_tasks(self.project,'someone-else')['tasks']],[task])
+
+    def test_closed_delivered_task_disappears_from_attention(self):
+        task=self.task('delivered')
+        self.request('POST','/v1/projects/%s/tasks/%s/claim'%(self.project,task),token=self.secret)
+        self.request('POST','/v1/projects/%s/tasks/%s/reviews'%(self.project,task),
+                     {'operation':'contribute','commit':test_http_agents.COMMIT,'base_commit':test_http_agents.BASE,
+                      'bundle_sha256':test_http_agents.BUNDLE,'summary':'done'},token=self.secret)
+        self.backend.state['tasks'][task]['status']='closed'
+        self.assertNotIn(task,[x['task'] for x in self.next()['next_actions']])
+
+    def test_unreadable_checkpoint_does_not_become_zero_open_items(self):
+        task=self.task('unknown checkpoint')
+        self.request('POST','/v1/projects/%s/tasks/%s/claim'%(self.project,task),token=self.secret)
+        self.backend.state.setdefault('checkpoints',{})[task]=['not a checkpoint']
+        action=next(x for x in self.next()['next_actions'] if x['task']==task)
+        self.assertEqual((action['kind'],action['open_items'],action['who']),('checkpoint-error',None,'operator'))
+
+    def test_own_review_stays_quiet_then_owner_edit_wakes(self):
+        task=self.task('blocker');base='/v1/projects/%s/tasks/%s'%(self.project,task)
+        self.request('POST',base+'/claim',token=self.secret)
+        cp=self.request('POST',base+'/checkpoints',
+                        {'previous':None,'summary':'blocked','open_items':[{'id':'key','text':'Need a key.'}]},
+                        token=self.secret)
+        self.assertEqual(cp.status,201,cp.data)
+        self.request('POST',base+'/reviews',
+                     {'operation':'contribute','commit':test_http_agents.COMMIT,'base_commit':test_http_agents.BASE,
+                      'bundle_sha256':test_http_agents.BUNDLE,'summary':'partial'},token=self.secret)
+        action=next(x for x in self.next()['next_actions'] if x['task']==task)
+        self.assertFalse(action['newer_activity'])
+        changed=self.request('PATCH',base,{'description':'The key is available.',
+                             'version':self.backend.state['tasks'][task]['version']},token=self.alex)
+        self.assertEqual(changed.status,200,changed.data)
+        action=next(x for x in self.next()['next_actions'] if x['task']==task)
+        self.assertTrue(action['newer_activity'])
+
+    def test_every_other_open_review_state_names_who_acts_next(self):
+        task=self.task('held');actor=self.next()['agent']['actor']
+        self.request('POST','/v1/projects/%s/tasks/%s/claim'%(self.project,task),token=self.secret)
+        row=dict(id=task,title='held',status='in_progress',assignee=actor,
+                 contribution_id='delivery',open_items=0,pending_change_requests=[])
+        for state,who in [('legacy-review-ready','owner'),('integrated','owner'),
+                          ('withdrawn','assignee'),('superseded','assignee'),
+                          ('future-state','owner'),('error','operator')]:
+            with self.subTest(state=state),patch.object(self.backend,'agent_tasks',
+                    return_value={'tasks':[dict(row,review_state=state)],'complete':True}):
+                action=next(x for x in self.next()['next_actions'] if x['task']==task)
+                self.assertEqual((action['review_state'],action['who']),(state,who))
+                self.assertIn(state,action['reason'])
+
+    def test_independent_counts_and_work_before_waiting(self):
+        actor=self.next()['agent']['actor']
+        rows=[dict(id='closed',title='closed',status='closed',assignee=actor,review_state='changes-requested',
+                   contribution_id='a',open_items=1,pending_change_requests=['request-closed']),
+              dict(id='blocked',title='blocked',status='open',assignee=actor,review_state='changes-requested',
+                   contribution_id='b',open_items=1,pending_change_requests=['request-open']),
+              dict(id='integrating',title='integrating',status='open',assignee=actor,
+                   review_state='awaiting-integration',contribution_id='c',open_items=0),
+              dict(id='review',title='review',status='open',assignee=actor,
+                   review_state='awaiting-review',contribution_id='d',open_items=0),
+              dict(id='working',title='working',status='in_progress',assignee=actor,
+                   review_state='none',contribution_id=None,open_items=0)]
+        with patch.object(self.backend,'agent_tasks',return_value={'tasks':rows,'complete':True}):
+            d=self.next();counts=d['attention']['counts']
+            self.assertEqual((counts['blocked'],counts['changes_requested'],counts['awaiting_review'],
+                              counts['awaiting_integration'],counts['in_progress']),(1,2,1,1,1))
+            self.assertEqual(d['attention']['state'],'changes-requested')
+            # Once feedback and the blocker have gone, own implementation outranks waiting.
+            rows[:]=rows[2:];d=self.next()
+            self.assertEqual(d['attention']['state'],'working')
+            self.assertEqual(kinds(d)[0],('in-progress','working'))
 
 
 if __name__ == '__main__':

@@ -198,6 +198,11 @@ own machine and pull work over the API without SSH or shared directories.
   prioritised as changes-requested, blocked, in-progress, claimable task, then
   awaiting review and awaiting integration (see HTTP_DEPLOYMENT.md, "What an agent
   is told to do next").
+  Action kind names are the contract; numeric priority values are relative sorting
+  hints and may change. Other own review states still receive an action naming
+  their state and who acts next, including an operator action for malformed history.
+  A replacement contribution does not answer outstanding review items: submit
+  structured responses against the current contribution as well.
   There is no scheduler, background job, poller or timer: the owner resumes the
   agent manually and re-reads the route.
 - **Owner API.** Session routes `POST /v1/agents`, `GET /v1/agents`,
