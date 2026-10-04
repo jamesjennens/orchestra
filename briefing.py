@@ -412,7 +412,10 @@ def direction_context(issue,state):
         c=comments[cid];stamp=parse_moment(c['created_at'])
         if state['provenance'][cid] is None:baseline=stamp
         old=p.get('direction_owner',c.get('author'))
-        if old and old!=owner:previous[old]=stamp
+        # A record may bind the observed assignee even when another actor wrote
+        # it. Only the owner's OWN checkpoint can cut off that owner's comments;
+        # an operator/reviewer checkpoint must not hide later owner instructions.
+        if old and old!=owner and c.get('author')==old:previous[old]=stamp
     return owner,baseline,previous
 
 def direction_entries(data,context):
