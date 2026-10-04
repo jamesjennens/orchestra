@@ -609,11 +609,14 @@ manually.
 Attention re-authorizes every granted project with the same live check the task routes
 use before it reads anything, so a project the caller can no longer open (the owner
 was removed, or the grant was narrowed) is skipped instead of leaked. Each project is
-read once per request through one full task snapshot, so an agent's own task is found
-however deep it sorts and the request costs one `endpoint.py` / `bd list --all`
-invocation per project whatever the project's size (the page-sized cap is applied to
-the in-memory snapshot); only the *claimable* suggestions meet the page-sized cap, and
-`truncated` reports that suggestion list.
+read through one current-work snapshot reused by every agent in this request.
+The endpoint backend pays one `work` command per page of 100 rows, up to its page
+bound; there is no additional `bd list` or owner-filtered read. Counts include every
+row read, while claimable suggestions and the final action list have separate caps.
+`truncated` reports any of those bounds, including an incomplete queue walk.
+My work retains its existing short principal-specific queue cache; its agent cards
+reuse that queue and add no read. Standalone agent attention reads stay fresh on
+each request. Authority is checked live in both cases.
 
 A project owner or admin governs which agents may work in their project without
 holding `agents.manage` and without seeing anything the agent's own owner keeps
@@ -646,8 +649,7 @@ owner's project membership and the agent stops on its next request. The
 agent's disable action revokes every credential; enable restores none, so issue a
 new credential after enabling. This is the settled personal-agent decision from
 2026-09-27 (design decision `01a0e2f2-569c-7d03-94ee-36b8dd61940a`).
-The
-`working_directory` hint is returned only to the owner or a superuser. The browser
+The `working_directory` hint is returned only to the owner or a superuser. The browser
 screens that display the directory and the copyable resume prompt are
 kittrial-5bb.20 and consume these JSON responses; they are not part of this service
 build.
