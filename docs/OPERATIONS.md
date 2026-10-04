@@ -197,7 +197,8 @@ history](#malformed-structured-history) (`void-record`).
 | `requirement-apply PROJECT --actor ACTOR --file record.json` | write an accepted requirement revision, or move an accepted record back to draft | the payload's `acceptance` object (named owners/approvers, policy, decision id, evidence) and the deployment operator allowlist |
 | `requirement-backfill PROJECT --actor ACTOR --file backfill.json` | add the controlled requirement type/state labels to records created before this route | an `evidence` pointer for an entry that becomes `accepted`, and the deployment operator allowlist |
 | `requirement-reconcile PROJECT --operation-id ID --actor ACTOR --disposition ...` | finish a requirement operation whose real write was uncertain | the deployment operator allowlist, checked before the receipt is read; then confirmation of the native record state |
-| `reference-apply PROJECT --actor OPERATOR --file acceptance.json` | accept a reference catalog entry: the payload names the newest draft `revision` and its `record_sha256`, and the command writes the next revision as accepted, after the F3 evidence (`operation: "draft"` with full content writes a direct accepted revision 1) | the deployment operator allowlist, checked before any write, and F3 evidence (`acceptance`: owners, approvers, policy, decision id, evidence) |
+| `reference-apply PROJECT --actor OPERATOR --file acceptance.json` | accept a reference catalog entry: the payload names the newest draft `revision` and its `record_sha256`, and the command writes the next revision as accepted, after the F3 evidence (`operation: "draft"` with full content writes a direct accepted revision 1). An entry whose authority is an attestation is accepted only under the [extra rules below](#attested-reference-entries) | the deployment operator allowlist, checked before any write, and F3 evidence (`acceptance`: owners, approvers, policy, decision id, evidence) |
+| `reference-apply PROJECT --actor OPERATOR --file batch.json` | accept a batch of reference entries under one F3 decision: the payload has `items` of `{key, revision, record_sha256}` (each the newest draft reviewed) in place of the single entry's fields. It behaves exactly as the `capability-apply` batch below: one receipt per item keyed `(operation_id, key)`, `accepted`, `already-accepted`, `refused` or `uncertain` per item, a refused item does not stop the others, the coordination lock is taken per item, at most 100 items, and re-running the same batch resumes it | the deployment operator allowlist, checked before any write, and F3 evidence |
 | `reference-reconcile PROJECT --operation-id ID --actor ACTOR --reason TEXT --disposition ...` | finish a reference operation whose real write was uncertain; `complete` needs `--issue-id` and refuses an anchor that has no live revision record, because its propose stopped or every record it held is voided (re-run the original `ref propose` with its `operation_id` first; if that payload is lost, use `anchor-release`) | the deployment operator allowlist, checked before the receipt is read; then confirmation of the native record state |
 | `capability-apply PROJECT --actor OPERATOR --file batch.json` | accept a batch of capabilities under one F3 decision: `items` of `{key, revision, record_sha256}` (each the newest draft reviewed). The command writes one acceptance record and one receipt per item, keyed `(operation_id, key)`, in list order. It reports `accepted`, `already-accepted`, `refused` or `uncertain` per item; an uncertain item stops the batch, and re-running the same batch resumes it. A changed list needs a new `operation_id`. The coordination lock is taken per item and released between items, with a 50 ms pause while it is free, so other writers wait behind at most one item; each item re-checks its `revision` and `record_sha256` under its own hold. An item takes about 3 seconds (two reads and four writes), so 100 items take 5 to 6 minutes: prefer batches of about 20. `operation: "draft"` with full content writes a direct accepted revision 1 | the deployment operator allowlist, checked before any write, and F3 evidence |
 | `capability-retire PROJECT --actor OPERATOR --file retire.json` | supersede the newest revision of a key by a `successor` key, with evidence. The successor must exist, and a cycle is refused. A retired key refuses `revise` and acceptance. This also stands in for the design's "demote" in slice 1a | the deployment operator allowlist and F3 evidence |
@@ -670,10 +671,61 @@ from `bd export --all`, as in the scan above.
   up (kittrial-5bb.92 review `order-check-limits-and-rollback`). No sidecar path is
   added, so backups restore on either kit, and rolling forward restores the repair with
   nothing to clean up.
-- **Limits.** A record of a newer version (`Kind: reference-entry-v2`) or of an unknown
-  kind of the family cannot be a void target: the target must claim the v1 prefix of
-  the declared kind, exactly or through the BOM/CRLF view the readers use. It stays
-  `unsupported` (or `malformed`) until a kit that reads it handles it.
+- **Limits.** A record of a version this kit does not read (`Kind: reference-entry-v3`,
+  `Kind: capability-entry-v2`) or of an unknown kind of the family cannot be a void
+  target: the target must claim a prefix this kit reads for the declared kind (v1, and
+  v2 of `reference-entry`), exactly or through the BOM/CRLF view the readers use. It
+  stays `unsupported` (or `malformed`) until a kit that reads it handles it.
+
+#### Attested reference entries
+A reference entry whose authority is an `attestation` records an operational fact: who
+observed or stated it, when, on what basis and how ([CLI contract](CLI_CONTRACT.md#ref-the-reference-catalog)).
+The kit cannot check such a fact against anything, so the acceptance carries the
+weight.
+
+- **Who writes what.** Any contributor may propose or revise an attested draft (`ref
+  propose`, `ref revise`). Only `admin.py reference-apply` accepts one. Until then
+  every read marks it: `state: draft-only`, `authority_kind: attested`,
+  `authority_accepted: false` and an `authority_note` that starts `NOT ACCEPTED.`
+- **What the operator must show.** On top of the ordinary acceptance rules, an attested
+  revision is accepted only when all of these hold. Each refusal is made before any
+  write.
+  1. `acceptance.evidence` is one line saying what you did to check the fact: you
+     re-ran the check (command, host, date), or you confirmed the statement with the
+     person named in `by`. The kit checks that the line is there, not what it says.
+  2. `acceptance.decision_id` names an existing issue of type `decision` or labelled
+     `decision`.
+  3. For an `owner-statement`, the identity in `by` is one of `acceptance.owners`,
+     written the same way.
+  4. `review_by` is in the future and at most 6 months after `observed`.
+  5. `observed` is not in the future and not more than 6 months old. An older
+     observation is refused: check the fact again and revise the entry first.
+- **Many at once.** Put the reviewed drafts in one batch (`items`) under one decision.
+  An item that fails a rule above is reported `refused` with its reason, and the others
+  are still accepted.
+- **Revising an older draft to an attestation.** A draft written with a `repo-path`
+  authority and no commit cannot be accepted. Revise it with `ref revise`, giving the
+  same content and an `attestation` authority, then accept that revision.
+- **What the kit does not have.** There is no authority type that points at a decision
+  issue. A working rule that nobody observed and the owner did not state is neither
+  basis: record it as a decision and cite it in the entry's `decisions`, with a
+  repository document as the authority.
+- **Record version and rollback.** An attested revision is stored as
+  `Kind: reference-entry-v2`; every other revision stays v1. A kit older than this one:
+  - does not serve an entry that holds a v2 revision. Such an entry reads
+    `unsupported` when its anchor also holds a v1 record: an earlier v1 revision, or
+    acceptance evidence, which stays v1, so every accepted attested entry reads this
+    way. An attested draft that was never accepted and has no v1 revision reads as an
+    anchor with no record yet, and `ref get` of it is refused, naming the key. Both
+    are named in `coverage`, and every other entry reads as before;
+  - cannot write to such an entry, void its v2 records or release its anchor, and
+    refuses a new propose of its key;
+  - backs up and restores a project that holds v2 records exactly as before: the
+    records are native comments, and no sidecar path is added.
+
+  So after a rollback the attested facts are not available until the kit is rolled
+  forward, and nothing is lost or changed in between. Do not "repair" such an entry
+  with the older kit.
 
 #### Orphan anchors
 

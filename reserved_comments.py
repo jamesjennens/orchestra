@@ -170,6 +170,13 @@ def comment_target(args):
 # through the raw path and a rollback to this kit stays safe. Only v1 is reserved;
 # a v2 writer needs its own tolerant-reader step (.58 3.8).
 REFERENCE_ENTRY_PREFIX = 'Kind: reference-entry-v1\n'
+# kittrial-5bb.98: a reference revision whose authority is an attestation (an
+# operational fact, not a repository or URL pointer) is version 2 of the entry record.
+# A kit before it reads such a revision as an unknown newer record: the entry reads
+# `unsupported` (or, when the anchor holds no v1 record at all - a never-accepted
+# attested draft - as an anchor with no record yet), and its operator void never
+# matches a v2 record (.41 3.8).
+REFERENCE_ENTRY_V2_PREFIX = 'Kind: reference-entry-v2\n'
 REFERENCE_ACCEPTANCE_PREFIX = 'Kind: reference-acceptance-v1\n'
 PROPOSAL_PREFIX = 'Kind: requirement-proposal-v1\n'
 PROPOSAL_DISPOSITION_PREFIX = 'Kind: proposal-disposition-v1\n'
@@ -818,7 +825,7 @@ def reserved_label(label):
 # Each record type label and the v1 record prefixes that make a row carrying it an
 # anchor. The first record a writer slice posts on a new anchor is one of these.
 RECORD_ANCHOR_FAMILIES = {
-    'reference': (REFERENCE_ENTRY_PREFIX, REFERENCE_ACCEPTANCE_PREFIX),
+    'reference': (REFERENCE_ENTRY_PREFIX, REFERENCE_ENTRY_V2_PREFIX, REFERENCE_ACCEPTANCE_PREFIX),
     'proposal': (PROPOSAL_PREFIX, PROPOSAL_DISPOSITION_PREFIX),
     'contribution-settings': (CONTRIBUTION_SETTINGS_PREFIX,),
     'capability': (CAPABILITY_ENTRY_PREFIX, CAPABILITY_ACCEPTANCE_PREFIX,
@@ -829,6 +836,8 @@ RECORD_COMMENT_FAMILIES = ('Kind: reference-', 'Kind: requirement-proposal-',
                            'Kind: proposal-disposition-', 'Kind: contribution-settings-',
                            'Kind: capability-')
 _RECORD_KIND = re.compile(r'Kind: ([a-z][a-z-]*?)-v([1-9][0-9]{0,5})\n')
+# Versions after 1 that this kit reads, as (kind, version).
+SUPPORTED_LATER_VERSIONS = frozenset({('reference-entry', 2)})
 
 
 def carries_record_label(row):
@@ -842,8 +851,8 @@ def carries_record_label(row):
 def is_record_anchor(row):
     """True for the native anchor of a reference, proposal, settings or capability.
 
-    An anchor is a row carrying an exact record type label AND a v1 record comment
-    of that label's family (kittrial-5bb.64 review, coordinator fix (a)). The label
+    An anchor is a row carrying an exact record type label AND a record comment of
+    that label's family in a version this kit reads (v1, and reference-entry-v2) (kittrial-5bb.64 review, coordinator fix (a)). The label
     alone is not evidence - projects use these words as ordinary labels - and nor
     are request:/request-content: labels, which create-child also writes. After this
     kit deploys both halves are guard-protected: the record prefixes are reserved and
@@ -890,8 +899,9 @@ def is_record_comment(text):
 def record_comment_kind(text):
     """(kind, version, state) for a record comment, else None.
 
-    `state` is `supported` for a v1 record of one of the nine designed kinds and
-    `unsupported` for anything else (an unknown version or kind), so a later slice's
+    `state` is `supported` for a v1 record of one of the nine designed kinds, and for
+    the later versions in SUPPORTED_LATER_VERSIONS (reference-entry-v2, kittrial-5bb.98),
+    and `unsupported` for anything else (an unknown version or kind), so a later slice's
     reader can report an unknown newer record per entry instead of failing the whole
     read (.41 3.8, .58 3.8). Every version is raw-write reserved either way.
     """
@@ -902,7 +912,8 @@ def record_comment_kind(text):
     if match is None:
         return ('unknown', None, 'unsupported')
     kind, version = match.group(1), int(match.group(2))
-    supported = kind in _RECORD_KIND_RESERVATIONS and version == 1
+    supported = kind in _RECORD_KIND_RESERVATIONS and (version == 1
+                                                       or (kind, version) in SUPPORTED_LATER_VERSIONS)
     return (kind, version, 'supported' if supported else 'unsupported')
 
 

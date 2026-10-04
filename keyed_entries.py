@@ -40,10 +40,12 @@ and gives it:
   reads is refused, so a void repairs a malformed, foreign or conflicting record and
   never withdraws one.
 """
+import contextlib
 import copy
 import json
 import re
 import subprocess
+import time
 from pathlib import Path
 
 import keyed_records as core
@@ -72,6 +74,17 @@ ACCEPTANCE_RECORD_FIELDS = ('schema_version', 'source', 'id', 'key', 'revision',
 # A native read failure: the endpoint's runner raises ValueError, admin's run_bd
 # raises CalledProcessError.
 NATIVE_FAILURES = (ValueError, OSError, subprocess.CalledProcessError)
+BATCH_MAX = 100
+# A pause outside the lock between batch items: flock gives no ordering guarantee, so
+# without it the batch could retake the lock before a waiting writer wakes.
+BATCH_YIELD_SECONDS = 0.05
+BATCH_FIELDS = {'schema_version', 'operation_id', 'items', 'acceptance_state', 'acceptance'}
+ITEM_FIELDS = {'key', 'revision', 'record_sha256'}
+
+
+def item_operation_id(operation_id, key):
+    """The per-item operation id of a batch: each item's receipt is keyed `(operation_id, key)`."""
+    return '%s/%s' % (operation_id, key)
 
 
 def read_labelled(run, label):
@@ -142,13 +155,24 @@ class AnchoredKind:
     malformed) and `extra_parsers` (the same kinds to their strict parser
     `body -> record or None`, which `void_refusal` uses to tell a well-formed record
     from a malformed one).
+
+    A kind whose entry record has more than one version (reference-entry-v2,
+    kittrial-5bb.98) also gives `entry_prefixes` (every prefix `parse_entry` reads) and
+    `entry_prefix_for(record)` (the prefix a record is written under); by default both
+    are `entry_prefix`. `acceptance_rules(record, acceptance, run)` may refuse an
+    acceptance of one record by what the record is (an attested reference needs more
+    from its operator); it runs before the journal for a direct accepted revision and
+    before any write for an accept.
     """
 
     def __init__(self, **values):
         defaults = {'pre_write': lambda payload, run, operators: None, 'extra_records': {}, 'extra_parsers': {},
-                    'supports_retire': False}
+                    'supports_retire': False, 'entry_prefixes': None, 'entry_prefix_for': None,
+                    'acceptance_rules': None}
         defaults.update(values)
         self.__dict__.update(defaults)
+        self.entry_prefixes = tuple(self.entry_prefixes or (self.entry_prefix,))
+        self.entry_prefix_for = self.entry_prefix_for or (lambda record: self.entry_prefix)
         self.propose_fields = frozenset(('schema_version', 'operation_id', 'operation', 'revision',
                                          'expected_sha256') + tuple(self.content_fields))
         self.accept_fields = frozenset(('schema_version', 'operation_id', 'operation', 'key', 'revision',
@@ -241,7 +265,7 @@ class AnchoredKind:
         return self.shown(run, self.listed_ids(run, ['--label-any', ','.join(labels)]))
 
     def existing_revisions(self, row):
-        return core.existing_ledger(row, self.entry_prefix, self.parse_entry, self.noun, 'revision', 'revision',
+        return core.existing_ledger(row, self.entry_prefixes, self.parse_entry, self.noun, 'revision', 'revision',
                                     belongs=self.entry_belongs)
 
     def existing_acceptances(self, row):
@@ -337,7 +361,7 @@ class AnchoredKind:
         return record
 
     def entry_comment(self, record):
-        body = self.entry_prefix + canonical_bytes(record).decode('utf-8')
+        body = self.entry_prefix_for(record) + canonical_bytes(record).decode('utf-8')
         if self.parse_entry(body) != record:
             raise ValueError('Refusing to write a %s revision that does not pass its own schema' % self.noun)
         return body
@@ -726,9 +750,11 @@ class AnchoredKind:
         if existing[payload['revision']]['sha256'] != payload['record_sha256']:
             raise ValueError('record_sha256 does not match revision %d of %s' % (payload['revision'], payload['key']))
 
-    def check_acceptance(self, payload, existing, record, operator, row):
+    def check_acceptance(self, payload, existing, record, operator, row, run=None):
         if not operator:
             return None
+        if self.acceptance_rules is not None:
+            self.acceptance_rules(record, payload['acceptance'], run)
         return core.bind_acceptance(payload['acceptance'], record)
 
     def apply_labels(self, run, task, current, payload, record):
@@ -763,16 +789,148 @@ class AnchoredKind:
             core.require_configured_operator(actor, operators, self.spec.accept_action)
         self.validate_payload(payload, operator=operator)
         self.pre_write(payload, run, operators)
-        return core.apply_native(payload, actor, run, project, self.write_spec(operators), operator=operator,
+        if operator and payload['operation'] == 'draft' and self.acceptance_rules is not None:
+            # A direct accepted revision creates its anchor, so its acceptance rules are
+            # checked here, before the journal and the create.
+            self.acceptance_rules(self.entry_record(payload, 1, 'accepted'), payload['acceptance'], run)
+        return core.apply_native(payload, actor, run, project, self.write_spec(operators, run), operator=operator,
                                  operators=operators)
 
-    def write_spec(self, operators):
+    # -- batch acceptance (.60 section 4; shared with references by kittrial-5bb.98) --------------
+
+    def validate_batch(self, payload):
+        command = self.apply_command.split()[-1]
+        if not isinstance(payload, dict):
+            raise ValueError('%s payload must be an object' % command)
+        core.refuse_injected_labels(payload, '%s operation' % self.noun)
+        core.checked_fields(payload, BATCH_FIELDS, '%s payload' % command)
+        if type(payload.get('schema_version')) is not int or payload['schema_version'] != 1:
+            raise ValueError('schema_version must be the integer 1')
+        identifier(payload.get('operation_id'))
+        if payload.get('acceptance_state') != 'accepted':
+            raise ValueError('%s writes accepted revisions (acceptance_state must be accepted)' % command)
+        core.validate_acceptance_shape(payload.get('acceptance'))
+        core.bound_acceptance(dict(payload['acceptance'], record_sha256='0' * 64))
+        items = payload.get('items')
+        if not isinstance(items, list) or not 1 <= len(items) <= BATCH_MAX:
+            raise ValueError('items must be a list of 1..%d {key, revision, record_sha256}' % BATCH_MAX)
+        keys = set()
+        for index, item in enumerate(items):
+            where = 'items[%d]' % index
+            if not isinstance(item, dict):
+                raise ValueError(where + ' must be an object')
+            core.checked_fields(item, ITEM_FIELDS, where)
+            if set(item) != ITEM_FIELDS:
+                raise ValueError(where + ' needs key, revision and record_sha256')
+            self.valid_key(item['key'], where + '.key')
+            core.positive_int(item['revision'], where + '.revision')
+            if not isinstance(item['record_sha256'], str) or not SHA256_TEXT.match(item['record_sha256']):
+                raise ValueError(where + '.record_sha256 must be the reviewed revision\'s content hash')
+            if item['key'] in keys:
+                raise ValueError('items must not repeat a key')
+            keys.add(item['key'])
+            identifier(item_operation_id(payload['operation_id'], item['key']))
+        return payload
+
+    def apply_batch(self, payload, actor, run, project, operators=None, lock=None):
+        """The kind's operator apply command with `items`: accept a batch under one F3 decision.
+
+        The operator allowlist is checked first. A batch receipt binds the operation id to
+        the exact item list, so a changed list under the same id is refused. Items run in
+        list order, each through the single core write (evidence, then the revision, then
+        the label) with its own receipt keyed `(operation_id, key)`; an item whose receipt is
+        complete rechecks its key for duplicate anchors before reporting `already-accepted`,
+        with no native write. A refusal before an item's writes is reported
+        `refused` and the batch continues; an uncertain write stops the batch (`uncertain`,
+        reconcile that item), and the rest stay `not-run` until a retry.
+
+        `lock` is a callable returning a context manager that holds the project's
+        coordination lock. The batch takes it once per ITEM and releases it between items
+        (review 01a0fc55 `batch-lock`), so another writer waits behind at most one item, not
+        the whole batch. Each item reads only its own key and re-checks compare-and-swap
+        under its own hold, so a change made between two items is seen, and refused if it
+        made the reviewed revision stale. Without `lock` the caller is holding it.
+        """
+        core.require_configured_operator(actor, operators, self.spec.accept_action)
+        self.validate_batch(payload)
+        lock = lock or contextlib.nullcontext
+        identity = content_hash({'operation_id': payload['operation_id']})
+        digest = content_hash({'actor': actor, 'payload': payload})
+        keys = [item['key'] for item in payload['items']]
+        with lock():
+            journal = core.journal_dir(project, self.journal)
+            receipt = core.receipt_path(journal, identity, self.noun)
+            prior = load_json(receipt) if receipt.exists() else None
+            if prior is not None and (prior.get('sha256') != digest or prior.get('operation') != 'apply-batch'):
+                raise ValueError('Operation ID already used for a different batch; a changed list needs a new '
+                                 'operation ID.')
+            atomic(receipt, {'sha256': digest, 'status': 'pending', 'actor': actor, 'operation': 'apply-batch',
+                             'operation_id': payload['operation_id'], 'items': keys})
+        results, stopped = [], False
+        for position, item in enumerate(payload['items']):
+            if stopped:
+                results.append({'key': item['key'], 'result': 'not-run'})
+                continue
+            if position and lock is not contextlib.nullcontext:
+                time.sleep(BATCH_YIELD_SECONDS)   # the lock is free here: let a waiting writer take it
+            with lock():
+                result = self._apply_item(payload, item, actor, run, project, operators, journal)
+            results.append(result)
+            stopped = result['result'] == 'uncertain'
+        complete = not stopped
+        with lock():
+            atomic(receipt, {'sha256': digest, 'status': 'complete' if complete else 'pending', 'actor': actor,
+                             'operation': 'apply-batch', 'operation_id': payload['operation_id'], 'items': keys,
+                             'results': {result['key']: result['result'] for result in results}})
+        return {'operation_id': payload['operation_id'], 'decision_id': payload['acceptance']['decision_id'],
+                'items': results, 'complete': complete}
+
+    def _apply_item(self, payload, item, actor, run, project, operators, journal):
+        """One batch item, under one hold of the coordination lock."""
+        operation_id = item_operation_id(payload['operation_id'], item['key'])
+        item_receipt = core.receipt_path(journal, content_hash({'operation_id': operation_id}), self.noun)
+        done = load_json(item_receipt) if item_receipt.exists() else None
+        if isinstance(done, dict) and done.get('status') == 'complete':
+            try:
+                self.require_unique_key(self.read_key_rows(run, item['key']), item['key'])
+            except ValueError as error:
+                return {'key': item['key'], 'result': 'refused', 'reason': str(error)}
+            return {'key': item['key'], 'result': 'already-accepted', 'revision': done.get('revision'),
+                    'native_id': done.get('id')}
+        single = {'schema_version': 1, 'operation_id': operation_id, 'operation': 'accept', 'key': item['key'],
+                  'revision': item['revision'], 'record_sha256': item['record_sha256'],
+                  'acceptance_state': 'accepted', 'acceptance': payload['acceptance']}
+        writes = []
+
+        def counted(argv):
+            if argv[:1] in (['comments'], ['update'], ['close'], ['create']) and '--dry-run' not in argv:
+                writes.append(argv[0])
+            return run(argv)
+        try:
+            outcome = self.apply_native(single, actor, counted, project, operator=True, operators=operators)
+        except (ValueError, RuntimeError, OSError) as error:
+            text = str(error)
+            if 'outcome is uncertain' in text or isinstance(error, (RuntimeError, OSError)):
+                return {'key': item['key'], 'result': 'uncertain',
+                        'reason': 'the native write did not confirm; reconcile %s with %s '
+                                  '--operation-id %s' % (item['key'], self.reconcile_command, operation_id)}
+            return {'key': item['key'], 'result': 'refused', 'reason': text}
+        # `accepted` when this run wrote (including finishing an earlier uncertain attempt);
+        # `already-accepted` when the item's accepted revision and evidence were already there.
+        return {'key': item['key'], 'result': 'accepted' if writes else 'already-accepted',
+                'revision': outcome['revision'], 'native_id': outcome['native_id'],
+                'record_comment_id': outcome.get('record_comment_id')}
+
+    def write_spec(self, operators, run=None):
         """The kind's spec for one write, whose reads see each row as `live_row` does.
 
         The writer then agrees with the readers: a comment an applied operator void names
-        takes no part in compare-and-swap, the key checks or the acceptance ledger.
+        takes no part in compare-and-swap, the key checks or the acceptance ledger. `run`
+        is the write's own native runner, for acceptance rules that read (`acceptance_rules`).
         """
         spec = copy.copy(self.spec)
+        spec.check_acceptance = lambda payload, existing, record, operator, row: self.check_acceptance(
+            payload, existing, record, operator, row, run=run)
         spec.read_rows = lambda run, payload=None: self.live_rows(self.spec.read_rows(run, payload), operators)
         spec.read_created = lambda run, task, payload: self.live_rows(self.spec.read_created(run, task, payload),
                                                                       operators)
