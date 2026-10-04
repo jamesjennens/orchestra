@@ -143,6 +143,88 @@ Use a new operation ID for each new assertion or correction. After an uncertain 
 
 Raw `bd` labels alone are insufficient evidence: an old `tested:passed` label can remain after scope changes. The contextual `lifecycle.py list` output is the authoritative lifecycle view; it checks scope, native event order, payload attribution and label agreement. Missing, mismatched or ambiguous evidence becomes unknown.
 
+Three payload fields are optional and additive: `note` (a per-task note, any fact), `trigger` (a free-text next trigger, only on a `pending` fact) and `defect_task` (only on `enabled=enabled-with-known-defect`, below). Every payload that validated before still validates; a kit that does not know one of these fields reads that fact as `unknown`, never as `passed`.
+
+## Record one release deploy for many tasks
+
+A release covers every task already integrated into it, so one operation records the release scope and the deployed fact for all of them instead of one command per task. Save the canonical export as above, keep a Git checkout that can see the release commit, and save `release.json`:
+
+```json
+{
+  "schema_version": 1,
+  "operation_id": "alex/release-2026-10-05",
+  "dimension": "release-deploy",
+  "value": "passed",
+  "scope": {
+    "source_commit": "",
+    "integration_commit": "5555555555555555555555555555555555555555",
+    "release_id": "release-2026-10-05",
+    "environment": "production"
+  },
+  "evidence": ["https://example.org/builds/987"],
+  "provenance": "performed",
+  "actor": "alex/session1",
+  "live_verified": false,
+  "targets": []
+}
+```
+
+```sh
+python lifecycle.py release --config client.local.json --project example --actor alex/session1 --file release.json --export issues.jsonl --repo /path/to/checkout --dry-run
+python lifecycle.py release --config client.local.json --project example --actor alex/session1 --file release.json --export issues.jsonl --repo /path/to/checkout
+python lifecycle.py release --config client.local.json --project example --actor alex/session1 --file release.json --export issues.jsonl --repo /path/to/checkout --live-verified
+```
+
+Run `--dry-run` first: it prints the resolved `targets` and the `skipped` tasks and writes nothing. The operation selects every task with a trusted `integrated=passed` scope whose `integration_commit` is an ancestor of the release commit, decided by `git merge-base --is-ancestor` in `--repo`. A task whose passing integration commit is missing, not a full lowercase commit, or undecidable is listed under `skipped`, never guessed; a task with no passing integration is not part of the release. Each target keeps its own `source_commit`/`integration_commit` and adds the release `release_id` and `environment`, so the recorded scope is the one a hand-written scope event would have: the release scope becomes the task's current scope, and facts recorded under an earlier scope read `unknown` until they are recorded again (per-scope integration evidence stays readable, see the review reads). Every target is verified against one export before the first write, so a stale target refuses the whole release and nothing is written.
+
+The command sends one payload; the endpoint then records the scope event (only when it differs), one `deployed=passed` fact carrying the shared evidence block and the target's optional `note`, and, with `--live-verified` or `"live_verified": true`, one `live-verified=passed` fact. Deterministic per-task operation IDs make an exact retry reconcile instead of duplicating; changed evidence or notes need a new operation ID. One release covers at most 200 targets, so split a larger release by environment. Add `"note": "..."` (one line, up to 500 characters) to a target for a per-task note; leave `targets` empty in the input file, because the command fills it in.
+
+## Read what a deployed release still owes
+
+```sh
+python lifecycle.py evidence-owed --export issues.jsonl
+```
+
+Groups the project's tasks by the environment and release of their trusted current scope and prints, for each task, `deployed`, the `enabled` flag (below), `remaining_evidence`, `responsible` and `next_trigger`. `remaining_evidence` is `deployed`/`live-verified` when they are not `passed`/`not-applicable`, plus any dimension explicitly recorded `pending` or `failed` in the current scope; a dimension that reads `unknown` only because a later release scope rolled the task's scope over is not re-owed. `responsible` is the task's assignee, falling back to the actor that recorded the deployed fact. `next_trigger` is the free-text `trigger` carried by a pending fact:
+
+```json
+{
+  "schema_version": 1,
+  "operation_id": "alex/verify-001",
+  "task": "example-task",
+  "dimension": "live-verified",
+  "value": "pending",
+  "scope": {"source_commit": "1111111111111111111111111111111111111111", "integration_commit": "", "release_id": "release-2026-10-05", "environment": "production"},
+  "evidence": ["plan:nightly-job-42"],
+  "provenance": "performed",
+  "actor": "alex/session1",
+  "trigger": "after the nightly job on 2026-10-06"
+}
+```
+
+Reading changes nothing, and a deployed release with no trusted scope is never invented.
+
+## Switched on but not effective
+
+`deployed=passed` says the release is live; it does not say the feature works. Record that separately with the `enabled` dimension, whose values are `enabled`, `disabled` and `enabled-with-known-defect`. The defect value names the task that will fix the problem, so `deployed=passed` no longer reads as fully done while the flag is on and broken:
+
+```json
+{
+  "schema_version": 1,
+  "operation_id": "alex/enabled-001",
+  "task": "example-task",
+  "dimension": "enabled",
+  "value": "enabled-with-known-defect",
+  "scope": {"source_commit": "1111111111111111111111111111111111111111", "integration_commit": "", "release_id": "release-2026-10-05", "environment": "production"},
+  "evidence": ["issue:example-defect-7"],
+  "provenance": "performed",
+  "actor": "alex/session1",
+  "defect_task": "example-fix-task"
+}
+```
+
+`enabled` is deliberately outside the six facts, so `brief`, `work` and `lifecycle.py list` keep their documented shape; `evidence-owed` shows the flag and the fixing task beside `deployed=passed`. An `enabled` fact uses the same scope rules and the same trust rule as the six facts: unattributed, unscoped, ambiguous or tampered events read `unknown` rather than being guessed. Nothing here infers `enabled` from `deployed`, and no release write records `enabled` on its own.
+
 ## Create children without guessing IDs
 
 Save `child.json`:
