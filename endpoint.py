@@ -11,6 +11,7 @@ no HTTP principal at all.
 import argparse
 import fcntl
 import json
+import record_json
 import re
 import subprocess
 import sys
@@ -463,7 +464,7 @@ def execute(root,request,authority_config=None,require_authority=False):
     if action in ('lifecycle','coordinate','requirement'):
         args=request.get('args',[])
         if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):raise ValueError('Expected one JSON payload')
-        payload=json.loads(args[0])
+        payload=record_json.loads(args[0])
         run_warnings=[]
         def run(argv):
             stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
@@ -586,7 +587,7 @@ def main():
     try:
         text=sys.stdin.read(2_000_001)
         if len(text)>2_000_000:raise ValueError('Request exceeds 2 MB')
-        answer=execute(root_path(a.root),json.loads(text),authority_config=authority_config,
+        answer=execute(root_path(a.root),record_json.loads(text),authority_config=authority_config,
                        require_authority=a.require_authority)
     except subprocess.TimeoutExpired:
         answer={'returncode':124,'stdout':'','stderr':'Command timed out; mutation outcome may be uncertain. Inspect state before retrying.\n'}

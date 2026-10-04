@@ -1,6 +1,7 @@
 """Resolve explicit requirement revisions from one native Beads JSONL export."""
 import argparse
 import json
+import record_json
 import sys
 from pathlib import Path
 
@@ -23,7 +24,7 @@ def parse_json(text):
                 raise ValueError('duplicate JSON field: ' + key)
             result[key] = value
         return result
-    value = json.loads(text, object_pairs_hook=unique)
+    value = record_json.loads(text, object_pairs_hook=unique)
     canonical_bytes(value)
     return value
 

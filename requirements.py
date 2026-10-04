@@ -9,6 +9,7 @@ migration and no requirement revision is written.
 import argparse
 import hashlib
 import json
+import record_json
 import re
 import sys
 
@@ -265,7 +266,9 @@ def load_json(path):
     except OSError as exc:
         _fail("cannot read %s: %s" % (path, exc.strerror or exc))
     try:
-        result = json.loads(payload.decode("utf-8"), object_pairs_hook=_unique_object)
+        # Through the nesting guard (kittrial-5bb.108): a payload file can be written by
+        # someone other than the kit, and a deeply nested one must be a refusal.
+        result = record_json.loads(payload.decode("utf-8"), object_pairs_hook=_unique_object)
         canonical_bytes(result)  # Reject nonfinite numbers and invalid Unicode.
         return result
     except UnicodeDecodeError:

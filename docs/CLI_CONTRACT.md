@@ -1459,6 +1459,7 @@ a clear refusal, not a wrong read.
 
 | Command | Option | Range |
 | --- | --- | --- |
+| every command | JSON nesting in a request, a `--file` attachment or a payload argument | at most 64 levels; deeper is refused with `JSON nested too deeply (more than 64 levels)`, exit 2, nothing written |
 | `work` | `--limit`, `--handoff-limit` | 1..100 |
 | `work` | `--offset`, `--handoff-offset` | >= 0 |
 | `work` | `--state` | one of the documented review states |

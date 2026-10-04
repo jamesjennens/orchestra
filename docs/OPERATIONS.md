@@ -702,6 +702,64 @@ bd update PROJECT-FORGED --remove-label capability --remove-label capability-key
 
 Use the labels the forged anchor actually carries (`bd show PROJECT-FORGED --json`). The stripped issue stays in the database, closed, with its comments, as evidence; it no longer counts as an anchor, and writes on the key work again. Record what you did and why on the genuine anchor's project, and take a backup afterwards.
 
+### Deeply nested JSON
+
+The kit refuses JSON nested more than 64 levels deep wherever it parses text that
+somebody else wrote: a record comment, a `--file` attachment, a payload argument, a
+request to the endpoint, an HTTP request body, a cursor. The deepest JSON the kit itself
+writes nests 4 levels.
+
+- **A record comment** nested deeper (which only a host write can produce: the record
+  prefixes are refused for contributors) reads as a malformed record of its kind. It
+  fails only its own entry or task: `work`, `brief`, `ref`, `capability` and `proposal`
+  reads carry on for everyone, the entry is named in `coverage`, and `void-record`
+  repairs a reference or capability record as it does any malformed one. Before this,
+  one such comment made the reads exit with `RecursionError`, made `work` exit 124 for
+  every actor of the project, and made `void-record` fail the same way.
+- **A void does not repair the project for an older kit.** The voided comment stays in
+  the tracker, and a kit before this one parses a record comment before it applies a
+  void, so it fails on that project exactly as it did before the void. Measured on the
+  kit before this one, one comment at a time: an over-deep reference or capability
+  record fails that catalog's reads and `work` for every actor; an over-deep review,
+  integration-revert or record-void comment fails `work` for every actor and the
+  task's `brief` and `review`; an over-deep checkpoint fails only that task's `brief`;
+  the other record kinds did not fail a read. A project with no such comment reads
+  identically on both kits.
+- **Before rolling such a project back to an older kit, remove the comments.** The
+  native tool has no command that deletes a comment, so this is a direct delete in the
+  tracker database, on the host, as an operator, under the kit environment, in the
+  project's directory. Take a backup first (`admin.py backup PROJECT`); the backup is
+  the only copy of what you remove. List the over-deep record comments with the kit's
+  own scan (comment id, then task id):
+
+  ```sh
+  bd sql "SELECT id, issue_id, text FROM comments WHERE text LIKE 'Kind: %'" --json \
+    | python3 -c "import json,sys; sys.path.insert(0,sys.argv[1]); import record_json as r; [print(c['id'], c['issue_id']) for c in json.loads(sys.stdin.read()) if r.nesting(c['text'].partition(chr(10))[2]) > r.NESTING_MAX]" /home/beads/beads-team-kit
+  ```
+
+  Remove each one, then run the listing again; it must print nothing:
+
+  ```sh
+  bd sql "DELETE FROM comments WHERE id = 'COMMENT-ID'"
+  ```
+
+  Both kits then read the project (checked on a runtime for every record kind, with
+  `work`, `brief`, `review`, `history`, the catalog lists and a backup afterwards). A
+  void record that named a removed comment stays and is harmless. Record what you
+  removed and why on the project, and take a backup afterwards. On this kit and later
+  ones the delete is not needed: `void-record` is the repair.
+- **A request** nested deeper is refused with `JSON nested too deeply (more than 64
+  levels)`: exit 2 over SSH, and HTTP 422 `Request body is not valid JSON` from the web
+  service. Nothing is written and no operation is reserved. Before this, some routes
+  answered exit 124 "outcome unknown" although nothing had been written, and the web
+  service answered HTTP 500.
+- **Why a fixed bound.** The interpreter's own limit is about a thousand levels and
+  depends on the Python version and on how deep the call stack already is, so the same
+  text could parse in a writer and fail in a reader. The bound is checked by counting
+  brackets in one pass before any parse, so it gives the same answer everywhere and costs
+  time in proportion to the text, however malformed the text is (about half a second for
+  the largest request the endpoint takes, 2 MB).
+
 ### Malformed structured history
 
 A comment that claims a reserved machine format (`Kind: contribution-review-v1`, `Kind: task-checkpoint-v1`) but fails validation makes `brief`, `review` and `refresh` fail for that task. Repair it on the host; never edit or delete rows in the native database.
@@ -944,9 +1002,12 @@ it was set ([CLI contract](CLI_CONTRACT.md#ref-the-reference-catalog)).
   - **Only a record that is valid everywhere else counts.** The comment must start with
     the exact `Kind: reference-entry-v3` line (a BOM or CRLF variant does not count) and
     be the canonical bytes of a v3 record whose every field outside `authority`
-    validates, content hash included, with an `authority` object whose `type` is a
-    non-empty name this kit does not know. A later kit may put anything inside
-    `authority`; it may not change v3 anywhere else.
+    validates, content hash included, with an `authority` object whose `type` this kit
+    does not know and which is shaped like a type name: lowercase letters, digits and
+    hyphens, starting with a letter, at most 32 characters. `Decision`, `repo-path ` with
+    a trailing space, a blank, a control character or markup is not a later kit's type,
+    and reads malformed. The record's `key` must also belong to the anchor it is on. A
+    later kit may put anything inside `authority`; it may not change v3 anywhere else.
   - **Everything else is malformed, and a void repairs it:** a stray or hand-typed
     comment, a typo in the type of a broken record, a wrong hash, a BOM or CRLF variant.
     So a line of garbage on a genuine entry never freezes it.

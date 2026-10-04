@@ -16,6 +16,7 @@ is a trusted-team attribution declaration, not a verified identity.
 import argparse
 import hashlib
 import json
+import record_json
 import os
 import subprocess
 import sys
@@ -131,7 +132,7 @@ def parse_body(text):
         return None
     rest = text[len(PREFIX):]
     try:
-        payload = json.loads(rest)
+        payload = record_json.loads(rest)
         if not isinstance(payload, dict) or not isinstance(payload.get('plan'), dict):
             return None
         if canonical_bytes(payload).decode("utf-8") + "\n" != rest:

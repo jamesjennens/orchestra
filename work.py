@@ -1,6 +1,7 @@
 """Review/contribution transport and bounded current work queues."""
 import argparse
 import json
+import record_json
 from lifecycle import integration_evidence, project_facts
 
 CONTRACT_VERSION = 'cli-contract-v1'
@@ -404,7 +405,7 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
     if len(args)!=2 or not args[1].startswith('@attachment:'):raise ValueError('A JSON file attachment is required')
     item=attachments.get(args[1].partition(':')[2],{})
     if not isinstance(item,dict) or item.get('flag') not in ('--file','-f') or not isinstance(item.get('text'),str):raise ValueError('Invalid attachment')
-    payload=json.loads(item['text'])
+    payload=record_json.loads(item['text'])
     if not isinstance(payload,dict) or payload.get('task')!=task:raise ValueError('Payload task mismatch')
     if action=='handoff':
         from handoff import execute as handoff

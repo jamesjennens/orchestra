@@ -986,6 +986,9 @@ line separately and unconfined.
     starts `NOT ACCEPTED.` for a draft; show that sentence wherever the entry is shown.
   - **404:** an unknown key, or an entry left without a record by an interrupted
     propose.
+  - **Request bodies, on every route:** a body nested more than 64 levels deep is
+    refused with `422` `Request body is not valid JSON`, before any route runs and
+    with no operation reserved; a cursor that decodes to such JSON is an invalid cursor.
   - **Telemetry:** the get route runs `ref get`, which the endpoint counts in the
     [reference lookup-miss log](OPERATIONS.md#the-reference-lookup-miss-log). A get of an
     unknown key stores that key's words, a count and two timestamps, and no account. So a
