@@ -50,6 +50,15 @@ class OwnerBaselineTests(unittest.TestCase):
         self.save_as(data,'bob-cp','bob/session',13)
         self.assert_directions(data,['first','alice-before'])
 
+    def test_owner_comments_tied_with_checkpoint_time_remain_possible_directions(self):
+        data=rows();self.add(data,'alice-before','alice/session',11)
+        self.save_as(data,'alice-cp','alice/session',12)
+        # Native second precision cannot establish order within this timestamp.
+        self.add(data,'alice-tied','alice/session',12)
+        data[0]['assignee']='bob/session'
+        self.save_as(data,'bob-cp','bob/session',13)
+        self.assert_directions(data,['alice-tied'])
+
     def test_each_previous_owner_uses_their_last_own_checkpoint(self):
         data=rows();self.save_as(data,'alice-first','alice/session',11)
         self.add(data,'alice-before-last','alice/session',12)

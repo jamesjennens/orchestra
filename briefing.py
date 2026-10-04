@@ -422,7 +422,10 @@ def direction_entries(data,context):
     owner,baseline,previous=context
     return [e for e in data['entries']
             if (baseline is None or parse_moment(e['timestamp'])>baseline)
-            and (e['author'] not in previous or parse_moment(e['timestamp'])>previous[e['author']])]
+            # Native timestamps may have only second precision. A tied comment
+            # may have arrived AFTER the owner's checkpoint; retain it rather
+            # than inventing an ordering from its opaque native ID.
+            and (e['author'] not in previous or parse_moment(e['timestamp'])>=previous[e['author']])]
 
 def retained_provenance(state):
     exact,trunc,recorded=chain_evidence(state['history'],state['provenance'])
