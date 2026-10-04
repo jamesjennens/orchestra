@@ -582,5 +582,46 @@ class ScreenTests(Case):
         self.assertFalse(self.on_host('gamma'))
 
 
+class GrantShapeTests(unittest.TestCase):
+    """What counts as a grant, and what counts toward its limit, from the stored state alone."""
+
+    def test_a_stored_grant_that_is_not_exactly_a_grant_is_no_grant(self):
+        import http_authority
+        good = {'limit': 5, 'granted_by': 'usr_' + 'a' * 16, 'granted_at': '2026-10-04T00:00:00Z'}
+        self.assertEqual(http_authority.project_grant({'project_grant': good})['limit'], 5)
+        for label, bad in (('a limit of 0', dict(good, limit=0)), ('a limit over the maximum', dict(good, limit=101)),
+                           ('a limit that is text', dict(good, limit='5')), ('a limit that is true', dict(good, limit=True)),
+                           ('nobody granted it', {'limit': 5}), ('a word', 'yes'), ('nothing', None)):
+            with self.subTest(grant=label):
+                self.assertIsNone(http_authority.project_grant({'project_grant': bad}))
+        self.assertIsNone(http_authority.project_grant(None))
+
+    def test_what_counts_toward_the_limit(self):
+        import http_authority
+        me, other = 'usr_' + 'a' * 16, 'usr_' + 'b' * 16
+        state = {'projects': {
+            'mine': {'created_by': me, 'archived': False},
+            'archived': {'created_by': me, 'archived': True},
+            'theirs': {'created_by': other, 'archived': False},
+            'proj_0123456789abcdef': {'created_by': me, 'archived': False},       # an older kit's record: no host project
+            'broken': 'not a record'}}
+        self.assertEqual(http_authority.created_projects(state, me), ['mine'])
+        self.assertEqual(http_authority.created_projects(state, other), ['theirs'])
+        self.assertEqual(http_authority.created_projects({}, me), [])
+
+    def test_a_credential_is_refused_the_capability_whatever_the_state_says(self):
+        import http_authority
+        issuer = 'usr_' + 'a' * 16
+        state = {'users': {issuer: {'id': issuer, 'superuser': True, 'disabled': False}},
+                 'credentials': {'cred_1': {'user_id': issuer, 'revoked': False, 'expires_at': 9e12, 'scopes': ['tasks'],
+                                            'project_id': 'alpha'}},
+                 'projects': {'alpha': {}}, 'memberships': {'alpha': {issuer: 'owner'}}}
+        with self.assertRaises(http_authority.AuthorityDenied) as caught:
+            http_authority.decide(state, {'via': 'credential', 'user_id': issuer, 'credential_id': 'cred_1',
+                                          'project': None, 'capability': http_authority.CAP_PROJECT_HOST_CREATE,
+                                          'now': 1.0})
+        self.assertEqual(caught.exception.status, 403)
+
+
 if __name__ == '__main__':
     unittest.main()

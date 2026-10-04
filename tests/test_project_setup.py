@@ -130,7 +130,7 @@ class RepositoryRuleTests(unittest.TestCase):
         # mutation of one is caught only through the sentence; both are checked here.
         self.assertFalse(any(form.fullmatch('https://user@git.example/team/p.git')
                              for form in http_auth.Service._REPOSITORY_FORMS))
-        for value in ('https://TOKEN@github.com/t/b.git', 'user:hunter2@host:path'):
+        for value in ('https://TOKEN@github.com/t/b.git', 'user:hunter2@host:path', 'ssh://user:hunter2@host/team/b.git'):
             with self.assertRaises(http_auth.HttpError) as caught:
                 http_auth.Service.validate_repository(value)
             said = caught.exception.message + str(caught.exception.detail or '')
