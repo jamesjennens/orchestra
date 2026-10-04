@@ -1652,6 +1652,13 @@ def retire_project(root,name,actor,reason,force=False):
                                      'directory on the same filesystem as projects/.'
                                      %(name,RETIRED_DIR,entry,error.strerror or error.__class__.__name__,RETIRED_DIR)) from None
             append_retire_journal(root,dict(record,event='retired',at=utc_stamp()))
+    # A web-started creation that stopped half way and is retired here holds its
+    # creator's place no longer (kittrial-5bb.118 part 2). The name stays retired.
+    import project_creation
+    try:
+        if project_creation.mark_removed(root,name,actor):record['creation']='removed'
+    except (ValueError,OSError):
+        pass
     return record
 
 def append_retire_journal(root,record):
@@ -1662,6 +1669,50 @@ def append_retire_journal(root,record):
     with os.fdopen(fd,'a',encoding='utf-8') as handle:
         handle.write(json.dumps(record,sort_keys=True,ensure_ascii=False)+'\n')
         handle.flush();os.fsync(handle.fileno())
+
+PROJECT_SETTINGS=[('no-git-ops','true'),('dolt.auto-push','false'),('dolt.auto-commit','on'),('backup.git-push','false')]
+
+def initialize_project(root,name,stage=None):
+    """The work of ``add-project``: database, settings, backup target, merge slot, first backup.
+
+    ``add-project`` calls this and then prints its advice. The web service's project
+    creation calls it through ``project_creation.create`` (kittrial-5bb.118 part 2), which
+    passes ``stage`` to record which step was running if the work stops.
+    """
+    at=stage or (lambda label:None)
+    path=project_dir(root,name)
+    refuse_retired_name(root,name)
+    if path.exists() and any(path.iterdir()): raise ValueError('Project already exists; use it rather than initializing again')
+    path.mkdir(exist_ok=True)
+    cfg=config(root)
+    at('init')
+    run_bd(root,name,['init','--server','--external','--server-host','127.0.0.1','--server-port',str(cfg['port']),
+                      '--server-user','root','--prefix',name,'--database',name,'--skip-agents','--skip-hooks','--non-interactive'])
+    at('configure')
+    for key,value in PROJECT_SETTINGS:
+        run_bd(root,name,['config','set',key,value])
+    at('backup-target')
+    run_bd(root,name,['backup','init',str(root/'backups'/name)])
+    at('merge-slot')
+    provision_merge_slot(root,name)
+    at('first-backup')
+    backup_project(root,name)
+
+def finish_project_steps(root,name):
+    """Complete an initialized project whose creation stopped: every step is safe to repeat.
+
+    The settings are set again, the backup target is initialized only if it is not there
+    yet, the merge slot is created only if missing, and a backup is taken.
+    """
+    path=project_dir(root,name)
+    if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+    for key,value in PROJECT_SETTINGS:
+        run_bd(root,name,['config','set',key,value])
+    target=root/'backups'/name
+    if not (target.is_dir() and any(target.iterdir())):
+        run_bd(root,name,['backup','init',str(target)])
+    provision_merge_slot(root,name)
+    backup_project(root,name)
 
 def add_project(root,name):
     """Initialize one project, provision its merge slot and back it up once.
@@ -1676,18 +1727,7 @@ def add_project(root,name):
     direction: it can only prompt an operator to double-check, never hide a gap. This is a
     deliberate choice, not a missed case, and it never edits, installs or enables a unit.
     """
-    path=project_dir(root,name)
-    refuse_retired_name(root,name)
-    if path.exists() and any(path.iterdir()): raise ValueError('Project already exists; use it rather than initializing again')
-    path.mkdir(exist_ok=True)
-    cfg=config(root)
-    run_bd(root,name,['init','--server','--external','--server-host','127.0.0.1','--server-port',str(cfg['port']),
-                      '--server-user','root','--prefix',name,'--database',name,'--skip-agents','--skip-hooks','--non-interactive'])
-    for key,value in [('no-git-ops','true'),('dolt.auto-push','false'),('dolt.auto-commit','on'),('backup.git-push','false')]:
-        run_bd(root,name,['config','set',key,value])
-    run_bd(root,name,['backup','init',str(root/'backups'/name)])
-    provision_merge_slot(root,name)
-    backup_project(root,name)
+    initialize_project(root,name)
     print(f'Created project {name}')
     print(scheduled_backup_coverage(root,name)[1])
     print(worker_client_setup(root,name))
@@ -3485,6 +3525,10 @@ def main():
     sub=p.add_subparsers(dest='command',required=True)
     a=sub.add_parser('install');a.add_argument('--port',type=int,default=13317);a.add_argument('--unit',default='beads-team.service')
     a=sub.add_parser('add-project');a.add_argument('project')
+    a=sub.add_parser('finish-project',help='complete a project creation the web interface started and that stopped half way')
+    a.add_argument('project')
+    a=sub.add_parser('project-creations',help='list the project creations the web interface started (JSON)')
+    a.add_argument('--attention',action='store_true',help='only the ones an operator must finish or remove')
     a=sub.add_parser('set-onboarding');a.add_argument('project');a.add_argument('--file',required=True)
     a=sub.add_parser('set-guidance',help='set the standing coordinator guidance every actor reads each run (operator allowlist, audited)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
@@ -3628,6 +3672,17 @@ def main():
     args=p.parse_args();root=root_path(args.root)
     if args.command=='install':install(root,args.port,args.unit)
     elif args.command=='add-project':add_project(root,args.project)
+    elif args.command=='finish-project':
+        import project_creation
+        result=project_creation.finish(root,args.project)
+        print(json.dumps(result,sort_keys=True))
+        print('Finished %s on the server. It is not registered in the web interface yet: the account that '
+              'started it creates it again there (the same name), or a superuser registers it.'%args.project,
+              file=sys.stderr)
+    elif args.command=='project-creations':
+        import project_creation
+        found=project_creation.attention(root) if args.attention else project_creation.records(root)
+        print(json.dumps(found,sort_keys=True,indent=1))
     elif args.command=='set-onboarding':
         import fcntl
         from onboarding import probe_endpoints, write_project

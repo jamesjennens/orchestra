@@ -95,6 +95,61 @@ export async function welcome(ctx) {
         h('p', { class: 'muted' }, 'Define a task → someone claims it → they deliver a contribution → an owner reviews it, requesting changes or approving → it is integrated and deployed. Each of the six completion facts is recorded separately.'))));
 }
 
+// "Create a project" for an account a superuser granted that, and for a superuser. The
+// project is made on the server and registered in one step; the creator is its owner.
+// `creation` is the session's project_host_create: null where the server has no host.
+export function hostCreatePanel(ctx, creation) {
+  if (!creation || !(creation.allowed || creation.reason === 'limit')) return null;
+  const numbers = creation.limit == null ? null : `You have created ${creation.used} of the ${creation.limit} projects you may have at one time. Archiving one frees a place.`;
+  if (!creation.allowed) {
+    return h('section', { class: 'panel', id: 'host-create' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Create a project')),
+      h('div', { class: 'panel-body' }, h('p', { class: 'small muted' }, numbers, ' Ask a superuser to raise the limit.')));
+  }
+  const status = h('div', { class: 'banner crit', role: 'alert', hidden: true });
+  const form = h('form', { class: 'form', novalidate: true },
+    h('p', { class: 'small muted' }, 'This creates the project on the server (it takes a few seconds) and makes you its owner. You then set it up step by step.', numbers ? ' ' + numbers : ''),
+    status,
+    field({ id: 'new_project_id', label: 'Project name', hint: '2–24 lowercase letters or digits, beginning with a letter. It becomes the start of every task id and cannot be changed.', required: true, maxlength: 24 }),
+    field({ id: 'new_project_name', label: 'Display name (optional)', hint: 'Defaults to the project name.', maxlength: 64 }),
+    h('div', null, h('button', { type: 'submit', class: 'primary' }, 'Create project')));
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const values = formValues(form);
+    const projectId = values.new_project_id.trim();
+    if (!/^[a-z][a-z0-9]{1,23}$/.test(projectId)) return setFieldError(form, 'new_project_id', 'Enter 2–24 lowercase letters or digits, beginning with a letter.');
+    setFieldError(form, 'new_project_id', '');
+    status.hidden = true;
+    const created = await act(form.querySelector('button'), () => ctx.api.createHostProject(projectId, values.new_project_name.trim()), {
+      success: 'Project created',
+      onError: (e) => {
+        // A creation that stopped half way: the server's sentence names the project and says who must act.
+        if (e.status === 409 && e.detail && e.detail.state === 'incomplete') { status.replaceChildren(e.message); status.hidden = false; return true; }
+        if (e.status === 422 || e.status === 409 || e.status === 403) { setFieldError(form, 'new_project_id', e.message); return true; }
+        return false;
+      },
+    });
+    if (created) { await ctx.refreshProjects(); ctx.go('/p/' + created.id + '/setup'); }
+  });
+  return h('section', { class: 'panel', id: 'host-create' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Create a project')), h('div', { class: 'panel-body' }, form));
+}
+
+// Superuser only: project creations that stopped half way, so that none is forgotten.
+export async function incompleteCreations(ctx) {
+  if (!ctx.me.superuser) return null;
+  const found = await ctx.api.projectCreations().catch(() => null);
+  const items = (found && found.items) || [];
+  if (!items.length) return null;
+  return h('section', { class: 'panel', id: 'incomplete-creations' },
+    h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Project creations that did not finish ', h('span', { class: 'nav-count' }, items.length))),
+    h('div', { class: 'panel-body stack' },
+      h('p', { class: 'small muted' }, 'Each was started from the web interface and stopped on the server. Nothing is registered here and the name is held. An operator finishes it or removes it on the server; this page does not run anything there.'),
+      items.map((item) => h('div', { class: 'card', 'data-creation': item.project },
+        h('div', { class: 'toolbar' }, h('h2', { class: 'small mono' }, item.project), h('span', { class: 'chip warn' }, item.state === 'damaged' ? 'Record damaged' : 'Did not finish')),
+        h('p', { class: 'small' }, 'Started by ', item.by_name || item.by || 'unknown', item.started_at ? [' ', time(item.started_at)] : null, item.stage ? `; stopped at the step “${item.stage}”.` : '.'),
+        h('p', { class: 'small muted' }, 'To finish it:'), h('pre', { class: 'json' }, item.finish),
+        h('p', { class: 'small muted' }, 'To remove it (the name stays retired):'), h('pre', { class: 'json' }, item.remove)))));
+}
+
 export async function directory(ctx) {
   await ctx.refreshProjects();
   const session = await ctx.api.current().catch(() => null);
@@ -175,6 +230,8 @@ export async function directory(ctx) {
       h('div', { class: 'toolbar' }, archivedToggle),
       list,
       review,
+      await incompleteCreations(ctx),
+      hostCreatePanel(ctx, session && session.project_host_create),
       h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, mode === 'register' ? 'Register a project' : 'New project')), h('div', { class: 'panel-body' }, panel)));
   }
 

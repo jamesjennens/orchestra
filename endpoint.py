@@ -27,7 +27,7 @@ from reserved_comments import (carries_record_label, check_raw_request, comment_
                                operator_only_in_args, raw_file_flag_in_args,
                                reserved_label_in_args, refuse_http_actor, status_change_targets,
                                unresolved_bd_flags)
-from http_authority import AuthorityConfig, NativeRunner, http_actor_denial, journal_path, run_guarded
+from http_authority import AuthorityConfig, NativeRunner, CAP_PROJECT_ADMIN, http_actor_denial, journal_path, run_guarded
 
 ALLOWED={'list','show','ready','search','count','create','update','close','reopen','comments','dep','state','lint'}
 # Legacy name kept for operators reading this file; enforcement is the
@@ -192,6 +192,15 @@ def _guard_record_anchor_status(root,path,args,actor):
                              'whose status only its record operations may change.'%(command,canonical))
 
 def execute(root,request,authority_config=None,require_authority=False):
+    # Two actions exist only for the web service and name no existing project
+    # (kittrial-5bb.118 part 2); project_creation holds them, with what stops other callers.
+    if request.get('action')=='create-project':
+        import project_creation
+        project_dir(root,request.get('project'))          # the name's shape, before anything else
+        return project_creation.create_action(root,request,authority_config)
+    if request.get('action')=='project-creations':
+        import project_creation
+        return project_creation.list_action(root,request,authority_config)
     name=request['project'];path=project_dir(root,name)
     if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
     actor=request.get('actor','')
@@ -239,6 +248,13 @@ def execute(root,request,authority_config=None,require_authority=False):
             return run_guarded(request,journal_path(path),work_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
+    if action=='set-onboarding':
+        # An owner sets the project's onboarding text from the web interface
+        # (kittrial-5bb.118 part 2). Service-only; see onboarding.web_action.
+        from onboarding import web_action
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            return web_action(path,name,request,authority_config)
     if action in ('onboard','docs'):
         from onboarding import execute as onboard
         return {'returncode':0,'stdout':onboard(Path(__file__).resolve().parent,path,name,actor,action,request.get('args',[]),endpoint=Path(__file__).resolve()),'stderr':''}
