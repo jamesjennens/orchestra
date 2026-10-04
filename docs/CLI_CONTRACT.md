@@ -1048,7 +1048,8 @@ never read more than they need:
     objects. It carries `authority` and `authority_kind` (`repository`, `url` or
     `attested`), and for an attested entry `authority_note`, a sentence saying who
     attested it, when, on what basis, and that it cannot be checked against a
-    repository.
+    repository. Once the entry is past its review date the sentence also says
+    `PAST ITS REVIEW DATE`.
   - `record_comment_id`.
   - `acceptance`: the F3 decision. Its `operator` is the allowlisted actor taken from
     the evidence comment's **native author**.
@@ -1165,7 +1166,8 @@ sets `operation`.
     owner said so). Nothing else: a rule somebody set for themselves belongs in a
     decision issue or a repository document.
   - `by`: `account:<uid>` or `person:<name>`, never a session actor.
-  - `observed`: the date it was observed or said, no later than today.
+  - `observed`: the date it was observed or said, no later than today. "Today" is the
+    server's UTC date, here and for a `url` authority's `retrieved`.
   - `how`: one line, at most 300 characters. For a host check, the command and the
     host; for an owner statement, where and when it was said.
   - `source`: optional, one line, at most 300 characters: where it is written down. The
