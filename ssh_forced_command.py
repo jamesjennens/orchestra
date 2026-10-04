@@ -55,6 +55,8 @@ import os
 import posixpath  # the paths here are the server's POSIX paths, whatever platform runs the tests
 import re
 import shlex
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -121,19 +123,39 @@ def _python(value):
     if not isinstance(value, str) or not PYTHON_NAME.fullmatch(value):
         raise ValueError('--python must be one interpreter name or absolute path using only '
                          'letters, digits, dot, underscore, dash and slash')
-    return value
+    environment = child_environment()
+    executable = shutil.which(value, path=environment['PATH'])
+    if executable is None:
+        raise ValueError('--python interpreter was not found or is not executable')
+
+    probe = ('import sys; sys.stdout.write("orchestra-python:%d.%d\\n" % '
+             'sys.version_info[:2]); sys.exit(0 if sys.version_info >= (3, 10) else 1)')
+    try:
+        result = subprocess.run(
+            [executable, '-E', '-s', '-c', probe],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=5, env=environment,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ValueError('--python is not a usable Python 3.10+ interpreter: %s' % error) from error
+
+    match = re.fullmatch(r'orchestra-python:(\d+)\.(\d+)\n', result.stdout or '')
+    if result.returncode != 0 or match is None or tuple(map(int, match.groups())) < (3, 10):
+        raise ValueError('--python must name a usable Python 3.10+ interpreter')
+    return executable
 
 
 def configured(args):
-    """Return (root, endpoints, python) as validated strings, or raise ValueError.
+    """Return configured paths and the interpreter candidate, or raise ValueError.
 
     Unknown flags (for example an HTTP service's ``--authority-store`` copied into the
     authorized_keys line by mistake) are refused by argparse before this runs: a
-    contribution key must never reach the authority path by accident.
+    contribution key must never reach the authority path by accident. The interpreter is
+    checked only after SSH_ORIGINAL_COMMAND selects the configured endpoint.
     """
     root = _path(args.root, '--root')
     endpoints = [_path(item, '--endpoint') for item in (args.endpoint or [default_endpoint()])]
-    python = _python(default_python() if args.python is None else args.python)
+    python = default_python() if args.python is None else args.python
     return root, endpoints, python
 
 
@@ -194,6 +216,7 @@ def main(argv=None):
         chosen, reason = select_endpoint(tokens, endpoints)
         if chosen is None:
             return refuse(reason)
+        python = _python(python)
         command = endpoint_argv(python, chosen, root)
         # Replace this process: the endpoint inherits the caller's stdio byte for byte, but
         # not the caller-influenced environment (see child_environment).

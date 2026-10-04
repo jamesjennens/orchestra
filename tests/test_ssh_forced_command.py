@@ -105,16 +105,74 @@ class EndpointSelectionTests(unittest.TestCase):
         self.assertLess(len(reason), 300)
 
 
+class PythonInterpreterValidationTests(unittest.TestCase):
+    def test_a_bare_name_is_resolved_and_probed_as_python_310_or_newer(self):
+        completed = subprocess.CompletedProcess([], 0, 'orchestra-python:3.11\n', '')
+        with patch('ssh_forced_command.shutil.which', return_value='/opt/python/bin/python3') as which, \
+                patch('ssh_forced_command.subprocess.run', return_value=completed) as run:
+            self.assertEqual(forced._python('python3'), '/opt/python/bin/python3')
+        environment = forced.child_environment()
+        which.assert_called_once_with('python3', path=environment['PATH'])
+        args, kwargs = run.call_args
+        self.assertEqual(args[0][:4], ['/opt/python/bin/python3', '-E', '-s', '-c'])
+        self.assertIs(kwargs['stdin'], subprocess.DEVNULL)
+        self.assertIs(kwargs['stdout'], subprocess.PIPE)
+        self.assertIs(kwargs['stderr'], subprocess.PIPE)
+        self.assertEqual(kwargs['timeout'], 5)
+        self.assertEqual(kwargs['env'], environment)
+
+    def test_a_missing_or_non_executable_interpreter_is_refused(self):
+        with patch('ssh_forced_command.shutil.which', return_value=None) as which, \
+                patch('ssh_forced_command.subprocess.run') as run:
+            with self.assertRaisesRegex(ValueError, '--python'):
+                forced._python('missing-python')
+        which.assert_called_once()
+        run.assert_not_called()
+
+    def test_an_executable_that_is_not_python_is_refused(self):
+        completed = subprocess.CompletedProcess([], 0, 'not-python\n', '')
+        with patch('ssh_forced_command.shutil.which', return_value='/usr/bin/not-python'), \
+                patch('ssh_forced_command.subprocess.run', return_value=completed):
+            with self.assertRaisesRegex(ValueError, 'usable Python 3.10\\+'):
+                forced._python('/usr/bin/not-python')
+
+    def test_an_unsupported_python_version_is_refused(self):
+        completed = subprocess.CompletedProcess([], 1, 'orchestra-python:3.9\n', '')
+        with patch('ssh_forced_command.shutil.which', return_value='/usr/bin/python3.9'), \
+                patch('ssh_forced_command.subprocess.run', return_value=completed):
+            with self.assertRaisesRegex(ValueError, 'Python 3.10\\+'):
+                forced._python('/usr/bin/python3.9')
+
+    def test_a_probe_that_cannot_start_or_times_out_is_refused(self):
+        failures = (OSError('not executable'),
+                    subprocess.TimeoutExpired('/usr/bin/python3', 5))
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__):
+                with patch('ssh_forced_command.shutil.which', return_value='/usr/bin/python3'), \
+                        patch('ssh_forced_command.subprocess.run', side_effect=failure):
+                    with self.assertRaisesRegex(ValueError, '--python'):
+                        forced._python('/usr/bin/python3')
+
+    def test_an_unsafe_interpreter_is_refused_before_lookup(self):
+        with patch('ssh_forced_command.shutil.which') as which:
+            with self.assertRaisesRegex(ValueError, '--python'):
+                forced._python('python3;touch')
+        which.assert_not_called()
+
+
 class WrapperExecTests(unittest.TestCase):
     """The wrapper refuses everything else and launches one fixed command line."""
 
     def invoke(self, original, argv=None):
         argv = argv or ['--root', ROOT, '--endpoint', ENDPOINT, '--python', PYTHON]
         out, err = io.StringIO(), io.StringIO()
+        probe = subprocess.CompletedProcess([], 0, 'orchestra-python:3.11\n', '')
         # Both exec entry points are patched: `execvpe` is the one that must be used, and
         # `execvp` (which inherits the caller's environment) must never run - patching it too
         # means a regression there fails a test instead of replacing the test process.
         with patch.dict(os.environ, {'SSH_ORIGINAL_COMMAND': original}), \
+                patch('ssh_forced_command.shutil.which', return_value=PYTHON), \
+                patch('ssh_forced_command.subprocess.run', return_value=probe), \
                 patch('ssh_forced_command.os.execvpe') as execvpe, \
                 patch('ssh_forced_command.os.execvp') as execvp, \
                 patch('sys.stdout', out), patch('sys.stderr', err):
@@ -163,6 +221,18 @@ class WrapperExecTests(unittest.TestCase):
                 self.assertEqual(out, '')
                 self.assertTrue(err)
                 execvpe.assert_not_called()
+
+    def test_a_refused_command_does_not_probe_the_interpreter(self):
+        with patch.dict(os.environ, {'SSH_ORIGINAL_COMMAND': 'admin.py'}), \
+                patch('ssh_forced_command.shutil.which') as which, \
+                patch('ssh_forced_command.subprocess.run') as run, \
+                patch('ssh_forced_command.os.execvpe') as execvpe, \
+                patch('sys.stderr', io.StringIO()):
+            self.assertEqual(forced.main(
+                ['--root', ROOT, '--endpoint', ENDPOINT, '--python', PYTHON]), 2)
+        which.assert_not_called()
+        run.assert_not_called()
+        execvpe.assert_not_called()
 
     def test_shell_metacharacters_never_reach_a_shell(self):
         for original in (ENDPOINT + '; rm -rf /', ENDPOINT + ' && id', '$(id)',
@@ -256,6 +326,10 @@ class WrapperExecTests(unittest.TestCase):
                    'PATH': '/usr/bin:/bin', 'HOME': '/home/beads',
                    'LANG': 'en_GB.UTF-8', 'LC_ALL': 'en_GB.UTF-8'}
         with patch.dict(os.environ, planted), \
+                patch('ssh_forced_command.shutil.which', return_value=PYTHON), \
+                patch('ssh_forced_command.subprocess.run',
+                      return_value=subprocess.CompletedProcess(
+                          [], 0, 'orchestra-python:3.11\n', '')), \
                 patch('ssh_forced_command.os.execvpe') as execvpe, \
                 patch('ssh_forced_command.os.execvp') as execvp, \
                 patch('sys.stderr', io.StringIO()):
