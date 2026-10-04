@@ -313,6 +313,31 @@ def operators(root, strict=False):
                              'or unset ORCHESTRA_OPERATORS before this command.')
     return allowed
 
+def review_workflow_writes(root, strict=False):
+    """The per-installation switch for WRITING the new review-workflow shapes.
+
+    kittrial-5bb.94 item 3 asked for a two-step ship: this kit's READERS understand
+    the new operations and fields (withdraw, request-review, resolve-item,
+    decline-review, an item severity and a request-changes summary), but writing
+    them is refused unless this installation opts in, because a kit built before
+    the change fails closed on any chain carrying one. `deployment.private.json`'s
+    `review_workflow_writes` is the single source; absent or false means OFF, so a
+    fresh install and a rolled-back one behave identically. Unlike `operators`
+    there is deliberately no `ORCHESTRA_*` fallback: it is not an authority list,
+    it is a deployment capability, and the endpoint supplies it to the review write
+    path. The coordinator turns it on (`admin.py review-writes on --actor OPERATOR`)
+    once the rollback target is a kit that reads the new shapes.
+    """
+    enabled = False
+    marker = root/'deployment.private.json'
+    if marker.is_file():
+        value = read_json_file(marker,'Deployment configuration').get('review_workflow_writes')
+        if isinstance(value,bool):
+            enabled = value
+        elif value is not None:
+            raise ValueError('deployment review_workflow_writes must be true or false')
+    return enabled
+
 def stored_operators(cfg):
     """The deployment allowlist as a list of identity strings.
 
@@ -3210,6 +3235,9 @@ def main():
     a.add_argument('action',choices=['list','add','remove']);a.add_argument('actor',nargs='?')
     a.add_argument('--confirm-revoke',action='store_true',dest='confirm_revoke',
                    help='with remove: acknowledge that this verifier\'s capability verifications stop reading verified')
+    a=sub.add_parser('review-writes',help='read or set the per-installation switch that allows WRITING the new review-workflow record shapes (readers understand them either way; OFF by default)')
+    a.add_argument('action',choices=['status','on','off'])
+    a.add_argument('--actor',required=True,help='an actor on the deployment operator allowlist')
     a=sub.add_parser('capability-verify',help='record verified capability checks (operator allowlist or verifiers list)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('authorized-keys',help='print the confined contributor and unrestricted operator authorized_keys lines for one public key')
@@ -3676,6 +3704,26 @@ def main():
         else:cfg.pop('verifiers',None)
         atomic_private_write(marker,json.dumps(cfg))
         print(json.dumps({'verifiers':current}))
+    elif args.command=='review-writes':
+        marker=root/'deployment.private.json'
+        if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
+        from recovery import identity
+        actor=identity(args.actor,'Invalid actor identity')
+        authority=operators(root, strict=True)
+        if actor not in authority:
+            raise ValueError('review-writes requires an actor on the deployment operator allowlist '
+                             '(deployment.private.json operators); ' + actor + ' is not on it')
+        cfg=config(root)
+        if args.action=='status':
+            print(json.dumps({'review_workflow_writes':review_workflow_writes(root)}))
+            return
+        enabled=args.action=='on'
+        # OFF is the absent key, so a deployment that never turned it on and one
+        # that turned it back off read identically.
+        if enabled:cfg['review_workflow_writes']=True
+        else:cfg.pop('review_workflow_writes',None)
+        atomic_private_write(marker,json.dumps(cfg))
+        print(json.dumps({'review_workflow_writes':review_workflow_writes(root)}))
     elif args.command=='authorized-keys':
         authorized_keys(root,args.key_file,args.role,args.python,args.comment)
     elif args.command=='backup':backup_projects(root,args.projects,args.all_projects)

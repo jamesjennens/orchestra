@@ -206,6 +206,7 @@ history](#malformed-structured-history) (`void-record`).
 | `capability-alias-propose PROJECT --actor OPERATOR --file alias.json` | propose an alias as a verified operator (`{schema_version, key, alias, evidence?}`). This is the only route that writes `identity: verified`; `capability propose-alias` through the endpoint always writes `unverified`, even for an operator's actor name | the deployment operator allowlist |
 | `capability-verify PROJECT --actor ACTOR --file payloads.json` | record capability checks as **verified**. The file is what `capability check --repo . --payloads payloads.json` wrote at the commit being verified (one payload, or `{schema_version, items}` of up to 500). Each item is one capability and takes the coordination lock on its own; the result is `recorded`, `already-recorded` or `refused` per item, and re-running the file is safe. This is the only route that writes a verified check: `capability check --record` through the endpoint always writes an unverified report | the deployment operator allowlist or the `verifiers` list, both checked before any read |
 | `verifiers list\|add\|remove [ACTOR] [--confirm-revoke]` | manage the deployment `verifiers` list: actors, other than operators, whose `capability-verify` records readers count as verified. The list is empty by default and grants nothing else. `remove` needs `--confirm-revoke`; the refusal names the capabilities whose verification would change | shell access to the coordination host; `deployment.private.json` is the only authority source |
+| `review-writes status\|on\|off --actor OPERATOR` | read or set the per-installation switch that allows **writing** the new review-workflow record shapes (`withdraw`, `request-review`, `resolve-item`, `decline-review`, an item `severity`, a request-changes `summary`). Readers in this kit understand those shapes either way; with the switch off (the default) a write of one is refused before any native write. See [Review-workflow write switch](#review-workflow-write-switch) | the deployment operator allowlist, checked before any write; `deployment.private.json` is the only source (there is no environment fallback) |
 | `proposal-review PROJECT --actor OPERATOR --file review.json` | record a coordinator disposition on a requirement proposal. The payload is `{schema_version, operation_id, key, previous, proposal_sha256, to_state, ...}`: `previous` is the `disposition_comment_id` and `proposal_sha256` the `sha256` that `proposal get` returned, so a stale read is refused before any write. `to_state` is `under-review` (the claim), `rejected` (with `reason`), `duplicate-of` (with `duplicate_of`), `needs-info` (with `question`), `escalated-to-owner` (with `escalation: {question, owner_identity, due_by}`) or `incorporated` (with `incorporation`, checked against the requirement record) | the deployment operator allowlist, checked before any read; the actor must be mapped to a person and must not be the submitter |
 | `proposal-decide PROJECT --actor OPERATOR --file decision.json` | record the owner decision on an escalated proposal: `to_state` `approved` or `rejected` (with `reason`), and `decision: {decision_id}` naming an existing native decision issue. Never a requirement id | the allowlist; the decider must be a different person than the escalator and must not be the submitter |
 | `proposal-settings PROJECT --actor OPERATOR [--map-actor ACTOR --to IDENTITY] [--namespace NAME --to IDENTITY] [--unmap-actor ACTOR] [--unmap-namespace NAME] [--add-decider IDENTITY] [--remove-decider IDENTITY]` | with no change, print the contribution settings; otherwise write the next settings record, composed from the current one and bound to its hash | the allowlist |
@@ -310,6 +311,50 @@ silently omits guidance. To roll back:
 3. After rolling forward again, re-run `admin.py set-guidance` to reinstall the
    text. The previous history and acknowledgements are not recovered
    automatically from the cleared files.
+
+### Review-workflow write switch
+
+kittrial-5bb.94 adds review-workflow records (`withdraw`, `request-review`,
+`resolve-item`, `decline-review`, an item `severity`, a request-changes `summary`)
+that a kit built before that change refuses: it meets an unknown `operation` value
+or an unexpected field inside a task's `Kind: contribution-review-v1` chain, fails
+closed on that task with `Malformed contribution-review history; operator
+reconciliation required`, and refuses every review write on it. The kit that ships
+them is therefore staged in two steps, and this kit is step one.
+
+* **Readers understand the new shapes unconditionally.** `review`, `brief`, `work`
+  and `history` parse and project them whatever the switch below says.
+* **Writers are off by default.** `deployment.private.json` gains one boolean,
+  `review_workflow_writes`; absent or `false` means **OFF**, and a non-boolean value
+  is refused. With it off, a review write of any new shape is refused before any
+  native write, and a legacy request-changes item (`{id, text}`, no severity, no
+  summary) still works. An exact retry of an operation id already in the chain still
+  reconciles, so records written while it was on stay recoverable.
+* **The coordinator turns it on** once the rollback target is a kit that reads the
+  new shapes:
+
+```sh
+python3 admin.py review-writes status --actor OPERATOR     # current value (default: false)
+python3 admin.py review-writes on  --actor OPERATOR        # allow writing the new shapes
+python3 admin.py review-writes off --actor OPERATOR        # back to refusing them
+```
+
+`--actor` must be on the deployment operator allowlist (`operators` in
+`deployment.private.json`), checked before any write. There is deliberately no
+`ORCHESTRA_*` environment fallback: the file is the single source, and the endpoint
+supplies the value to the review write path, so a contributor cannot set it.
+`off` removes the key, so a deployment that never turned it on and one that turned
+it back off read identically.
+
+**Deployment order and rollback.** Deploy this kit with the switch off, verify the
+reads (`review`, `brief`, `work`, `history`), and leave it off for as long as a
+rollback to a pre-kittrial-5bb.94 kit must stay possible: no chain this kit writes
+can then contain a shape that kit refuses. Once the rollback target is a kit that
+reads the new shapes, run `review-writes on`. After that, rolling back below this
+kit leaves every task that carries a new shape unreadable (the same fail-closed
+hazard as the `assignee_at_approval` snapshot): reconcile with
+`admin.py void-record` on each affected record, or stay forward. Turning the switch
+off again does not remove records already written; it only stops new ones.
 
 Validate a payload before writing. Each command is fail-closed and refuses before
 any native write, and the same validator can be run with no native read or write
