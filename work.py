@@ -28,6 +28,10 @@ VALUE_OPTIONS = {'--owner', '--state', '--limit', '--offset', '--handoff-limit',
                  '--since', '--cursor', '--body-budget', '--ref-limit', '--ref-offset',
                  '--proposal-limit', '--proposal-offset', '--capability-limit', '--capability-offset'}
 
+#: At most this many request ids are named per work item (a review record holds at most 20 items).
+PENDING_REQUEST_IDS_MAX = 20
+
+
 def help_requested(args):
     """True when args ask for help; side-effect free for every command."""
     for index, token in enumerate(args):
@@ -94,7 +98,9 @@ def help_payload(action='work'):
             'item_identity': 'items[].task is the native task ID; items[].contribution_id is the '
                              'contribution comment ID, not a Git commit or latest_comment_id',
             'item_fields': ['task', 'title', 'owner', 'status', 'review_state', 'contribution_id',
-                            'commit', 'pending_review_items', 'pending_handoff_requests',
+                            'commit', 'pending_review_items', 'pending_change_requests', 'open_items',
+                            'checkpoint_at', 'newer_activity',
+                            'pending_handoff_requests',
                             'pending_handoff_total', 'pending_handoff_next_offset', 'lifecycle',
                             'lifecycle_scope', 'lifecycle_matches_contribution', 'error',
                             'deployed_delivery', 'deployed_delivery_is_current_contribution',
@@ -316,7 +322,32 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         handoff_requests=handoff_requests[a.handoff_offset:a.handoff_offset+a.handoff_limit]
         if journal_errors:
             state='error';error='Malformed handoff journal: '+json.dumps(journal_errors[:10],sort_keys=True)
-        items.append({'task':row['id'],'title':str(row.get('title',''))[:200],'owner':row.get('assignee'),'status':row.get('status'),'review_state':state,
+        # Additive (kittrial-5bb.114): what an agent's attention read needs from this one
+        # read. `open_items` is the number of open items in the task's latest valid
+        # checkpoint (0 with none, None when its checkpoint history cannot be read);
+        # `checkpoint_at` is when that checkpoint was written; `newer_activity` says
+        # whether any comment or record was written on the task after it, so a blocked
+        # task with nothing new can be left alone; `pending_change_requests` names the
+        # request-changes records still unresolved.
+        checkpoint_at=None;newer_activity=None
+        try:
+            from briefing import checkpoints
+            latest_checkpoint,_=checkpoints(row)
+            open_items=len(latest_checkpoint[0]['open_items']) if latest_checkpoint else 0
+            if latest_checkpoint:
+                comments=row.get('comments') or []
+                position=next(index for index,comment in enumerate(comments)
+                              if str(comment.get('id'))==str(latest_checkpoint[1].get('id')))
+                checkpoint_at=latest_checkpoint[1].get('created_at')
+                newer_activity=position<len(comments)-1
+        except (ValueError,TypeError,KeyError,StopIteration):
+            open_items=None;checkpoint_at=None;newer_activity=None
+        pending_change_requests=[]
+        for pending in review.get('pending_requests',[]):
+            if pending.get('request') not in pending_change_requests:pending_change_requests.append(pending.get('request'))
+        items.append({'open_items':open_items,'checkpoint_at':checkpoint_at,'newer_activity':newer_activity,
+                      'pending_change_requests':pending_change_requests[:PENDING_REQUEST_IDS_MAX],
+                      'task':row['id'],'title':str(row.get('title',''))[:200],'owner':row.get('assignee'),'status':row.get('status'),'review_state':state,
                       'contribution_id':contribution.get('comment_id'),'commit':contribution.get('commit'),'pending_review_items':len(review.get('pending_requests',[])),
                       'pending_handoff_requests':handoff_requests,
                       'pending_handoff_total':handoff_total,

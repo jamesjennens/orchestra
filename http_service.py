@@ -753,11 +753,14 @@ class InProcessBackend:
         stays the paginated view over the *same* snapshot so the HTTP page route is
         unchanged.
         """
+        tasks = self._project_rows(project_id)
+        return {'items': tasks, 'total': len(tasks)}
+
+    def _project_rows(self, project_id):
         tasks = [t for t in self.state['tasks'].values() if t['project_id'] == project_id]
         tasks.sort(key=lambda t: t['id'])
         # Record anchors never reach a task surface (kittrial-5bb.64).
-        tasks = hide_records([dict(t) for t in tasks])
-        return {'items': tasks, 'total': len(tasks)}
+        return hide_records([dict(t) for t in tasks])
 
     def list_tasks(self, project_id, limit, offset):
         snapshot = self.read_tasks(project_id)
@@ -829,6 +832,38 @@ class InProcessBackend:
                            for t in self.read_tasks(project_id)['items']},
                 'complete': True}
 
+    def agent_tasks(self, project_id, actor=None, queue=None):
+        """The tasks one actor holds (every held task when ``actor`` is None), each with
+        what agent attention needs. ``queue`` is accepted for the endpoint backend's
+        signature and is not needed here.
+
+        The same shape as :meth:`EndpointBackend.agent_tasks` (which reads the canonical
+        ``work`` view): review state, the open request ids, whether a contribution
+        exists, how many open items the latest checkpoint lists, when it was written
+        and whether a review record is newer than it. A closed task stays listed only
+        while its review is still active, as in ``work``.
+        """
+        checkpoints = self.state.get('checkpoints') or {}
+        rows = []
+        for task in self._project_rows(project_id):
+            if not task.get('assignee') or (actor is not None and task.get('assignee') != actor):
+                continue
+            review = self._review_view(task)
+            if task.get('status') == 'closed' and review['state'] not in ACTIVE_REVIEW_STATES:
+                continue
+            saved = checkpoints.get(task['id'])
+            last = saved[-1] if isinstance(saved, list) and saved and isinstance(saved[-1], dict) else None
+            checkpoint_at = last.get('created_at') if last else None
+            rows.append({'id': task['id'], 'title': task.get('title'), 'status': task.get('status'),
+                         'assignee': task.get('assignee'), 'review_state': review['state'],
+                         'contribution_id': (review['contribution'] or {}).get('id'),
+                         'pending_change_requests': [r['id'] for r in review['requests'] if r['status'] == 'open'],
+                         'open_items': len(last.get('open_items') or []) if last else 0,
+                         'checkpoint_at': checkpoint_at,
+                         'newer_activity': (bool(checkpoint_at and review['latest_at']
+                                                 and review['latest_at'] > checkpoint_at) if last else None)})
+        return {'tasks': rows, 'complete': True}
+
     def review_queue(self, project_id):
         """Every task with current work, highest-attention review states first.
 
@@ -863,7 +898,7 @@ def queue_order(item):
 
 def queue_item(project_id, task, review_state, contribution, open_requests,
                pending_request_ids=None, waiting_since=None, integration=None,
-               integration_warnings=None):
+               integration_warnings=None, attention=None):
     """One review-queue row, in the shape both backends return.
 
     ``pending_request_ids`` and ``waiting_since`` (time of the latest review record)
@@ -885,7 +920,11 @@ def queue_item(project_id, task, review_state, contribution, open_requests,
             'pending_request_ids': list(pending_request_ids or []),
             'waiting_since': waiting_since,
             'integration': integration,
-            'integration_warnings': list(integration_warnings or [])}
+            'integration_warnings': list(integration_warnings or []),
+            # What agent attention needs from the canonical ``work`` row (kittrial-5bb.114):
+            # the request-changes record ids, and the latest checkpoint's open items,
+            # time and whether anything is newer. None where the backend does not say.
+            'attention': attention}
 
 
 class EndpointBackend:
@@ -1555,6 +1594,73 @@ class EndpointBackend:
     #: reports ``complete: false`` rather than reading on.
     QUEUE_MAX_PAGES = 10
 
+    @staticmethod
+    def _attention_fields(row):
+        """The four attention fields of one canonical ``work`` row, type-checked."""
+        open_items = row.get('open_items')
+        return {'pending_change_requests': [value for value in row.get('pending_change_requests') or []
+                                            if isinstance(value, str)],
+                'open_items': open_items if type(open_items) is int else 0,
+                'checkpoint_at': row.get('checkpoint_at') if isinstance(row.get('checkpoint_at'), str) else None,
+                'newer_activity': row.get('newer_activity') if type(row.get('newer_activity')) is bool else None}
+
+    def agent_tasks(self, project_id, actor=None, queue=None):
+        """The tasks one actor holds, from the canonical ``work --owner ACTOR`` view.
+
+        With no ``actor`` it answers for every held task from the unfiltered view: the
+        owners' agent list and My work ask once per project for all their agents, not
+        once per agent, and pass the review ``queue`` they have already read so that it
+        costs no further ``work`` read at all.
+
+        ``bd list`` rows carry no review state and no checkpoint, so agent attention
+        read from them alone never reported changes requested, a contribution awaiting
+        review or a blocker on this backend (kittrial-5bb.114). ``work`` computes the
+        review projection per task and, since that change, the open items of the
+        latest checkpoint and the pending request ids, so one owner-filtered read per
+        project carries everything. It is paged to the same bound as the review queue;
+        an actor holding fewer than :data:`MAX_PAGE` tasks costs one read. ``work
+        --owner`` also lists tasks the actor was only NAMED to review; those are not
+        the actor's own and are left out here.
+        """
+        if actor is None:
+            queue = queue if queue is not None else self.review_queue(project_id)
+            rows = []
+            for item in queue.get('items') or []:
+                if not isinstance(item, dict) or not item.get('assignee'):
+                    continue
+                attention = item.get('attention') if isinstance(item.get('attention'), dict) else {}
+                rows.append({'id': item.get('id'), 'title': item.get('title'), 'status': item.get('status'),
+                             'assignee': item.get('assignee'), 'review_state': item.get('review_state'),
+                             'contribution_id': (item.get('contribution') or {}).get('id'),
+                             'pending_change_requests': list(attention.get('pending_change_requests') or []),
+                             'open_items': attention.get('open_items') or 0,
+                             'checkpoint_at': attention.get('checkpoint_at'),
+                             'newer_activity': attention.get('newer_activity')})
+            return {'tasks': rows, 'complete': bool(queue.get('complete'))}
+        if not isinstance(actor, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}', actor):
+            return {'tasks': [], 'complete': True}
+        owner = ['--owner', caller_arg(actor, 'actor')]
+        rows = []
+        offset = 0
+        complete = False
+        for _ in range(self.QUEUE_MAX_PAGES):
+            page = self._run('work', project_id, self.actor_namespace + '/read',
+                             owner + ['--limit', str(MAX_PAGE), '--offset', str(offset), '--json'])
+            if not isinstance(page, dict):
+                raise uncertain('Canonical work queue returned an unexpected shape')
+            for row in page.get('items') or []:
+                if not isinstance(row, dict) or row.get('owner') != actor:
+                    continue
+                rows.append(dict({'id': row.get('task'), 'title': row.get('title'), 'status': row.get('status'),
+                                  'assignee': row.get('owner'), 'review_state': row.get('review_state'),
+                                  'contribution_id': row.get('contribution_id')},
+                                 **self._attention_fields(row)))
+            offset = page.get('next_offset')
+            if offset is None:
+                complete = True
+                break
+        return {'tasks': rows, 'complete': complete}
+
     def review_queue(self, project_id):
         """The canonical ``work`` queue (review projection per task), fully paged.
 
@@ -1587,7 +1693,8 @@ class EndpointBackend:
                 items.append(queue_item(project_id, task, row.get('review_state'),
                                         contribution, row.get('pending_review_items') or 0,
                                         integration=row.get('integration'),
-                                        integration_warnings=row_warnings))
+                                        integration_warnings=row_warnings,
+                                        attention=self._attention_fields(row)))
             offset = page.get('next_offset')
             if offset is None:
                 complete = True
@@ -2596,7 +2703,8 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _agent_items(self, principal):
         items = []
         for agent in self.service.list_agents(principal):
-            attention = self._agent_attention(principal, agent)
+            # One read per project for all the agents listed, not one per agent.
+            attention = self._agent_attention(principal, agent, many=True)
             items.append(dict(agent, attention=self._agent_attention_view(agent, attention),
                               resume_prompt=self._agent_resume_prompt(agent, attention)))
         return items
@@ -2714,11 +2822,12 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     # -- read-time agent attention --------------------------------------------
     def _agent_blocked_tasks(self):
-        """Task ids whose latest checkpoint still lists open items.
+        """Task ids whose latest checkpoint still lists open items (``GET /v1/me/work``).
 
         This reads the in-process canonical view when it is present; the canonical
         endpoint binding does not mirror checkpoints into it, so a missing view simply
-        yields no ``blocked`` signal rather than a wrong one.
+        yields no ``blocked`` signal rather than a wrong one. Agent attention no longer
+        uses it (kittrial-5bb.114): see :meth:`_agent_own_tasks`.
         """
         state = getattr(self.backend, 'state', None)
         if not isinstance(state, dict):
@@ -2734,15 +2843,50 @@ class ApiHandler(BaseHTTPRequestHandler):
                     blocked.add(task_id)
         return blocked
 
-    def _agent_action(self, priority, kind, project_id, task, reason):
+    def _agent_own_tasks(self, project_id, actor, many=False):
+        """The agent's own tasks in one project, read once per HTTP request.
+
+        One backend read (:meth:`EndpointBackend.agent_tasks`: the canonical ``work``
+        view) gives each task's review state, pending request ids, whether it has a
+        contribution, and the open items and time of its latest checkpoint. For one
+        agent the read is owner-filtered. With ``many`` (the owners' agent list and My
+        work, which compute attention for every agent) the rows come from this
+        request's review-queue read, the same unfiltered ``work`` view the queue and
+        the task list use, split by assignee in memory: the cost does not grow with the
+        number of agents, and a request that has already read the queue pays nothing
+        more. Nothing new is cached across requests.
+        """
+        cache = getattr(self, '_agent_own_cache', None)
+        if cache is None:
+            cache = self._agent_own_cache = {}
+        key = (project_id, None if many else actor)
+        if key not in cache:
+            if not many:
+                read = self.backend.agent_tasks(project_id, actor)
+            elif getattr(self.backend, 'REVIEW_STATES_FROM_QUEUE', False):
+                read = self.backend.agent_tasks(project_id, None, queue=self._review_queue(project_id))
+            else:
+                # A backend whose own rows carry everything needs no queue read.
+                read = self.backend.agent_tasks(project_id, None)
+            cache[key] = {'tasks': [task for task in read.get('tasks') or [] if isinstance(task, dict)],
+                          'complete': bool(read.get('complete'))}
+        read = cache[key]
+        if not many:
+            return read
+        return {'tasks': [task for task in read['tasks'] if task.get('assignee') == actor],
+                'complete': read['complete']}
+
+    def _agent_action(self, priority, kind, project_id, task, reason, **extra):
         task_id = task.get('id')
         base = '/v1/projects/%s/tasks/%s' % (project_id, task_id)
-        return {'priority': priority, 'kind': kind, 'project': project_id,
-                'task': task_id, 'title': task.get('title'),
-                'status': task.get('status'), 'review_state': task.get('review_state'),
-                'assignee': task.get('assignee'), 'reason': reason,
-                'links': {'task': base, 'brief': base, 'history': base + '/history',
-                          'project': '/v1/projects/%s' % project_id}}
+        action = {'priority': priority, 'kind': kind, 'project': project_id,
+                  'task': task_id, 'title': task.get('title'),
+                  'status': task.get('status'), 'review_state': task.get('review_state'),
+                  'assignee': task.get('assignee'), 'reason': reason,
+                  'links': {'task': base, 'brief': base, 'history': base + '/history',
+                            'project': '/v1/projects/%s' % project_id}}
+        action.update(extra)
+        return action
 
     def _agent_may_read(self, principal, project_id):
         """The task-route authority check for one project, reused by attention.
@@ -2785,20 +2929,35 @@ class ApiHandler(BaseHTTPRequestHandler):
         cache[project_id] = result
         return result
 
-    def _agent_attention(self, principal, agent):
+    def _agent_attention(self, principal, agent, many=False):
         """Owner/agent-visible attention, computed at read time from bounded reads.
 
         Each granted project is re-authorized with the same live-authority check the
         task routes apply (:meth:`_agent_may_read`), so a project the principal can no
-        longer read drops out of attention instead of leaking its tasks. Each project
-        is read once per request (:meth:`_agent_project_tasks`) and walked to its last
-        page, so an agent's own task is counted however deep it sorts; the page-sized
-        cap applies only to the claimable suggestions.
+        longer read drops out of attention instead of leaking its tasks.
+
+        Two reads per project and request. The agent's OWN tasks come from
+        :meth:`_agent_own_tasks` (kittrial-5bb.114): the snapshot's rows carry no review
+        state and no checkpoint on the endpoint backend, so read from them alone an
+        agent with changes requested was told there was nothing to do. The snapshot
+        (:meth:`_agent_project_tasks`) is walked to its last page for the claimable
+        suggestions only.
+
+        One action per own task, the most pressing reason first, then in this order:
+        changes requested (1), blocked by its latest checkpoint (2), in progress with no
+        contribution yet (3), then claimable work (4), then a contribution that waits
+        for a reviewer or, once approved, for integration (5): the agent can do nothing
+        about those, so they never sit ahead of work the agent can do. ``in_progress`` counts own open tasks with no
+        contribution that are NOT blocked. A blocked action
+        carries ``blocked_since`` (when the checkpoint was written) and
+        ``newer_activity`` (whether anything was written on the task after it), so an
+        agent can leave a blocked task with nothing new alone instead of re-reading it
+        and writing another checkpoint on every wake. The counts are independent of the
+        actions: a task with changes requested AND open checkpoint items counts in both.
         """
         actor = agent.get('actor') or agent.get('id')
-        blocked = self._agent_blocked_tasks()
         counts = {'claimable': 0, 'claimed': 0, 'changes_requested': 0,
-                  'awaiting_review': 0, 'blocked': 0}
+                  'awaiting_review': 0, 'blocked': 0, 'in_progress': 0, 'awaiting_integration': 0}
         own_actions = []
         claimable_actions = []
         truncated = False
@@ -2807,37 +2966,56 @@ class ApiHandler(BaseHTTPRequestHandler):
                 continue
             try:
                 read = self._agent_project_tasks(project_id)
+                own = self._agent_own_tasks(project_id, actor, many=many)
             except HttpError:
                 # A project the principal can no longer open simply drops out.
                 continue
-            if not read['complete']:
+            if not read['complete'] or not own['complete']:
                 truncated = True
-            for task in read['tasks']:
-                assigned = task.get('assignee') == actor
+            for task in own['tasks']:
+                counts['claimed'] += 1
                 review = task.get('review_state')
-                if assigned and review == 'changes-requested':
-                    counts['changes_requested'] += 1
+                is_open = task.get('status') != 'closed'
+                open_items = task.get('open_items') or 0
+                blocked = is_open and open_items > 0
+                in_progress = (is_open and not blocked and not task.get('contribution_id')
+                               and review in (None, 'none'))
+                integrating = review in ('awaiting-integration', 'approved')
+                counts['changes_requested'] += review == 'changes-requested'
+                counts['awaiting_review'] += review == 'awaiting-review'
+                counts['awaiting_integration'] += integrating
+                counts['blocked'] += blocked
+                counts['in_progress'] += in_progress
+                details = {'requests': list(task.get('pending_change_requests') or []), 'open_items': open_items,
+                           'blocked_since': task.get('checkpoint_at') if blocked else None,
+                           'newer_activity': task.get('newer_activity') if blocked else None}
+                if review == 'changes-requested':
                     own_actions.append(self._agent_action(
                         1, 'changes-requested', project_id, task,
-                        'A reviewer requested changes on this contribution.'))
-                elif assigned and review == 'awaiting-review':
-                    counts['awaiting_review'] += 1
-                    own_actions.append(self._agent_action(
-                        4, 'awaiting-review', project_id, task,
-                        'Waiting for a human review decision.'))
-                elif assigned and task.get('status') != 'closed' and \
-                        task.get('id') in blocked:
-                    counts['blocked'] += 1
+                        'A reviewer requested changes on this contribution.', **details))
+                elif blocked:
                     own_actions.append(self._agent_action(
                         2, 'blocked', project_id, task,
-                        'The latest checkpoint left unresolved items.'))
-                if assigned:
-                    counts['claimed'] += 1
-                elif task.get('status') == 'open' and task.get('assignee') is None:
+                        'The latest checkpoint left unresolved items.', **details))
+                elif in_progress:
+                    own_actions.append(self._agent_action(
+                        3, 'in-progress', project_id, task,
+                        'Claimed by this agent and not delivered yet.', **details))
+                elif review == 'awaiting-review':
+                    own_actions.append(self._agent_action(
+                        5, 'awaiting-review', project_id, task,
+                        'Waiting for a human review decision.', **details))
+                elif integrating:
+                    own_actions.append(self._agent_action(
+                        5, 'awaiting-integration', project_id, task,
+                        'Approved; waiting for the coordinator to integrate it. Nothing for the agent to do.',
+                        **details))
+            for task in read['tasks']:
+                if task.get('status') == 'open' and task.get('assignee') is None:
                     counts['claimable'] += 1
                     if len(claimable_actions) < AGENT_CLAIMABLE_LIMIT:
                         claimable_actions.append(self._agent_action(
-                            3, 'claimable-task', project_id, task,
+                            4, 'claimable-task', project_id, task,
                             'Open, unclaimed work the agent may take.'))
         # The count is exact over every page; only the collected suggestions are capped,
         # so a long claimable list can never hide the agent's own feedback.
@@ -2852,8 +3030,12 @@ class ApiHandler(BaseHTTPRequestHandler):
             state = 'changes-requested'
         elif counts['blocked']:
             state = 'blocked'
+        elif counts['in_progress']:
+            state = 'working'
         elif counts['awaiting_review']:
             state = 'waiting-review'
+        elif counts['awaiting_integration']:
+            state = 'waiting-integration'
         elif counts['claimed']:
             state = 'working'
         else:
@@ -2871,11 +3053,14 @@ class ApiHandler(BaseHTTPRequestHandler):
             return ('%d task(s) have unresolved checkpoint items.'
                     % counts['blocked'])
         if state == 'working':
-            return ('%d claimed task(s) in flight; %d claimable.'
-                    % (counts['claimed'], counts['claimable']))
+            return ('%d claimed task(s) in flight, %d not delivered yet; %d claimable.'
+                    % (counts['claimed'], counts.get('in_progress', 0), counts['claimable']))
         if state == 'waiting-review':
             return ('%d contribution(s) waiting for a human review decision.'
                     % counts['awaiting_review'])
+        if state == 'waiting-integration':
+            return ('%d approved contribution(s) waiting for integration; nothing for the agent to do.'
+                    % counts.get('awaiting_integration', 0))
         return ('Idle: %d claimable task(s), nothing in flight.' % counts['claimable'])
 
     @staticmethod

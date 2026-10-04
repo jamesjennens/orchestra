@@ -1067,6 +1067,13 @@ class CountingBackend(InProcessBackend):
         self.list_calls = []
         #: Only full-snapshot reads (``read_tasks``): what attention must use once.
         self.read_calls = []
+        #: Own-task reads (``agent_tasks``): on the endpoint binding each is a ``work``
+        #: read. ``None`` as the actor is the one unfiltered read the owners' list makes.
+        self.own_calls = []
+
+    def agent_tasks(self, project_id, actor=None, queue=None):
+        self.own_calls.append((project_id, actor))
+        return super().agent_tasks(project_id, actor, queue)
 
     def read_tasks(self, project_id):
         self.read_calls.append(project_id)
@@ -1102,18 +1109,27 @@ class AgentReadCostTests(AgentHarness):
         # 10 agents x 5 projects would be 50 reads; the request performs 5.
         self.assertEqual(5, len(self.backend.list_calls))
         self.assertEqual(set(self.projects), {call[0] for call in self.backend.list_calls})
+        # The same for the own-task read (kittrial-5bb.114): one unfiltered read per
+        # project for all ten agents, never one per agent.
+        self.assertEqual(sorted(self.backend.own_calls), sorted((project, None) for project in self.projects))
         # The cache never outlives the request: the next read re-reads every project.
         self.backend.list_calls = []
+        self.backend.own_calls = []
         self.request('GET', '/v1/agents', token=self.alex)
         self.assertEqual(5, len(self.backend.list_calls))
+        self.assertEqual(5, len(self.backend.own_calls))
 
     def test_agent_next_reads_every_granted_project_once(self):
         agent_id, secret, _ = self.agent_secret(self.alex, projects=list(self.projects))
         self.assertTrue(agent_id)
         self.backend.list_calls = []
+        self.backend.own_calls = []
         nxt = self.request('GET', '/v1/agents/me/next', token=secret)
         self.assertEqual(200, nxt.status, nxt.data)
         self.assertEqual(5, len(self.backend.list_calls))
+        # One owner-filtered own-task read per project, naming this agent's actor.
+        actor = nxt.data['agent']['actor']
+        self.assertEqual(sorted(self.backend.own_calls), sorted((project, actor) for project in self.projects))
 
     def test_a_project_bigger_than_one_page_still_costs_one_read(self):
         # 130 tasks in one project: the page walk used to cost one full read per

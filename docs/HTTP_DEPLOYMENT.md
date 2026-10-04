@@ -1088,16 +1088,39 @@ line separately and unconfined.
   only makes earlier digests incomparable with later ones. Operators who need stronger guarantees
   should disable self-service project creation (section 12 of the design) so only
   real project owners can look names up.
-- **Known limitation `endpoint-blocked-signal`.** `blocked` attention for an agent is
-  derived from the in-process canonical checkpoint view (`backend.state['checkpoints']`).
-  The canonical endpoint binding does not mirror checkpoints into service state, so
-  over `--backend endpoint` that one signal is **absent rather than wrong** while
-  changes-requested, claimable and awaiting-review are unaffected. Mirroring
-  checkpoints into the endpoint backend is deliberately not attempted in this
-  revision (it is the open checkpoint item `endpoint-blocked-signal`). My work and
-  its agent prompts (slice 2a) read the blocked signal from the bounded per-task
-  `brief` reads described above instead; the agent's own `/v1/agents/me/next` and
-  agent cards still lack it on the canonical binding.
+- **What an agent is told to do next (`GET /v1/agents/me/next`, and the attention on
+  each agent card).** Closed limitation `endpoint-blocked-signal`, and more
+  (kittrial-5bb.114): on `--backend endpoint` this read used to take everything from
+  the `bd list` snapshot, whose rows carry no review state and no checkpoint, so an
+  agent with changes requested, a contribution awaiting review or a blocker was told
+  there was nothing to do. The agent's own tasks now come from the canonical `work`
+  view (one owner-filtered `work` read per project for one agent; for the owners'
+  agent list and My work, the review-queue read that request already makes, the same
+  unfiltered view, however many agents it shows), and the snapshot is used only for
+  the claimable suggestions. So `/v1/agents/me/next` costs two canonical reads per
+  granted project. Nothing is cached across requests.
+  - **One action per own task, in this order:** `changes-requested` (priority 1, with
+    `requests`, the request-changes record ids), `blocked` (2: the latest checkpoint
+    lists open items; with `open_items`, `blocked_since` and `newer_activity`),
+    `in-progress` (3: claimed, not closed, nothing delivered yet), then
+    `claimable-task` (4), then `awaiting-review` and `awaiting-integration` (5).
+  - **Why the two waiting kinds are last.** An agent, and anything that wakes it,
+    takes the first action. The agent can do nothing about a contribution that waits
+    for a reviewer or for integration, so those never sit ahead of work it can do.
+    They are still listed and counted.
+  - **A blocked task can stay quiet.** `blocked_since` is when the latest checkpoint
+    was written; `newer_activity` is `false` while no comment or record has been
+    written on the task since. An agent should leave such a task alone instead of
+    re-reading it and writing another checkpoint on every wake.
+  - **`counts`** are over the agent's own tasks: `claimed` (every task it holds that
+    the `work` view lists: open ones, and closed ones whose review is still active),
+    `changes_requested`, `blocked`, `in_progress` (not delivered and not blocked),
+    `awaiting_review`, `awaiting_integration`, and `claimable` for the project. A task
+    with changes requested and open checkpoint items counts in both.
+  - **`state`**: `changes-requested`, `blocked`, `working`, `waiting-review`,
+    `waiting-integration` or `idle`, the first that applies.
+  - `GET /v1/me/work` (a person's own queue) still reads its blocked signal from the
+    bounded per-task `brief` reads described above.
 - Administrative audit coverage is partial: login outcomes, authorization
   denials and every successful idempotent mutation are recorded; a per-field
   before/after administrative trail is not implemented.

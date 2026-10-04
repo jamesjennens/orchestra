@@ -15,7 +15,7 @@ export const ATTENTION = {
 
 // The server reports attention as { state, summary, counts }; the prototype's mock
 // uses a flat word. One card shape serves both.
-const SERVER_ATTENTION = { 'changes-requested': 'feedback', blocked: 'blocked', 'waiting-review': 'waiting', working: 'working', idle: 'idle' };
+const SERVER_ATTENTION = { 'changes-requested': 'feedback', blocked: 'blocked', 'waiting-review': 'waiting', 'waiting-integration': 'waiting', working: 'working', idle: 'idle' };
 export function attentionOf(agent) {
   if (typeof agent.attention === 'string') return agent.attention;
   return SERVER_ATTENTION[agent.attention && agent.attention.state] || 'idle';

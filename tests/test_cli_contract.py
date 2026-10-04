@@ -34,6 +34,8 @@ ITEM_FIELDS = {
     'workflow_state', 'integration',
     # Additive integration disagreement signal (kittrial-5bb.52).
     'integration_disagreements', 'integration_warnings',
+    # Additive: what agent attention needs from this read (kittrial-5bb.114).
+    'pending_change_requests', 'open_items', 'checkpoint_at', 'newer_activity',
     # Additive deployed-delivery identification (kittrial-5bb.95).
     'deployed_delivery', 'deployed_delivery_is_current_contribution',
     # Additive review-request identification (kittrial-5bb.94 item 4).
