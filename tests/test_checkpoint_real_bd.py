@@ -87,6 +87,10 @@ class RealBdCheckpointCompatibilityTests(unittest.TestCase):
     def test_reassigned_owner_boundary_and_unassigned_author_on_native_records(self):
         task=self.create()
         def native(*args,actor='op'):
+            # bd's global --actor is the audit actor; comment authors are set
+            # separately, as the endpoint's native runner does in production.
+            if args[:2]==('comments','add'):
+                args=(*args,'--author',actor)
             result=self.bd(*args,actor=actor)
             self.assertEqual(result.returncode,0,result.stderr)
             return result.stdout
@@ -105,7 +109,9 @@ class RealBdCheckpointCompatibilityTests(unittest.TestCase):
         native('update',task,'--assignee','bob','--status','in_progress','--json')
         enabled_write('bob')
         page=b.direction_page(self.export_rows(),'pp',task)
-        self.assertEqual([x['id'] for x in page['items']],[task+'-c'+str(later)])
+        stamps=[(c['id'],c['author'],c['created_at'])
+                for c in b.task_row(self.export_rows(),task)['comments']]
+        self.assertEqual([x['id'] for x in page['items']],[task+'-c'+str(later)],stamps)
         self.assertEqual(b.brief(self.export_rows(),'pp',task)['directions']['total'],1)
         native('update',task,'--assignee=','--json')
         native('comments','add',task,'Newest checkpoint author own progress.',actor='bob')
