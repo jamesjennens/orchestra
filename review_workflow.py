@@ -59,7 +59,31 @@ EXTRA = {
     'request-changes': {'contribution', 'items'},
     'respond': {'contribution', 'resolutions'},
     'approve': {'contribution', 'summary'},
+    # Additive operations (kittrial-5bb.94). They are new `operation` values in the
+    # same reserved chain, so a record written by an older kit keeps validating
+    # unchanged and a kit that does not know an operation fails closed on that
+    # chain instead of misreading it. Every new FIELD is optional on the operation
+    # that carries it, so old-shaped records are never refused.
+    'withdraw': {'contribution', 'reason'},
+    'request-review': {'contribution', 'reviewer'},
+    'resolve-item': {'contribution', 'request', 'item', 'reason'},
 }
+#: Fields an operation accepts in addition to ``EXTRA``; each is optional and
+#: additive to the operation's exact legacy field set.
+OPTIONAL = {
+    'contribute': {'follows'},
+    'request-changes': {'summary'},
+    'request-review': {'summary'},
+    'withdraw': {'disposition'},
+    'resolve-item': {'disposition'},
+}
+#: Item severity on a request-changes item. Absent means ``blocking`` so every
+#: record written before severity existed keeps blocking approval.
+SEVERITIES = ('blocking', 'note')
+#: How a contribution stops awaiting review: withdrawn, or marked superseded.
+WITHDRAW_DISPOSITIONS = ('withdrawn', 'superseded')
+#: How the requester disposes of their own item: resolve it, or leave it as a note.
+RESOLVE_DISPOSITIONS = ('resolved', 'note')
 # Optional additive field on an ``approve`` record: the task assignee at the moment
 # the approval was written. Stamped server-side by ``execute``; approve records
 # written before this field existed keep validating without it, and a null value is
@@ -136,24 +160,30 @@ def fields(value, expected):
         raise ValueError('Invalid review workflow fields')
 
 
+def item_fields(item):
+    """One request-changes item: ``{id, text}`` plus the optional additive severity.
+
+    An item written before severity existed has exactly ``{id, text}`` and keeps
+    validating unchanged; the reader then treats it as ``blocking``.
+    """
+    if not isinstance(item, dict) or set(item) not in ({'id', 'text'}, {'id', 'text', 'severity'}):
+        raise ValueError('Invalid review item fields')
+
+
 def validate(p, task):
     if not isinstance(p, dict) or not isinstance(p.get('operation'), str) or p['operation'] not in EXTRA:
         raise ValueError('Invalid review workflow operation')
-    if p['operation'] == 'contribute':
-        # `follows` is optional on purpose: payloads and chains written before the
-        # additive follow-on relation existed must keep validating unchanged.
-        expected = COMMON | EXTRA['contribute']
-        if set(p) not in (expected, expected | {'follows'}):
-            raise ValueError('Invalid review workflow fields')
-    else:
-        expected = COMMON | EXTRA[p['operation']]
-        if p['operation'] == 'approve':
-            # The assignee snapshot is additive: approve records written before it
-            # existed keep validating, and the server stamps it before the append.
-            if set(p) not in (expected, expected | {ASSIGNEE_SNAPSHOT}):
-                raise ValueError('Invalid review workflow fields')
-        else:
-            fields(p, expected)
+    # The required field set stays EXACT and the optional additions are a superset:
+    # ``follows`` (additive follow-on relation), the server-stamped assignee
+    # snapshot, a request-changes summary and the kittrial-5bb.94 item severity /
+    # withdraw / request-review / resolve-item fields. A record written before any
+    # of them existed has exactly the required set and keeps validating unchanged.
+    required = COMMON | EXTRA[p['operation']]
+    allowed = required | OPTIONAL.get(p['operation'], frozenset())
+    if p['operation'] == 'approve':
+        allowed = allowed | {ASSIGNEE_SNAPSHOT}
+    if not required <= set(p) <= allowed:
+        raise ValueError('Invalid review workflow fields')
     if type(p['schema_version']) is not int or p['schema_version'] != 1 or p['task'] != task:
         raise ValueError('Invalid review workflow version/task')
     identity(task); identity(p['operation_id'])
@@ -192,23 +222,48 @@ def validate(p, task):
             snapshot = p.get(ASSIGNEE_SNAPSHOT)
             if snapshot is not None:
                 text(snapshot, 'assignee snapshot', 300)
-        else:
-            values = p['items'] if op == 'request-changes' else p['resolutions']
+        elif op == 'request-changes':
+            # The summary is additive (kittrial-5bb.94 item 3): request-changes used
+            # to reject it, so the reviewer's reasoning sat in an unlinked comment.
+            if 'summary' in p:
+                text(p['summary'], 'summary', 1200)
+            values = p['items']
             if not isinstance(values, list) or not 1 <= len(values) <= 20:
                 raise ValueError('Require 1..20 review items')
             seen = set()
             for item in values:
-                if op == 'request-changes':
-                    fields(item, {'id', 'text'}); identity(item['id']); text(item['text'], 'review text', 1000)
-                    key = item['id']
-                else:
-                    fields(item, {'request', 'item', 'reason', 'evidence'})
-                    identity(item['request']); identity(item['item'])
-                    text(item['reason'], 'resolution reason', 1000); text(item['evidence'], 'resolution evidence', 1000)
-                    key = (item['request'], item['item'])
+                item_fields(item); identity(item['id']); text(item['text'], 'review text', 1000)
+                if item.get('severity', 'blocking') not in SEVERITIES:
+                    raise ValueError('Review item severity must be blocking or note')
+                if item['id'] in seen:
+                    raise ValueError('Duplicate review item')
+                seen.add(item['id'])
+        elif op == 'respond':
+            values = p['resolutions']
+            if not isinstance(values, list) or not 1 <= len(values) <= 20:
+                raise ValueError('Require 1..20 review items')
+            seen = set()
+            for item in values:
+                fields(item, {'request', 'item', 'reason', 'evidence'})
+                identity(item['request']); identity(item['item'])
+                text(item['reason'], 'resolution reason', 1000); text(item['evidence'], 'resolution evidence', 1000)
+                key = (item['request'], item['item'])
                 if key in seen:
                     raise ValueError('Duplicate review item')
                 seen.add(key)
+        elif op == 'request-review':
+            identity(p['reviewer'])
+            if 'summary' in p:
+                text(p['summary'], 'summary', 1200)
+        elif op == 'withdraw':
+            text(p['reason'], 'withdraw reason', 1000)
+            if p.get('disposition') is not None and p['disposition'] not in WITHDRAW_DISPOSITIONS:
+                raise ValueError('withdraw disposition must be withdrawn or superseded')
+        elif op == 'resolve-item':
+            identity(p['request']); identity(p['item'])
+            text(p['reason'], 'resolution reason', 1000)
+            if p.get('disposition') is not None and p['disposition'] not in RESOLVE_DISPOSITIONS:
+                raise ValueError('resolve-item disposition must be resolved or note')
     if len(canonical_bytes(p)) > 24000:
         raise ValueError('Review workflow payload exceeds 24 KB')
 
@@ -1058,8 +1113,15 @@ def projection(ordered, voids=None, invalid=None, refused=None, positions=None, 
     shared integration overlay can subtract exactly the reverted integration commit.
     ``invalid_reverts`` names the revert comments and journal entries that were
     ignored, and is surfaced as a warning so an unauthorized or unhosted revert
-    record is never dropped silently (voids already warn)."""
-    contribution = None; prior = []; pending = {}; approved = False; approved_id = None; latest = None
+    record is never dropped silently (voids already warn).
+
+    Additive (kittrial-5bb.94): ``note_requests`` are non-blocking request-changes
+    items, ``pending_review_requests`` are open first-class review requests and
+    ``withdrawal`` is the withdraw/supersede record for the current contribution
+    (``review_state`` is then ``withdrawn`` or ``superseded``). All three are empty
+    or null on a chain written before these operations existed."""
+    contribution = None; prior = []; pending = {}; notes = {}; reviews = {}
+    approved = False; approved_id = None; latest = None; withdrawal = None
     for p, c in ordered:
         cid = str(c['id']); op = p['operation']
         metadata = {'comment_id': cid, 'author': c['author'], 'timestamp': c['created_at']}
@@ -1080,28 +1142,80 @@ def projection(ordered, voids=None, invalid=None, refused=None, positions=None, 
                 relation = None
             if contribution is not None:
                 prior.append(dict(contribution, relation=relation))
+            # A new contribution starts review again: it clears any withdrawal and
+            # every review request that named the replaced revision.
             contribution = dict(p, **metadata); approved = False; approved_id = None
+            withdrawal = None; reviews = {}
         else:
             if not current or p['contribution'] != current:
                 raise ValueError(describe_contribution_mismatch(op, p['contribution'], current, latest))
+            if withdrawal is not None and op != 'withdraw':
+                # A withdrawn/superseded contribution is final for its revision: the
+                # only way back into review is a new contribution (above), so a
+                # stray later review operation fails closed instead of reviving it.
+                raise ValueError('Contribution was ' + withdrawal['disposition'] +
+                                 '; deliver a new revision to continue review')
             if op == 'request-changes':
                 for item in p['items']:
-                    pending[(cid, item['id'])] = dict(request=cid, item=item['id'], text=item['text'],
-                        contribution=current, author=c['author'], timestamp=c['created_at'])
-                if len(pending) > 20:
+                    severity = item.get('severity', 'blocking')
+                    entry = dict(request=cid, item=item['id'], text=item['text'],
+                                 severity=severity, contribution=current, author=c['author'],
+                                 timestamp=c['created_at'])
+                    # Only a blocking item holds up approval; a note is recorded and
+                    # stays visible, but never blocks (kittrial-5bb.94 item 2).
+                    (notes if severity == 'note' else pending)[(cid, item['id'])] = entry
+                if len(pending) + len(notes) > 20:
                     raise ValueError('At most 20 unresolved review items are allowed')
                 approved = False
             elif op == 'respond':
                 for item in p['resolutions']:
                     key = (item['request'], item['item'])
-                    if key not in pending:
+                    if key in pending:
+                        del pending[key]
+                    elif key in notes:
+                        del notes[key]
+                    else:
                         raise ValueError('Resolution must reference an unresolved request/item')
-                    del pending[key]
                 approved = False
+            elif op == 'resolve-item':
+                # The REQUESTER resolves (or downgrades) their own item, without the
+                # task owner. The native author must be the item's requester.
+                key = (p['request'], p['item'])
+                entry = pending.get(key) or notes.get(key)
+                if entry is None:
+                    raise ValueError('Resolution must reference an unresolved request/item')
+                if author_key(c['author']) != author_key(entry['author']):
+                    raise ValueError('Only the requester may resolve their own review item')
+                if p.get('disposition', 'resolved') == 'note':
+                    pending.pop(key, None)
+                    notes[key] = dict(entry, severity='note')
+                else:
+                    pending.pop(key, None); notes.pop(key, None)
+                approved = False
+            elif op == 'request-review':
+                if any(author_key(request['reviewer']) == author_key(p['reviewer'])
+                       and request['contribution'] == current for request in reviews.values()):
+                    raise ValueError('A review request for that reviewer is already open')
+                reviews[cid] = dict(request=cid, reviewer=p['reviewer'],
+                                    summary=p.get('summary'), contribution=current,
+                                    author=c['author'], timestamp=c['created_at'])
+            elif op == 'withdraw':
+                withdrawal = dict(request=cid, disposition=p.get('disposition', 'withdrawn'),
+                                  reason=p['reason'], contribution=current, author=c['author'],
+                                  timestamp=c['created_at'])
+                pending.clear(); notes.clear(); reviews.clear()
+                approved = False; approved_id = None
             elif op == 'approve':
                 if pending:
                     raise ValueError('Cannot approve while review requests remain unresolved')
                 approved = True; approved_id = cid
+            if op in ('approve', 'request-changes'):
+                # A named reviewer closes their own request by approving or
+                # requesting changes on the same contribution.
+                for key, request in list(reviews.items()):
+                    if (request['contribution'] == p['contribution']
+                            and author_key(request['reviewer']) == author_key(c['author'])):
+                        del reviews[key]
         latest = cid
     void_list = list(voids or [])
     # A void is an operator repair of a broken history. An approval recorded
@@ -1124,7 +1238,9 @@ def projection(ordered, voids=None, invalid=None, refused=None, positions=None, 
                 stale_approval.append(p['target'])
         if stale_approval:
             approved = False
-    state = ('none' if contribution is None else 'changes-requested' if pending else
+    state = ('none' if contribution is None else
+             withdrawal['disposition'] if withdrawal else
+             'changes-requested' if pending else
              'awaiting-integration' if approved else 'awaiting-review')
     recoveries = [{'comment_id': str(c['id']), 'disposition': p['disposition'], 'target': p['target'],
                    'target_kind': p['target_kind'], 'target_sha256': p['target_sha256'],
@@ -1159,6 +1275,11 @@ def projection(ordered, voids=None, invalid=None, refused=None, positions=None, 
                         'read: ' + ', '.join(invalid_reverts[:5]))
     return dict(contribution=contribution, prior_contributions=prior, review_state=state,
                 pending_requests=list(pending.values()), latest_comment_id=latest,
+                # Additive (kittrial-5bb.94): non-blocking items, open first-class
+                # review requests, and the withdrawal/supersede record for the
+                # current contribution. All are absent/empty on an old-shaped chain.
+                note_requests=list(notes.values()), pending_review_requests=list(reviews.values()),
+                withdrawal=withdrawal,
                 recoveries=recoveries, warnings=warnings, reverts=list(reverts or []))
 
 
@@ -1334,6 +1455,27 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None):
         raise ValueError('Only the current assigned owner may contribute/respond; resume or handoff first')
     if payload['operation'] == 'request-changes' and issue.get('status') == 'closed':
         raise ValueError('Reopen the closed task explicitly before requesting changes')
+    if payload['operation'] in ('withdraw', 'request-review'):
+        # A coordinator (the server-side operator allowlist the endpoint supplies)
+        # may act; otherwise withdraw must come from the contribution's own author
+        # and a review request from the current task owner.
+        authority = recovery.configured_operators(operators)
+        if actor not in authority:
+            contributor = state.get('contribution') or {}
+            if payload['operation'] == 'withdraw':
+                if author_key(actor) != author_key(contributor.get('author')):
+                    raise ValueError('Only the contribution author or a configured coordinator may '
+                                     'withdraw or supersede a contribution')
+            elif actor != issue.get('assignee'):
+                raise ValueError('Only the current assigned owner or a configured coordinator may '
+                                 'request a review')
+    if payload['operation'] == 'request-review':
+        # The self-approval refusal is unchanged and request-review may not route
+        # around it by naming the contribution's own author as the reviewer.
+        author = (state.get('contribution') or {}).get('author')
+        if author_key(payload['reviewer']) == author_key(author):
+            raise ValueError('request-review must name a reviewer other than the contribution author; '
+                             'a contribution cannot be reviewed by its own author')
     # The assignee an approval is judged against is recorded server-side, from the
     # task row, so a caller cannot forge it to open the follow-on gate.
     if payload['operation'] == 'approve':

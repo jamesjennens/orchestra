@@ -191,7 +191,9 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     review_next={'changes-requested':'Address the outstanding review requests for the current contribution; read review '+task+'.',
                  'awaiting-review':'Reviewer: retrieve and verify the current contribution, then record review feedback or approval.',
                  'awaiting-integration':'Authorized integrator: integrate the approved contribution and record scoped integration evidence.',
-                 'integrated':'Integration is recorded for this contribution; follow the project release/deployment workflow and scoped lifecycle evidence.'}
+                 'integrated':'Integration is recorded for this contribution; follow the project release/deployment workflow and scoped lifecycle evidence.',
+                 'withdrawn':'The current contribution was withdrawn by its author or a coordinator; read review '+task+' or deliver a new revision.',
+                 'superseded':'The current contribution was marked superseded; read review '+task+' or deliver a new revision.'}
     # The integration overlay warnings (kittrial-5bb.52) are part of the shared
     # projection's warnings; surface them in the compact read too, so a revert, a
     # resolved-elsewhere fact conflict or an ignored revert record is visible

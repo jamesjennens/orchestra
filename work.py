@@ -4,7 +4,7 @@ import json
 from lifecycle import integration_evidence, project_facts
 
 CONTRACT_VERSION = 'cli-contract-v1'
-WORK_STATES = ['none','awaiting-review','changes-requested','awaiting-integration','integrated','legacy-review-ready','error']
+WORK_STATES = ['none','awaiting-review','changes-requested','awaiting-integration','integrated','legacy-review-ready','withdrawn','superseded','error']
 WORK_LIMIT_MIN, WORK_LIMIT_MAX = 1, 100
 WORK_OFFSET_MIN = 0
 
@@ -99,11 +99,16 @@ def help_payload(action='work'):
         }
     elif action == 'review':
         payload['operations'] = ['read (review TASK)', 'contribute', 'request-changes',
-                                 'respond', 'approve']
+                                 'respond', 'approve', 'withdraw', 'request-review',
+                                 'resolve-item']
         payload['notes'] = [
             'Contribution payloads use contribution = the contribution record comment_id, '
             'never a Git SHA and never latest_comment_id.',
             'A JSON file attachment is required for every operation except read.',
+            'A request-changes item may carry severity blocking or note (absent means blocking); '
+            'only a blocking item holds up approval.',
+            'withdraw (author or coordinator, with reason) or request-review (naming a reviewer) '
+            'is additive; older kits refuse the unknown operation rather than misreading it.',
         ]
     elif action == 'handoff':
         payload['operations'] = ['transfer (from_actor/to_actor)', 'request', 'disposition']
@@ -246,23 +251,35 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
     else:
         revert_map,revert_problems=reverts,{}
     from reserved_comments import is_record_anchor
+    from review_workflow import author_key
     for row in rows:
         if row.get('issue_type') in ('event','gate','merge-slot'):continue
         # Record anchors (kittrial-5bb.64) are never work, whatever their status.
         if is_record_anchor(row):continue
-        if owner is not None and row.get('assignee')!=owner:continue
         task_reverts=revert_map.get(row['id'],[])
         task_scopes=evidence.get(row['id']) if scopes is None else scopes.get(row['id'])
         try:review=workflow(row,task_scopes,operators=operators,reverts=task_reverts,journal=journal,
                             invalid_reverts=revert_problems.get(row['id']));state=review['review_state'];error=None
         except ValueError as e:review={};state='error';error=str(e)[:300]
+        if owner is not None and row.get('assignee')!=owner:
+            # A first-class review request (kittrial-5bb.94 item 4) puts the task in
+            # the NAMED reviewer's queue even though they are not its assignee.
+            named=[request for request in (review.get('pending_review_requests') or [])
+                   if author_key(request.get('reviewer'))==author_key(owner)]
+            if not named:continue
         # The integration overlay's warnings (kittrial-5bb.52): the owner decision
         # keeps any-pass-wins, and a host-issued revert is always surfaced, so both
         # the disagreement and the revert warning travel with the row.
         disagreements=review.get('integration_disagreements') or []
         integration_warnings=[w for w in review.get('warnings') or [] if is_integration_warning(w)]
         fact=facts.get(row['id'],{}).get('facts',{})
-        if row.get('status')=='closed' and state not in ('changes-requested','awaiting-review','awaiting-integration','legacy-review-ready','error'):continue
+        # Closing a task clears its awaiting-review queue entry (kittrial-5bb.94
+        # item 1): the record stays in history and `review TASK` still reports it,
+        # but a closed task is no longer offered to a reviewer. Outstanding
+        # requested changes, an approved-but-unintegrated revision and a malformed
+        # history stay visible: closure is not acceptance, and a broken chain must
+        # still be surfaced.
+        if row.get('status')=='closed' and state not in ('changes-requested','awaiting-integration','error'):continue
         if a.state and a.state!=state:continue
         contribution=review.get('contribution') or {}
         scope=facts.get(row['id'],{}).get('scope') or {}
