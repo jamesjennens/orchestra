@@ -2,8 +2,9 @@
 
 Run as ``python sigterm_stress_child.py REPO PREVIOUS SECONDS``. A kernel timer
 (``timer_create``, so no Python thread and no patched signal function is involved)
-sends one real SIGTERM per trial at a random delay around the end of a guarded block;
-the delay adapts towards that end, wherever this machine puts it.
+sends one real SIGTERM per trial, armed inside a guarded block whose length adapts so
+that the stop lands around the block's end and the guard's exit, wherever this
+machine's timer actually fires.
 After every trial the child checks the guard's postconditions and, on the first
 violation, prints it and exits 1. PREVIOUS is the handler installed before the guard:
 ``custom`` (counts deliveries), ``ignore`` (SIG_IGN) or ``default`` (SIG_DFL, so a stop
@@ -22,6 +23,7 @@ sys.path.insert(0, sys.argv[1])
 import admin  # noqa: E402
 
 PREVIOUS, SECONDS = sys.argv[2], float(sys.argv[3])
+MIN_SIZE, STEP = 20, 1.06
 
 libc = ctypes.CDLL(None, use_errno=True)
 
@@ -77,14 +79,13 @@ def work(n):
     return total
 
 
-def trial(delay):
-    """One guarded block with a cleanup, a stop due after ``delay`` seconds."""
+def trial(delay, size):
+    """One guarded block of ``size`` steps, a stop due ``delay`` seconds into it."""
     outcome = {'raised': 0}
     try:
         with admin.signal_termination_guard():
-            arm(delay)           # from inside the block: a short delay is always in it
-            work(200)
-            work(60)
+            arm(delay)           # from inside the block: the stop is due after setup
+            work(size)
     except admin.TerminatedBySignal:
         outcome['raised'] = 1
     while remaining():
@@ -93,32 +94,36 @@ def trial(delay):
     return outcome
 
 
-def calibrate():
+def calibrate(size):
+    """Seconds one guarded block of ``size`` steps takes here."""
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     started = time.perf_counter()
     for _ in range(200):
         with admin.signal_termination_guard():
             arm(10)
-            work(200)
-            work(60)
+            work(size)
         libc.timer_settime(timer, 0, ctypes.byref(Itimerspec()), None)
     signal.signal(signal.SIGTERM, previous)
     return (time.perf_counter() - started) / 200
 
 
 def main():
-    # The delay tracks the block's end: it starts at the calibrated length and moves
-    # after every trial towards the point where stops change from raised (inside the
-    # guard) to the previous handler's (after it), so a slow or loaded machine still
-    # samples both sides and the exit between them.
-    centre = calibrate()
+    # The stop must land around the block's end and the guard's exit, wherever this
+    # machine's timer actually fires: a virtual machine can fire one a millisecond or
+    # more late (timer slack, coarse clock events), so a fixed block was always over
+    # before the stop arrived, and on a fast machine the guard's exit alone outlasts a
+    # short block. So after every trial the stop moves later if it was raised inside
+    # the guard and earlier if it reached the previous handler: first by the delay, and
+    # once the delay is down to its floor, by lengthening the block.
+    size, floor = MIN_SIZE, calibrate(MIN_SIZE) / 4
+    centre = floor
     counts = {'trials': 0, 'raised': 0, 'previous': 0, 'ignored': 0}
     deadline = time.monotonic() + SECONDS
     while time.monotonic() < deadline:
         delay = random.uniform(0.7 * centre, 1.3 * centre)
         before = len(received)
         try:
-            outcome = trial(delay)
+            outcome = trial(delay, size)
         except BaseException:
             print('escaped: ' + traceback.format_exc().replace('\n', ' | '))
             sys.exit(1)
@@ -133,9 +138,17 @@ def main():
         if PREVIOUS == 'custom' and outcome['raised'] + got != 1:
             problems.append('stop delivered %d times' % (outcome['raised'] + got))
         if problems:
-            print('trial %d (delay %.1fus): %s' % (counts['trials'], delay * 1e6, '; '.join(problems)))
+            print('trial %d (delay %.1fus, block %d): %s' % (counts['trials'], delay * 1e6, size, '; '.join(problems)))
             sys.exit(1)
-        centre = min(max(centre * (1.03 if outcome['raised'] else 0.97), 1e-6), 0.05)
+        if outcome['raised']:
+            if size > MIN_SIZE:
+                size = max(MIN_SIZE, int(size / STEP))   # stop later: shorter block first
+            else:
+                centre = min(centre * STEP, 0.05)        # then a later stop
+        elif centre > floor:
+            centre = max(floor, centre / STEP)           # stop earlier: shorter delay first
+        else:
+            size = min(int(size * STEP) + 1, 10000000)   # then a longer block
         counts['trials'] += 1
         counts['raised'] += outcome['raised']
         counts['previous'] += got

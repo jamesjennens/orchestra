@@ -949,8 +949,11 @@ class TerminationGuardStressCase(unittest.TestCase):
                 result = self.run_child(previous, 1)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 counts = json.loads(result.stdout.splitlines()[-1])
-                self.assertGreater(counts['trials'], 100)
+                # A late timer (a VM can fire one milliseconds late) lengthens each trial;
+                # the child adapts the block so stops land on both sides of its end.
+                self.assertGreater(counts['trials'], 20)
                 self.assertGreater(counts['raised'], 0)
+                self.assertGreater(counts['trials'] - counts['raised'], 0)
 
     def test_default_previous_handler(self):
         # A stop the previous SIG_DFL owns ends the child with SIGTERM: allowed. Any wrong
