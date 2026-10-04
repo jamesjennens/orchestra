@@ -83,3 +83,33 @@ class RealBdCheckpointCompatibilityTests(unittest.TestCase):
 
     def test_previous_kit_then_tip_then_previous_kit(self):
         task=self.create();self.old_write(task,first=True);self.tip_write(task);self.old_write(task)
+
+    def test_reassigned_owner_boundary_and_unassigned_author_on_native_records(self):
+        task=self.create()
+        def native(*args,actor='op'):
+            result=self.bd(*args,actor=actor)
+            self.assertEqual(result.returncode,0,result.stderr)
+            return result.stdout
+        def enabled_write(actor):
+            data=self.export_rows();read=b.brief(data,'pp',task)
+            payload=dict(schema_version=1,task=task,previous=(read['checkpoint'] or {}).get('comment_id'),
+                         activity_cursor=read['activity_cursor'],source_commit='',branch='',intent='owner boundary',
+                         acceptance='retain later instructions',summary='checkpoint',next_action='continue',
+                         open_items=[],resolved=[])
+            b.save_checkpoint(data,'pp',task,payload,actor,
+                              lambda args:native(*args,actor=actor),provenance_writes=True)
+        native('comments','add',task,'Owner progress before own checkpoint.')
+        enabled_write('op')
+        later=json.loads(native('comments','add',task,'Owner instruction after own checkpoint.','--json'))['id']
+        enabled_write('operator')  # Observed assignee op, but not op's own checkpoint.
+        native('update',task,'--assignee','bob','--status','in_progress','--json')
+        enabled_write('bob')
+        page=b.direction_page(self.export_rows(),'pp',task)
+        self.assertEqual([x['id'] for x in page['items']],[task+'-c'+str(later)])
+        self.assertEqual(b.brief(self.export_rows(),'pp',task)['directions']['total'],1)
+        native('update',task,'--assignee=','--json')
+        native('comments','add',task,'Newest checkpoint author own progress.',actor='bob')
+        reviewer=json.loads(native('comments','add',task,'Reviewer direction.','--json',actor='reviewer'))['id']
+        page=b.direction_page(self.export_rows(),'pp',task)
+        self.assertEqual({x['id'] for x in page['items']},
+                         {task+'-c'+str(later),task+'-c'+str(reviewer)})
