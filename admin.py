@@ -74,6 +74,11 @@ class TerminatedBySignal(BaseException):
         super().__init__('terminated by signal %d'%signum)
         self.signum=signum
 
+# The active termination guards, innermost last (kittrial-5bb.122). raise_termination
+# consults them, so a stop that the interpreter runs late - at whatever bytecode
+# boundary follows the signal - still lands on the guard's rules.
+_termination_guards=[]
+
 def raise_termination(signum,frame):
     """Signal handler that turns a stop into an exception so the cleanup path runs.
 
@@ -83,7 +88,23 @@ def raise_termination(signum,frame):
     this also ignores later ``SIGTERM`` for the rest of the guarded section; the guard
     restores the previous handler in its ``finally``. ``SIGKILL`` remains the operator's
     way to force a stop that runs no cleanup.
+
+    Python runs this handler at a bytecode boundary after the signal arrived, so it can
+    run inside the guard's own code - its setup, or its exit while it restores the
+    previous handler (``signal.signal`` itself runs pending handlers first). There it
+    never sets ``SIG_IGN`` and never raises, because nothing would then restore the
+    handler: the frame Python passes is the guard's, so the stop is recorded and the
+    guard raises it at a point where the previous handler is installed again
+    (kittrial-5bb.122). A handler run after an earlier stop already raised is ignored,
+    so a stop that was already pending cannot interrupt the cleanup either.
     """
+    if _termination_guards:
+        if frame is not None and frame.f_code is _GUARD_CODE:
+            _termination_guards[-1]['held']=True
+            return
+        if any(guard['stopped'] for guard in _termination_guards):
+            return
+        for guard in _termination_guards:guard['stopped']=True
     try: signal.signal(signum,signal.SIG_IGN)
     except (ValueError,OSError,RuntimeError,AttributeError): pass
     raise TerminatedBySignal(signum)
@@ -109,8 +130,19 @@ def signal_termination_guard():
     block (see ``raise_termination``), so the cleanup it started cannot itself be
     interrupted; a very short window whose state must change as one unit additionally
     holds the signal with ``sigterm_blocked``.
+
+    The exit restores the previous handler with ``SIGTERM`` held in this thread
+    (kittrial-5bb.122). A stop that arrives during the exit - pending in the kernel, or
+    already caught and waiting for its Python handler - is taken by the guard, never set
+    to ``SIG_IGN`` and never dropped: once the previous handler is installed, a stop the
+    block had not already turned into the exception is raised as ``TerminatedBySignal``.
+    Every exit path therefore leaves the previous handler installed. (A stop handled in
+    the caller's frame after the block's last statement but before the generator
+    resumes is raised there, as any stop in the block is; the context manager is then
+    released and closing the generator runs this same exit.)
     """
     previous={}
+    state={'stopped':False,'held':False}
     if threading.current_thread() is threading.main_thread():
         try:
             for signum in (signal.SIGTERM,):
@@ -118,12 +150,38 @@ def signal_termination_guard():
                 signal.signal(signum,raise_termination)
         except (ValueError,OSError,RuntimeError,AttributeError):
             previous={}
+    if previous:_termination_guards.append(state)
     try:
+        if state['held']:
+            raise TerminatedBySignal(signal.SIGTERM)   # taken while the handler was installed
         yield
     finally:
-        for signum,handler in previous.items():
-            try: signal.signal(signum,handler)
-            except (ValueError,OSError,RuntimeError,AttributeError): pass
+        if previous:
+            mask=None
+            if hasattr(signal,'pthread_sigmask') and hasattr(signal,'SIG_BLOCK'):
+                try: mask=signal.pthread_sigmask(signal.SIG_BLOCK,{signal.SIGTERM})
+                except (ValueError,OSError,RuntimeError,AttributeError): mask=None
+            try:
+                for signum,handler in previous.items():
+                    try: signal.signal(signum,handler)
+                    except (ValueError,OSError,RuntimeError,AttributeError): pass
+                if mask is not None and hasattr(signal,'sigtimedwait'):
+                    # A stop the kernel holds for this thread arrived while the guard was
+                    # still exiting; it would otherwise reach the previous handler (usually
+                    # SIG_DFL, ending the process with no cleanup) the moment the mask is
+                    # restored. The guard takes it instead.
+                    try:
+                        while signal.sigtimedwait({signal.SIGTERM},0) is not None:state['held']=True
+                    except (ValueError,OSError,RuntimeError,AttributeError): pass
+            finally:
+                _termination_guards.remove(state)
+                if mask is not None:
+                    try: signal.pthread_sigmask(signal.SIG_SETMASK,mask)
+                    except (ValueError,OSError,RuntimeError,AttributeError): pass
+            if state['held'] and not state['stopped']:
+                raise TerminatedBySignal(signal.SIGTERM)
+
+_GUARD_CODE=signal_termination_guard.__wrapped__.__code__
 
 @contextmanager
 def sigterm_blocked():
