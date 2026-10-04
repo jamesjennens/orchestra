@@ -198,7 +198,7 @@ class NoUnguardedParseTests(unittest.TestCase):
         'http_service.py': (5, "the endpoint's answer to the service, and host configuration"),
         'keyed_entries.py': (4, 'bd output'),
         'keyed_records.py': (3, 'bd output'),
-        'lifecycle.py': (4, 'bd output'),
+        'lifecycle.py': (6, "bd output, plus the endpoint's release-query and group answers on the caller's machine (kittrial-5bb.107 rev3)"),
         'native.py': (2, 'bd output'),
         'office_service.py': (1, 'host configuration'),
         'proposal_records.py': (7, 'bd output, the host session file, and a copy of a structure the kit built'),
@@ -229,9 +229,12 @@ class NoUnguardedParseTests(unittest.TestCase):
     def test_the_guard_is_used_where_other_peoples_text_is_parsed(self):
         uses = {path.name: path.read_text(encoding='utf-8').count('record_json.loads(')
                 for path in KIT.glob('*.py') if path.name != 'record_json.py'}
+        # lifecycle.py is down to one guarded parse (kittrial-5bb.107 rev3): its
+        # reverted_integrations now delegates to review_state.reverts_by_task, so the
+        # raw reject-comment parse that used record_json.loads here is gone.
         self.assertEqual({name: count for name, count in uses.items() if count}, {
             'briefing.py': 3, 'endpoint.py': 2, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 2,
-            'handoff.py': 1, 'http_service.py': 2, 'lifecycle.py': 2, 'recovery.py': 1, 'requirements.py': 1,
+            'handoff.py': 1, 'http_service.py': 2, 'lifecycle.py': 1, 'recovery.py': 1, 'requirements.py': 1,
             'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
 
     def test_the_parsers_that_do_not_call_it_directly_reach_it(self):

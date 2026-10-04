@@ -569,6 +569,46 @@ class ReleaseCommandTests(unittest.TestCase):
                                                 'integration_commit': MERGE_A}])
             self.assertEqual(report['result']['targets'], [{'task': 'trial-a'}])
 
+    def test_the_client_uses_the_endpoints_reverted_set(self):
+        # rev3 item 4.1b: the writing command must use the ENDPOINT's reverted set,
+        # not the local journal view. The endpoint reverts the only task, so no group
+        # may be sent and the task must be reported skipped as reverted.
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        sent = []
+        client = types.ModuleType('client')
+
+        def fake_request(config, project, actor, args, action=None):
+            payload = json.loads(args[0]); sent.append(payload)
+            if payload['dimension'] == RELEASE_QUERY:
+                return {'returncode': 0, 'stderr': '', 'stdout': json.dumps(
+                    {'reverted': [{'task': 'trial-a', 'integration_commit': MERGE_A}],
+                     'live_releases': []})}
+            return {'returncode': 0, 'stderr': '',
+                    'stdout': json.dumps(apply_native(payload, ACTOR, store.run))}
+
+        client.request = fake_request
+        with scratch() as root:
+            report = json.loads(self.run_cli(self.fixture(root, store), client))
+        self.assertEqual([payload for payload in sent if payload['dimension'] == RELEASE], [],
+                         'the endpoint reverted the only task, so no group may be sent')
+        self.assertIn('reverted', report['skipped'][0]['reason'])
+
+    def test_the_dry_run_says_its_revert_view_is_local(self):
+        # rev3 item 3.4: the dry run is offline, so it must say that it can list a
+        # target the writing run skips.
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        client = types.ModuleType('client')
+
+        def unexpected(*args, **kwargs):
+            raise AssertionError('the dry run must stay offline')
+
+        client.request = unexpected
+        with scratch() as root:
+            report = json.loads(self.run_cli(self.fixture(root, store) + ['--dry-run'], client))
+        self.assertEqual(report['reverts_source'], 'local')
+        self.assertIn('offline', report['dry_run_revert_note'])
+        self.assertTrue(any('offline' in warning for warning in report['warnings']))
+
     def test_evidence_owed_command_prints_the_grouped_read(self):
         store = NativeStore(tasks=('trial-a',)).seed('trial-a')
         production = scope(release='release-1', environment='production')
@@ -724,6 +764,53 @@ class ReselectionTests(unittest.TestCase):
         self.assertEqual(selection['targets'],
                          [{'task': 'trial-a', 'source_commit': SOURCE_B,
                            'integration_commit': MERGE_B}])
+
+    def test_a_deployment_in_a_later_release_is_not_already_deployed(self):
+        # Kills the mutation that drops the within-R half of the containment rule
+        # (rev3 item 4.1a): a scope that CONTAINS the chosen integration but is NOT
+        # contained in R is a LATER release, not an earlier deployment, so the task
+        # must still be selected.
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        self.deployed(store, 'trial-a', 'r-2', 'production', integration=RELEASE_2)
+        selection = release_selection(
+            store.rows, self.release_scope(integration=RELEASE_1, release='r-1'),
+            self.ancestry({(MERGE_A, RELEASE_1), (MERGE_A, RELEASE_2), (RELEASE_1, RELEASE_2)}))
+        self.assertEqual([item['task'] for item in selection['targets']], ['trial-a'])
+
+    def live_deployed(self, store, task, release, environment, integration, source=SOURCE_A):
+        """Record a release scope plus deployed=passed AND live=live for a task."""
+        scope_value = scope(source=source, integration=integration, release=release,
+                            environment=environment)
+        store.record(payload(task, 'lifecycle-scope',
+                             operation='scope-%s-%s' % (task, release), scope_value=scope_value))
+        store.record(payload(task, 'deployed', operation='deployed-%s-%s' % (task, release),
+                             scope_value=scope_value))
+        store.record(payload(task, 'live', value='live', operation='live-%s-%s' % (task, release),
+                             scope_value=scope_value))
+
+    def test_a_plain_deploy_supersedes_a_live_task_it_does_not_carry(self):
+        # rev3 item 1: a plain deploy of a hotfix H that does not contain a task
+        # already live in the environment must not leave that task reading live.
+        store = (NativeStore(tasks=('trial-a', 'trial-b'))
+                 .seed('trial-a')
+                 .seed('trial-b', integration=MERGE_B, source=SOURCE_B))
+        self.live_deployed(store, 'trial-a', 'r-1', 'production', MERGE_A)
+        self.live_deployed(store, 'trial-b', 'r-1', 'production', MERGE_B, source=SOURCE_B)
+        selection = release_selection(
+            store.rows, self.release_scope(integration=RELEASE_COMMIT, release='h-1'),
+            self.ancestry({(MERGE_A, RELEASE_COMMIT)}))
+        self.assertEqual(selection['targets'], [],
+                         'trial-a is already live in a release contained in H')
+        self.assertEqual(selection['supersede'], ['trial-b'],
+                         'trial-b is live here but H does not carry it')
+        result = store.record(release_payload([], release='h-1',
+                                              scope={'source_commit': '', 'integration_commit': RELEASE_COMMIT,
+                                                     'release_id': 'h-1', 'environment': 'production'},
+                                              supersede=['trial-b']))
+        self.assertEqual([item['task'] for item in result['superseded']], ['trial-b'])
+        state = store.facts('trial-b')
+        self.assertEqual(state['live'], 'superseded')
+        self.assertEqual(state['facts']['deployed']['value'], 'unknown')
 
     def test_a_caller_subset_selects_only_the_named_tasks(self):
         store = (NativeStore(tasks=('trial-a', 'trial-b')).seed('trial-a')
@@ -1253,6 +1340,27 @@ class LaterLiveVerifiedTests(unittest.TestCase):
                 self.assertNotIn('live-verified', owed[('r-1', 'trial-a')])
                 self.assertEqual(owed[('r-2', 'trial-a')], ['live-verified'])
 
+    def test_a_late_verify_under_an_older_scope_never_hides_the_current_scope_fact(self):
+        # rev3 item 2: deploy R1 to staging; deploy R1 to production with
+        # --live-verified; then --live-verified for staging. The current scope stays
+        # production and production must keep reading live-verified=passed even
+        # though the newest live-verified event is now the staging one.
+        import briefing
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        for environment, operation, verified in (('staging', 'deploy-staging', False),
+                                                 ('production', 'deploy-production', True),
+                                                 ('staging', 'verify-staging', True)):
+            store.record(release_payload([target('trial-a')], operation=operation,
+                                         release='r-1', live_verified=verified,
+                                         scope={'source_commit': '', 'integration_commit': RELEASE_COMMIT,
+                                                'release_id': 'r-1', 'environment': environment}))
+        state = store.facts('trial-a')
+        self.assertEqual(state['scope']['environment'], 'production')
+        self.assertEqual(state['facts']['live-verified']['value'], 'passed',
+                         'a later fact under the older staging scope must not hide production')
+        brief = briefing.brief(store.rows, 'trial', 'trial-a')
+        self.assertEqual(brief['lifecycle']['live-verified']['value'], 'passed')
+
     def test_a_verified_newer_release_does_not_mask_an_unverified_older_one(self):
         # The verification owed for R1 must not be read as done because a LATER
         # release of the same integration was verified (rev2 item 3).
@@ -1369,12 +1477,14 @@ class ReleaseCostEstimateTests(unittest.TestCase):
 
     def test_the_estimate_covers_the_measured_cost(self):
         self.assertLessEqual(lifecycle.RELEASE_CHUNK_DEFAULT, 25)
-        self.assertGreaterEqual(
-            round(lifecycle.DRY_RUN_FIXED_SECONDS + lifecycle.DRY_RUN_SECONDS_PER_TARGET * 201, 1),
-            335.0)
-        self.assertGreaterEqual(
-            round(lifecycle.DRY_RUN_FIXED_SECONDS + lifecycle.DRY_RUN_SECONDS_PER_TARGET * 50, 1),
-            86.0)
+        per_target = lifecycle.DRY_RUN_SECONDS_PER_TARGET
+        fixed = lifecycle.DRY_RUN_FIXED_SECONDS
+        # Each target now costs three writes, and the reviewer measured 438 s for
+        # 201 targets (rev3 item 3.3), so the stated upper bound must clear that.
+        self.assertGreaterEqual(round(fixed + per_target * 201, 1), 438.0)
+        self.assertGreaterEqual(round(fixed + per_target * 50, 1), 86.0)
+        self.assertLessEqual(round(fixed + per_target * lifecycle.RELEASE_CHUNK_DEFAULT, 1), 150.0,
+                             'one default group must stay inside the 150 s client timeout')
 
     def test_the_dry_run_uses_the_upper_bound_formula(self):
         store = (NativeStore(tasks=('trial-a', 'trial-b', 'trial-c'))
@@ -1469,10 +1579,97 @@ class RollbackSemanticsTests(unittest.TestCase):
         self.assertEqual(state['facts']['deployed']['value'], 'passed')
         self.assertEqual(state['live'], 'unknown')
 
-    def test_supersede_belongs_to_an_explicit_rollback(self):
-        with self.assertRaisesRegex(ValueError, 'supersede belongs to an explicit rollback'):
-            validate_release_payload(
-                release_payload([target('trial-a')], supersede=['trial-b']))
+    def test_supersede_is_allowed_on_a_plain_deploy_but_never_overlaps_a_target(self):
+        # rev3 item 1: a plain deploy of a hotfix release that does not carry a live
+        # task supersedes it, so the field is no longer rollback-only. rev3 item 3.1:
+        # a hand-built payload may not name one task as both target and superseded.
+        validate_release_payload(release_payload([target('trial-a')], supersede=['trial-b']))
+        with self.assertRaisesRegex(ValueError, 'both a release target and superseded'):
+            validate_release_payload(release_payload([target('trial-a')], supersede=['trial-a']))
+
+    def live_in(self, store, task, release, environment, integration, source=SOURCE_A):
+        scope_value = scope(source=source, integration=integration, release=release,
+                            environment=environment)
+        store.record(payload(task, 'lifecycle-scope',
+                             operation='scope-%s-%s-%s' % (task, release, environment),
+                             scope_value=scope_value))
+        store.record(payload(task, 'deployed',
+                             operation='deployed-%s-%s-%s' % (task, release, environment),
+                             scope_value=scope_value))
+        store.record(payload(task, 'live', value='live',
+                             operation='live-%s-%s-%s' % (task, release, environment),
+                             scope_value=scope_value))
+
+    def test_a_rollback_uses_the_environments_history_not_the_current_scope(self):
+        # rev3 item 1: two tasks deployed to production at r-1 and then to staging at
+        # r-1 have staging as their CURRENT scope. A production rollback must still
+        # find and supersede the task in production.
+        store = (NativeStore(tasks=('trial-a', 'trial-b'))
+                 .seed('trial-a')
+                 .seed('trial-b', integration=MERGE_B, source=SOURCE_B))
+        production = {'source_commit': '', 'integration_commit': RELEASE_1,
+                      'release_id': 'r-1', 'environment': 'production'}
+        staging = {'source_commit': '', 'integration_commit': RELEASE_1,
+                   'release_id': 'r-1', 'environment': 'staging'}
+        for environment, operation in ((production, 'release-prod'), (staging, 'release-staging')):
+            store.record(release_payload([target('trial-a'),
+                                          target('trial-b', integration=MERGE_B, source=SOURCE_B)],
+                                         operation=operation, release='r-1', scope=environment))
+        self.assertEqual(store.facts('trial-b')['scope']['environment'], 'staging')
+        result = store.record(release_payload([], operation='rollback-prod', release='r-1',
+                                              scope=production, rollback=True, supersede=['trial-b']))
+        self.assertEqual([item['task'] for item in result['superseded']], ['trial-b'])
+        self.assertEqual(result['superseded'][0]['scope']['environment'], 'production',
+                         'the supersede fact is written under the environment live scope')
+
+    def test_a_rollback_does_not_supersede_a_task_live_in_another_environment(self):
+        # Kills the mutation that drops the environment check from the supersede
+        # decision (rev3 item 4.1c): trial-b is live only in staging, so a production
+        # rollback must not touch it.
+        store = (NativeStore(tasks=('trial-a', 'trial-b'))
+                 .seed('trial-a')
+                 .seed('trial-b', integration=MERGE_B, source=SOURCE_B))
+        self.live_in(store, 'trial-a', 'r-1', 'production', RELEASE_1)
+        self.live_in(store, 'trial-b', 'r-3', 'staging', MERGE_B, source=SOURCE_B)
+        selection = rollback_selection(
+            store.rows, {'source_commit': '', 'integration_commit': RELEASE_1,
+                         'release_id': 'r-1', 'environment': 'production'},
+            lambda commit, release: (commit, release) == (MERGE_A, RELEASE_1))
+        self.assertEqual([item['task'] for item in selection['targets']], ['trial-a'])
+        self.assertEqual(selection['supersede'], [],
+                         'a task live only in staging is not superseded by a production rollback')
+
+    def test_a_rollback_to_a_never_deployed_release_is_refused(self):
+        # rev3 item 3.1: rolling back to a release that was never deployed in the
+        # environment is refused, on the client and at the endpoint.
+        store = (NativeStore(tasks=('trial-a',)).seed('trial-a'))
+        store.record(release_payload([target('trial-a')], operation='release-r3', release='r-3'))
+        scope_value = {'source_commit': '', 'integration_commit': RELEASE_1,
+                       'release_id': 'r-1', 'environment': 'production'}
+        with self.assertRaisesRegex(ValueError, 'was never deployed'):
+            rollback_selection(store.rows, scope_value, lambda commit, release: True)
+        with self.assertRaisesRegex(ValueError, 'was never deployed'):
+            store.record(release_payload([], release='r-1', scope=scope_value, rollback=True))
+
+    def test_a_rollback_in_an_environment_with_nothing_deployed_is_refused(self):
+        # rev3 item 3.1: with nothing deployed the "rollback" would act as a full
+        # deploy, so it is refused before any write.
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        scope_value = {'source_commit': '', 'integration_commit': RELEASE_1,
+                       'release_id': 'r-1', 'environment': 'production'}
+        with self.assertRaisesRegex(ValueError, 'nothing is deployed in that environment'):
+            rollback_selection(store.rows, scope_value, lambda commit, release: True)
+        with self.assertRaisesRegex(ValueError, 'nothing is deployed in that environment'):
+            store.record(release_payload([], release='r-1', scope=scope_value, rollback=True))
+
+    def test_a_hand_built_rollback_cannot_name_a_task_twice(self):
+        store = (NativeStore(tasks=('trial-a',)).seed('trial-a'))
+        store.record(release_payload([target('trial-a')], operation='release-r1', release='r-1'))
+        scope_value = {'source_commit': '', 'integration_commit': RELEASE_1,
+                       'release_id': 'r-1', 'environment': 'production'}
+        with self.assertRaisesRegex(ValueError, 'both a release target and superseded'):
+            store.record(release_payload([target('trial-a')], release='r-1', scope=scope_value,
+                                         rollback=True, supersede=['trial-a']))
 
 
 class ReleaseQueryTests(unittest.TestCase):
@@ -1538,6 +1735,52 @@ class ReleaseQueryTests(unittest.TestCase):
         self.assertIn('reverted', [item['reason'] for item in selection['skipped']][0])
 
 
+    def test_live_releases_cover_an_environment_that_has_live_tasks(self):
+        # rev3 item 3.5: the query's environment may not be the task's newest live
+        # scope; it must still report the live releases that environment has.
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        store.record(release_payload([target('trial-a')], operation='deploy-prod', release='r-p',
+                                     scope={'source_commit': '', 'integration_commit': RELEASE_COMMIT,
+                                            'release_id': 'r-p', 'environment': 'production'}))
+        store.record(release_payload([target('trial-a')], operation='deploy-staging', release='r-s',
+                                     scope={'source_commit': '', 'integration_commit': RELEASE_COMMIT,
+                                            'release_id': 'r-s', 'environment': 'staging'}))
+        answer = release_query(dict(release_payload([]), dimension=RELEASE_QUERY),
+                               ACTOR, store.run, operators=[OPERATOR], journal=self.journal)
+        self.assertEqual(answer['environment'], 'production')
+        self.assertEqual({item['release_id'] for item in answer['live_releases']}, {'r-p'})
+
+
+class SingleFactScopeTests(unittest.TestCase):
+    """A single recorded fact must name the task's CURRENT scope (rev3 item 2)."""
+
+    def test_a_single_fact_under_an_older_scope_is_refused(self):
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        older = scope(source=SOURCE_A, integration=MERGE_A, release='release-a', environment='staging')
+        newer = scope(source=SOURCE_B, integration=MERGE_B, release='release-b', environment='production')
+        store.record(payload('trial-a', 'lifecycle-scope', operation='scope-newer', scope_value=newer))
+        store.record(payload('trial-a', 'integrated', operation='integrated-newer', scope_value=newer))
+        with self.assertRaisesRegex(ValueError, 'set matching lifecycle scope'):
+            store.record(payload('trial-a', 'tested', operation='tested-older', scope_value=older))
+
+    def test_the_release_operation_may_still_write_under_an_older_scope(self):
+        # The documented relaxation: only a release operation (a verify-only target
+        # or a per-environment supersede) may write under an already-recorded scope.
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        store.record(release_payload([target('trial-a')], operation='deploy-staging', release='r-1',
+                                     scope={'source_commit': '', 'integration_commit': RELEASE_COMMIT,
+                                            'release_id': 'r-1', 'environment': 'staging'}))
+        store.record(release_payload([target('trial-a')], operation='deploy-production', release='r-1',
+                                     scope={'source_commit': '', 'integration_commit': RELEASE_COMMIT,
+                                            'release_id': 'r-1', 'environment': 'production'}))
+        result = store.record(release_payload([target('trial-a')], operation='verify-staging',
+                                              release='r-1', live_verified=True,
+                                              scope={'source_commit': '', 'integration_commit': RELEASE_COMMIT,
+                                                     'release_id': 'r-1', 'environment': 'staging'}))
+        self.assertTrue(result['targets'][0]['verify_only'])
+        self.assertIsNotNone(result['targets'][0]['live_verified'])
+
+
 class EvidenceOwedCostTests(unittest.TestCase):
     """evidence-owed hashes each distinct scope once, not once per event (item 6.4)."""
 
@@ -1578,6 +1821,9 @@ class RollbackCommandTests(ReleaseCommandTests):
         store = (NativeStore(tasks=('trial-a', 'trial-b'))
                  .seed('trial-a')
                  .seed('trial-b', integration=MERGE_B, source=SOURCE_B))
+        # r-1 must already have been deployed in production: a rollback to a release
+        # that was never deployed is refused (rev3 item 3.1).
+        store.record(release_payload([target('trial-a')], operation='release-r1', release='r-1'))
         store.record(release_payload([target('trial-a'),
                                       target('trial-b', integration=MERGE_B, source=SOURCE_B)],
                                      operation='release-r3', release='r-3'))

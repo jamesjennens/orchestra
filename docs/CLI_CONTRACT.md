@@ -246,11 +246,24 @@ is `true` when `deployed_delivery.source_commit` equals the current contribution
 `commit`, `false` when it does not, and `null` when either the delivery or the
 current contribution is absent. A deployed release may ship a superseded revision,
 so the two are independent of `lifecycle_matches_contribution`. `deployed_live` is
-the task's newest trusted liveness fact: `live` (the named release scope is the
-live release for its environment), `superseded` (an explicit rollback moved the
-environment past it; `deployed` then reads `unknown` and `deployed_delivery` is
-`null`), or `unknown` for a task written before liveness existed (which reads
-exactly as it did before).
+the `live` fact recorded for the task's **current** scope: `live` (the named release
+scope is the live release for its environment), `superseded` (an explicit rollback
+or a later release the task is not in moved the environment past it; `deployed` then
+reads `unknown` and `deployed_delivery` is `null`), or `unknown` for a task written
+before liveness existed (which reads exactly as it did before). Liveness itself is
+decided **per environment** from the scope history (rev3 item 1), so a task can be
+live in production and superseded in staging; `deployed_live` reports the fact for
+the task's current scope, while release/rollback selection and `release-query`
+answer per environment.
+
+**The six lifecycle facts are read for the task's current scope (rev3 item 2).**
+`brief`, `work`, `review` and `evidence-owed` report, for each dimension, the newest
+event whose payload scope IS the task's current `lifecycle_scope`. A fact recorded
+later under an older, already-recorded scope (a verify-only `live-verified`, a
+per-environment `live=superseded`) therefore never hides the current scope's fact,
+which the previous reader got wrong. The native `dim:` label is still matched
+against the newest event of that dimension, so an unstructured or tampered event
+still reads `unknown` and its `event_id` names the event that caused it.
 
 `brief` adds an `attention` array, plus `attention_total` and `attention_more`. It
 holds at most 3 items of each kind: `reference-review` items first, then `reference`
