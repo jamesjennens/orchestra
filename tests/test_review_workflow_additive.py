@@ -185,9 +185,14 @@ class StagedRolloutTests(Base):
             self.assertTrue(admin.review_workflow_writes(root))
             marker.write_text(json.dumps({'review_workflow_writes': False}), encoding='utf-8')
             self.assertFalse(admin.review_workflow_writes(root))
+            # A malformed value is read as OFF with a warning instead of raising, so
+            # `work` and `review` keep answering for everyone (item 2).
+            warnings = []
             marker.write_text(json.dumps({'review_workflow_writes': 'yes'}), encoding='utf-8')
-            with self.assertRaisesRegex(ValueError, 'true or false'):
-                admin.review_workflow_writes(root)
+            self.assertFalse(admin.review_workflow_writes(root, warnings=warnings))
+            self.assertEqual(len(warnings), 1)
+            self.assertIn('review_workflow_writes', warnings[0])
+            self.assertIn('true or false', warnings[0])
         finally:
             if marker.is_file():
                 marker.unlink()
@@ -608,6 +613,264 @@ class ClosedQueueTests(Base):
         self.issue['status'] = 'closed'
         page = work.queue([self.issue], 'worker', ['--mine'])
         self.assertEqual([i['review_state'] for i in page['items']], ['changes-requested'])
+
+
+class ClosedWithdrawnItemTests(Base):
+    """kittrial-5bb.110 item 4: a closed withdrawn task with a blocking item open."""
+
+    def test_closed_withdrawn_task_with_a_blocking_item_stays_in_work(self):
+        contribution = self.send(self.contribution())['comment_id']
+        self.send(self.payload('request-changes', contribution=contribution,
+                               items=[dict(id='fix', text='Fix')]), 'reviewer')
+        self.send(self.payload('withdraw', contribution=contribution, reason='Re-scoped'))
+        state = self.shared()
+        self.assertEqual(state['review_state'], 'withdrawn')
+        # The withdraw carries the blocking item (it is not erased).
+        self.assertEqual([i['item'] for i in state['pending_requests']], ['fix'])
+        self.issue['status'] = 'closed'
+        page = work.queue([self.issue], 'worker', ['--mine'])
+        self.assertEqual([i['task'] for i in page['items']], ['task-1'])
+        self.assertEqual(page['items'][0]['review_state'], 'withdrawn')
+
+    def test_closed_withdrawn_task_with_no_open_item_is_hidden(self):
+        contribution = self.send(self.contribution())['comment_id']
+        self.send(self.payload('withdraw', contribution=contribution, reason='Re-scoped'))
+        self.issue['status'] = 'closed'
+        self.assertEqual(work.queue([self.issue], 'worker', ['--mine'])['total'], 0)
+
+
+class ReopenAndResolveTests(Base):
+    """kittrial-5bb.110 items 5 and 6: closure hides requests on read; withdraw freezes items."""
+
+    def test_reopening_a_task_revives_its_open_review_requests(self):
+        contribution = self.send(self.contribution())['comment_id']
+        self.send(self.payload('request-review', contribution=contribution, reviewer='alice'))
+        self.issue['status'] = 'closed'
+        self.assertEqual(self.shared()['pending_review_requests'], [])
+        self.assertEqual(work.queue([self.issue], 'alice', ['--mine'])['total'], 0)
+        self.issue['status'] = 'in_progress'
+        self.assertEqual([r['reviewer'] for r in self.shared()['pending_review_requests']], ['alice'])
+        self.assertEqual(work.queue([self.issue], 'alice', ['--mine'])['total'], 1)
+        # Closure changed no record: the chain is still contribute + request-review.
+        self.assertEqual(self.review_count(), 2)
+
+    def test_the_requester_cannot_resolve_an_item_while_the_contribution_is_withdrawn(self):
+        contribution = self.send(self.contribution())['comment_id']
+        request = self.send(self.payload('request-changes', contribution=contribution,
+                                         items=[dict(id='fix', text='Fix')]), 'reviewer')['comment_id']
+        self.send(self.payload('withdraw', contribution=contribution, reason='Re-scoped'))
+        with self.assertRaisesRegex(ValueError, 'withdrawn; deliver a new revision'):
+            self.send(self.payload('resolve-item', contribution=contribution, request=request,
+                                   item='fix', reason='Handled'), 'reviewer')
+        self.assertEqual(self.review_count(), 3)
+        # The next contribution revives the item; the same requester may then resolve it.
+        second = self.send(self.contribution())['comment_id']
+        self.send(self.payload('resolve-item', contribution=second, request=request,
+                               item='fix', reason='Handled'), 'reviewer')
+        self.assertEqual(w.project(self.issue)['pending_requests'], [])
+
+
+class SwitchRefusalFieldTests(Base):
+    """kittrial-5bb.110 item 7: the refusal names the additive FIELD, not just the operation."""
+
+    def test_a_summary_or_severity_refusal_names_the_field(self):
+        contribution = self.send(self.contribution())['comment_id']
+        with self.assertRaisesRegex(ValueError, r'request-changes summary'):
+            self.send(self.payload('request-changes', contribution=contribution, summary='Because',
+                                   items=[dict(id='a', text='A')]), 'reviewer', review_writes=False)
+        with self.assertRaisesRegex(ValueError, r'item severity'):
+            self.send(self.payload('request-changes', contribution=contribution,
+                                   items=[dict(id='b', text='B', severity='note')]),
+                      'reviewer', review_writes=False)
+        # A new operation still names the operation, not a field.
+        with self.assertRaisesRegex(ValueError, r'operation withdraw'):
+            self.send(self.payload('withdraw', contribution=contribution, reason='x'),
+                      review_writes=False)
+        # A legacy request-changes item is still written with the switch off.
+        self.send(self.payload('request-changes', contribution=contribution,
+                               items=[dict(id='c', text='C')]), 'reviewer', review_writes=False)
+        self.assertEqual(self.review_count(), 2)
+
+
+class VariationSelectorTests(Base):
+    """kittrial-5bb.110 item 8: U+E0100-U+E01EF selectors are refused like tag characters."""
+
+    def test_variation_selectors_are_refused_in_review_text(self):
+        contribution = self.send(self.contribution())['comment_id']
+        with self.assertRaisesRegex(ValueError, 'variation-selector'):
+            self.send(self.payload('request-changes', contribution=contribution,
+                                   items=[dict(id='fix', text='hide \U000E0100 here')]), 'reviewer')
+        with self.assertRaisesRegex(ValueError, 'variation-selector'):
+            self.send(self.payload('withdraw', contribution=contribution,
+                                   reason='bad \U000E01EF'))
+        # A plain string with no selector is still accepted.
+        self.send(self.payload('request-changes', contribution=contribution,
+                               items=[dict(id='ok', text='Plain')]), 'reviewer')
+        self.assertEqual(self.review_count(), 2)
+
+
+class RequestCapBoundaryTests(Base):
+    """Mutation M8 (cap 10->11) and M10 (the cap counts declined requests)."""
+
+    def _rows_with_open_requests(self, count, requester='mallory'):
+        rows = [chain_row('task-1%02d' % index, author=requester) for index in range(count)]
+        target = chain_row('task-1', request=False)
+        rows.append(target)
+        self.issue = target
+        self.rows = rows
+        return target
+
+    def test_the_cap_refuses_the_eleventh_open_request(self):
+        self._rows_with_open_requests(9)
+        self.send(self.payload('request-review', contribution='1', reviewer='alice'),
+                  'mallory', operators=('mallory',))
+        self.assertEqual(w.open_review_requests_by(self.rows, 'mallory'), 10)
+        with self.assertRaisesRegex(ValueError, 'already has 10 open review requests'):
+            self.send(self.payload('request-review', contribution='1', reviewer='bob'),
+                      'mallory', operators=('mallory',))
+        self.assertEqual(w.open_review_requests_by(self.rows, 'mallory'), 10)
+
+    def test_the_cap_is_per_requester_name(self):
+        self._rows_with_open_requests(10)
+        with self.assertRaisesRegex(ValueError, 'open review requests'):
+            self.send(self.payload('request-review', contribution='1', reviewer='alice'),
+                      'mallory', operators=('mallory', 'coord'))
+        # A different requester name (here a configured coordinator) has its own budget.
+        self.send(self.payload('request-review', contribution='1', reviewer='alice'),
+                  'coord', operators=('mallory', 'coord'))
+        self.assertEqual(w.open_review_requests_by(self.rows, 'coord'), 1)
+
+    def test_a_declined_request_does_not_count_toward_the_cap(self):
+        row = chain_row('task-1', author='mallory')       # contribution + request-review (alice)
+        decline = dict(schema_version=1, operation='decline-review', operation_id='d-1',
+                       task='task-1', previous='2', contribution='1', request='2', reason='Out')
+        row['comments'].append(dict(id='3', text=w.PREFIX + json.dumps(decline), author='alice',
+                                    created_at='2026-09-16T00:00:00Z'))
+        # The request is closed; it is not an OPEN request for anyone, so neither the
+        # requester nor the reviewer carries it against their cap.
+        self.assertEqual(w.open_review_requests_by([row], 'mallory'), 0)
+        self.assertEqual(w.open_review_requests_by([row], 'alice'), 0)
+
+
+class ReviewWritesCommandTests(unittest.TestCase):
+    """Mutation M15 (admin allowlist) and kittrial-5bb.110 item 3 (audit + lock)."""
+
+    def setUp(self):
+        from unittest.mock import patch
+        self.root = Path(__file__).resolve().parents[1] / '.review-writes-probe'
+        self.root.mkdir(exist_ok=True)
+        self.marker = self.root / 'deployment.private.json'
+        self.marker.write_text(json.dumps({'operators': ['coord']}), encoding='utf-8')
+        # `operators(strict=True)` refuses a disagreeing shell ORCHESTRA_OPERATORS.
+        self._env = patch.dict('os.environ', {'ORCHESTRA_OPERATORS': ''})
+        self._env.start()
+
+    def tearDown(self):
+        self._env.stop()
+        for name in ('deployment.private.json', admin.REVIEW_WRITES_AUDIT, admin.REVIEW_WRITES_LOCK):
+            path = self.root / name
+            if path.exists():
+                path.unlink()
+        if self.root.is_dir():
+            self.root.rmdir()
+
+    def test_only_an_allowlisted_operator_may_flip_the_switch(self):
+        with self.assertRaisesRegex(ValueError, 'operator allowlist'):
+            admin.review_writes_command(self.root, 'mallory', 'on')
+        self.assertFalse(admin.review_workflow_writes(self.root))
+        self.assertIsNone(admin.review_writes_audit(self.root))
+
+    def test_a_flip_records_who_and_when_and_the_value_it_replaced(self):
+        result, warnings = admin.review_writes_command(self.root, 'coord', 'on')
+        self.assertTrue(result['review_workflow_writes'])
+        self.assertEqual(warnings, [])
+        record = admin.review_writes_audit(self.root)
+        self.assertEqual((record['set_by'], record['review_workflow_writes'], record['previous']),
+                         ('coord', True, False))
+        self.assertTrue(record['set_at'])
+        result, _ = admin.review_writes_command(self.root, 'coord', 'off')
+        self.assertFalse(result['review_workflow_writes'])
+        record = admin.review_writes_audit(self.root)
+        self.assertEqual((record['set_by'], record['review_workflow_writes'], record['previous']),
+                         ('coord', False, True))
+        self.assertIsNone(json.loads(self.marker.read_text(encoding='utf-8'))
+                          .get('review_workflow_writes'))
+
+    def test_status_reads_a_malformed_switch_as_off_with_a_warning(self):
+        self.marker.write_text(json.dumps({'operators': ['coord'], 'review_workflow_writes': 'yes'}),
+                               encoding='utf-8')
+        result, warnings = admin.review_writes_command(self.root, 'coord', 'status')
+        self.assertFalse(result['review_workflow_writes'])
+        self.assertTrue(warnings)
+
+
+@unittest.skipIf(sys.platform == 'win32', 'endpoint.py imports fcntl (POSIX-only)')
+class EndpointReviewSwitchTests(unittest.TestCase):
+    """Mutation M7: the endpoint supplies the deployment switch, never a constant True."""
+
+    def setUp(self):
+        self.root = Path(__file__).resolve().parents[1] / '.endpoint-switch-probe'
+        project = self.root / 'projects' / 'example'
+        (project / '.beads').mkdir(parents=True, exist_ok=True)
+        (project / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _run(self, writes):
+        self.root.mkdir(parents=True, exist_ok=True)
+        (self.root / 'deployment.private.json').write_text(
+            json.dumps({'operators': ['coord'], 'review_workflow_writes': writes}), encoding='utf-8')
+        import endpoint
+        import work
+        from unittest.mock import patch
+        seen = {}
+
+        def fake_work(path, actor, action, args, attachments, runner, operators=None,
+                      verifiers=None, review_writes=None):
+            seen['review_writes'] = review_writes
+            return {'task': 'example-1', 'review_state': 'awaiting-review'}
+
+        with patch.object(work, 'execute', side_effect=fake_work):
+            answer = endpoint.execute(self.root, {'project': 'example', 'actor': 'worker',
+                                                  'action': 'review', 'args': ['example-1']})
+        return seen, answer
+
+    def test_the_endpoint_reads_the_switch_from_the_deployment(self):
+        seen, _ = self._run(False)
+        self.assertFalse(seen['review_writes'])
+        seen, _ = self._run(True)
+        self.assertTrue(seen['review_writes'])
+
+    def test_a_malformed_switch_is_off_and_warns_on_the_endpoint(self):
+        seen, answer = self._run('yes')
+        self.assertFalse(seen['review_writes'])
+        self.assertIn('WARNING', answer['stderr'])
+        self.assertIn('review_workflow_writes', answer['stderr'])
+
+
+class BackupRoundTripTests(Base):
+    """kittrial-5bb.110 item 9: a rev-2 chain survives an export/restore round trip.
+
+    A native backup and ``restore-new`` carry issue rows and their comments verbatim,
+    so the new-shaped records must read identically after the round trip and must not
+    be mistaken for a malformed or unsupported history by any reader (the reserved
+    prefix, the projection and the work queue).
+    """
+
+    def test_a_new_shape_chain_reads_identically_after_the_round_trip(self):
+        contribution = self.send(self.contribution())['comment_id']
+        self.send(self.payload('request-changes', contribution=contribution, summary='Why',
+                               items=[dict(id='fix', text='Fix', severity='note')]), 'reviewer')
+        self.send(self.payload('request-review', contribution=contribution, reviewer='alice'))
+        before = w.project(self.issue)
+        # Exactly what a native export writes and a restore parses back.
+        exported = json.dumps(self.issue, ensure_ascii=False)
+        restored = [json.loads(exported)]
+        self.assertEqual(exported, json.dumps(restored[0], ensure_ascii=False))
+        self.assertEqual(before, w.project(restored[0]))
+        self.assertEqual(work.queue(restored, 'alice', ['--mine'])['total'], 1)
 
 
 if __name__ == '__main__':

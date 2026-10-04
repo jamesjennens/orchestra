@@ -508,7 +508,7 @@ def operators(root, strict=False):
                              'or unset ORCHESTRA_OPERATORS before this command.')
     return allowed
 
-def review_workflow_writes(root, strict=False):
+def review_workflow_writes(root, strict=False, warnings=None):
     """The per-installation switch for WRITING the new review-workflow shapes.
 
     kittrial-5bb.94 item 3 asked for a two-step ship: this kit's READERS understand
@@ -522,6 +522,12 @@ def review_workflow_writes(root, strict=False):
     it is a deployment capability, and the endpoint supplies it to the review write
     path. The coordinator turns it on (`admin.py review-writes on --actor OPERATOR`)
     once the rollback target is a kit that reads the new shapes.
+
+    A value that is neither true/false nor absent is read as OFF with a warning
+    (kittrial-5bb.110 item 2): raising made `work` and `review TASK` fail for every
+    actor on the installation while `brief` still answered. When `warnings` is a
+    list the warning is appended to it (the endpoint surfaces it on stderr);
+    otherwise it is printed to stderr here.
     """
     enabled = False
     marker = root/'deployment.private.json'
@@ -530,7 +536,12 @@ def review_workflow_writes(root, strict=False):
         if isinstance(value,bool):
             enabled = value
         elif value is not None:
-            raise ValueError('deployment review_workflow_writes must be true or false')
+            message = ('deployment review_workflow_writes is %r, not true or false; reading it as off '
+                       '(no new-shaped review write is allowed)' % (value,))
+            if warnings is not None:
+                warnings.append('WARNING: ' + message)
+            else:
+                print('WARNING: ' + message,file=sys.stderr)
     return enabled
 
 def checkpoint_provenance_switch(root,action,actor):
@@ -558,6 +569,97 @@ def checkpoint_provenance_switch(root,action,actor):
     if not enabled:
         print('Warning: existing provenance tasks refuse new legacy checkpoints; disabling does not make their history readable by older kits.',file=sys.stderr)
     return dict(checkpoint_provenance_writes=enabled,audit_records=len(audit)+1)
+
+#: Audit record of the switch flips, beside deployment.private.json. It is
+#: deployment-level (there is one switch per installation, not per project), so it
+#: is not part of any project's coordination backup. `review-writes` writes it under
+#: ``REVIEW_WRITES_LOCK`` so a flip records the value it replaced.
+REVIEW_WRITES_AUDIT = 'review-writes.audit.json'
+REVIEW_WRITES_LOCK = '.review-writes.lock'
+
+
+def review_writes_audit(root):
+    """The last switch flip this kit recorded, or None when it is absent or unreadable."""
+    path = root/REVIEW_WRITES_AUDIT
+    if not path.is_file():
+        return None
+    try:
+        record = read_json_file(path,'Review-writes audit record')
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record,dict) or record.get('schema_version')!=1:
+        return None
+    return record
+
+
+def write_review_writes_audit(root, enabled, actor, previous):
+    """Record WHO flipped ``review_workflow_writes``, WHEN, and the value replaced.
+
+    Written atomically at mode 0600 like the deployment file itself. The caller
+    holds ``REVIEW_WRITES_LOCK`` for the whole read-modify-write so two concurrent
+    flips cannot lose one another (kittrial-5bb.110 item 3).
+    """
+    from datetime import datetime,timezone
+    record = {'schema_version':1,'review_workflow_writes':bool(enabled),'set_by':actor,
+              'set_at':datetime.now(timezone.utc).isoformat(),'previous':bool(previous)}
+    atomic_private_write(root/REVIEW_WRITES_AUDIT,json.dumps(record))
+    return record
+
+
+@contextmanager
+def review_writes_lock(root):
+    """Serialise one switch flip (and its audit record) with an exclusive flock.
+
+    POSIX-only, like every other coordination lock in the kit: on a host without
+    ``fcntl`` the atomic file writes still stand. The lock file is deployment-level
+    and holds no state, so a leftover file is harmless and is never backed up.
+    """
+    handle=(root/REVIEW_WRITES_LOCK).open('a')
+    try:
+        import fcntl
+        fcntl.flock(handle,fcntl.LOCK_EX)
+    except ImportError:
+        pass
+    try:
+        yield handle
+    finally:
+        handle.close()
+
+
+def review_writes_command(root, actor, action):
+    """Read or flip ``review_workflow_writes``; returns ``(result, warnings)``.
+
+    The actor must be on the deployment operator allowlist, so a contributor that
+    reaches the host command line cannot turn the switch on or off
+    (kittrial-5bb.110 item 1 / review mutation M15). A flip then records who set it
+    and when under the deployment lock (item 3). Extracted from the CLI so the
+    allowlist and audit behaviour are unit-testable without a subprocess.
+    """
+    marker=root/'deployment.private.json'
+    if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
+    from recovery import identity
+    actor=identity(actor,'Invalid actor identity')
+    authority=operators(root, strict=True)
+    if actor not in authority:
+        raise ValueError('review-writes requires an actor on the deployment operator allowlist '
+                         '(deployment.private.json operators); ' + actor + ' is not on it')
+    if action=='status':
+        warnings=[]
+        enabled=review_workflow_writes(root,warnings=warnings)
+        return {'review_workflow_writes':enabled,'audit':review_writes_audit(root)},warnings
+    # One hold of the deployment lock for the whole read-modify-write, so the audit
+    # record names the value that was actually replaced (item 3).
+    with review_writes_lock(root):
+        cfg=config(root)
+        previous=review_workflow_writes(root)
+        enabled=action=='on'
+        # OFF is the absent key, so a deployment that never turned it on and one
+        # that turned it back off read identically.
+        if enabled:cfg['review_workflow_writes']=True
+        else:cfg.pop('review_workflow_writes',None)
+        atomic_private_write(marker,json.dumps(cfg))
+        write_review_writes_audit(root,enabled,actor,previous)
+    return {'review_workflow_writes':review_workflow_writes(root)},[]
 
 def stored_operators(cfg):
     """The deployment allowlist as a list of identity strings.
@@ -4109,25 +4211,9 @@ def main():
     elif args.command=='checkpoint-provenance-writes':
         print(json.dumps(checkpoint_provenance_switch(root,args.action,args.actor)))
     elif args.command=='review-writes':
-        marker=root/'deployment.private.json'
-        if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
-        from recovery import identity
-        actor=identity(args.actor,'Invalid actor identity')
-        authority=operators(root, strict=True)
-        if actor not in authority:
-            raise ValueError('review-writes requires an actor on the deployment operator allowlist '
-                             '(deployment.private.json operators); ' + actor + ' is not on it')
-        cfg=config(root)
-        if args.action=='status':
-            print(json.dumps({'review_workflow_writes':review_workflow_writes(root)}))
-            return
-        enabled=args.action=='on'
-        # OFF is the absent key, so a deployment that never turned it on and one
-        # that turned it back off read identically.
-        if enabled:cfg['review_workflow_writes']=True
-        else:cfg.pop('review_workflow_writes',None)
-        atomic_private_write(marker,json.dumps(cfg))
-        print(json.dumps({'review_workflow_writes':review_workflow_writes(root)}))
+        result,warnings=review_writes_command(root,args.actor,args.action)
+        for line in warnings:print(line,file=sys.stderr)
+        print(json.dumps(result))
     elif args.command=='authorized-keys':
         authorized_keys(root,args.key_file,args.role,args.python,args.comment)
     elif args.command=='backup':backup_projects(root,args.projects,args.all_projects)

@@ -842,6 +842,122 @@ class CanonicalProtocolCase(EndpointCase):
             self.assertEqual('task-1', body['task'])
 
 
+class HttpNewReviewOperationsCase(EndpointCase):
+    """kittrial-5bb.110 item 9: the HTTP review path carries the added operations.
+
+    Before the follow-up, ``EndpointBackend.REVIEW_FIELDS`` knew only the pre-.94
+    operations, so ``POST .../reviews`` with withdraw/request-review/resolve-item/
+    decline-review was refused as an unknown operation and a request-changes
+    ``summary`` was silently dropped. The new states were unreachable over HTTP.
+    """
+
+    def canonical_body(self, principal, project, operation, **extra):
+        payload = {'task_id': 'task-1', 'operation': operation, 'schema_version': 1,
+                   'operation_id': 'op-' + operation, 'previous': None}
+        payload.update(extra)
+        _, _, args, attachments = self.backend._command(
+            'reviews.add', principal, project, payload, 'f' * 64)
+        self.assertEqual(['task-1', '@attachment:0'], args)
+        return json.loads(attachments['0']['text'])
+
+    def test_every_new_operation_and_additive_field_builds_a_valid_body(self):
+        from review_workflow import validate
+        alex, project = self.setup_project()
+        principal = self.service.authenticate(alex)
+        cid, rid = 'c' * 20, 'r' * 20
+        cases = [
+            ('withdraw', {'contribution': cid, 'reason': 'Re-scoped'}),
+            ('request-review', {'contribution': cid, 'reviewer': 'blair@host'}),
+            ('resolve-item', {'contribution': cid, 'request': rid, 'item': 'fix',
+                              'reason': 'Handled'}),
+            ('decline-review', {'contribution': cid, 'request': rid, 'reason': 'Out'}),
+        ]
+        for operation, extra in cases:
+            with self.subTest(operation=operation):
+                body = self.canonical_body(principal, project, operation, **extra)
+                validate(body, 'task-1')          # raises if the operation/fields are wrong
+                self.assertEqual(operation, body['operation'])
+        # The additive fields must survive the hop, not only the new operations.
+        body = self.canonical_body(principal, project, 'request-changes', contribution=cid,
+                                   summary='Why', items=[{'id': 'fix', 'text': 'Fix',
+                                                          'severity': 'note'}])
+        validate(body, 'task-1')
+        self.assertEqual('Why', body['summary'])
+        body = self.canonical_body(principal, project, 'request-review', contribution=cid,
+                                   reviewer='blair', summary='Please look')
+        validate(body, 'task-1')
+        self.assertEqual('Please look', body['summary'])
+        body = self.canonical_body(principal, project, 'withdraw', contribution=cid,
+                                   reason='x', disposition='superseded')
+        validate(body, 'task-1')
+        self.assertEqual('superseded', body['disposition'])
+
+    def test_withdraw_round_trips_over_http_when_the_switch_is_on(self):
+        alex, project = self.setup_project()
+        task_id = self.create_task(alex, project, 'withdraw over http').data['id']
+        self.assertEqual(200, self.request('POST', '/v1/projects/%s/tasks/%s/claim'
+                                           % (project, task_id), {}, token=alex).status)
+        review = self.contribute(alex, project, task_id)
+        self.assertEqual(201, review.status, review.data)
+        contribution_id = review.data.get('comment_id') or \
+            (review.data.get('contribution') or {}).get('comment_id')
+        # The per-installation switch is deployment configuration the canonical
+        # endpoint reads; without it the write is refused before the new state exists.
+        (self.canonical_root / 'deployment.private.json').write_text(
+            json.dumps({'operators': [], 'review_workflow_writes': True}), encoding='utf-8')
+        withdrawn = self.request(
+            'POST', '/v1/projects/%s/tasks/%s/reviews' % (project, task_id),
+            {'operation': 'withdraw', 'schema_version': 1, 'previous': contribution_id,
+             'operation_id': 'op-' + secrets.token_hex(6),
+             'contribution': contribution_id, 'reason': 'Re-scoped'}, token=alex)
+        self.assertEqual(201, withdrawn.status, withdrawn.data)
+        self.assertEqual('withdrawn', withdrawn.data.get('review_state'))
+
+    def test_withdraw_is_refused_over_http_when_the_switch_is_off(self):
+        alex, project = self.setup_project()
+        task_id = self.create_task(alex, project, 'switch off over http').data['id']
+        self.assertEqual(200, self.request('POST', '/v1/projects/%s/tasks/%s/claim'
+                                           % (project, task_id), {}, token=alex).status)
+        review = self.contribute(alex, project, task_id)
+        contribution_id = review.data.get('comment_id') or \
+            (review.data.get('contribution') or {}).get('comment_id')
+        denied = self.request(
+            'POST', '/v1/projects/%s/tasks/%s/reviews' % (project, task_id),
+            {'operation': 'withdraw', 'schema_version': 1, 'previous': contribution_id,
+             'operation_id': 'op-' + secrets.token_hex(6),
+             'contribution': contribution_id, 'reason': 'Re-scoped'}, token=alex)
+        self.assertEqual(422, denied.status, denied.data)
+        self.assertIn('review_workflow_writes off', json.dumps(denied.data))
+
+    def test_brief_and_queue_expose_the_withdrawn_state(self):
+        alex, project = self.setup_project()
+        task_id = self.create_task(alex, project, 'withdrawn reads').data['id']
+        self.assertEqual(200, self.request('POST', '/v1/projects/%s/tasks/%s/claim'
+                                           % (project, task_id), {}, token=alex).status)
+        review = self.contribute(alex, project, task_id)
+        contribution_id = review.data.get('comment_id') or \
+            (review.data.get('contribution') or {}).get('comment_id')
+        (self.canonical_root / 'deployment.private.json').write_text(
+            json.dumps({'operators': [], 'review_workflow_writes': True}), encoding='utf-8')
+        withdrawn = self.request(
+            'POST', '/v1/projects/%s/tasks/%s/reviews' % (project, task_id),
+            {'operation': 'withdraw', 'schema_version': 1, 'previous': contribution_id,
+             'operation_id': 'op-' + secrets.token_hex(6),
+             'contribution': contribution_id, 'reason': 'Re-scoped'}, token=alex)
+        self.assertEqual(201, withdrawn.status, withdrawn.data)
+        # The brief carries the withdrawal record, not just the state string.
+        brief = self.request('GET', '/v1/projects/%s/tasks/%s/brief'
+                             % (project, task_id), token=alex)
+        self.assertEqual(200, brief.status, brief.data)
+        self.assertEqual('withdrawn', brief.data['review']['state'])
+        self.assertEqual('withdrawn', brief.data['review']['withdrawal']['disposition'])
+        self.assertEqual('Re-scoped', brief.data['review']['withdrawal']['reason'])
+        # The queue accepts the new state as a filter instead of hiding it.
+        queue = self.request('GET', '/v1/projects/%s/queue?state=withdrawn' % project, token=alex)
+        self.assertEqual(200, queue.status, queue.data)
+        self.assertEqual([task_id], [item['id'] for item in queue.data['items']])
+
+
 class HttpFollowsForwardingCase(EndpointCase):
     """http-drops-follows: the optional additive ``follows`` relation survives HTTP.
 

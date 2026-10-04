@@ -47,7 +47,7 @@ export async function overview(ctx, { pid }) {
       draw();
     } }, label)));
   const reviewSel = h('select', { id: 'review-filter', 'aria-label': 'Review state', onchange: (e) => { state.review = e.target.value; state.cursor = null; state.stack = []; draw(); } },
-    [['', 'Any review state'], ['awaiting-review', 'Awaiting review'], ['changes-requested', 'Changes requested'], ['approved', 'Approved · not integrated'], ['none', 'No contribution']].map(([v, l]) => h('option', { value: v }, l)));
+    [['', 'Any review state'], ['awaiting-review', 'Awaiting review'], ['changes-requested', 'Changes requested'], ['approved', 'Approved · not integrated'], ['withdrawn', 'Withdrawn'], ['superseded', 'Superseded'], ['none', 'No contribution']].map(([v, l]) => h('option', { value: v }, l)));
   let debounce;
   search.addEventListener('input', () => { clearTimeout(debounce); debounce = setTimeout(() => { state.q = search.value.trim(); state.cursor = null; state.stack = []; draw(); }, 250); });
 

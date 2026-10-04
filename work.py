@@ -333,8 +333,15 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         # but a closed task is no longer offered to a reviewer. Outstanding
         # requested changes, an approved-but-unintegrated revision and a malformed
         # history stay visible: closure is not acceptance, and a broken chain must
-        # still be surfaced.
-        if row.get('status')=='closed' and state not in ('changes-requested','awaiting-integration','error'):continue
+        # still be surfaced. A WITHDRAWN (or superseded) contribution with a
+        # blocking item still open stays visible for the same reason as
+        # changes-requested: the item is actionable work although the revision is
+        # final (kittrial-5bb.110 item 4).
+        closed_open_item = bool(review.get('pending_requests'))
+        if (row.get('status')=='closed'
+                and state not in ('changes-requested','awaiting-integration','error')
+                and not (state in ('withdrawn','superseded') and closed_open_item)):
+            continue
         if a.state and a.state!=state:continue
         contribution=review.get('contribution') or {}
         scope=facts.get(row['id'],{}).get('scope') or {}

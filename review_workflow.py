@@ -107,12 +107,14 @@ MAX_OPEN_REVIEW_REQUESTS = 10
 REVIEWER = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}')
 #: Plain text for a field another worker reads (the rule ``guidance`` applies):
 #: no C0 control characters other than tab/newline/carriage return and no DEL, no
-#: C1 controls, bidi controls, word joiners, BOM or Unicode tag characters, and a
+#: C1 controls, bidi controls, word joiners, BOM, Unicode tag characters or
+#: variation selectors (U+E0100-U+E01EF, as guidance refuses), and a
 #: ZWNJ/ZWJ only between letters. Applied on the WRITE path, so a record written
 #: before the rule existed still reads.
 PLAIN_CONTROL = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 PLAIN_INVISIBLE = re.compile('[\u0080-\u009f\u00ad\u200b\u200e\u200f\u2028\u2029\u202a-\u202e'
-                             '\u2060-\u2064\u2066-\u2069\ufeff\U000E0000-\U000E007F]')
+                             '\u2060-\u2064\u2066-\u2069\ufeff\U000E0000-\U000E007F'
+                             '\U000E0100-\U000E01EF]')
 PLAIN_JOINER = re.compile('[\u200c\u200d]')
 #: Item severity on a request-changes item. Absent means ``blocking`` so every
 #: record written before severity existed keeps blocking approval.
@@ -212,7 +214,8 @@ def plain_text(value, name):
     if PLAIN_CONTROL.search(value):
         raise ValueError(f'{name} must be plain text (no control characters)')
     if PLAIN_INVISIBLE.search(value):
-        raise ValueError(f'{name} must be plain text (no bidi, zero-width, C1 or tag characters)')
+        raise ValueError(f'{name} must be plain text (no bidi, zero-width, C1, tag or '
+                         'variation-selector characters)')
     for match in PLAIN_JOINER.finditer(value):
         before = value[match.start() - 1] if match.start() else ''
         after = value[match.end()] if match.end() < len(value) else ''
@@ -244,6 +247,29 @@ def check_plain_text(payload):
                         plain_text(item[key], 'resolution ' + key)
 
 
+def new_write_field(payload):
+    """The operation or FIELD a validated payload writes that is new in kittrial-5bb.94.
+
+    Returns ``None`` for a legacy shape. A new operation names the operation; a
+    request-changes carrying the additive ``summary`` or an item ``severity`` names
+    that FIELD, so the switch-off refusal points at the field (item 7) instead of
+    only saying ``operation/field request-changes``. Both are named when both are set.
+    """
+    op = payload.get('operation')
+    if op in NEW_WRITE_OPERATIONS:
+        return 'operation ' + str(op)
+    if op == 'request-changes':
+        named = []
+        if 'summary' in payload:
+            named.append('summary')
+        if any(isinstance(item, dict) and item.get('severity') is not None
+               for item in payload.get('items') or []):
+            named.append('item severity')
+        if named:
+            return 'request-changes ' + ' and '.join(named)
+    return None
+
+
 def new_write_requested(payload):
     """Whether a validated payload writes a new-shaped record (item 3).
 
@@ -252,19 +278,12 @@ def new_write_requested(payload):
     are additive fields. A legacy ``{id, text}`` request-changes item is an OLD
     shape and is not gated.
     """
-    if payload.get('operation') in NEW_WRITE_OPERATIONS:
-        return True
-    if payload.get('operation') == 'request-changes':
-        if 'summary' in payload:
-            return True
-        return any(isinstance(item, dict) and item.get('severity') is not None
-                   for item in payload.get('items') or [])
-    return False
+    return new_write_field(payload) is not None
 
 
 def new_write_refusal(payload):
     """The refusal text for a new-shaped write on an installation with the switch off."""
-    return ('Review workflow operation/field ' + str(payload.get('operation')) +
+    return ('Review workflow ' + (new_write_field(payload) or str(payload.get('operation'))) +
             ' writes a new record shape that a kit built before kittrial-5bb.94 cannot read. '
             'This installation has review_workflow_writes off (the default); the readers here '
             'understand the new operations and fields already, so this is a write switch, not a '

@@ -416,11 +416,13 @@ them is therefore staged in two steps, and this kit is step one.
 * **Readers understand the new shapes unconditionally.** `review`, `brief`, `work`
   and `history` parse and project them whatever the switch below says.
 * **Writers are off by default.** `deployment.private.json` gains one boolean,
-  `review_workflow_writes`; absent or `false` means **OFF**, and a non-boolean value
-  is refused. With it off, a review write of any new shape is refused before any
-  native write, and a legacy request-changes item (`{id, text}`, no severity, no
-  summary) still works. An exact retry of an operation id already in the chain still
-  reconciles, so records written while it was on stay recoverable.
+  `review_workflow_writes`; absent or `false` means **OFF**, and a value that is not
+  a boolean (a hand-set `"yes"`, say) is **read as OFF with a warning** rather than
+  refused, so a malformed value cannot make `work` or `review` fail for every actor
+  while `brief` still answers. With it off, a review write of any new shape is
+  refused before any native write, and a legacy request-changes item (`{id, text}`,
+  no severity, no summary) still works. An exact retry of an operation id already in
+  the chain still reconciles, so records written while it was on stay recoverable.
 * **The coordinator turns it on** once the rollback target is a kit that reads the
   new shapes:
 

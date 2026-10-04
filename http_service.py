@@ -995,8 +995,12 @@ class InProcessBackend:
 
 #: Review states that still need someone to act (``work.queue`` keeps these even on a
 #: closed task). ``approved`` is the in-process name for ``awaiting-integration``.
+#: ``withdrawn``/``superseded`` are additive (kittrial-5bb.94): the canonical ``work``
+#: queue lists such a task while a blocking item is still open, so the HTTP queue and
+#: its ``state=`` filter accept them too or the two transports disagree
+#: (kittrial-5bb.110 item 9).
 ACTIVE_REVIEW_STATES = ('changes-requested', 'error', 'awaiting-review', 'legacy-review-ready',
-                        'awaiting-integration', 'approved')
+                        'awaiting-integration', 'approved', 'withdrawn', 'superseded')
 QUEUE_PRIORITY = {'changes-requested': 0, 'error': 1, 'awaiting-review': 2,
                   'legacy-review-ready': 2, 'awaiting-integration': 3, 'approved': 3}
 
@@ -1301,15 +1305,29 @@ class EndpointBackend:
         # A reviewer's recommendation (kittrial-5bb.115): a record beside the chain, so
         # it carries no `previous` (see REVIEW_NO_PREVIOUS).
         'recommend': ('contribution', 'commit', 'verdict', 'summary', 'items'),
+        # The additive review-workflow operations (kittrial-5bb.94, checked over HTTP by
+        # kittrial-5bb.110 item 9). Without these the canonical backend refused every
+        # one of them as an unknown operation, so the new states could not be reached
+        # over HTTP at all.
+        'withdraw': ('contribution', 'reason'),
+        'request-review': ('contribution', 'reviewer'),
+        'resolve-item': ('contribution', 'request', 'item', 'reason'),
+        'decline-review': ('contribution', 'request', 'reason'),
     }
     #: Operations whose canonical record takes no ``previous``.
     REVIEW_NO_PREVIOUS = ('recommend',)
     #: Optional canonical review fields: forwarded only when the caller supplied them,
     #: so old payloads keep the exact legacy field set (no operation-inappropriate
     #: nulls) and a follow-on's additive ``follows`` relation is not silently dropped
-    #: into a first contribution or a supersede.
+    #: into a first contribution or a supersede. The request-changes summary, a
+    #: request-review summary and the withdrawn/resolve dispositions are the same kind
+    #: of additive field (kittrial-5bb.94 items 3 and 5).
     REVIEW_OPTIONAL_FIELDS = {
         'contribute': ('follows',),
+        'request-changes': ('summary',),
+        'request-review': ('summary',),
+        'withdraw': ('disposition',),
+        'resolve-item': ('disposition',),
     }
     CHECKPOINT_FIELDS = ('schema_version', 'previous', 'activity_cursor', 'source_commit',
                          'branch', 'intent', 'acceptance', 'summary', 'next_action',
@@ -1378,8 +1396,8 @@ class EndpointBackend:
         if route == 'reviews.add':
             operation = payload.get('operation')
             if operation not in self.REVIEW_FIELDS:
-                raise invalid('Review operation must be contribute, request-changes, '
-                              'respond, approve or recommend')
+                raise invalid('Unsupported review operation %r; expected one of: %s'
+                              % (operation, ', '.join(sorted(self.REVIEW_FIELDS))))
             common = tuple(field for field in self.REVIEW_COMMON
                            if not (field == 'previous' and operation in self.REVIEW_NO_PREVIOUS))
             if operation == 'recommend' and 'items' not in payload:
@@ -1684,8 +1702,43 @@ class EndpointBackend:
         requests = [{'id': item.get('item'), 'request': item.get('request'),
                      'text': item.get('text'), 'contribution': item.get('contribution'),
                      'author': item.get('author'), 'at': item.get('timestamp'),
-                     'status': 'open', 'resolution': None}
+                     'status': 'open', 'resolution': None,
+                     # Additive (kittrial-5bb.94, exposed over HTTP by kittrial-5bb.110
+                     # item 9): the item's severity and the request-changes summary that
+                     # asked for it. Absent severity reads as blocking.
+                     'severity': item.get('severity') or 'blocking',
+                     'summary': item.get('summary')}
                     for item in review.get('pending_requests') or [] if isinstance(item, dict)]
+
+        def note_view(item):
+            return {'id': item.get('item'), 'request': item.get('request'),
+                    'text': item.get('text'), 'contribution': item.get('contribution'),
+                    'author': item.get('author'), 'at': item.get('timestamp'),
+                    'status': 'open', 'severity': item.get('severity') or 'note',
+                    'summary': item.get('summary')}
+
+        def request_view(entry):
+            return {'request': entry.get('request'), 'reviewer': entry.get('reviewer'),
+                    'summary': entry.get('summary'), 'contribution': entry.get('contribution'),
+                    'author': entry.get('author'), 'at': entry.get('timestamp')}
+
+        # The additive review-workflow states (kittrial-5bb.94): non-blocking items,
+        # open first-class review requests, the requests their named reviewer declined
+        # and the withdraw/supersede record for the current contribution.
+        note_requests = [note_view(item) for item in review.get('note_requests') or []
+                         if isinstance(item, dict)]
+        pending_review_requests = [request_view(entry)
+                                   for entry in review.get('pending_review_requests') or []
+                                   if isinstance(entry, dict)]
+        declined_review_requests = [dict(request_view(entry), reason=entry.get('reason'))
+                                    for entry in review.get('declined_review_requests') or []
+                                    if isinstance(entry, dict)]
+        raw_withdrawal = review.get('withdrawal')
+        withdrawal = ({'disposition': raw_withdrawal.get('disposition'),
+                       'reason': raw_withdrawal.get('reason'),
+                       'author': raw_withdrawal.get('author'),
+                       'at': raw_withdrawal.get('timestamp')}
+                      if isinstance(raw_withdrawal, dict) else None)
         lifecycle = {dimension: {'value': fact.get('value'), 'note': None}
                      for dimension, fact in (data.get('lifecycle') or {}).items()
                      if isinstance(fact, dict)}
@@ -1695,6 +1748,12 @@ class EndpointBackend:
                            'contribution': contribution, 'requests': requests,
                            'open_requests': review.get('pending_total', len(requests)),
                            'latest_id': review.get('latest_comment_id'),
+                           # Additive (kittrial-5bb.94): the new states travel with every
+                           # brief read, exactly as `review TASK` reports them.
+                           'note_requests': note_requests,
+                           'pending_review_requests': pending_review_requests,
+                           'declined_review_requests': declined_review_requests,
+                           'withdrawal': withdrawal,
                            # Additive (kittrial-5bb.115): the standing recommendation.
                            'recommendation': self._recommendation(review.get('recommendation')),
                            'recommendations': [{'id': entry.get('comment_id'), 'author': entry.get('author'),
