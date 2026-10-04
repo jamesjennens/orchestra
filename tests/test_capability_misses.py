@@ -41,6 +41,9 @@ except ImportError:
     REAL_FCNTL = None
 
 T0 = '2026-10-01T12:00:00Z'
+# The documented bounds, as literals: a loop written with `cm.ENTRIES_MAX` or `cm.NEW_PER_HOUR` would run
+# for as long as a changed bound says, so a wrong bound would hang the suite instead of failing it.
+ENTRIES, PER_HOUR = 500, 60
 REPORT_FIELDS = {'schema_version', 'schema', 'contract', 'trust', 'log', 'recording', 'notice', 'since', 'finds', 'misses', 'miss_rate',
                  'phrases_stored', 'phrases_resolved_now', 'not_stored', 'limit', 'phrases', 'bounds', 'coverage'}
 PHRASE_FIELDS = {'trust', 'phrase', 'count', 'first_seen', 'last_seen', 'resolves_now', 'resolved_by'}
@@ -214,7 +217,7 @@ class RecordTests(MissLogCase):
         for minute in range(41):
             cm.apply(log, 'genuine phrase', False, at(minute % 60))
         for hour in range(13, 13 + 11):
-            for number in range(cm.NEW_PER_HOUR):
+            for number in range(PER_HOUR):
                 cm.apply(log, 'junk %d %d' % (hour, number), False, at(number % 60, hour=hour % 24,
                                                                         day=1 + hour // 24))
         self.assertEqual(len(log['phrases']), cm.ENTRIES_MAX)
@@ -252,7 +255,7 @@ class RecordTests(MissLogCase):
             for phrase in junk:
                 if phrase in log['phrases']:
                     self.assertEqual(cm.apply(log, phrase, False, at(0, hour=hour)), 'counted')
-            for number in range(cm.NEW_PER_HOUR):
+            for number in range(PER_HOUR):
                 junk.append('junk %d %d' % (hour, number))
                 cm.apply(log, junk[-1], False, at(1 + number % 58, hour=hour))
         self.assertTrue(cm._valid(log))
@@ -273,7 +276,7 @@ class RecordTests(MissLogCase):
     def test_the_real_cap_holds(self):
         with patch.object(cm, 'NEW_PER_HOUR', 10 ** 6):
             log = cm._fresh(T0)
-            for number in range(cm.ENTRIES_MAX + 25):
+            for number in range(ENTRIES + 25):
                 self.assertEqual(cm.apply(log, 'phrase number %d' % number, False, at(number % 60, number // 60)),
                                  'recorded')
             self.assertEqual((len(log['phrases']), log['evicted']), (cm.ENTRIES_MAX, 25))
@@ -298,8 +301,8 @@ class RecordTests(MissLogCase):
     def test_the_default_bounds_are_the_documented_ones(self):
         self.assertEqual((cm.ENTRIES_MAX, cm.NEW_PER_HOUR, cm.PHRASE_CHARS_MAX), (500, 60, 80))
         log = cm._fresh(T0)
-        results = [cm.apply(log, 'phrase %d' % number, False, T0) for number in range(cm.NEW_PER_HOUR + 5)]
-        self.assertEqual((results.count('recorded'), results.count('overflow')), (cm.NEW_PER_HOUR, 5))
+        results = [cm.apply(log, 'phrase %d' % number, False, T0) for number in range(PER_HOUR + 5)]
+        self.assertEqual((results.count('recorded'), results.count('overflow')), (PER_HOUR, 5))
 
     def test_a_corrupt_oversized_or_foreign_file_starts_a_fresh_log(self):
         good = cm._fresh(T0)
@@ -322,7 +325,7 @@ class RecordTests(MissLogCase):
             'entry extra': json.dumps(dict(good, phrases={'merge slot': {'count': 1, 'first': T0, 'last': T0,
                                                                          'actor': 'alice'}})).encode(),
             'too many': json.dumps(dict(good, phrases={'p %d' % n: {'count': 1, 'first': T0, 'last': T0}
-                                                       for n in range(cm.ENTRIES_MAX + 1)})).encode(),
+                                                       for n in range(ENTRIES + 1)})).encode(),
             'deep nesting': b'[' * 200000,
             'oversized': b' ' * (cm.FILE_BYTES_MAX + 1),
             'empty': b'',

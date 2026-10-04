@@ -160,7 +160,8 @@ b ref list --tag data --json
   (`accepted` or `draft`), `authority_kind` and `source` (the `ref get` to run). It
   returns no statement: read the entry with `ref get`. A phrase is an exact match when
   it is an entry's key or title, or when every word of it is in that entry's key, title
-  and tags.
+  and tags. Use at least two words that mean something: common words (`the`, `how`,
+  `for`) and one- or two-letter words are ignored.
 - **A miss is counted.** A `ref find` with no exact match, and a `ref get` of a key
   nobody has recorded, are counted with their phrase so the coordinator can see what is
   missing (`ref misses`). No actor is stored.
@@ -186,7 +187,7 @@ b ref list --tag data --json
   drafts, and lists the keys of accepted entries that match your in-progress tasks.
   `brief TASK` shows up to three entries tagged like the task and up to three accepted
   entries that match its title. Neither shows a draft: you get only a count of the
-  drafts that match, and read them yourself with `ref find`.
+  drafts that match (9 means 9 or more).
 
 ## Propose a requirement instead of opening a task
 

@@ -341,7 +341,9 @@ def format_brief(result):
     if result.get('attention_more'):
         lines.append('More attention: %d (ref list --due expired; proposal list; capability list)'%result['attention_more'])
     if result.get('reference_drafts_matching'):
-        lines.append('Draft reference entries that match this task: %d (not accepted, not authoritative; read them with ref find)'%result['reference_drafts_matching'])
+        from reference_records import DRAFTS_SHOWN_MAX
+        count=result['reference_drafts_matching']
+        lines.append('Draft reference entries that match this task: %s (not accepted, not authoritative)'%('%d or more'%count if count>=DRAFTS_SHOWN_MAX else count))
     return '\n'.join(lines)+'\n'
 
 def help_limits(action):
@@ -371,7 +373,8 @@ def help_notes(action):
                 'attention lists at most 3 reference-review items (entries tagged with the task\'s labels, '
                 'then expired and due-soon), expired first, then at most 3 reference items (accepted entries '
                 'whose key, title or tags share at least two words with the task title; '
-                'reference_drafts_matching counts the drafts that match and shows nothing else of them), '
+                'reference_drafts_matching counts the drafts that match, 9 meaning 9 or more, and shows '
+                'nothing else of them), '
                 'then at most 3 proposal-review items (proposals '
                 'that target this requirement record or one of the task\'s area labels, then, for an operator, '
                 'the oldest waiting ones), then at most 3 capability items (accepted capabilities tagged with '

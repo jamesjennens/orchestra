@@ -986,6 +986,10 @@ line separately and unconfined.
     starts `NOT ACCEPTED.` for a draft; show that sentence wherever the entry is shown.
   - **404:** an unknown key, or an entry left without a record by an interrupted
     propose.
+  - **Telemetry:** the get route runs `ref get`, which the endpoint counts in the
+    [reference lookup-miss log](OPERATIONS.md#the-reference-lookup-miss-log). A get of an
+    unknown key stores that key's words, a count and two timestamps, and no account. So a
+    member with read access writes to that log; it is bounded and never backed up.
   - **In-process backend:** it holds no native records, so its catalog is empty.
   - **Read-only:** there are no HTTP writes; proposals use the client and acceptance
     uses `admin.py reference-apply`.

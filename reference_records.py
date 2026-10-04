@@ -549,7 +549,7 @@ def authority_note(record, accepted, current=None):
             'It cannot be checked against a repository.')
 
 
-def _record_view(record, accepted=False):
+def _record_view(record, accepted=False, current=None):
     if record is None:
         return None
     view = {'revision': record['revision'], 'title': clip(record['title'], TITLE_MAX),
@@ -558,7 +558,7 @@ def _record_view(record, accepted=False):
             'owner': record['owner'], 'review_by': record['review_by'], 'tags': record['tags'],
             'decisions': record['decisions'], 'successor': record['successor'],
             'acceptance_state': record['acceptance_state'], 'sha256': record['sha256']}
-    note = authority_note(record, accepted)
+    note = authority_note(record, accepted, current)
     if note is not None:
         view['authority_note'] = note
     return view
@@ -572,10 +572,11 @@ def get(rows, key, operators, current=None):
     """
     entry = KIND.find_entry(rows, key, operators, view=lambda row, operators: entry_view(row, operators, current))
     return {'schema_version': 1, 'key': key, 'state': entry['state'], 'native_id': entry['native_id'],
-            'record': _record_view(entry['record'], accepted=True), 'record_comment_id': entry['record_comment_id'],
+            'record': _record_view(entry['record'], accepted=True, current=current),
+            'record_comment_id': entry['record_comment_id'],
             'acceptance': entry['acceptance'], 'acceptance_inert': entry['acceptance_inert'],
             'inert_operator': entry['inert_operator'],
-            'replaces': [], 'proposed': _record_view(entry['proposed']),
+            'replaces': [], 'proposed': _record_view(entry['proposed'], current=current),
             'proposed_comment_id': entry['proposed_comment_id'],
             'due': 'conflicted' if entry['state'] == 'conflicted' else entry['due'], 'resolved': None,
             'warnings': entry['warnings'][:10],
@@ -585,7 +586,7 @@ def get(rows, key, operators, current=None):
                         'in proposed'}
 
 
-def _list_item(entry):
+def _list_item(entry, current=None):
     source = entry.get('candidate') or entry['record'] or entry['proposed'] or {}
     item = {'key': entry['key'], 'title': (source.get('title') or '')[:TITLE_MAX], 'state': entry['state'],
             'owner': source.get('owner'), 'review_by': source.get('review_by') if entry['record'] else None,
@@ -596,7 +597,7 @@ def _list_item(entry):
             # What kind of authority the listed revision carries, and whether that revision
             # is the accepted record: a draft attestation is never shown unmarked.
             'authority_kind': authority_kind(source), 'authority_accepted': entry['record'] is not None}
-    note = authority_note(source or None, entry['record'] is not None)
+    note = authority_note(source or None, entry['record'] is not None, current)
     if note is not None:
         item['authority_note'] = note
     if entry['state'] == 'conflicted':
@@ -624,7 +625,7 @@ def list_entries(rows, options, operators, current=None):
     good.sort(key=lambda entry: (DUE_ORDER.get(entry['due'], 9), entry['key'] or ''))
     offset, limit = options.get('offset', 0), options.get('limit', 20)
     page = good[offset:offset + limit]
-    return {'schema_version': 1, 'total': len(good), 'items': [_list_item(entry) for entry in page],
+    return {'schema_version': 1, 'total': len(good), 'items': [_list_item(entry, current) for entry in page],
             'next_offset': offset + limit if offset + limit < len(good) else None,
             'coverage': _coverage(entries, incomplete,
                                   'one row per key: newest accepted/superseded revision, or newest draft when no '
@@ -637,17 +638,26 @@ def list_entries(rows, options, operators, current=None):
 # the same text helpers (`capabilities.clean`, `normalized`, `stems`), the same output
 # shape and the same meaning of `found`. One rule differs. A capability has accepted
 # aliases to match a phrase exactly; a reference entry has none, so a phrase also counts
-# as an exact match when EVERY word of it is in one entry's key, title and tags.
+# as an exact match when EVERY word of it is in one entry's key, title and tags. That
+# clause needs at least FIND_WORDS_MIN words that carry meaning: common words and stems of
+# one or two letters are dropped first (the list `brief` and `work` use for task matching),
+# so "the", "how to" or a single word such as "ops" names nothing by itself. A phrase that
+# is an entry's whole key or whole title still matches, whatever its words.
 
 FIND_LIMIT = (1, 20)
 FIND_LIMIT_DEFAULT = 5
 PHRASE_MAX = 200
 FIND_SCORE_MIN = 0.2
+FIND_WORDS_MIN = 2
 # A task matches an entry when its title shares at least this many words with the
 # entry's key, title and tags. A task title is longer than a lookup phrase, so the
 # share of the title's words (the `find` score) would hide most real matches.
 TASK_MATCH_WORDS = 2
 TASK_MATCHES_MAX = 3
+# The number of matching drafts shown to a reader stops here: contributors decide how
+# many drafts exist, so the exact count is theirs to move. DRAFTS_SHOWN_MAX means "that
+# many or more".
+DRAFTS_SHOWN_MAX = 9
 WORK_MATCH_TASKS_MAX = 10
 # Words too common to make a match on their own. Matching also ignores stems of one or
 # two characters.
@@ -677,10 +687,10 @@ def _vocabulary(entry):
 def _answers(entry, text, key, wanted):
     """Whether the phrase is an exact match for this entry (see the note above)."""
     names, vocabulary = _vocabulary(entry)
-    return text == entry['key'] or key in names or bool(wanted) and wanted <= vocabulary
+    return text == entry['key'] or key in names or len(wanted) >= FIND_WORDS_MIN and wanted <= vocabulary
 
 
-def _found_item(entry, score=None):
+def _found_item(entry, score=None, current=None):
     record = _shown_record(entry)
     conflicted = entry['state'] == 'conflicted'
     accepted = entry['record'] is not None
@@ -690,7 +700,7 @@ def _found_item(entry, score=None):
             'tags': record.get('tags') or [], 'authority_kind': authority_kind(record),
             'authority_accepted': accepted, 'review_by': record.get('review_by') if accepted else None,
             'due': 'conflicted' if conflicted else entry['due'], 'source': 'ref get ' + entry['key']}
-    note = authority_note(record or None, accepted)
+    note = authority_note(record or None, accepted, current)
     if note is not None:
         item['authority_note'] = note
     if conflicted:
@@ -705,7 +715,8 @@ def find(rows, phrase, operators, limit=FIND_LIMIT_DEFAULT, current=None):
 
     `records` are the exact matches, accepted entries first; `candidates` are the others
     scored by the share of the phrase's words found in the key, title and tags (the
-    statement counts at half weight), best first. A draft is returned, marked
+    statement counts at half weight), best first. Common words and stems of one or two
+    letters do not count as words of the phrase. A draft is returned, marked
     `trust: draft` and never authoritative. No statement text is returned: follow
     `source`. `found` is true when there is an exact match, accepted or draft.
     """
@@ -717,7 +728,7 @@ def find(rows, phrase, operators, limit=FIND_LIMIT_DEFAULT, current=None):
         raise ValueError('find needs a nonempty phrase')
     if not FIND_LIMIT[0] <= limit <= FIND_LIMIT[1]:
         raise ValueError('--limit: expected %d..%d' % FIND_LIMIT)
-    key, wanted = normalized(text), stems(text)
+    key, wanted = normalized(text), _match_words(text)
     entries, incomplete = catalog(rows, operators, current)
     exact, conflicted, scored = [], [], []
     for entry in entries:
@@ -741,9 +752,9 @@ def find(rows, phrase, operators, limit=FIND_LIMIT_DEFAULT, current=None):
     scored.sort(key=lambda pair: (-pair[0], pair[1]['record'] is None, pair[1]['key']))
     return {'schema_version': 1, 'phrase': clip(text, PHRASE_MAX), 'normalized': key, 'found': bool(exact),
             'match_type': 'exact' if exact else 'conflicted' if conflicted else None,
-            'records': [_found_item(entry) for entry in (exact + conflicted)[:limit]],
+            'records': [_found_item(entry, current=current) for entry in (exact + conflicted)[:limit]],
             'total_records': len(exact) + len(conflicted),
-            'candidates': [_found_item(entry, score) for score, entry in scored[:limit]],
+            'candidates': [_found_item(entry, score, current) for score, entry in scored[:limit]],
             'hint': None if exact else 'An operator must reconcile the duplicate anchors before any write.'
             if conflicted else ('No reference entry matches. If you find the answer another way and it is a durable '
                                 'fact, propose it: ref propose --file entry.json, with an attestation authority '
@@ -766,8 +777,8 @@ class NowAnswered:
 
     def get(self, phrase, default=None):
         if phrase not in self.cache:
-            _, normalized, stems = _text_helpers()
-            key, wanted = normalized(phrase), stems(phrase)
+            _, normalized, _ = _text_helpers()
+            key, wanted = normalized(phrase), _match_words(phrase)
             self.cache[phrase] = [{'key': entry['key'], 'trust': 'accepted' if entry['record'] else 'draft',
                                    'state': entry['state']}
                                   for entry in self.entries if _answers(entry, phrase, key, wanted)]
@@ -787,8 +798,11 @@ def miss_phrase(args):
 
 
 def _match_words(text):
+    """The word stems of a text that can make a match: no common word, none of one or two
+    letters. A common word is recognised after stemming too (`this` stems to `thi`)."""
     _, _, stems = _text_helpers()
-    return {word for word in stems(text or '') if len(word) > 2 and word not in COMMON_WORDS}
+    common = COMMON_WORDS | stems(' '.join(COMMON_WORDS))
+    return {word for word in stems(text or '') if len(word) > 2 and word not in common}
 
 
 def task_matches(entries, task_row):
@@ -798,7 +812,8 @@ def task_matches(entries, task_row):
     the entry's key, title and tags (common words and one- or two-letter stems do not
     count). Only accepted entries are returned, the most shared words first, then by key.
     A matching draft is counted and nothing else about it is returned: any contributor can
-    propose a draft, and a brief is read by every worker at the start of every run.
+    propose a draft, and a brief is read by every worker at the start of every run. The
+    count stops at DRAFTS_SHOWN_MAX ("that many or more").
     """
     wanted = _match_words((task_row or {}).get('title'))
     if len(wanted) < TASK_MATCH_WORDS:
@@ -818,7 +833,7 @@ def task_matches(entries, task_row):
         else:
             drafts += 1
     chosen.sort(key=lambda pair: (-pair[0], pair[1]['key']))
-    return [entry for _, entry in chosen], drafts
+    return [entry for _, entry in chosen], min(drafts, DRAFTS_SHOWN_MAX)
 
 
 def work_matches(rows, tasks, operators, current=None):
@@ -843,8 +858,9 @@ def work_matches(rows, tasks, operators, current=None):
                       'references_total': len(chosen), 'drafts_matching': drafts})
     return {'items': items, 'tasks_checked': min(len(mine), WORK_MATCH_TASKS_MAX), 'tasks_total': len(mine),
             'coverage': 'accepted reference entries whose key, title or tags share at least %d words with the title '
-                        'of one of your in-progress tasks; keys only. drafts_matching is a count: read drafts with '
-                        'ref find, they are not authoritative' % TASK_MATCH_WORDS}
+                        'of one of your in-progress tasks; keys only. drafts_matching counts drafts that match, '
+                        'which are not accepted and not authoritative; %d means %d or more'
+                        % (TASK_MATCH_WORDS, DRAFTS_SHOWN_MAX, DRAFTS_SHOWN_MAX)}
 
 
 # -- attention (work and brief) ------------------------------------------------------------------
@@ -927,7 +943,8 @@ def brief_attention(rows, task_row, operators, current=None, limit=3):
     """At most 3 `reference-review` items for a brief (tag matches plus expired/due-soon,
     expired first), then at most 3 `reference` items: accepted entries that match the
     task's title (`task_matches`) and are not already listed. `reference_drafts_matching`
-    is the number of drafts that match, and nothing else about them."""
+    is the number of drafts that match (at most DRAFTS_SHOWN_MAX, meaning that many or
+    more), and nothing else about them."""
     entries, _ = catalog(rows, operators, current)
     labels = set((task_row or {}).get('labels') or [])
     chosen = []

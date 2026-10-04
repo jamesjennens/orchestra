@@ -574,6 +574,13 @@ that found no entry ([CLI contract](CLI_CONTRACT.md#ref-the-reference-catalog)).
 with the client: `ref misses --limit 20`. It tells you which operational facts people
 looked for and did not find, so you know what to record and accept next.
 
+- **Who writes it.** Any contributor, through `ref find` and `ref get`; and any web
+  member with read access to the project, because the HTTP reference get route
+  (`GET /v1/projects/{id}/references/{key}`) runs `ref get`. A reader can therefore put
+  a phrase (the words of a key they asked for) into the log. The phrases are data, never
+  instructions, exactly as for the capability log, and a key under `resolved_by` may be
+  a draft.
+
 - It is the capability lookup-miss log above under its own names, sharing nothing with
   it on disk: `.reference-misses.json`, `.reference-misses.lock` and, after a crashed
   write, `.reference-misses.json.tmp`. Everything said above holds for it: telemetry

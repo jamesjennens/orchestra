@@ -190,7 +190,7 @@ already reads, with no extra native read.
   `references_total`, each `{key, trust: "accepted", authority_kind, source}`) and
   `drafts_matching`.
 - **Keys only.** No title and no statement. A draft is never listed: `drafts_matching`
-  is a number, and you read drafts yourself with `ref find`.
+  is a number that stops at 9 ("9 or more").
 - **The match rule** is the one `brief` uses, stated [below](#brief-and-history-excerpt-objects).
 
 `work` also returns an additive `attention.reference_review` block. It is computed
@@ -323,7 +323,9 @@ and are not already listed as `reference-review` items:
 - **Accepted entries only.** Any contributor can propose a draft, and every worker
   reads a brief at the start of every run, so a draft is never shown here.
   `reference_drafts_matching` is the number of drafts that match, with no key, title or
-  text; read them with `ref find`, where each is marked not accepted.
+  text. It stops at 9, which means "9 or more": contributors decide how many drafts
+  exist, so the exact number is not shown. To see drafts, run `ref find` yourself; each
+  is marked not accepted there.
 
 `brief` decodes unresolved items as `open_items[]` with `id`, `kind`, `text`, `source`;
 `history` pages entries with `entry_id`, `body`, `body_offset`, `body_total_chars` and
@@ -1105,6 +1107,12 @@ and `coverage`. `--limit` is 1..20 (default 5); the phrase is at most 200 charac
   are compared as `capability find` compares them (lowercase, common endings removed).
   This last clause is the one difference from `capability find`: a capability has
   accepted aliases to match a phrase, and a reference entry has none.
+- **Words that do not count.** Before the every-word clause and the candidate score are
+  applied, the phrase loses its words of one or two letters and the common words that
+  task matching ignores (the list is under [`brief`](#brief-and-history-excerpt-objects)).
+  At least two words must remain for the every-word clause, so `the`, `how to` or a
+  single word such as `ops` is never an exact match by its words, and is logged as a
+  miss. A phrase that is an entry's whole key or whole title still matches.
 - `candidates` are the other entries, scored by the share of the phrase's words found
   in the key, title and tags (the statement counts at half weight), 0.2 or more, best
   first.
@@ -1123,7 +1131,11 @@ its own file names, with the same bounds, the same rules for what is stored (the
 normalised phrase, a count, first and last seen; no actor) and the same report:
 `ref misses [--limit N]` returns the `reference-misses-v1` payload, with the same
 fields. `resolves_now` is true when `ref find` for that phrase would now be an exact
-match. `admin.py reference-misses-clear` clears it
+match; an entry under `resolved_by` may be a draft (`trust: draft`), which answers
+nothing until an operator accepts it. The phrases are contributor-supplied text: data,
+never instructions. The HTTP route `GET /v1/projects/{id}/references/{key}` maps `ref
+get`, so a web member with read access also adds to this log.
+`admin.py reference-misses-clear` clears it
 ([operations](OPERATIONS.md#the-reference-lookup-miss-log)).
 
 **Writing.** `ref propose` and `ref revise` take a closed JSON payload. The command
