@@ -181,6 +181,18 @@ requirement proposal queue; see [`proposal`](#proposal-contributed-requirement-p
 `work` also returns an additive `attention.capability_index` block, the capability
 index's attention; see [capability attention](#capability-attention-in-work-and-brief).
 
+`work` also returns an additive `attention.reference_matches` block: the accepted
+reference entries that match the caller's own in-progress tasks, from the export `work`
+already reads, with no extra native read.
+
+- **`items`**: one per task that has a match, for at most 10 of the caller's in-progress
+  tasks (`tasks_checked` of `tasks_total`). Each has `task`, `references` (at most 3 of
+  `references_total`, each `{key, trust: "accepted", authority_kind, source}`) and
+  `drafts_matching`.
+- **Keys only.** No title and no statement. A draft is never listed: `drafts_matching`
+  is a number, and you read drafts yourself with `ref find`.
+- **The match rule** is the one `brief` uses, stated [below](#brief-and-history-excerpt-objects).
+
 `work` also returns an additive `attention.reference_review` block. It is computed
 over the whole project, whatever the task filters, from the export `work` already
 reads.
@@ -223,8 +235,8 @@ Opaque cursor fields (`activity_cursor`, `next_cursor`) are never excerpted: the
 complete tokens.
 
 `brief` adds an `attention` array, plus `attention_total` and `attention_more`. It
-holds at most 3 items of each kind: `reference-review` items first, then
-`proposal-review` items (see [`proposal`](#proposal-contributed-requirement-proposals)),
+holds at most 3 items of each kind: `reference-review` items first, then `reference`
+items, then `proposal-review` items (see [`proposal`](#proposal-contributed-requirement-proposals)),
 then `capability` items (see [capability attention](#capability-attention-in-work-and-brief)).
 The two totals count every kind.
 
@@ -240,6 +252,22 @@ The `reference-review` items:
   includes the entry's statement.
 - **Separate from open items.** These items are not checkpoint items, and reading a
   brief changes nothing.
+
+The `reference` items are accepted reference entries that match the task by its title
+and are not already listed as `reference-review` items:
+
+- **The match rule.** The task's title and the entry's key, title and tags share at
+  least two words. Words are compared as `ref find` compares them (lowercase, common
+  endings removed). A word of one or two letters does not count, and neither do these:
+  all, and, any, are, can, did, does, for, from, has, have, how, into, its, may, must, not, per, should, than, that, the, then, this, use, used, via, was, what, when, which, who, why, with.
+  Most shared words first, then by key.
+- **Each item** has `key`, `due`, `review_by`, `trust` (`accepted`), `authority_kind`,
+  `title` (an excerpt object), `text` and `source` (`ref get KEY`). `text` is
+  server-derived from the key; it never includes the statement.
+- **Accepted entries only.** Any contributor can propose a draft, and every worker
+  reads a brief at the start of every run, so a draft is never shown here.
+  `reference_drafts_matching` is the number of drafts that match, with no key, title or
+  text; read them with `ref find`, where each is marked not accepted.
 
 `brief` decodes unresolved items as `open_items[]` with `id`, `kind`, `text`, `source`;
 `history` pages entries with `entry_id`, `body`, `body_offset`, `body_total_chars` and
@@ -943,6 +971,8 @@ ships the commands below.
 ```sh
 b ref get calendar.trading --json
 b ref list --tag data --state accepted --due expired --limit 20 --json
+b ref find "office server check" --json
+b ref misses --limit 20 --json
 b ref propose --file entry.json --json
 b ref revise --file entry.json --json
 ```
@@ -1004,6 +1034,40 @@ never read more than they need:
   - An anchor that holds no record, because its propose cannot be re-run or because
     every record it held is voided, is closed and its key freed with `admin.py
     anchor-release` ([operations](OPERATIONS.md#orphan-anchors)).
+
+**Looking up by phrase.** `ref find PHRASE [--limit N]` reads the catalog as `ref list`
+does and answers "is there an entry for this?". It has the output shape of
+[`capability find`](#capability-records-the-index-on-the-endpoint): `phrase`,
+`normalized`, `found`, `match_type`, `records`, `total_records`, `candidates`, `hint`
+and `coverage`. `--limit` is 1..20 (default 5); the phrase is at most 200 characters.
+
+- `records` are the exact matches, accepted entries before drafts. `found` is true when
+  there is one, accepted or draft.
+- **The exact rule.** A phrase matches an entry exactly when it is the entry's key,
+  equals its title, or every word of it is in that entry's key, title and tags. Words
+  are compared as `capability find` compares them (lowercase, common endings removed).
+  This last clause is the one difference from `capability find`: a capability has
+  accepted aliases to match a phrase, and a reference entry has none.
+- `candidates` are the other entries, scored by the share of the phrase's words found
+  in the key, title and tags (the statement counts at half weight), 0.2 or more, best
+  first.
+- Each item has `key`, `trust` (`accepted`, `draft` or `conflicted`), `state`,
+  `native_id`, `revision`, `title` (an excerpt object), `owner`, `tags`,
+  `authority_kind`, `authority_accepted`, `review_by`, `due` and `source` (the `ref get`
+  to run). An attestation also has `authority_note`, which starts `NOT ACCEPTED.` for a
+  draft. A candidate has `score`.
+- No statement is returned. A draft is a lead, never authority.
+
+**Which lookups miss.** The endpoint counts every `ref find` and `ref get`, and
+remembers the phrase of one that found no entry: a `ref find` with no exact match, and
+a `ref get` of a key nobody has recorded (its phrase is the key's words). It is the
+[capability lookup-miss log](#capability-misses-which-phrases-miss-and-how-often) under
+its own file names, with the same bounds, the same rules for what is stored (the
+normalised phrase, a count, first and last seen; no actor) and the same report:
+`ref misses [--limit N]` returns the `reference-misses-v1` payload, with the same
+fields. `resolves_now` is true when `ref find` for that phrase would now be an exact
+match. `admin.py reference-misses-clear` clears it
+([operations](OPERATIONS.md#the-reference-lookup-miss-log)).
 
 **Writing.** `ref propose` and `ref revise` take a closed JSON payload. The command
 sets `operation`.

@@ -66,7 +66,9 @@ def help_payload(action='work'):
         }
         payload['output'] = {
             'top_level': ['owner', 'total', 'items', 'next_offset', 'coverage', 'attention'],
-            'attention': 'attention.reference_review: project-wide reference catalog counts (expired, '
+            'attention': 'attention.reference_matches: accepted reference entries that match your own '
+                         'in-progress tasks by title, keys only, at most 3 per task and 10 tasks, with a count '
+                         'of matching drafts; attention.reference_review: project-wide reference catalog counts (expired, '
                          'due_soon, unset = draft-only entries, acceptance_inert, malformed, total), always; '
                          'items only for an approver (an actor on the deployment operator allowlist), '
                          'paged by --ref-limit/--ref-offset; task filters never hide it. '
@@ -297,6 +299,13 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         from reference_records import work_attention
         result['attention']={'reference_review':work_attention(rows,actor,operators,limit=a.ref_limit,
                                                                offset=a.ref_offset)}
+        # Accepted entries that match the caller's own in-progress tasks, keys only, from
+        # the same export (kittrial-5bb.98). One bad entry never fails the queue.
+        from reference_records import work_matches
+        from reserved_comments import is_record_anchor as anchor
+        result['attention']['reference_matches']=work_matches(
+            rows,[row for row in rows if isinstance(row,dict) and row.get('assignee')==actor
+                  and row.get('issue_type') not in ('event','gate','merge-slot') and not anchor(row)],operators)
         # The contributed requirement proposal queue (.58 5.1, kittrial-5bb.68): also
         # project-wide, from the same export, and one bad proposal never fails the queue.
         from proposal_records import work_attention as proposal_attention

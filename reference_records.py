@@ -624,6 +624,222 @@ def list_entries(rows, options, operators, current=None):
                                   'revision is accepted')}
 
 
+# -- lookup by phrase (kittrial-5bb.98 delivery B) -------------------------------------------------
+#
+# `ref find PHRASE` answers "is there an entry for this?" the way `capability find` does:
+# the same text helpers (`capabilities.clean`, `normalized`, `stems`), the same output
+# shape and the same meaning of `found`. One rule differs. A capability has accepted
+# aliases to match a phrase exactly; a reference entry has none, so a phrase also counts
+# as an exact match when EVERY word of it is in one entry's key, title and tags.
+
+FIND_LIMIT = (1, 20)
+FIND_LIMIT_DEFAULT = 5
+PHRASE_MAX = 200
+FIND_SCORE_MIN = 0.2
+# A task matches an entry when its title shares at least this many words with the
+# entry's key, title and tags. A task title is longer than a lookup phrase, so the
+# share of the title's words (the `find` score) would hide most real matches.
+TASK_MATCH_WORDS = 2
+TASK_MATCHES_MAX = 3
+WORK_MATCH_TASKS_MAX = 10
+# Words too common to make a match on their own. Matching also ignores stems of one or
+# two characters.
+COMMON_WORDS = frozenset('the and for with from that this not are was has have its into than then when what '
+                         'which who how why can may must should does did use used all any per via'.split())
+
+
+def _text_helpers():
+    from capabilities import clean, normalized, stems
+    return clean, normalized, stems
+
+
+def _shown_record(entry):
+    """The revision a lookup judges an entry by: the accepted record, else the newest draft."""
+    return entry.get('candidate') or entry['record'] or entry['proposed'] or {}
+
+
+def _vocabulary(entry):
+    """(exact names, word stems) of one entry: its key words, title and tags."""
+    _, normalized, stems = _text_helpers()
+    record = _shown_record(entry)
+    key_words = (entry['key'] or '').replace('.', ' ').replace('-', ' ')
+    names = {normalized(key_words), normalized(record.get('title') or '')} - {''}
+    return names, stems(' '.join([key_words, record.get('title') or '', ' '.join(record.get('tags') or [])]))
+
+
+def _answers(entry, text, key, wanted):
+    """Whether the phrase is an exact match for this entry (see the note above)."""
+    names, vocabulary = _vocabulary(entry)
+    return text == entry['key'] or key in names or bool(wanted) and wanted <= vocabulary
+
+
+def _found_item(entry, score=None):
+    record = _shown_record(entry)
+    conflicted = entry['state'] == 'conflicted'
+    accepted = entry['record'] is not None
+    item = {'key': entry['key'], 'trust': 'conflicted' if conflicted else 'accepted' if accepted else 'draft',
+            'state': entry['state'], 'native_id': entry['native_id'], 'revision': record.get('revision'),
+            'title': clip(record.get('title') or '', TITLE_MAX), 'owner': record.get('owner'),
+            'tags': record.get('tags') or [], 'authority_kind': authority_kind(record),
+            'authority_accepted': accepted, 'review_by': record.get('review_by') if accepted else None,
+            'due': 'conflicted' if conflicted else entry['due'], 'source': 'ref get ' + entry['key']}
+    note = authority_note(record or None, accepted)
+    if note is not None:
+        item['authority_note'] = note
+    if conflicted:
+        item['anchor_trust'] = entry['anchor_trust']
+    if score is not None:
+        item['score'] = round(score, 3)
+    return item
+
+
+def find(rows, phrase, operators, limit=FIND_LIMIT_DEFAULT, current=None):
+    """`ref find PHRASE`: the entries a phrase names, and the nearest ones when none does.
+
+    `records` are the exact matches, accepted entries first; `candidates` are the others
+    scored by the share of the phrase's words found in the key, title and tags (the
+    statement counts at half weight), best first. A draft is returned, marked
+    `trust: draft` and never authoritative. No statement text is returned: follow
+    `source`. `found` is true when there is an exact match, accepted or draft.
+    """
+    clean, normalized, stems = _text_helpers()
+    if not isinstance(phrase, str) or len(phrase) > PHRASE_MAX:
+        raise ValueError('phrase: expected text up to %d characters' % PHRASE_MAX)
+    text = clean(phrase)
+    if not text:
+        raise ValueError('find needs a nonempty phrase')
+    if not FIND_LIMIT[0] <= limit <= FIND_LIMIT[1]:
+        raise ValueError('--limit: expected %d..%d' % FIND_LIMIT)
+    key, wanted = normalized(text), stems(text)
+    entries, incomplete = catalog(rows, operators, current)
+    exact, conflicted, scored = [], [], []
+    for entry in entries:
+        if entry['state'] in ('malformed', 'unsupported') or entry['key'] is None:
+            continue
+        if _answers(entry, text, key, wanted):
+            (conflicted if entry['state'] == 'conflicted' else exact).append(entry)
+            continue
+        _, vocabulary = _vocabulary(entry)
+        overlap = len(wanted & vocabulary) / len(wanted) if wanted else 0.0
+        statement = len(wanted & stems(_shown_record(entry).get('statement') or '')) / len(wanted) if wanted else 0.0
+        score = max(overlap, 0.5 * statement)
+        if score >= FIND_SCORE_MIN:
+            scored.append((score, entry))
+    exact.sort(key=lambda entry: (entry['record'] is None, entry['key']))
+    groups = {tuple(anchor['native_id'] for anchor in entry['duplicate_anchors']) for entry in conflicted}
+    conflicted = [entry for entry in entries if entry['state'] == 'conflicted'
+                  and tuple(anchor['native_id'] for anchor in entry['duplicate_anchors']) in groups]
+    listed = {entry['native_id'] for entry in conflicted}
+    scored = [pair for pair in scored if pair[1]['native_id'] not in listed]
+    scored.sort(key=lambda pair: (-pair[0], pair[1]['record'] is None, pair[1]['key']))
+    return {'schema_version': 1, 'phrase': clip(text, PHRASE_MAX), 'normalized': key, 'found': bool(exact),
+            'match_type': 'exact' if exact else 'conflicted' if conflicted else None,
+            'records': [_found_item(entry) for entry in (exact + conflicted)[:limit]],
+            'total_records': len(exact) + len(conflicted),
+            'candidates': [_found_item(entry, score) for score, entry in scored[:limit]],
+            'hint': None if exact else 'An operator must reconcile the duplicate anchors before any write.'
+            if conflicted else ('No reference entry matches. If you find the answer another way and it is a durable '
+                                'fact, propose it: ref propose --file entry.json, with an attestation authority '
+                                'saying who observed it, when and how.'),
+            'coverage': _coverage(entries, incomplete, 'accepted entries and drafts; a draft is a lead, never '
+                                                       'authority; the statement is read with ref get')}
+
+
+class NowAnswered:
+    """What `ref find` would now match exactly, for `ref misses`: `get(phrase)` is the
+    [{key, trust, state}] of the entries that answer a stored (normalised) phrase."""
+
+    def __init__(self, rows, operators):
+        entries, _ = catalog(rows, operators)
+        self.entries = sorted((entry for entry in entries
+                               if entry['state'] not in ('malformed', 'unsupported', 'conflicted')
+                               and entry['key'] is not None),
+                              key=lambda entry: (entry['record'] is None, entry['key']))
+        self.cache = {}
+
+    def get(self, phrase, default=None):
+        if phrase not in self.cache:
+            _, normalized, stems = _text_helpers()
+            key, wanted = normalized(phrase), stems(phrase)
+            self.cache[phrase] = [{'key': entry['key'], 'trust': 'accepted' if entry['record'] else 'draft',
+                                   'state': entry['state']}
+                                  for entry in self.entries if _answers(entry, phrase, key, wanted)]
+        return self.cache[phrase] or default
+
+    def __getitem__(self, phrase):
+        return self.get(phrase) or []
+
+
+def miss_phrase(args):
+    """The phrase the miss log records for one read, or None when the read is not a lookup:
+    the phrase of `ref find`, or the words of the key of `ref get`."""
+    rest = [token for token in args[1:] if token != '--json']
+    if args[:1] == ['get'] and len(rest) == 1:
+        return rest[0].replace('.', ' ').replace('-', ' ')
+    return None
+
+
+def _match_words(text):
+    _, _, stems = _text_helpers()
+    return {word for word in stems(text or '') if len(word) > 2 and word not in COMMON_WORDS}
+
+
+def task_matches(entries, task_row):
+    """(accepted entries, number of drafts) that match one task by its title.
+
+    An entry matches when the task's title shares at least TASK_MATCH_WORDS words with
+    the entry's key, title and tags (common words and one- or two-letter stems do not
+    count). Only accepted entries are returned, the most shared words first, then by key.
+    A matching draft is counted and nothing else about it is returned: any contributor can
+    propose a draft, and a brief is read by every worker at the start of every run.
+    """
+    wanted = _match_words((task_row or {}).get('title'))
+    if len(wanted) < TASK_MATCH_WORDS:
+        return [], 0
+    chosen, drafts = [], 0
+    for entry in entries:
+        if entry['state'] not in ('accepted', 'draft-only') or entry['key'] is None:
+            continue
+        record = _shown_record(entry)
+        key_words = entry['key'].replace('.', ' ').replace('-', ' ')
+        shared = len(wanted & _match_words(' '.join([key_words, record.get('title') or '',
+                                                     ' '.join(record.get('tags') or [])])))
+        if shared < TASK_MATCH_WORDS:
+            continue
+        if entry['state'] == 'accepted' and entry['record'] is not None:
+            chosen.append((shared, entry))
+        else:
+            drafts += 1
+    chosen.sort(key=lambda pair: (-pair[0], pair[1]['key']))
+    return [entry for _, entry in chosen], drafts
+
+
+def work_matches(rows, tasks, operators, current=None):
+    """`attention.reference_matches` for `work`: accepted entries that match the caller's
+    own in-progress tasks, as keys only.
+
+    `tasks` are the caller's rows `work` already holds; `rows` is the export it already
+    read. At most WORK_MATCH_TASKS_MAX tasks and TASK_MATCHES_MAX keys each. No statement,
+    no title, and of drafts only a count.
+    """
+    entries, _ = catalog(rows, operators, current)
+    mine = [row for row in tasks if row.get('status') == 'in_progress']
+    items = []
+    for row in sorted(mine, key=lambda row: str(row.get('id')))[:WORK_MATCH_TASKS_MAX]:
+        chosen, drafts = task_matches(entries, row)
+        if not chosen and not drafts:
+            continue
+        items.append({'task': row.get('id'),
+                      'references': [{'key': entry['key'], 'trust': 'accepted',
+                                      'authority_kind': authority_kind(entry['record']),
+                                      'source': 'ref get ' + entry['key']} for entry in chosen[:TASK_MATCHES_MAX]],
+                      'references_total': len(chosen), 'drafts_matching': drafts})
+    return {'items': items, 'tasks_checked': min(len(mine), WORK_MATCH_TASKS_MAX), 'tasks_total': len(mine),
+            'coverage': 'accepted reference entries whose key, title or tags share at least %d words with the title '
+                        'of one of your in-progress tasks; keys only. drafts_matching is a count: read drafts with '
+                        'ref find, they are not authoritative' % TASK_MATCH_WORDS}
+
+
 # -- attention (work and brief) ------------------------------------------------------------------
 
 def work_attention(rows, actor, operators, current=None, limit=20, offset=0):
@@ -701,7 +917,10 @@ def _attention_title(value):
 
 
 def brief_attention(rows, task_row, operators, current=None, limit=3):
-    """At most 3 `reference-review` items for a brief: tag matches plus expired/due-soon, expired first."""
+    """At most 3 `reference-review` items for a brief (tag matches plus expired/due-soon,
+    expired first), then at most 3 `reference` items: accepted entries that match the
+    task's title (`task_matches`) and are not already listed. `reference_drafts_matching`
+    is the number of drafts that match, and nothing else about them."""
     entries, _ = catalog(rows, operators, current)
     labels = set((task_row or {}).get('labels') or [])
     chosen = []
@@ -718,8 +937,19 @@ def brief_attention(rows, task_row, operators, current=None, limit=3):
               'title': _attention_title(entry['record']['title']),
               'text': _attention_text(entry), 'source': 'ref get ' + entry['key']}
              for entry in chosen[:limit]]
-    more = len(chosen) - len(items)
-    return {'attention': items, 'attention_total': len(chosen), 'attention_more': more or None}
+    listed = {entry['key'] for entry in chosen[:limit]}
+    matched, drafts = task_matches(entries, task_row)
+    matched = [entry for entry in matched if entry['key'] not in listed]
+    items += [{'kind': 'reference', 'key': entry['key'], 'due': entry['due'],
+               'review_by': entry['record']['review_by'], 'trust': 'accepted',
+               'authority_kind': authority_kind(entry['record']),
+               'title': _attention_title(entry['record']['title']),
+               'text': '%s %s may answer a question on this task (accepted).'
+                       % ('Attested reference' if attested(entry['record']) else 'Reference', entry['key']),
+               'source': 'ref get ' + entry['key']} for entry in matched[:TASK_MATCHES_MAX]]
+    total = len(chosen) + len(matched)
+    return {'attention': items, 'attention_total': total, 'attention_more': (total - len(items)) or None,
+            'reference_drafts_matching': drafts}
 
 
 def _attention_text(entry):
@@ -738,8 +968,16 @@ def help_payload():
     return {'schema_version': 1, 'action': 'ref', 'contract': 'cli-contract-v1',
             'usage': ['ref get KEY', 'ref list [--tag TAG]... [--owner IDENTITY] '
                       '[--state draft-only|accepted|superseded|all] [--due expired|due-soon|unset] '
-                      '[--authority repository|url|attested] [--limit N] [--offset N]', 'ref propose --file entry.json', 'ref revise --file entry.json'],
-            'limits': {'list_limit': [1, LIST_LIMIT_MAX], 'title': TITLE_MAX, 'statement': STATEMENT_MAX,
+                      '[--authority repository|url|attested] [--limit N] [--offset N]',
+                      'ref find PHRASE [--limit N]', 'ref misses [--limit N]', 'ref propose --file entry.json', 'ref revise --file entry.json'],
+            'lookup': 'Look here before asking the owner or searching: ref find PHRASE returns the entries a '
+                      'phrase names (accepted first; a draft is marked and is never authority) and the nearest '
+                      'ones when none does. When you learn a durable operational fact, propose it.',
+            'telemetry': 'Each ref find and ref get is counted per project, and one that finds no entry also '
+                         'records its normalised phrase (for ref get, the words of the key), a count and '
+                         'first/last seen times; no actor is stored. Read it with ref misses.',
+            'limits': {'list_limit': [1, LIST_LIMIT_MAX], 'find_limit': list(FIND_LIMIT), 'phrase': PHRASE_MAX,
+                       'title': TITLE_MAX, 'statement': STATEMENT_MAX,
                        'tags': TAGS_MAX, 'key': KEY_MAX, 'due_soon_days': DUE_SOON_DAYS,
                        'attestation_line': ATTESTATION_LINE_MAX, 'attested_review_months': ATTESTED_REVIEW_MONTHS,
                        'batch_items': keyed_entries.BATCH_MAX},
@@ -755,7 +993,7 @@ def help_payload():
                          '--reason TEXT --disposition complete|failed|released [--issue-id ID]',
                          'admin.py void-record PROJECT --actor OPERATOR --file void.json',
                          'admin.py anchor-release PROJECT --kind reference --issue-id ID --actor OPERATOR '
-                         '--reason TEXT']}
+                         '--reason TEXT', 'admin.py reference-misses-clear PROJECT']}
 
 
 def parse_list_options(args):
@@ -795,8 +1033,9 @@ def parse_list_options(args):
 
 
 def read(args, run, operators):
-    """`ref get KEY` / `ref list ...` / `ref --help`: read-only. `get` reads only its key
-    (`read_key_rows`); `list` reads the catalog (`read_rows`)."""
+    """`ref get KEY` / `ref list ...` / `ref find PHRASE` / `ref --help`: read-only. `get`
+    reads only its key (`read_key_rows`); `list` and `find` read the catalog (`read_rows`).
+    `ref misses` is answered by the endpoint itself (it needs the project directory)."""
     if not args or args[0] in ('--help', '-h', 'help'):
         return help_payload()
     command, rest = args[0], args[1:]
@@ -808,4 +1047,31 @@ def read(args, run, operators):
         return get(read_key_rows(run, rest[0]), rest[0], operators)
     if command == 'list':
         return list_entries(read_rows(run), parse_list_options(rest), operators)
-    raise ValueError('ref: unknown command %s; use get, list, propose or revise' % command)
+    if command == 'find':
+        phrase, limit = parse_find_options(rest)
+        return find(read_rows(run), phrase, operators, limit=limit)
+    raise ValueError('ref: unknown command %s; use get, list, find, misses, propose or revise' % command)
+
+
+def parse_find_options(args):
+    """`ref find PHRASE [--limit N] [--json]`: exactly one phrase."""
+    limit, phrases, index = FIND_LIMIT_DEFAULT, [], 0
+    while index < len(args):
+        token = args[index]
+        if token == '--json':
+            index += 1
+        elif token == '--limit':
+            if index + 1 >= len(args) or not re.fullmatch(r'[0-9]{1,4}', args[index + 1]):
+                raise ValueError('ref find: --limit must be %d..%d' % FIND_LIMIT)
+            limit = int(args[index + 1])
+            index += 2
+        elif token.startswith('--'):
+            raise ValueError('ref find: unknown option %s' % token[:40])
+        else:
+            phrases.append(token)
+            index += 1
+    if len(phrases) != 1:
+        raise ValueError('ref find takes exactly one PHRASE (quote it)')
+    if not FIND_LIMIT[0] <= limit <= FIND_LIMIT[1]:
+        raise ValueError('ref find: --limit must be %d..%d' % FIND_LIMIT)
+    return phrases[0], limit

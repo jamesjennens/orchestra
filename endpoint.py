@@ -251,10 +251,11 @@ def execute(root,request,authority_config=None,require_authority=False):
             rows=[json.loads(line) for line in stdout.splitlines() if line.strip()]
         return {'returncode':0,'stdout':json.dumps({'schema_version':1,'anchors':record_anchor_ids(rows)})+'\n','stderr':warnings}
     if action=='ref':
-        # The reference catalog (.41 slice 1, kittrial-5bb.66). Reads (get, list, help)
+        # The reference catalog (.41 slice 1, kittrial-5bb.66). Reads (get, list, find, help)
         # read their own key, or the catalog in two native reads (reference_records), take no
         # coordination lock and are not run_guarded (like the anchors read); propose
-        # and revise are writes, under the lock and the operation journal.
+        # and revise are writes, under the lock and the operation journal. misses is a read
+        # of the reference lookup-miss log, which find and get feed (kittrial-5bb.98).
         import reference_records
         args=request.get('args',[])
         if not isinstance(args,list) or any(not isinstance(x,str) or '\0' in x for x in args):raise ValueError('Expected argument list')
@@ -264,7 +265,29 @@ def execute(root,request,authority_config=None,require_authority=False):
             if warnings:run_warnings.append(warnings)
             return stdout
         if not args or args[0] not in reference_records.CONTRIBUTOR_OPERATIONS:
-            result=reference_records.read(args,run,configured_operators(root))
+            import capability_misses
+            log=capability_misses.REFERENCE
+            def counted(phrase,found):
+                # Telemetry, exactly as for capability find: its own non-blocking lock file,
+                # never .coordination.lock; no bd call; it cannot fail or delay the read.
+                try:capability_misses.record_find(path,phrase,found,which=log)
+                except Exception:pass
+            if args[:1]==['misses'] and not any(token in ('--help','-h') for token in args):
+                # Read-only, no lock, not run_guarded. It reads the telemetry file, and the
+                # catalog once (only when the log holds a phrase) to mark the misses an entry
+                # would now answer. ASCII-escaped: the phrases are untrusted text.
+                limit=capability_misses.options(args[1:],log)['limit']
+                result=capability_misses.report(path,lambda:reference_records.NowAnswered(reference_records.read_rows(run),configured_operators(root)),limit,log)
+                return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=True)+'\n','stderr':''.join(run_warnings)}
+            looked_up=reference_records.miss_phrase(args)
+            try:result=reference_records.read(args,run,configured_operators(root))
+            except ValueError as error:
+                # `ref get` of a key nobody has recorded is a lookup that missed.
+                if looked_up is not None and str(error).startswith('Unknown reference key'):counted(looked_up,False)
+                raise
+            if args[:1]==['find'] and isinstance(result,dict) and isinstance(result.get('found'),bool):
+                counted(result.get('normalized'),result['found'])
+            elif looked_up is not None:counted(looked_up,True)
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
         payload=reference_records.write_payload(args,request.get('attachments',{}))
         runner=NativeRunner(run)

@@ -80,6 +80,13 @@ class EndpointDispatchTests(unittest.TestCase):
         clock = patch('time.gmtime', return_value=TODAY)
         clock.start()
         self.addCleanup(clock.stop)
+        # `self.locks` replaces fcntl.flock to count holds of the coordination lock. The
+        # lookup-miss log (kittrial-5bb.98) takes its own lock file through the same
+        # function, so it is switched off here; tests/test_reference_lookup.py covers it.
+        import capability_misses
+        quiet = patch.object(capability_misses, 'fcntl', None)
+        quiet.start()
+        self.addCleanup(quiet.stop)
 
     def fake_run(self, argv, env, timeout=None):
         command = list(map(str, argv))
