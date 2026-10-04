@@ -34,12 +34,16 @@ ITEM_FIELDS = {
     'workflow_state', 'integration',
     # Additive integration disagreement signal (kittrial-5bb.52).
     'integration_disagreements', 'integration_warnings',
+    # Additive deployed-delivery identification (kittrial-5bb.95).
+    'deployed_delivery', 'deployed_delivery_is_current_contribution',
 }
 BRIEF_FIELDS = {
     'task', 'title', 'owner', 'status', 'activity_cursor', 'checkpoint', 'intent',
     'acceptance', 'current_position', 'next_action', 'unresolved', 'review',
     'lifecycle', 'dependencies', 'lifecycle_scope',
     'lifecycle_matches_contribution', 'warnings', 'evidence',
+    # Additive deployed-delivery identification (kittrial-5bb.95).
+    'deployed_delivery', 'deployed_delivery_is_current_contribution',
 }
 
 

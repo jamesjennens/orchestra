@@ -17,8 +17,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import lifecycle
 from lifecycle import (DEFECT_VALUE, ENABLED, RELEASE, RELEASE_TARGETS_MAX, apply_native,
-                       derived_id, enabled_states, evidence_owed, git_ancestry, project_facts,
-                       release_targets, validate_payload, validate_release_payload)
+                       derived_id, enabled_states, evidence_owed, git_ancestry,
+                       integration_evidence, project_facts, release_selection, release_targets,
+                       reverted_integrations, scoped_evidence, validate_payload,
+                       validate_release_payload)
 from requirements import content_hash
 
 ACTOR = 'alice/session'
@@ -27,6 +29,17 @@ SOURCE_B = '2' * 40
 MERGE_A = '3' * 40
 MERGE_B = '4' * 40
 RELEASE_COMMIT = '5' * 40
+RELEASE_1 = '6' * 40
+RELEASE_2 = '7' * 40
+PREVIOUS_RELEASE = '8' * 40
+OLD_FIELDS = {'schema_version', 'operation_id', 'task', 'dimension', 'value', 'scope',
+              'evidence', 'provenance', 'actor'}
+
+
+def old_validate(p):
+    """A pre-note kit's validator: any extra field makes the payload unknown."""
+    if not isinstance(p, dict) or set(p) != OLD_FIELDS:
+        raise ValueError('invalid lifecycle payload')
 
 
 @contextlib.contextmanager
@@ -312,7 +325,9 @@ class GitAncestryTests(unittest.TestCase):
 
 class EnabledStateTests(unittest.TestCase):
     def test_enabled_with_known_defect_points_at_the_fixing_task(self):
-        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        # The fixing task must exist: an enabled-with-known-defect fact that names
+        # no real task is refused (kittrial-5bb.95 review item small-and-tests).
+        store = NativeStore(tasks=('trial-a', 'fixing-task')).seed('trial-a')
         store.record(payload('trial-a', ENABLED, value=DEFECT_VALUE, operation='enabled-1',
                              defect_task='fixing-task'))
         state = enabled_states(store.rows)[0]
@@ -354,7 +369,8 @@ class EnabledStateTests(unittest.TestCase):
 
 class EvidenceOwedTests(unittest.TestCase):
     def seeded(self):
-        store = NativeStore().seed('trial-a').seed('trial-b', integration=MERGE_B, source=SOURCE_B)
+        store = (NativeStore(tasks=('trial-a', 'trial-b', 'fixing-task'))
+                 .seed('trial-a').seed('trial-b', integration=MERGE_B, source=SOURCE_B))
         production = scope(release='release-1', environment='production')
         store.record(payload('trial-a', 'lifecycle-scope', operation='deploy-scope-a',
                              scope_value=production))
@@ -535,6 +551,369 @@ class AdditivePayloadTests(unittest.TestCase):
         store.record(payload('trial-a', 'implemented', operation='plain'))
         store.rows[-1]['description'] += 'x'
         self.assertEqual(store.facts('trial-a')['facts']['implemented']['value'], 'unknown')
+
+
+class ReselectionTests(unittest.TestCase):
+    """A release selects only what is new in it (kittrial-5bb.95 item 1)."""
+
+    def deployed(self, store, task, release, environment, integration=RELEASE_1,
+                 source=SOURCE_A, live=False):
+        scope_value = scope(source=source, integration=integration, release=release,
+                            environment=environment)
+        store.record(payload(task, 'lifecycle-scope',
+                             operation='scope-%s-%s-%s' % (task, release, environment),
+                             scope_value=scope_value))
+        store.record(payload(task, 'deployed',
+                             operation='deployed-%s-%s-%s' % (task, release, environment),
+                             scope_value=scope_value))
+        if live:
+            store.record(payload(task, 'live-verified',
+                                 operation='verified-%s-%s-%s' % (task, release, environment),
+                                 scope_value=scope_value))
+
+    def release_scope(self, integration=RELEASE_2, release='r-2', environment='production'):
+        return {'source_commit': '', 'integration_commit': integration,
+                'release_id': release, 'environment': environment}
+
+    def ancestry(self, pairs):
+        def is_ancestor(commit, release):
+            return commit == release or (commit, release) in pairs
+        return is_ancestor
+
+    def test_a_second_release_selects_only_the_task_that_is_new(self):
+        store = (NativeStore(tasks=('trial-a', 'trial-b')).seed('trial-a')
+                 .seed('trial-b', integration=MERGE_B, source=SOURCE_B))
+        self.deployed(store, 'trial-a', 'r-1', 'production')
+        selection = release_selection(
+            store.rows, self.release_scope(),
+            self.ancestry({(MERGE_A, RELEASE_1), (MERGE_A, RELEASE_2), (MERGE_B, RELEASE_2),
+                           (RELEASE_1, RELEASE_2)}))
+        self.assertEqual([item['task'] for item in selection['targets']], ['trial-b'])
+        reasons = {item['task']: item['reason'] for item in selection['skipped']}
+        self.assertIn('already deployed', reasons['trial-a'])
+
+    def test_a_new_integration_is_selected_even_when_an_older_one_was_deployed(self):
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        self.deployed(store, 'trial-a', 'r-1', 'production')
+        # A NEW integration recorded after the first release must still ship.
+        newer = scope(source=SOURCE_B, integration=MERGE_B)
+        store.record(payload('trial-a', 'lifecycle-scope', operation='scope-b', scope_value=newer))
+        store.record(payload('trial-a', 'integrated', operation='integrated-b', scope_value=newer))
+        selection = release_selection(
+            store.rows, self.release_scope(),
+            self.ancestry({(MERGE_A, RELEASE_1), (MERGE_B, RELEASE_2), (RELEASE_1, RELEASE_2)}))
+        self.assertEqual(selection['targets'],
+                         [{'task': 'trial-a', 'source_commit': SOURCE_B,
+                           'integration_commit': MERGE_B}])
+
+    def test_a_caller_subset_selects_only_the_named_tasks(self):
+        store = (NativeStore(tasks=('trial-a', 'trial-b')).seed('trial-a')
+                 .seed('trial-b', integration=MERGE_B, source=SOURCE_B))
+        selection = release_selection(store.rows, self.release_scope(),
+                                      self.ancestry({(MERGE_A, RELEASE_2), (MERGE_B, RELEASE_2)}),
+                                      subset={'trial-b'})
+        self.assertEqual([item['task'] for item in selection['targets']], ['trial-b'])
+        self.assertEqual(selection['skipped'], [])
+
+    def test_a_previous_release_restricts_selection_to_the_range(self):
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        second = scope(source=SOURCE_B, integration=MERGE_B)
+        store.record(payload('trial-a', 'lifecycle-scope', operation='scope-b', scope_value=second))
+        store.record(payload('trial-a', 'integrated', operation='integrated-b', scope_value=second))
+        without = release_selection(store.rows, self.release_scope(),
+                                    self.ancestry({(MERGE_A, RELEASE_2), (MERGE_B, RELEASE_2)}))
+        self.assertEqual(without['targets'][0]['integration_commit'], MERGE_B)
+        def ranged(commit, release):
+            if release == RELEASE_2 and commit in (MERGE_A, MERGE_B):
+                return True
+            if commit == PREVIOUS_RELEASE and release == MERGE_A:
+                return True
+            return False
+        with_previous = release_selection(store.rows, self.release_scope(), ranged,
+                                          previous_commit=PREVIOUS_RELEASE)
+        self.assertEqual(with_previous['targets'][0]['integration_commit'], MERGE_A)
+
+    def test_chunking_pages_past_the_wire_bound(self):
+        items = [target('trial-%03d' % index) for index in range(RELEASE_TARGETS_MAX + 5)]
+        chunks = lifecycle._chunks(items, RELEASE_TARGETS_MAX)
+        self.assertEqual([len(chunk) for chunk in chunks], [RELEASE_TARGETS_MAX, 5])
+        with self.assertRaisesRegex(ValueError, 'at most'):
+            validate_release_payload(release_payload(items))
+
+
+class RevertAndDeliveryTests(unittest.TestCase):
+    """Reverted integrations are excluded; a stale delivery is flagged (item 3)."""
+
+    def seeded(self, task='trial-a'):
+        return NativeStore(tasks=(task,)).seed(task)
+
+    def revert(self, store, task, commit):
+        store.rows[0].setdefault('comments', []).append(
+            {'id': 'revert-1', 'author': ACTOR, 'created_at': '',
+             'text': lifecycle.REVERT_PREFIX + json.dumps({'operation': 'revert-record',
+                                                           'integration_commit': commit})})
+
+    def test_a_reverted_integration_is_not_selected(self):
+        store = self.seeded()
+        self.revert(store, 'trial-a', MERGE_A)
+        self.assertEqual(reverted_integrations(store.rows), {('trial-a', MERGE_A)})
+        selection = release_selection(store.rows, {'source_commit': '', 'integration_commit': RELEASE_COMMIT,
+                                                   'release_id': 'release-1', 'environment': 'production'},
+                                      lambda commit, release: True)
+        self.assertEqual(selection['targets'], [])
+        self.assertIn('reverted', selection['skipped'][0]['reason'])
+
+    def test_a_reverted_integration_is_refused_by_the_endpoint(self):
+        store = self.seeded()
+        self.revert(store, 'trial-a', MERGE_A)
+        with self.assertRaisesRegex(ValueError, 'reverted'):
+            store.record(release_payload([target('trial-a')]))
+
+    def test_selection_flags_a_delivery_that_is_not_the_current_contribution(self):
+        store = self.seeded()
+        selection = release_selection(store.rows, {'source_commit': '', 'integration_commit': RELEASE_COMMIT,
+                                                   'release_id': 'release-1', 'environment': 'production'},
+                                      lambda commit, release: True,
+                                      current_commits={'trial-a': SOURCE_B})
+        self.assertEqual([item['task'] for item in selection['targets']], ['trial-a'])
+        flag = selection['flags'][0]
+        self.assertEqual(flag['flag'], 'delivery-not-current')
+        self.assertEqual(flag['current_contribution'], SOURCE_B)
+        self.assertIn(SOURCE_A, flag['reason'])
+
+    def test_the_release_result_flags_a_delivery_that_is_not_current(self):
+        store = self.seeded()
+        original = lifecycle.current_contribution_commits
+        lifecycle.current_contribution_commits = lambda rows: {'trial-a': SOURCE_B}
+        try:
+            result = store.record(release_payload([target('trial-a')]))
+        finally:
+            lifecycle.current_contribution_commits = original
+        recorded = result['targets'][0]
+        self.assertEqual(recorded['flag'], 'delivery-not-current')
+        self.assertEqual(recorded['current_contribution'], SOURCE_B)
+        self.assertIn('reader_note', result)
+
+
+class EvidenceOwedHistoryTests(unittest.TestCase):
+    """Evidence owed survives later releases and other environments (item 4)."""
+
+    def release(self, store, release, environment, integration, live=False):
+        scope_value = scope(source=SOURCE_A, integration=integration, release=release,
+                            environment=environment)
+        store.record(payload('trial-a', 'lifecycle-scope',
+                             operation='scope-%s-%s' % (release, environment), scope_value=scope_value))
+        store.record(payload('trial-a', 'deployed',
+                             operation='deployed-%s-%s' % (release, environment), scope_value=scope_value))
+        if live:
+            store.record(payload('trial-a', 'live-verified',
+                                 operation='verified-%s-%s' % (release, environment),
+                                 scope_value=scope_value))
+
+    def test_evidence_owed_keeps_earlier_environment_and_release_debts(self):
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        self.release(store, 'r-10', 'staging', RELEASE_1, live=True)
+        self.release(store, 'r-10', 'production', RELEASE_1)
+        self.release(store, 'r-11', 'production', RELEASE_2)
+        owed = {(group['environment'], group['release_id']): group['tasks'][0]['remaining_evidence']
+                for group in evidence_owed(store.rows)}
+        self.assertEqual(owed, {('staging', 'r-10'): [],
+                                ('production', 'r-10'): ['live-verified'],
+                                ('production', 'r-11'): ['live-verified']})
+
+    def test_scoped_evidence_keeps_every_recorded_scope(self):
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        self.release(store, 'r-10', 'production', RELEASE_1)
+        entry = next(item for item in scoped_evidence(store.rows, ('deployed',))
+                     if item['id'] == 'trial-a')
+        releases = [item['scope']['release_id'] for item in entry['scopes'] if item['deployed']]
+        self.assertEqual(releases, ['r-10'])
+
+
+class NoteOnOlderKitTests(unittest.TestCase):
+    """The per-target note rides the deployed fact only (item 5)."""
+
+    def test_a_note_never_reaches_the_scope_event_and_an_old_reader_still_reads_it(self):
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        store.record(release_payload([target('trial-a', note='note for the deployed fact')]))
+        events = [lifecycle.native_event(row) for row in store.rows if row.get('issue_type') == 'event']
+        payloads = [event['payload'] for event in events if event and event['payload']]
+        scope_payloads = [p for p in payloads
+                          if p['dimension'] == 'lifecycle-scope' and p['scope']['release_id'] == 'release-1']
+        self.assertEqual(len(scope_payloads), 1)
+        self.assertEqual(set(scope_payloads[0]), OLD_FIELDS)
+        self.assertNotIn('note', scope_payloads[0])
+        deployed = [p for p in payloads
+                    if p['dimension'] == 'deployed' and p['scope']['release_id'] == 'release-1']
+        self.assertEqual(deployed[0]['note'], 'note for the deployed fact')
+        # A strict pre-note reader still reads the release scope; the annotated
+        # deployed payload is unknown to it, never passed.
+        original = lifecycle.validate_payload
+        lifecycle.validate_payload = old_validate
+        try:
+            state = next(row for row in project_facts(store.rows) if row['id'] == 'trial-a')
+        finally:
+            lifecycle.validate_payload = original
+        self.assertEqual(state['scope'], scope(source=SOURCE_A, integration=MERGE_A,
+                                               release='release-1', environment='production'))
+        self.assertEqual(state['facts']['deployed']['value'], 'unknown')
+
+
+class SilentDropAndConflictTests(unittest.TestCase):
+    """Nothing integrated is dropped silently; IDs are checked first (item 6)."""
+
+    def release_scope(self):
+        return {'source_commit': '', 'integration_commit': RELEASE_COMMIT,
+                'release_id': 'release-1', 'environment': 'production'}
+
+    def test_a_raw_native_set_state_integration_is_reported_as_skipped(self):
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        store.rows.append(dict(_type='issue', id='trial-a.99', issue_type='event',
+                               title='State change: integrated → passed',
+                               description='Set integrated to passed\n\nReason: manual operator note',
+                               status='closed', created_by=ACTOR, created_at='',
+                               dependencies=[dict(issue_id='trial-a.99', depends_on_id='trial-a',
+                                                  type='parent-child')]))
+        selection = release_selection(store.rows, self.release_scope(), lambda commit, release: True)
+        self.assertEqual(selection['targets'], [])
+        self.assertIn('raw native set-state', selection['skipped'][0]['reason'])
+
+    def test_two_integrated_labels_are_reported_as_skipped(self):
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        store.rows[0]['labels'] = store.rows[0]['labels'] + ['integrated:failed']
+        selection = release_selection(store.rows, self.release_scope(), lambda commit, release: True)
+        self.assertEqual(selection['targets'], [])
+        self.assertIn('more than one native integrated: label', selection['skipped'][0]['reason'])
+
+    def test_an_operation_id_conflict_is_refused_before_the_first_write(self):
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        release = release_payload([target('trial-a')], operation='release-1')
+        planted = derived_id('release-1', 'deployed', 'trial-a')
+        store.record(payload('trial-a', 'tested', operation=planted))
+        before = json.dumps(store.rows)
+        calls = len(store.calls)
+        with self.assertRaisesRegex(ValueError, 'operation ID already used for different content'):
+            store.record(release)
+        self.assertEqual(json.dumps(store.rows), before)
+        self.assertEqual(store.calls[calls:], [['export', '--all']])
+
+
+class SmallAndTestsTests(unittest.TestCase):
+    """defect_task existence, shallow clones, the git guard and scope writes (item 7)."""
+
+    def test_an_unknown_defect_task_is_refused(self):
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        with self.assertRaisesRegex(ValueError, 'unknown defect_task'):
+            store.record(payload('trial-a', ENABLED, value=DEFECT_VALUE, operation='enabled-x',
+                                 defect_task='no-such-task'))
+
+    def test_a_non_commit_integration_never_reaches_the_git_command_line(self):
+        store = NativeStore(tasks=('trial-help',))
+        odd = scope(integration='--help')
+        store.record(payload('trial-help', 'lifecycle-scope', operation='scope-help', scope_value=odd))
+        store.record(payload('trial-help', 'integrated', operation='integrated-help', scope_value=odd))
+        def never(commit, release):
+            raise AssertionError('the non-commit guard must keep %r off the git command line' % commit)
+        selection = release_selection(store.rows,
+                                      {'source_commit': '', 'integration_commit': RELEASE_COMMIT,
+                                       'release_id': 'release-1', 'environment': 'production'}, never)
+        self.assertEqual(selection['targets'], [])
+        self.assertIn('not a full lowercase commit', selection['skipped'][0]['reason'])
+
+    def test_the_release_scope_is_written_only_when_it_differs(self):
+        store = NativeStore(tasks=('trial-a',))
+        already = scope(source=SOURCE_A, integration=MERGE_A, release='release-1',
+                        environment='production')
+        store.record(payload('trial-a', 'lifecycle-scope', operation='scope-equal', scope_value=already))
+        store.record(payload('trial-a', 'integrated', operation='integrated-a', scope_value=already))
+        result = store.record(release_payload([target('trial-a')]))
+        self.assertIs(result['targets'][0]['scope_recorded'], False)
+        scope_events = [row for row in store.rows if row.get('issue_type') == 'event'
+                        and 'lifecycle-scope' in row.get('description', '')]
+        self.assertEqual(len(scope_events), 1)
+
+    def test_the_release_reads_one_export_for_the_whole_batch(self):
+        store = (NativeStore(tasks=('trial-a', 'trial-b')).seed('trial-a')
+                 .seed('trial-b', integration=MERGE_B, source=SOURCE_B))
+        calls = len(store.calls)
+        store.record(release_payload([target('trial-a'),
+                                      target('trial-b', source=SOURCE_B, integration=MERGE_B)],
+                                     live_verified=True))
+        added = store.calls[calls:]
+        self.assertEqual(added.count(['export', '--all']), 1)
+
+    def test_integration_evidence_shape_is_unchanged(self):
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        entry = next(item for item in integration_evidence(store.rows) if item['id'] == 'trial-a')
+        self.assertLessEqual({'value', 'event_id', 'evidence', 'provenance'},
+                             set(entry['scopes'][0]['integrated']))
+        self.assertLessEqual({'scope_token', 'scope', 'order', 'integrated'},
+                             set(entry['scopes'][0]))
+
+
+@unittest.skipUnless(shutil.which('git'), 'git is not installed')
+class ShallowCloneTests(unittest.TestCase):
+    def test_a_commit_missing_from_the_checkout_is_named(self):
+        root = tempfile.mkdtemp()
+        try:
+            if subprocess.run(['git', '-C', root, 'init', '-q'], capture_output=True).returncode:
+                self.skipTest('git cannot create a repository in this environment')
+            subprocess.run(['git', '-C', root, 'config', 'user.email', 'synthetic@example.invalid'],
+                           capture_output=True)
+            subprocess.run(['git', '-C', root, 'config', 'user.name', 'Synthetic Test'],
+                           capture_output=True)
+            (Path(root) / 'file.txt').write_text('one\n', encoding='utf-8')
+            subprocess.run(['git', '-C', root, 'add', 'file.txt'], capture_output=True)
+            subprocess.run(['git', '-C', root, 'commit', '-q', '-m', 'first'], capture_output=True)
+            head = subprocess.run(['git', '-C', root, 'rev-parse', 'HEAD'], capture_output=True,
+                                  text=True).stdout.strip()
+            missing = 'a' * 40
+            with self.assertRaises(ValueError) as caught:
+                git_ancestry(root)(missing, head)
+            self.assertIn('is not in this checkout', str(caught.exception))
+            self.assertIn(missing, str(caught.exception))
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+
+class ReleaseCommandChunkTests(ReleaseCommandTests):
+    """The release command sends one request per group (item 2, lock hold)."""
+
+    def test_the_command_splits_the_write_into_groups(self):
+        store = (NativeStore(tasks=('trial-a', 'trial-b', 'trial-c'))
+                 .seed('trial-a').seed('trial-b').seed('trial-c'))
+        sent = []
+        client = types.ModuleType('client')
+        def fake_request(config, project, actor, args, action=None):
+            sent.append(json.loads(args[0]))
+            return {'returncode': 0, 'stderr': '',
+                    'stdout': json.dumps({'targets': [{'task': item['task']} for item in json.loads(args[0])['targets']]})}
+        client.request = fake_request
+        with scratch() as root:
+            argv = self.fixture(root, store) + ['--chunk-size', '2']
+            report = json.loads(self.run_cli(argv, client))
+        self.assertEqual(report['chunks'], [2, 1])
+        self.assertEqual(len(sent), 2)
+        self.assertTrue(all(len(payload['targets']) <= 2 for payload in sent))
+
+
+class ReaderDeliveryTests(unittest.TestCase):
+    """brief/work name the delivery a deployed fact belongs to (item 3)."""
+
+    def test_brief_and_work_name_the_deployed_delivery(self):
+        import briefing
+        import work
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        store.record(release_payload([target('trial-a')]))
+        brief = briefing.brief(store.rows, 'trial', 'trial-a')
+        self.assertEqual(brief['deployed_delivery'],
+                         {'release_id': 'release-1', 'environment': 'production',
+                          'source_commit': SOURCE_A, 'integration_commit': MERGE_A})
+        self.assertIsNone(brief['deployed_delivery_is_current_contribution'])
+        queue = work.queue(store.rows, ACTOR, ['--mine'])
+        item = next(entry for entry in queue['items'] if entry['task'] == 'trial-a')
+        self.assertEqual(item['deployed_delivery']['release_id'], 'release-1')
+        self.assertEqual(item['deployed_delivery']['environment'], 'production')
 
 
 if __name__ == '__main__':
