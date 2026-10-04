@@ -75,6 +75,10 @@ class RepositoryRuleTests(unittest.TestCase):
             'a host with no path': 'https://git.example',
             'a host without a user in the scp form': 'host:path',
             'a host ending in a dash': 'https://git.example-/p.git',
+            # A host that starts with a dash and is otherwise well formed, in each form.
+            'an ssh host starting with a dash': 'ssh://-host.example/team/p.git',
+            'an scp host starting with a dash': 'git@-host.example:team/p.git',
+            'an https host starting with a dash': 'https://-host.example/team/p.git',
             'not text': 7,
             'a list': ['https://git.example/a.git'],
         }
@@ -86,6 +90,11 @@ class RepositoryRuleTests(unittest.TestCase):
         with self.assertRaises(http_auth.HttpError) as caught:
             http_auth.Service.validate_repository('https://user:secret@git.example/p.git')
         self.assertNotIn('secret', caught.exception.message + str(caught.exception.detail or ''))
+        # Two layers refuse a user name on https: the sentence above, and the accepted forms
+        # themselves (the https form has no user part). Either alone refuses it, so a
+        # mutation of one is caught only through the sentence; both are checked here.
+        self.assertFalse(any(form.fullmatch('https://user@git.example/team/p.git')
+                             for form in http_auth.Service._REPOSITORY_FORMS))
         for value in ('https://TOKEN@github.com/t/b.git', 'user:hunter2@host:path'):
             with self.assertRaises(http_auth.HttpError) as caught:
                 http_auth.Service.validate_repository(value)
