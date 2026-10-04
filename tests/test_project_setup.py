@@ -518,6 +518,8 @@ class SetupScreenTests(test_http_agents.AgentHarness):
         self.assertEqual(steps['first-task']['links'], ['#/p/%s/new' % project])
         self.assertEqual(steps['agent']['links'], ['#/agents'])
         self.assertEqual(steps['members']['links'], ['#/p/%s/settings' % project])
+        # A step still to do leads with the way there; a done one keeps a quiet link.
+        self.assertEqual((steps['first-task']['linkTexts'], steps['members']['linkTexts']), (['Go there'], ['Open']))
         self.assertEqual(steps['guidance']['commands'],
                          ['admin.py set-guidance %s --actor OPERATOR --file FILE' % project])
         self.assertIn('The web interface cannot do this step', steps['guidance']['text'])
@@ -536,6 +538,7 @@ class SetupScreenTests(test_http_agents.AgentHarness):
         self.assertEqual(seen['hint'], {'text': '2 steps are left to set this project up. See the setup steps',
                                         'link': '#/p/%s/setup' % project})
         self.assertIsNone(seen['noHintForContributor'])
+        self.assertEqual(seen['contributorAsked'], 0)
         self.assertIsNone(seen['noHintWhenArchived'])
         self.assertEqual(seen['contributor']['steps'], 0)
         self.assertIn('Only an owner of this project, or a superuser, can see its setup steps.',

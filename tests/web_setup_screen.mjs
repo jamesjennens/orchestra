@@ -27,6 +27,7 @@ const steps = (root) => root.all((e) => e.tagName === 'LI').map((li) => ({
   chip: li.all((e) => e.tagName === 'SPAN' && e.className.startsWith('chip'))[0].textContent,
   text: li.textContent,
   links: li.all((e) => e.tagName === 'A').map((a) => a.attributes.href),
+  linkTexts: li.all((e) => e.tagName === 'A').map((a) => a.textContent),
   commands: li.all((e) => e.tagName === 'PRE').map((pre) => pre.textContent),
 }));
 
@@ -55,7 +56,11 @@ const steps = (root) => root.all((e) => e.tagName === 'LI').map((li) => ({
   // 3. The line on the project page while steps are left.
   const hint = await setup.setupHint(ctx, { id: project, role: 'owner' });
   out.hint = hint ? { text: hint.textContent, link: hint.all((e) => e.tagName === 'A')[0].attributes.href } : null;
-  out.noHintForContributor = await setup.setupHint(who.contributor, { id: project, role: 'contributor' });
+  // A contributor gets no line, and the page does not even ask the server for one.
+  let asked = 0;
+  const counting = { ...who.contributor, api: { ...who.contributor.api, projectSetup: (...args) => { asked += 1; return who.contributor.api.projectSetup(...args); } } };
+  out.noHintForContributor = await setup.setupHint(counting, { id: project, role: 'contributor' });
+  out.contributorAsked = asked;
   out.noHintWhenArchived = await setup.setupHint(ctx, { id: project, role: 'owner', archived: true });
 }
 
