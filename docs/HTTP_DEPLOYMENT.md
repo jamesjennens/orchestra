@@ -979,7 +979,7 @@ line separately and unconfined.
   (`CAP_READ`). They are the .41 slice 1, kittrial-5bb.66.
   - **Canonical binding:** they map the endpoint's read-only `ref list` and `ref get`.
   - **List query:** `tag` (comma-separated, all must match), `owner`, `state`, `due`,
-    `authority` (`repository`, `url` or `attested`), `limit` and `cursor`. A bad filter
+    `authority` (`repository`, `url`, `attested` or `decision`), `limit` and `cursor`. A bad filter
     is a `422` before any canonical read.
   - **Authority kind:** every listed row and every `record` and `proposed` object
     carries `authority_kind`. An attestation also carries `authority_note`, which

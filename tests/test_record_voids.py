@@ -379,7 +379,7 @@ class ReferenceVoidTests(VoidCase):
                 self.assertEqual(self.get()['state'], 'malformed')
                 self.void(void_payload('ref-1', bad['id'], text, operation_id='void-%d' % number))
                 self.assertEqual(self.get()['state'], 'draft-only')
-        newer = self.native.add_comment('ref-1', 'Kind: reference-entry-v3\n{}', author='mallory')
+        newer = self.native.add_comment('ref-1', 'Kind: reference-entry-v4\n{}', author='mallory')
         with self.assertRaisesRegex(ValueError, 'not a reference-entry record'):
             self.void(void_payload('ref-1', newer['id'], newer['text'], operation_id='void-3'))
         self.assertEqual(self.get()['state'], 'unsupported')

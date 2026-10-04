@@ -176,8 +176,9 @@ b ref list --tag data --json
 - **Propose a fact you checked:** `b ref propose --file entry.json`. For an
   operational fact, which no file states, use an `attestation` authority: who observed
   or stated it (`by`), when (`observed`), on what basis (`host-check` or
-  `owner-statement`) and how. Your entry is a draft, marked `NOT ACCEPTED` on every
-  read, until an operator accepts it.
+  `owner-statement`) and how. For a rule the project set for itself, use a `decision`
+  authority: `{"type": "decision", "id": ISSUE}`, the decision issue that set it. Your
+  entry is a draft, marked `NOT ACCEPTED` on every read, until an operator accepts it.
 - **Correct an entry:** `b ref revise --file entry.json`, naming the next `revision`
   and the newest revision's `sha256` as `expected_sha256`.
 - **Owner:** use your durable identity, `account:<uid>` or `person:<name>`, never a

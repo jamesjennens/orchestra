@@ -61,6 +61,14 @@ asked of the operator (`attestation_acceptance_rules`), and every read marks it
 `authority_kind: attested` with a sentence saying it cannot be checked against a
 repository, and whether it is accepted.
 
+A rule the project set for itself (how a release is made, what runs first) was neither
+observed nor stated by the owner. Its authority is a `decision`: the id of the native
+decision issue that set it (kittrial-5bb.104), checked as the `decisions` field is. A
+revision with that authority is `Kind: reference-entry-v3` (`schema_version` 3). Version
+3 is the last bump an authority type needs: a v3 record whose authority type this kit
+does not know reads `unsupported`, never malformed (`unsupported_reason`), so a later
+type is written inside v3.
+
 Statements are untrusted text: they never enter an error message, and excerpts
 carry `trust`. The due-soon window is fixed at 30 days (a per-project setting is
 deferred to slice 2 with its configuration store).
@@ -83,7 +91,8 @@ from recovery import configured_operators
 from requirements import SHA256_TEXT, canonical_bytes, content_hash
 from reserved_comments import (REFERENCE_ACCEPTANCE_PREFIX as ACCEPTANCE_PREFIX,
                                REFERENCE_ENTRY_PREFIX as ENTRY_PREFIX,
-                               REFERENCE_ENTRY_V2_PREFIX as ENTRY_V2_PREFIX)
+                               REFERENCE_ENTRY_V2_PREFIX as ENTRY_V2_PREFIX,
+                               REFERENCE_ENTRY_V3_PREFIX as ENTRY_V3_PREFIX)
 
 TYPE_LABEL = 'reference'
 STATE_LABEL = {'draft': 'reference:draft', 'accepted': 'reference:accepted',
@@ -122,7 +131,13 @@ ATTESTATION_LINE_MAX = 300
 ATTESTED_REVIEW_MONTHS = 6
 # What a reader is told the authority is. `repository` and `url` are pointers a person
 # can follow; `attested` is provenance only.
-AUTHORITY_KINDS = {'repo-path': 'repository', 'url': 'url', 'attestation': 'attested'}
+AUTHORITY_KINDS = {'repo-path': 'repository', 'url': 'url', 'attestation': 'attested', 'decision': 'decision'}
+# The record version each authority type is written under. A type added after `decision`
+# is written under 3 as well: from version 3 on, a reader that does not know a type reads
+# the entry `unsupported` (`unsupported_reason`), so no further version is needed for one.
+AUTHORITY_VERSION = {'repo-path': 1, 'url': 1, 'attestation': 2, 'decision': 3}
+ENTRY_PREFIXES = {1: ENTRY_PREFIX, 2: ENTRY_V2_PREFIX, 3: ENTRY_V3_PREFIX}
+AUTHORITY_TYPE = re.compile(r'[a-z][a-z0-9-]{0,31}')
 ENTRY_FIELDS = ('schema_version', 'key', 'revision', 'title', 'statement', 'authority', 'owner',
                 'review_by', 'tags', 'decisions', 'acceptance_state', 'successor', 'origin', 'sha256')
 CONTENT_FIELDS = ('key', 'title', 'statement', 'authority', 'owner', 'review_by', 'tags', 'decisions')
@@ -221,13 +236,21 @@ def valid_authority(value):
         _one_line(value.get('how'), 'authority.how', ATTESTATION_LINE_MAX)
         if 'source' in value:
             _one_line(value['source'], 'authority.source', ATTESTATION_LINE_MAX)
+    elif kind == 'decision':
+        core.checked_fields(value, ('type', 'id'), 'authority')
+        if not isinstance(value.get('id'), str) or not ISSUE_ID.fullmatch(value['id']):
+            raise ValueError('authority.id must be the id of a native decision issue')
     else:
-        raise ValueError('authority.type must be repo-path, url or attestation')
+        raise ValueError('authority.type must be repo-path, url, attestation or decision')
     return value
 
 
 def attested(record):
     return record['authority']['type'] == 'attestation'
+
+
+def decided(record):
+    return record['authority']['type'] == 'decision'
 
 
 def valid_tags(value):
@@ -248,8 +271,9 @@ def validate_entry(record):
     """The closed entry schema, time-independent (a record stays valid as days pass)."""
     if not isinstance(record, dict) or set(record) != set(ENTRY_FIELDS):
         raise ValueError('reference entry has the wrong field set')
-    if type(record['schema_version']) is not int or record['schema_version'] not in (1, 2):
-        raise ValueError('schema_version must be the integer 1, or 2 for an attestation authority')
+    if type(record['schema_version']) is not int or record['schema_version'] not in ENTRY_PREFIXES:
+        raise ValueError('schema_version must be the integer 1, 2 for an attestation authority or 3 for a '
+                         'decision authority')
     valid_key(record['key'])
     core.positive_int(record['revision'], 'revision')
     _bounded_text(record['title'], 'title', TITLE_MAX)
@@ -259,6 +283,8 @@ def validate_entry(record):
     # only that, so no revision can be written both ways.
     if (record['schema_version'] == 2) != attested(record):
         raise ValueError('schema_version 2 is the entry record with an attestation authority, and only that')
+    if (record['schema_version'] == 3) != decided(record):
+        raise ValueError('schema_version 3 is the entry record with a decision authority, and only that')
     valid_owner(record['owner'])
     if record['review_by'] is not None:
         _date(record['review_by'], 'review_by')
@@ -290,7 +316,7 @@ def validate_entry(record):
 
 def parse_entry(body):
     """The entry record iff the comment is exactly what a legitimate writer posts."""
-    prefix = next((item for item in (ENTRY_PREFIX, ENTRY_V2_PREFIX)
+    prefix = next((item for item in ENTRY_PREFIXES.values()
                    if isinstance(body, str) and body.startswith(item)), None)
     if prefix is None:
         return None
@@ -306,8 +332,53 @@ def parse_entry(body):
 
 
 def entry_prefix_for(record):
-    """The record kind a revision is written under: v2 for an attestation authority."""
-    return ENTRY_V2_PREFIX if record['schema_version'] == 2 else ENTRY_PREFIX
+    """The record kind a revision is written under: v2 for an attestation authority, v3 for
+    a decision authority."""
+    return ENTRY_PREFIXES[record['schema_version']]
+
+
+def unsupported_reason(body):
+    """Why a `reference-entry-v3` comment is a record this kit does not support, or None.
+
+    From version 3 on an authority type is not a reason for a new record version. A later
+    kit may put any fields inside `authority`; it may not change a v3 record anywhere else
+    without a new version. So a v3 comment is an unknown authority type, and its entry
+    reads `unsupported` (never a void target, no write), only when ALL of this holds:
+
+    - it starts with the exact v3 prefix (no BOM or CRLF lookalike) and its body is the
+      canonical bytes of one JSON object;
+    - everything outside `authority` passes the v3 schema: the closed field set,
+      `schema_version` 3, every other field's own rule, and the content hash;
+    - `authority` is an object whose `type` is a non-empty string this kit does not know.
+
+    Anything else that fails the schema is malformed, as before, and a void repairs it: a
+    stray comment, a typo, a wrong hash. Otherwise one line of garbage on a genuine entry
+    would freeze it for good (review of 2d93a07). The warning cannot tell a record a later
+    kit wrote from one somebody built by hand on the host to look like it; both need a kit
+    or a host step this kit does not have. The type is echoed only when it has the shape
+    of a type name.
+    """
+    if not isinstance(body, str) or not body.startswith(ENTRY_V3_PREFIX):
+        return None
+    rest = body[len(ENTRY_V3_PREFIX):]
+    try:
+        record = parse_json(rest)
+        if not isinstance(record, dict) or canonical_bytes(record).decode('utf-8') != rest \
+                or content_hash(record) != record['sha256']:
+            return None
+        authority = record['authority']
+        kind = authority.get('type') if isinstance(authority, dict) else None
+        if not isinstance(kind, str) or not kind or kind in AUTHORITY_KINDS:
+            return None
+        # Everything outside `authority`, the field set included: the same record with an
+        # authority this kit knows must be a valid v3 record.
+        probe = dict(record, authority={'type': 'decision', 'id': 'x'})
+        probe['sha256'] = content_hash(probe)
+        validate_entry(probe)
+    except (ValueError, TypeError, KeyError, UnicodeDecodeError):
+        return None
+    return ('authority type %s is newer than this kit' % kind if AUTHORITY_TYPE.fullmatch(kind)
+            else 'an authority type newer than this kit')
 
 
 # -- payloads ------------------------------------------------------------------------------
@@ -365,7 +436,7 @@ def _months_ahead(day, months):
 
 
 def entry_record(payload, revision, acceptance_state, origin=None):
-    version = 2 if isinstance(payload['authority'], dict) and payload['authority'].get('type') == 'attestation' else 1
+    version = AUTHORITY_VERSION.get(payload['authority'].get('type'), 1) if isinstance(payload['authority'], dict) else 1
     record = {'schema_version': version, 'key': payload['key'], 'revision': revision,
               'title': payload['title'], 'statement': payload['statement'],
               'authority': payload['authority'], 'owner': payload['owner'],
@@ -392,6 +463,69 @@ def check_decisions(payload, run):
     if bad:
         raise ValueError('Unknown decision link(s) %s: each must be an existing issue of type decision or '
                          'labelled decision' % ', '.join(bad))
+
+
+def _decision_issue(run, issue):
+    """Whether `issue` names an existing native issue of type `decision` or labelled
+    `decision`. `bd list --id` returns only the rows that exist, so an unknown id is False
+    and never a native failure. That is all the kit checks: the issue may be open or
+    closed, and anyone may have created or labelled it (kittrial-5bb.87, kittrial-5bb.106)."""
+    shown = json.loads(run(['list', '--id', issue, '--all', '--limit', '0', '--json']) or '[]')
+    found = next((row for row in shown or [] if isinstance(row, dict) and row.get('id') == issue), None)
+    return found is not None and (found.get('issue_type') == 'decision' or 'decision' in (found.get('labels') or []))
+
+
+def check_authority_decision(payload, run):
+    """A propose, revise or direct revision with a decision authority: its `id` must name
+    an existing decision issue. Checked before the journal, so a refusal creates nothing.
+    (An accept checks the reviewed draft's id in `acceptance_rules`.)"""
+    authority = payload.get('authority')
+    if payload['operation'] == 'accept' or not isinstance(authority, dict) or authority.get('type') != 'decision':
+        return
+    if not _decision_issue(run, authority['id']):
+        raise ValueError('authority.id %s must name an existing issue of type decision or labelled decision'
+                         % authority['id'])
+
+
+def decision_acceptance_rules(record, acceptance, run):
+    """What an operator must show to accept a revision whose authority is a decision
+    (kittrial-5bb.104). Each refusal comes before any write of the acceptance.
+
+    - `authority.id` still names an existing decision issue. It was checked when the draft
+      was written; the issue can have been deleted or lost its type since.
+    - `acceptance.decision_id` names an existing decision issue too. It may be the same
+      issue: the decision that sets a rule is usually the one that accepts it.
+    - `acceptance.evidence` is one line.
+
+    Nothing requires the decision to be closed or to have been created by an operator:
+    over SSH a contributor can do either under any actor name, so such a rule would look
+    like a control without being one. The control is that only an allowlisted operator
+    accepts, on the host route, and is expected to have read the decision.
+    """
+    evidence = acceptance['evidence']
+    if len(evidence) > STATEMENT_MAX or any(ord(character) < 32 for character in evidence):
+        raise ValueError('acceptance.evidence for an entry with a decision authority must be one line (at most '
+                         '%d characters)' % STATEMENT_MAX)
+    decision = acceptance['decision_id']
+    if not ISSUE_ID.fullmatch(decision):
+        # The id becomes a native argument, so its shape is checked before any native read.
+        raise ValueError('acceptance.decision_id must be a native decision issue id for an entry with a decision '
+                         'authority')
+    issue = record['authority']['id']
+    if not _decision_issue(run, issue):
+        raise ValueError('authority.id %s no longer names an issue of type decision or labelled decision; revise '
+                         'the entry to point at the decision that sets this rule before it is accepted' % issue)
+    if decision != issue and not _decision_issue(run, decision):
+        raise ValueError('acceptance.decision_id must name an existing issue of type decision or labelled '
+                         'decision for an entry with a decision authority')
+
+
+def acceptance_rules(record, acceptance, run):
+    """The extra acceptance rules of the authority types the kit cannot resolve."""
+    if attested(record):
+        attestation_acceptance_rules(record, acceptance, run)
+    elif decided(record):
+        decision_acceptance_rules(record, acceptance, run)
 
 
 def attestation_acceptance_rules(record, acceptance, run):
@@ -425,9 +559,7 @@ def attestation_acceptance_rules(record, acceptance, run):
     if not ISSUE_ID.fullmatch(decision):
         # The id becomes a native argument, so its shape is checked before any native read.
         raise ValueError('acceptance.decision_id must be a native decision issue id for an attested entry')
-    shown = json.loads(run(['list', '--id', decision, '--all', '--limit', '0', '--json']) or '[]')
-    found = next((row for row in shown or [] if isinstance(row, dict) and row.get('id') == decision), None)
-    if found is None or not (found.get('issue_type') == 'decision' or 'decision' in (found.get('labels') or [])):
+    if not _decision_issue(run, decision):
         raise ValueError('acceptance.decision_id must name an existing issue of type decision or labelled '
                          'decision for an attested entry: nothing else anchors an operational fact')
 
@@ -443,9 +575,11 @@ KIND = keyed_entries.AnchoredKind(
     validate_entry=lambda record: validate_entry(record),
     entry_record=lambda payload, revision, state: entry_record(payload, revision, state),
     validate_content=_validate_content, write_time_rules=lambda record: _write_time_rules(record),
-    content_fields=CONTENT_FIELDS, pre_write=lambda payload, run, operators: check_decisions(payload, run),
-    entry_prefixes=(ENTRY_PREFIX, ENTRY_V2_PREFIX), entry_prefix_for=lambda record: entry_prefix_for(record),
-    acceptance_rules=lambda record, acceptance, run: attestation_acceptance_rules(record, acceptance, run),
+    content_fields=CONTENT_FIELDS,
+    pre_write=lambda payload, run, operators: (check_decisions(payload, run), check_authority_decision(payload, run)),
+    entry_prefixes=tuple(ENTRY_PREFIXES.values()), entry_prefix_for=lambda record: entry_prefix_for(record),
+    acceptance_rules=lambda record, acceptance, run: acceptance_rules(record, acceptance, run),
+    unsupported_reason=lambda body: unsupported_reason(body),
 )
 SPEC = KIND.spec
 PROPOSE_FIELDS, ACCEPT_FIELDS, DIRECT_FIELDS = KIND.propose_fields, KIND.accept_fields, KIND.direct_fields
@@ -523,19 +657,31 @@ _coverage = KIND.coverage
 
 
 def authority_kind(record):
-    """`repository`, `url` or `attested`: what kind of authority a reader is looking at."""
+    """`repository`, `url`, `attested` or `decision`: what kind of authority a reader is looking at."""
     return AUTHORITY_KINDS.get(((record or {}).get('authority') or {}).get('type'))
 
 
 def authority_note(record, accepted, current=None):
-    """The sentence every read shows beside an attestation, else None.
+    """The sentence every read shows beside an attestation or a decision authority, else None.
 
     Server-derived from validated fields only (the identity, the dates and the basis), never
     the free-text `how` or `source`. `accepted` is whether the reader is presenting this
     revision as the accepted record; a draft attestation is always marked not accepted,
     and an accepted one past its review date says so in the same sentence.
     """
-    if record is None or not attested(record):
+    if record is None:
+        return None
+    if decided(record):
+        # Server-derived from the issue id only.
+        issue = record['authority']['id']
+        if not accepted:
+            return ('NOT ACCEPTED. Points at decision %s; no operator has accepted it, so it is a lead and not '
+                    'authority.' % issue)
+        late = (', and PAST ITS REVIEW DATE (%s): check that the decision still stands before relying on it'
+                % record['review_by'] if due(record.get('review_by'), current) == 'expired' else '')
+        return ('Set by decision %s, accepted by an operator%s. It is a rule this project set for itself, not an '
+                'observed fact: read the decision for the reasons.' % (issue, late))
+    if not attested(record):
         return None
     authority = record['authority']
     who = 'Attested by %s on %s (%s)' % (authority['by'], authority['observed'], authority['basis'])
@@ -992,7 +1138,7 @@ def help_payload():
     return {'schema_version': 1, 'action': 'ref', 'contract': 'cli-contract-v1',
             'usage': ['ref get KEY', 'ref list [--tag TAG]... [--owner IDENTITY] '
                       '[--state draft-only|accepted|superseded|all] [--due expired|due-soon|unset] '
-                      '[--authority repository|url|attested] [--limit N] [--offset N]',
+                      '[--authority repository|url|attested|decision] [--limit N] [--offset N]',
                       'ref find PHRASE [--limit N]', 'ref misses [--limit N]', 'ref propose --file entry.json', 'ref revise --file entry.json'],
             'lookup': 'Look here before asking the owner or searching: ref find PHRASE returns the entries a '
                       'phrase names (accepted first; a draft is marked and is never authority) and the nearest '
@@ -1006,9 +1152,10 @@ def help_payload():
                        'attestation_line': ATTESTATION_LINE_MAX, 'attested_review_months': ATTESTED_REVIEW_MONTHS,
                        'batch_items': keyed_entries.BATCH_MAX},
             'authority': {'types': sorted(AUTHORITY_KINDS), 'attestation_bases': list(ATTESTATION_BASES),
-                          'kinds': 'authority_kind is repository, url or attested; an attested entry is '
+                          'kinds': 'authority_kind is repository, url, attested or decision; an attested entry is '
                                    'provenance (who observed or stated it, when and how), accepted only by an '
-                                   'operator, and cannot be checked against a repository'},
+                                   'operator, and cannot be checked against a repository; a decision entry is a '
+                                   'rule the project set for itself and points at the decision issue that set it'},
             'operator': ['admin.py reference-apply PROJECT --actor OPERATOR --file acceptance.json',
                          'admin.py reference-apply PROJECT --actor OPERATOR --file batch.json  '
                          '(a batch: {schema_version, operation_id, acceptance_state, acceptance, items: '
@@ -1050,7 +1197,7 @@ def parse_list_options(args):
     if options.get('due') not in (None, 'expired', 'due-soon', 'unset'):
         raise ValueError('ref list: --due must be expired, due-soon or unset')
     if options.get('authority') not in (None,) + tuple(AUTHORITY_KINDS.values()):
-        raise ValueError('ref list: --authority must be repository, url or attested')
+        raise ValueError('ref list: --authority must be repository, url, attested or decision')
     if options.get('owner') is not None:
         valid_owner(options['owner'])
     return options

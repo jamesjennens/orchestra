@@ -61,7 +61,8 @@ REVIEW_KIND_PREFIXES = {'contribution-review': 'Kind: contribution-review-v1\n',
 # them to reserved_comments.
 # `reference-entry` has two versions this kit reads (v2: an attestation authority,
 # kittrial-5bb.98); a void names the kind, and the target's bytes say which version.
-KEYED_KIND_PREFIXES = {'reference-entry': ('Kind: reference-entry-v1\n', 'Kind: reference-entry-v2\n'),
+KEYED_KIND_PREFIXES = {'reference-entry': ('Kind: reference-entry-v1\n', 'Kind: reference-entry-v2\n',
+                                           'Kind: reference-entry-v3\n'),
                        'reference-acceptance': 'Kind: reference-acceptance-v1\n',
                        'capability-entry': 'Kind: capability-entry-v1\n',
                        'capability-acceptance': 'Kind: capability-acceptance-v1\n',

@@ -177,6 +177,11 @@ REFERENCE_ENTRY_PREFIX = 'Kind: reference-entry-v1\n'
 # attested draft - as an anchor with no record yet), and its operator void never
 # matches a v2 record (.41 3.8).
 REFERENCE_ENTRY_V2_PREFIX = 'Kind: reference-entry-v2\n'
+# kittrial-5bb.104: a revision whose authority is a decision issue is version 3, for the
+# same reason. Version 3 is meant to be the last bump an authority type needs: a v3
+# record whose authority type this kit does not know reads `unsupported` (never
+# malformed, never voidable), so a later type can be written inside v3.
+REFERENCE_ENTRY_V3_PREFIX = 'Kind: reference-entry-v3\n'
 REFERENCE_ACCEPTANCE_PREFIX = 'Kind: reference-acceptance-v1\n'
 PROPOSAL_PREFIX = 'Kind: requirement-proposal-v1\n'
 PROPOSAL_DISPOSITION_PREFIX = 'Kind: proposal-disposition-v1\n'
@@ -825,7 +830,8 @@ def reserved_label(label):
 # Each record type label and the v1 record prefixes that make a row carrying it an
 # anchor. The first record a writer slice posts on a new anchor is one of these.
 RECORD_ANCHOR_FAMILIES = {
-    'reference': (REFERENCE_ENTRY_PREFIX, REFERENCE_ENTRY_V2_PREFIX, REFERENCE_ACCEPTANCE_PREFIX),
+    'reference': (REFERENCE_ENTRY_PREFIX, REFERENCE_ENTRY_V2_PREFIX, REFERENCE_ENTRY_V3_PREFIX,
+                  REFERENCE_ACCEPTANCE_PREFIX),
     'proposal': (PROPOSAL_PREFIX, PROPOSAL_DISPOSITION_PREFIX),
     'contribution-settings': (CONTRIBUTION_SETTINGS_PREFIX,),
     'capability': (CAPABILITY_ENTRY_PREFIX, CAPABILITY_ACCEPTANCE_PREFIX,
@@ -837,7 +843,7 @@ RECORD_COMMENT_FAMILIES = ('Kind: reference-', 'Kind: requirement-proposal-',
                            'Kind: capability-')
 _RECORD_KIND = re.compile(r'Kind: ([a-z][a-z-]*?)-v([1-9][0-9]{0,5})\n')
 # Versions after 1 that this kit reads, as (kind, version).
-SUPPORTED_LATER_VERSIONS = frozenset({('reference-entry', 2)})
+SUPPORTED_LATER_VERSIONS = frozenset({('reference-entry', 2), ('reference-entry', 3)})
 
 
 def carries_record_label(row):
@@ -900,7 +906,8 @@ def record_comment_kind(text):
     """(kind, version, state) for a record comment, else None.
 
     `state` is `supported` for a v1 record of one of the nine designed kinds, and for
-    the later versions in SUPPORTED_LATER_VERSIONS (reference-entry-v2, kittrial-5bb.98),
+    the later versions in SUPPORTED_LATER_VERSIONS (reference-entry-v2, kittrial-5bb.98, and
+    reference-entry-v3, kittrial-5bb.104),
     and `unsupported` for anything else (an unknown version or kind), so a later slice's
     reader can report an unknown newer record per entry instead of failing the whole
     read (.41 3.8, .58 3.8). Every version is raw-write reserved either way.

@@ -162,13 +162,17 @@ class AnchoredKind:
     are `entry_prefix`. `acceptance_rules(record, acceptance, run)` may refuse an
     acceptance of one record by what the record is (an attested reference needs more
     from its operator); it runs before the journal for a direct accepted revision and
-    before any write for an accept.
+    before any write for an accept. `unsupported_reason(body)` says why a record comment
+    of a version this kit reads is nonetheless one it does not support (a reference
+    revision whose authority type is newer than this kit, kittrial-5bb.104), or None; such
+    a record makes its entry read `unsupported` exactly as a newer record version does:
+    it is never malformed, never a void target, and every write on its entry is refused.
     """
 
     def __init__(self, **values):
         defaults = {'pre_write': lambda payload, run, operators: None, 'extra_records': {}, 'extra_parsers': {},
                     'supports_retire': False, 'entry_prefixes': None, 'entry_prefix_for': None,
-                    'acceptance_rules': None}
+                    'acceptance_rules': None, 'unsupported_reason': None}
         defaults.update(values)
         self.__dict__.update(defaults)
         self.entry_prefixes = tuple(self.entry_prefixes or (self.entry_prefix,))
@@ -264,7 +268,23 @@ class AnchoredKind:
             labels.append('request:' + content_hash({'operation_id': operation_id}))
         return self.shown(run, self.listed_ids(run, ['--label-any', ','.join(labels)]))
 
+    def unsupported_record(self, body):
+        """Why this kit does not support one record comment of this kind's family, or None:
+        a record version it does not read, or what `unsupported_reason` says."""
+        kind = record_comment_kind(body)
+        if not kind or not kind[0].startswith(self.family):
+            return None
+        if kind[2] == 'unsupported':
+            return '%s-v%s is newer than this kit' % (kind[0], kind[1])
+        return self.unsupported_reason(body) if self.unsupported_reason is not None else None
+
     def existing_revisions(self, row):
+        for comment in row.get('comments') or []:
+            reason = self.unsupported_record(comment.get('text')) if isinstance(comment, dict) else None
+            if reason is not None and comment['text'].startswith(self.entry_prefixes):
+                # Not "malformed": a newer kit wrote it, and this one must leave it alone.
+                raise ValueError('%s anchor %s carries a record this kit does not support (%s); an operator must '
+                                 'handle it with a kit that does.' % (self.title, row.get('id'), reason))
         return core.existing_ledger(row, self.entry_prefixes, self.parse_entry, self.noun, 'revision', 'revision',
                                     belongs=self.entry_belongs)
 
@@ -441,6 +461,10 @@ class AnchoredKind:
         target = next((comment for comment in comments if str(comment.get('id')) == payload['target']), None)
         if target is None:
             return 'its target %s is not on the anchor' % payload['target']
+        unsupported = self.unsupported_record(target.get('text'))
+        if unsupported is not None:
+            return ('record %s is one this kit does not support (%s), so it cannot be judged here; use a kit that '
+                    'reads it' % (payload['target'], unsupported))
         slot = self.record_slot(kind, target, row)
         if slot is None:
             return None
@@ -1297,10 +1321,10 @@ class AnchoredKind:
                 kind = record_comment_kind(body)
                 if not kind or not kind[0].startswith(self.family):
                     continue
-                if kind[2] == 'unsupported':
+                unsupported = self.unsupported_record(body)
+                if unsupported is not None:
                     view.update(state='unsupported')
-                    view['warnings'].append({'code': 'unsupported-record',
-                                             'detail': '%s-v%s is newer than this kit' % (kind[0], kind[1])})
+                    view['warnings'].append({'code': 'unsupported-record', 'detail': unsupported})
                     return view
                 if kind[0] == self.family + 'entry':
                     record = self.parse_entry(body)
