@@ -18,11 +18,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import lifecycle
 import review_workflow as rw
-from lifecycle import (DEFECT_VALUE, ENABLED, RELEASE, RELEASE_TARGETS_MAX, apply_native,
-                       derived_id, enabled_states, evidence_owed, git_ancestry,
-                       integration_evidence, project_facts, release_selection, release_targets,
-                       reverted_integrations, scoped_evidence, validate_payload,
-                       validate_release_payload)
+from lifecycle import (DEFECT_VALUE, ENABLED, LIVE, RELEASE, RELEASE_QUERY, RELEASE_TARGETS_MAX,
+                       apply_native, derived_id, enabled_states, evidence_owed, git_ancestry,
+                       integration_evidence, project_facts, release_query, release_selection,
+                       release_targets, reverted_integrations, rollback_selection, scoped_evidence,
+                       validate_payload, validate_query_payload, validate_release_payload)
 from requirements import canonical_bytes, content_hash
 
 ACTOR = 'alice/session'
@@ -463,6 +463,67 @@ class ReleaseCommandTests(unittest.TestCase):
         return ['lifecycle.py', 'release', '--config', str(config), '--project', 'example',
                 '--actor', ACTOR, '--file', str(request), '--export', str(export), '--repo', str(root)]
 
+    def fixture_for(self, root, store, data):
+        export = Path(root) / 'issues.jsonl'
+        export.write_text(''.join(json.dumps(row) + '\n' for row in store.rows), encoding='utf-8')
+        request = Path(root) / 'release.json'
+        request.write_text(json.dumps(data), encoding='utf-8')
+        config = Path(root) / 'client.json'
+        config.write_text('{}', encoding='utf-8')
+        return ['lifecycle.py', 'release', '--config', str(config), '--project', 'example',
+                '--actor', ACTOR, '--file', str(request), '--export', str(export), '--repo', str(root)]
+
+    def test_a_plain_release_round_trips_through_the_endpoint(self):
+        # The CLI's chunk payload must be exactly a valid release payload: a plain
+        # release carries NO supersede field (that field belongs to a rollback only).
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        sent = []
+        client = types.ModuleType('client')
+        def fake_request(config, project, actor, args, action=None):
+            payload = json.loads(args[0]); sent.append(payload)
+            return {'returncode': 0, 'stderr': '',
+                    'stdout': json.dumps(apply_native(payload, ACTOR, store.run))}
+        client.request = fake_request
+        with scratch() as root:
+            argv = self.fixture(root, store)
+            report = json.loads(self.run_cli(argv, client))
+        self.assertEqual(report['groups_completed'], 1)
+        write = next(payload for payload in sent if payload['dimension'] == RELEASE)
+        self.assertNotIn('supersede', write)
+        self.assertEqual(store.facts('trial-a')['facts']['deployed']['value'], 'passed')
+        self.assertEqual(store.facts('trial-a')['live'], 'live')
+
+    def test_a_rollback_round_trips_through_the_endpoint(self):
+        store = (NativeStore(tasks=('trial-a', 'trial-b'))
+                 .seed('trial-a')
+                 .seed('trial-b', integration=MERGE_B, source=SOURCE_B))
+        store.record(release_payload([target('trial-a')], operation='release-r1', release='r-1',
+                                     scope={'source_commit': '', 'integration_commit': RELEASE_1,
+                                            'release_id': 'r-1', 'environment': 'production'}))
+        store.record(release_payload([target('trial-a'),
+                                      target('trial-b', integration=MERGE_B, source=SOURCE_B)],
+                                     operation='release-r3', release='r-3',
+                                     scope={'source_commit': '', 'integration_commit': RELEASE_2,
+                                            'release_id': 'r-3', 'environment': 'production'}))
+        sent = []
+        client = types.ModuleType('client')
+        def fake_request(config, project, actor, args, action=None):
+            payload = json.loads(args[0]); sent.append(payload)
+            return {'returncode': 0, 'stderr': '',
+                    'stdout': json.dumps(apply_native(payload, ACTOR, store.run))}
+        client.request = fake_request
+        rb = release_payload([], operation='rollback-r1', release='r-1',
+                             scope={'source_commit': '', 'integration_commit': RELEASE_1,
+                                    'release_id': 'r-1', 'environment': 'production'},
+                             rollback=True)
+        with scratch() as root:
+            report = json.loads(self.run_cli(self.fixture_for(root, store, rb) + ['--rollback'], client))
+        self.assertTrue(report['rollback'])
+        self.assertEqual(report['superseded'], ['trial-b'])
+        self.assertEqual(store.facts('trial-a')['scope']['release_id'], 'r-1')
+        self.assertEqual(store.facts('trial-b')['live'], 'superseded')
+        self.assertEqual(store.facts('trial-b')['facts']['deployed']['value'], 'unknown')
+
     def test_dry_run_prints_the_selection_and_never_contacts_the_endpoint(self):
         store = NativeStore().seed('trial-a').seed('trial-b', integration=MERGE_B, source=SOURCE_B)
         calls = []
@@ -478,13 +539,17 @@ class ReleaseCommandTests(unittest.TestCase):
             self.assertNotIn('result', report)
             self.assertEqual(calls, [])
 
-    def test_release_sends_one_payload_with_the_resolved_targets(self):
+    def test_release_asks_the_endpoint_about_reverts_then_writes_the_targets(self):
         store = NativeStore(tasks=('trial-a',)).seed('trial-a')
         calls = []
         client = types.ModuleType('client')
 
         def fake_request(config, project, actor, args, action=None):
-            calls.append({'project': project, 'actor': actor, 'args': args, 'action': action})
+            payload = json.loads(args[0])
+            calls.append({'project': project, 'actor': actor, 'payload': payload, 'action': action})
+            if payload['dimension'] == RELEASE_QUERY:
+                return {'returncode': 0, 'stderr': '',
+                        'stdout': json.dumps({'reverted': [], 'live_releases': []})}
             return {'returncode': 0, 'stderr': '',
                     'stdout': json.dumps({'operation_id': 'release-1',
                                           'targets': [{'task': 'trial-a'}]})}
@@ -493,10 +558,11 @@ class ReleaseCommandTests(unittest.TestCase):
         with scratch() as root:
             argv = self.fixture(root, store) + ['--live-verified']
             report = json.loads(self.run_cli(argv, client))
-            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(calls), 2)
             self.assertEqual((calls[0]['project'], calls[0]['actor'], calls[0]['action']),
                              ('example', ACTOR, 'lifecycle'))
-            sent = json.loads(calls[0]['args'][0])
+            self.assertEqual(calls[0]['payload']['dimension'], RELEASE_QUERY)
+            sent = calls[1]['payload']
             self.assertEqual(sent['dimension'], RELEASE)
             self.assertTrue(sent['live_verified'])
             self.assertEqual(sent['targets'], [{'task': 'trial-a', 'source_commit': SOURCE_A,
@@ -597,35 +663,42 @@ class ReselectionTests(unittest.TestCase):
         self.assertEqual(selection['targets'], [])
         self.assertIn('already deployed', selection['skipped'][0]['reason'])
 
-    def test_a_different_release_id_reselects_a_task_deployed_earlier(self):
-        # .107 item 4: deployed is per (environment, release id). A new release id
-        # must record even a task already deployed at an earlier release, so a
-        # rollback and a later roll-forward can both be recorded.
+    def test_a_plain_second_release_is_incremental_by_default(self):
+        # rev2 item 1: a plain deploy of R2 after R1 selects only what is NEW in R2.
+        # No --previous-release-commit is needed; the containment rule makes the
+        # default incremental again (rev1's per-release-id rule reselected everything).
         store = NativeStore(tasks=('trial-a',)).seed('trial-a')
         self.deployed(store, 'trial-a', 'r-1', 'production')
         selection = release_selection(
             store.rows, self.release_scope(integration=RELEASE_2, release='r-2'),
-            self.ancestry({(MERGE_A, RELEASE_1), (MERGE_A, RELEASE_2),
-                           (RELEASE_1, RELEASE_2)}))
-        self.assertEqual([item['task'] for item in selection['targets']], ['trial-a'])
+            self.ancestry({(MERGE_A, RELEASE_1), (MERGE_A, RELEASE_2), (RELEASE_1, RELEASE_2)}))
+        self.assertEqual(selection['targets'], [],
+                         'a task already deployed in a release contained in R2 is not reselected')
+        self.assertIn('already deployed', selection['skipped'][0]['reason'])
 
     def test_a_rollback_and_a_roll_forward_are_both_recordable(self):
-        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
-        def always(commit, release):
-            return True
-        store.record(release_payload([target('trial-a')], operation='release-r1', release='r-1'))
-        store.record(release_payload([target('trial-a')], operation='release-r3', release='r-3'))
-        rollback = release_selection(store.rows,
-                                     self.release_scope(release='r-1', integration=RELEASE_COMMIT),
-                                     always)
-        self.assertEqual([item['task'] for item in rollback['targets']], ['trial-a'],
-                         'a rollback to R1 must be recordable after R3')
-        store.record(release_payload([target('trial-a')], operation='release-r1-again', release='r-1'))
-        again = release_selection(store.rows,
-                                  self.release_scope(release='r-3', integration=RELEASE_COMMIT),
-                                  always)
-        self.assertEqual([item['task'] for item in again['targets']], ['trial-a'],
-                         'rolling forward to R3 again must be recordable')
+        store = NativeStore(tasks=('trial-a', 'trial-b'))
+        store.seed('trial-a').seed('trial-b', integration=MERGE_B, source=SOURCE_B)
+
+        def scope_for(release):
+            return {'source_commit': '', 'integration_commit': RELEASE_1 if release == 'r-1' else RELEASE_2,
+                    'release_id': release, 'environment': 'production'}
+
+        store.record(release_payload([target('trial-a')], operation='release-r1', release='r-1',
+                                     scope=scope_for('r-1')))
+        store.record(release_payload([target('trial-a'),
+                                      target('trial-b', integration=MERGE_B, source=SOURCE_B)],
+                                     operation='release-r3', release='r-3', scope=scope_for('r-3')))
+        ranged = self.ancestry({(MERGE_A, RELEASE_1), (MERGE_A, RELEASE_2),
+                                (MERGE_B, RELEASE_2), (RELEASE_1, RELEASE_2)})
+        rollback = rollback_selection(store.rows, scope_for('r-1'), ranged)
+        self.assertEqual([item['task'] for item in rollback['targets']], ['trial-a'])
+        self.assertEqual(rollback['supersede'], ['trial-b'])
+        store.record(release_payload([target('trial-a')], operation='rollback-r1', release='r-1',
+                                     scope=scope_for('r-1'), rollback=True, supersede=['trial-b']))
+        forward = release_selection(store.rows, scope_for('r-3'), ranged)
+        self.assertEqual([item['task'] for item in forward['targets']], ['trial-b'],
+                         'rolling forward re-lives the superseded task and leaves the live one alone')
 
     def test_a_deployment_in_another_environment_is_not_already_deployed(self):
         # Kills the mutation that drops the environment from the already-deployed
@@ -1024,16 +1097,19 @@ class ReleaseCommandChunkTests(ReleaseCommandTests):
         sent = []
         client = types.ModuleType('client')
         def fake_request(config, project, actor, args, action=None):
-            sent.append(json.loads(args[0]))
+            payload = json.loads(args[0])
+            sent.append(payload)
             return {'returncode': 0, 'stderr': '',
-                    'stdout': json.dumps({'targets': [{'task': item['task']} for item in json.loads(args[0])['targets']]})}
+                    'stdout': json.dumps({'targets': [{'task': item['task']}
+                                                       for item in payload['targets']]})}
         client.request = fake_request
         with scratch() as root:
             argv = self.fixture(root, store) + ['--chunk-size', '2']
             report = json.loads(self.run_cli(argv, client))
+        writes = [payload for payload in sent if payload['dimension'] == RELEASE]
         self.assertEqual(report['chunks'], [2, 1])
-        self.assertEqual(len(sent), 2)
-        self.assertTrue(all(len(payload['targets']) <= 2 for payload in sent))
+        self.assertEqual(len(writes), 2)
+        self.assertTrue(all(len(payload['targets']) <= 2 for payload in writes))
 
 
 class ReaderDeliveryTests(unittest.TestCase):
@@ -1051,7 +1127,10 @@ class ReaderDeliveryTests(unittest.TestCase):
              'text': rw.PREFIX + canonical_bytes(payload).decode()})
 
     def clipped(self, value):
-        return {'text': value, 'omitted_chars': 0}
+        # deployed_delivery values are PLAIN STRINGS clipped to 160 characters - the
+        # shape the field shipped with a version ago (rev2 item 6.1), not excerpt
+        # objects.
+        return value[:160]
 
     def test_brief_and_work_name_the_deployed_delivery(self):
         import briefing
@@ -1064,11 +1143,15 @@ class ReaderDeliveryTests(unittest.TestCase):
                           'environment': self.clipped('production'),
                           'source_commit': self.clipped(SOURCE_A),
                           'integration_commit': self.clipped(MERGE_A)})
+        self.assertTrue(all(isinstance(value, str)
+                            for value in brief['deployed_delivery'].values()))
         self.assertIsNone(brief['deployed_delivery_is_current_contribution'])
+        self.assertEqual(brief['deployed_live'], 'live')
         queue = work.queue(store.rows, ACTOR, ['--mine'])
         item = next(entry for entry in queue['items'] if entry['task'] == 'trial-a')
         self.assertEqual(item['deployed_delivery']['release_id'], self.clipped('release-1'))
         self.assertEqual(item['deployed_delivery']['environment'], self.clipped('production'))
+        self.assertEqual(item['deployed_live'], 'live')
 
     def test_deployed_delivery_is_current_contribution_answers_both_ways(self):
         # Kills the mutation that inverts this answer in brief (.107 item 8).
@@ -1099,8 +1182,9 @@ class ReaderDeliveryTests(unittest.TestCase):
         store.record(release_payload([target('trial-a')], release='r' * 3657))
         brief = briefing.brief(store.rows, 'trial', 'trial-a')
         release = brief['deployed_delivery']['release_id']
-        self.assertEqual(len(release['text']), 160)
-        self.assertEqual(release['omitted_chars'], 3657 - 160)
+        self.assertIsInstance(release, str)
+        self.assertEqual(len(release), 160)
+        self.assertEqual(release, 'r' * 160)
 
 
 class LaterLiveVerifiedTests(unittest.TestCase):
@@ -1125,6 +1209,7 @@ class LaterLiveVerifiedTests(unittest.TestCase):
         store.record(release_payload([target('trial-a')], release='r-1'))
         result = store.record(release_payload([target('trial-a')], release='r-1', live_verified=True))
         recorded = result['targets'][0]
+        self.assertTrue(recorded['verify_only'])
         self.assertTrue(recorded['already_deployed'])
         self.assertIsNone(recorded['deployed'])
         self.assertIsNotNone(recorded['live_verified'])
@@ -1132,10 +1217,65 @@ class LaterLiveVerifiedTests(unittest.TestCase):
         deployed_events = [row for row in store.rows if row.get('issue_type') == 'event'
                            and 'deployed' in row.get('title', '')]
         self.assertEqual(len(deployed_events), 1)
-        # Once it is passed, a further --live-verified is a no-op.
+        # Once it is passed, a further --live-verified is a no-op: the endpoint's
+        # plan is empty (reconciled) and the client's selection skips it.
         again = store.record(release_payload([target('trial-a')], release='r-1', live_verified=True))
         self.assertIsNone(again['targets'][0]['live_verified'])
         self.assertTrue(again['targets'][0]['reconciled'])
+        selection = release_selection(store.rows, self.release_scope(),
+                                      lambda commit, release: True, live_verified=True)
+        self.assertEqual(selection['targets'], [])
+        self.assertIn('already deployed', selection['skipped'][0]['reason'])
+
+    def test_verifying_an_older_release_never_moves_the_current_scope(self):
+        # rev2 item 3: deploy R1, deploy R2, then --live-verified for R1. The task's
+        # current scope stays R2 whichever operation id the operator uses, and the
+        # live-verification is recorded as evidence for R1.
+        for operation in ('r1-verify-new', 'release-r1'):
+            with self.subTest(operation=operation):
+                store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+                store.record(release_payload([target('trial-a')], operation='release-r1', release='r-1'))
+                store.record(release_payload([target('trial-a')], operation='release-r2', release='r-2'))
+                result = store.record(release_payload([target('trial-a')], operation=operation,
+                                                      release='r-1', live_verified=True))
+                recorded = result['targets'][0]
+                self.assertTrue(recorded['verify_only'])
+                self.assertFalse(recorded['scope_recorded'])
+                self.assertIsNone(recorded['deployed'])
+                self.assertIsNotNone(recorded['live_verified'])
+                state = store.facts('trial-a')
+                self.assertEqual(state['scope']['release_id'], 'r-2',
+                                 'verifying R1 must not move the current scope back')
+                self.assertEqual(state['facts']['deployed']['value'], 'passed')
+                # The evidence is readable per scope: R1 no longer owes live-verified.
+                owed = {(group['release_id'], item['task']): item['remaining_evidence']
+                        for group in evidence_owed(store.rows) for item in group['tasks']}
+                self.assertNotIn('live-verified', owed[('r-1', 'trial-a')])
+                self.assertEqual(owed[('r-2', 'trial-a')], ['live-verified'])
+
+    def test_a_verified_newer_release_does_not_mask_an_unverified_older_one(self):
+        # The verification owed for R1 must not be read as done because a LATER
+        # release of the same integration was verified (rev2 item 3).
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        store.record(release_payload([target('trial-a')], operation='release-r1', release='r-1'))
+        store.record(release_payload([target('trial-a')], operation='release-r2', release='r-2',
+                                     live_verified=True))
+        result = store.record(release_payload([target('trial-a')], operation='verify-r1',
+                                              release='r-1', live_verified=True))
+        self.assertTrue(result['targets'][0]['verify_only'])
+        self.assertIsNotNone(result['targets'][0]['live_verified'])
+        self.assertEqual(store.facts('trial-a')['scope']['release_id'], 'r-2')
+
+    def test_a_late_verify_of_a_rolled_back_release_still_does_not_move_the_scope(self):
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        store.record(release_payload([target('trial-a')], operation='release-r1', release='r-1'))
+        store.record(release_payload([target('trial-a')], operation='release-r3', release='r-3'))
+        store.record(release_payload([target('trial-a')], operation='rollback-r1', release='r-1',
+                                     rollback=True))
+        result = store.record(release_payload([target('trial-a')], operation='verify-r1',
+                                              release='r-1', live_verified=True))
+        self.assertTrue(result['targets'][0]['verify_only'])
+        self.assertEqual(store.facts('trial-a')['scope']['release_id'], 'r-1')
 
 
 class PreviousReleaseValidationTests(ReleaseCommandTests):
@@ -1177,21 +1317,36 @@ class ReleaseGroupReportingTests(ReleaseCommandTests):
         store.record(payload('trial-c', 'tested', operation=planted))
         sent = []
         client = types.ModuleType('client')
-        client.request = lambda *args, **kwargs: sent.append(args) or {
-            'returncode': 0, 'stdout': '{}', 'stderr': ''}
+        def fake_request(config, project, actor, args, action=None):
+            payload = json.loads(args[0])
+            sent.append(payload)
+            if payload['dimension'] == RELEASE_QUERY:
+                return {'returncode': 0, 'stdout': json.dumps({'reverted': []}), 'stderr': ''}
+            return {'returncode': 0, 'stdout': '{}', 'stderr': ''}
+        client.request = fake_request
         with scratch() as root:
             argv = self.fixture(root, store) + ['--chunk-size', '1']
-            _out, error = self.run_cli(argv, client, catch=True)
-        self.assertEqual(sent, [], 'no group may be sent after the whole-release check fails')
+            out, error = self.run_cli(argv, client, catch=True)
+        writes = [payload for payload in sent if payload['dimension'] == RELEASE]
+        self.assertEqual(writes, [], 'no group may be sent after the whole-release check fails')
         self.assertIn('operation ID already used for different content', error or '')
+        # The planted-id refusal prints the SAME JSON failure report as a group
+        # failure (rev2 item 6.2), not only the plain error line.
+        report = json.loads(out)
+        self.assertEqual(report['groups_completed'], 0)
+        self.assertIn('operation ID already used for different content', report['failure'])
 
     def test_a_group_failure_reports_which_groups_completed(self):
         store = self.store()
-        sent = []
+        writes = []
         client = types.ModuleType('client')
         def fake_request(config, project, actor, args, action=None):
-            sent.append(args)
-            if len(sent) == 2:
+            payload = json.loads(args[0])
+            if payload['dimension'] == RELEASE_QUERY:
+                return {'returncode': 0, 'stderr': '',
+                        'stdout': json.dumps({'reverted': []})}
+            writes.append(payload)
+            if len(writes) == 2:
                 return {'returncode': 2, 'stdout': '', 'stderr': 'endpoint refused group two'}
             return {'returncode': 0, 'stderr': '', 'stdout': json.dumps({'targets': []})}
         client.request = fake_request
@@ -1204,6 +1359,9 @@ class ReleaseGroupReportingTests(ReleaseCommandTests):
         self.assertEqual(report['chunks'], [1, 1, 1])
         self.assertIn('endpoint refused group two', report['failure'])
         self.assertIn('failed after 1 of 3 group(s)', error or '')
+        # A between-group failure needs a fresh export before a retry (rev2 item 6.3).
+        self.assertTrue(report['fresh_export_required'])
+        self.assertIn('FRESH export', report['fresh_export_note'])
 
 
 class ReleaseCostEstimateTests(unittest.TestCase):
@@ -1230,6 +1388,216 @@ class ReleaseCostEstimateTests(unittest.TestCase):
         self.assertEqual(report['expected_seconds'],
                          round(lifecycle.DRY_RUN_FIXED_SECONDS
                                + lifecycle.DRY_RUN_SECONDS_PER_TARGET * 3, 1))
+
+
+class RollbackSemanticsTests(unittest.TestCase):
+    """An explicit rollback leaves every reader saying what is live (rev2 item 2)."""
+
+    def rolled_back(self):
+        store = (NativeStore(tasks=('trial-a', 'trial-b'))
+                 .seed('trial-a')
+                 .seed('trial-b', integration=MERGE_B, source=SOURCE_B))
+        store.record(release_payload([target('trial-a')], operation='release-r1', release='r-1'))
+        store.record(release_payload([target('trial-a'),
+                                      target('trial-b', integration=MERGE_B, source=SOURCE_B)],
+                                     operation='release-r3', release='r-3'))
+        result = store.record(release_payload([target('trial-a')], operation='rollback-r1',
+                                              release='r-1', rollback=True, supersede=['trial-b']))
+        return store, result
+
+    def test_a_rollback_moves_the_live_release_and_supersedes_newer_tasks(self):
+        store, result = self.rolled_back()
+        self.assertEqual([entry['task'] for entry in result['targets']], ['trial-a'])
+        self.assertFalse(result['targets'][0]['verify_only'])
+        self.assertTrue(result['rollback'])
+        self.assertEqual([entry['task'] for entry in result['superseded']], ['trial-b'])
+        first = store.facts('trial-a')
+        self.assertEqual(first['facts']['deployed']['value'], 'passed')
+        self.assertEqual(first['scope']['release_id'], 'r-1')
+        self.assertEqual(first['live'], 'live')
+        second = store.facts('trial-b')
+        self.assertEqual(second['facts']['deployed']['value'], 'unknown',
+                         'a task only in the newer release reads not live after a rollback')
+        self.assertEqual(second['live'], 'superseded')
+
+    def test_brief_and_work_agree_with_the_rollback(self):
+        import briefing
+        import work
+        store, _result = self.rolled_back()
+        brief = briefing.brief(store.rows, 'trial', 'trial-b')
+        self.assertIsNone(brief['deployed_delivery'])
+        self.assertEqual(brief['deployed_live'], 'superseded')
+        self.assertEqual(brief['lifecycle']['deployed']['value'], 'unknown')
+        item = next(entry for entry in work.queue(store.rows, ACTOR, ['--mine'])['items']
+                    if entry['task'] == 'trial-b')
+        self.assertIsNone(item['deployed_delivery'])
+        self.assertEqual(item['deployed_live'], 'superseded')
+        kept = briefing.brief(store.rows, 'trial', 'trial-a')
+        self.assertEqual(kept['deployed_delivery']['release_id'], 'r-1')
+        self.assertEqual(kept['deployed_live'], 'live')
+
+    def test_evidence_owed_names_the_superseded_release(self):
+        store, _result = self.rolled_back()
+        rows = {(group['environment'], group['release_id'], item['task']): item['live']
+                for group in evidence_owed(store.rows) for item in group['tasks']}
+        self.assertEqual(rows[('production', 'r-1', 'trial-a')], 'live')
+        self.assertEqual(rows[('production', 'r-3', 'trial-b')], 'superseded')
+
+    def test_a_plain_roll_forward_re_lives_a_superseded_task(self):
+        import briefing
+        store, _result = self.rolled_back()
+        forward = release_payload([target('trial-b', integration=MERGE_B, source=SOURCE_B)],
+                                  operation='forward-r3', release='r-3')
+        store.record(forward)
+        state = store.facts('trial-b')
+        self.assertEqual(state['live'], 'live')
+        self.assertEqual(state['facts']['deployed']['value'], 'passed')
+        self.assertEqual(briefing.brief(store.rows, 'trial', 'trial-b')['deployed_live'], 'live')
+
+    def test_an_older_kit_still_reads_the_release_as_it_did_before(self):
+        # An additive dimension: a kit that predates `live` has no reader for it and
+        # drops those events entirely, so it reads the superseded task exactly as it
+        # did before (rev2 item 4). Dropping the live events here simulates that.
+        store, _result = self.rolled_back()
+
+        def is_live_event(row):
+            event = lifecycle.native_event(row)
+            return event is not None and event['dimension'] == 'live'
+
+        older = [row for row in store.rows if not is_live_event(row)]
+        state = next(row for row in project_facts(older) if row['id'] == 'trial-b')
+        self.assertEqual(state['facts']['deployed']['value'], 'passed')
+        self.assertEqual(state['live'], 'unknown')
+
+    def test_supersede_belongs_to_an_explicit_rollback(self):
+        with self.assertRaisesRegex(ValueError, 'supersede belongs to an explicit rollback'):
+            validate_release_payload(
+                release_payload([target('trial-a')], supersede=['trial-b']))
+
+
+class ReleaseQueryTests(unittest.TestCase):
+    """The default command learns reverts from the endpoint (rev2 item 5)."""
+
+    def setUp(self):
+        journal = None
+        try:
+            journal = Path(tempfile.mkdtemp())
+            (journal / rw.JOURNAL_DIR).mkdir()
+        except OSError as exc:
+            if journal is not None:
+                shutil.rmtree(journal, ignore_errors=True)
+            self.skipTest('no writable host revert journal: ' + str(exc))
+        self.journal = journal
+        self.addCleanup(shutil.rmtree, journal, ignore_errors=True)
+
+    def revert(self, store, task, commit):
+        payload = dict(schema_version=1, operation='revert-record', operation_id='revert-1',
+                       task=task, contribution='1', integration_commit=commit,
+                       revert_commit='b' * 40, reason='dropped', operator=OPERATOR)
+        row = next(item for item in store.rows if item['id'] == task)
+        cid = str(len(row.get('comments') or []) + 1)
+        row.setdefault('comments', []).append(
+            {'id': cid, 'author': OPERATOR, 'created_at': '2026-01-01T00:00:00Z',
+             'text': lifecycle.REVERT_PREFIX + canonical_bytes(payload).decode()})
+        entry = rw.revert_journal_entry(rw.JOURNAL_REVERT, payload, cid, OPERATOR, task=task,
+                                        contribution='1', integration_commit=commit,
+                                        revert_commit='b' * 40)
+        rw.publish_revert_journal(self.journal, entry)
+
+    def test_the_query_returns_the_host_reverted_set(self):
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        self.revert(store, 'trial-a', MERGE_A)
+        query = dict(release_payload([]), dimension=RELEASE_QUERY)
+        validate_query_payload(query)
+        answer = release_query(query, ACTOR, store.run, operators=[OPERATOR], journal=self.journal)
+        self.assertEqual(answer['dimension'], RELEASE_QUERY)
+        self.assertEqual(answer['reverted'],
+                         [{'task': 'trial-a', 'integration_commit': MERGE_A}])
+
+    def test_the_query_writes_nothing(self):
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        before = json.dumps(store.rows)
+        calls = len(store.calls)
+        query = dict(release_payload([]), dimension=RELEASE_QUERY)
+        release_query(query, ACTOR, store.run, operators=[OPERATOR], journal=self.journal)
+        self.assertEqual(json.dumps(store.rows), before)
+        self.assertEqual(store.calls[calls:], [['export', '--all']])
+
+    def test_a_reverted_target_is_not_selected_for_a_second_release(self):
+        store = (NativeStore(tasks=('trial-a', 'trial-b'))
+                 .seed('trial-a').seed('trial-b', integration=MERGE_B, source=SOURCE_B))
+        self.revert(store, 'trial-b', MERGE_B)
+        answer = release_query(dict(release_payload([]), dimension=RELEASE_QUERY),
+                               ACTOR, store.run, operators=[OPERATOR], journal=self.journal)
+        reverted = {(item['task'], item['integration_commit']) for item in answer['reverted']}
+        selection = release_selection(
+            store.rows, {'source_commit': '', 'integration_commit': RELEASE_COMMIT,
+                         'release_id': 'r-2', 'environment': 'production'},
+            lambda commit, release: True, reverted=reverted)
+        self.assertEqual([item['task'] for item in selection['targets']], ['trial-a'])
+        self.assertIn('reverted', [item['reason'] for item in selection['skipped']][0])
+
+
+class EvidenceOwedCostTests(unittest.TestCase):
+    """evidence-owed hashes each distinct scope once, not once per event (item 6.4)."""
+
+    def test_the_scope_token_is_memoised_across_events(self):
+        import unittest.mock
+        store = NativeStore(tasks=('trial-a',))
+        seeded = scope()
+        store.record(payload('trial-a', 'lifecycle-scope', operation='scope-a', scope_value=seeded))
+        for index in range(25):
+            store.record(payload('trial-a', 'deployed', operation='deploy-%d' % index,
+                                 scope_value=seeded))
+        real = lifecycle.hashlib.sha256
+        calls = {'n': 0}
+        def counting(*args, **kwargs):
+            calls['n'] += 1
+            return real(*args, **kwargs)
+        with unittest.mock.patch.object(lifecycle.hashlib, 'sha256', counting):
+            lifecycle.evidence_owed(store.rows)
+        self.assertLessEqual(calls['n'], 2,
+                             'the same distinct scope must not be hashed once per event')
+
+
+class RollbackCommandTests(ReleaseCommandTests):
+    """`release --rollback` sends the resolved targets plus the supersede list."""
+
+    def rollback_fixture(self, root, store):
+        export = Path(root) / 'issues.jsonl'
+        export.write_text(''.join(json.dumps(row) + '\n' for row in store.rows), encoding='utf-8')
+        request = Path(root) / 'release.json'
+        request.write_text(json.dumps(release_payload([], release='r-1', rollback=True)),
+                           encoding='utf-8')
+        config = Path(root) / 'client.json'
+        config.write_text('{}', encoding='utf-8')
+        return ['lifecycle.py', 'release', '--config', str(config), '--project', 'example',
+                '--actor', ACTOR, '--file', str(request), '--export', str(export), '--repo', str(root)]
+
+    def test_the_rollback_flag_sends_targets_and_supersede(self):
+        store = (NativeStore(tasks=('trial-a', 'trial-b'))
+                 .seed('trial-a')
+                 .seed('trial-b', integration=MERGE_B, source=SOURCE_B))
+        store.record(release_payload([target('trial-a'),
+                                      target('trial-b', integration=MERGE_B, source=SOURCE_B)],
+                                     operation='release-r3', release='r-3'))
+        sent = []
+        client = types.ModuleType('client')
+        def fake_request(config, project, actor, args, action=None):
+            payload = json.loads(args[0]); sent.append(payload)
+            if payload['dimension'] == RELEASE_QUERY:
+                return {'returncode': 0, 'stderr': '', 'stdout': json.dumps({'reverted': []})}
+            return {'returncode': 0, 'stderr': '', 'stdout': json.dumps({'targets': []})}
+        client.request = fake_request
+        with scratch() as root:
+            argv = self.rollback_fixture(root, store) + ['--rollback']
+            report = json.loads(self.run_cli(argv, client))
+        write = next(payload for payload in sent if payload['dimension'] == RELEASE)
+        self.assertTrue(write['rollback'])
+        self.assertEqual([item['task'] for item in write['targets']], ['trial-a'])
+        self.assertEqual(write['supersede'], ['trial-b'])
+        self.assertTrue(report['rollback'])
+        self.assertEqual(report['superseded'], ['trial-b'])
 
 
 if __name__ == '__main__':

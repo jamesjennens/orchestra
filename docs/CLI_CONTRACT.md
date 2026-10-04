@@ -235,17 +235,22 @@ a bare string; treat `omitted_chars > 0` as "read `show`/`history` for the full 
 Opaque cursor fields (`activity_cursor`, `next_cursor`) are never excerpted: they are
 complete tokens.
 
-`brief` and each `work` item also carry two additive lifecycle delivery fields
-(kittrial-5bb.107 item 7). `deployed_delivery` is the delivery a passed
+`brief` and each `work` item also carry three additive lifecycle delivery fields
+(kittrial-5bb.107 item 7, rev2 item 6.1). `deployed_delivery` is the delivery a passed
 `deployed` fact belongs to, or `null` when the task has no trusted `deployed=passed`
 fact. It is an object with the four scope fields `release_id`, `environment`,
-`source_commit` and `integration_commit`, each an excerpt object (`text` +
-`omitted_chars`) clipped at 160 characters exactly as `lifecycle_scope` is, so an
-oversized or hostile `release_id` is bounded. `deployed_delivery_is_current_contribution`
+`source_commit` and `integration_commit`, each a **plain string clipped to 160
+characters** - the shape the field was released with; rev1 briefly changed the values
+to excerpt objects and rev2 restores the released shape. `deployed_delivery_is_current_contribution`
 is `true` when `deployed_delivery.source_commit` equals the current contribution's
 `commit`, `false` when it does not, and `null` when either the delivery or the
 current contribution is absent. A deployed release may ship a superseded revision,
-so the two are independent of `lifecycle_matches_contribution`.
+so the two are independent of `lifecycle_matches_contribution`. `deployed_live` is
+the task's newest trusted liveness fact: `live` (the named release scope is the
+live release for its environment), `superseded` (an explicit rollback moved the
+environment past it; `deployed` then reads `unknown` and `deployed_delivery` is
+`null`), or `unknown` for a task written before liveness existed (which reads
+exactly as it did before).
 
 `brief` adds an `attention` array, plus `attention_total` and `attention_more`. It
 holds at most 3 items of each kind: `reference-review` items first, then `reference`
