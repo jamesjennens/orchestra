@@ -2,7 +2,8 @@
 
 Run as ``python sigterm_stress_child.py REPO PREVIOUS SECONDS``. A kernel timer
 (``timer_create``, so no Python thread and no patched signal function is involved)
-sends one real SIGTERM per trial at a random delay around the end of a guarded block.
+sends one real SIGTERM per trial at a random delay around the end of a guarded block;
+the delay adapts towards that end, wherever this machine puts it.
 After every trial the child checks the guard's postconditions and, on the first
 violation, prints it and exits 1. PREVIOUS is the handler installed before the guard:
 ``custom`` (counts deliveries), ``ignore`` (SIG_IGN) or ``default`` (SIG_DFL, so a stop
@@ -79,9 +80,9 @@ def work(n):
 def trial(delay):
     """One guarded block with a cleanup, a stop due after ``delay`` seconds."""
     outcome = {'raised': 0}
-    arm(delay)
     try:
         with admin.signal_termination_guard():
+            arm(delay)           # from inside the block: a short delay is always in it
             work(200)
             work(60)
     except admin.TerminatedBySignal:
@@ -96,8 +97,8 @@ def calibrate():
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     started = time.perf_counter()
     for _ in range(200):
-        arm(10)
         with admin.signal_termination_guard():
+            arm(10)
             work(200)
             work(60)
         libc.timer_settime(timer, 0, ctypes.byref(Itimerspec()), None)
@@ -106,11 +107,15 @@ def calibrate():
 
 
 def main():
-    period = calibrate()
+    # The delay tracks the block's end: it starts at the calibrated length and moves
+    # after every trial towards the point where stops change from raised (inside the
+    # guard) to the previous handler's (after it), so a slow or loaded machine still
+    # samples both sides and the exit between them.
+    centre = calibrate()
     counts = {'trials': 0, 'raised': 0, 'previous': 0, 'ignored': 0}
     deadline = time.monotonic() + SECONDS
     while time.monotonic() < deadline:
-        delay = random.uniform(0.5 * period, 1.6 * period)   # around the block's end
+        delay = random.uniform(0.7 * centre, 1.3 * centre)
         before = len(received)
         try:
             outcome = trial(delay)
@@ -130,6 +135,7 @@ def main():
         if problems:
             print('trial %d (delay %.1fus): %s' % (counts['trials'], delay * 1e6, '; '.join(problems)))
             sys.exit(1)
+        centre = min(max(centre * (1.03 if outcome['raised'] else 0.97), 1e-6), 0.05)
         counts['trials'] += 1
         counts['raised'] += outcome['raised']
         counts['previous'] += got
