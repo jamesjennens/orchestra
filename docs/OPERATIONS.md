@@ -704,6 +704,17 @@ Use the labels the forged anchor actually carries (`bd show PROJECT-FORGED --jso
 
 ### Deeply nested JSON
 
+**Known limits of this section (coordinator note at integration, from the independent
+review of kittrial-5bb.108; tracked as kittrial-5bb.111).** The guard covers record
+comments and caller requests. It does not yet cover three host-written inputs: issue
+metadata set with the native tool (`bd update --metadata`), the project's `.sessions.json`,
+and the `--file` payloads of `admin.py` commands. JSON nested thousands of levels deep in
+the first two still makes `work` and `brief` fail for the project, on this kit as on older
+ones. The list below of what fails on an older kit is also incomplete: proposal, proposal
+disposition, contribution-settings and requirement-revision comments, and a lifecycle
+record stored as a state reason (which the listing command does not print, because it reads
+only comments), fail reads there too.
+
 The kit refuses JSON nested more than 64 levels deep wherever it parses text that
 somebody else wrote: a record comment, a `--file` attachment, a payload argument, a
 request to the endpoint, an HTTP request body, a cursor. The deepest JSON the kit itself
