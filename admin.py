@@ -1813,7 +1813,35 @@ def last_complete_guard(root,name):
                 pass
         raise
 
-def backup_project(root,name,degraded=None):
+def guidance_backup_pair(path):
+    """The guidance fragment for one project's coordination sidecar, and any fault.
+
+    Returns ``({'GUIDANCE.md': ..., '.guidance.json': ...}, None)`` for a healthy
+    pair, ``({}, None)`` when the project carries no guidance, and ``({}, message)``
+    when the pair is mismatched or unreadable. The caller leaves the bad pair out and
+    marks the project degraded instead of skipping its tracker backup
+    (kittrial-5bb.99 review `guidance-fault-skips-the-project-backup`).
+    """
+    if not ((path/'GUIDANCE.md').exists() or (path/'GUIDANCE.md').is_symlink()):
+        return {}, None
+    from guidance import (META_NAME as GUIDANCE_META, read_meta as read_guidance_meta,
+                          read_text as read_guidance_text, validate_meta as validate_guidance_meta,
+                          version_of as guidance_version)
+    try:
+        guidance_text=read_guidance_text(path)
+        guidance_meta=read_guidance_meta(path)
+        if guidance_meta is None:
+            raise ValueError('the guidance text has no readable audit metadata')
+        validate_guidance_meta(guidance_meta)
+        if guidance_meta['version']!=guidance_version(guidance_text):
+            raise ValueError('the audit record does not match the guidance text (a hand edit or a crashed set)')
+    except ValueError as error:
+        return {}, ('guidance is degraded: %s. The tracker backup is complete but carries no guidance pair; '
+                    'ask the operator to repair it with `admin.py set-guidance PROJECT --actor OPERATOR '
+                    '--file FILE` (a set with the same text repairs it) and then take a fresh backup.'%(error,))
+    return {'GUIDANCE.md': {'text': guidance_text}, GUIDANCE_META: guidance_meta}, None
+
+def backup_project(root,name):
     import fcntl
     from coordination import atomic
     path=project_dir(root,name)
@@ -1888,36 +1916,16 @@ def backup_project(root,name,degraded=None):
             files['ONBOARDING.md']={'text':read_document(path,'ONBOARDING.md',PROJECT_LIMIT)}
         if (path/'GUIDANCE.md').exists() or (path/'GUIDANCE.md').is_symlink():
             # The standing guidance channel (kittrial-5bb.99): the text and its audit
-            # record are one generation. A mismatched or unreadable pair is handled
-            # below as a DEGRADED backup rather than a failed project.
-            from guidance import (META_NAME as GUIDANCE_META, read_meta as read_guidance_meta,
-                                  read_text as read_guidance_text, validate_meta as validate_guidance_meta,
-                                  version_of as guidance_version)
-            try:
-                guidance_text=read_guidance_text(path)
-                guidance_meta=read_guidance_meta(path)
-                if guidance_meta is None:
-                    raise ValueError('the guidance text has no readable audit metadata')
-                validate_guidance_meta(guidance_meta)
-                if guidance_meta['version']!=guidance_version(guidance_text):
-                    raise ValueError('the audit record does not match the guidance text (a hand edit or a '
-                                     'crashed set)')
-            except ValueError as error:
-                # A two-file sidecar fault must not stop the tracker backup (live
-                # installations run `backup --all` on a daily timer): leave the
-                # mismatched pair out, mark the project degraded here and in the
-                # status record, and keep the tracker backup complete and usable
-                # (kittrial-5bb.99 review `guidance-fault-skips-the-project-backup`).
-                fault=('guidance is degraded: %s. The tracker backup is complete but carries no guidance pair; '
-                       'ask the operator to repair it with `admin.py set-guidance PROJECT --actor OPERATOR '
-                       '--file FILE` (a set with the same text repairs it) and then take a fresh backup.'
-                       %(error,))
-                if degraded is not None:
-                    degraded.append(fault)
+            # record are one generation. A mismatched or unreadable pair is a two-file
+            # sidecar fault and must not stop the tracker backup (live installations
+            # run `backup --all` on a daily timer): leave the pair out, mark the
+            # project degraded with an actionable message, and keep this project's
+            # tracker backup complete and usable
+            # (kittrial-5bb.99 review `guidance-fault-skips-the-project-backup`).
+            fragment,fault=guidance_backup_pair(path)
+            files.update(fragment)
+            if fault:
                 print('backup degraded for %s: %s'%(name,fault),file=sys.stderr)
-            else:
-                files['GUIDANCE.md']={'text':guidance_text}
-                files[GUIDANCE_META]=guidance_meta
         feedback=path/'.feedback.jsonl'
         if feedback.exists() or feedback.is_symlink():
             if feedback.is_symlink():raise ValueError('Feedback feed must not be a symlink')
@@ -2613,16 +2621,16 @@ def backup_projects(root,names,all_projects=False):
         # One project's failure must not abandon the rest of the run, and the run's
         # status file must still record the truth; the reason is reported and the
         # process exits non-zero below. KeyboardInterrupt/SystemExit still propagate.
-        degraded=[]
         try:
-            native=backup_project(root,name,degraded=degraded)
+            native=backup_project(root,name)
         except Exception as error:
             results.append({'name':name,'status':'failed','reason':failure_reason(error)})
             incomplete.append(name);continue
         complete,reason=backup_pair_state(root,name)
         if complete:
             entry={'name':name,'status':'complete','completed_at':utc_stamp()}
-            if degraded:entry['degraded']=' '.join(degraded)
+            _,degraded_fault=guidance_backup_pair(path)
+            if degraded_fault:entry['degraded']=degraded_fault
             results.append(entry)
             print(native)
         else:

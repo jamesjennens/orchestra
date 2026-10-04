@@ -566,13 +566,16 @@ class GuidanceBackupTests(unittest.TestCase):
         # project is marked degraded.
         (self.root / 'backups' / 'example').mkdir(parents=True)
         (self.project / 'GUIDANCE.md').write_text('hand edited text\n', encoding='utf-8')
-        degraded = []
+        err = io.StringIO()
         fake = types.SimpleNamespace(flock=Mock(), LOCK_EX=2)
-        with patch.dict(sys.modules, {'fcntl': fake}), patch.object(admin, 'run_bd', return_value='synced'):
-            self.assertEqual(admin.backup_project(self.root, 'example', degraded=degraded), 'synced')
-        self.assertEqual(len(degraded), 1)
-        self.assertIn('guidance is degraded', degraded[0])
-        self.assertIn('set-guidance', degraded[0])
+        with patch.dict(sys.modules, {'fcntl': fake}), patch.object(admin, 'run_bd', return_value='synced'), \
+                contextlib.redirect_stderr(err):
+            self.assertEqual(admin.backup_project(self.root, 'example'), 'synced')
+        self.assertIn('guidance is degraded', err.getvalue())
+        self.assertIn('set-guidance', err.getvalue())
+        fragment, fault = admin.guidance_backup_pair(self.project)
+        self.assertEqual(fragment, {})
+        self.assertIn('guidance is degraded', fault)
         sidecar = json.loads((self.root / 'backups' / 'example.coordination.json').read_text(encoding='utf-8'))
         self.assertEqual(sidecar['status'], 'complete')
         self.assertNotIn('GUIDANCE.md', sidecar['files'])
@@ -842,7 +845,7 @@ class GuidanceEndpointTests(unittest.TestCase):
         import endpoint  # noqa: F401
         (self.project / '.guidance.json').write_text('[' * 4000 + ']' * 4000, encoding='utf-8')
         answer = json.loads(self.call('guidance', [])['stdout'])
-        self.assertTrue(answer['present']); self.assertIn('warning', answer)
+        self.assertFalse(answer['present']); self.assertIn('warning', answer)
         # An unreadable record makes the text unbound, so the endpoint withholds it
         # (kittrial-5bb.99 review `unbound-text-is-still-delivered`).
         self.assertIsNone(answer['text']); self.assertTrue(answer['unbound'])
