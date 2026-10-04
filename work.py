@@ -110,11 +110,18 @@ def help_payload(action='work'):
     elif action == 'review':
         payload['operations'] = ['read (review TASK)', 'contribute', 'request-changes',
                                  'respond', 'approve', 'withdraw', 'request-review',
-                                 'resolve-item', 'decline-review']
+                                 'resolve-item', 'decline-review', 'recommend']
+        import review_recommendations
+        payload['limits'] = review_recommendations.help_limits()
         payload['notes'] = [
             'Contribution payloads use contribution = the contribution record comment_id, '
             'never a Git SHA and never latest_comment_id.',
             'A JSON file attachment is required for every operation except read.',
+            'recommend records a reviewer\'s advice to approve the CURRENT contribution: '
+            '{schema_version, operation, operation_id, task, contribution, commit, verdict: approve, '
+            'summary, items}. It is never an approval, never changes whether approval is allowed, and '
+            'takes no `previous`. Not for the contribution\'s author or the task\'s assignee; only while '
+            'the contribution awaits review. The newest one by the same actor replaces their earlier one.',
             'A request-changes item may carry severity blocking or note (absent means blocking); '
             'only a blocking item holds up approval. Each pending/note item also carries the '
             'request-changes summary that asked for it.',
@@ -211,7 +218,13 @@ class Parser(argparse.ArgumentParser):
 
 def workflow(issue,scopes=None,operators=None,reverts=None,journal=None,invalid_reverts=None):
     from review_state import project as reviewed
-    return reviewed(issue,scopes,operators,reverts,journal,invalid_reverts)
+    result=reviewed(issue,scopes,operators,reverts,journal,invalid_reverts)
+    # Additive (kittrial-5bb.115): the standing reviewer recommendations for the current
+    # contribution. They sit beside the review chain and change nothing in it; every
+    # reader (review, brief, work) gets them from this one place.
+    from review_recommendations import block as recommendations
+    result.update(recommendations(issue,result))
+    return result
 
 def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes=None, journal=None,
           reference_attention=False, verifiers=None):
@@ -375,6 +388,10 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                       # requests, and whether this row is in their queue because they
                       # were NAMED rather than because they own the task.
                       'review_request':review_request,'review_requests':review_requests,
+                      # Additive (kittrial-5bb.115): a reviewer recommends approving the current
+                      # contribution and nobody has decided yet; and who recommends it.
+                      'recommended':bool(review.get('recommended')),
+                      'recommended_by':[entry['author'] for entry in review.get('recommendations') or []],
                       # Additive (kittrial-5bb.52): the integration disagreement entries
                       # naming both facts and both scopes, and their rendered warnings.
                       'integration_disagreements':disagreements,'integration_warnings':integration_warnings})
@@ -458,8 +475,13 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
             from handoff import disposition as handoff_disposition
             return handoff_disposition(path,actor,payload,run)
         return handoff(path,actor,payload,run)
-    from review_workflow import execute as review
     rows=[json.loads(line) for line in run(['export','--all']).splitlines() if line.strip()]
+    if payload.get('operation')=='recommend':
+        # A reviewer's recommendation (kittrial-5bb.115) is a record beside the review
+        # chain: it has its own writer and never passes through the chain's.
+        from review_recommendations import execute as recommend
+        return recommend(rows,task,actor,payload,run,operators=operators,journal=path)
+    from review_workflow import execute as review
     result=review(rows,task,actor,payload,run, operators=operators, journal=path,
                   review_writes=review_writes)
     if payload.get('operation')=='request-changes':
