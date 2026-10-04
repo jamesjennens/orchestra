@@ -65,7 +65,15 @@ def help_payload(action='work'):
             'capability-offset': '>= %d' % WORK_OFFSET_MIN,
         }
         payload['output'] = {
-            'top_level': ['owner', 'total', 'items', 'next_offset', 'coverage', 'attention'],
+            'top_level': ['owner', 'total', 'items', 'next_offset', 'coverage', 'attention', 'guidance'],
+            'guidance': 'guidance: the project\'s current standing guidance version (kittrial-5bb.99), '
+                        'with present, version, set_at, set_by (null when the audit record does not bind to '
+                        'the text), unbound (true when the text is withheld), previous_version, the calling '
+                        'actor\'s acknowledged state and attention (true when guidance is set, or cannot be '
+                        'read, and this actor has not acknowledged the current version); next_action names '
+                        '`guidance get`, or, for unbound text, says the guidance is being repaired by the '
+                        'operator and that the withheld text must not be followed. '
+                        'A project with no guidance reads as present: false, never an error.',
             'attention': 'attention.reference_review: project-wide reference catalog counts (expired, '
                          'due_soon, unset = draft-only entries, acceptance_inert, malformed, total), always; '
                          'items only for an approver (an actor on the deployment operator allowlist), '
@@ -283,6 +291,13 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
     items.sort(key=lambda r:(priority.get(r['review_state'],4),r['task']))
     result={'owner':owner,'total':len(items),'items':items[a.offset:a.offset+a.limit],'next_offset':a.offset+a.limit if a.offset+a.limit<len(items) else None,
             'coverage':'Fresh current view; structured review takes precedence over legacy review-ready labels. Lifecycle facts remain independent; malformed handoff journals are surfaced as errors.'}
+    if journal is not None:
+        # The standing guidance channel (kittrial-5bb.99): every work queue page
+        # carries the current guidance version, so a worker that only runs `work`
+        # still sees that the coordinator's guidance changed. A project with no
+        # guidance reads as present: false, never an error.
+        from guidance import brief_block
+        result['guidance']=brief_block(journal,actor)
     warnings=[]
     for item in items:
         for warning in item['integration_warnings']:

@@ -99,14 +99,19 @@ def execute(path, project, args, export, *, actor=None):
         if not UUID.fullmatch(a.request_id):raise ValueError('request-id must be a lowercase UUID')
         found=[r for r in data['records'].values() if r['actor']==actor]
         if not found:raise ValueError('Resume requires a registered actor in this project; legacy actors may use onboard, or request an explicit authorized handoff')
+        # The standing guidance channel (kittrial-5bb.99): the resume output is the
+        # worker's first server read each run, so it carries the current guidance
+        # version and whether this actor has acknowledged it.
+        from guidance import brief_block
+        block=brief_block(path,actor)
         resumes=data.setdefault('resumes',{})
         old=resumes.get(a.request_id)
         if old:
             if old['actor']!=actor:raise ValueError('Resume request-id already used by a different actor')
-            return dict(project=project,session=found[0],resume=old,reconciled=True)
+            return dict(project=project,session=found[0],resume=old,reconciled=True,guidance=block)
         event=dict(request_id=a.request_id,actor=actor,timestamp=datetime.now(timezone.utc).isoformat())
         resumes[a.request_id]=event;validate(data);atomic(file,data)
-        return dict(project=project,session=found[0],resume=event,reconciled=False)
+        return dict(project=project,session=found[0],resume=event,reconciled=False,guidance=block)
     if a.operation=='run':
         if not UUID.fullmatch(a.run_id) or (a.kind!='status' and not UUID.fullmatch(a.event_id)):
             raise ValueError('run-id and event-id must be lowercase UUIDs')

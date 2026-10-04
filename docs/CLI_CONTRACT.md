@@ -228,6 +228,62 @@ holds at most 3 items of each kind: `reference-review` items first, then
 then `capability` items (see [capability attention](#capability-attention-in-work-and-brief)).
 The two totals count every kind.
 
+Every `brief`, `work` and session `resume` response also carries a `guidance` block
+for the project's operator-set standing guidance (kittrial-5bb.99): `present`,
+`version` (the SHA-256 of the guidance text), `set_at`, `set_by` (`null` when the
+audit record does not bind the text to a valid operator set), `unbound` (true for
+that case), `previous_version`, this actor's `acknowledged` state, and `attention`
+(true when guidance is set, or cannot be read, and this actor has not acknowledged
+the current version; `next_action` then names `guidance get`, or, for unbound text,
+says the guidance is being repaired by the operator). An unreadable record carries
+`present: null`, `unreadable: true`, `attention: true` and a `warning` instead of
+failing. **Text without a setter is never delivered or followed:** `guidance get`
+returns `text: null` with the `warning`, `unbound: true` and the repair
+`next_action` for a text whose audit record is missing or does not match it, exactly
+as it does for the unreadable states, and `attention` stays raised. A hand-edited or
+crash-interrupted generation is therefore withheld until an operator set with the
+same text repairs it. The reader never reports a setter for text the audit record
+does not bind to.
+
+`guidance get [--since VERSION]` returns the current text and what changed since a
+version the server recorded (`since_known` is false and a `warning` is returned for
+an unknown version); `guidance version` returns the block without the text.
+`guidance ack --version VERSION` records that the calling actor read that exact
+version: the version is required in that exact form (a bare positional version is
+refused), a stale one is refused **without naming the current version** so a caller
+must call `guidance get` first, and any actor the endpoint accepts may ack for
+itself. An ack is unauthenticated: actors are self-declared, so an ack proves only
+that some caller named that actor and version, a flood can fill the bounded table
+and evict a real lane's ack, and that fails safe because an evicted lane re-reads
+and re-acks (the pruning and oldest-eviction rules below keep the table usable).
+`guidance status` lists which lanes have acknowledged which version, with
+`up_to_date`, `behind` and `stale`; it is gated on the configured operator
+allowlist, but the actor name is self-declared and it deliberately shows **no
+guidance text** (not the current text, the previous text or the history). The
+authoritative operator read is the host command `admin.py guidance-status`, which
+does include the current text, the previous text and the history. The endpoint's
+other guidance subcommands are refused: it never writes guidance.
+
+Guidance is written only by the operator host command
+`admin.py set-guidance PROJECT --actor ACTOR --file FILE`, is bounded (8000 bytes)
+plain text (C0, C1, bidi, word-joiner, BOM and Unicode tag `U+E0000`-`U+E007F`
+characters are refused; ZWNJ/ZWJ are allowed between letters, so legitimate Persian
+text is not blocked), is audited (who, when, version, previous version, bounded
+history), and never overrides the user's authorization or the worker safety rules.
+A set with the same text repairs a missing or mismatched audit record
+(`repaired: true`), and the generation the audit record named is kept in `history`,
+so `get --since` still knows it. The table is bounded (500), drops acks for versions
+other than the current and previous one at every set, evicts its oldest entry rather
+than refusing a new lane, and the operator can drop stale acks with
+`admin.py compact-guidance-acks PROJECT --actor ACTOR` (audited in the record as
+`acks_compacted_by`/`acks_compacted_at`, and kept across later sets).
+`admin.py clear-guidance PROJECT --actor ACTOR` removes the text and its record and
+leaves a small local `.guidance-clear.json` record of who cleared it, when and the
+cleared version; a `GUIDANCE.md` that is a symlink is refused, so that state needs a
+manual delete. A project with no guidance reads as `present: false`, never an
+error. Rolling a project back to an older kit has a documented
+[clear-first step](OPERATIONS.md#standing-guidance).
+
 The `reference-review` items:
 
 - **Selection:** entries tagged with one of the task's labels, plus expired and

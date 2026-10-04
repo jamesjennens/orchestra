@@ -168,6 +168,7 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     deps=[d for d in (issue.get('dependencies') or []) if d.get('type')!='parent-child']
     from work import workflow
     from review_state import is_integration_warning, scopes_for
+    from guidance import brief_block
     review=workflow(issue,scopes_for(rows,task),operators=operators,journal=journal)
     # ORIGINAL meaning: does the scope currently shown in `lifecycle`/`lifecycle_scope`
     # (the newest recorded scope) belong to the current contribution? The ANY-scope
@@ -210,7 +211,7 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     attention={'attention':attention['attention']+capabilities['attention'],
                'attention_total':attention['attention_total']+capabilities['attention_total'],
                'attention_more':((attention['attention_more'] or 0)+(capabilities['attention_more'] or 0)) or None}
-    return {**attention,'task':task,'title':clip(issue.get('title'),200),'owner':clip(issue.get('assignee') or 'unassigned',96),'status':issue.get('status'),
+    result={**attention,'task':task,'title':clip(issue.get('title'),200),'owner':clip(issue.get('assignee') or 'unassigned',96),'status':issue.get('status'),
             'activity_cursor':activity_cursor(data),'checkpoint':None if p is None else {'comment_id':str(c['id']),'author':clip(c.get('author'),96),'timestamp':c.get('created_at'),'source_commit':p['source_commit'],'branch':p['branch'],'incorporated_activity_cursor':p['activity_cursor'],
                 'newer_activity':p['activity_cursor']!=activity_cursor(snapshot(rows,project,task,str(c['id'])))},
             'intent':clip(p['intent'] if p else issue.get('description'),600),'acceptance':clip(p['acceptance'] if p else issue.get('acceptance_criteria'),1000),
@@ -230,6 +231,12 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
                        +integration_warnings
                        +['Newer activity also includes edits, deletions or changed task fields. Prose resolutions never silently clear explicit items.'],
             'evidence':{'issue':'show '+task,'history':'history '+task,'checkpoint_entry':task+'-c'+str(c['id']) if c else None}}
+    if journal is not None:
+        # The standing guidance channel (kittrial-5bb.99): every endpoint brief
+        # carries the current version; a direct library call with no project path
+        # cannot read the guidance and omits the block.
+        result['guidance']=brief_block(journal,actor)
+    return result
 
 def save_checkpoint(rows,project,task,p,actor,run):
     validate_checkpoint(p,task);issue=task_row(rows,task)
@@ -303,6 +310,13 @@ def format_brief(result):
            'Review/contribution: '+json.dumps(result['review'],ensure_ascii=False),
            'Intent: '+excerpt(result['intent']),'Acceptance: '+excerpt(result['acceptance']),
            'Current position: '+result['current_position'],'Next: '+result['next_action']]
+    guidance=result.get('guidance')
+    if guidance and guidance.get('present'):
+        lines.append('Guidance: version %s set by %s at %s | acknowledged: %s | attention: %s'%(
+            guidance['version'],guidance.get('set_by') or 'unknown',guidance.get('set_at') or 'unknown',
+            guidance.get('acknowledged'),guidance.get('attention')))
+    if guidance and guidance.get('warning'):
+        lines.append('Guidance warning: '+guidance['warning'])
     cp=result['checkpoint']
     if cp:lines += [f'Checkpoint: {cp["comment_id"]} by {excerpt(cp["author"])} at {cp["timestamp"]}',f'Branch: {cp["branch"] or "unknown"} | Source commit: {cp["source_commit"] or "unknown"}',
                     'Newer/changed activity: '+str(cp['newer_activity']), 'Incorporated activity cursor: '+cp['incorporated_activity_cursor']]
@@ -341,6 +355,12 @@ def help_limits(action):
 def help_notes(action):
     if action=='brief':
         return ['Unresolved items come from the latest valid checkpoint; a missing checkpoint means unknown, not zero.',
+                'Every endpoint brief carries a guidance block (kittrial-5bb.99): the current coordinator '
+                'guidance version, who set it and whether this actor has acknowledged it; read it with '
+                '`guidance get` and record the read with `guidance ack --version VERSION`, naming the version '
+                'you read. An unreadable or unbound guidance record carries attention true and a warning, and '
+                'unbound text is withheld (`text: null`, `unbound: true`) with a next action saying the '
+                'guidance is being repaired by the operator; text without a setter is never followed.',
                 '--limit/--offset are not brief options; use --items-limit/--items-offset.',
                 'attention lists at most 3 reference-review items (entries tagged with the task\'s labels, '
                 'then expired and due-soon), expired first, then at most 3 proposal-review items (proposals '

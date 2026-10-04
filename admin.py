@@ -1442,7 +1442,7 @@ def validate_coordination_files(files):
     for name,record in files.items():
         quarantine = isinstance(name,str) and re.fullmatch(r'\.feedback\.jsonl\.(?:[a-f0-9]{16}|[a-f0-9]{64})\.incomplete',name)
         journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-backfills|\.integration-reverts|\.reference-requests|\.proposal-requests|\.capability-requests)/[a-f0-9]{64}\.json',name)
-        if name not in ('.merge-context.json','ONBOARDING.md','.sessions.json','.feedback.jsonl') and not quarantine and not journal:raise ValueError('Invalid coordination backup path')
+        if name not in ('.merge-context.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.sessions.json','.feedback.jsonl') and not quarantine and not journal:raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
         if name=='.sessions.json':
             from sessions import validate
@@ -1477,6 +1477,13 @@ def validate_coordination_files(files):
             validate_revert_journal_entry(record,name.partition('/')[2])
             if not name.startswith(JOURNAL_DIR+'/'):raise ValueError('Invalid coordination backup path')
         if name=='ONBOARDING.md' and (set(record)!={'text'} or not isinstance(record['text'],str) or not record['text'].strip() or len(record['text'].encode('utf-8'))>8000):raise ValueError('Invalid onboarding backup')
+        if name=='GUIDANCE.md':
+            from guidance import validate_text
+            if set(record)!={'text'}:raise ValueError('Invalid guidance backup')
+            validate_text(record['text'])
+        if name=='.guidance.json':
+            from guidance import validate_meta
+            validate_meta(record)
         if name=='.feedback.jsonl':
             from feedback import validate_feed_text
             if set(record) != {'text'}:raise ValueError('Invalid feedback backup')
@@ -1484,6 +1491,16 @@ def validate_coordination_files(files):
         if quarantine:
             from feedback import validate_quarantine_record
             validate_quarantine_record(name,record)
+    # The guidance text and its audit record are one generation: a backup that
+    # carries the text but not the matching record (or a record whose version is not
+    # the hash of the text) is refused rather than restored as a mismatched pair
+    # (kittrial-5bb.99 review `get-misattributes-on-mismatch`).
+    if 'GUIDANCE.md' in files or '.guidance.json' in files:
+        if 'GUIDANCE.md' not in files or '.guidance.json' not in files:
+            raise ValueError('Invalid guidance backup: the text and its audit record must be backed up together')
+        from guidance import version_of as guidance_version
+        if files['.guidance.json'].get('version')!=guidance_version(files['GUIDANCE.md']['text']):
+            raise ValueError('Invalid guidance backup: the audit record does not match the guidance text')
 
 def journal_snapshot_path(root,name):
     """Where ``backup_project`` stores the project's operation-journal snapshot."""
@@ -1796,6 +1813,34 @@ def last_complete_guard(root,name):
                 pass
         raise
 
+def guidance_backup_pair(path):
+    """The guidance fragment for one project's coordination sidecar, and any fault.
+
+    Returns ``({'GUIDANCE.md': ..., '.guidance.json': ...}, None)`` for a healthy
+    pair, ``({}, None)`` when the project carries no guidance, and ``({}, message)``
+    when the pair is mismatched or unreadable. The caller leaves the bad pair out and
+    marks the project degraded instead of skipping its tracker backup
+    (kittrial-5bb.99 review `guidance-fault-skips-the-project-backup`).
+    """
+    if not ((path/'GUIDANCE.md').exists() or (path/'GUIDANCE.md').is_symlink()):
+        return {}, None
+    from guidance import (META_NAME as GUIDANCE_META, read_meta as read_guidance_meta,
+                          read_text as read_guidance_text, validate_meta as validate_guidance_meta,
+                          version_of as guidance_version)
+    try:
+        guidance_text=read_guidance_text(path)
+        guidance_meta=read_guidance_meta(path)
+        if guidance_meta is None:
+            raise ValueError('the guidance text has no readable audit metadata')
+        validate_guidance_meta(guidance_meta)
+        if guidance_meta['version']!=guidance_version(guidance_text):
+            raise ValueError('the audit record does not match the guidance text (a hand edit or a crashed set)')
+    except ValueError as error:
+        return {}, ('guidance is degraded: %s. The tracker backup is complete but carries no guidance pair; '
+                    'ask the operator to repair it with `admin.py set-guidance PROJECT --actor OPERATOR '
+                    '--file FILE` (a set with the same text repairs it) and then take a fresh backup.'%(error,))
+    return {'GUIDANCE.md': {'text': guidance_text}, GUIDANCE_META: guidance_meta}, None
+
 def backup_project(root,name):
     import fcntl
     from coordination import atomic
@@ -1869,6 +1914,18 @@ def backup_project(root,name):
         if (path/'ONBOARDING.md').exists() or (path/'ONBOARDING.md').is_symlink():
             from onboarding import read_document, PROJECT_LIMIT
             files['ONBOARDING.md']={'text':read_document(path,'ONBOARDING.md',PROJECT_LIMIT)}
+        if (path/'GUIDANCE.md').exists() or (path/'GUIDANCE.md').is_symlink():
+            # The standing guidance channel (kittrial-5bb.99): the text and its audit
+            # record are one generation. A mismatched or unreadable pair is a two-file
+            # sidecar fault and must not stop the tracker backup (live installations
+            # run `backup --all` on a daily timer): leave the pair out, mark the
+            # project degraded with an actionable message, and keep this project's
+            # tracker backup complete and usable
+            # (kittrial-5bb.99 review `guidance-fault-skips-the-project-backup`).
+            fragment,fault=guidance_backup_pair(path)
+            files.update(fragment)
+            if fault:
+                print('backup degraded for %s: %s'%(name,fault),file=sys.stderr)
         feedback=path/'.feedback.jsonl'
         if feedback.exists() or feedback.is_symlink():
             if feedback.is_symlink():raise ValueError('Feedback feed must not be a symlink')
@@ -2145,6 +2202,8 @@ def backup_status_record(results,scope,generated_at):
     projects=[]
     for item in results:
         entry={'name':item['name'],'status':item['status']}
+        if item.get('degraded'):
+            entry['degraded']=item['degraded']
         if item['status']=='complete':
             entry['completed_at']=item['completed_at']
             entry['pair']={'native':'backups/'+item['name'],
@@ -2195,12 +2254,17 @@ def validate_backup_status(record):
                 raise ValueError('Complete backup status for %s must name the pair %s'%(name,expected))
             if 'reason' in entry:
                 raise ValueError('Complete backup status for %s must not carry a failure reason'%name)
+            degraded=entry.get('degraded')
+            if degraded is not None and (not isinstance(degraded,str) or not degraded.strip()):
+                raise ValueError('Degraded backup status for %s needs a nonempty message'%name)
         else:
             reason=entry.get('reason')
             if not isinstance(reason,str) or not reason.strip():
                 raise ValueError('Backup status for %s must say why it is not complete'%name)
             if 'completed_at' in entry or 'pair' in entry:
                 raise ValueError('Incomplete backup status for %s must not carry a completion'%name)
+            if 'degraded' in entry:
+                raise ValueError('Incomplete backup status for %s must not carry a degraded message'%name)
     expected='complete' if complete==len(projects) else 'incomplete'
     if record.get('status')!=expected:
         raise ValueError('Backup status run status must be %s for its project entries'%expected)
@@ -2527,7 +2591,10 @@ def backup_projects(root,names,all_projects=False):
     project does not stop the others, and the run exits non-zero when any target's
     pair is not complete. The status file is written (and validated) before that
     decision, so a failed or skipped project is recorded NOT complete instead of
-    being lost with the process.
+    being lost with the process. A project whose GUIDANCE pair is mismatched or
+    unreadable is recorded COMPLETE plus ``degraded``: the tracker backup is
+    restorable and usable, so it does not fail the run or the daily timer, and the
+    actionable repair message is in the entry and on stderr.
     """
     if all_projects:
         targets=initialized_projects(root);scope='all'
@@ -2561,7 +2628,10 @@ def backup_projects(root,names,all_projects=False):
             incomplete.append(name);continue
         complete,reason=backup_pair_state(root,name)
         if complete:
-            results.append({'name':name,'status':'complete','completed_at':utc_stamp()})
+            entry={'name':name,'status':'complete','completed_at':utc_stamp()}
+            _,degraded_fault=guidance_backup_pair(path)
+            if degraded_fault:entry['degraded']=degraded_fault
+            results.append(entry)
             print(native)
         else:
             results.append({'name':name,'status':'failed','reason':reason})
@@ -2758,6 +2828,21 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
             validate_revert_journal_entry(record,name.partition('/')[2])
         elif name.startswith(tuple(journal+'/' for journal in RECORD_JOURNALS)):
             validate_record_receipt(name,record)
+        elif name=='GUIDANCE.md':
+            from guidance import validate_text
+            if set(record)!={'text'}:raise ValueError('Invalid guidance backup')
+            validate_text(record['text'])
+        elif name=='.guidance.json':
+            from guidance import validate_meta
+            validate_meta(record)
+    # The guidance text and its audit record are one generation: refuse to restore a
+    # mismatched pair rather than installing text that cannot be attributed.
+    if 'GUIDANCE.md' in files or '.guidance.json' in files:
+        if 'GUIDANCE.md' not in files or '.guidance.json' not in files:
+            raise ValueError('Invalid guidance backup: the text and its audit record must be restored together')
+        from guidance import version_of as guidance_version
+        if files['.guidance.json'].get('version')!=guidance_version(files['GUIDANCE.md']['text']):
+            raise ValueError('Invalid guidance backup: the audit record does not match the guidance text')
     for name,record in files.items():
         target=project_dir(root,destination)/name
         target.parent.mkdir(exist_ok=True)
@@ -2768,6 +2853,13 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
         if name=='ONBOARDING.md':
             from onboarding import write_project
             write_project(target,record['text'])
+        elif name=='GUIDANCE.md':
+            from guidance import write_text as write_guidance_text
+            write_guidance_text(target,record['text'])
+        elif name=='.guidance.json':
+            from guidance import validate_meta
+            validate_meta(record)
+            atomic(target,record)
         elif name=='.feedback.jsonl':
             temporary=target.with_suffix('.tmp')
             temporary.write_text(record['text'],encoding='utf-8',newline='\n')
@@ -3048,6 +3140,14 @@ def main():
     a=sub.add_parser('install');a.add_argument('--port',type=int,default=13317);a.add_argument('--unit',default='beads-team.service')
     a=sub.add_parser('add-project');a.add_argument('project')
     a=sub.add_parser('set-onboarding');a.add_argument('project');a.add_argument('--file',required=True)
+    a=sub.add_parser('set-guidance',help='set the standing coordinator guidance every actor reads each run (operator allowlist, audited)')
+    a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('guidance-status',help='which actors have acknowledged which guidance version (operator allowlist)')
+    a.add_argument('project');a.add_argument('--actor',required=True)
+    a=sub.add_parser('clear-guidance',help='remove the project standing guidance and its audit record (operator allowlist)')
+    a.add_argument('project');a.add_argument('--actor',required=True)
+    a=sub.add_parser('compact-guidance-acks',help='drop guidance acknowledgements for versions no longer current or previous (operator allowlist, audited)')
+    a.add_argument('project');a.add_argument('--actor',required=True)
     a=sub.add_parser('handoff');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('requirement-backfill');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('requirement-apply');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
@@ -3185,6 +3285,63 @@ def main():
         for warning in probe_endpoints(text,args.project,Path(__file__).resolve().parent):
             print(warning,file=sys.stderr)
         print('Project onboarding installed; back up the project after changes.')
+    elif args.command=='set-guidance':
+        import fcntl
+        from guidance import write_guidance
+        from keyed_records import require_configured_operator
+        # The operator allowlist is checked before the project is read or any file
+        # is written, so a contributor actor cannot set guidance even if it reaches
+        # the host command line.
+        require_configured_operator(args.actor,operators(root,strict=True),'set the project guidance')
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        text=Path(args.file).read_text(encoding='utf-8-sig')
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            result=write_guidance(path,text,args.actor)
+        outcome='installed' if result['changed'] else ('repaired' if result.get('repaired') else 'unchanged')
+        print('Project guidance %s (version %s); back up the project after changes.'
+              %(outcome,result['version']))
+        if result.get('repaired') and not result['changed']:
+            print('The audit record was missing or did not match the text; it is now bound to the text you set.')
+        print(json.dumps(result,sort_keys=True))
+    elif args.command=='clear-guidance':
+        import fcntl
+        from guidance import clear as guidance_clear
+        from keyed_records import require_configured_operator
+        require_configured_operator(args.actor,operators(root,strict=True),'clear the project guidance')
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            result=guidance_clear(path,args.actor)
+        print('Project guidance cleared (%s); back up the project after changes. A small local record in %s keeps '
+              'who cleared it, when and the cleared version; the removed guidance record itself stays in the most '
+              'recent coordination backup, if one was taken.'
+              %(', '.join(result['removed']) or 'nothing was set',result.get('clear_record','the project directory')))
+        print(json.dumps(result,sort_keys=True))
+    elif args.command=='compact-guidance-acks':
+        import fcntl
+        from guidance import compact as guidance_compact
+        from keyed_records import require_configured_operator
+        require_configured_operator(args.actor,operators(root,strict=True),'compact the project guidance acks')
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            result=guidance_compact(path,args.actor)
+        print('Guidance acknowledgements compacted: removed %d for versions no longer current or previous.'
+              %result['removed_total'])
+        print(json.dumps(result,sort_keys=True))
+    elif args.command=='guidance-status':
+        import fcntl
+        from guidance import status as guidance_status
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            guidance_report=guidance_status(path,args.actor,operators(root,strict=True),host=True)
+        print(json.dumps(guidance_report,sort_keys=True,indent=2))
     elif args.command=='service':print(service(root,args.action))
     elif args.command=='record-store':
         try:

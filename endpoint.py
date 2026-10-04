@@ -34,6 +34,26 @@ ALLOWED={'list','show','ready','search','count','create','update','close','reope
 FORBIDDEN={'--directory','-C','--db','--repo','--global','--actor','--author','--profile','--graph','--config','--metadata'}
 FILE_FLAGS={'--body-file','--design-file','--file','-f'}
 
+def _guidance_ack_version(args):
+    """The version named by `guidance ack --version VERSION` (kittrial-5bb.99).
+
+    The caller must name the version it actually read with the explicit
+    ``--version`` flag; the endpoint never assumes the current version and never
+    accepts a bare positional version, so the documented form is the only form
+    (kittrial-5bb.99 review `small` 3).
+    """
+    if not args:
+        raise ValueError('Name the guidance version you read: guidance ack --version VERSION')
+    if args[0]=='--version':
+        if len(args)!=2:raise ValueError('Use guidance ack --version VERSION')
+        return args[1]
+    if args[0].startswith('--version='):
+        if len(args)!=1:raise ValueError('Use guidance ack --version VERSION')
+        value=args[0].split('=',1)[1]
+        if not value:raise ValueError('Use guidance ack --version VERSION')
+        return value
+    raise ValueError('Use guidance ack --version VERSION')
+
 def _native_labels(root,path,actor,task):
     """Canonical id and labels of one native issue, read through pinned bd.
 
@@ -220,6 +240,41 @@ def execute(root,request,authority_config=None,require_authority=False):
     if action in ('onboard','docs'):
         from onboarding import execute as onboard
         return {'returncode':0,'stdout':onboard(Path(__file__).resolve().parent,path,name,actor,action,request.get('args',[]),endpoint=Path(__file__).resolve()),'stderr':''}
+    if action=='guidance':
+        # The standing guidance channel (kittrial-5bb.99 slice 1, revised). The
+        # endpoint is read-only except for the caller's own acknowledgement: the only
+        # guidance writer is the operator host command `admin.py set-guidance`, and
+        # this allowlist refuses every other subcommand, so adding a write route here
+        # cannot pass unnoticed (review `tests`: the test enumerates the accepted
+        # subcommands and fails on any not in the read+ack set). `ack` names the
+        # version the caller read with the explicit --version flag; it is
+        # unauthenticated, so any actor the endpoint accepts may ack for itself
+        # (review `registration-gate-locks-out-unregistered-lanes`).
+        import guidance
+        args=request.get('args',[])
+        if not isinstance(args,list) or any(not isinstance(a,str) or '\0' in a for a in args):
+            raise ValueError('Expected argument list')
+        subcommand=args[0] if args else 'get'
+        if subcommand not in ('get','version','ack','status'):
+            raise ValueError('Unknown guidance action %r: the endpoint can only read guidance (get, version), '
+                             'acknowledge the version the caller read (ack), or, for an operator, read status. '
+                             'The only writer is the operator host command admin.py set-guidance.'%subcommand)
+        if subcommand=='ack':
+            version=_guidance_ack_version(args[1:])
+            with (path/'.coordination.lock').open('a') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX)
+                result=guidance.acknowledge(path,actor,version)
+        elif subcommand=='status':
+            if len(args)!=1:raise ValueError('Use guidance status without arguments')
+            # Endpoint status shows versions and actor names, never guidance text
+            # (review `small` 1); the host guidance-status read adds the text.
+            result=guidance.status(path,actor,configured_operators(root))
+        elif subcommand=='version':
+            if len(args)!=1:raise ValueError('Use guidance version without arguments')
+            result=guidance.state(path,actor)
+        else:
+            result=guidance.read(path,args,actor)
+        return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False,indent=2)+'\n','stderr':''}
     if action=='anchors':
         # Read-only (kittrial-5bb.71): which rows are record anchors, by the predicate
         # every surface uses (reserved_comments.is_record_anchor), in ONE native read:
