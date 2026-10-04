@@ -222,8 +222,8 @@ history](#malformed-structured-history) (`void-record`).
 | `anchor-release PROJECT --kind reference\|capability --issue-id ID --actor OPERATOR --reason TEXT` | close a reference or capability anchor that holds no record and free its key, when the propose that created it cannot be re-run ([orphan anchors](#orphan-anchors)). With `--duplicate` (and, for an anchor that carries acceptance evidence, `--set-aside-evidence`) it releases a named anchor of a [duplicated key](#a-duplicated-record-key) although it holds well-formed records | the deployment operator allowlist, checked before any read |
 | `handoff PROJECT --actor ACTOR --file handoff.json` | transfer a claim when the current owner cannot act | an owner decision/evidence pointer in the payload's `approval` |
 | `set-guidance PROJECT --actor OPERATOR --file FILE` | install the project's [standing guidance](#standing-guidance) text (bounded plain text, 8000 bytes) and its audit record. A set with the same text repairs a missing or mismatched audit record (`repaired: true`) | the deployment operator allowlist, checked before any write |
-| `guidance-status PROJECT --actor OPERATOR` | print who has acknowledged which guidance version, with the current text, the previous text, the history, `up_to_date`, `behind` and `stale` (the authoritative read; the endpoint's `guidance status` shows no guidance text) | the deployment operator allowlist |
-| `clear-guidance PROJECT --actor OPERATOR` | remove `GUIDANCE.md` and `.guidance.json` and write the local `.guidance-clear.json` record (who, when, cleared version); guidance then reads `present: false`. A symlinked `GUIDANCE.md` is refused and needs a manual delete | the deployment operator allowlist |
+| `guidance-status PROJECT --actor OPERATOR` | print who has acknowledged which guidance version, with the current text, the previous text, the history, `up_to_date`, `behind` and `stale`, and who cleared the guidance, when and which version (`clear_record`, `clears`) (the authoritative read; the endpoint's `guidance status` shows no guidance text) | the deployment operator allowlist |
+| `clear-guidance PROJECT --actor OPERATOR` | remove `GUIDANCE.md` and `.guidance.json` and write the local `.guidance-clear.json` record (who, when, cleared version; shown by `guidance-status`); guidance then reads `present: false`. A record already there that is not valid is kept as `.guidance-clear.json.invalid.<UTC time>`, and the command says so. A symlinked `GUIDANCE.md` is refused and needs a manual delete | the deployment operator allowlist |
 | `compact-guidance-acks PROJECT --actor OPERATOR` | drop acknowledgements for versions other than the current and previous one; the record keeps `acks_compacted_by`/`acks_compacted_at` (also kept across later sets) as the audit trail | the deployment operator allowlist |
 
 All five are shell-trusted: access to the service account's shell is the boundary.
@@ -256,9 +256,12 @@ authoritative operator read and adds the current text, the previous text and the
 history.
 
 * A hand edit of `GUIDANCE.md`, or a crash between the two writes, is reported as an
-  **unbound** record: the version block shows `present: true`, `set_by: null`,
-  `unbound: true` and a `warning`, and `guidance get` returns `text: null` with the
-  warning and a `next_action` saying the guidance is being repaired by the operator.
+  **unbound** record. Every reader says the same thing (`guidance get`,
+  `guidance version` and the block in `brief`, `work` and resume): `present: true`,
+  `version: null`, `set_by: null`, `unbound: true`, `meta_version` (the version the
+  audit record names), a `warning` and a `next_action` saying the guidance is being
+  repaired by the operator; `guidance get` returns `text: null`. No reader hands out
+  the hash of the withheld text, and nobody can acknowledge it.
   Text without a setter is never delivered to a worker and never followed. Setting
   the same text again repairs the record and prints `repaired`; the generation the
   old audit record named is kept in `history`, so `get --since` still knows it. A
@@ -274,6 +277,15 @@ history.
   the pair with a same-text `set-guidance` and takes a fresh backup. `restore-new` on
   a backup with no guidance pair restores the tracker with the project reading
   `present: false` (no guidance), never a mismatched pair.
+  A degraded run does not read like a clean one (kittrial-5bb.105): the summary line
+  counts and names the degraded projects (`Backed up 3 of 3 project(s), 1 degraded
+  (NAME); ...`), a one-project `backup` prints `complete but degraded`,
+  `backup-status` prints the count and each message on stderr (stdout stays the JSON
+  record), `backup-copy` names each degraded project it copies, and `restore-new`
+  says that what the degraded entry names was not in the backup and was not restored.
+  `backup-status --require-complete` still passes, so the timer is unaffected;
+  `backup-status --require-clean` and `backup-copy --require-clean` refuse. Use
+  `--require-clean` as the backup check before a release.
 * Acknowledgement requires the version the caller read, given as
   `--version VERSION`; the endpoint refuses a bare positional version and refuses a
   stale version **without naming the current one**, so a caller must run
@@ -286,14 +298,48 @@ history.
   `compact-guidance-acks` drops stale ones on demand (its
   `acks_compacted_by`/`acks_compacted_at` audit is kept across later sets). An
   acknowledgement does not prove a read.
-* Guidance is bounded (8000 bytes) plain text. C0, C1, bidi, word-joiner, BOM and
-  Unicode tag (`U+E0000`-`U+E007F`) characters are refused; ZWNJ/ZWJ are allowed
-  between letters so legitimate Persian text is not blocked.
+* Guidance is bounded (8000 bytes) plain text. C0, C1, bidi, word-joiner, BOM and Unicode tag (`U+E0000`-`U+E007F`) characters are refused, and so are the other characters that render as nothing or as a blank (kittrial-5bb.105): variation selectors (`U+FE00`-`U+FE0F`, `U+E0100`-`U+E01EF`, and the Mongolian `U+180B`-`U+180D`, `U+180F`), the Hangul fillers (`U+115F`, `U+1160`, `U+3164`, `U+FFA0`), the Khitan filler `U+16FE4`, `U+034F`, `U+17B4`, `U+17B5`, `U+2800`, `U+FFFC`, and every format character (Unicode category Cf: `U+061C`, `U+180E`, `U+FFF9`-`U+FFFB`, the musical, shorthand and Egyptian format controls and the rest), so the rule does not depend on a list. The only format characters allowed are the visible ones that are part of real text (the Arabic number signs and end of ayah `U+0600`-`U+0605`, `U+06DD`, `U+0890`, `U+0891`, `U+08E2`, the Syriac abbreviation mark `U+070F`, the Kaithi number signs) and ZWNJ/ZWJ under the rule below. The same check runs when the text is read, so a hand-edited file that carries one reads `unreadable` until an operator sets clean text. One `set-guidance` repairs any file that cannot be read as guidance (a refused character, over the limit, not UTF-8): `guidance-status` (and the endpoint's `guidance status`) answers in that state instead of failing: `unreadable: true`, `unreadable_reason` naming the character or the limit, `audit_record` (the version, setter and time of the last generation an operator set), the acknowledgement table and the `repair` sentence, never the unreadable text. The set replaces the file, prints that it did, answers `replaced_unreadable: true`, copies nothing of the unreadable file into the record, and keeps the history and the acknowledgement rules of any other set. (Before kittrial-5bb.105 that set was refused with the old file's error and the repair was `clear-guidance`, which drops both.) ZWNJ and ZWJ are allowed only between two letters or combining marks of one script that uses them (Arabic, including Persian and Urdu; Syriac; Mongolian; N'Ko; Devanagari, Bengali, Gurmukhi, Gujarati, Oriya, Tamil, Telugu, Kannada, Malayalam, Sinhala); anywhere else, including inside a Latin word and in an emoji sequence, they are refused. An emoji that needs `U+FE0F` is therefore refused: check the text with `guidance-status` before upgrading a project whose guidance holds one.
 * `clear-guidance` removes both files, writes the small local
   `.guidance-clear.json` audit record (who cleared it, when, the cleared version,
-  bounded to the last 10 clears) and guidance reads `present: false`. That local
-  record is not part of the coordination backup; the removed guidance record itself
-  stays in the project's most recent coordination backup, if one was taken.
+  bounded to the last 10 clears) and guidance reads `present: false`.
+  `guidance-status` (host) and the endpoint's `guidance status` show it: `clears`
+  (who, when, which version; never text) and `clear_record` (`absent`, `ok` or
+  `invalid`). A file at that path that is not a valid record this kit wrote (a hand
+  edit, a symlink) reads `invalid` with a `clear_warning`, and the next clear keeps it
+  as `.guidance-clear.json.invalid.<UTC time>` (each one under its own name, listed in
+  `clear_records_kept_aside`) and starts a new record instead of replacing it
+  silently. The record is not yet written into the coordination backup: this kit's
+  restore accepts and validates it in a sidecar, but the kit before it refuses a whole
+  restore on a sidecar path it does not know, so `backup` starts carrying it only
+  once every installation runs a kit that accepts it. Until then a restored project
+  has no clear record; the removed guidance record itself stays in the project's most
+  recent coordination backup, if one was taken.
+
+**Upgrading to this kit, and rolling back from it (kittrial-5bb.105).** The plain-text
+rule is checked when guidance is read as well as when it is set, so a change of rule
+has an effect in both directions.
+
+* **Before upgrading, check each installation's guidance.** Guidance that was valid
+  before and holds a character this kit refuses (for example an emoji that carries
+  U+FE0F, or any other invisible format character) reads `unreadable` from every reader
+  after the upgrade, with `attention` raised and the text withheld, until an operator
+  sets clean text. Run, for each project, on the kit you are about to deploy:
+
+  ```sh
+  python3 /path/to/new-kit/admin.py --root /home/beads/beads-runtime guidance-status PROJECT --actor OPERATOR
+  ```
+
+  It answers `unreadable: true` with the character named in `unreadable_reason` if the
+  current text would be refused; one `set-guidance` with clean text repairs it, before
+  or after the upgrade. A refused character in the PREVIOUS text is harmless: the
+  record stays valid, acknowledgements, compaction and backup work, and that previous
+  text is withheld from `get --since` and from `guidance-status`
+  (`previous_text_withheld: true`).
+* **Rolling back.** This kit accepts some text the kit before it refuses: a zero-width
+  joiner or non-joiner after a combining mark (the common Indic use after a virama) is
+  accepted here and reads `unreadable` there, and that project's backup is recorded
+  degraded there. Before rolling back a project whose guidance uses one, set text
+  without it, or clear the guidance, on this kit.
 
 **Rollback gap and the exact step.** An older kit (at or before
 `dca96b9d`) validates the coordination sidecar against a fixed path set that does
@@ -489,6 +535,8 @@ Read that record on the host:
 python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime backup-status
 python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime backup-status --require-complete
 ```
+
+`--require-clean` is the stricter gate: everything `--require-complete` checks, and it also exits non-zero when any project is recorded `degraded` (complete, but missing something it should carry, today a guidance pair), naming each. Use it before a release; keep `--require-complete` for the timer and the daily copy, which a degraded project must not fail. `backup-copy DEST --require-clean` refuses in the same case; without the option `backup-copy` copies a degraded project and names it.
 
 `--require-complete` exits non-zero unless the last run used `--all` and every project initialized in the runtime is listed as complete with its pair still complete on disk, naming each project that is missing, not complete in the record, absent from the record (a project added after the last run), or no longer complete on disk. Use it as the gate in front of the off-machine copy, so a project that is absent from the schedule or whose pair is half written is noticed instead of being silently omitted.
 

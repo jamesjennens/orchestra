@@ -32,6 +32,7 @@ import record_json
 import os
 import re
 import tempfile
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from coordination import atomic
@@ -39,6 +40,7 @@ from coordination import atomic
 GUIDANCE_NAME = 'GUIDANCE.md'
 META_NAME = '.guidance.json'
 CLEAR_NAME = '.guidance-clear.json'
+CLEAR_INVALID_NAME = '.guidance-clear.json.invalid'
 LIMIT = 8000
 HISTORY_LIMIT = 50
 ACK_LIMIT = 500
@@ -55,11 +57,49 @@ CONTROL = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 # tag character is a known invisible-instruction vector.
 INVISIBLE = re.compile('[\u0080-\u009f\u00ad\u200b\u200e\u200f\u2028\u2029\u202a-\u202e'
                        '\u2060-\u2064\u2066-\u2069\ufeff\U000E0000-\U000E007F]')
-# ZWNJ (U+200C) and ZWJ (U+200D) are legitimate in Persian/Arabic text and inside
-# emoji sequences, so they are allowed BETWEEN LETTERS rather than refused outright
-# (kittrial-5bb.99 review `small` 4). Anywhere else they are still invisible text and
-# are refused.
+# More characters that render as nothing, or as a blank, while changing the bytes
+# (kittrial-5bb.105): they let two texts look the same with different versions, defeat a
+# keyword match, or carry data nobody sees. Variation selectors (U+FE00-FE0F and the
+# supplement U+E0100-E01EF, a known smuggling vector) and the Mongolian free variation
+# selectors; the Hangul fillers; the Arabic letter mark; the combining grapheme joiner;
+# the Mongolian vowel separator; the Khmer invisible vowels; the braille blank; the
+# interlinear annotation and object replacement characters. Refused when read as well
+# as when set, like the ones above, so a hand-edited file cannot carry them either.
+HIDDEN = re.compile('[\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u2800\u3164\ufe00-\ufe0f'
+                    '\uffa0\ufff9-\ufffc\U00016FE4\U000E0100-\U000E01EF]')
+# Beyond the two lists: EVERY format character (Unicode category Cf) is refused, so the
+# rule does not depend on a list that keeps growing (review of f2d6050: the musical and
+# shorthand format controls U+1D173 and U+1BCA0 and the Egyptian ones at U+13430 were
+# still accepted). Two exceptions. ZWNJ and ZWJ have the joiner rule below. And the
+# prepended concatenation marks are Cf but VISIBLE (the Arabic number signs and end of
+# ayah, the Syriac abbreviation mark, the Kaithi number signs), so they stay allowed.
+# The lists above remain for what is not Cf: variation selectors and the Khitan filler
+# (marks), the Hangul fillers (letters), the braille blank and U+FFFC (symbols).
+VISIBLE_FORMAT = frozenset('\u0600\u0601\u0602\u0603\u0604\u0605\u06dd\u070f\u0890\u0891\u08e2'
+                           '\U000110BD\U000110CD')
+
+
+def _format_character(text):
+    """The first refused format character (category Cf) in ``text``, or None."""
+    if text.isascii():
+        return None
+    for character in text:
+        if character in '\u200c\u200d' or character in VISIBLE_FORMAT:
+            continue
+        if unicodedata.category(character) == 'Cf':
+            return character
+    return None
+# ZWNJ (U+200C) and ZWJ (U+200D) are part of ordinary spelling in some scripts and
+# invisible text everywhere else. They are allowed only between two characters that are
+# letters or combining marks of the SAME joiner-using script (kittrial-5bb.105). That
+# admits Persian and Urdu, and the commonest Indic use, after a virama (a combining
+# mark, which the earlier "between letters" rule refused); it refuses a joiner inside
+# an English word, which defeated a keyword match and gave two texts that look the same
+# with different versions. An emoji ZWJ sequence is refused: guidance is instructions,
+# and such a sequence needs a variation selector, which is refused above.
 JOINER = re.compile('[\u200c\u200d]')
+JOINER_SCRIPTS = frozenset(('ARABIC', 'SYRIAC', 'MONGOLIAN', 'NKO', 'DEVANAGARI', 'BENGALI', 'GURMUKHI', 'GUJARATI',
+                            'ORIYA', 'TAMIL', 'TELUGU', 'KANNADA', 'MALAYALAM', 'SINHALA'))
 STAMP = re.compile(r'[0-9A-Za-z:+.\- ]{1,64}')
 META_FIELDS = {'schema_version', 'version', 'set_by', 'set_at', 'previous_version',
                'previous_text', 'history', 'acknowledged', 'acks_compacted_by',
@@ -94,6 +134,15 @@ def _valid_stamp(value):
     return isinstance(value, str) and bool(STAMP.fullmatch(value))
 
 
+def _joiner_script(character):
+    """The joiner-using script a letter or combining mark belongs to, else None."""
+    if not character or unicodedata.category(character)[0] not in 'LM':
+        return None
+    name = unicodedata.name(character, '')
+    script = name.split(' ', 1)[0] if name else ''
+    return script if script in JOINER_SCRIPTS else None
+
+
 def validate_text(text):
     """A bounded, nonempty, plain-text guidance payload."""
     if not isinstance(text, str) or not text.strip():
@@ -102,16 +151,36 @@ def validate_text(text):
         raise ValueError('Guidance must be plain text (no control characters)')
     if INVISIBLE.search(text):
         raise ValueError('Guidance must be plain text (no bidi, zero-width, C1 or tag characters)')
+    hidden = HIDDEN.search(text)
+    if hidden:
+        raise ValueError('Guidance must be plain text (no invisible or blank-looking character: U+%04X, a '
+                         'variation selector, filler, letter mark or similar)' % ord(hidden.group()))
+    formatting = _format_character(text)
+    if formatting:
+        raise ValueError('Guidance must be plain text (no invisible or blank-looking character: U+%04X, a '
+                         'format character)' % ord(formatting))
     for match in JOINER.finditer(text):
-        before = text[match.start() - 1] if match.start() else ''
-        after = text[match.end()] if match.end() < len(text) else ''
-        if not (before.isalpha() and after.isalpha()):
+        before = _joiner_script(text[match.start() - 1] if match.start() else '')
+        after = _joiner_script(text[match.end()] if match.end() < len(text) else '')
+        if before is None or before != after:
             raise ValueError('Guidance must be plain text (a zero-width joiner or non-joiner is only allowed '
-                             'between letters)')
+                             'between letters of one script that uses it, such as Arabic or Devanagari)')
     if len(text.encode('utf-8')) > LIMIT:
         raise ValueError('Guidance exceeds %d bytes; shorten it or keep the long material in the '
                          'project onboarding entry point' % LIMIT)
     return text
+
+
+def _readable_file(target):
+    """True for a regular file whose bytes can be read (so only its CONTENT is at fault)."""
+    try:
+        if not target.is_file():
+            return False
+        with target.open('rb') as handle:
+            handle.read(1)
+        return True
+    except OSError:
+        return False
 
 
 def _paths(path):
@@ -178,6 +247,28 @@ def read_meta(path):
     return value if _valid_meta(value) else None
 
 
+def _storable_text(text):
+    """Shape of a stored previous text: nonempty bounded text with no control character."""
+    return (isinstance(text, str) and bool(text.strip()) and not CONTROL.search(text)
+            and len(text.encode('utf-8', 'replace')) <= LIMIT)
+
+
+def _deliverable_text(text):
+    """A stored text only if it passes TODAY's plain-text rule, else None (withheld)."""
+    try:
+        return validate_text(text) if text is not None else None
+    except ValueError:
+        return None
+
+
+def _strictly_valid(meta):
+    try:
+        validate_meta(meta)
+        return True
+    except ValueError:
+        return False
+
+
 def validate_meta(meta):
     """Strict validation of a record this kit wrote (writer and backup path)."""
     if not isinstance(meta, dict):
@@ -200,8 +291,13 @@ def validate_meta(meta):
     previous = meta['previous_version']
     if previous is not None and (not isinstance(previous, str) or not VERSION.fullmatch(previous)):
         raise ValueError('Invalid guidance record: previous_version')
-    if meta.get('previous_text') is not None:
-        validate_text(meta['previous_text'])
+    # The previous text is HISTORY: it is never delivered as guidance, and it was valid
+    # under the rules of the kit that stored it. Checking it against today's character
+    # rules made a healthy record fail after an upgrade that refuses a character it
+    # holds, so nobody could acknowledge, compact or back up (review of f2d6050). It is
+    # checked for shape only; a reader withholds it if it fails today's rules.
+    if meta.get('previous_text') is not None and not _storable_text(meta['previous_text']):
+        raise ValueError('Invalid guidance record: previous_text must be bounded text without control characters')
     history = meta['history']
     if not isinstance(history, list) or len(history) > HISTORY_LIMIT:
         raise ValueError('Invalid guidance record: history must be a list of at most %d entries' % HISTORY_LIMIT)
@@ -339,8 +435,12 @@ def _unreadable(message):
 
 
 def _withheld(meta, since, warning):
-    """The unbound result: the text exists but is withheld until the operator repairs it."""
-    return {'schema_version': 1, 'present': False, 'version': None, 'set_at': None, 'set_by': None,
+    """The unbound result: the text exists but is withheld until the operator repairs it.
+
+    `present` is true (a text file is there) and `version` is null (nobody may follow or
+    acknowledge it), in this read and in `state`, so `get`, `version`, `brief`, `work`
+    and resume say the same thing (kittrial-5bb.105)."""
+    return {'schema_version': 1, 'present': True, 'version': None, 'set_at': None, 'set_by': None,
             'text': None, 'changed': False, 'since': since, 'since_known': since is None,
             'previous_version': None, 'previous_text': None, 'acknowledged': None,
             'meta_version': meta.get('version') if isinstance(meta, dict) else None,
@@ -367,7 +467,9 @@ def state(path, actor=None):
     set_by, set_at, bound, warning = _attribution(meta, current) if text is not None else (None, None, False, None)
     entry = _acknowledgement(meta, actor)
     acknowledged = bound and bool(entry) and entry.get('version') == current
-    result = {'schema_version': 1, 'present': text is not None, 'version': current,
+    # The hash of unbound text is not a version: nobody may follow or acknowledge it, so
+    # no reader hands it out (`meta_version` still says what the record names).
+    result = {'schema_version': 1, 'present': text is not None, 'version': current if bound else None,
               'set_at': set_at, 'set_by': set_by,
               'previous_version': (meta.get('previous_version') if bound else None),
               'meta_version': meta.get('version') if isinstance(meta, dict) else None,
@@ -447,10 +549,17 @@ def read(path, args, actor=None):
               'previous_version': previous,
               # "What changed since a version": the immediately previous text is kept
               # beside its version, so a caller that names it gets the exact prior text.
-              'previous_text': (meta.get('previous_text') if bound and since == previous else None),
+              'previous_text': (_deliverable_text(meta.get('previous_text'))
+                                if bound and since == previous else None),
               'acknowledged': bool(entry) and entry.get('version') == current,
               'attention': not bool(entry) or entry.get('version') != current,
               'unreadable': False, 'unbound': False}
+    if bound and since == previous and meta.get('previous_text') is not None and result['previous_text'] is None:
+        # The stored previous text holds a character this kit refuses: withheld, as an
+        # unreadable current text is (review of f2d6050).
+        result['previous_text_withheld'] = True
+        result['warning'] = ('The previous guidance text holds a character this kit refuses, so it is withheld; '
+                             'the current text above is complete.')
     if warning:
         result['warning'] = warning
     elif since is not None and not since_known:
@@ -467,18 +576,38 @@ def write_guidance(path, text, actor, now=None):
     between the text write and the metadata write recovers by setting the same
     text again. Acknowledgement entries for versions other than the current and
     previous one are dropped at every set.
+
+    A set also replaces a file on disk that cannot be read as guidance (a refused
+    character, over the limit, not UTF-8): ``replaced_unreadable: true``. That file is
+    a generation nobody set, so nothing of it is copied into the record: no history
+    entry, no previous version, no previous text. Before kittrial-5bb.105 the set was
+    refused with the OLD file's error, which read as if the new text were wrong, and
+    the only repair was a clear, which drops the acknowledgements and the history.
     """
     validate_text(text)
     validate_actor(actor)
     target, meta_path = _paths(path)
-    old_text = read_text(path)
+    replaced_unreadable = False
+    try:
+        old_text = read_text(path)
+    except ValueError:
+        # Only a regular file whose CONTENT is refused is replaced; a directory in its
+        # place or a file that cannot be opened (permissions) is still the operator's
+        # to look at.
+        if not _readable_file(target):
+            raise
+        old_text, replaced_unreadable = None, True
     old_meta = read_meta(path)
     current = version_of(text)
     previous = version_of(old_text) if old_text is not None else None
     old_bound = old_text is not None and isinstance(old_meta, dict) and old_meta.get('version') == previous
     old_attributed = old_bound and _valid_actor(old_meta.get('set_by')) and _valid_stamp(old_meta.get('set_at'))
-    needs_repair = old_text is not None and not old_attributed
-    if previous == current and old_attributed:
+    needs_repair = replaced_unreadable or (old_text is not None and not old_attributed)
+    # A record that binds the text but fails the strict check (the check acknowledge,
+    # compact and backup apply) is rewritten by a same-text set, instead of "unchanged".
+    rewrite = previous == current and old_attributed and not _strictly_valid(old_meta)
+    needs_repair = needs_repair or rewrite
+    if previous == current and old_attributed and not rewrite:
         return {'version': current, 'set_by': old_meta['set_by'], 'set_at': old_meta['set_at'],
                 'previous_version': old_meta.get('previous_version'), 'changed': False, 'repaired': False}
     stamp = now or datetime.now(timezone.utc).isoformat()
@@ -514,6 +643,13 @@ def write_guidance(path, text, actor, now=None):
         # and never the current text as the previous text.
         previous_version = record_version if record_version in superseded else None
         previous_text = None
+        if rewrite:
+            # The record already names this text: keep its own previous generation where
+            # those two fields are well formed.
+            kept = old_meta.get('previous_version')
+            previous_version = kept if isinstance(kept, str) and VERSION.fullmatch(kept) else None
+            previous_text = (old_meta.get('previous_text')
+                             if previous_version and _storable_text(old_meta.get('previous_text')) else None)
     else:
         previous_version = previous
         previous_text = old_text
@@ -533,9 +669,12 @@ def write_guidance(path, text, actor, now=None):
     # audit fields, which a set with the same text repairs (see above).
     write_text(target, text)
     atomic(meta_path, meta)
-    return {'version': current, 'set_by': actor, 'set_at': stamp,
-            'previous_version': previous_version,
-            'changed': previous != current, 'repaired': needs_repair}
+    result = {'version': current, 'set_by': actor, 'set_at': stamp,
+              'previous_version': previous_version,
+              'changed': previous != current, 'repaired': needs_repair}
+    if replaced_unreadable:
+        result['replaced_unreadable'] = True
+    return result
 
 
 def acknowledge(path, actor, version=None):
@@ -651,19 +790,47 @@ def validate_clear_record(record):
     return record
 
 
-def read_clear_record(path):
-    """The local clear audit record, or None when it is absent or unreadable."""
+def clear_record_state(path):
+    """(state, record): 'absent', 'ok' with the validated record, or 'invalid'.
+
+    'invalid' is a file at the record's path that is a symlink, is not a regular file,
+    cannot be read or does not validate. It is reported, never silently treated as "no
+    clears" (kittrial-5bb.105).
+    """
     target = Path(path) / CLEAR_NAME
+    if not (target.exists() or target.is_symlink()):
+        return 'absent', None
     if target.is_symlink() or not target.is_file():
-        return None
+        return 'invalid', None
     try:
         value = record_json.loads(target.read_text(encoding='utf-8'))
+        return 'ok', validate_clear_record(value)
     except (OSError, UnicodeError, ValueError, RecursionError):
-        return None
+        return 'invalid', None
+
+
+def read_clear_record(path):
+    """The local clear audit record, or None when it is absent or invalid."""
+    return clear_record_state(path)[1]
+
+
+def clears_view(path):
+    """What `guidance-status` shows about clears: who, when and which version; never text."""
+    state, record = clear_record_state(path)
     try:
-        return validate_clear_record(value)
-    except ValueError:
-        return None
+        aside = sorted(entry.name for entry in Path(path).iterdir()
+                       if entry.name.startswith(CLEAR_INVALID_NAME + '.'))
+    except OSError:
+        aside = []
+    view = {'clear_record': state, 'clears': list(record['clears']) if record else [],
+            'clear_record_kept_aside': bool(aside),
+            # The invalid records kept so far, newest last; at most the last ten are named.
+            'clear_records_kept_aside': aside[-CLEAR_LIMIT:], 'clear_records_kept_aside_total': len(aside)}
+    if state == 'invalid':
+        view['clear_warning'] = ('The clear record %s is not a valid record this kit wrote, so who cleared the '
+                                 'guidance cannot be read from it. It is kept as it is; the next clear moves it to '
+                                 '%s.<UTC time> and starts a new record.' % (CLEAR_NAME, CLEAR_INVALID_NAME))
+    return view
 
 
 def clear(path, actor):
@@ -689,14 +856,84 @@ def clear(path, actor):
                 raise ValueError('The guidance file could not be removed; ask the operator to check permissions')
             removed.append(target.name)
     stamp = datetime.now(timezone.utc).isoformat()
-    previous = read_clear_record(path)
+    state, previous = clear_record_state(path)
+    kept_aside = None
+    if state == 'invalid':
+        # A record this kit did not write (a hand edit, a planted file, a symlink) used
+        # to be replaced without a word. Keep it beside the new record and say so.
+        # Dated, and numbered within a second, so a second invalid record never
+        # overwrites the first one kept (review of f2d6050).
+        moment = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+        aside = Path(path) / ('%s.%s' % (CLEAR_INVALID_NAME, moment))
+        number = 1
+        while aside.exists() or aside.is_symlink():
+            number += 1
+            aside = Path(path) / ('%s.%s-%d' % (CLEAR_INVALID_NAME, moment, number))
+        try:
+            os.replace(Path(path) / CLEAR_NAME, aside)
+            kept_aside = aside.name
+        except OSError:
+            raise ValueError('The existing guidance clear record is not valid and could not be moved aside; ask '
+                             'the operator to check %s' % CLEAR_NAME) from None
     clears = ([{'cleared_by': actor, 'cleared_at': stamp, 'cleared_version': cleared_version}]
               + (previous['clears'] if previous else []))[:CLEAR_LIMIT]
     record = {'schema_version': 1, 'clears': clears}
     validate_clear_record(record)
     atomic(Path(path) / CLEAR_NAME, record)
-    return {'removed': sorted(set(removed)), 'cleared_by': actor, 'cleared_at': stamp,
-            'cleared_version': cleared_version, 'clear_record': CLEAR_NAME}
+    result = {'removed': sorted(set(removed)), 'cleared_by': actor, 'cleared_at': stamp,
+              'cleared_version': cleared_version, 'clear_record': CLEAR_NAME}
+    if kept_aside:
+        result['invalid_record_kept_as'] = kept_aside
+    return result
+
+
+UNREADABLE_REPAIR = ('One `admin.py set-guidance PROJECT --actor OPERATOR --file FILE` with clean text replaces the '
+                     'file and keeps the audit record, the history and the acknowledgement rules; nothing of the '
+                     'unreadable file is copied.')
+
+
+def _unreadable_status(path, reason, host):
+    """The status of a project whose guidance file cannot be read as guidance.
+
+    What can be seen without the text: why it cannot be read (the reason names the
+    character or the limit), the audit record's own version, setter and time (the last
+    generation an operator set), and the acknowledgement table. Never the unreadable
+    text, on either form.
+    """
+    meta = read_meta(path)
+    recorded = meta.get('version') if isinstance(meta, dict) else None
+    rows = []
+    table = meta.get('acknowledged') if isinstance(meta, dict) else None
+    if isinstance(table, dict):
+        for name, entry in sorted(table.items()):
+            if not _valid_actor(name) or not isinstance(entry, dict) or set(entry) != {'version', 'acknowledged_at'}:
+                continue
+            if not isinstance(entry.get('version'), str) or not VERSION.fullmatch(entry['version']):
+                continue
+            rows.append({'actor': name, 'version': entry['version'],
+                         'acknowledged_at': entry.get('acknowledged_at'), 'current': False})
+    record = None
+    if isinstance(meta, dict):
+        record = {'version': recorded,
+                  'set_by': meta.get('set_by') if _valid_actor(meta.get('set_by')) else None,
+                  'set_at': meta.get('set_at') if _valid_stamp(meta.get('set_at')) else None}
+    result = {'schema_version': 1, 'present': None, 'unreadable': True, 'unreadable_reason': reason,
+              'repair': UNREADABLE_REPAIR, 'version': None, 'set_by': None, 'set_at': None,
+              'meta_version': recorded, 'audit_record': record, 'previous_version': None,
+              'acknowledged': rows, 'acknowledged_total': len(rows),
+              # Nobody is up to date with a file nobody can read. `behind` are the
+              # actors whose acknowledgement is the version the audit record names.
+              'up_to_date': [],
+              'behind': sorted(row['actor'] for row in rows if row['version'] == recorded),
+              'stale': sorted(row['actor'] for row in rows if row['version'] != recorded),
+              'text_unbound': False, 'compact_hint': None,
+              'warning': 'The guidance file cannot be read as guidance: %s. %s' % (reason.rstrip('.'), UNREADABLE_REPAIR)}
+    if host:
+        result['text'] = None
+        result['previous_text'] = None
+        result['history'] = _history_entries(meta)
+    result.update(clears_view(path))
+    return result
 
 
 def status(path, actor, operators=None, host=False):
@@ -712,7 +949,16 @@ def status(path, actor, operators=None, host=False):
     """
     from keyed_records import require_configured_operator
     require_configured_operator(actor, operators, 'read the guidance acknowledgement status')
-    text = read_text(path)
+    target, _ = _paths(path)
+    try:
+        text = read_text(path)
+    except ValueError as error:
+        # The operator runs this to find out what is wrong, so it answers with what it
+        # can see instead of failing with the file's error (kittrial-5bb.105). A
+        # directory in the file's place or a permission fault still raises.
+        if not _readable_file(target):
+            raise
+        return _unreadable_status(path, str(error), host)
     meta = read_meta(path) if text is not None else None
     current = version_of(text) if text is not None else None
     set_by, set_at, bound, warning = _attribution(meta, current) if text is not None else (None, None, False, None)
@@ -745,11 +991,16 @@ def status(path, actor, operators=None, host=False):
         # The host route (operator allowlist plus shell access): the operator may see
         # the text even when it is unbound, to diagnose the hand edit or crashed set.
         result['text'] = text
-        result['previous_text'] = meta.get('previous_text') if bound else None
+        result['previous_text'] = _deliverable_text(meta.get('previous_text')) if bound else None
+        if bound and meta.get('previous_text') is not None and result['previous_text'] is None:
+            result['previous_text_withheld'] = True
         result['history'] = meta.get('history') if bound else []
     if 'acks_compacted_by' in (meta or {}):
         result['acks_compacted_by'] = meta.get('acks_compacted_by')
         result['acks_compacted_at'] = meta.get('acks_compacted_at')
+    # Who cleared the guidance, when and which version: it was written to a local file
+    # and shown nowhere (kittrial-5bb.105). Names, times and hashes only, on both forms.
+    result.update(clears_view(path))
     if warning:
         result['warning'] = warning
     return result

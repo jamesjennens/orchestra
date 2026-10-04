@@ -57,7 +57,9 @@ workers to re-run `onboard`; that is the interim this channel replaces.
   whose audit record does not bind it to a valid operator set is **withheld**
   (`text: null`, `unbound: true`, `attention: true`, a warning and a repair
   `next_action`): an instruction no setter stands behind is never delivered to a
-  worker or followed, and a same-text set repairs it.
+  worker or followed, and a same-text set repairs it. Every reader reports unbound
+  text the same way, `present: true` with `version: null` (kittrial-5bb.105): the
+  hash of withheld text is not a version anyone may follow or acknowledge.
 * The **endpoint never writes guidance**. Its subcommands are an explicit allowlist
   (`get`, `version`, `ack`, `status`); every write-shaped subcommand is refused, the
   test enumerates the accepted subcommands and fails on any not in that read+ack
@@ -75,8 +77,12 @@ workers to re-run `onboard`; that is the interim this channel replaces.
   ack; that fails safe because an evicted lane re-reads and re-acks, and a future
   composed prompt must not treat an ack as proof that the text was read or followed.
 * The endpoint **refuses invisible instruction vectors**: C0/C1, bidi controls, word
-  joiners, BOM and the Unicode tag block `U+E0000`-`U+E007F`. ZWNJ/ZWJ are allowed
-  between letters, so legitimate Persian text is not blocked.
+  joiners, BOM, the Unicode tag block `U+E0000`-`U+E007F`, and (kittrial-5bb.105)
+  variation selectors, fillers and the other characters that render as nothing or as
+  a blank; the list is in [OPERATIONS.md](OPERATIONS.md#standing-guidance). ZWNJ/ZWJ
+  are allowed only between letters or marks of one script that uses them, so
+  legitimate Persian and Hindi text is not blocked and a joiner inside a Latin word
+  or an emoji sequence is refused.
 
 ## Trust boundary
 
@@ -113,11 +119,16 @@ strict ones:
   fault as **degraded**: the tracker backup still completes, the bad pair is left
   out, the project's status entry is `complete` with a `degraded` repair message,
   and the run exits 0 so the daily timer is not failed by a two-file instruction
-  fault. `restore-new` on a backup with no guidance pair restores the tracker with
+  fault. The summary lines, `backup-status`, `backup-copy` and `restore-new` each
+  name a degraded project, and `--require-clean` refuses one (kittrial-5bb.105). `restore-new` on a backup with no guidance pair restores the tracker with
   no guidance (`present: false`).
 * `clear-guidance` leaves a small local `.guidance-clear.json` record (who, when,
-  the cleared version; the last 10 clears), which is not part of the coordination
-  backup. A symlinked `GUIDANCE.md` is refused by `clear-guidance` and needs a
+  the cleared version; the last 10 clears). Both status reads show it, and an
+  invalid file at its path is reported and kept aside, never silently replaced
+  (kittrial-5bb.105). Restore accepts and validates the record in a sidecar; `backup`
+  does not write it yet, because a kit before kittrial-5bb.105 refuses a whole restore
+  on a sidecar path it does not know. The writer follows once every installation
+  runs a kit that accepts the path. A symlinked `GUIDANCE.md` is refused by `clear-guidance` and needs a
   manual delete.
 * **Rollback gap:** an older kit (at or before `dca96b9d`) validates the
   coordination sidecar against a fixed path set that does not include the two

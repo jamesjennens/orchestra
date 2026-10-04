@@ -2,6 +2,7 @@
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 import types
@@ -113,15 +114,368 @@ class GuidanceRecordTests(unittest.TestCase):
                 guidance.validate_text(bad)
 
     def test_zwnj_and_zwj_are_allowed_between_letters_only(self):
-        # kittrial-5bb.99 review `small` 4: ZWNJ/ZWJ are legitimate in Persian text
-        # (and emoji), so a blanket refusal blocked real prose. They are allowed
-        # between letters and refused anywhere else.
-        for good in ['می\u200cروم', 'a\u200cb', 'a\u200db', 'می\u200dروم']:
-            with self.subTest(good=repr(good)):
-                self.assertEqual(guidance.validate_text(good), good)
-        for bad in ['\u200ca', 'a\u200c', 'a \u200cb', 'a\u200c1', '1\u200cb', 'a\u200c.']:
-            with self.subTest(bad=repr(bad)), self.assertRaisesRegex(ValueError, 'joiner'):
-                guidance.validate_text(bad)
+        # kittrial-5bb.99 review `small` 4: ZWNJ/ZWJ are legitimate in Persian text, so
+        # a blanket refusal blocked real prose. kittrial-5bb.105 narrows "between
+        # letters" to "between letters or marks of one script that uses joiners".
+        good = ['می\u200cروم', 'می\u200dروم',                      # Persian
+                '\u0915\u094d\u200d\u0937', '\u0915\u094d\u200c\u0937',  # Devanagari, after a virama (a mark)
+                '\u0d15\u0d4d\u200d', ]                              # filled in below
+        good[-1] = '\u0d28\u0d4d\u200d\u0d31'                         # Malayalam
+        for text in good:
+            with self.subTest(good=ascii(text)):
+                self.assertEqual(guidance.validate_text(text), text)
+        bad = ['\u200ca', 'a\u200c', 'a \u200cb', 'a\u200c1', '1\u200cb', 'a\u200c.',
+               'a\u200cb', 'a\u200db', 'app\u200crove', 'e\u0301\u200dx',   # Latin letters and marks
+               '\u0445\u200c\u0445',                                    # Cyrillic
+               '\u4e2d\u200d\u6587',                                    # Han
+               'a\u200c\u0645', '\u0645\u200ca',                         # one side only
+               '\u0645\u200c\u0915',                                    # two joiner scripts, mixed
+               '\u0645\u200c\u200c\u0645',                              # two joiners in a row
+               '\u0661\u200c\u0662',                                    # Arabic digits, not letters
+               '\U0001F468\u200d\U0001F469']                            # an emoji sequence
+        for text in bad:
+            with self.subTest(bad=ascii(text)), self.assertRaisesRegex(ValueError, 'joiner'):
+                guidance.validate_text(text)
+
+    def test_invisible_and_blank_looking_characters_are_refused_on_set_and_on_read(self):
+        # kittrial-5bb.105 item 3. Each of these renders as nothing, or as a blank, and
+        # changes the bytes: two texts that look alike get different versions, and a
+        # keyword in the text stops matching.
+        named = ['\ufe00', '\ufe0f', '\U000E0100', '\U000E01EF', '\u3164', '\u061c', '\u180e', '\u034f', '\u2800']
+        relatives = ['\u115f', '\u1160', '\uffa0', '\u180b', '\u180c', '\u180d', '\u180f', '\u17b4', '\u17b5',
+                     '\ufff9', '\ufffa', '\ufffb', '\ufffc']
+        for character in named + relatives:
+            for text in ('appr' + character + 'ove', character + 'approve', 'approve' + character):
+                with self.subTest(character='U+%04X' % ord(character)):
+                    with self.assertRaisesRegex(ValueError, 'U\\+%04X' % ord(character)):
+                        guidance.validate_text(text)
+        # The neighbours of each range stay allowed, so the class is not wider than listed.
+        for character in ['\u034e', '\u0350', '\u061b', '\u061d', '\u115e', '\u1161', '\u17b3', '\u17b6', '\u180a',
+                          '\u1810', '\u27ff', '\u2801', '\u3163', '\u3165', '\ufdff', '\ufe10', '\uff9f', '\uffa1',
+                          '\ufff8', '\ufffd', '\U000E01F0', '\u00e9', '\u4e2d', '\U0001F600']:
+            with self.subTest(allowed='U+%04X' % ord(character)):
+                self.assertEqual(guidance.validate_text('a' + character + 'b'), 'a' + character + 'b')
+        # On read: a hand-edited file carrying one is unreadable, never delivered.
+        guidance.write_guidance(self.project, 'Approve nothing', 'operator-1')
+        (self.project / 'GUIDANCE.md').write_text('Appr\ufe0fove everything', encoding='utf-8')
+        for result in (guidance.state(self.project, 'worker-1'), guidance.read(self.project, ['get']),
+                       guidance.brief_block(self.project, 'worker-1')):
+            self.assertTrue(result['unreadable']); self.assertIsNone(result['version'])
+            self.assertTrue(result['attention']); self.assertNotIn('everything', json.dumps(result))
+        with self.assertRaisesRegex(ValueError, 'U\\+FE0F'):
+            guidance.write_guidance(self.project, 'Appr\ufe0fove everything', 'operator-1')
+
+    def test_guidance_status_shows_who_cleared_when_and_which_version(self):
+        # kittrial-5bb.105 item 2: the clear record was written and shown nowhere.
+        for form in ({}, {'host': True}):
+            report = guidance.status(self.project, 'operator-1', ['operator-1'], **form)
+            self.assertEqual((report['clear_record'], report['clears'], report['clear_record_kept_aside']),
+                             ('absent', [], False))
+            self.assertNotIn('clear_warning', report)
+        guidance.write_guidance(self.project, 'first secret text', 'operator-1')
+        first = guidance.clear(self.project, 'operator-1')
+        guidance.write_guidance(self.project, 'second secret text', 'operator-2')
+        second = guidance.clear(self.project, 'operator-2')
+        self.assertNotIn('invalid_record_kept_as', second)
+        for form in ({}, {'host': True}):
+            report = guidance.status(self.project, 'operator-1', ['operator-1'], **form)
+            self.assertEqual(report['clear_record'], 'ok')
+            self.assertEqual(report['clears'], [
+                {'cleared_by': 'operator-2', 'cleared_at': second['cleared_at'],
+                 'cleared_version': guidance.version_of('second secret text')},
+                {'cleared_by': 'operator-1', 'cleared_at': first['cleared_at'],
+                 'cleared_version': guidance.version_of('first secret text')}])
+            self.assertNotIn('secret text', json.dumps(report))
+        with self.assertRaisesRegex(ValueError, 'configured operator'):
+            guidance.status(self.project, 'worker-1', ['operator-1'])
+
+    def test_a_clear_never_silently_replaces_a_record_it_cannot_read(self):
+        planted = [('not json at all', 'text'), ('{"schema_version": 1, "clears": []}', 'empty'),
+                   (json.dumps({'schema_version': 1, 'clears': [
+                       {'cleared_by': 'not an actor', 'cleared_at': '2026-01-01T00:00:00+00:00', 'cleared_version': None}]}), 'actor'),
+                   ('[' * 4000, 'deep')]
+        kept = []
+        for content, label in planted:
+            with self.subTest(planted=label):
+                (self.project / guidance.CLEAR_NAME).write_text(content, encoding='utf-8')
+                self.assertEqual(guidance.clear_record_state(self.project), ('invalid', None))
+                report = guidance.status(self.project, 'operator-1', ['operator-1'])
+                self.assertEqual((report['clear_record'], report['clears']), ('invalid', []))
+                self.assertIn('not a valid record', report['clear_warning'])
+                # Reading changes nothing.
+                self.assertEqual((self.project / guidance.CLEAR_NAME).read_text(encoding='utf-8'), content)
+                guidance.write_guidance(self.project, 'text', 'operator-1')
+                result = guidance.clear(self.project, 'operator-1')
+                name = result['invalid_record_kept_as']
+                self.assertRegex(name, r'^\.guidance-clear\.json\.invalid\.\d{8}T\d{6}Z(-\d+)?$')
+                self.assertEqual((self.project / name).read_text(encoding='utf-8'), content)
+                kept.append((name, content))
+                report = guidance.status(self.project, 'operator-1', ['operator-1'])
+                self.assertEqual(report['clear_record'], 'ok'); self.assertTrue(report['clear_record_kept_aside'])
+                self.assertEqual([entry['cleared_by'] for entry in report['clears']], ['operator-1'])
+                # Each clear here follows an invalid record, so the new record starts again.
+                (self.project / guidance.CLEAR_NAME).unlink()
+        # Review of f2d6050: a second invalid record used to overwrite the first one kept.
+        # Every one is still there, under its own dated name, with its own content.
+        self.assertEqual(len({name for name, _ in kept}), len(planted))
+        for name, content in kept:
+            self.assertEqual((self.project / name).read_text(encoding='utf-8'), content)
+        report = guidance.status(self.project, 'operator-1', ['operator-1'])
+        self.assertEqual((sorted(report['clear_records_kept_aside']), report['clear_records_kept_aside_total']),
+                         (sorted(name for name, _ in kept), len(planted)))
+        # A valid record is extended, never moved aside.
+        guidance.write_guidance(self.project, 'text', 'operator-1')
+        guidance.clear(self.project, 'operator-1')
+        guidance.write_guidance(self.project, 'text', 'operator-1')
+        result = guidance.clear(self.project, 'operator-2')
+        self.assertNotIn('invalid_record_kept_as', result)
+        self.assertEqual(guidance.status(self.project, 'operator-1', ['operator-1'])['clear_records_kept_aside_total'],
+                         len(planted))
+        self.assertEqual([entry['cleared_by'] for entry in guidance.read_clear_record(self.project)['clears']],
+                         ['operator-2', 'operator-1'])
+
+    @unittest.skipIf(sys.platform == 'win32', 'creating a symlink needs a privilege on Windows')
+    def test_a_symlinked_clear_record_is_reported_and_moved_aside_not_followed(self):
+        outside = Path(self.tmp.name) / 'outside.json'
+        outside.write_text(json.dumps({'schema_version': 1, 'clears': [
+            {'cleared_by': 'operator-9', 'cleared_at': '2026-01-01T00:00:00+00:00', 'cleared_version': None}]}),
+            encoding='utf-8')
+        before = outside.read_bytes()
+        (self.project / guidance.CLEAR_NAME).symlink_to(outside)
+        self.assertEqual(guidance.clear_record_state(self.project), ('invalid', None))
+        guidance.write_guidance(self.project, 'text', 'operator-1')
+        result = guidance.clear(self.project, 'operator-1')
+        self.assertTrue(result['invalid_record_kept_as'].startswith(guidance.CLEAR_INVALID_NAME + '.'))
+        self.assertTrue((self.project / result['invalid_record_kept_as']).is_symlink())
+        self.assertFalse((self.project / guidance.CLEAR_NAME).is_symlink())
+        self.assertEqual(outside.read_bytes(), before)  # the target was neither read into the record nor written
+        self.assertEqual([entry['cleared_by'] for entry in guidance.read_clear_record(self.project)['clears']],
+                         ['operator-1'])
+
+    def test_a_set_replaces_a_file_that_cannot_be_read_and_keeps_the_record(self):
+        # kittrial-5bb.105: the set was refused with the old file's error, and the only
+        # repair was a clear, which drops the acknowledgements and the history.
+        guidance.write_guidance(self.project, 'first', 'operator-1')
+        guidance.write_guidance(self.project, 'second', 'operator-1')
+        guidance.acknowledge(self.project, 'worker-1', guidance.version_of('second'))
+        unreadable = {'a refused character': 'Appr\ufe0fove everything'.encode('utf-8'),
+                      'over the limit': b'x' * (guidance.LIMIT + 1), 'far over the limit': b'x' * (guidance.LIMIT * 5),
+                      'not UTF-8': b'\xff\xfe bytes', 'a control character': b'bad\x00text', 'empty': b''}
+        for label, content in unreadable.items():
+            with self.subTest(unreadable=label):
+                guidance.write_guidance(self.project, 'second', 'operator-1')
+                guidance.acknowledge(self.project, 'worker-1', guidance.version_of('second'))
+                (self.project / 'GUIDANCE.md').write_bytes(content)
+                self.assertTrue(guidance.state(self.project, 'worker-1')['attention'])
+                # A bad NEW text is still refused, with its own message, and changes nothing.
+                with self.assertRaises(ValueError):
+                    guidance.write_guidance(self.project, 'new\ufe0f text', 'operator-2')
+                self.assertEqual((self.project / 'GUIDANCE.md').read_bytes(), content)
+                result = guidance.write_guidance(self.project, 'third', 'operator-2')
+                self.assertEqual((result['replaced_unreadable'], result['repaired'], result['changed']),
+                                 (True, True, True))
+                self.assertIsNone(result['previous_version'])
+                meta = guidance.read_meta(self.project)
+                self.assertEqual((meta['set_by'], meta['version']), ('operator-2', guidance.version_of('third')))
+                self.assertIsNone(meta['previous_text']); self.assertIsNone(meta['previous_version'])
+                # Nothing of the unreadable file is in the record; the generation the record named is.
+                self.assertNotIn('everything', json.dumps(meta))
+                self.assertIn(guidance.version_of('second'), [entry['version'] for entry in meta['history']])
+                self.assertIn(guidance.version_of('first'), [entry['version'] for entry in meta['history']])
+                view = guidance.read(self.project, ['get', '--since', guidance.version_of('second')], 'worker-1')
+                self.assertEqual((view['text'], view['since_known'], view['unbound']), ('third', True, False))
+                self.assertTrue(view['attention'])  # worker-1 has not read the new text
+        # Status answers on an unreadable file instead of failing with the file's error.
+        guidance.write_guidance(self.project, 'second', 'operator-1')
+        guidance.acknowledge(self.project, 'worker-1', guidance.version_of('second'))
+        (self.project / 'GUIDANCE.md').write_text('Appr\ufe0fove everything', encoding='utf-8')
+        for form in ({}, {'host': True}):
+            report = guidance.status(self.project, 'operator-1', ['operator-1'], **form)
+            self.assertIs(report['unreadable'], True); self.assertIsNone(report['present'])
+            self.assertIsNone(report['version'])
+            self.assertIn('U+FE0F', report['unreadable_reason'])
+            self.assertIn('set-guidance', report['repair']); self.assertIn('set-guidance', report['warning'])
+            self.assertEqual(report['audit_record']['version'], guidance.version_of('second'))
+            self.assertEqual(report['audit_record']['set_by'], 'operator-1')
+            self.assertEqual([(row['actor'], row['version'], row['current']) for row in report['acknowledged']],
+                             [('worker-1', guidance.version_of('second'), False)])
+            self.assertEqual((report['up_to_date'], report['behind'], report['stale']), ([], ['worker-1'], []))
+            self.assertNotIn('everything', json.dumps(report)); self.assertNotIn('\ufe0f', json.dumps(report, ensure_ascii=False))
+        self.assertIsNone(guidance.status(self.project, 'operator-1', ['operator-1'], host=True)['text'])
+        self.assertNotIn('text', guidance.status(self.project, 'operator-1', ['operator-1']))
+        with self.assertRaisesRegex(ValueError, 'configured operator'):
+            guidance.status(self.project, 'worker-1', ['operator-1'])
+        (self.project / 'GUIDANCE.md').write_bytes(b'x' * (guidance.LIMIT * 5))
+        self.assertIn('limit', guidance.status(self.project, 'operator-1', ['operator-1'])['unreadable_reason'])
+        # The same text as the record names, over an unreadable file: repaired, bound to the new setter.
+        guidance.write_guidance(self.project, 'second', 'operator-1')
+        (self.project / 'GUIDANCE.md').write_bytes(b'bad\x00text')
+        result = guidance.write_guidance(self.project, 'second', 'operator-2')
+        self.assertTrue(result['replaced_unreadable']); self.assertTrue(result['repaired'])
+        self.assertEqual(guidance.read(self.project, ['get'])['set_by'], 'operator-2')
+        # A readable file is never reported as replaced.
+        self.assertNotIn('replaced_unreadable', guidance.write_guidance(self.project, 'fourth', 'operator-1'))
+        # A directory in the file's place is not replaced.
+        (self.project / 'GUIDANCE.md').unlink(); (self.project / 'GUIDANCE.md').mkdir()
+        with self.assertRaisesRegex(ValueError, 'could not be read'):
+            guidance.write_guidance(self.project, 'fifth', 'operator-1')
+        with self.assertRaisesRegex(ValueError, 'could not be read'):
+            guidance.status(self.project, 'operator-1', ['operator-1'], host=True)
+        self.assertTrue((self.project / 'GUIDANCE.md').is_dir())
+
+    def record_with_a_refused_previous_text(self, previous='Ship it \u2764\ufe0f today'):
+        """What the kit before this one leaves: a healthy record whose PREVIOUS text holds
+        a character this kit refuses (it was valid when it was set)."""
+        guidance.write_guidance(self.project, 'placeholder for the old text', 'operator-1')
+        guidance.write_guidance(self.project, 'the clean current text', 'operator-1')
+        meta = json.loads((self.project / '.guidance.json').read_text(encoding='utf-8'))
+        meta['previous_text'] = previous
+        meta['previous_version'] = guidance.version_of(previous)
+        (self.project / '.guidance.json').write_text(json.dumps(meta), encoding='utf-8')
+        return guidance.version_of('the clean current text'), meta['previous_version']
+
+    def test_a_refused_character_in_the_previous_text_does_not_break_a_healthy_record(self):
+        # Review of f2d6050 (P2): acknowledge, compact and backup validated the stored
+        # previous text against today's rules, so after the upgrade nobody could
+        # acknowledge and a same-text set answered "unchanged" and repaired nothing.
+        current, previous = self.record_with_a_refused_previous_text()
+        with self.assertRaises(ValueError):
+            guidance.validate_text('Ship it \u2764\ufe0f today')         # it IS refused as guidance
+        state = guidance.state(self.project, 'worker-1')
+        self.assertEqual((state['version'], state['unbound'], state['attention']), (current, False, True))
+        self.assertTrue(guidance.acknowledge(self.project, 'worker-1', current)['acknowledged'])
+        self.assertFalse(guidance.state(self.project, 'worker-1')['attention'])
+        inject_stale_ack(self.project, 'stale-lane', 'a' * 64)
+        self.assertEqual(guidance.compact(self.project, 'operator-1')['removed_total'], 1)
+        fragment, fault = admin.guidance_backup_pair(self.project)
+        self.assertIsNone(fault)
+        admin.validate_coordination_files(fragment)
+        guidance.validate_meta(guidance.read_meta(self.project))
+        # The record is still strict about shape: a control character or an oversized previous text is refused.
+        for bad in ('bad\x00text', 'x' * (guidance.LIMIT + 1), '', 7):
+            with self.subTest(bad=repr(bad)[:20]), self.assertRaises(ValueError):
+                guidance.validate_meta(dict(guidance.read_meta(self.project), previous_text=bad))
+
+    def test_a_previous_text_that_fails_todays_rule_is_withheld_from_get_since_and_status(self):
+        current, previous = self.record_with_a_refused_previous_text()
+        view = guidance.read(self.project, ['get', '--since', previous], 'worker-1')
+        self.assertEqual((view['text'], view['since_known'], view['changed']), ('the clean current text', True, True))
+        self.assertIsNone(view['previous_text']); self.assertIs(view['previous_text_withheld'], True)
+        self.assertIn('withheld', view['warning'])
+        self.assertNotIn('\ufe0f', json.dumps(view, ensure_ascii=False))
+        report = guidance.status(self.project, 'operator-1', ['operator-1'], host=True)
+        self.assertIsNone(report['previous_text']); self.assertIs(report['previous_text_withheld'], True)
+        # A previous text that passes the rule is still returned, and not marked.
+        guidance.write_guidance(self.project, 'a third text', 'operator-1')
+        view = guidance.read(self.project, ['get', '--since', current], 'worker-1')
+        self.assertEqual(view['previous_text'], 'the clean current text')
+        self.assertNotIn('previous_text_withheld', view)
+        self.assertNotIn('previous_text_withheld', guidance.status(self.project, 'operator-1', ['operator-1'], host=True))
+
+    def test_a_same_text_set_rewrites_a_record_that_fails_the_strict_check(self):
+        # The record binds the text and names its setter, but would fail the check that
+        # acknowledge, compact and backup apply. A same-text set used to answer "unchanged".
+        guidance.write_guidance(self.project, 'first', 'operator-1')
+        guidance.write_guidance(self.project, 'second', 'operator-1')
+        guidance.acknowledge(self.project, 'worker-1', guidance.version_of('second'))
+        meta = json.loads((self.project / '.guidance.json').read_text(encoding='utf-8'))
+        meta['history'].append({'version': 'not a version', 'set_by': None, 'set_at': None, 'previous_version': None})
+        (self.project / '.guidance.json').write_text(json.dumps(meta), encoding='utf-8')
+        with self.assertRaises(ValueError):
+            guidance.acknowledge(self.project, 'worker-2', guidance.version_of('second'))
+        self.assertIn('guidance is degraded', admin.guidance_backup_pair(self.project)[1])
+        result = guidance.write_guidance(self.project, 'second', 'operator-2')
+        self.assertEqual((result['changed'], result['repaired']), (False, True))
+        repaired = guidance.read_meta(self.project)
+        guidance.validate_meta(repaired)
+        self.assertEqual((repaired['previous_version'], repaired['previous_text']),
+                         (guidance.version_of('first'), 'first'))
+        self.assertEqual([entry['version'] for entry in repaired['history']], [guidance.version_of('first')])
+        self.assertTrue(guidance.state(self.project, 'worker-1')['acknowledged'])     # the ack stands
+        self.assertTrue(guidance.acknowledge(self.project, 'worker-2', guidance.version_of('second'))['acknowledged'])
+        self.assertIsNone(admin.guidance_backup_pair(self.project)[1])
+        # A healthy record is still "unchanged".
+        again = guidance.write_guidance(self.project, 'second', 'operator-3')
+        self.assertEqual((again['changed'], again['repaired'], again['set_by']), (False, False, 'operator-2'))
+
+    def test_every_format_character_is_refused_except_the_visible_ones_and_the_joiner_rule(self):
+        # Review of f2d6050: refuse by category (Cf), not by a list that keeps growing.
+        import unicodedata
+        named = ['\U0001D173', '\U0001D17A', '\U0001BCA0', '\U0001BCA3', '\U00013430', '\U00016FE4']
+        for character in named:
+            with self.subTest(character='U+%04X' % ord(character)):
+                with self.assertRaisesRegex(ValueError, 'U\\+%04X' % ord(character)):
+                    guidance.validate_text('appr' + character + 'ove')
+        refused = allowed = 0
+        for point in range(0x110000):
+            character = chr(point)
+            if unicodedata.category(character) != 'Cf':
+                continue
+            if character in '\u200c\u200d':
+                continue                                    # the joiner rule has its own test
+            try:
+                guidance.validate_text('a' + character + 'b')
+                allowed += 1
+                self.assertIn(character, guidance.VISIBLE_FORMAT, 'U+%04X' % point)
+            except ValueError:
+                refused += 1
+                self.assertNotIn(character, guidance.VISIBLE_FORMAT, 'U+%04X' % point)
+        self.assertGreater(refused, 140)
+        self.assertLessEqual(allowed, len(guidance.VISIBLE_FORMAT))
+        # The visible format characters are part of real text and stay allowed.
+        for text in ('\u0600\u0661\u0662', '\u06dd\u0661', '\u070f\u0710'):
+            self.assertEqual(guidance.validate_text(text), text)
+        # Plain ASCII takes the short path.
+        self.assertIsNone(guidance._format_character('plain ascii text'))
+
+    @unittest.skipIf(sys.platform == 'win32' or (hasattr(os, 'geteuid') and os.geteuid() == 0),
+                     'file modes do not stop a read on Windows or for root')
+    def test_a_guidance_file_that_cannot_be_opened_is_left_for_the_operator(self):
+        # Review of f2d6050: a mode-000 file was replaced, though the comment said a
+        # permission fault is the operator's to look at.
+        guidance.write_guidance(self.project, 'text', 'operator-1')
+        target = self.project / 'GUIDANCE.md'
+        target.chmod(0)
+        self.addCleanup(target.chmod, 0o644)
+        with self.assertRaisesRegex(ValueError, 'could not be read'):
+            guidance.write_guidance(self.project, 'new text', 'operator-1')
+        with self.assertRaisesRegex(ValueError, 'could not be read'):
+            guidance.status(self.project, 'operator-1', ['operator-1'], host=True)
+        self.assertEqual(target.stat().st_mode & 0o777, 0)
+        target.chmod(0o644)
+        self.assertEqual(target.read_text(encoding='utf-8'), 'text')
+
+    def test_unbound_guidance_reads_the_same_from_every_reader(self):
+        # kittrial-5bb.105 item 5: `get` said present false while the block in brief,
+        # work and resume said present true with the hash of the withheld text.
+        guidance.write_guidance(self.project, 'original text', 'op-james')
+        recorded = guidance.version_of('original text')
+        (self.project / 'GUIDANCE.md').write_bytes(b'hand edited text\n')
+        readers = {'get': guidance.read(self.project, ['get'], 'worker-1'),
+                   'get --since': guidance.read(self.project, ['get', '--since', recorded], 'worker-1'),
+                   'version': guidance.read(self.project, ['version'], 'worker-1'),
+                   'state': guidance.state(self.project, 'worker-1'),
+                   'block': guidance.brief_block(self.project, 'worker-1')}
+        for name, result in readers.items():
+            with self.subTest(reader=name):
+                self.assertIs(result['present'], True)
+                self.assertIsNone(result['version'])
+                self.assertIs(result['unbound'], True); self.assertIs(result['attention'], True)
+                self.assertIsNone(result['set_by']); self.assertIsNone(result['set_at'])
+                self.assertEqual(result['meta_version'], recorded)
+                self.assertEqual(result['next_action'], guidance.REPAIR_NEXT_ACTION)
+                self.assertIn('warning', result)
+                self.assertNotIn(guidance.version_of('hand edited text\n'), json.dumps(result))
+                self.assertNotIn('hand edited', json.dumps(result))
+        # Nobody can acknowledge it, by the hash of the withheld text or by the recorded version.
+        for version in (guidance.version_of('hand edited text\n'), recorded):
+            with self.assertRaises(ValueError):
+                guidance.acknowledge(self.project, 'worker-1', version)
+        # Bound guidance is unchanged: the version is the hash of the text.
+        guidance.write_guidance(self.project, 'repaired', 'op-james')
+        for result in (guidance.read(self.project, ['get']), guidance.state(self.project, 'worker-1')):
+            self.assertEqual(result['version'], guidance.version_of('repaired'))
+            self.assertIs(result['present'], True); self.assertIs(result['unbound'], False)
 
     def test_acknowledge_records_actor_and_clears_attention(self):
         guidance.write_guidance(self.project, 'Current guidance', 'operator-1')
@@ -256,9 +610,11 @@ class GuidanceRecordTests(unittest.TestCase):
         self.assertTrue(state['present']); self.assertIsNone(state['set_by'])
         self.assertIn('warning', state); self.assertTrue(state['attention'])
         self.assertTrue(state['unbound'])
+        self.assertIsNone(state['version'])
         # The text is withheld, never delivered on an unreadable record.
         result = guidance.read(self.project, ['get'])
-        self.assertFalse(result['present']); self.assertIsNone(result['text'])
+        self.assertTrue(result['present']); self.assertIsNone(result['text'])
+        self.assertIsNone(result['version'])
         self.assertTrue(result['unbound'])
         self.assertIsNone(result['set_by']); self.assertIn('warning', result)
 
@@ -310,7 +666,7 @@ class GuidanceRecordTests(unittest.TestCase):
         # as the unreadable states do, and attention stays raised with the repair
         # action (kittrial-5bb.99 review `unbound-text-is-still-delivered`).
         result = guidance.read(self.project, ['get'])
-        self.assertFalse(result['present']); self.assertIsNone(result['text'])
+        self.assertTrue(result['present']); self.assertIsNone(result['text'])
         self.assertTrue(result['unbound']); self.assertTrue(result['attention'])
         self.assertIsNone(result['set_by']); self.assertIn('warning', result)
         self.assertIn('repaired by the operator', result['next_action'])
@@ -603,6 +959,86 @@ class GuidanceBackupTests(unittest.TestCase):
         self.assertIn('GUIDANCE.md', second['files'])
         self.assertIn('.guidance.json', second['files'])
 
+    def test_the_summary_line_counts_and_names_the_degraded_projects(self):
+        # kittrial-5bb.105 item 1: a complete, degraded run read exactly like a clean one.
+        self.make_second_project()
+        for name in ('example', 'second'):
+            (self.root / 'backups' / name).mkdir(parents=True)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            self.backup(all_projects=True)
+        self.assertIn('Backed up 2 of 2 project(s); ', out.getvalue())
+        self.assertNotIn('degraded', out.getvalue())
+        (self.project / 'GUIDANCE.md').write_text('hand edited text\n', encoding='utf-8')
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            self.backup(all_projects=True)
+        self.assertIn('Backed up 2 of 2 project(s), 1 degraded (example); ', out.getvalue())
+        (self.root / 'projects' / 'second' / 'GUIDANCE.md').write_text('also edited\n', encoding='utf-8')
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            self.backup(names=['example', 'second'])
+        self.assertIn('Backed up 2 of 2 project(s), 2 degraded (example, second); ', out.getvalue())
+        # One project: the degraded sentence is on stdout too, not only on stderr.
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            self.backup(names=['example'])
+        self.assertIn('Backup of example is complete but degraded: guidance is degraded', out.getvalue())
+        guidance.write_guidance(self.project, 'repaired', 'operator-1')
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            self.backup(names=['example'])
+        self.assertNotIn('degraded', out.getvalue())
+
+    def test_restore_new_says_what_a_degraded_backup_did_not_carry(self):
+        stamp = admin.utc_stamp()
+        entry = {'name': 'example', 'status': 'complete', 'completed_at': stamp,
+                 'pair': {'native': 'backups/example', 'coordination': 'backups/example.coordination.json'}}
+        record = {'schema_version': 1, 'scope': 'all', 'generated_at': stamp, 'status': 'complete',
+                  'projects': [dict(entry, degraded='guidance is degraded: repair it')]}
+        (self.root / 'backups').mkdir(exist_ok=True)
+        self.assertIsNone(admin.restore_degraded_note(self.root, 'example', 'copy'))  # no run record: no note
+        admin.write_backup_status(self.root, record)
+        note = admin.restore_degraded_note(self.root, 'example', 'copy')
+        self.assertIn('recorded example degraded', note); self.assertIn('not restored into copy', note)
+        self.assertIn('guidance is degraded: repair it', note)
+        self.assertIsNone(admin.restore_degraded_note(self.root, 'other', 'copy'))
+        # The source project being gone does not hide the note: that is when a restore is run.
+        import shutil
+        shutil.rmtree(self.project)
+        self.assertIsNotNone(admin.restore_degraded_note(self.root, 'example', 'copy'))
+        admin.write_backup_status(self.root, dict(record, projects=[entry]))
+        self.assertIsNone(admin.restore_degraded_note(self.root, 'example', 'copy'))
+        (self.root / 'backups' / admin.BACKUP_STATUS_NAME).write_text('not json', encoding='utf-8')
+        self.assertIsNone(admin.restore_degraded_note(self.root, 'example', 'copy'))
+
+    def test_a_sidecar_that_carries_the_clear_record_is_validated_and_restored(self):
+        # kittrial-5bb.105 item 2 (first of two releases): restore accepts the record;
+        # `backup` does not write it yet, because the previous kit refuses a whole
+        # restore on a sidecar path it does not know.
+        guidance.clear(self.project, 'operator-1')
+        clear_record = guidance.read_clear_record(self.project)
+        files = {'.guidance-clear.json': clear_record}
+        admin.validate_coordination_files(files)
+        dest = self.root / 'projects' / 'dest'; dest.mkdir(parents=True)
+        with patch.object(admin, 'coordination_backup', return_value=files):
+            admin.restore_coordination(self.root, 'source', 'dest')
+        self.assertEqual(guidance.read_clear_record(dest), clear_record)
+        self.assertEqual(guidance.status(dest, 'operator-1', ['operator-1'])['clears'], clear_record['clears'])
+        for bad in ({}, {'schema_version': 1, 'clears': []}, dict(clear_record, extra=1),
+                    {'schema_version': 1, 'clears': [dict(clear_record['clears'][0], cleared_by='bad actor\n')]},
+                    {'schema_version': 1, 'clears': [dict(clear_record['clears'][0], text='the guidance')]}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    admin.validate_coordination_files({'.guidance-clear.json': bad})
+                other = self.root / 'projects' / 'other'; other.mkdir(parents=True, exist_ok=True)
+                with patch.object(admin, 'coordination_backup', return_value={'.guidance-clear.json': bad}):
+                    with self.assertRaises(ValueError):
+                        admin.restore_coordination(self.root, 'source', 'other')
+                self.assertEqual(list(other.iterdir()), [])
+        # The writer waits: this kit's backup does not carry the record yet.
+        self.assertNotIn(guidance.CLEAR_NAME, admin.guidance_backup_pair(self.project)[0])
+
     def test_backup_status_degraded_entry_is_validated(self):
         stamp = admin.utc_stamp()
         entry = {'name': 'example', 'status': 'complete', 'completed_at': stamp,
@@ -687,9 +1123,20 @@ class GuidanceAdminTests(unittest.TestCase):
         stdout, _ = self.run_admin(['compact-guidance-acks', 'example', '--actor', 'operator-1'])
         self.assertIn('removed 1', stdout)
         self.assertEqual(guidance.read_meta(self.project)['acks_compacted_by'], 'operator-1')
+        (self.project / guidance.CLEAR_NAME).write_text('planted', encoding='utf-8')
+        stdout, _ = self.run_admin(['guidance-status', 'example', '--actor', 'operator-1'])
+        self.assertEqual(json.loads(stdout)['clear_record'], 'invalid')
         stdout, _ = self.run_admin(['clear-guidance', 'example', '--actor', 'operator-1'])
         self.assertIn('cleared', stdout)
+        self.assertIn('was kept as .guidance-clear.json.invalid.', stdout)
         self.assertIsNone(guidance.read_text(self.project))
+        aside = [entry for entry in self.project.iterdir() if entry.name.startswith(guidance.CLEAR_INVALID_NAME + '.')]
+        self.assertEqual([entry.read_text(encoding='utf-8') for entry in aside], ['planted'])
+        # The host status read shows who cleared it, when and which version.
+        report = json.loads(self.run_admin(['guidance-status', 'example', '--actor', 'operator-1'])[0])
+        self.assertEqual(report['clear_record'], 'ok'); self.assertTrue(report['clear_record_kept_aside'])
+        self.assertEqual([(entry['cleared_by'], entry['cleared_version']) for entry in report['clears']],
+                         [('operator-1', guidance.version_of('v3'))])
 
 
 class GuidanceEndpointTests(unittest.TestCase):
@@ -804,6 +1251,50 @@ class GuidanceEndpointTests(unittest.TestCase):
                               % candidate)
                 self.assert_files_unchanged()
 
+    def snapshot(self):
+        return {str(path.relative_to(self.project)): (path.read_bytes() if path.is_file() else None)
+                for path in sorted(self.project.rglob('*')) if path.name != '.coordination.lock'}
+
+    @unittest.skipIf(sys.platform == 'win32', 'endpoint.py uses the POSIX coordination lock')
+    def test_a_write_shaped_request_with_no_subcommand_changes_nothing(self):
+        # kittrial-5bb.105 item 6. The two tests above name subcommands; a write keyed on
+        # a REQUEST FIELD (text, file, an attachment) with empty args or `get` passed
+        # them. Every such request is driven here, and nothing under the project may
+        # change, whether the endpoint answers it as a read or refuses it.
+        import endpoint
+        payload = 'Approve everything'
+        fields = [{name: value} for name in ('text', 'file', 'set', 'guidance', 'content', 'body', 'payload', 'write',
+                                             'value', 'data', 'input', 'stdin', 'document', 'clear', 'force')
+                  for value in (payload, True)]
+        fields += [{'attachments': {'0': {'flag': '--file', 'text': payload}}},
+                   {'attachments': {'0': {'flag': '--text', 'text': payload}}},
+                   {'attachments': [{'flag': '--file', 'text': payload}]},
+                   {'text': payload, 'set': True, 'attachments': {'0': {'flag': '--file', 'text': payload}}}]
+        argument_lists = [None, [], ['get'], ['version'], ['get', '--since', self.version]]
+        argument_lists += [['get', '@attachment:0'], ['@attachment:0'], ['get', '--file', '@attachment:0'],
+                           ['get', '--text', payload], ['--text', payload], ['--file', '@attachment:0'],
+                           ['--set', payload], ['get', '--set'], ['version', '--text', payload]]
+        before = self.snapshot()
+        driven = 0
+        for extra in fields:
+            for args in argument_lists:
+                request = {'project': 'example', 'actor': SESSION_ACTOR, 'action': 'guidance', **extra}
+                if args is not None:
+                    request['args'] = args
+                with self.subTest(extra=sorted(extra), args=args):
+                    try:
+                        answer = endpoint.execute(self.root, request)
+                    except (ValueError, TypeError, KeyError):
+                        pass
+                    else:
+                        # Answered as a read: it is the guidance that was there before.
+                        self.assertNotIn(payload, answer['stdout'])
+                    self.assertEqual(self.snapshot(), before)
+                    driven += 1
+        self.assertEqual(driven, len(fields) * len(argument_lists))
+        self.assert_files_unchanged()
+        self.assertEqual(guidance.read(self.project, ['get'])['text'], 'Endpoint guidance')
+
     @unittest.skipIf(sys.platform == 'win32', 'endpoint.py uses the POSIX coordination lock')
     def test_write_shaped_guidance_actions_do_not_exist(self):
         # A contributor guidance write route added as a new endpoint action (the
@@ -845,7 +1336,8 @@ class GuidanceEndpointTests(unittest.TestCase):
         import endpoint  # noqa: F401
         (self.project / '.guidance.json').write_text('[' * 4000 + ']' * 4000, encoding='utf-8')
         answer = json.loads(self.call('guidance', [])['stdout'])
-        self.assertFalse(answer['present']); self.assertIn('warning', answer)
+        self.assertTrue(answer['present']); self.assertIn('warning', answer)
+        self.assertIsNone(answer['version'])
         # An unreadable record makes the text unbound, so the endpoint withholds it
         # (kittrial-5bb.99 review `unbound-text-is-still-delivered`).
         self.assertIsNone(answer['text']); self.assertTrue(answer['unbound'])

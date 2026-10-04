@@ -843,6 +843,35 @@ class BackupCopyCase(RuntimeCase):
         self.assertEqual(stdout, '')
         self.assertFalse(self.destination.exists())
 
+    def degraded(self):
+        self.record()
+        record = admin.read_backup_status(self.root)
+        record['projects'][1]['degraded'] = 'guidance is degraded: the pair was left out; repair it'
+        admin.write_backup_status(self.root, record)
+
+    def test_the_copy_names_a_degraded_project_and_copies_it(self):
+        # kittrial-5bb.105 item 1.
+        self.degraded()
+        stdout, stderr, code = self.run_admin('backup-copy', str(self.destination))
+        self.assertEqual(code, 0, stderr)
+        self.assertIn('Degraded, copied as it is: beta: guidance is degraded', stdout)
+        self.assertNotIn('alpha: guidance', stdout)
+        self.assertTrue((self.destination / 'beta').is_dir())
+        self.assertTrue((self.destination / 'beta.coordination.json').is_file())
+
+    def test_the_copy_with_require_clean_refuses_a_degraded_project_and_copies_nothing(self):
+        self.degraded()
+        stdout, stderr, code = self.run_admin('backup-copy', str(self.destination), '--require-clean')
+        self.assertNotEqual(code, 0)
+        self.assertIn('backup-copy refused (--require-clean): 1 degraded (beta)', stderr)
+        self.assertFalse(self.destination.exists())
+        # With nothing degraded the option changes nothing.
+        self.record()
+        stdout, stderr, code = self.run_admin('backup-copy', str(self.destination), '--require-clean')
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn('egraded', stdout)
+        self.assertTrue((self.destination / 'alpha').is_dir())
+
     def test_the_copy_refuses_a_project_initialized_after_the_run(self):
         self.record()
         make_project(self.root, 'gamma')
