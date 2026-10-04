@@ -309,6 +309,37 @@ class BackupStatusReadCase(unittest.TestCase):
         self.assertEqual(code, 0, stderr)
         self.assertEqual(json.loads(stdout), self.record)
 
+    def degraded_record(self):
+        record = json.loads(json.dumps(self.record))
+        record['projects'][1]['degraded'] = 'guidance is degraded: the pair was left out; repair it'
+        return record
+
+    def test_require_complete_passes_a_degraded_project_and_require_clean_refuses_it(self):
+        # kittrial-5bb.105 item 1.
+        admin.write_backup_status(self.root, self.degraded_record())
+        for argv in (('backup-status',), ('backup-status', '--require-complete')):
+            stdout, stderr, code = self.run_status(*argv)
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(json.loads(stdout), self.degraded_record())  # stdout stays one JSON document
+            self.assertIn('backup-status: 1 degraded (beta). beta: guidance is degraded', stderr)
+        stdout, stderr, code = self.run_status('backup-status', '--require-clean')
+        self.assertNotEqual(code, 0)
+        self.assertIn('--require-clean refuses a degraded project', stderr)
+        self.assertIn('1 degraded (beta)', stderr)
+        stdout, stderr, code = self.run_status('backup-status', '--require-clean', '--require-complete')
+        self.assertNotEqual(code, 0)
+
+    def test_require_clean_passes_a_clean_run_and_checks_everything_require_complete_checks(self):
+        admin.write_backup_status(self.root, self.record)
+        stdout, stderr, code = self.run_status('backup-status', '--require-clean')
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn('degraded', stderr)
+        self.assertEqual(json.loads(stdout), self.record)
+        (self.root / 'backups' / 'beta').rmdir()
+        stdout, stderr, code = self.run_status('backup-status', '--require-clean')
+        self.assertNotEqual(code, 0)
+        self.assertIn('beta: native backup directory is missing', stderr)
+
     def test_require_complete_refuses_a_named_run_that_cannot_cover_every_project(self):
         named = json.loads(json.dumps(self.record))
         named['scope'] = 'named'

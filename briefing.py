@@ -325,7 +325,10 @@ def format_brief(result):
            'Intent: '+excerpt(result['intent']),'Acceptance: '+excerpt(result['acceptance']),
            'Current position: '+result['current_position'],'Next: '+result['next_action']]
     guidance=result.get('guidance')
-    if guidance and guidance.get('present'):
+    if guidance and guidance.get('present') and guidance.get('unbound'):
+        # Unbound text has no version anyone may follow (kittrial-5bb.105); the warning line below says why.
+        lines.append('Guidance: present but withheld until the operator repairs it | attention: True')
+    elif guidance and guidance.get('present'):
         lines.append('Guidance: version %s set by %s at %s | acknowledged: %s | attention: %s'%(
             guidance['version'],guidance.get('set_by') or 'unknown',guidance.get('set_at') or 'unknown',
             guidance.get('acknowledged'),guidance.get('attention')))
@@ -379,7 +382,7 @@ def help_notes(action):
                 'guidance version, who set it and whether this actor has acknowledged it; read it with '
                 '`guidance get` and record the read with `guidance ack --version VERSION`, naming the version '
                 'you read. An unreadable or unbound guidance record carries attention true and a warning, and '
-                'unbound text is withheld (`text: null`, `unbound: true`) with a next action saying the '
+                'unbound text is withheld (`text: null`, `version: null`, `unbound: true`) with a next action saying the '
                 'guidance is being repaired by the operator; text without a setter is never followed.',
                 '--limit/--offset are not brief options; use --items-limit/--items-offset.',
                 'attention lists at most 3 reference-review items (entries tagged with the task\'s labels, '

@@ -1467,7 +1467,7 @@ def validate_coordination_files(files):
     for name,record in files.items():
         quarantine = isinstance(name,str) and re.fullmatch(r'\.feedback\.jsonl\.(?:[a-f0-9]{16}|[a-f0-9]{64})\.incomplete',name)
         journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-backfills|\.integration-reverts|\.reference-requests|\.proposal-requests|\.capability-requests)/[a-f0-9]{64}\.json',name)
-        if name not in ('.merge-context.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.sessions.json','.feedback.jsonl') and not quarantine and not journal:raise ValueError('Invalid coordination backup path')
+        if name not in ('.merge-context.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl') and not quarantine and not journal:raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
         if name=='.sessions.json':
             from sessions import validate
@@ -1509,6 +1509,13 @@ def validate_coordination_files(files):
         if name=='.guidance.json':
             from guidance import validate_meta
             validate_meta(record)
+        if name=='.guidance-clear.json':
+            # Accepted and validated so a backup that carries the clear record restores
+            # (kittrial-5bb.105). `backup` does not write it yet: a kit before this one
+            # refuses a whole restore on a sidecar path it does not know, so the writer
+            # waits until every installation runs a kit that accepts it.
+            from guidance import validate_clear_record
+            validate_clear_record(record)
         if name=='.feedback.jsonl':
             from feedback import validate_feed_text
             if set(record) != {'text'}:raise ValueError('Invalid feedback backup')
@@ -1863,7 +1870,9 @@ def guidance_backup_pair(path):
     except ValueError as error:
         return {}, ('guidance is degraded: %s. The tracker backup is complete but carries no guidance pair; '
                     'ask the operator to repair it with `admin.py set-guidance PROJECT --actor OPERATOR '
-                    '--file FILE` (a set with the same text repairs it) and then take a fresh backup.'%(error,))
+                    '--file FILE` and then take a fresh backup. A set with the same text repairs a record that '
+                    'is missing, does not match or is not valid; a guidance file that cannot be read needs a '
+                    'set with clean text, which replaces it.'%(error,))
     return {'GUIDANCE.md': {'text': guidance_text}, GUIDANCE_META: guidance_meta}, None
 
 def backup_project(root,name):
@@ -2354,6 +2363,39 @@ def read_backup_status(root):
     validate_backup_status(record)
     return record
 
+def degraded_projects(root,record):
+    """``[(name, message)]``: the projects the last run recorded complete but degraded.
+
+    A degraded project has a restorable tracker backup that is missing something it
+    should carry (today: a GUIDANCE pair that was mismatched or unreadable when the
+    backup ran). It does not fail ``--require-complete`` or the daily timer; it is what
+    ``--require-clean`` refuses, and what the summary lines name, so it cannot be missed
+    (kittrial-5bb.105). A project retired since the run is left out, as in the gate.
+    """
+    retired={name for name,_ in retired_entries(root)}-set(initialized_projects(root))
+    return [(entry['name'],entry['degraded']) for entry in record['projects']
+            if entry.get('degraded') and entry['name'] not in retired]
+
+def restore_degraded_note(root,project,destination):
+    """The sentence ``restore-new`` prints when the last run recorded its source degraded.
+
+    Read from the run record itself, whether or not the source project still exists (a
+    restore is often of a project that is gone). None when the record is missing or
+    unreadable, or does not name the project degraded.
+    """
+    try:record=read_backup_status(root)
+    except (ValueError,OSError):return None
+    for entry in record['projects']:
+        if entry['name']==project and entry.get('degraded'):
+            return ('Note: the last backup run recorded %s degraded, so what it names was not in this backup and '
+                    'was not restored into %s: %s'%(project,destination,entry['degraded']))
+    return None
+
+def degraded_summary(degraded):
+    """'2 degraded (alpha, beta)', or '' when none."""
+    if not degraded:return ''
+    return '%d degraded (%s)'%(len(degraded),', '.join(name for name,_ in degraded))
+
 def require_complete_problems(root,record):
     """Why the last run does not cover every initialized project with a complete pair.
 
@@ -2450,7 +2492,7 @@ def _replace_with(staged,target):
             try:previous.unlink()
             except OSError:pass
 
-def backup_copy(root,destination):
+def backup_copy(root,destination,require_clean=False):
     """Reference off-machine copy of every project's last complete backup pair.
 
     The gate is exactly ``backup-status --require-complete``: every initialized project
@@ -2488,6 +2530,14 @@ def backup_copy(root,destination):
     if problems:
         raise SystemExit('backup-copy refused: not every initialized project has a complete backup pair '
                          'on disk: '+'; '.join(problems))
+    # A degraded project copies (its tracker backup is restorable), but never silently:
+    # each one is named with its message, and --require-clean refuses instead.
+    degraded=degraded_projects(root,record)
+    if degraded and require_clean:
+        raise SystemExit('backup-copy refused (--require-clean): %s. %s'%(
+            degraded_summary(degraded),' '.join('%s: %s'%item for item in degraded)))
+    for name,message in degraded:
+        print('Degraded, copied as it is: %s: %s'%(name,message))
     try:
         destination=copy_destination_path(destination)
     except ValueError as error:
@@ -2665,10 +2715,16 @@ def backup_projects(root,names,all_projects=False):
     for entry in results:
         if entry['status']!='complete':
             print('backup %s for %s: %s'%(entry['status'],entry['name'],entry['reason']),file=sys.stderr)
+    degraded=[(entry['name'],entry['degraded']) for entry in results if entry.get('degraded')]
     if len(targets)>1:
-        print('Backed up %d of %d project(s); %s is %s.'%(
-            len(targets)-len(incomplete),len(targets),root/'backups'/BACKUP_STATUS_NAME,
+        # The count of degraded projects is IN the summary line: a run that is complete
+        # and degraded used to read exactly like a clean one (kittrial-5bb.105).
+        print('Backed up %d of %d project(s)%s; %s is %s.'%(
+            len(targets)-len(incomplete),len(targets),
+            ', '+degraded_summary(degraded) if degraded else '',root/'backups'/BACKUP_STATUS_NAME,
             'complete' if not incomplete else 'incomplete'))
+    elif degraded:
+        print('Backup of %s is complete but degraded: %s'%degraded[0])
     if incomplete:
         raise SystemExit('backup incomplete for: '+' '.join(incomplete)+
                          ' (see %s)'%(root/'backups'/BACKUP_STATUS_NAME))
@@ -2860,6 +2916,9 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
         elif name=='.guidance.json':
             from guidance import validate_meta
             validate_meta(record)
+        elif name=='.guidance-clear.json':
+            from guidance import validate_clear_record
+            validate_clear_record(record)
     # The guidance text and its audit record are one generation: refuse to restore a
     # mismatched pair rather than installing text that cannot be attributed.
     if 'GUIDANCE.md' in files or '.guidance.json' in files:
@@ -3257,9 +3316,15 @@ def main():
     a.add_argument('--require-complete',action='store_true',dest='require_complete',
                    help='exit non-zero unless the last run covered every project (--all) and every initialized '
                         'project has a complete pair on disk')
+    a.add_argument('--require-clean',action='store_true',dest='require_clean',
+                   help='everything --require-complete checks, and also exit non-zero when any project is '
+                        'recorded degraded (complete, but missing something it should carry); for a release gate')
     a=sub.add_parser('backup-copy');a.add_argument('destination',metavar='DEST',
                    help='copy every project\'s last complete backup pair under this off-machine directory; '
                         'refuses unless backup-status --require-complete would pass')
+    a.add_argument('--require-clean',action='store_true',dest='require_clean',
+                   help='also refuse when any project is recorded degraded; without it a degraded project is '
+                        'copied and named')
     a=sub.add_parser('backup-repoint');a.add_argument('project')
     a=sub.add_parser('restore-new');a.add_argument('project');a.add_argument('destination')
     a.add_argument('--restore-operators',action='store_true',dest='restore_operators',
@@ -3334,6 +3399,9 @@ def main():
               %(outcome,result['version']))
         if result.get('repaired') and not result['changed']:
             print('The audit record was missing or did not match the text; it is now bound to the text you set.')
+        if result.get('replaced_unreadable'):
+            print('The guidance file that was on disk could not be read as guidance (a refused character, over the '
+                  'limit, or not UTF-8) and was replaced. Nothing of it was kept in the record.')
         print(json.dumps(result,sort_keys=True))
     elif args.command=='clear-guidance':
         import fcntl
@@ -3346,9 +3414,12 @@ def main():
             fcntl.flock(lock,fcntl.LOCK_EX)
             result=guidance_clear(path,args.actor)
         print('Project guidance cleared (%s); back up the project after changes. A small local record in %s keeps '
-              'who cleared it, when and the cleared version; the removed guidance record itself stays in the most '
-              'recent coordination backup, if one was taken.'
+              'who cleared it, when and the cleared version (guidance-status shows it; it is not in the backup); '
+              'the removed guidance record itself stays in the most recent coordination backup, if one was taken.'
               %(', '.join(result['removed']) or 'nothing was set',result.get('clear_record','the project directory')))
+        if result.get('invalid_record_kept_as'):
+            print('The clear record that was already there was not a valid record this kit wrote. It was kept as %s '
+                  'and a new record was started.'%result['invalid_record_kept_as'])
         print(json.dumps(result,sort_keys=True))
     elif args.command=='compact-guidance-acks':
         import fcntl
@@ -3727,7 +3798,7 @@ def main():
     elif args.command=='authorized-keys':
         authorized_keys(root,args.key_file,args.role,args.python,args.comment)
     elif args.command=='backup':backup_projects(root,args.projects,args.all_projects)
-    elif args.command=='backup-copy':backup_copy(root,args.destination)
+    elif args.command=='backup-copy':backup_copy(root,args.destination,require_clean=args.require_clean)
     elif args.command=='backup-repoint':print(json.dumps(repoint_backup(root,args.project),sort_keys=True))
     elif args.command=='retire-project':
         result=retire_project(root,args.project,args.actor,args.reason,force=args.force)
@@ -3742,11 +3813,20 @@ def main():
         # see them (the key appears only when there are any, the record is unchanged).
         retired=[entry for _,entry in retired_entries(root)]
         print(json.dumps(dict(record,retired=retired) if retired else record,sort_keys=True))
-        if args.require_complete:
+        degraded=degraded_projects(root,record)
+        if degraded:
+            # stdout stays one JSON document; the plain sentence goes to stderr.
+            print('backup-status: %s. %s'%(degraded_summary(degraded),' '.join('%s: %s'%item for item in degraded)),
+                  file=sys.stderr)
+        if args.require_complete or args.require_clean:
             problems=require_complete_problems(root,record)
             if problems:
                 raise SystemExit('backup-status: not every project has a complete backup pair on disk: '
                                  +'; '.join(problems))
+        if args.require_clean and degraded:
+            # The strict gate (for a release): complete is not enough, nothing may be degraded.
+            raise SystemExit('backup-status: every pair is complete, but %s; --require-clean refuses a degraded '
+                             'project. Repair it and take a fresh backup.'%degraded_summary(degraded))
     elif args.command=='journal':
         import fcntl
         from http_authority import OperationJournal, journal_path
@@ -3838,6 +3918,11 @@ def main():
             finally:
                 restoring.close()
         print('Restored only into the newly created project; retained original issue IDs. Never use this clone as a second live tracker.')
+        # A backup recorded degraded restores its tracker, and nothing says what is
+        # missing unless this does (kittrial-5bb.105). The run record is advisory here:
+        # an unreadable one must not fail a restore that has already succeeded.
+        noted=restore_degraded_note(root,args.project,args.destination)
+        if noted:print(noted)
 
 def finish_restore(root,args,snapshot):
     """What ``restore-new`` does after the native restore: re-point, sidecar, journals."""

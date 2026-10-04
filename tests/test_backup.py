@@ -305,6 +305,46 @@ class BackupTests(unittest.TestCase):
         self.assertIn('Restored only into the newly created project', out.getvalue())
         self.assertEqual(json.loads((self.destination / self.request_name).read_text()), self.receipt)
 
+    def restore_new_output(self):
+        argv = ['admin.py', '--root', str(self.root), 'restore-new', 'source', 'destination']
+        with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', return_value=self.root), \
+                patch.object(admin, 'add_project'), patch.object(admin, 'run_bd', return_value='restored'), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            admin.main()
+        return out.getvalue()
+
+    def test_restore_new_prints_what_a_degraded_backup_did_not_carry(self):
+        # kittrial-5bb.105 (review of f2d6050: the note had no test through the command).
+        (self.root / 'deployment.private.json').write_text(
+            json.dumps({'password': 'x', 'operators': ['operator']}), encoding='utf-8')
+        self.save_bundle()
+        stamp = admin.utc_stamp()
+        entry = {'name': 'source', 'status': 'complete', 'completed_at': stamp,
+                 'pair': {'native': 'backups/source', 'coordination': 'backups/source.coordination.json'}}
+        record = {'schema_version': 1, 'scope': 'all', 'generated_at': stamp, 'status': 'complete',
+                  'projects': [dict(entry, degraded='guidance is degraded: the pair was left out; repair it')]}
+        admin.write_backup_status(self.root, record)
+        output = self.restore_new_output()
+        self.assertIn('Restored only into the newly created project', output)
+        note = [line for line in output.splitlines() if line.startswith('Note: the last backup run recorded')]
+        self.assertEqual(len(note), 1, output)
+        self.assertIn('recorded source degraded', note[0])
+        self.assertIn('was not restored into destination: guidance is degraded: the pair was left out', note[0])
+
+    def test_restore_new_prints_no_degraded_note_for_a_clean_or_missing_run_record(self):
+        (self.root / 'deployment.private.json').write_text(
+            json.dumps({'password': 'x', 'operators': ['operator']}), encoding='utf-8')
+        self.save_bundle()
+        self.assertNotIn('degraded', self.restore_new_output())               # no run record at all
+        import shutil
+        shutil.rmtree(self.destination); self.destination.mkdir()
+        stamp = admin.utc_stamp()
+        admin.write_backup_status(self.root, {
+            'schema_version': 1, 'scope': 'all', 'generated_at': stamp, 'status': 'complete',
+            'projects': [{'name': 'source', 'status': 'complete', 'completed_at': stamp,
+                          'pair': {'native': 'backups/source', 'coordination': 'backups/source.coordination.json'}}]})
+        self.assertNotIn('degraded', self.restore_new_output())
+
     def test_restore_new_repoints_the_clone_at_its_own_native_backup_target(self):
         # kittrial-5bb.49: `bd backup restore` carries the SOURCE project's backup target
         # into the clone, so without re-pointing, `backup destination` syncs the clone into
