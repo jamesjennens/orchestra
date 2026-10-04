@@ -1470,7 +1470,7 @@ incorporation. Rejected and duplicate proposals are never selected.
   `review`, `handoff`. It is stable and is what dependencies reference.
 - **Comment ID**: `contribution_id`, `contribution.comment_id`, `latest_comment_id`,
   checkpoint `comment_id`. In a `contribute`/`request-changes`/`respond`/`approve`/
-  `withdraw`/`request-review`/`resolve-item`/`decline-review` payload, `contribution` is the
+  `withdraw`/`request-review`/`resolve-item`/`decline-review`/`recommend` payload, `contribution` is the
   **contribution record's comment ID** — never a Git SHA and never `latest_comment_id`.
 - **Git commit**: `contribution.commit` / `base_commit` are exact 40- or 64-character
   hexadecimal revisions. They are not comment IDs.

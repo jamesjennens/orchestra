@@ -185,7 +185,9 @@ export function createMock(options = {}) {
     if (tid) (db.history[tid] = db.history[tid] || []).unshift({ time: new Date().toISOString(), action, user_id: db.session, detail: detail || null });
   };
   const projectView = (p) => ({ ...p, role: me().superuser && !role(p.id) ? 'superuser' : role(p.id), members: Object.keys(db.memberships[p.id] || {}) });
-  const taskView = (t) => ({ ...t, assignee_name: t.assignee ? name(t.assignee) : null, next_action: nextAction(t) });
+  // A recommendation stands only while its revision awaits review (the real service's rule).
+  const advice = (t) => (t.recommendation && t.review_state === 'awaiting-review' && t.contribution && t.recommendation.commit === t.contribution.commit ? { ...t.recommendation, author_name: name(t.recommendation.author) } : null);
+  const taskView = (t) => ({ ...t, assignee_name: t.assignee ? name(t.assignee) : null, next_action: nextAction(t), recommended: !!advice(t), recommended_by: advice(t) ? [t.recommendation.author] : [] });
   const nextAction = (t) => {
     if (t.status === 'closed') return null;
     switch (t.review_state) {
@@ -362,7 +364,7 @@ export function createMock(options = {}) {
   on('GET', '/v1/projects/(?<pid>[\\w-]+)/tasks/(?<tid>[\\w-]+)', (b, p) => { const g = guardProject(p.pid); if (g) return g; const t = findTask(p.pid, p.tid); return t ? ok(taskView(t)) : err(404, 'not_found', 'Task not found'); });
   on('GET', '/v1/projects/(?<pid>[\\w-]+)/tasks/(?<tid>[\\w-]+)/brief', (b, p) => {
     const g = guardProject(p.pid); if (g) return g; const t = findTask(p.pid, p.tid); if (!t) return err(404, 'not_found', 'Task not found');
-    return ok({ task: taskView(t), checkpoint: t.checkpoint && { ...t.checkpoint, author_name: name(t.checkpoint.author) }, lifecycle: t.lifecycle, review: { state: t.review_state, contribution: contributionView(t), requests: t.requests, open_requests: openCount(t), latest_id: contributionId(t) }, depends_on: t.depends_on.map((id) => { const d = db.tasks.find((x) => x.id === id); return d ? { id, title: d.title, status: d.status } : { id, title: id, status: 'unknown' }; }) });
+    return ok({ task: taskView(t), checkpoint: t.checkpoint && { ...t.checkpoint, author_name: name(t.checkpoint.author) }, lifecycle: t.lifecycle, review: { state: t.review_state, contribution: contributionView(t), requests: t.requests, open_requests: openCount(t), latest_id: contributionId(t), recommendation: advice(t), recommendations: advice(t) ? [advice(t)].map((r) => ({ id: r.id, author: r.author, author_name: r.author_name, at: r.at })) : [] }, depends_on: t.depends_on.map((id) => { const d = db.tasks.find((x) => x.id === id); return d ? { id, title: d.title, status: d.status } : { id, title: id, status: 'unknown' }; }) });
   });
   on('PATCH', '/v1/projects/(?<pid>[\\w-]+)/tasks/(?<tid>[\\w-]+)', (b, p) => {
     const g = guardProject(p.pid); if (g) return g; const t = findTask(p.pid, p.tid); if (!t) return err(404, 'not_found', 'Task not found');
@@ -394,6 +396,16 @@ export function createMock(options = {}) {
       }
       t.version += 1; t.updated_at = new Date().toISOString(); log(p.pid, 'review-' + b.operation, t.id, b.summary);
       return ok(taskView(t), 201);
+    }
+    if (b.operation === 'recommend') {
+      if (!canWrite(p.pid)) return err(403, 'forbidden', 'You cannot review in this project');
+      if (!t.contribution || b.contribution !== contributionId(t) || b.commit !== t.contribution.commit || t.review_state !== 'awaiting-review') return err(409, 'conflict', 'This contribution changed or was already reviewed; reload to see the current revision');
+      if (t.assignee === db.session || t.contribution.author === db.session) return err(403, 'forbidden', 'Nobody recommends their own contribution');
+      if (b.verdict !== 'approve') return err(422, 'invalid_payload', 'verdict must be approve; a reviewer who wants changes requests changes');
+      if (!String(b.summary || '').trim() || String(b.summary).length > 1200) return err(422, 'invalid_payload', 'A recommendation summary must be 1-1200 characters');
+      t.recommendation = { id: 'rec' + (db.seq += 1), author: db.session, at: new Date().toISOString(), contribution: b.contribution, commit: b.commit, verdict: 'approve', summary: b.summary.trim(), items: (b.items || []).filter((x) => x && x.text) };
+      log(p.pid, 'recommend', t.id);
+      return ok({ recommendation: advice(t), task_version: t.version }, 201);
     }
     if (b.operation === 'contribute') {
       if (t.assignee !== db.session) return err(403, 'forbidden', 'Only the assignee can deliver a contribution');
@@ -433,6 +445,7 @@ export function createMock(options = {}) {
       if (t.assignee === db.session) mine.push(v);
       if (isOwner(t.project_id) && (role(t.project_id) === 'owner') && ['awaiting-review', 'approved'].includes(t.review_state)) toReview.push(v);
     }
+    toReview.sort((a, c) => Number(c.recommended) - Number(a.recommended));
     // The real service builds these prompts from the same data (agent_prompts.py); the
     // prototype only shows a sample so the buttons can be tried.
     const viewerOnly = Object.entries(db.memberships).every(([pid, m]) => !m[db.session] || m[db.session] === 'viewer');

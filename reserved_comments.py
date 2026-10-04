@@ -24,6 +24,7 @@ from lifecycle import PREFIX as LIFECYCLE_PREFIX
 from requirements import ACCEPTANCE_FIELDS, SHA256_TEXT
 from recovery import PREFIX as VOID_PREFIX
 from review_workflow import PREFIX as REVIEW_PREFIX, REVERT_PREFIX
+RECOMMENDATION_PREFIX = 'Kind: review-recommendation-v1\n'    # review_recommendations.PREFIX (imports this module's peers)
 from worker_gate import PREFIX as PLAN_PREFIX, parse_body as parse_plan_body
 
 
@@ -202,6 +203,7 @@ RESERVED = (
     (PLAN_PREFIX, 'worker plan registration', 'worker_gate.py register'),
     (VOID_PREFIX, 'operator void record', 'admin.py void-record on the coordination host'),
     (REVERT_PREFIX, 'integration revert record', 'admin.py revert-record on the coordination host'),
+    (RECOMMENDATION_PREFIX, 'review recommendation', 'review TASK --file payload.json (operation recommend)'),
     (REFERENCE_ENTRY_PREFIX, 'reference catalog entry', 'ref propose|revise'),
     (REFERENCE_ACCEPTANCE_PREFIX, 'reference acceptance evidence', 'admin.py reference-apply'),
     (PROPOSAL_PREFIX, 'requirement proposal', 'proposal submit|revise'),
@@ -228,6 +230,7 @@ _RECORD_KIND_RESERVATIONS = {
     'capability-acceptance': ('capability acceptance evidence', 'admin.py capability-apply'),
     'capability-verification': ('capability verification', 'capability check --record (capability verify)'),
     'capability-alias': ('capability alias', 'capability propose-alias|alias-reject'),
+    'review-recommendation': ('review recommendation', 'review TASK --file payload.json (operation recommend)'),
 }
 _RECORD_KIND_ANY_VERSION = re.compile(
     r'Kind: (%s)-v[0-9]+\n' % '|'.join(re.escape(kind) for kind in _RECORD_KIND_RESERVATIONS))

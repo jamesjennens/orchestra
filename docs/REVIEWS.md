@@ -329,6 +329,73 @@ Only the named reviewer may decline (normalised attribution key); anyone else is
 
 **Open requests are capped per requester.** One actor may hold at most **10 open review requests at a time, counted across every task in the project**: an 11th is refused before any write, naming the requester's current count and the cap. That is the abuse path where one actor put 25 tasks into another's `work --mine` queue in 71 seconds. The count reads every task's chain and ignores a chain it cannot parse, exactly as `work` treats an unreadable row; a declined, closed or otherwise settled request frees a slot.
 
+### A reviewer's recommendation
+
+A reviewer who finds nothing to change, and who may not approve (a reviewing agent never may), records a **recommendation**. It is advice to whoever approves. It is never an approval.
+
+```json
+{
+  "schema_version": 1,
+  "operation": "recommend",
+  "operation_id": "recommend-001",
+  "task": "example-task",
+  "contribution": "CURRENT_CONTRIBUTION_COMMENT_ID",
+  "commit": "THE_CONTRIBUTION_COMMIT",
+  "verdict": "approve",
+  "summary": "What was checked and what was not.",
+  "items": [{"id": "naming", "text": "An optional note for the approver."}]
+}
+```
+
+Sent with `review TASK --file payload.json`, like the other review operations. It takes no `previous`.
+
+**What it is.**
+
+* A record of its own kind (`Kind: review-recommendation-v1`), stored as a comment on the task **beside** the review chain. It is not a link in the chain.
+* It names the contribution's comment id and the contribution's commit. Both must be the task's current ones.
+* `verdict` is `approve` only. A reviewer who wants changes uses `request-changes`.
+* `summary` is 1 to 1200 characters. `items` is 0 to 20 notes, each with an `id` and a `text` of at most 1000 characters. The payload is at most 24 KB. `review --help` lists these.
+* Text with control or format characters (a bidi override, a zero-width character) is refused.
+
+**What it does not do.**
+
+* It does not change the review state, so the task stays `awaiting-review`.
+* It does not move `latest_comment_id`, so an owner's `approve` with the contribution as `previous` is not stale.
+* It does not make approval allowed and does not resolve or create an item. Nothing in the approval rules reads it.
+
+**Who may write one.** Anyone who may write on the task, except the contribution's author and the task's assignee (compared with the name rule of the follow-on gate, so an agent of the same owner under another session id is the same author). The rule is applied when it is written **and again every time it is read**.
+
+**Independence by person, over HTTP only.** The rule above compares actor names. A person and their agent have different names, so over SSH the kit cannot tell that a recommender is the owner of the agent that delivered the work. The web service knows who owns each agent, and it also refuses (403) a recommendation from:
+
+* the person who owns the agent that authored the contribution or is the task's assignee;
+* another agent owned by the same person as the author or the assignee.
+
+The web service applies the same rule when it reads: such a record is left out of the brief's `recommendations` and of a row's `recommended_by`. Two limits follow. If the newest standing recommendation is left out this way, the brief's `recommendation` is null even when an older one by an independent reviewer stands (that reviewer is still named in `recommendations`, and the text is in the task history). The queue compares with the task's assignee only, because its rows do not carry the contribution's author. `review`, `brief` and `work` over SSH show every recommendation that passes the name rule.
+
+**When it stands.** A recommendation is shown only while all of these hold:
+
+* the task is `awaiting-review` and not closed;
+* it names the current contribution and that contribution's commit;
+* it was written after the contribution;
+* no `approve` or `request-changes` on that contribution was written after it.
+
+A new revision, a decision or a withdrawal makes it lapse. The newest recommendation by one actor replaces that actor's earlier one.
+
+**Where it shows.**
+
+* `review TASK` and `brief TASK`: `recommendation` (the newest standing one, in full, or `null`), `recommendations` (each standing one's comment id, author and time, newest first, at most 20) and `recommended` (true or false).
+* `work`: each item carries `recommended` and `recommended_by`.
+* Over HTTP: the same operation on `POST /v1/projects/{id}/tasks/{task}/reviews` (the `reviews` capability; a viewer is refused). The task brief's `review` carries `recommendation` and `recommendations`; rows of `GET /v1/projects/{id}/queue` and of `/v1/me/work` carry `recommended` and `recommended_by`, and a recommended contribution comes first among those of its project that await review.
+* The web interface shows it on the task page above the owner's review form, and marks the row in the Reviews list. A member who can review but is not an owner gets a form to record one.
+
+**Compatibility.** No write switch. A kit that predates this ignores the record: its `review`, `brief`, `work` and `history` reads of a task that carries one are unchanged (`history` lists it as an ordinary comment). The older kit does not reserve the prefix, so on that kit anyone could post a raw comment that starts with it. This kit shows such a comment only if it is a fully valid record that passes every rule above, which is what this kit would have accepted.
+
+**Known limits.**
+
+* There is no operator command to void a recommendation. A wrong one lapses at the next decision or revision, and its author can replace it.
+* When an operator voids a decision (`admin.py void-record`), a recommendation written before that decision stays hidden, because the reader counts the voided decision's position. The reviewer records it again.
+* A recommendation is not a review request and does not close one.
+
 ### Staged rollout: writing the new shapes is opt-in
 
 kittrial-5bb.94's coordinator direction is a **two-step ship**, because every shape above is one an older kit fails closed on.

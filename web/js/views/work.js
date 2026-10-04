@@ -17,6 +17,7 @@ function workTable(ctx, rows, { showProject = true, emptyTitle, emptyBody }) {
         h('td', null, t.review_state && t.review_state !== 'none' ? reviewChip(t.review_state) : statusChip(t.status)),
         h('td', null, t.next_action ? t.next_action.text : h('span', { class: 'muted' }, '—'),
           t.blocked ? [' ', h('span', { class: 'chip crit', title: 'The latest checkpoint lists unresolved items' }, 'Blocked')] : null,
+          t.recommended ? [' ', h('span', { class: 'chip ok', title: 'A reviewer recommends approving this revision. An owner still decides.' }, 'Recommended')] : null,
           t.pending_request_ids && t.pending_request_ids.length ? h('div', { class: 'sub' }, 'Open requests: ', t.pending_request_ids.join(', ')) : null),
         // Canonical queue rows carry no update time; the review wait start is shown instead.
         h('td', { class: 'hide-narrow muted' }, t.updated_at ? time(t.updated_at) : t.waiting_since ? time(t.waiting_since) : ''));

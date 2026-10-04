@@ -143,7 +143,8 @@ export async function reviews(ctx, { pid }) {
         rows.length ? h('div', { class: 'table-wrap' }, h('table', null,
           h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Task'), h('th', { scope: 'col' }, 'Contribution'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Open requests'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Waiting since'))),
           h('tbody', null, rows.map((t) => h('tr', { class: 'row-link', onclick: (e) => { if (e.target.tagName !== 'A') ctx.go(`/p/${pid}/t/${t.id}`); } },
-            h('td', null, h('a', { class: 'title', href: ctx.href(`/p/${pid}/t/${t.id}`) }, t.title), h('div', { class: 'sub' }, t.assignee_name || 'Unassigned')),
+            h('td', null, h('a', { class: 'title', href: ctx.href(`/p/${pid}/t/${t.id}`) }, t.title), h('div', { class: 'sub' }, t.assignee_name || 'Unassigned'),
+              t.recommended ? h('span', { class: 'chip ok', title: 'A reviewer recommends approving this revision. An owner still decides.' }, 'Recommended') : null),
             h('td', null, t.contribution ? [t.contribution.revision ? h('span', null, 'Revision ', t.contribution.revision, ' · ') : null, h('code', null, shortSha(t.contribution.commit))] : '—'),
             h('td', { class: 'hide-narrow num' }, String(openRequests(t))),
             h('td', { class: 'hide-narrow muted' }, (t.contribution && t.contribution.at) || t.updated_at ? time((t.contribution && t.contribution.at) || t.updated_at) : '')))))) :

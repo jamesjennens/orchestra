@@ -6,7 +6,7 @@ const ACTIONS = {
   'task-created': ['Created the task', ''], 'task-claimed': ['Claimed the task', 'accent'], 'task-updated': ['Edited the task', ''],
   'contribution': ['Delivered a contribution', 'accent'], 'change-requested': ['Requested a change', 'warn'], 'change-resolved': ['Change resolved', 'ok'],
   'review-approve': ['Approved', 'ok'], 'review-request-changes': ['Requested changes', 'warn'],
-  'approve': ['Approved', 'ok'], 'request-changes': ['Requested changes', 'warn'], 'respond': ['Responded to review', ''],
+  'approve': ['Approved', 'ok'], 'request-changes': ['Requested changes', 'warn'], 'respond': ['Responded to review', ''], 'recommend': ['Recommended approval', ''],
   'checkpoint-added': ['Recorded a checkpoint', ''], 'checkpoint': ['Recorded a checkpoint', ''], 'comment': ['Commented', ''],
 };
 
@@ -101,7 +101,11 @@ export async function detail(ctx, { pid, tid }) {
       `Revision ${c.revision} arrived, but ${carried.length} requested change(s) from an earlier revision are still open. `,
       `Each stays open until ${t.assignee_name || 'the assignee'} responds to it.`));
   }
+  // A reviewer's recommendation is advice to the owner; it never changes the review state.
+  const advice = review.state === 'awaiting-review' ? review.recommendation : null;
+  if (advice) reviewBody.append(recommendationNote(review, advice));
   if (owner && c && review.state === 'awaiting-review' && !project.archived) reviewBody.append(reviewActions(ctx, pid, tid, c, review));
+  if (!owner && writer && !mine && c && c.author !== ctx.me.id && review.state === 'awaiting-review') reviewBody.append(recommendForm(ctx, pid, tid, c));
   if (responder) reviewBody.append(respondForm(ctx, pid, tid, c, review, openRequests, carried.length > 0));
   if (mine && writer && ['none', 'changes-requested'].includes(review.state) && t.status !== 'closed') reviewBody.append(deliverForm(ctx, pid, tid, c, openRequests.length, review, carried.length > 0));
   const reviewPanel = h('section', { class: 'panel', 'aria-labelledby': 'review-h' },
@@ -221,6 +225,50 @@ function reviewActions(ctx, pid, tid, contribution, review) {
     if (!items.length) return setFieldError(form, 'r-items', 'Describe at least one change, or use Approve.');
     setFieldError(form, 'r-items', '');
     await submit(form.querySelector('button[name=request]'), { operation: 'request-changes', ...target, items: items.map((text, i) => ({ id: 'item-' + (i + 1), text })) }, 'Changes requested');
+  });
+  return form;
+}
+
+// What a reviewer recommended for the current revision. Shown as advice: the owner's
+// decision is still to make, and the page says so.
+function recommendationNote(review, advice) {
+  const others = (review.recommendations || []).filter((r) => r.id !== advice.id).map((r) => r.author_name || r.author);
+  // One child, so the banner's row layout does not split the sentence into columns.
+  return h('div', { class: 'banner', role: 'note', id: 'recommendation' }, h('div', null,
+    h('p', null, h('strong', null, 'Recommended for approval'), ' by ', advice.author_name || advice.author, ' ', time(advice.at),
+      ' for commit ', h('code', { title: advice.commit }, shortSha(advice.commit)), '. An owner still decides.'),
+    h('p', { class: 'prose' }, advice.summary),
+    advice.items && advice.items.length ? h('ul', null, advice.items.map((item) => h('li', null, item.text))) : null,
+    others.length ? h('p', { class: 'small muted' }, 'Also recommended by ', others.join(', '), '.') : null));
+}
+
+// A member who can review but cannot approve records a recommendation for the owner.
+// It names the contribution and commit on the page, so a newer revision is refused (409).
+function recommendForm(ctx, pid, tid, contribution) {
+  const status = h('div', { class: 'banner crit', role: 'alert', hidden: true });
+  const form = h('form', { class: 'form', novalidate: true },
+    h('h3', { class: 'small' }, `Recommend revision ${contribution.revision} for approval`),
+    status,
+    field({ id: 'rec-summary', label: 'What you checked', type: 'textarea', rows: 3, required: true, maxlength: 1200, hint: 'The owner reads this before deciding. Say what you checked and what you did not.' }),
+    field({ id: 'rec-items', label: 'Notes for the owner', type: 'textarea', rows: 3, hint: 'Optional. One note per line. To ask for changes, an owner requests them.' }),
+    h('div', null, h('button', { type: 'submit', class: 'primary' }, 'Recommend approval')));
+  form.addEventListener('input', () => ctx.setDirty(true));
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const values = formValues(form);
+    const summary = values['rec-summary'].trim();
+    if (!summary) return setFieldError(form, 'rec-summary', 'Say what you checked.');
+    setFieldError(form, 'rec-summary', '');
+    const items = values['rec-items'].split('\n').map((s) => s.trim()).filter(Boolean).map((text, i) => ({ id: 'note-' + (i + 1), text }));
+    const body = { operation: 'recommend', contribution: contribution.id, commit: contribution.commit, verdict: 'approve', summary, items };
+    try {
+      await act(form.querySelector('button[type=submit]'), () => ctx.api.review(pid, tid, body), { success: 'Recommendation recorded', onError: (error) => {
+        if (error.status !== 409) return false;
+        status.replaceChildren('A newer revision arrived or the contribution was already reviewed. ', h('button', { type: 'button', class: 'link', onclick: () => { ctx.setDirty(false); ctx.render(); } }, 'Reload to see it'), '.');
+        status.hidden = false; return true;
+      } });
+    } catch { return; }
+    if (status.hidden) { ctx.setDirty(false); ctx.render(); }
   });
   return form;
 }

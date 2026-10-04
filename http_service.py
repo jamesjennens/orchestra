@@ -546,10 +546,12 @@ class InProcessBackend:
     def _review_add(self, principal, project_id, payload):
         task = self._task(project_id, payload.get('task_id'))
         operation = payload.get('operation')
-        if operation not in ('contribute', 'request-changes', 'respond', 'approve'):
-            raise invalid('Review operation must be contribute, request-changes, respond '
-                          'or approve')
+        if operation not in ('contribute', 'request-changes', 'respond', 'approve', 'recommend'):
+            raise invalid('Review operation must be contribute, request-changes, respond, '
+                          'approve or recommend')
         contributions = self.state.setdefault('contributions', {}).setdefault(task['id'], [])
+        if operation == 'recommend':
+            return self._recommend(principal, project_id, task, contributions, payload)
         if operation == 'contribute':
             commit = payload.get('commit')
             base_commit = payload.get('base_commit')
@@ -637,6 +639,84 @@ class InProcessBackend:
         task['version'] += 1
         self._event(project_id, task['id'], operation, principal, record['actor'])
         return {'review': record, 'task_version': task['version']}
+
+    def _recommend(self, principal, project_id, task, records, payload):
+        """A reviewer's recommendation (kittrial-5bb.115), with the canonical rules.
+
+        Kept in its own list, beside the review records, so it never becomes the
+        chain's latest record and never changes the review state. The same rules as
+        ``review_recommendations.execute``: the current contribution and its commit,
+        only while it awaits review, never by its author or the task's assignee.
+        """
+        import review_recommendations as rec
+        from review_workflow import author_key, plain_text
+        current = [r for r in records if r['kind'] == 'contribution']
+        if not current:
+            raise conflict('There is no contribution to recommend')
+        contribution = current[-1]
+        if payload.get('contribution') != contribution['id']:
+            raise conflict('That is not the task\'s current contribution; reread the task before recommending',
+                           {'current_contribution': contribution['id']})
+        if payload.get('commit') != contribution['commit']:
+            raise conflict('That is not the current contribution\'s commit; reread the task before recommending')
+        if (task.get('review_state') or 'none') != 'awaiting-review' or task.get('status') == 'closed':
+            raise conflict('A recommendation is accepted only while the contribution awaits review')
+        if payload.get('verdict') not in rec.VERDICTS:
+            raise invalid('verdict must be approve; a reviewer who wants changes requests changes')
+        summary = payload.get('summary')
+        if not isinstance(summary, str) or not summary.strip() or len(summary) > rec.SUMMARY_MAX:
+            raise invalid('A recommendation summary must be 1-%d characters' % rec.SUMMARY_MAX)
+        raw = payload.get('items')
+        if raw is not None and not isinstance(raw, list):
+            raise invalid('Recommendation items must be a list')
+        items = self._review_items(raw)
+        try:
+            plain_text(summary, 'summary')
+            for item in items:
+                plain_text(item['text'], 'note text')
+        except ValueError as error:
+            raise invalid(str(error))
+        actor = payload.get('actor') or principal.actor
+        if author_key(actor) in (author_key(contribution['actor']), author_key(task.get('assignee'))):
+            raise forbidden('Nobody recommends their own contribution')
+        record = {'id': 'rec_' + secrets.token_hex(6), 'task_id': task['id'], 'kind': 'recommendation',
+                  'contribution_id': contribution['id'], 'commit': contribution['commit'],
+                  'verdict': payload['verdict'], 'summary': summary.strip(), 'items': items, 'actor': actor,
+                  'created_at': now_iso(self.service._now()),
+                  # Its place among the review records, so a later decision makes it lapse.
+                  'after': len(records)}
+        self.state.setdefault('recommendations', {}).setdefault(task['id'], []).append(record)
+        self._event(project_id, task['id'], 'recommend', principal, actor)
+        return {'recommendation': self._recommendation_view(record), 'task_version': task['version']}
+
+    @staticmethod
+    def _recommendation_view(record):
+        return {'id': record['id'], 'author': record['actor'], 'at': record['created_at'],
+                'contribution': record['contribution_id'], 'commit': record['commit'],
+                'verdict': record['verdict'], 'summary': record['summary'],
+                'items': [dict(item) for item in record['items']]}
+
+    def _standing_recommendations(self, task, records):
+        """The recommendations that stand for the task's current contribution, newest first."""
+        from review_workflow import author_key
+        current = [r for r in records if r['kind'] == 'contribution']
+        if not current or (task.get('review_state') or 'none') != 'awaiting-review' \
+                or task.get('status') == 'closed':
+            return []
+        contribution = current[-1]
+        decided = max([position for position, record in enumerate(records)
+                       if record['kind'] in ('request-changes', 'approve')
+                       and record.get('contribution_id') == contribution['id']] or [-1])
+        excluded = {author_key(contribution['actor']), author_key(task.get('assignee'))}
+        newest = {}
+        for record in self.state.get('recommendations', {}).get(task['id']) or []:
+            if record['contribution_id'] != contribution['id'] or record['after'] <= decided:
+                continue
+            if author_key(record['actor']) in excluded:
+                continue
+            newest[author_key(record['actor'])] = record
+        ordered = sorted(newest.values(), key=lambda record: (record['after'], record['created_at']), reverse=True)
+        return [self._recommendation_view(record) for record in ordered[:20]]
 
     @staticmethod
     def _requests(records, open_only=False):
@@ -799,7 +879,11 @@ class InProcessBackend:
                             'commit': current['commit'], 'base_commit': current['base_commit'],
                             'branch': current.get('branch'), 'summary': current['summary'],
                             'author': current['actor'], 'at': current['created_at']}
+        standing = self._standing_recommendations(task, records)
         return {'state': task.get('review_state') or 'none', 'contribution': contribution,
+                # Additive (kittrial-5bb.115): advice to approve the current contribution.
+                'recommendation': standing[0] if standing else None,
+                'recommendations': [{'id': r['id'], 'author': r['author'], 'at': r['at']} for r in standing],
                 'requests': requests,
                 'open_requests': sum(1 for r in requests if r['status'] == 'open'),
                 'latest_id': records[-1]['id'] if records else None,
@@ -880,7 +964,8 @@ class InProcessBackend:
                 project_id, task, review['state'], review['contribution'],
                 review['open_requests'],
                 pending_request_ids=[r['id'] for r in review['requests'] if r['status'] == 'open'],
-                waiting_since=review['latest_at']))
+                waiting_since=review['latest_at'],
+                recommended_by=[r['author'] for r in review['recommendations']]))
         items.sort(key=queue_order)
         return {'items': items, 'complete': True, 'warnings': []}
 
@@ -894,12 +979,14 @@ QUEUE_PRIORITY = {'changes-requested': 0, 'error': 1, 'awaiting-review': 2,
 
 
 def queue_order(item):
-    return (QUEUE_PRIORITY.get(item['review_state'], 4), str(item['id']))
+    # Among contributions that await review, one a reviewer recommends approving comes
+    # first: it is the one an owner can act on at once (kittrial-5bb.115).
+    return (QUEUE_PRIORITY.get(item['review_state'], 4), 0 if item.get('recommended') else 1, str(item['id']))
 
 
 def queue_item(project_id, task, review_state, contribution, open_requests,
                pending_request_ids=None, waiting_since=None, integration=None,
-               integration_warnings=None, attention=None):
+               integration_warnings=None, attention=None, recommended_by=None):
     """One review-queue row, in the shape both backends return.
 
     ``pending_request_ids`` and ``waiting_since`` (time of the latest review record)
@@ -925,7 +1012,11 @@ def queue_item(project_id, task, review_state, contribution, open_requests,
             # What agent attention needs from the canonical ``work`` row (kittrial-5bb.114):
             # the request-changes record ids, and the latest checkpoint's open items,
             # time and whether anything is newer. None where the backend does not say.
-            'attention': attention}
+            'attention': attention,
+            # Additive (kittrial-5bb.115): reviewers who recommend approving the current
+            # contribution while nobody has decided. Never an approval.
+            'recommended': bool(recommended_by),
+            'recommended_by': list(recommended_by or [])}
 
 
 class EndpointBackend:
@@ -1168,7 +1259,12 @@ class EndpointBackend:
         'request-changes': ('contribution', 'items'),
         'respond': ('contribution', 'resolutions'),
         'approve': ('contribution', 'summary'),
+        # A reviewer's recommendation (kittrial-5bb.115): a record beside the chain, so
+        # it carries no `previous` (see REVIEW_NO_PREVIOUS).
+        'recommend': ('contribution', 'commit', 'verdict', 'summary', 'items'),
     }
+    #: Operations whose canonical record takes no ``previous``.
+    REVIEW_NO_PREVIOUS = ('recommend',)
     #: Optional canonical review fields: forwarded only when the caller supplied them,
     #: so old payloads keep the exact legacy field set (no operation-inappropriate
     #: nulls) and a follow-on's additive ``follows`` relation is not silently dropped
@@ -1244,8 +1340,12 @@ class EndpointBackend:
             operation = payload.get('operation')
             if operation not in self.REVIEW_FIELDS:
                 raise invalid('Review operation must be contribute, request-changes, '
-                              'respond or approve')
-            fields = self.REVIEW_COMMON + self.REVIEW_FIELDS[operation]
+                              'respond, approve or recommend')
+            common = tuple(field for field in self.REVIEW_COMMON
+                           if not (field == 'previous' and operation in self.REVIEW_NO_PREVIOUS))
+            if operation == 'recommend' and 'items' not in payload:
+                payload = dict(payload, items=[])
+            fields = common + self.REVIEW_FIELDS[operation]
             missing = [field for field in fields
                        if field not in payload and not
                        (field == 'operation_id' and operation_id)]
@@ -1556,6 +1656,12 @@ class EndpointBackend:
                            'contribution': contribution, 'requests': requests,
                            'open_requests': review.get('pending_total', len(requests)),
                            'latest_id': review.get('latest_comment_id'),
+                           # Additive (kittrial-5bb.115): the standing recommendation.
+                           'recommendation': self._recommendation(review.get('recommendation')),
+                           'recommendations': [{'id': entry.get('comment_id'), 'author': entry.get('author'),
+                                                'at': entry.get('timestamp')}
+                                               for entry in review.get('recommendations') or []
+                                               if isinstance(entry, dict)],
                            'revisions': priors + 1 if contribution else 0,
                            'warnings': review.get('warnings') or [],
                            # Additive (kittrial-5bb.52): the machine-readable
@@ -1567,6 +1673,16 @@ class EndpointBackend:
                                 'status': 'unknown', 'type': d.get('type')}
                                for d in dependencies if isinstance(d, dict)],
                 'warnings': data.get('warnings') or []}
+
+    @staticmethod
+    def _recommendation(value):
+        """The canonical recommendation view in the shape the in-process backend returns."""
+        if not isinstance(value, dict):
+            return None
+        return {'id': value.get('comment_id'), 'author': value.get('author'), 'at': value.get('timestamp'),
+                'contribution': value.get('contribution'), 'commit': value.get('commit'),
+                'verdict': value.get('verdict'), 'summary': value.get('summary'),
+                'items': [dict(item) for item in value.get('items') or [] if isinstance(item, dict)]}
 
     #: ``GET /v1/me/work`` may reuse one principal's queue read of a project for this
     #: long, so a burst of page loads does not re-export every project each time.
@@ -1705,7 +1821,9 @@ class EndpointBackend:
                                         contribution, row.get('pending_review_items') or 0,
                                         integration=row.get('integration'),
                                         integration_warnings=row_warnings,
-                                        attention=self._attention_fields(row)))
+                                        attention=self._attention_fields(row),
+                                        recommended_by=[name for name in row.get('recommended_by') or []
+                                                        if isinstance(name, str)]))
             offset = page.get('next_offset')
             if offset is None:
                 complete = True
@@ -2219,6 +2337,35 @@ class ApiHandler(BaseHTTPRequestHandler):
         names = self.service.actor_names([t.get('assignee') for t in tasks])
         return [self._task_view(t, names) for t in tasks]
 
+    #: Said when a recommendation is refused because it is not independent of the author.
+    NOT_INDEPENDENT = ('A recommendation must be independent of the author: the contribution\'s author, the '
+                       'task\'s assignee, the person who owns the agent that delivered it, and that person\'s '
+                       'other agents cannot recommend it')
+
+    def _independent(self, actors, parties):
+        """The ``actors`` who are a different PERSON from every one of ``parties``.
+
+        The canonical rule compares actor names, and a person and their agents are
+        different names. The web service knows who owns each agent, so here a person,
+        their agent, and two agents of one person are all the same party
+        (kittrial-5bb.115).
+        """
+        persons = {self.service.actor_person(party) for party in parties if isinstance(party, str) and party}
+        return [actor for actor in actors
+                if isinstance(actor, str) and self.service.actor_person(actor) not in persons]
+
+    def _independent_queue(self, read):
+        """Drop from each row's ``recommended_by`` anyone who is the assignee's person."""
+        changed = False
+        for item in read.get('items') or []:
+            names = item.get('recommended_by') or []
+            kept = self._independent(names, [item.get('assignee')]) if names else names
+            if len(kept) != len(names):
+                item['recommended_by'], item['recommended'], changed = kept, bool(kept), True
+        if changed:
+            read['items'].sort(key=queue_order)
+        return read
+
     def _review_queue(self, project_id, shared=False):
         """One review-queue read of a project per request (and, when ``shared`` and the
         backend allows it, reused for ``READ_CACHE_SECONDS`` by the same principal).
@@ -2226,7 +2373,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         Authorization is never cached: callers re-check live authority first.
         """
         return self._cached_read('queue', project_id,
-                                 lambda: self.backend.review_queue(project_id), shared)
+                                 lambda: self._independent_queue(self.backend.review_queue(project_id)), shared)
 
     def _cached_read(self, kind, project_id, load, shared=False):
         """One canonical read per request, optionally reused across requests.
@@ -3553,6 +3700,19 @@ class ApiHandler(BaseHTTPRequestHandler):
         actors += [checkpoint.get('author')] if checkpoint else []
         actors += [contribution.get('author')] if contribution else []
         actors += [r.get('author') for r in review.get('requests') or []]
+        # Only a recommendation by a different person from the author and the assignee is
+        # shown (see _independent). The canonical read gives the newest one in full; when
+        # that one is dropped here the full text of an older one is not available, so the
+        # list still names who else recommends and `recommendation` is null.
+        parties = [brief['task'].get('assignee'), (contribution or {}).get('author')]
+        standing = review.get('recommendations') or []
+        kept = set(self._independent([entry.get('author') for entry in standing], parties))
+        review['recommendations'] = [entry for entry in standing if entry.get('author') in kept]
+        if review.get('recommendation') and review['recommendation'].get('author') not in kept:
+            review['recommendation'] = None
+        advice = [review.get('recommendation')] if review.get('recommendation') else []
+        advice += review.get('recommendations') or []
+        actors += [entry.get('author') for entry in advice]
         names = self.service.actor_names(actors)
         task = dict(brief['task'], review_state=review.get('state') or 'none')
         brief['task'] = self._task_view(task, names)
@@ -3562,6 +3722,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             contribution['author_name'] = names.get(contribution.get('author'))
         for request in review.get('requests') or []:
             request['author_name'] = names.get(request.get('author'))
+        for entry in advice:
+            entry['author_name'] = names.get(entry.get('author'))
         base = '/v1/projects/%s/tasks/%s' % (pid, tid)
         brief['links'] = {'task': base, 'history': base + '/history',
                           'reviews': base + '/reviews', 'checkpoints': base + '/checkpoints'}
@@ -3622,6 +3784,16 @@ class ApiHandler(BaseHTTPRequestHandler):
             payload['actor'] = self.service.bind_actor(ctx.principal, payload.get('actor'))
 
         def add():
+            if payload.get('operation') == 'recommend':
+                # Independence by PERSON, which only the web service can know; the
+                # canonical write then applies the name rule and every other rule.
+                current = self.backend.task_brief(ctx.params['pid'], ctx.params['tid'])
+                parties = [(current.get('task') or {}).get('assignee'),
+                           ((current.get('review') or {}).get('contribution') or {}).get('author')]
+                actor = payload.get('actor') or ctx.principal.actor or ctx.principal.user_id
+                if not self._independent([actor], parties) or \
+                        not self._independent([ctx.principal.user_id], parties):
+                    raise forbidden(self.NOT_INDEPENDENT)
             if payload.get('operation') == 'respond':
                 # Only the task's assignee (the contributor of the current revision)
                 # may respond to requested changes. Both backends enforce it at the
