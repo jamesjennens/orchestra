@@ -546,7 +546,10 @@ class SyncClientHandleCase(RuntimeCase):
         with self.assertRaises(admin.TerminatedBySignal):
             with admin.signal_termination_guard():
                 with admin.sigterm_blocked():
-                    os.kill(os.getpid(), signal.SIGTERM)
+                    # Directed at this thread, so it stays pending until the window closes,
+                    # whichever thread the process signal would otherwise reach and
+                    # whenever the interpreter then runs the handler (kittrial-5bb.122).
+                    signal.pthread_kill(threading.main_thread().ident, signal.SIGTERM)
                     self.assertIn(signal.SIGTERM,
                                   signal.pthread_sigmask(signal.SIG_BLOCK, set()))
         self.assertIs(signal.getsignal(signal.SIGTERM), previous)
@@ -565,7 +568,407 @@ class SyncClientHandleCase(RuntimeCase):
                     marks.append(signal.getsignal(signal.SIGTERM))
                     os.kill(os.getpid(), signal.SIGTERM)
                     marks.append('survived')
-        self.assertEqual(marks, [signal.SIG_IGN, 'survived'])
+        # The handler stays installed and ignores the second stop itself (kittrial-5bb.122
+        # review: it no longer switches to SIG_IGN, which a stop in the guard's exit could
+        # leave behind); the guard puts the previous handler back.
+        self.assertEqual(marks, [admin.raise_termination, 'survived'])
+
+
+
+@unittest.skipUnless(hasattr(signal, 'pthread_sigmask') and hasattr(signal, 'pthread_kill'),
+                     'POSIX signal masks are required')
+class TerminationGuardExitCase(unittest.TestCase):
+    """A stop delivered at each point of signal_termination_guard's exit (kittrial-5bb.122).
+
+    Python runs a caught signal's handler at a later bytecode boundary, and
+    `signal.signal` runs pending handlers before it swaps. So a stop can reach
+    `raise_termination` while the guard is restoring the previous handler; it used to
+    set SIG_IGN there and raise, and nothing restored the handler again (seen once in CI:
+    "SIG_IGN is not SIG_DFL"). Each point is driven two ways: `handler`, the interpreter
+    running the pending handler right there, and `kernel`, a real SIGTERM directed at this
+    thread. Whatever the point, the stop must be raised as TerminatedBySignal or reach the
+    previous handler, exactly once, and the previous handler and mask must be back.
+    """
+    POINTS = ('end-of-block', 'after-block', 'in-restore', 'after-restore', 'after-unmask')
+    STYLES = ('handler', 'kernel')
+
+    def setUp(self):
+        self.received = []
+        self.previous = lambda signum, frame: self.received.append(signum)
+        old = signal.signal(signal.SIGTERM, self.previous)
+        self.addCleanup(signal.signal, signal.SIGTERM, old)
+        self.mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        self.addCleanup(signal.pthread_sigmask, signal.SIG_SETMASK, self.mask)
+
+    def deliver(self, style, frame):
+        """`handler`: what the interpreter does with a pending stop at this boundary - call
+        the installed handler with the running frame. `kernel`: a real SIGTERM."""
+        if style == 'kernel':
+            signal.pthread_kill(threading.main_thread().ident, signal.SIGTERM)
+            return
+        handler = signal.getsignal(signal.SIGTERM)
+        # CPython drops a pending signal whose handler is no longer callable.
+        self.assertTrue(callable(handler) or handler == signal.SIG_IGN, handler)
+        if callable(handler):
+            handler(signal.SIGTERM, frame)
+
+    def exit_with_stop(self, point, style, stopped_first=False):
+        """Run the guard, delivering one stop at `point` of its exit. Returns the exception."""
+        real_mask, real_signal = signal.pthread_sigmask, signal.signal
+        fired = []
+
+        def fire(at):
+            if at == point and not fired:
+                fired.append(at)
+                self.deliver(style, sys._getframe(2))   # the frame that made the call
+
+        def mask(how, signals):
+            old = real_mask(how, signals)
+            if how == signal.SIG_BLOCK and set(signals) == {signal.SIGTERM}:
+                fire('after-block')
+            if how == signal.SIG_SETMASK:
+                fire('after-unmask')
+            return old
+
+        def swap(signum, handler):
+            restoring = handler is not admin.raise_termination and handler != signal.SIG_IGN
+            if restoring:
+                fire('in-restore')
+            old = real_signal(signum, handler)
+            if restoring:
+                fire('after-restore')
+            return old
+
+        caught = None
+        try:
+            with patch.object(signal, 'pthread_sigmask', mask), patch.object(signal, 'signal', swap):
+                with admin.signal_termination_guard():
+                    try:
+                        if stopped_first:
+                            self.deliver('handler', sys._getframe())
+                    finally:
+                        if point == 'end-of-block' and not fired:
+                            fired.append(point)
+                            self.deliver(style, sys._getframe())
+        except admin.TerminatedBySignal as error:
+            caught = error
+        for _ in range(3):
+            pass   # bytecode boundaries: a stop now pending at the previous handler runs here
+        self.assertEqual(fired, [point])
+        self.assertIs(signal.getsignal(signal.SIGTERM), self.previous)
+        self.assertEqual(signal.pthread_sigmask(signal.SIG_BLOCK, set()), self.mask)
+        return caught
+
+    # Who owns a stop: one the guard can see before it hands the signal back is raised
+    # as TerminatedBySignal, so the cleanup runs (in production the previous handler is
+    # usually SIG_DFL, which would kill the process with no cleanup). Only a stop that
+    # is handled after the previous handler is installed and unmasked - or that the
+    # interpreter runs once the previous handler is back - belongs to that handler.
+    PREVIOUS_OWNS = {('after-restore', 'handler'), ('after-unmask', 'handler'), ('after-unmask', 'kernel')}
+
+    def test_every_exit_point_restores_the_handler_and_keeps_the_stop(self):
+        for point in self.POINTS:
+            for style in self.STYLES:
+                with self.subTest(point=point, style=style):
+                    del self.received[:]
+                    caught = self.exit_with_stop(point, style)
+                    self.assertEqual((caught is not None) + len(self.received), 1,
+                                     'the stop was dropped or delivered twice')
+                    self.assertEqual(caught is None, (point, style) in self.PREVIOUS_OWNS)
+
+    def test_a_stop_during_the_exit_cannot_interrupt_the_cleanup_of_an_earlier_one(self):
+        for point in self.POINTS:
+            for style in self.STYLES:
+                with self.subTest(point=point, style=style):
+                    del self.received[:]
+                    caught = self.exit_with_stop(point, style, stopped_first=True)
+                    self.assertIsNotNone(caught)
+                    self.assertIsNone(caught.__context__, 'a second stop interrupted the first')
+
+    def test_a_stop_already_pending_when_the_first_one_raised_is_ignored(self):
+        # The first stop sets SIG_IGN, but a second one the interpreter had already caught
+        # still runs the handler; it must not raise inside the cleanup the first started.
+        cleanup = []
+        with self.assertRaises(admin.TerminatedBySignal) as raised:
+            with admin.signal_termination_guard():
+                try:
+                    admin.raise_termination(signal.SIGTERM, sys._getframe())
+                finally:
+                    admin.raise_termination(signal.SIGTERM, sys._getframe())
+                    cleanup.append('ran')
+        self.assertEqual(cleanup, ['ran'])
+        self.assertIsNone(raised.exception.__context__)
+        self.assertIs(signal.getsignal(signal.SIGTERM), self.previous)
+
+    def test_a_stop_during_the_exit_after_an_error_is_raised_not_dropped(self):
+        real_signal = signal.signal
+
+        def swap(signum, handler):
+            if handler is self.previous:
+                # the pending handler runs here, in the guard's frame
+                admin.raise_termination(signal.SIGTERM, sys._getframe(1))
+            return real_signal(signum, handler)
+
+        with self.assertRaises(admin.TerminatedBySignal) as raised:
+            with patch.object(signal, 'signal', swap):
+                with admin.signal_termination_guard():
+                    raise ValueError('the block failed')
+        self.assertIsInstance(raised.exception.__context__, ValueError)
+        self.assertIs(signal.getsignal(signal.SIGTERM), self.previous)
+
+
+@unittest.skipUnless(hasattr(signal, 'pthread_sigmask') and hasattr(signal, 'pthread_kill'),
+                     'POSIX signal masks are required')
+class TerminationGuardRealSignalCase(unittest.TestCase):
+    """Real SIGTERMs, nothing patched (kittrial-5bb.122 review).
+
+    `signal.signal` and `signal.pthread_sigmask` are Python functions in Lib/signal.py, so
+    while the guard is inside them the frame Python hands the handler is theirs, not the
+    guard's. The earlier tests called the handler with the guard's own frame and patched
+    those functions, and missed it: a stop there set SIG_IGN and escaped the restore.
+    Here a profile hook only chooses the moment; the signal is a real one sent to this
+    thread, and the interpreter runs the handler wherever it next checks.
+    """
+
+    def setUp(self):
+        self.received = []
+        self.previous = lambda signum, frame: self.received.append(signum)
+        old = signal.signal(signal.SIGTERM, self.previous)
+        self.addCleanup(signal.signal, signal.SIGTERM, old)
+        self.mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        self.addCleanup(signal.pthread_sigmask, signal.SIG_SETMASK, self.mask)
+        self.addCleanup(sys.setprofile, None)
+
+    @staticmethod
+    def in_guard(frame):
+        while frame is not None:
+            if frame.f_code in admin._GUARD_CODES:
+                return True
+            frame = frame.f_back
+        return False
+
+    def wrapper_calls(self, action, at=None, guard_filter=None):
+        """Profile calls into Lib/signal.py made from the guard's own code; send a real
+        SIGTERM at the call numbered `at`. Returns how many such calls there were."""
+        seen = []
+
+        def profile(frame, event, arg):
+            if (event == 'call' and frame.f_code.co_filename == signal.__file__ and self.in_guard(frame.f_back)
+                    and (guard_filter is None or guard_filter(frame))):
+                if len(seen) == at:
+                    signal.pthread_kill(threading.main_thread().ident, signal.SIGTERM)
+                seen.append(frame.f_code.co_name)
+
+        sys.setprofile(profile)
+        try:
+            return action(), seen
+        finally:
+            sys.setprofile(None)
+
+    def settle(self):
+        for _ in range(3):
+            pass
+        sum(range(10))   # a call: a stop now pending at the previous handler runs here
+
+    def assert_restored(self):
+        self.assertIs(signal.getsignal(signal.SIGTERM), self.previous)
+        self.assertEqual(signal.pthread_sigmask(signal.SIG_BLOCK, set()), self.mask)
+        self.assertEqual(admin._termination_guards, [])
+
+    def guarded(self):
+        try:
+            with admin.signal_termination_guard():
+                sum(range(10))
+        except admin.TerminatedBySignal:
+            return 'raised'
+        return 'completed'
+
+    def test_a_real_stop_inside_the_signal_wrappers_is_raised_or_reaches_the_previous_handler(self):
+        _, calls = self.wrapper_calls(self.guarded)
+        # setup: getsignal, signal; exit: pthread_sigmask (read), pthread_sigmask (block),
+        # signal, sigtimedwait or sigpending, pthread_sigmask (restore)
+        self.assertGreaterEqual(len(calls), 6, calls)
+        self.assertIn('pthread_sigmask', calls)
+        for index, name in enumerate(calls):
+            with self.subTest(call=index, wrapper=name):
+                del self.received[:]
+                outcome, _ = self.wrapper_calls(self.guarded, at=index)
+                self.settle()
+                self.assert_restored()
+                self.assertEqual((outcome == 'raised') + len(self.received), 1,
+                                 'the stop was dropped or delivered twice: %s, %r' % (outcome, self.received))
+
+    def test_a_stop_recorded_during_setup_is_raised_before_the_block(self):
+        ran = []
+
+        def profile(frame, event, arg):
+            # What the interpreter does with a stop caught as the install returns: run the
+            # handler with the frame then executing, the wrapper's (whose caller is the guard).
+            if (event == 'return' and frame.f_code.co_name == 'signal' and frame.f_code.co_filename == signal.__file__
+                    and arg is not admin.raise_termination and self.in_guard(frame.f_back)
+                    and signal.getsignal(signal.SIGTERM) is admin.raise_termination):
+                sys.setprofile(None)
+                admin.raise_termination(signal.SIGTERM, frame)
+
+        sys.setprofile(profile)
+        with self.assertRaises(admin.TerminatedBySignal):
+            with admin.signal_termination_guard():
+                ran.append('block')
+        sys.setprofile(None)
+        self.assertEqual(ran, [])
+        self.assert_restored()
+        self.assertEqual(self.received, [])
+
+    def test_nested_guards_raise_at_the_inner_exit_and_protect_the_outer_cleanup(self):
+        # restore-new wraps native_restore: a stop taken at the INNER guard's exit is raised
+        # there, and a second stop must not interrupt the outer block's cleanup.
+        for index in range(4):
+            with self.subTest(call=index):
+                del self.received[:]
+                trace = []
+                inner = admin.signal_termination_guard()
+
+                def run():
+                    try:
+                        with admin.signal_termination_guard():
+                            try:
+                                with inner:
+                                    trace.append('inner block')
+                                trace.append('after inner')
+                            finally:
+                                os.kill(os.getpid(), signal.SIGTERM)    # a second stop
+                                sum(range(10))
+                                trace.append('outer cleanup')
+                    except admin.TerminatedBySignal as error:
+                        return error
+                    return None
+
+                error, calls = self.wrapper_calls(
+                    run, at=index, guard_filter=lambda frame: self.in_inner_exit(frame, inner))
+                self.settle()
+                self.assertGreater(len(calls), index)
+                self.assertIsNotNone(error)
+                self.assertIsNone(error.__context__, 'a second stop interrupted the cleanup')
+                self.assertEqual(trace, ['inner block', 'outer cleanup'])
+                self.assert_restored()
+                self.assertEqual(self.received, [])
+
+    def test_a_stop_in_the_inner_block_protects_the_outer_cleanup(self):
+        # The first stop lands in the INNER block: every guard is marked stopped, so a
+        # second stop in the outer block's cleanup, after the inner guard is gone, is
+        # ignored too.
+        trace = []
+        with self.assertRaises(admin.TerminatedBySignal) as raised:
+            with admin.signal_termination_guard():
+                try:
+                    with admin.signal_termination_guard():
+                        os.kill(os.getpid(), signal.SIGTERM)
+                        sum(range(10))
+                        trace.append('inner block went on')
+                finally:
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    sum(range(10))
+                    trace.append('outer cleanup')
+        self.assertIsNone(raised.exception.__context__)
+        self.assertEqual(trace, ['outer cleanup'])
+        self.settle()
+        self.assert_restored()
+        self.assertEqual(self.received, [])
+
+    def test_a_stop_run_as_the_inner_guard_unmasks_cannot_leave_the_mask_held(self):
+        # The inner guard stays listed until its mask is back: a handler the interpreter
+        # runs inside that last pthread_sigmask call (a stop another thread caught while
+        # this one was masked) is recorded on the inner guard, not raised before the
+        # restore. The handler is run here as the interpreter would, with the wrapper's frame.
+        inner = admin.signal_termination_guard()
+
+        def profile(frame, event, arg):
+            if (event == 'call' and frame.f_code.co_name == 'pthread_sigmask'
+                    and frame.f_code.co_filename == signal.__file__ and self.in_inner_exit(frame, inner)
+                    and frame.f_locals.get('how') == signal.SIG_SETMASK):
+                sys.setprofile(None)
+                admin.raise_termination(signal.SIGTERM, frame)
+
+        with self.assertRaises(admin.TerminatedBySignal):
+            with admin.signal_termination_guard():
+                sys.setprofile(profile)
+                with inner:
+                    pass
+        sys.setprofile(None)
+        self.settle()
+        self.assert_restored()
+        self.assertEqual(self.received, [])
+
+    @staticmethod
+    def in_inner_exit(frame, inner):
+        while frame is not None:
+            if frame.f_code is admin.signal_termination_guard._release.__code__:
+                return frame.f_locals.get('self') is inner
+            frame = frame.f_back
+        return False
+
+    def test_an_abandoned_guard_hands_a_recorded_stop_to_the_previous_handler(self):
+        # A generator suspended inside the block is closed (here explicitly, as the
+        # collector would): the stop recorded during that exit cannot be raised into the
+        # closer, so it must reach the previous handler rather than be lost.
+        def suspended():
+            with admin.signal_termination_guard():
+                yield 'inside'
+
+        generator = suspended()
+        self.assertEqual(next(generator), 'inside')
+        unraisable = []
+        old_hook = sys.unraisablehook
+        sys.unraisablehook = unraisable.append
+        try:
+            _, calls = self.wrapper_calls(generator.close, at=1)
+        finally:
+            sys.unraisablehook = old_hook
+        self.settle()
+        self.assertTrue(calls)
+        self.assertEqual(unraisable, [])
+        self.assertEqual(self.received, [signal.SIGTERM])
+        self.assert_restored()
+
+
+@unittest.skipUnless(sys.platform.startswith('linux'), 'timer_create and real signal timing are Linux-only')
+class TerminationGuardStressCase(unittest.TestCase):
+    """Real SIGTERMs from a kernel timer at random delays around a guarded block's end,
+    in child processes, for each kind of previous handler (kittrial-5bb.122 review).
+    Bounded to about a second per handler; tests/sigterm_stress_child.py runs longer."""
+    CHILD = Path(__file__).resolve().parent / 'sigterm_stress_child.py'
+    REPO = str(Path(__file__).resolve().parent.parent)
+
+    def run_child(self, previous, seconds):
+        return subprocess.run([sys.executable, str(self.CHILD), self.REPO, previous, str(seconds)],
+                              capture_output=True, text=True, timeout=60)
+
+    def test_custom_and_ignored_previous_handlers(self):
+        for previous in ('custom', 'ignore'):
+            with self.subTest(previous=previous):
+                result = self.run_child(previous, 1)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                counts = json.loads(result.stdout.splitlines()[-1])
+                # A late timer (a VM can fire one milliseconds late) lengthens each trial;
+                # the child adapts the block so stops land on both sides of its end.
+                self.assertGreater(counts['trials'], 20)
+                self.assertGreater(counts['raised'], 0)
+                self.assertGreater(counts['trials'] - counts['raised'], 0)
+
+    def test_default_previous_handler(self):
+        # A stop the previous SIG_DFL owns ends the child with SIGTERM: allowed. Any wrong
+        # state after a trial makes the child exit 1 instead.
+        deadline, trials, ended = time.monotonic() + 1.5, 0, 0
+        while time.monotonic() < deadline:
+            result = self.run_child('default', 0.5)
+            trials += result.stderr.count('t\n')
+            if result.returncode == -signal.SIGTERM:
+                ended += 1
+                continue
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        # About half the stops belong to SIG_DFL and end the child, so process start-up
+        # bounds the count; each ended child is one trial too.
+        self.assertGreater(trials + ended, 8)
 
 
 class LastCompletePairCase(RuntimeCase):
