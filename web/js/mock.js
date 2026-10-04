@@ -537,7 +537,9 @@ export function createMock(options = {}) {
       if (cacheKey && result.status < 400) db.results[cacheKey] = result;
       return JSON.parse(JSON.stringify(result));
     }
-    return err(404, 'not_found', 'No such route');
+    // The server's own words for a route it does not have: the screens tell "this server
+    // has no such feature" from "not found" by this sentence.
+    return err(404, 'not_found', 'No such operation');
   };
 }
 

@@ -251,7 +251,7 @@ The routes exist on the endpoint backend; the in-process backend answers 501.
 | Route | Who | What |
 | --- | --- | --- |
 | `POST /v1/projects/{id}/proposals` | `proposals.write`: contributors, owners, and an agent credential with the `proposals` scope | submit; with `key` in the body, revise your own proposal. Send an `Idempotency-Key` (or an `operation_id`): the proposal key derives from it |
-| `GET /v1/projects/{id}/proposals` | any member | the queue: `state`, `target`, `order` (`oldest`, the default, or `newest`), `mine=1` (only the caller's own account), `limit`, `cursor`. `total` is the count for the filter, not for the page. Also `can_propose` and `can_triage` for the caller |
+| `GET /v1/projects/{id}/proposals` | any member | the queue: `state`, `target`, `order` (`oldest`, the default, or `newest`), `mine=1` (only the caller's own **verified** proposals, the rule of `/v1/me/contributions`: one that merely names the account is not counted), `limit`, `cursor`. `total` is the count for the filter, not for the page. Also `can_propose` and `can_triage` for the caller |
 | `GET /v1/projects/{id}/proposals/{key}` | any member | the newest revision, the disposition timeline (`history` 1..50), the derived links, and `deciders` (the configured owner deciders) |
 | `POST /v1/projects/{id}/proposals/{key}/dispositions` | `reviews.approve`: owners, in a signed-in session | triage (`operation: "review"`, the default) or the owner decision (`"decide"`), with `previous` and `proposal_sha256` from the detail read |
 | `GET /v1/me/contributions` | a signed-in session | your own **verified** proposals across your projects, newest first, `limit` per page with a `cursor` (`next_cursor`); it pages through the newest 100 and stops there: the last page has `truncated: true` and no `next_cursor`, and older proposals are read per project from the queue. A cursor the route did not issue is refused with 409. A proposal that only names your account, or whose later revision someone else wrote, is not listed |
@@ -388,11 +388,15 @@ The rules:
   stays. Pressing the same button again with nothing changed sends the same request
   under the same `Idempotency-Key`, so it cannot create a duplicate; changing the
   content makes it a new request. This holds for every form in the web interface, not
-  only these.
-- "Who decides" on an escalation offers the configured owner deciders that are web
-  accounts in the project. A decider configured as a `person:` identity cannot be chosen
-  from the web; the form says so, and an operator escalates with the host command. With
-  no deciders configured, the project's other owners are offered.
+  only these. The key is kept in the page, so the protection ends with a reload: the
+  message says to stay on the page, and to check whether the change was saved before
+  sending it again after a reload.
+- "Who decides" on an escalation offers the configured owner deciders who are owners of
+  the project (only an owner can record the decision on the web), except the member who
+  escalates. The form names the configured deciders it does not offer and why: not an
+  owner here, not a web account in the project (a `person:` identity), or the escalator.
+  When none can be offered, an operator escalates with the host command. With no
+  deciders configured, the project's other owners are offered.
 - A `person:` submitter is shown as "a named person, not a web account".
 
 Not built yet:

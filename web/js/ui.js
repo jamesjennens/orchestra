@@ -77,10 +77,14 @@ function reason(error, fallback) {
   return /^Canonical command rejected the request$/.test(message) ? detail : message + ': ' + detail;
 }
 
+// What to do after an uncertain outcome. The protection lives in this page (api.js keeps
+// the request's Idempotency-Key in memory), so it ends with a reload, and the message says so.
+const RETRY = 'Stay on this page and press the same button again without changing anything: the same request is sent again, so it cannot create a duplicate. Do not reload first; after a reload the next press is a new request, so check whether it was saved before sending it again.';
+
 export function describe(error) {
   if (!error) return 'Something went wrong.';
   switch (error.status) {
-    case 0: return 'The server could not be reached. Your change may not have been saved. Press the same button again without changing anything: the same request is sent again, so it cannot create a duplicate.';
+    case 0: return 'The server could not be reached. Your change may not have been saved. ' + RETRY;
     case 401: return 'Your session has ended. Sign in again to continue.';
     case 403: return error.message || 'You do not have permission to do that.';
     case 404: return 'This item does not exist, or you do not have access to it.';
@@ -89,7 +93,7 @@ export function describe(error) {
     case 422: return reason(error, 'Some details are not valid.');
     case 429: return 'Too many attempts. Wait a few minutes and try again.';
     case 501: return 'This server does not support that yet.';
-    default: return error.status >= 500 ? 'The server could not confirm whether this was saved. Press the same button again without changing anything: the same request is sent again, so it cannot create a duplicate.' : (error.message || 'Request failed.');
+    default: return error.status >= 500 ? 'The server could not confirm whether this was saved. ' + RETRY : (error.message || 'Request failed.');
   }
 }
 
