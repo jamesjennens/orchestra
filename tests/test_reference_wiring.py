@@ -198,6 +198,37 @@ class OperatorCommandTests(unittest.TestCase):
         view = rr.get(rr.read_rows(self.native), 'calendar.trading', [OPERATOR])
         self.assertEqual((view['state'], view['acceptance']['operator']), ('accepted', OPERATOR))
 
+    def test_reference_apply_with_items_is_a_batch_and_takes_the_lock_per_item(self):
+        # kittrial-5bb.98: one decision, several reviewed drafts, one of them attested.
+        self.native.seed('decision-42', issue_type='decision', status='closed')
+        self.native.actor = 'alice'
+        rr.apply_native(entry(operation_id='attested', key='office.server.check', authority={
+            'type': 'attestation', 'basis': 'host-check', 'by': 'person:james', 'observed': '2026-09-20',
+            'how': 'check script run on the office server'}), 'alice', self.native, self.project)
+        single = self.accept_payload()
+        items = [{'key': key, 'revision': 1,
+                  'record_sha256': rr.existing_revisions(rr.anchor_for(rr.read_key_rows(self.native, key), key)[0])[1]['sha256']}
+                 for key in ('calendar.trading', 'office.server.check')]
+        items.append({'key': 'calendar.missing', 'revision': 1, 'record_sha256': 'f' * 64})
+        batch = {'schema_version': 1, 'operation_id': 'batch-1', 'items': items, 'acceptance_state': 'accepted',
+                 'acceptance': single['acceptance']}
+        with self.assertRaisesRegex(ValueError, 'not a server-side configured operator'):
+            self.apply(batch, actor='rogue')
+        flock = sys.modules['fcntl'].flock
+        flock.reset_mock()
+        result = self.apply(batch)
+        self.assertEqual([(item['key'], item['result']) for item in result['items']],
+                         [('calendar.trading', 'accepted'), ('office.server.check', 'accepted'),
+                          ('calendar.missing', 'refused')])
+        self.assertIn('Unknown reference key', result['items'][2]['reason'])
+        self.assertTrue(result['complete'])
+        # The batch receipt, three items, the batch receipt again: five separate holds.
+        self.assertEqual(flock.call_count, 5)
+        for key in ('calendar.trading', 'office.server.check'):
+            view = rr.get(rr.read_key_rows(self.native, key), key, [OPERATOR])
+            self.assertEqual((view['state'], view['acceptance']['operator']), ('accepted', OPERATOR))
+        self.assertEqual(self.apply(batch)['items'][0]['result'], 'already-accepted')
+
     def test_reference_and_record_reconcile_dispatch_to_the_kind(self):
         self.native.create_outcome = 'not-written'
         self.native.actor = 'alice'
@@ -277,6 +308,13 @@ class HttpReferenceRouteTests(EndpointCase if EndpointCase else unittest.TestCas
         self.assertEqual(200, listed.status, listed.data)
         self.assertEqual([(i['key'], i['state'], i['due']) for i in listed.data['items']],
                          [('calendar.trading', 'accepted', 'ok')])
+        # kittrial-5bb.98: every listed entry says what kind of authority it carries, and
+        # the list filters on it.
+        self.assertEqual([(i['authority_kind'], i['authority_accepted']) for i in listed.data['items']],
+                         [('repository', True)])
+        for kind, total in (('repository', 1), ('attested', 0)):
+            filtered = self.request('GET', '/v1/projects/%s/references?authority=%s' % (project, kind), token=alex)
+            self.assertEqual((200, total), (filtered.status, filtered.data['total']), filtered.data)
         self.assertIsNone(listed.data['next_cursor'])
         got = self.request('GET', '/v1/projects/%s/references/calendar.trading' % project, token=alex)
         self.assertEqual(200, got.status, got.data)
@@ -292,7 +330,8 @@ class HttpReferenceRouteTests(EndpointCase if EndpointCase else unittest.TestCas
     def test_a_bad_filter_is_a_422_before_any_canonical_read(self):
         alex, project = self.setup_project()
         self.backend.actions = []
-        for query in ('state=open', 'due=soon', 'owner=session-4e40fde3', 'tag=Bad%20Tag', 'limit=0'):
+        for query in ('state=open', 'due=soon', 'owner=session-4e40fde3', 'tag=Bad%20Tag', 'limit=0',
+                      'authority=attestation'):
             with self.subTest(query=query):
                 bad = self.request('GET', '/v1/projects/%s/references?%s' % (project, query), token=alex)
                 self.assertEqual(422, bad.status, bad.data)

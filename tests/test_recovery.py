@@ -394,7 +394,7 @@ class ReviewRecoveryTests(unittest.TestCase):
         # reserves; the proposal kinds (kittrial-5bb.68) are not void targets yet.
         import reserved_comments as r
         self.assertEqual(recovery.KEYED_KIND_PREFIXES, {
-            'reference-entry': r.REFERENCE_ENTRY_PREFIX, 'reference-acceptance': r.REFERENCE_ACCEPTANCE_PREFIX,
+            'reference-entry': (r.REFERENCE_ENTRY_PREFIX, r.REFERENCE_ENTRY_V2_PREFIX), 'reference-acceptance': r.REFERENCE_ACCEPTANCE_PREFIX,
             'capability-entry': r.CAPABILITY_ENTRY_PREFIX,
             'capability-acceptance': r.CAPABILITY_ACCEPTANCE_PREFIX,
             'capability-verification': r.CAPABILITY_VERIFICATION_PREFIX,

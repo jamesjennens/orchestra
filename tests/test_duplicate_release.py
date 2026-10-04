@@ -148,7 +148,7 @@ class ReadableRecordRuleTests(ReleaseCase):
             family = module.KIND.family
             extras = (('a CRLF lookalike', module.ENTRY_PREFIX.replace('\n', '\r\n') + '{}', 'malformed'),
                       ('a malformed acceptance', module.KIND.acceptance_prefix + '{broken', 'malformed'),
-                      ('a -v2 record', 'Kind: %sentry-v2\n{}' % family, 'unsupported'),
+                      ('a -v3 record', 'Kind: %sentry-v3\n{}' % family, 'unsupported'),
                       ('an unknown kind of the family', 'Kind: %sfuture-v1\n{}' % family, 'unsupported'))
             for label, text, state in extras:
                 with self.subTest(kind=module.TYPE_LABEL, extra=label):
@@ -389,7 +389,7 @@ class DuplicateReleaseTests(ReleaseCase):
             real, forged = anchor(module, 'z-real'), anchor(module, 'a-forged', state='draft')
             inert = evidence_by(module, anchor(module, 'b-inert'), 'former-operator')
             newer = anchor(module, 'c-newer', state='draft')
-            newer['comments'].append({'id': 'v2', 'text': 'Kind: %sentry-v2\n{}' % module.KIND.family,
+            newer['comments'].append({'id': 'v3', 'text': 'Kind: %sentry-v3\n{}' % module.KIND.family,
                                       'author': 'alice'})
             two_keys = anchor(module, 'd-two', state='draft')
             two_keys['labels'].append(module.key_label('other.fact'))

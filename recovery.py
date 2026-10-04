@@ -59,7 +59,9 @@ REVIEW_KIND_PREFIXES = {'contribution-review': 'Kind: contribution-review-v1\n',
 # (`reference-`, `capability-`) it starts with. The prefixes are repeated rather
 # than imported because reserved_comments imports this module; test_recovery pins
 # them to reserved_comments.
-KEYED_KIND_PREFIXES = {'reference-entry': 'Kind: reference-entry-v1\n',
+# `reference-entry` has two versions this kit reads (v2: an attestation authority,
+# kittrial-5bb.98); a void names the kind, and the target's bytes say which version.
+KEYED_KIND_PREFIXES = {'reference-entry': ('Kind: reference-entry-v1\n', 'Kind: reference-entry-v2\n'),
                        'reference-acceptance': 'Kind: reference-acceptance-v1\n',
                        'capability-entry': 'Kind: capability-entry-v1\n',
                        'capability-acceptance': 'Kind: capability-acceptance-v1\n',
@@ -162,13 +164,14 @@ def validate(p, task):
 
 
 def claims_kind(raw, kind):
-    """True when the target's bytes claim the v1 record `kind`.
+    """True when the target's bytes claim the record `kind` in a version this kit reads
+    (v1, and v2 of `reference-entry`).
 
     A keyed kind is matched through the reserved-prefix view its readers use
     (`reserved_comments`: one leading BOM dropped, CRLF folded), so a lookalike that
     reads as a malformed record of that kind can be voided (kittrial-5bb.74 review). A
     review kind keeps the exact prefix: its reader does not read a lookalike as a
-    record at all. An unknown or newer version (`-v2`) never matches.
+    record at all. An unknown or newer version never matches.
     """
     prefix = KIND_PREFIXES[kind]
     if raw.startswith(prefix):

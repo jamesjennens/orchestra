@@ -959,12 +959,17 @@ never read more than they need:
 - **`ref get KEY`** returns these fields:
   - `key`, `state` and `native_id`.
   - `record`: the newest accepted revision. Its `title` and `statement` are excerpt
-    objects.
+    objects. It carries `authority` and `authority_kind` (`repository`, `url` or
+    `attested`), and for an attested entry `authority_note`, a sentence saying who
+    attested it, when, on what basis, and that it cannot be checked against a
+    repository.
   - `record_comment_id`.
   - `acceptance`: the F3 decision. Its `operator` is the allowlisted actor taken from
     the evidence comment's **native author**.
   - `acceptance_inert` and `inert_operator`.
-  - `proposed`: the newest draft after `record`, with `proposed_comment_id`.
+  - `proposed`: the newest draft after `record`, with `proposed_comment_id`. It has
+    the same fields as `record`. The `authority_note` of a proposed attestation
+    starts `NOT ACCEPTED.`: a draft attestation is a lead, never authority.
   - `due`: `ok`, `due-soon`, `expired` or `unset`.
   - `replaces` (`[]` in slice 1) and `resolved` (`null`).
   - `warnings`, `trust` and `coverage`.
@@ -977,13 +982,15 @@ never read more than they need:
   unambiguous key, or every anchor row for a conflicted key (see duplicate rules above).
   - Rows are ordered expired, due-soon, unset, then ok, and by key within each.
   - Each row has `key`, `title` (at most 200 characters), `state`, `owner`,
-    `review_by`, `proposed_review_by`, `due`, `tags`, `revision`, `native_id` and
-    `acceptance_inert`.
+    `review_by`, `proposed_review_by`, `due`, `tags`, `revision`, `native_id`,
+    `acceptance_inert`, `authority_kind` and `authority_accepted` (whether the row
+    shows the accepted record). A row that shows an attestation also has
+    `authority_note`, which starts `NOT ACCEPTED.` when it is a draft.
   - Options: `--tag` (repeatable; all tags must match), `--owner IDENTITY`,
     `--state draft-only|accepted|superseded|all`, `--due expired|due-soon|unset`,
-    `--limit` and `--offset`.
+    `--authority repository|url|attested`, `--limit` and `--offset`.
 - **Failures stay per entry.** A malformed entry, an unsupported newer record kind
-  (`Kind: reference-entry-v2`), or an anchor left without its record by an interrupted
+  (`Kind: reference-entry-v3`), or an anchor left without its record by an interrupted
   propose fails only itself.
   - `coverage` names such entries, with at most 10 anchor ids.
   - A read never fails the whole catalog.
@@ -1016,13 +1023,40 @@ sets `operation`.
   - `title`: at most 200 characters.
   - `statement`: at most 2,000 characters. It is untrusted text, and it never
     appears in an error.
-  - `authority`: a `repo-path` (a relative path with no `..`, an optional 40-hex
-    `commit` and an optional `anchor`) or a `url` (`https` only, no userinfo, with a
-    `retrieved` date no later than today).
+  - `authority`: one of three types.
+    - `repo-path`: a relative path with no `..`, an optional 40-hex `commit` and an
+      optional `anchor`.
+    - `url`: `https` only, no userinfo, with a `retrieved` date no later than today.
+    - `attestation`: for an operational fact that no file or page states (which host
+      runs what, what the owner said). See below.
   - `owner`: `account:<uid>` or `person:<name>`. A session actor is refused.
   - `review_by`: a real date at most 24 months ahead.
   - `tags`: at most 12 lowercase slugs.
   - `decisions`: each must be an issue of type `decision` or labelled `decision`.
+- **An attestation** says who observed or stated the fact, and how:
+
+  ```json
+  {"type": "attestation", "basis": "host-check", "by": "person:example", "observed": "2026-10-03",
+   "how": "example-check.sh run on the office server; output read",
+   "source": "handover notes, 2026-10-03 entry"}
+  ```
+
+  - `basis`: `host-check` (someone looked at a live system) or `owner-statement` (the
+    owner said so). Nothing else: a rule somebody set for themselves belongs in a
+    decision issue or a repository document.
+  - `by`: `account:<uid>` or `person:<name>`, never a session actor.
+  - `observed`: the date it was observed or said, no later than today.
+  - `how`: one line, at most 300 characters. For a host check, the command and the
+    host; for an owner statement, where and when it was said.
+  - `source`: optional, one line, at most 300 characters: where it is written down. The
+    kit does not resolve it.
+  - `review_by`, when set, is at most 6 months after `observed`.
+  - Any contributor may propose or revise an attested draft. Only the operator accepts
+    it, and more is asked of the operator than for a repository entry
+    ([operations](OPERATIONS.md#attested-reference-entries)).
+  - An attested revision is stored as `Kind: reference-entry-v2`; every other revision
+    stays `reference-entry-v1`. A kit older than this one does not serve an entry that
+    holds a v2 revision ([operations](OPERATIONS.md#attested-reference-entries)).
 - **Caller-written fields are refused.** `acceptance_state`, `successor`, `sha256`,
   `acceptance` and `labels` are written by the operation.
 - **`propose`** creates the entry's native anchor, closes it and posts revision 1 as a
@@ -1044,7 +1078,8 @@ sets `operation`.
     operator releases the anchor (`admin.py anchor-release`).
 
 Acceptance is not a client command. It is the operator's
-`admin.py reference-apply` ([operations](OPERATIONS.md#operator-commands)).
+`admin.py reference-apply` ([operations](OPERATIONS.md#operator-commands)), for one
+entry or for a batch of them.
 
 ## `proposal`: contributed requirement proposals
 

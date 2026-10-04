@@ -1251,7 +1251,7 @@ class EndpointBackend:
         args = ['list', '--limit', str(options['limit']), '--offset', str(options['offset'])]
         for tag in options.get('tags') or []:
             args += ['--tag', caller_arg(tag, 'tag')]
-        for name in ('owner', 'state', 'due'):
+        for name in ('owner', 'state', 'due', 'authority'):
             if options.get(name):
                 args += ['--' + name, caller_arg(options[name], name)]
         return self._ref_read(project_id, args)
@@ -3005,8 +3005,8 @@ class ApiHandler(BaseHTTPRequestHandler):
     def references_list(self, ctx):
         """The reference catalog (.41 slice 1), read-only at CAP_READ.
 
-        Query: `tag` (comma-separated, all must match), `owner`, `state`, `due`, `limit`
-        and the page `cursor`. Statements are untrusted text: they are returned as data
+        Query: `tag` (comma-separated, all must match), `owner`, `state`, `due`,
+        `authority` (repository, url or attested), `limit` and the page `cursor`. Statements are untrusted text: they are returned as data
         and never placed in an error body or an audit record.
         """
         self._project(ctx, CAP_READ)
@@ -3014,7 +3014,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         args = ['--limit', str(limit), '--offset', str(state['o'])]
         for tag in [t for t in (ctx.query.get('tag') or '').split(',') if t]:
             args += ['--tag', tag]
-        for name in ('owner', 'state', 'due'):
+        for name in ('owner', 'state', 'due', 'authority'):
             if ctx.query.get(name):
                 args += ['--' + name, ctx.query[name]]
         import reference_records

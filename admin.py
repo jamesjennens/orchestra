@@ -3066,7 +3066,7 @@ def main():
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('capability-misses-clear',help='delete a project\'s capability lookup-miss log (telemetry; not backed up)')
     a.add_argument('project')
-    a=sub.add_parser('reference-apply',help='accept a reference catalog entry (operator allowlist, F3 evidence)')
+    a=sub.add_parser('reference-apply',help='accept a reference catalog entry, or a batch of them with items (operator allowlist, F3 evidence)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('proposal-review',help='record a coordinator disposition on a requirement proposal (operator allowlist)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
@@ -3259,17 +3259,28 @@ def main():
             print(json.dumps(reconcile(path,args.operation_id,args.actor,args.reason,
                                        args.disposition,run,issue_id=args.issue_id)))
     elif args.command=='reference-apply':
+        import contextlib
         import fcntl
-        from reference_records import apply_native as reference_apply
+        import reference_records
         path=project_dir(root,args.project)
         if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
         payload=read_json_file(args.file,'Payload file',encoding='utf-8-sig')
-        if isinstance(payload,dict):payload.setdefault('operation','accept')
         authority=operators(root,strict=True)
         def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
-        with (path/'.coordination.lock').open('a') as lock:
-            fcntl.flock(lock,fcntl.LOCK_EX)
-            print(json.dumps(reference_apply(payload,args.actor,run,path,operator=True,operators=authority)))
+        @contextlib.contextmanager
+        def held():
+            # One hold of the project's coordination lock; closing the file releases it.
+            with (path/'.coordination.lock').open('a') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX)
+                yield
+        if isinstance(payload,dict) and 'items' in payload:
+            # A batch (kittrial-5bb.98) takes the lock once per item and releases it between
+            # items, exactly as capability-apply does.
+            print(json.dumps(reference_records.apply_batch(payload,args.actor,run,path,operators=authority,lock=held)))
+        else:
+            if isinstance(payload,dict):payload.setdefault('operation','accept')
+            with held():
+                print(json.dumps(reference_records.apply_native(payload,args.actor,run,path,operator=True,operators=authority)))
     elif args.command in ('capability-apply','capability-retire','capability-alias-reject','capability-alias-propose'):
         import contextlib
         import fcntl

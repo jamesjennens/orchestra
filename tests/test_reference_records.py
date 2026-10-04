@@ -607,7 +607,7 @@ class ReadIsolationTests(ReferenceCase):
     def test_one_malformed_or_unsupported_entry_fails_only_itself(self):
         self.seed_entries()
         self.native.add_comment('ref-2', 'Kind: reference-entry-v1\n{"not": "valid"}')
-        self.native.add_comment('ref-3', 'Kind: reference-entry-v2\n{}')
+        self.native.add_comment('ref-3', 'Kind: reference-entry-v3\n{}')
         listing = rr.read(['list'], self.native, [OPERATOR])
         self.assertEqual([item['key'] for item in listing['items']], ['calendar.trading'])
         self.assertIn('1 entry skipped as malformed (ref-2)', listing['coverage'])

@@ -1,5 +1,9 @@
 # Durable per-project reference catalog - design proposal
 
+Section 17 was added later, with its implementation (kittrial-5bb.98): an
+`attestation` authority for operational facts. The rest of the document is the
+revision 3 proposal as it was reviewed.
+
 Status: **proposal, revision 3. Not implemented, not accepted.** This document
 changes no code. It proposes a record kind, an authority model, client commands,
 attention surfacing, repo sync, backup/rollback coverage and a migration path for
@@ -1728,3 +1732,111 @@ check the deployment operator allowlist (`admin.py:2214-2223`,
 `docs/OPERATIONS.md:61-63`). The catalog deliberately does not copy that gap, and
 the fix belongs in a separate follow-up task against `requirement-apply`, not in
 this design.
+
+## 17. Attested authority for operational facts (kittrial-5bb.98)
+
+This section is a design note written with its implementation. It adds one
+authority type and uses the forward-compatibility rule of 3.8 for the first time.
+
+### 17.1 The problem
+
+Section 3.6 allows two authorities: a repository path pinned to a commit, and a
+URL with a retrieval date. Many facts a project needs are neither. "The office
+server runs the service under this account", "backups run before a release",
+"the owner said to proceed" have no file or page that states them: somebody
+looked, or somebody said so. On the trial project 37 such entries were proposed
+with a `repo-path` authority pointing at a handover file, with no commit. None
+could be accepted, so every one of them stayed a draft that readers must not
+trust.
+
+### 17.2 The type
+
+```json
+{"type": "attestation", "basis": "host-check", "by": "person:example", "observed": "2026-10-03",
+ "how": "example-check.sh run on the office server; output read",
+ "source": "handover notes, 2026-10-03 entry"}
+```
+
+- `basis` is a closed set of two: `host-check` (someone looked at a live system)
+  and `owner-statement` (the owner said so).
+- `by` is the durable identity (3.4) whose observation or statement it is.
+- `observed` is the date, never later than today.
+- `how` is one required line: the command and host, or where the statement was made.
+- `source` is an optional line saying where it is written down. The kit never
+  resolves it.
+
+An attestation is provenance, not a pointer. Nothing in it can be checked by the
+kit, and no reader may present it as if it could.
+
+**No third basis.** A rule that a coordinator set for itself was neither observed
+nor stated by the owner. It needs a decision issue. The catalog has no authority
+type that points at a decision issue (an entry can cite decisions in `decisions`,
+but its authority must still be a path, a URL or an attestation); adding one is a
+separate follow-up.
+
+### 17.3 Who accepts, and what they must show
+
+Contributors propose and revise attested drafts over SSH, like any draft.
+Acceptance stays on the operator host route (4, 6.7). Because the kit can check
+nothing about the fact, the acceptance carries the weight. An attested revision
+is accepted only when:
+
+1. `acceptance.evidence` is one line saying what the operator did to check the
+   fact. The kit checks its presence and shape, not its truth.
+2. `acceptance.decision_id` names an existing native issue of type `decision` or
+   labelled `decision`. (A repository entry's decision id is free text today;
+   that is unchanged.)
+3. For an `owner-statement`, `by` is one of `acceptance.owners`.
+4. `review_by` is at most 6 months after `observed`. Repository and URL entries
+   keep the 24-month ceiling.
+5. `observed` is not in the future and not more than 6 months old.
+
+Every refusal happens before any write of the acceptance; a direct accepted
+revision 1 is checked before its anchor is created.
+
+### 17.4 What a reader sees
+
+- `authority_kind` on every `record`, `proposed`, list row and attention item:
+  `repository`, `url` or `attested`.
+- `authority_note` beside every attestation, built by the server from validated
+  fields only (identity, date, basis), never from `how` or `source`. For the
+  accepted record it says the fact is attested, accepted by an operator, and
+  cannot be checked against a repository. For a draft it starts `NOT ACCEPTED.`
+- `authority_accepted` on list rows and attention items: whether the row shows
+  the accepted record.
+- `ref list --authority repository|url|attested` and the same HTTP query.
+
+`ref check` (6.6, 9.3) is not implemented. When it is, an attested entry belongs
+in its own group and must never be reported as "authority unchanged".
+
+### 17.5 Record version: the 3.8 rule, used
+
+An attested revision is `Kind: reference-entry-v2` with `schema_version` 2 and the
+same field set; a repository or URL revision stays v1. Version 2 is the record
+with an attestation authority and only that, so no content can be written two
+ways. An entry may hold revisions of both versions (a `repo-path` draft revised to
+an attestation). Acceptance evidence stays v1: it binds a record hash.
+
+The alternative was a third `type` inside v1. An older kit would read that entry
+as `malformed`, and its operator void accepts a malformed record as a target, so
+an operator on a rolled-back kit could void a valid accepted fact. With v2, an
+older kit:
+
+- reads an entry as `unsupported`, as 3.8 says, when its anchor also holds a v1
+  record: an earlier v1 revision, or acceptance evidence (always v1), so every
+  accepted attested entry;
+- reads a never-accepted attested draft with no v1 revision as an anchor with no
+  record yet. 3.8 did not foresee this: the older kit's anchor test
+  (`is_record_anchor`) asks for a v1 record. The entry is still not served, is
+  named in `coverage`, and cannot be written, voided, released or proposed over,
+  because each of those paths refuses a record comment of any version;
+- backs up and restores the project unchanged. No sidecar path is added.
+
+So a rollback withholds attested entries until roll-forward and loses nothing.
+
+### 17.6 Batch accept
+
+`admin.py reference-apply` with `items` accepts several reviewed drafts under one
+decision. It is the batch `capability-apply` already had (.60 section 4), moved
+into the shared entry layer (12.1): one receipt per item, the coordination lock
+taken per item, a refused item reported without stopping the others.

@@ -43,7 +43,6 @@ with the entry and reports each revision's `verification` (`verified`, `reported
 Summaries and alias text are untrusted: they never enter an error message, and every
 excerpt carries `trust`.
 """
-import contextlib
 import json
 import re
 import time
@@ -55,7 +54,8 @@ import keyed_records as core
 from capabilities import normalized as normalize, safe_relpath, split_pointer, stems, words
 from coordination import atomic, identifier
 from export_requirements import parse_json
-from keyed_entries import CONTRIBUTOR_OPERATIONS, NATIVE_FAILURES, read_labelled
+from keyed_entries import (BATCH_FIELDS, BATCH_MAX, BATCH_YIELD_SECONDS, CONTRIBUTOR_OPERATIONS, ITEM_FIELDS,
+                           NATIVE_FAILURES, item_operation_id, read_labelled)
 from recovery import configured_operators
 from requirements import SHA256_TEXT, canonical_bytes, content_hash, load_json
 from reserved_comments import (CAPABILITY_ACCEPTANCE_PREFIX as ACCEPTANCE_PREFIX,
@@ -80,10 +80,6 @@ TAGS_MAX = 8
 PHRASE_MAX = 200
 FIND_LIMIT = (1, 20)
 LIST_LIMIT_MAX = 100
-BATCH_MAX = 100
-# A pause outside the lock between batch items: flock gives no ordering guarantee, so
-# without it the batch could retake the lock before a waiting writer wakes.
-BATCH_YIELD_SECONDS = 0.05
 ACCOUNT = re.compile(r'account:[A-Za-z0-9][A-Za-z0-9_.@-]{0,95}')
 PERSON = re.compile(r"person:[A-Za-z0-9](?:[A-Za-z0-9 _.'-]{0,94}[A-Za-z0-9_.'])?")
 SESSION_MARKER = re.compile(r'session-[0-9a-f]{4}|/session[0-9]*(?:$|/)|(?:^|[^A-Za-z0-9])session[0-9]+$',
@@ -505,138 +501,15 @@ def reconcile(project, operation_id, actor, reason, disposition, run, issue_id=N
 
 # -- batch acceptance (.60 section 4) ----------------------------------------------------------------
 
-BATCH_FIELDS = {'schema_version', 'operation_id', 'items', 'acceptance_state', 'acceptance'}
-ITEM_FIELDS = {'key', 'revision', 'record_sha256'}
-
-
 def validate_batch(payload):
-    if not isinstance(payload, dict):
-        raise ValueError('capability-apply payload must be an object')
-    core.refuse_injected_labels(payload, 'capability operation')
-    core.checked_fields(payload, BATCH_FIELDS, 'capability-apply payload')
-    if type(payload.get('schema_version')) is not int or payload['schema_version'] != 1:
-        raise ValueError('schema_version must be the integer 1')
-    identifier(payload.get('operation_id'))
-    if payload.get('acceptance_state') != 'accepted':
-        raise ValueError('capability-apply writes accepted revisions (acceptance_state must be accepted)')
-    core.validate_acceptance_shape(payload.get('acceptance'))
-    core.bound_acceptance(dict(payload['acceptance'], record_sha256='0' * 64))
-    items = payload.get('items')
-    if not isinstance(items, list) or not 1 <= len(items) <= BATCH_MAX:
-        raise ValueError('items must be a list of 1..%d {key, revision, record_sha256}' % BATCH_MAX)
-    keys = set()
-    for index, item in enumerate(items):
-        where = 'items[%d]' % index
-        if not isinstance(item, dict):
-            raise ValueError(where + ' must be an object')
-        core.checked_fields(item, ITEM_FIELDS, where)
-        if set(item) != ITEM_FIELDS:
-            raise ValueError(where + ' needs key, revision and record_sha256')
-        valid_key(item['key'], where + '.key')
-        core.positive_int(item['revision'], where + '.revision')
-        if not isinstance(item['record_sha256'], str) or not SHA256_TEXT.match(item['record_sha256']):
-            raise ValueError(where + '.record_sha256 must be the reviewed revision\'s content hash')
-        if item['key'] in keys:
-            raise ValueError('items must not repeat a key')
-        keys.add(item['key'])
-        identifier(item_operation_id(payload['operation_id'], item['key']))
-    return payload
-
-
-def item_operation_id(operation_id, key):
-    """The per-item operation id: each item's receipt is keyed `(operation_id, key)`."""
-    return '%s/%s' % (operation_id, key)
+    return KIND.validate_batch(payload)
 
 
 def apply_batch(payload, actor, run, project, operators=None, lock=None):
-    """`admin.py capability-apply`: accept a batch under one F3 decision (.60 section 4).
-
-    The operator allowlist is checked first. A batch receipt binds the operation id to
-    the exact item list, so a changed list under the same id is refused. Items run in
-    list order, each through the single core write (evidence, then the revision, then
-    the label) with its own receipt keyed `(operation_id, key)`; an item whose receipt is
-    complete rechecks its key for duplicate anchors before reporting `already-accepted`,
-    with no native write. A refusal before an item's writes is reported
-    `refused` and the batch continues; an uncertain write stops the batch (`uncertain`,
-    reconcile that item), and the rest stay `not-run` until a retry.
-
-    `lock` is a callable returning a context manager that holds the project's
-    coordination lock. The batch takes it once per ITEM and releases it between items
-    (review 01a0fc55 `batch-lock`), so another writer waits behind at most one item, not
-    the whole batch. Each item reads only its own key and re-checks compare-and-swap
-    under its own hold, so a change made between two items is seen, and refused if it
-    made the reviewed revision stale. Without `lock` the caller is holding it.
-    """
-    core.require_configured_operator(actor, operators, KIND.spec.accept_action)
-    validate_batch(payload)
-    lock = lock or contextlib.nullcontext
-    identity = content_hash({'operation_id': payload['operation_id']})
-    digest = content_hash({'actor': actor, 'payload': payload})
-    keys = [item['key'] for item in payload['items']]
-    with lock():
-        journal = core.journal_dir(project, JOURNAL)
-        receipt = core.receipt_path(journal, identity, 'capability')
-        prior = load_json(receipt) if receipt.exists() else None
-        if prior is not None and (prior.get('sha256') != digest or prior.get('operation') != 'apply-batch'):
-            raise ValueError('Operation ID already used for a different batch; a changed list needs a new '
-                             'operation ID.')
-        atomic(receipt, {'sha256': digest, 'status': 'pending', 'actor': actor, 'operation': 'apply-batch',
-                         'operation_id': payload['operation_id'], 'items': keys})
-    results, stopped = [], False
-    for position, item in enumerate(payload['items']):
-        if stopped:
-            results.append({'key': item['key'], 'result': 'not-run'})
-            continue
-        if position and lock is not contextlib.nullcontext:
-            time.sleep(BATCH_YIELD_SECONDS)   # the lock is free here: let a waiting writer take it
-        with lock():
-            result = _apply_item(payload, item, actor, run, project, operators, journal)
-        results.append(result)
-        stopped = result['result'] == 'uncertain'
-    complete = not stopped
-    with lock():
-        atomic(receipt, {'sha256': digest, 'status': 'complete' if complete else 'pending', 'actor': actor,
-                         'operation': 'apply-batch', 'operation_id': payload['operation_id'], 'items': keys,
-                         'results': {result['key']: result['result'] for result in results}})
-    return {'operation_id': payload['operation_id'], 'decision_id': payload['acceptance']['decision_id'],
-            'items': results, 'complete': complete}
-
-
-def _apply_item(payload, item, actor, run, project, operators, journal):
-    """One batch item, under one hold of the coordination lock."""
-    operation_id = item_operation_id(payload['operation_id'], item['key'])
-    item_receipt = core.receipt_path(journal, content_hash({'operation_id': operation_id}), 'capability')
-    done = load_json(item_receipt) if item_receipt.exists() else None
-    if isinstance(done, dict) and done.get('status') == 'complete':
-        try:
-            KIND.require_unique_key(KIND.read_key_rows(run, item['key']), item['key'])
-        except ValueError as error:
-            return {'key': item['key'], 'result': 'refused', 'reason': str(error)}
-        return {'key': item['key'], 'result': 'already-accepted', 'revision': done.get('revision'),
-                'native_id': done.get('id')}
-    single = {'schema_version': 1, 'operation_id': operation_id, 'operation': 'accept', 'key': item['key'],
-              'revision': item['revision'], 'record_sha256': item['record_sha256'],
-              'acceptance_state': 'accepted', 'acceptance': payload['acceptance']}
-    writes = []
-
-    def counted(argv):
-        if argv[:1] in (['comments'], ['update'], ['close'], ['create']) and '--dry-run' not in argv:
-            writes.append(argv[0])
-        return run(argv)
-    try:
-        outcome = KIND.apply_native(single, actor, counted, project, operator=True, operators=operators)
-    except (ValueError, RuntimeError, OSError) as error:
-        text = str(error)
-        if 'outcome is uncertain' in text or isinstance(error, (RuntimeError, OSError)):
-            return {'key': item['key'], 'result': 'uncertain',
-                    'reason': 'the native write did not confirm; reconcile %s with admin.py '
-                              'capability-reconcile --operation-id %s' % (item['key'], operation_id)}
-        return {'key': item['key'], 'result': 'refused', 'reason': text}
-    # `accepted` when this run wrote (including finishing an earlier uncertain attempt);
-    # `already-accepted` when the item's accepted revision and evidence were already there.
-    return {'key': item['key'], 'result': 'accepted' if writes else 'already-accepted',
-            'revision': outcome['revision'], 'native_id': outcome['native_id'],
-            'record_comment_id': outcome.get('record_comment_id')}
+    """`admin.py capability-apply` with `items`: accept a batch under one F3 decision
+    (.60 section 4). The batch itself is the shared `AnchoredKind.apply_batch`, which the
+    reference catalog uses too (kittrial-5bb.98)."""
+    return KIND.apply_batch(payload, actor, run, project, operators=operators, lock=lock)
 
 
 # -- aliases ---------------------------------------------------------------------------------------
