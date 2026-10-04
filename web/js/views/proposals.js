@@ -388,12 +388,12 @@ export async function detailPanel(ctx, pid, key) {
       // are owners here are offered. The note names the others, by display name for an
       // account (never its raw id) and as written for a person: identity.
       const byId = new Map(members.map((m) => ['account:' + m.user_id, m]));
-      const label = (d) => (byId.has(d) ? byId.get(d).display_name : d.startsWith('account:') ? 'an account that is not a member here' : d);
+      const label = (d) => (byId.has(d) ? byId.get(d).display_name : d.startsWith('account:') ? 'an account that is not a member of this project' : d);
       const me = 'account:' + ctx.me.id;
       owners = configured.filter((d) => byId.has(d) && byId.get(d).role === 'owner' && d !== me).map((d) => [d, byId.get(d).display_name]);
       const offered = new Set(owners.map(([d]) => d));
       const notes = configured.filter((d) => !offered.has(d)).map((d) => (d === me ? 'you (the one who escalates cannot also decide)'
-        : byId.has(d) ? label(d) + ' (not an owner of this project, so cannot decide here)' : label(d) + ' (not a web account in this project)'));
+        : byId.has(d) ? label(d) + ' (not an owner of this project, so cannot decide here)' : (d.startsWith('account:') ? label(d) : label(d) + ' (not a web account in this project)')));
       if (!owners.length) view.deciders_note = 'None of the deciders configured for this project can be chosen from the web: ' + notes.join('; ') + '. An operator escalates with the host command.';
       else if (notes.length) view.deciders_note = 'Also configured, but not offered: ' + notes.join('; ') + '.';
     } else {

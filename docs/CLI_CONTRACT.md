@@ -216,7 +216,8 @@ reads.
   - Draft entries are listed by `ref list --state draft-only`.
 
 `show TASK --json` returns native issue rows. `comments TASK --json` returns native
-comment rows. In raw rows a task's `assignee` is a plain string; in briefing/history
+comment rows; there is no `comments list`, and the endpoint refuses it with that
+sentence instead of the native tool's usage text. In raw rows a task's `assignee` is a plain string; in briefing/history
 views identity and authorship become excerpt objects (below).
 
 ## `brief` and `history`: excerpt objects
@@ -468,6 +469,12 @@ punctuation.
 - `reason`, when not resolved: `invalid-pointer`, `file-missing`, `symbol-missing`,
   `anchor-missing`, `unsupported-file-type`, `parse-error`, `too-complex`, `file-too-large`
   or `unreadable`.
+
+**Symbols are Python-only; headings are Markdown-only.** For any other file (JavaScript,
+CSS, a shell script, a template) point at the whole file: `web/js/ui.js`. A
+`FILE::symbol` pointer into such a file is not an error, but it can never be checked: it
+reads `resolved: null` with `unsupported-file-type` in every `resolve` and `check`. Name
+the functions that matter in the record's summary instead, so a search finds them.
 
 A missing pointer is a result, not an error, so check `summary.missing`. Unsafe pointers
 are refused as `invalid-pointer` without reading anything. A pointer is unsafe when it is
@@ -1378,7 +1385,10 @@ action unless the HTTP service launched the endpoint. Declare your own session a
   proposal whose `submitter` is the identity named, each with its `identity`
   (`verified` or `unverified`), so an unmapped contributor sees their own
   submissions. Through the HTTP service the same read lists verified proposals only
-  and adds `unverified_omitted`: there the submitter is an authenticated account.
+  and adds `unverified_omitted` (how many proposals name that account but are not
+  verified): there the submitter is an authenticated account. An `--offset` past the
+  end, and over HTTP a cursor that now points past the end, returns an empty page with
+  the current `total`, not an error.
   `list` and `mine` take `--order oldest|newest` (default oldest). `get` returns
   `deciders`, the configured owner deciders.
 - **Help is a command.** `proposal --help` and `proposal list --help` return the help
@@ -1457,6 +1467,16 @@ a clear refusal, not a wrong read.
 
 ## Documented limits
 
+**A text field over its limit is refused with the field, the length it had and the
+limit** (kittrial-5bb.97): `summary: 1431 characters, the limit is 1200`. An empty field
+says `must not be empty`, and a value that is not text says `expected text`, each with
+the limit. For a list the error names which entry: `items[2] (id docs-and-small) review
+text: 1105 characters, the limit is 1000`, `resolutions[1] (item second) resolution
+reason: ...`, `open_items[0].text (id blocked-on-keys): ...`. `review --help`,
+`handoff --help` and `checkpoint --help` list every field limit in `limits`, from the
+same numbers the validators enforce, so a caller can read a limit instead of finding
+it by failing.
+
 | Command | Option | Range |
 | --- | --- | --- |
 | every command | JSON nesting in a request, a `--file` attachment or a payload argument | at most 64 levels; deeper is refused with `JSON nested too deeply (more than 64 levels)`, exit 2, nothing written |
@@ -1481,12 +1501,20 @@ a clear refusal, not a wrong read.
 | `history` | `--limit` | 1..20 |
 | `history` | `--body-budget` | 256..8000 encoded bytes |
 | `review` | `items`/`resolutions` | 1..20 entries |
-| `review` | `summary` | <= 1200 characters |
+| `review` | `summary` (contribute, approve, request-changes, request-review) | <= 1200 characters |
 | `review` | item `severity` | `blocking` or `note` (absent means `blocking`) |
 | `review` | `withdraw` `reason` / `request-review` `reviewer` / `resolve-item` `reason` | <= 1000 characters / an actor identity (may contain `@` or `/`) / <= 1000 characters |
 | `review` | `decline-review` `reason` | <= 1000 characters |
 | `review` | open `request-review` requests per requester | 10 (project-wide) |
 | `review` | writing a new shape (`withdraw`, `request-review`, `resolve-item`, `decline-review`, item `severity`, request-changes `summary`) | refused unless `deployment.private.json` sets `review_workflow_writes` true (`admin.py review-writes on`); readers always understand them |
+| `review` | `repository`, delivery `remote`, bundle `path` | <= 1000 characters each |
+| `review` | delivery `branch` | <= 300 characters |
+| `review` | item `text`; resolution `reason`, `evidence` | <= 1000 characters each |
+| `review` | whole payload | <= 24 KB canonical bytes |
+| `handoff` | `reason`, `approval` | <= 1000 characters each |
+| `checkpoint` | `intent`, `next_action` | <= 600 characters each |
+| `checkpoint` | `acceptance`, `summary` | <= 1000 characters each |
+| `checkpoint` | `source_commit` / `branch` | <= 128 / <= 200 characters |
 | `checkpoint` | `open_items` / `resolved` | <= 100 each |
 | `checkpoint` | item `text`/`reason` | <= 400 characters |
 | `checkpoint` | item `source`/`evidence` | <= 240 characters |

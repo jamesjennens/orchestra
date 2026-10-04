@@ -572,6 +572,25 @@ class ReviewFixCase(ProposalHarness):
         log = self.request('GET', '/v1/me/contributions', token=self.token('dana')).data
         self.assertEqual([item['key'] for item in log['items']], [key])
 
+    def test_a_cursor_past_the_end_is_an_empty_page_not_a_refusal(self):
+        # kittrial-5bb.97 (from the kittrial-5bb.102 review): a cursor the route issued stays
+        # valid when the total shrinks under it; the page it names is then empty.
+        for index in range(3):
+            self.submit(text='Proposal number %d.' % index)
+        first = self.request('GET', self.base() + '?limit=1', token=self.token('alex')).data
+        second = self.request('GET', self.base() + '?limit=1&cursor=' + first['next_cursor'], token=self.token('alex')).data
+        self.assertEqual((first['total'], len(second['items'])), (3, 1))
+        path = self.canonical_root / 'canonical.json'
+        state = json.loads(path.read_text(encoding='utf-8'))
+        proposals = [row for row in state['rows']
+                     if any(comment['text'].startswith(pr.REVISION_PREFIX) for comment in row.get('comments') or [])]
+        self.assertEqual(len(proposals), 3)
+        state['rows'] = [row for row in state['rows'] if row not in proposals[1:]]    # the total shrinks to 1
+        path.write_text(json.dumps(state), encoding='utf-8')
+        answer = self.request('GET', self.base() + '?limit=1&cursor=' + second['next_cursor'], token=self.token('alex'))
+        self.assertEqual(200, answer.status, answer.data)
+        self.assertEqual((answer.data['items'], answer.data['total'], answer.data['next_cursor']), ([], 1, None))
+
     def test_my_contributions_is_newest_first_with_a_cursor(self):
         keys = [self.submit(text='Proposal number %d.' % index).data['key'] for index in range(5)]
         stamps = {}
@@ -827,6 +846,8 @@ class ScreenBehaviourCase(ProposalHarness):
             pr.change_settings({'add_decider': decider}, 'ops', settings, ['ops'])
         erin = self.create_account(self.admin, 'erin', 'erin-password-1')          # not a member of the project
         self.people['erin'] = (self.login('erin', 'erin-password-1')[0], erin)
+        # kittrial-5bb.97: a configured decider that is an account but not a member here.
+        pr.change_settings({'add_decider': 'account:' + erin}, 'ops', settings, ['ops'])
         web = KIT / 'web' / 'js'
         people = ['%s=%s=%s' % (name, token, uid) for name, (token, uid) in self.people.items()]
         done = run_node_module(self, node, 'await import(process.argv[1])',
@@ -872,6 +893,10 @@ class ScreenBehaviourCase(ProposalHarness):
                      'person:owner (not a web account in this project)'):
             self.assertIn(text, deciders['note'])
         self.assertNotIn('usr_', deciders['note'])
+        # The non-member account is described once, not twice (kittrial-5bb.97).
+        self.assertIn('an account that is not a member of this project', deciders['note'])
+        self.assertNotIn('member of this project (', deciders['note'])
+        self.assertNotIn('not a member here', deciders['note'])
 
         # The smaller ones.
         self.assertEqual(seen['badKey']['requests'], 0)

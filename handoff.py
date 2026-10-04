@@ -4,11 +4,20 @@ import record_json
 import re
 from datetime import datetime, timezone
 from coordination import atomic
+from field_limits import check_text
 from requirements import canonical_bytes, content_hash
 
 ACTOR=re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}')
 ID=re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,160}')
 UUID=re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+#: The text limits of a handoff payload; the validators and the `handoff` help both
+#: read this table (kittrial-5bb.97).
+TEXT_LIMITS={'reason':1000,'approval':1000}
+
+def help_limits():
+    """The limits for the machine-readable `handoff` help."""
+    from field_limits import describe
+    return describe(TEXT_LIMITS)
 
 def validate_request(p):
     keys={'schema_version','operation','request_id','task','from_actor','to_actor','reason'}
@@ -19,8 +28,7 @@ def validate_request(p):
     for key in ('from_actor','to_actor'):
         if not isinstance(p[key],str) or not ACTOR.fullmatch(p[key]):raise ValueError('Invalid '+key)
     if p['from_actor']==p['to_actor']:raise ValueError('Requester must be distinct from current owner')
-    if not isinstance(p['reason'],str) or not p['reason'].strip() or len(p['reason'])>1000:
-        raise ValueError('Handoff request requires a bounded reason')
+    check_text(p['reason'],'reason',TEXT_LIMITS['reason'],nul=False)
 
 def validate_request_record(record):
     if not isinstance(record,dict) or not {'schema_version','request_id','task','from_actor','to_actor','reason','requester','status','created_at','digest'}.issubset(record):
@@ -84,8 +92,7 @@ def validate(p):
     for key in ('from_actor','to_actor'):
         if not isinstance(p[key],str) or not ACTOR.fullmatch(p[key]):raise ValueError('Invalid '+key)
     if p['from_actor']==p['to_actor']:raise ValueError('Use session resume to keep the same owner')
-    for key in ('reason','approval'):
-        if not isinstance(p[key],str) or not p[key].strip() or len(p[key])>1000:raise ValueError('Handoff requires bounded reason and approval evidence')
+    for key in ('reason','approval'):check_text(p[key],key,TEXT_LIMITS[key],nul=False)
 
 def request(path, actor, p):
     validate_request(p)
@@ -140,8 +147,9 @@ def disposition(path, actor, p, run, operator=False):
         raise ValueError('Invalid handoff disposition payload')
     if not ID.fullmatch(p['operation_id']) or not UUID.fullmatch(p['request_id']) or not ID.fullmatch(p['task']):
         raise ValueError('Invalid handoff disposition identity')
-    if p['disposition'] not in ('accept','decline','withdraw','supersede') or not isinstance(p['reason'],str) or not p['reason'].strip() or len(p['reason'])>1000:
-        raise ValueError('Invalid handoff disposition')
+    if p['disposition'] not in ('accept','decline','withdraw','supersede'):
+        raise ValueError('Invalid handoff disposition: expected accept, decline, withdraw or supersede')
+    check_text(p['reason'],'reason',TEXT_LIMITS['reason'],nul=False)
     if p['supersedes'] is not None and not UUID.fullmatch(p['supersedes']):raise ValueError('Invalid superseded request')
     file=_request_file(path,p['request_id'])
     if not file.exists():raise ValueError('Unknown handoff request')

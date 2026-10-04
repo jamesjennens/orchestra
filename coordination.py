@@ -300,7 +300,16 @@ def apply_native(p, actor, run, project):
         return {'id':issue['id'],'reconciled':False}
     if op not in ('merge-create','merge-check','merge-acquire','merge-release'):raise ValueError('Unknown coordination operation')
     expected={'operation','task','target'} if op=='merge-acquire' else {'operation'}
-    if set(p)!=expected:raise ValueError('Invalid merge request fields; holder is always the request actor')
+    if set(p)!=expected:
+        # Name the fault (kittrial-5bb.97): which fields are unexpected or missing for THIS
+        # operation. Caller-supplied names are bounded so an error cannot echo a large payload.
+        def names(values):return ', '.join(str(value)[:40] for value in sorted(values, key=str)[:8])
+        details=[]
+        if set(p)-expected:details.append('unexpected field(s): '+names(set(p)-expected))
+        if expected-set(p):details.append('missing field(s): '+names(expected-set(p)))
+        raise ValueError('Invalid merge request fields for %s: %s. merge-acquire takes operation, task and target; '
+                         'merge-create, merge-check and merge-release take only operation. The holder is always '
+                         'the request actor.'%(op,'; '.join(details)))
     context_path=project/'.merge-context.json'
     if op=='merge-create':return json.loads(run(['merge-slot','create','--json']))
     state=json.loads(run(['merge-slot','check','--json']))
