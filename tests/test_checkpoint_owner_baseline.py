@@ -32,7 +32,7 @@ class OwnerBaselineTests(unittest.TestCase):
         self.assertEqual(canonical_bytes(data),before,'Reads must not clear or rewrite directions')
 
     def test_only_previous_owners_own_checkpoint_sets_the_cutoff(self):
-        data=rows();self.add(data,'alice-before','alice/session',11)
+        data=rows();self.add(data,'alice-before','alice/session',12)
         self.save_as(data,'alice-cp','alice/session',12)
         self.add(data,'alice-later','alice/session',13)
         self.add(data,'reviewer','reviewer/session',14)
@@ -51,7 +51,7 @@ class OwnerBaselineTests(unittest.TestCase):
         self.assert_directions(data,['first','alice-before'])
 
     def test_owner_comments_tied_with_checkpoint_time_remain_possible_directions(self):
-        data=rows();self.add(data,'alice-before','alice/session',11)
+        data=rows();self.add(data,'alice-before','alice/session',12)
         self.save_as(data,'alice-cp','alice/session',12)
         # Native second precision cannot establish order within this timestamp.
         self.add(data,'alice-tied','alice/session',12)

@@ -406,16 +406,22 @@ def direction_context(issue,state):
     """
     current=state['current']
     owner=issue.get('assignee') or (current[1].get('author') if current else None)
-    baseline=None;previous={}
+    baseline=None;previous={};known_by_stamp={}
     comments={str(c['id']):c for c in issue.get('comments') or []}
+    stamps={issue['id']+'-c'+cid:parse_moment(c['created_at']) for cid,c in comments.items()}
     for cid,p in state['history']:
         c=comments[cid];stamp=parse_moment(c['created_at'])
-        if state['provenance'][cid] is None:baseline=stamp
+        prov=state['provenance'][cid]
+        if prov is None:baseline=stamp
+        else:
+            for eid in set(prov['digests'])|set(prov['older']):
+                if eid in stamps:known_by_stamp.setdefault(stamps[eid],set()).add(eid)
         old=p.get('direction_owner',c.get('author'))
         # A record may bind the observed assignee even when another actor wrote
         # it. Only the owner's OWN checkpoint can cut off that owner's comments;
         # an operator/reviewer checkpoint must not hide later owner instructions.
-        if old and old!=owner and c.get('author')==old:previous[old]=stamp
+        if old and old!=owner and c.get('author')==old:
+            previous[old]=(stamp,frozenset(known_by_stamp.get(stamp,())))
     return owner,baseline,previous
 
 def direction_entries(data,context):
@@ -425,7 +431,10 @@ def direction_entries(data,context):
             # Native timestamps may have only second precision. A tied comment
             # may have arrived AFTER the owner's checkpoint; retain it rather
             # than inventing an ordering from its opaque native ID.
-            and (e['author'] not in previous or parse_moment(e['timestamp'])>=previous[e['author']])]
+            and (e['author'] not in previous
+                 or parse_moment(e['timestamp'])>previous[e['author']][0]
+                 or (parse_moment(e['timestamp'])==previous[e['author']][0]
+                     and e['entry_id'] not in previous[e['author']][1]))]
 
 def retained_provenance(state):
     exact,trunc,recorded=chain_evidence(state['history'],state['provenance'])
