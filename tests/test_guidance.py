@@ -301,7 +301,7 @@ class GuidanceRecordTests(unittest.TestCase):
 
     def test_mismatch_withholds_the_text_and_is_not_attributed(self):
         guidance.write_guidance(self.project, 'original text', 'op-james')
-        (self.project / 'GUIDANCE.md').write_text('hand edited text\n', encoding='utf-8')
+        (self.project / 'GUIDANCE.md').write_bytes(b'hand edited text\n')
         state = guidance.state(self.project, 'worker-1')
         self.assertTrue(state['present']); self.assertIsNone(state['set_by'])
         self.assertTrue(state['unbound']); self.assertTrue(state['attention'])
