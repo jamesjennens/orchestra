@@ -178,6 +178,39 @@ class EndpointAttentionTests(fixes.EndpointCase):
         self.assertNotIn('--owner',self.calls[0][1])
         self.assertEqual(self.calls[0][1],['--limit','100','--offset','0','--json'])
 
+    def test_attention_pages_over_100_owned_tasks_and_reports_page_bound(self):
+        actor = self.next()['agent']['actor']
+        rows = [dict(task='owned-%03d' % i, title='owned', owner=actor,
+                     status='in_progress', review_state='none', open_items=0)
+                for i in range(130)]
+        # Feedback beyond the first page must affect the aggregate even when the
+        # returned action list is capped. These are canonical work page fixtures.
+        rows[-1].update(review_state='changes-requested', contribution_id='delivery',
+                        pending_change_requests=['request'], pending_review_items=1)
+        calls = []
+
+        def paged(action, project, reader, args, *rest, **kwargs):
+            self.assertEqual(action, 'work')
+            self.assertNotIn('--owner', args)
+            offset = int(args[args.index('--offset') + 1])
+            calls.append(offset)
+            return {'items': rows[offset:offset + 100],
+                    'next_offset': offset + 100 if offset + 100 < len(rows) else None}
+
+        with patch.object(self.backend, '_run', side_effect=paged):
+            data = self.next()
+            self.assertEqual(calls, [0, 100])
+            self.assertEqual(data['attention']['counts']['claimed'], 130)
+            self.assertEqual(data['attention']['counts']['changes_requested'], 1)
+            self.assertEqual(kinds(data)[0], ('changes-requested', 'owned-129'))
+            self.assertTrue(data['attention']['truncated'])
+            calls.clear()
+            with patch.object(self.backend, 'QUEUE_MAX_PAGES', 1):
+                bounded = self.next()
+            self.assertEqual(calls, [0])
+            self.assertEqual(bounded['attention']['counts']['claimed'], 100)
+            self.assertTrue(bounded['attention']['truncated'])
+
     def test_conflicting_checkpoint_history_keeps_unknown_and_operator_action(self):
         task=self.tasks[0];self.claim(task)
         self.checkpoint(task,[])
