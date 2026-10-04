@@ -707,6 +707,9 @@ class AnchoredKind:
             else:
                 record.update(revision=payload['revision'] + 1, acceptance_state='accepted', successor=None)
             record['sha256'] = content_hash(record)
+            # The date rules first: they can name the cause (a stale observation) where the
+            # schema would only say what is missing (kittrial-5bb.98 review).
+            self.write_time_rules(record)
             self.validate_entry(record)
         self.write_time_rules(record)
         return record['revision'], record
@@ -844,6 +847,12 @@ class AnchoredKind:
         `refused` and the batch continues; an uncertain write stops the batch (`uncertain`,
         reconcile that item), and the rest stay `not-run` until a retry.
 
+        The result counts what happened: `accepted` (written now or already there),
+        `refused`, and `stopped` (an uncertain write stopped the batch). `complete` is true
+        only when every item is accepted: a batch with a refused item is not complete, so
+        nobody reads a successful exit as "all accepted" (kittrial-5bb.98 review). The batch
+        receipt is settled whenever the batch was not stopped, as before.
+
         `lock` is a callable returning a context manager that holds the project's
         coordination lock. The batch takes it once per ITEM and releases it between items
         (review 01a0fc55 `batch-lock`), so another writer waits behind at most one item, not
@@ -877,13 +886,15 @@ class AnchoredKind:
                 result = self._apply_item(payload, item, actor, run, project, operators, journal)
             results.append(result)
             stopped = result['result'] == 'uncertain'
-        complete = not stopped
         with lock():
-            atomic(receipt, {'sha256': digest, 'status': 'complete' if complete else 'pending', 'actor': actor,
+            atomic(receipt, {'sha256': digest, 'status': 'pending' if stopped else 'complete', 'actor': actor,
                              'operation': 'apply-batch', 'operation_id': payload['operation_id'], 'items': keys,
                              'results': {result['key']: result['result'] for result in results}})
+        refused = sum(result['result'] == 'refused' for result in results)
+        accepted = sum(result['result'] in ('accepted', 'already-accepted') for result in results)
         return {'operation_id': payload['operation_id'], 'decision_id': payload['acceptance']['decision_id'],
-                'items': results, 'complete': complete}
+                'items': results, 'accepted': accepted, 'refused': refused, 'stopped': stopped,
+                'complete': accepted == len(results)}
 
     def _apply_item(self, payload, item, actor, run, project, operators, journal):
         """One batch item, under one hold of the coordination lock."""

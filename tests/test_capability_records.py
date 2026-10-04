@@ -359,7 +359,10 @@ class BatchAcceptanceTests(CapabilityCase):
         mixed = self.batch([{'key': 'a.one', 'revision': 1, 'record_sha256': 'f' * 64}, self.item('a.two'),
                             self.item('a.three')], operation_id='mixed')
         self.assertEqual([item['result'] for item in mixed['items']], ['refused', 'accepted', 'accepted'])
-        self.assertTrue(mixed['complete'])   # only an uncertain write leaves a batch incomplete
+        # A refused item makes the batch not complete (kittrial-5bb.98 review); it was not
+        # stopped, so its receipt is settled and the other items were accepted.
+        self.assertEqual((mixed['complete'], mixed['stopped'], mixed['accepted'], mixed['refused']),
+                         (False, False, 2, 1))
         self.assertEqual(self.read('get', 'a.one')['state'], 'draft-only')
         # An identical re-run reports accepted items from receipts, but rereads each key
         # to refuse newly planted duplicate anchors before any native write.

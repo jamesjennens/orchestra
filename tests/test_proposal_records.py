@@ -1138,7 +1138,8 @@ class AttentionTests(ProposalCase):
         writes = len(self.native.writes())
         rows = self.rows()
         result = work.queue(rows, COORD, [], operators=OPS, journal=self.project, reference_attention=True)
-        self.assertEqual(set(result['attention']), {'reference_review', 'proposal_queue', 'capability_index'})
+        self.assertEqual(set(result['attention']), {'reference_review', 'reference_matches', 'proposal_queue',
+                                                    'capability_index'})
         self.assertEqual(result['attention']['proposal_queue']['counts']['submitted'], 6)
         self.assertEqual(result['attention']['proposal_queue']['actions'][0]['project'], 'demo')
         paged = work.queue(rows, COORD, ['--proposal-limit', '2'], operators=OPS, journal=self.project,
