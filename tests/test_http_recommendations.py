@@ -47,6 +47,10 @@ class Shared:
                 answer = self.recommend(token, task, contribution, commit)
                 self.assertEqual(403, answer.status, answer.data)
                 self.assertIn('must be independent of the author', answer.data['error']['message'])
+        # An attribution label under the agent's own name is a different name; the person signed in is the same.
+        labelled = self.recommend(sibling, task, contribution, commit, actor=made.data['agent']['id'] + '/reviewer')
+        self.assertEqual(403, labelled.status, labelled.data)
+        self.assertIn('must be independent of the author', labelled.data['error']['message'])
         review = self.review(self.owner, task)
         self.assertEqual((review['recommendation'], review['recommendations']), (None, []))
         # Another person, and another person's agent, may.
@@ -165,6 +169,20 @@ class InProcessTests(Shared, test_http_agents.AgentHarness):
             'bundle_sha256': test_http_agents.BUNDLE, 'summary': 'revised'}, token=self.agent)
         self.assertEqual(201, revised.status, revised.data)
         self.assertIsNone(self.review(self.owner, task)['recommendation'])
+
+    def test_the_backend_applies_the_name_rule_itself(self):
+        """Behind the route's rule by person, the in-process write still refuses the author by name."""
+        from http_service import HttpError
+        commit = test_http_agents.COMMIT
+        task, contribution = self.deliver('first', commit)
+        author = self.review(self.owner, task)['contribution']['author']
+        stored = self.backend.get_task(self.project, task)
+        records = self.backend.state['contributions'][task]
+        payload = {'contribution': contribution, 'commit': commit, 'verdict': 'approve', 'summary': SUMMARY, 'items': []}
+        with self.assertRaises(HttpError) as refused:
+            self.backend._recommend(None, self.project, stored, records, dict(payload, actor=author))
+        self.assertEqual(refused.exception.status, 403)
+        self.assertNotIn(task, self.backend.state.get('recommendations', {}))
 
     def test_a_stored_one_by_the_authors_own_person_is_not_shown(self):
         """The read applies the same rule: such a record can reach the task over SSH, where only names are compared."""
