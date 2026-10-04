@@ -3625,9 +3625,6 @@ class ApiHandler(BaseHTTPRequestHandler):
                         'awaiting-review', 'legacy-review-ready', 'awaiting-integration',
                         'approved'):
                     to_review.append(row)
-        # A contribution a reviewer recommends approving comes first in what the caller may
-        # decide (kittrial-5bb.115); the sort is stable, so the order is otherwise kept.
-        to_review.sort(key=lambda row: 0 if row.get('recommended') else 1)
         if len(assigned) > MAX_PAGE or len(to_review) > MAX_PAGE:
             truncated = True
         try:
