@@ -36,6 +36,8 @@ ITEM_FIELDS = {
     'integration_disagreements', 'integration_warnings',
     # Additive deployed-delivery identification (kittrial-5bb.95).
     'deployed_delivery', 'deployed_delivery_is_current_contribution',
+    # Additive review-request identification (kittrial-5bb.94 item 4).
+    'review_request', 'review_requests',
 }
 BRIEF_FIELDS = {
     'task', 'title', 'owner', 'status', 'activity_cursor', 'checkpoint', 'intent',

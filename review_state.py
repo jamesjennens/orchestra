@@ -53,7 +53,8 @@ and neither switches the rule to newest-wins:
 #: Warning prefixes this module adds to a read's ``warnings`` list for the
 #: integration overlay. ``brief`` and ``work`` use the predicate below to carry
 #: them into their own warning surfaces without matching strings by hand.
-INTEGRATION_WARNING_PREFIXES = ('Integration fact disagreement', 'Integration revert')
+INTEGRATION_WARNING_PREFIXES = ('Integration fact disagreement', 'Integration revert',
+                                'Integration after withdrawal')
 #: Bound on the ``integration.reverted_commits`` list a read embeds; the
 #: untruncated count stays available as ``integration.reverted_total``.
 REVERTED_COMMITS_LIMIT = 5
@@ -154,7 +155,13 @@ def integration_disagreements(result):
       surviving evidence together;
     * ``newest-scope-disagrees`` -- no revert is in play and a newer matching scope
       records a different value (typically ``integrated=failed``) while an older
-      pass still governs by any-pass-wins.
+      pass still governs by any-pass-wins;
+    * ``withdrawn-integration-passed`` -- the CURRENT contribution was withdrawn or
+      superseded and a trusted scope still records ``integrated=passed`` for its
+      commit. Withdrawing a contribution does not stop integration being recorded
+      for that commit (the integration fact is scoped lifecycle evidence, not part
+      of the review chain), and the read would otherwise show ``withdrawn`` with
+      ``integration.fact='passed'`` and no explanation (kittrial-5bb.94 item 5).
 
     The owner decision on kittrial-5bb.32 is to keep any-pass-wins, so this is
     deliberately a signal, not a state change. Returns an empty list for a result
@@ -189,6 +196,19 @@ def integration_disagreements(result):
     for prior in result.get('prior_contributions') or []:
         if isinstance(prior, dict):
             block(prior, prior.get('comment_id'), prior.get('relation'))
+    withdrawal=result.get('withdrawal')
+    evidence=result.get('integration')
+    if isinstance(withdrawal,dict) and isinstance(evidence,dict) and evidence.get('fact')=='passed':
+        found.append({'kind':'withdrawn-integration-passed',
+                      'contribution':((result.get('contribution') or {}).get('comment_id')
+                                      if isinstance(result.get('contribution'),dict) else None),
+                      'relation':None,
+                      'disposition':withdrawal.get('disposition'),
+                      'withdrawal':withdrawal.get('request'),
+                      'reason':withdrawal.get('reason'),
+                      'fact':evidence.get('fact'),'newest_fact':evidence.get('newest_fact'),
+                      'scope':evidence.get('scope'),'newest_scope':evidence.get('newest_scope'),
+                      'integration_commit':evidence.get('integration_commit')})
     return found
 
 
@@ -205,6 +225,15 @@ def disagreement_warnings(disagreements):
         where=_contribution_text(item)
         if item.get('kind')=='reverted':
             lines.append(_revert_warning(item, where))
+            continue
+        if item.get('kind')=='withdrawn-integration-passed':
+            lines.append('Integration after withdrawal for ' + where + ': the contribution reads ' +
+                         str(item.get('disposition')) + ' (withdraw record ' + str(item.get('withdrawal')) +
+                         ') but a trusted scope still records ' + str(item.get('fact')) +
+                         ' for commit ' + str(item.get('integration_commit')) + ' under scope ' +
+                         _scope_text(item.get('scope')) + '. A withdraw does not stop integration being '
+                         'recorded for that commit; an operator decides whether the integration stands '
+                         '(and this task needs a new revision) or is reverted with `admin.py revert-record`')
             continue
         lines.append('Integration fact disagreement for ' + where + ': the any-pass-wins fact is ' +
                      str(item.get('fact')) + ' under scope ' + _scope_text(item.get('scope')) +

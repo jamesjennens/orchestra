@@ -16,7 +16,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from admin import environment,project_dir,root_path,operators as configured_operators,verifiers as configured_verifiers
+from admin import environment,project_dir,root_path,operators as configured_operators,verifiers as configured_verifiers,review_workflow_writes as configured_review_writes
 import native
 from render import render
 from lifecycle import apply_native
@@ -231,7 +231,8 @@ def execute(root,request,authority_config=None,require_authority=False):
         def work_effect():
             return {'returncode':0,'stdout':json.dumps(work_execute(path,actor,action,args,request.get('attachments',{}),runner,
                                                                     operators=configured_operators(root),
-                                                                    verifiers=configured_verifiers(root)),ensure_ascii=False,indent=2)+'\n','stderr':''.join(run_warnings)}
+                                                                    verifiers=configured_verifiers(root),
+                                                                    review_writes=configured_review_writes(root)),ensure_ascii=False,indent=2)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             return run_guarded(request,journal_path(path),work_effect,

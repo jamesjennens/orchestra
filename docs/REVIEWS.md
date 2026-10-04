@@ -211,6 +211,145 @@ After publishing a corrected contribution, its assigned owner explicitly respond
 
 Responses are owner assertions, not reviewer acceptance. When all requests have explicit responses, the contribution returns to `awaiting-review`. A reviewer may accept using an `approve` operation with the same common fields plus `contribution` and a `summary`. Approval requires no unresolved requests and refers to the current contribution. It projects `awaiting-integration`; it does not set reviewed/integrated/deployed lifecycle facts. A new contribution requires review again. Review participation remains subject to project policy; actor names are attribution, not verified authority.
 
+`request-changes` also accepts an **optional** `summary` (1..1200 characters). It used to reject the field, so a reviewer's reasoning had to sit in a separate unlinked comment. The summary is stored on the request record and returned in structured form: every `pending_requests`/`note_requests` entry carries it as `summary`, so `review TASK` and `brief` show why the changes were asked for without reading raw comments:
+
+```json
+{
+  "schema_version": 1,
+  "operation": "request-changes",
+  "operation_id": "review-001",
+  "task": "example-task",
+  "previous": "LATEST_WORKFLOW_COMMENT_ID",
+  "contribution": "CURRENT_CONTRIBUTION_COMMENT_ID",
+  "summary": "Why these corrections are required, kept with the request.",
+  "items": [{"id":"fix-1","text":"Describe the required correction and acceptance."}]
+}
+```
+
+### Item severity: blocking or note
+
+An item may carry `severity`:
+
+```json
+{"id":"fix-1","text":"Describe the required correction.","severity":"blocking"}
+{"id":"nit-1","text":"Optional readability suggestion.","severity":"note"}
+```
+
+`blocking` is the default when the field is absent, so every item written before severity existed keeps blocking approval. Only a **blocking** item holds up approval and appears in `pending_requests`; a `note` is reported separately in `note_requests` and never blocks. Both lists carry the same per-item fields (`request`, `item`, `text`, `severity`, `summary`, `contribution`, `author`, `timestamp`); `summary` is the requesting review's optional summary (`null` when the request carried none), so `review TASK` returns the reviewer's reasoning in structured form instead of leaving it only in history and raw comments. At most 20 unresolved items of either kind are allowed.
+
+A reviewer can also **resolve or downgrade their own item** without the task owner, using `resolve-item`. The operation names the request record and the item, and requires the caller's native author to be that item's requester; anyone else is refused (the task owner uses `respond`):
+
+```json
+{
+  "schema_version": 1,
+  "operation": "resolve-item",
+  "operation_id": "resolve-001",
+  "task": "example-task",
+  "previous": "LATEST_WORKFLOW_COMMENT_ID",
+  "contribution": "CURRENT_CONTRIBUTION_COMMENT_ID",
+  "request": "REQUEST_CHANGES_COMMENT_ID",
+  "item": "fix-1",
+  "reason": "Why the request no longer applies.",
+  "disposition": "resolved"
+}
+```
+
+`disposition` is optional and is `resolved` (default) or `note`: `note` downgrades a blocking item to a non-blocking note instead of removing it. The record stays in the chain either way.
+
+**The requester match is a normalised attribution key, not verified identity.** `resolve-item` (and only `resolve-item`) compares the caller's **self-declared** native author to the item's requester with the same normalisation the follow-on gate uses: case-folded with any `/`-namespace suffix dropped. `RITA`, `rita/anything` and `rita` are therefore all accepted as the requester, and the stored record then reads as the reviewer's own resolution of their own item. Nothing verifies who actually ran the command: this is the self-declared-actor limit tracked as kittrial-5bb.106, and it is a deliberate narrowing of the review workflow, not an identity system. Every other authority decision in this document (withdraw, decline, request-review, coordinator actions) compares an actor label the caller supplied just as directly.
+
+**`approve` itself does not refuse the contribution's author.** Any actor the transport accepts may record an `approve` on the current contribution, including its author and the assignee: the projection only requires that no blocking item is unresolved. What refuses a self-approval is the **additive `follows` gate** below, which is evaluated only when a later contribution declares `follows`. A first contribution, a `supersedes` revision and integration are not gated on the approval's author, and the HTTP path's `CAP_APPROVE` capability is the only route where approval authority is authenticated.
+
+### Withdrawing or superseding a contribution
+
+A contribution that is no longer to be reviewed can be closed out by its **author** or by a **coordinator** (an actor on the server-side operator allowlist) with `withdraw`:
+
+```json
+{
+  "schema_version": 1,
+  "operation": "withdraw",
+  "operation_id": "withdraw-001",
+  "task": "example-task",
+  "previous": "LATEST_WORKFLOW_COMMENT_ID",
+  "contribution": "CURRENT_CONTRIBUTION_COMMENT_ID",
+  "reason": "Superseded by a re-scope; a different change is needed.",
+  "disposition": "withdrawn"
+}
+```
+
+`disposition` is optional and is `withdrawn` (default) or `superseded`. The operation closes the contribution's review requests and `review TASK` then reports `review_state` `withdrawn` or `superseded` plus a `withdrawal` block naming the record, reason, author and timestamp. Approval is refused on a withdrawn revision; the only way back into review is a new contribution, which clears the withdrawal. The record stays in history for audit.
+
+Three rules keep a withdraw from becoming a way around review:
+
+* **It carries the unresolved items forward.** A withdraw does **not** clear the contribution's `pending_requests`/`note_requests`; the task's NEXT contribution carries them, exactly as a `supersede` revision does. Without that, withdrawing and re-contributing at the same commit would read `awaiting-review` with no pending items and an unrelated `approve` would be accepted - a second route around the blocking items that left no per-item answer. The items stay visible on the withdrawn revision too (`review_state` is still `withdrawn`/`superseded`, with the items listed), and after the new contribution the state is `changes-requested` until the owner responds.
+* **An integrated contribution cannot be withdrawn.** Once the contribution reads `integrated` (a trusted scope records `integrated=passed` for its FULL commit) the withdraw is refused before any write. Otherwise the read showed `withdrawn` with an integration block still saying `passed` and matching, the task left `work --state integrated`, and a following contribution was refused as not approved, so the task could no longer take a second delivery. Withdrawing an approved-but-unintegrated revision is still allowed.
+* **A second withdraw on the same contribution is refused.** The disposition is decided once. On the read path a chain that already holds two withdraw records stays readable: the **first** disposition stands and the ignored record is named in a warning, so a later record can never flip `withdrawn` to `superseded` (or back).
+
+**Withdrawal does not stop integration being recorded.** The integration fact is scoped lifecycle evidence, not part of the review chain, so a `integrated=passed` recorded after a withdraw is still recorded. `review TASK`, `brief` and `work` then report the withdrawal **with a warning** (`integration_disagreements` kind `withdrawn-integration-passed`, and a matching warning line naming the withdraw record, the commit and the scope), and the operator decides whether the integration stands and the task needs a new revision or the integration commit is removed with `admin.py revert-record`. A withdrawn contribution with a passing integration block is never shown without that warning.
+
+**Closing a task clears its awaiting-review queue entry.** A closed task is no longer offered to a reviewer when its review state is `awaiting-review` (or the legacy `review-ready` label) - that was the queue behaviour the pilot reported as contributions "awaiting review for ever" on closed tasks. The record stays readable through `review TASK`, and `brief`/`work` still surface a closed task with outstanding `changes-requested`, an approved-but-unintegrated revision, or a malformed history, because closure is not acceptance.
+
+### First-class review requests
+
+Independent review is requested on the contribution itself instead of a hand-made review-assignment task. The current task owner (or a coordinator) records `request-review`, naming the reviewer:
+
+```json
+{
+  "schema_version": 1,
+  "operation": "request-review",
+  "operation_id": "request-review-001",
+  "task": "example-task",
+  "previous": "LATEST_WORKFLOW_COMMENT_ID",
+  "contribution": "CURRENT_CONTRIBUTION_COMMENT_ID",
+  "reviewer": "REVIEWER_ACTOR",
+  "summary": "Optional pointer to what needs independent review."
+}
+```
+
+The optional `summary` is bounded to 1200 characters. An open request appears in `review TASK` as `pending_review_requests` and puts the task in the **named reviewer's** `work --mine` queue even though they are not the assignee; it is not in any other actor's queue. A reviewer named for an already-open request is refused as a duplicate, a request for a revision a new contribution replaced is dropped with it, and the self-approval refusal is unchanged: `request-review` refuses to name the contribution's own author as the reviewer, and the additive follow-on gate below still refuses an approval by the contribution author or the assignee. The reviewer field is an actor identity, so `@` and `/` are accepted (for example `alice@host`, `team/alice`); the narrower comment-id shape used elsewhere is not applied to a person.
+
+**A queue row that is a review request says so.** Two additive `work` item fields: `review_requests` lists the open requests naming the **calling** actor (request id, reviewer, contribution, summary, author, timestamp), and `review_request` is true when the row is in that caller's queue because they were named rather than because they own the task. `work --help` lists both under `item_fields`.
+
+**A request closes four ways.** The named reviewer's own `approve` or `request-changes` on the same contribution closes it (as before); **any** `approve` on the current contribution closes every request for it, so a request cannot stay open after another reviewer approves; closing the native task closes them too (`projection` reads the task status, so `review TASK`, `brief` and `work` all report no open request for a closed task, and a new `request-review` on a closed task is refused with the "Reopen the closed task explicitly" rule); and the named reviewer can **decline** their own request with a new gated operation:
+
+```json
+{
+  "schema_version": 1,
+  "operation": "decline-review",
+  "operation_id": "decline-001",
+  "task": "example-task",
+  "previous": "LATEST_WORKFLOW_COMMENT_ID",
+  "contribution": "CURRENT_CONTRIBUTION_COMMENT_ID",
+  "request": "REQUEST_REVIEW_COMMENT_ID",
+  "reason": "Out of my area; ask someone else."
+}
+```
+
+Only the named reviewer may decline (normalised attribution key); anyone else is refused, and the declined request is returned additively as `declined_review_requests` (request, reviewer, reason, author, timestamp) so the closure is not silent.
+
+**Open requests are capped per requester.** One actor may hold at most **10 open review requests at a time, counted across every task in the project**: an 11th is refused before any write, naming the requester's current count and the cap. That is the abuse path where one actor put 25 tasks into another's `work --mine` queue in 71 seconds. The count reads every task's chain and ignores a chain it cannot parse, exactly as `work` treats an unreadable row; a declined, closed or otherwise settled request frees a slot.
+
+### Staged rollout: writing the new shapes is opt-in
+
+kittrial-5bb.94's coordinator direction is a **two-step ship**, because every shape above is one an older kit fails closed on.
+
+* The **readers in this kit understand every new operation and field unconditionally**: `review`, `brief`, `work` and `history` parse and project `withdraw`, `request-review`, `resolve-item`, `decline-review`, an item `severity` and a request-changes `summary` in both settings below.
+* **Writing** them is refused unless the per-installation setting `review_workflow_writes` is on. It is a boolean in the deployment configuration `deployment.private.json` at the runtime root, **absent or false means OFF**, and a non-boolean value is refused rather than coerced. With it off, `execute` refuses `withdraw`, `resolve-item`, `request-review` and `decline-review`, a `request-changes` that carries `summary`, and a `request-changes` item that carries `severity`, all **before any native write**. A legacy `{id, text}` request-changes item is an old shape and is still written with the switch off, and an **exact retry** of an operation id already in the chain still reconciles, so a record written while the switch was on stays recoverable after it is turned off.
+* There is deliberately **no `ORCHESTRA_*` environment fallback**: `deployment.private.json` is the single source, exactly as for `operators` and `verifiers`, and the endpoint supplies the value to the review write path. A contributor cannot set it from a payload.
+* The coordinator turns it on once the **rollback target is a kit that reads the new shapes**:
+
+```text
+python3 admin.py review-writes status --actor OPERATOR
+python3 admin.py review-writes on --actor OPERATOR
+python3 admin.py review-writes off --actor OPERATOR
+```
+
+The actor must be on the deployment operator allowlist. Until the switch is on, a deployment may roll back to the previous kit safely: no chain it wrote can contain a shape that kit refuses. After it is on, the rollback position is the one described under "Rollback compatibility" below.
+
+### Rollback compatibility of the additive operations
+
+`withdraw`, `request-review`, `resolve-item` and `decline-review` are new `operation` values in the same reserved `Kind: contribution-review-v1` chain, and `severity`, the request-changes `summary` and the `disposition` fields are optional additions to existing operations. **Records written before this change keep validating and reading unchanged** in this kit: an item without `severity` reads as `blocking`, a request-changes without `summary` is unchanged, and `note_requests`/`pending_review_requests`/`declined_review_requests`/`withdrawal` read empty or null. In the other direction an older kit meets an `operation` it does not know inside a task's chain, fails closed on that chain ("Malformed contribution-review history; operator reconciliation required") and needs an operator void or an upgraded kit - it never silently misreads the record. That is exactly why writing them is behind `review_workflow_writes`: with the switch off (the default) a deployment that may still be rolled back never writes a shape the older kit cannot read, and the coordinator turns it on once the rollback target reads them. The same limits as the `assignee_at_approval` snapshot apply: decide the rollback position before deploying, and use `admin.py void-record` to reconcile a chain an older kit cannot read.
+
 ## Target the contribution record, not the latest comment
 
 `contribution` in a `request-changes`, `respond` or `approve` operation names the **contribution record's `comment_id`** — the `contribution.comment_id` returned by `review TASK`, or `contribution_id` on an item returned by `work --mine`. The Git SHA is a separate value: `contribution.commit` in `review TASK`, or `commit` in a work item. The contribution record ID is **not** `latest_comment_id`, which is the newest record in the chain and advances with every reviewer request, response and approval. The two coincide only while the contribution is also the most recent record.
@@ -250,12 +389,12 @@ b brief example-task
 b review example-task
 ```
 
-The queue sorts requested changes first and shows task status, owner, review state, exact contribution commit and separate lifecycle values/scope. `--owner ACTOR`, `--limit` and `--offset` support coordinator scans. Pages are fresh views, not immutable history snapshots. Closed tasks with outstanding review state remain visible; closure is not acceptance. Check the scope-match field before applying historical lifecycle evidence to the current contribution.
+The queue sorts requested changes first and shows task status, owner, review state, exact contribution commit and separate lifecycle values/scope. `--owner ACTOR`, `--limit` and `--offset` support coordinator scans. Pages are fresh views, not immutable history snapshots. Closing a task clears its `awaiting-review`/legacy `review-ready` queue entry (see "Withdrawing or superseding a contribution"); a closed task with outstanding requested changes or an approved-but-unintegrated revision stays visible, and closure is still not acceptance. Check the scope-match field before applying historical lifecycle evidence to the current contribution.
 
 `review TASK`, `brief` and `work` combine the workflow chain and lifecycle evidence in **one shared projection**, so they cannot disagree about whether a contribution is integrated. The review write receipt (`review TASK --file payload.json`) reports the same effective `review_state` as those reads, plus the same additive `workflow_state` and `integration` fields, so an approval whose scoped integration evidence was recorded earlier is receipted as `integrated` rather than `awaiting-integration`. Additive fields:
 
-- `review_state` is the effective state and may now be `integrated`.
-- `workflow_state` is the raw append-only workflow state, kept clearly separate (`none`, `awaiting-review`, `changes-requested`, `awaiting-integration`, or `legacy-review-ready` for the legacy label).
+- `review_state` is the effective state and may now be `integrated`, or `withdrawn`/`superseded` after a `withdraw` operation.
+- `workflow_state` is the raw append-only workflow state, kept clearly separate (`none`, `awaiting-review`, `changes-requested`, `awaiting-integration`, `withdrawn`, `superseded`, or `legacy-review-ready` for the legacy label).
 - `integration` reports `fact`, `scope`, `scope_token`, `source_commit`, `integration_commit`, `matches_contribution`, `newest_fact`, `newest_scope_token`, `newest_scope`, `reverted`, `reverted_commits` (bounded) and `reverted_total` for the current contribution. Each `prior_contributions` entry carries the same block for its own FULL commit, so a follow-on read also answers whether the replaced revision is integrated. A top-level `integration_disagreements` list (and, in `brief`/`work`, a matching human-readable warning) names both facts and both scopes whenever `newest_fact` differs from `fact`, and carries a `reverted` entry naming the removed commit(s) whenever a host-issued revert applies to the contribution.
 
 Exactly what each match field means:

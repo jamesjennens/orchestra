@@ -1439,9 +1439,9 @@ incorporation. Rejected and duplicate proposals are never selected.
 - **Native task ID**: `task`/`items[].task`/the positional argument to `show`, `brief`,
   `review`, `handoff`. It is stable and is what dependencies reference.
 - **Comment ID**: `contribution_id`, `contribution.comment_id`, `latest_comment_id`,
-  checkpoint `comment_id`. In a `contribute`/`request-changes`/`respond`/`approve`
-  payload, `contribution` is the **contribution record's comment ID** — never a Git SHA
-  and never `latest_comment_id`.
+  checkpoint `comment_id`. In a `contribute`/`request-changes`/`respond`/`approve`/
+  `withdraw`/`request-review`/`resolve-item`/`decline-review` payload, `contribution` is the
+  **contribution record's comment ID** — never a Git SHA and never `latest_comment_id`.
 - **Git commit**: `contribution.commit` / `base_commit` are exact 40- or 64-character
   hexadecimal revisions. They are not comment IDs.
 - **`activity_cursor`**: identifies the current task snapshot. `brief` emits it;
@@ -1481,6 +1481,11 @@ a clear refusal, not a wrong read.
 | `history` | `--body-budget` | 256..8000 encoded bytes |
 | `review` | `items`/`resolutions` | 1..20 entries |
 | `review` | `summary` | <= 1200 characters |
+| `review` | item `severity` | `blocking` or `note` (absent means `blocking`) |
+| `review` | `withdraw` `reason` / `request-review` `reviewer` / `resolve-item` `reason` | <= 1000 characters / an actor identity (may contain `@` or `/`) / <= 1000 characters |
+| `review` | `decline-review` `reason` | <= 1000 characters |
+| `review` | open `request-review` requests per requester | 10 (project-wide) |
+| `review` | writing a new shape (`withdraw`, `request-review`, `resolve-item`, `decline-review`, item `severity`, request-changes `summary`) | refused unless `deployment.private.json` sets `review_workflow_writes` true (`admin.py review-writes on`); readers always understand them |
 | `checkpoint` | `open_items` / `resolved` | <= 100 each |
 | `checkpoint` | item `text`/`reason` | <= 400 characters |
 | `checkpoint` | item `source`/`evidence` | <= 240 characters |
