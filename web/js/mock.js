@@ -259,6 +259,39 @@ export function createMock(options = {}) {
     return ok(projectView(db.projects[id]), 201);
   });
   on('GET', '/v1/projects/(?<pid>[\\w-]+)', (b, p) => guardProject(p.pid) || ok(projectView(db.projects[p.pid])));
+  // Project setup (kittrial-5bb.118): the steps as the real service returns them. The
+  // three host steps are examples here; the mock has no server behind it.
+  on('PATCH', '/v1/projects/(?<pid>[\\w-]+)', (b, p) => {
+    const g = guardProject(p.pid); if (g) return g;
+    if (!isOwner(p.pid)) return err(403, 'forbidden', 'Only a project owner can change a project');
+    const value = b.repository;
+    if (value && (value.length > 300 || !/^[A-Za-z0-9._~:\/@%+=,\\-]+$/.test(value) || value.startsWith('-'))) return err(422, 'invalid_payload', 'repository may contain only letters, digits and . _ ~ : / @ % + = , \\ - (no spaces, quotes or control characters) and must not start with -');
+    // The real service accepts four exact forms (HTTP_DEPLOYMENT); the prototype refuses the credential-carrying ones.
+    if (value && (/^https?:\/\/[^\/]*@/i.test(value) || /^[^\/@:]*:[^\/@]*@/.test(value) || /^[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\/@]*:[^\/@]*@/.test(value))) return err(422, 'invalid_payload', 'repository must not contain a user name, token or password on an https URL, or a password anywhere; give the location only');
+    if (value) db.projects[p.pid].repository = value; else delete db.projects[p.pid].repository;
+    log(p.pid, 'projects.repository');
+    return ok({ id: p.pid, repository: value || null });
+  });
+  on('GET', '/v1/projects/(?<pid>[\\w-]+)/setup', (b, p) => {
+    const g = guardProject(p.pid); if (g) return g;
+    if (!isOwner(p.pid)) return err(403, 'forbidden', 'Only a project owner can see the setup steps');
+    const project = db.projects[p.pid];
+    const members = Object.keys(db.memberships[p.pid] || {}).length;
+    const tasks = db.tasks.filter((t) => t.project_id === p.pid).length;
+    const agents = Object.values(db.users).filter((u) => u.agent_of && (db.memberships[p.pid] || {})[u.id]);
+    const operator = 'The web interface cannot do this step. It is done on the server, by an operator, with the command shown. If you are also the operator, run it there; otherwise send the command to whoever is.';
+    const step = (id, title, state, detail, who, who_text, extra = {}) => ({ id, title, state, detail, who, who_text, link: null, command: null, note: null, ...extra });
+    const steps = [
+      step('members', 'Add the people who will work in this project', members > 1 ? 'done' : 'optional', members > 1 ? `${members} members.` : 'You are the only member. That is fine if you work alone; otherwise add the others.', 'owner', 'A project owner', { note: 'An owner adds contributors and viewers. Only a superuser can make someone an owner.' }),
+      step('repository', "Record where the project's repository is", project.repository ? 'done' : 'todo', project.repository ? 'Recorded: ' + project.repository : 'Not recorded. An agent needs a clone of the repository with a remote it can push to; this tells it which repository that is.', 'owner', 'A project owner', { note: "Orchestra stores this as a label and shows it to members and their agents. It does not check that the repository exists, that anyone can reach it, or that an agent's clone points at it." }),
+      step('first-task', 'Define a first task', tasks ? 'done' : 'todo', tasks ? `${tasks} task(s) defined.` : 'No task yet. Define the first piece of work so that someone, or an agent, can claim it.', 'member', 'Any member who may write tasks'),
+      step('agent', 'Grant a personal agent this project', agents.length ? 'done' : 'todo', agents.length ? `${agents.length} agent(s) may work here.` : 'No agent may work here yet. Each member creates their own agent and grants it this project; the agent page gives the setup text to copy to the machine the agent runs on.', 'each-member', 'Each member, for their own agent', { note: "An agent belongs to the member who created it. You can see that other members' agents exist here, not their setup." }),
+      step('guidance', 'Set the standing guidance every worker reads', 'todo', 'Not set. Guidance is the short standing instruction every worker and agent reads at the start of a run.', 'operator', 'An operator, on the server that runs Orchestra', { command: `admin.py set-guidance ${p.pid} --actor OPERATOR --file FILE`, note: operator }),
+      step('onboarding', "Set the project's onboarding entry point", 'done', 'Set (last changed 2026-10-01).', 'operator', 'An operator, on the server that runs Orchestra'),
+      step('backup', 'Make sure a scheduled backup covers this project', 'todo', 'No scheduled backup on the server covers this project. An operator adds the line shown to the backup schedule, or names this project in the existing one. No backup run has recorded this project yet.', 'operator', 'An operator, on the server that runs Orchestra', { command: 'ExecStart=/usr/bin/python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime backup --all', note: operator }),
+    ];
+    return ok({ project: { id: p.pid, name: project.name, repository: project.repository || null }, steps, remaining: steps.filter((s) => s.state === 'todo').length, host: 'available', generated_at: new Date().toISOString() });
+  });
   on('POST', '/v1/projects/(?<pid>[\\w-]+)/archive', (b, p) => {
     const g = guardProject(p.pid); if (g) return g;
     if (!isOwner(p.pid)) return err(403, 'forbidden', 'Only a project owner can archive it');

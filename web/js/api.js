@@ -103,6 +103,9 @@ export function createApi(transport) {
     createProject: (name) => mutate('POST', '/v1/projects', { name }),
     registerProject: (projectId, name) => mutate('POST', '/v1/projects', name ? { project_id: projectId, name } : { project_id: projectId }),
     archiveProject: (pid) => mutate('POST', `/v1/projects/${pid}/archive`, {}),
+    // The setup steps of a project (owners and superusers), and where its repository is.
+    projectSetup: (pid) => call('GET', `/v1/projects/${pid}/setup`),
+    setRepository: (pid, repository) => mutate('PATCH', `/v1/projects/${pid}`, { repository }),
     // Superuser only: the records this server will not serve, to confirm or archive.
     unconfirmedProjects: () => call('GET', '/v1/projects/unconfirmed'),
     confirmProject: (pid) => mutate('POST', `/v1/projects/${pid}/confirm`, {}),

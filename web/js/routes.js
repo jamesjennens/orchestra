@@ -16,6 +16,7 @@ export const ROUTE_PATTERNS = [
   ['reviews', '/p/{pid}/reviews'],
   ['feedback', '/p/{pid}/feedback'],
   ['settings', '/p/{pid}/settings'],
+  ['setup', '/p/{pid}/setup'],
   ['newTask', '/p/{pid}/new'],
   ['task', '/p/{pid}/t/{tid}'],
   ['requirements', '/p/{pid}/requirements'],

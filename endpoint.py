@@ -242,6 +242,13 @@ def execute(root,request,authority_config=None,require_authority=False):
     if action in ('onboard','docs'):
         from onboarding import execute as onboard
         return {'returncode':0,'stdout':onboard(Path(__file__).resolve().parent,path,name,actor,action,request.get('args',[]),endpoint=Path(__file__).resolve()),'stderr':''}
+    if action=='setup-status':
+        # Read-only (kittrial-5bb.118): what the host knows about this project's setup,
+        # for the web setup page. States, versions and times only; never guidance or
+        # onboarding text. It takes no lock and writes nothing.
+        if request.get('args',[]) not in ([],None):raise ValueError('Use setup-status without arguments')
+        from admin import project_setup_status
+        return {'returncode':0,'stdout':json.dumps(project_setup_status(root,name))+'\n','stderr':''}
     if action=='guidance':
         # The standing guidance channel (kittrial-5bb.99 slice 1, revised). The
         # endpoint is read-only except for the caller's own acknowledgement: the only

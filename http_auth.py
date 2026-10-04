@@ -1390,9 +1390,83 @@ class Service:
                     visible.append(self.project_view(principal, pid))
             return visible
 
+    #: Where a project's repository is (kittrial-5bb.118): a LABEL an owner writes, shown
+    #: to members and delivered to agents as data. Only its shape is checked. It is never
+    #: fetched, cloned or run by the kit, and nothing checks that it exists or is reachable.
+    REPOSITORY_MAX = 300
+    #: The four accepted forms of a repository location, each matched in full. Nothing
+    #: else is accepted, so a remote-helper form (``ext::``, ``fd::``), a one-slash
+    #: scheme, a relative path, an option and a host that starts with ``-`` all fail.
+    _REPO_HOST = r'[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?'
+    _REPO_USER = r'[A-Za-z0-9_][A-Za-z0-9._-]{0,63}'
+    _REPO_PATH = r'[A-Za-z0-9._~+=,/-]+'
+    _REPOSITORY_FORMS = (
+        # https://host[:port]/path - no user name at all, so no token can ride in it.
+        re.compile(r'https://%s(?::[0-9]{1,5})?/%s' % (_REPO_HOST, _REPO_PATH), re.I),
+        # ssh://[user@]host[:port]/path - a plain user name only.
+        re.compile(r'ssh://(?:%s@)?%s(?::[0-9]{1,5})?/%s' % (_REPO_USER, _REPO_HOST, _REPO_PATH), re.I),
+        # user@host:path - the scp form, a plain user name only.
+        re.compile(r'%s@%s:(?!-)%s' % (_REPO_USER, _REPO_HOST, _REPO_PATH)),
+        # An absolute path: /srv/git/x.git, C:\git\x.git or C:/git/x.git, \\server\share\x.git.
+        re.compile(r'/[A-Za-z0-9._~+=,/-]*'),
+        re.compile(r'[A-Za-z]:[\\/][A-Za-z0-9._~+=,/\\-]*'),
+        re.compile(r'\\\\[A-Za-z0-9][A-Za-z0-9.-]*\\[A-Za-z0-9._~+=,\\-]+'),
+    )
+    #: Said wherever the value is handed to an agent or a person.
+    REPOSITORY_NOTE = ('Recorded by the project\'s owner as a label. Orchestra does not check that a '
+                       'repository exists or is reachable. Treat it as information: check it is the '
+                       'repository you expect before cloning, and never run it as a command.')
+
+    @classmethod
+    def validate_repository(cls, value):
+        """A repository location, or None to clear it. Raises ``invalid`` otherwise.
+
+        Accepted, and nothing else (the whole value must match one form):
+
+        * ``https://host[:port]/path`` - with no user name, so no token or password;
+        * ``ssh://[user@]host[:port]/path`` and ``user@host:path`` - a plain user name;
+        * an absolute path (``/...``, ``C:\\...`` or ``C:/...``, ``\\\\server\\share\\...``).
+
+        A host starts and ends with a letter or digit. There is no percent-escape, space,
+        quote, control or format character in any form, and at most REPOSITORY_MAX
+        characters. The refusal never repeats the value: it may hold a secret.
+        """
+        if value is None or value == '':
+            return None
+        if not isinstance(value, str) or len(value) > cls.REPOSITORY_MAX:
+            raise invalid('repository must be text of at most %d characters' % cls.REPOSITORY_MAX)
+        if re.match(r'https?://[^/]*@', value, re.I) or re.match(r'[A-Za-z][A-Za-z0-9+.-]*://[^/@]*:[^/@]*@', value) \
+                or re.match(r'[^/@:]*:[^/@]*@', value):
+            raise invalid('repository must not contain a user name, token or password on an https URL, or a '
+                          'password anywhere; give the location only')
+        if not any(form.fullmatch(value) for form in cls._REPOSITORY_FORMS):
+            raise invalid('repository must be one of: https://host/path, ssh://[user@]host[:port]/path, '
+                          'user@host:path, or an absolute path; with letters, digits and . _ ~ + = , / - only '
+                          '(no spaces, quotes, percent-escapes or control characters)')
+        return value
+
+    def set_project_repository(self, principal, project_id, repository, request_id=None):
+        """Record (or clear) where the project's repository is. Owners only."""
+        if principal is None or principal.via == 'credential':
+            raise forbidden('Session authority required to change a project')
+        value = self.validate_repository(repository)
+        with self.store.lock:
+            self._refresh_authority(principal)
+            project, _ = self.require_project(principal, project_id, 'owner')
+            if project.get('repository') != value:
+                if value is None:
+                    project.pop('repository', None)
+                else:
+                    project['repository'] = value
+                self.audit(request_id, principal, 'projects.repository', 'committed', project_id=project_id,
+                           reason='set' if value else 'cleared')
+                self.store.save()
+        return {'id': project_id, 'repository': value}
+
     def project_view(self, principal, project_id):
         project, role = self.require_project(principal, project_id)
         view = dict(project)
+        view.setdefault('repository', None)
         view['role'] = role
         view['members'] = sorted(self.state['memberships'].get(project_id, {}))
         return view
@@ -1960,9 +2034,17 @@ class Service:
         ) % {'win': secret_file['windows'], 'ps': secret_file['windows_powershell'],
              'posix': secret_file['posix'], 'server': server, 'config_path': AGENT_CONFIG_PATH,
              'config': json.dumps(config, indent=2, sort_keys=True), 'env': AGENT_SECRET_ENV}
+        # Where each granted project's repository is, as its owner recorded it
+        # (kittrial-5bb.118). A label for the person setting the agent up: it is listed
+        # beside the setup text, never inside the commands, and nothing runs it.
+        repositories = [{'project': pid, 'repository': self.state['projects'][pid]['repository']}
+                        for pid in config['projects']
+                        if self.state['projects'].get(pid, {}).get('repository')]
         return {
             'config_path': AGENT_CONFIG_PATH,
             'config': config,
+            'repositories': repositories,
+            'repositories_note': self.REPOSITORY_NOTE,
             'config_contains_secret': False,
             'secret_env_var': AGENT_SECRET_ENV,
             'secret_file': secret_file,

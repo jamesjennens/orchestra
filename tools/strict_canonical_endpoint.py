@@ -300,6 +300,15 @@ def dispatch(canonical, request, tmp, run=None):
         items = {k: dict(v, path=str(Path(tmp) / k)) for k, v in attachments.items()}
         result = work_execute(canonical.path, actor, action, args, items, run)
         return envelope(0, json.dumps(result, ensure_ascii=False) + '\n')
+    if action == 'setup-status':
+        # endpoint.py's read-only setup-status action (kittrial-5bb.118).
+        try:
+            from admin import project_setup_status
+        except ImportError:  # a revision that predates the action
+            raise ValueError('Unknown action')
+        if args:
+            raise ValueError('Use setup-status without arguments')
+        return envelope(0, json.dumps(project_setup_status(canonical.root, project, canonical.path)) + '\n')
     if action == 'anchors':
         # endpoint.py's read-only anchors action (kittrial-5bb.71): the anchors among
         # the given task ids (bd show --include-comments there), or the snapshot.
