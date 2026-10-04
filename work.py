@@ -111,8 +111,6 @@ def help_payload(action='work'):
         payload['operations'] = ['read (review TASK)', 'contribute', 'request-changes',
                                  'respond', 'approve', 'withdraw', 'request-review',
                                  'resolve-item', 'decline-review', 'recommend']
-        import review_recommendations
-        payload['limits'] = review_recommendations.help_limits()
         payload['notes'] = [
             'Contribution payloads use contribution = the contribution record comment_id, '
             'never a Git SHA and never latest_comment_id.',
@@ -135,7 +133,8 @@ def help_payload(action='work'):
             'review item or a resolution the error also names which one (its index and id). The limits '
             'are listed in `limits`.',
         ]
-        payload['limits'] = review_workflow_limits()
+        import review_recommendations
+        payload['limits'] = dict(review_workflow_limits(), **review_recommendations.help_limits())
     elif action == 'handoff':
         payload['operations'] = ['transfer (from_actor/to_actor)', 'request', 'disposition']
         payload['notes'] = ['A JSON file attachment is required; payload.task must equal TASK.']

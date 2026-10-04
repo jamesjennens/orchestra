@@ -333,6 +333,8 @@ class TransportTests(Harness):
         self.assertEqual(payload['limits']['recommend summary'], '1..1200 characters')
         self.assertEqual(payload['limits']['recommend items'], '0..20 notes, each text <= 1000 characters')
         self.assertEqual(payload['limits']['recommend verdict'], 'approve')
+        # Beside the chain's own limits (kittrial-5bb.97), not instead of them.
+        self.assertEqual(payload['limits']['review text'], '<= 1000 characters')
         self.assertTrue(any('never an approval' in note for note in payload['notes']))
 
 
