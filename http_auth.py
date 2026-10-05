@@ -1783,6 +1783,37 @@ class Service:
     # agent on its next request. ``working_directory`` is a free-text hint for the
     # owner's own machine; the server stores it and never reads it, and only the owner
     # (or a superuser) ever receives it in a response.
+    def agent_review_standing(self, agent_id, project_id):
+        """``(may_review, owner_approves)`` for one agent in one project, from live state.
+
+        ``may_review``: a live credential of the agent holds the reviews capability there
+        (its scope, capped by its owner's current role). ``owner_approves``: the agent's
+        owner can approve in that project. Used to decide which review work an agent is
+        shown (kittrial-5bb.115); it grants nothing.
+        """
+        from http_authority import credential_capabilities
+        with self.store.lock:
+            agent = self.state['agents'].get(agent_id)
+            if not isinstance(agent, dict) or not agent.get('enabled') or \
+                    project_id not in (agent.get('projects') or []):
+                return False, False
+            owner = self.state['users'].get(agent.get('owner'))
+            if not isinstance(owner, dict) or owner.get('disabled'):
+                return False, False
+            role = self.state.get('memberships', {}).get(project_id, {}).get(owner['id'])
+            approves = bool(owner.get('superuser')) or CAP_APPROVE in ROLE_CAPABILITIES.get(role, frozenset())
+            moment = self._expiry_now()
+            for credential in self.state.get('credentials', {}).values():
+                if not isinstance(credential, dict) or credential.get('agent_id') != agent_id or \
+                        credential.get('revoked') or credential.get('expires_at', 0) <= moment:
+                    continue
+                try:
+                    if CAP_REVIEWS in credential_capabilities(self.state, credential, owner, project_id):
+                        return True, approves
+                except AuthorityDenied:
+                    continue
+            return False, approves
+
     def agent_actor(self, agent):
         """The stable attribution label an agent's API writes carry."""
         return agent['id']

@@ -37,7 +37,7 @@ ITEM_FIELDS = {
     # Additive: what agent attention needs from this read (kittrial-5bb.114).
     'pending_change_requests', 'open_items', 'checkpoint_at', 'newer_activity',
     # Additive: a standing reviewer recommendation on the current contribution (kittrial-5bb.115).
-    'recommended', 'recommended_by',
+    'recommended', 'recommended_by', 'contribution_author',
     # Additive deployed-delivery identification (kittrial-5bb.95).
     'deployed_delivery', 'deployed_delivery_is_current_contribution',
     # Additive review-request identification (kittrial-5bb.94 item 4).

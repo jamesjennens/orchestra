@@ -1277,8 +1277,9 @@ line separately and unconfined.
   - **One action per own task, in this order:** `changes-requested` (priority 1, with
     `requests`, the request-changes record ids), `blocked` (2: the latest checkpoint
     lists open items; with `open_items`, `blocked_since` and `newer_activity`),
-    `in-progress` (3: claimed, not closed, nothing delivered yet), then
-    `claimable-task` (4), then `awaiting-review` and `awaiting-integration` (5).
+    `in-progress` (3: claimed, not closed, nothing delivered yet), then review work
+    and `claimable-task` (4, see below), then `awaiting-review` and
+    `awaiting-integration` (5).
     `review-error` names the malformed state and asks an operator to reconcile it;
     other own states get `review-state`, naming the state and who acts next. Neither
     silently disappears from the action list. Action **kind names** are the client
@@ -1289,6 +1290,36 @@ line separately and unconfined.
     Explicitly unreadable checkpoint history keeps `open_items: null` and gets
     `checkpoint-error`, asking an operator to reconcile it. Unknown does not count
     as zero unresolved items or as undelivered work the agent can safely continue.
+  - **Review work (kittrial-5bb.115).** Two kinds, for an agent that holds the reviews
+    capability in the project. They come from the same `work` snapshot: no further
+    read.
+    - `to-review`: a contribution that awaits review and that this agent has not
+      recommended yet. The agent reviews it and records a recommendation or requests
+      changes. `who` is `agent`.
+    - `review-recommended`: a contribution that awaits review and has a standing
+      recommendation, shown to an agent **whose owner can approve**. An agent cannot
+      approve: the action says to tell the owner it is ready. `who` is `owner`.
+    - An agent is shown a delivery only if it could itself recommend it: not its own
+      task or contribution, not its owner's, not another agent of its owner's, and
+      only in a project it is granted.
+    - Each action carries `recommended_by`, `contribution` and `commit`.
+    - `counts` gains `review_recommended` and `to_review`. At most 20 review actions in
+      all, over every project the agent is granted (recommended ones first), are
+      listed, so claimable work stays on the list. The counts are exact and
+      `truncated` says when more exist.
+    - **The `state` values do not change for review work.** An agent with nothing of
+      its own and something to review still reads `idle`. The `summary` names the
+      review work whenever a count is not zero ("1 contribution(s) recommended for
+      approval: tell the owner; 2 contribution(s) to review."), so an owner looking at
+      the agent list is not told there is nothing to do.
+    - The prompt copied from My work (`GET /v1/me/work`, `agent_prompts`) names the
+      same work. A person who may review but not approve gets "Contributions you could
+      review" with the contributions of other people that nobody of theirs has
+      recommended yet; an approver's review lines add "recommended by N reviewer(s)".
+  - **Order within a priority is part of the contract; the numbers are not.**
+    `review-recommended`, `to-review` and `claimable-task` all carry priority 4 and
+    are listed in that order. No kind was renumbered when these two were added. A
+    client relies on the order of `next_actions` and on the kind names.
   - **Why the two waiting kinds are last.** An agent, and anything that wakes it,
     takes the first action. The agent can do nothing about a contribution that waits
     for a reviewer or for integration, so those never sit ahead of work it can do.
