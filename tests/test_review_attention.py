@@ -190,7 +190,11 @@ class InProcessTests(Shared, test_http_agents.AgentHarness):
 
     def test_standing_is_per_project_and_follows_the_live_grant(self):
         self.people()
-        other = self.create_project(self.admin_token(), 'Beta')
+        admin = self.admin_token()
+        other = self.create_project(admin, 'Beta')
+        # Heron's owner owns Beta too; Heron itself is not granted it.
+        added = self.request('PUT', '/v1/projects/%s/members/%s' % (other, self.ids['olive']), {'role': 'owner'}, token=admin)
+        self.assertIn(added.status, (200, 201), added.data)
         standing = self.service.agent_review_standing
         self.assertEqual(standing(self.agent_ids['Heron'], self.project), (True, True))
         self.assertEqual(standing(self.agent_ids['Osprey'], self.project), (True, False))
