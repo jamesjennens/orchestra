@@ -1432,6 +1432,70 @@ class LaterLiveVerifiedTests(unittest.TestCase):
         self.assertEqual(store.facts('trial-a')['scope']['release_id'], 'r-1')
 
 
+class ReleaseWriteVolumeTests(unittest.TestCase):
+    """The write count a large project pays for a later release (.107 item 2).
+
+    200 tasks is the request bound and the size the rev3 review used; these pin
+    that a later release selects only what it ADDS, and that a later
+    ``--live-verified`` appends ONE fact per carried unverified task instead of
+    rewriting its scope, deployed, live and live-verified facts (the pre-fix
+    behaviour, four writes each).
+    """
+
+    def release_scope(self, release='r-2', environment='production'):
+        return {'source_commit': '', 'integration_commit': RELEASE_COMMIT,
+                'release_id': release, 'environment': environment}
+
+    def writes(self, store):
+        return len([call for call in store.calls if call[0] == 'set-state'])
+
+    def test_a_later_release_selects_only_what_it_adds_at_two_hundred_tasks(self):
+        carried = tuple('carried-%03d' % index for index in range(200))
+        store = NativeStore(tasks=carried + ('fresh-001',))
+        for task in carried:
+            store.seed(task)
+        store.seed('fresh-001', integration=MERGE_B, source=SOURCE_B)
+        store.record(release_payload([target(task) for task in carried],
+                                     operation='release-r1', release='r-1'))
+        selection = release_selection(store.rows, self.release_scope(),
+                                      lambda commit, release: True)
+        self.assertEqual([item['task'] for item in selection['targets']], ['fresh-001'],
+                         'a plain later release selects only the tasks it adds')
+        self.assertTrue(all('already deployed' in item['reason'] for item in selection['skipped']),
+                        'the 200 carried tasks are skipped as already deployed')
+
+    def test_a_later_live_verified_writes_one_fact_per_carried_task_at_two_hundred(self):
+        tasks = tuple('task-%03d' % index for index in range(200))
+        store = NativeStore(tasks=tasks)
+        for task in tasks:
+            store.seed(task)
+        first = store.record(release_payload([target(task) for task in tasks],
+                                             operation='release-r1', release='r-1'))
+        self.assertEqual(len(first['targets']), 200)
+        again = release_selection(store.rows, self.release_scope(release='r-1'),
+                                  lambda commit, release: True, live_verified=True)
+        self.assertEqual(again['verify_only'], sorted(tasks),
+                         'every carried unverified task is verification-only')
+        before = self.writes(store)
+        second = store.record(release_payload([target(task) for task in tasks],
+                                              operation='verify-r1', release='r-1',
+                                              live_verified=True))
+        writes = self.writes(store) - before
+        self.assertEqual(writes, 200,
+                         'a later --live-verified must write ONE live-verified fact per carried '
+                         'task (200), not rewrite scope/deployed/live/live-verified (800)')
+        self.assertTrue(all(item['verify_only'] for item in second['targets']))
+        self.assertTrue(all(item['deployed'] is None and item['scope_recorded'] is False
+                            for item in second['targets']))
+        # Once verified, a further --live-verified is a no-op: nothing is written.
+        before = self.writes(store)
+        store.record(release_payload([target(task) for task in tasks],
+                                     operation='verify-r1-again', release='r-1',
+                                     live_verified=True))
+        self.assertEqual(self.writes(store) - before, 0,
+                         'a verified carried task costs no further write')
+
+
 class PreviousReleaseValidationTests(ReleaseCommandTests):
     """--previous-release-commit is validated before git is used (.107 item 5)."""
 
