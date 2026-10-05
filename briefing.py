@@ -100,6 +100,18 @@ def text(value,label,limit,empty=False):
     # Names the field, the length it had and the limit (kittrial-5bb.97).
     check_text(value,label,limit,empty=empty,nul=False)
 
+def shown_name(name):
+    """A caller-written field name as it may appear in a refusal (kittrial-5bb.113 review).
+
+    An ordinary name is shown as it is. Anything else is shown as a quoted JSON string in
+    ASCII, so a newline, an escape sequence, a bidi or zero-width character or a NUL is
+    spelled out and never sent raw, and its square brackets are escaped too, so a name
+    cannot be written to look like the next numbered problem of the refusal.
+    """
+    if re.fullmatch(r'[A-Za-z0-9_.-]+',name):return name
+    quoted=json.dumps(name,ensure_ascii=True)
+    return quoted.replace('[','\\u005b').replace(']','\\u005d').replace('\x7f','\\u007f')
+
 def field_names(values):
     """Bounded, sorted caller-supplied field names for an error message.
 
@@ -107,7 +119,7 @@ def field_names(values):
     validation error into an echo of an arbitrarily large payload.
     """
     names=sorted(values)
-    shown=[name[:FIELD_NAME_LIMIT]+('...' if len(name)>FIELD_NAME_LIMIT else '') for name in names[:FIELD_NAME_COUNT]]
+    shown=[shown_name(name[:FIELD_NAME_LIMIT])+('...' if len(name)>FIELD_NAME_LIMIT else '') for name in names[:FIELD_NAME_COUNT]]
     if len(names)>FIELD_NAME_COUNT:shown.append('(+%d more)'%(len(names)-FIELD_NAME_COUNT))
     return ', '.join(shown)
 

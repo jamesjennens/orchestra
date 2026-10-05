@@ -722,7 +722,12 @@ def raw_file_flag_in_args(args):
 RESERVED_LABEL_PREFIXES = ('request:', 'request-content:', 'requirement:',
                            'reference:', 'reference-key:', 'proposal:', 'proposal-key:',
                            'capability:', 'capability-key:')
-RESERVED_EXACT_LABELS = frozenset({'requirement', 'brd-section'})
+# `gt:slot` marks a project's merge slot (coordination.MERGE_SLOT_LABEL). One
+# `--remove-label gt:slot` by a contributor put the slot back among claimable work
+# and a claim then jammed it (kittrial-5bb.113 review), so no contributor adds,
+# removes or replaces it on any row.
+MERGE_SLOT_LABEL = 'gt:slot'
+RESERVED_EXACT_LABELS = frozenset({'requirement', 'brd-section', MERGE_SLOT_LABEL})
 # Every label-writing spelling accepted by the pinned bd 1.2.2, verified by
 # driving the binary (`bd create --help` / `bd update --help` plus a behaviour
 # probe of each candidate). `create` accepts the UNDOCUMENTED `--label` alias of
@@ -1306,6 +1311,93 @@ def status_change_targets(args):
         return (command, None)
     targets = [token for token in operands if not token.startswith('@attachment:')]
     return (command, targets or None)
+
+
+# ---------------------------------------------------------------------------
+# Writes that name the project's merge slot (kittrial-5bb.113 review).
+#
+# The slot is a row of type task with the id `<project>-merge-slot`. Refusing only
+# status and assignee moves left title, description, priority, labels, comments
+# and dependencies writable. Every writing invocation is now checked: the tokens
+# in an id position that COULD name the slot are found here, and the endpoint
+# resolves each through bd before the write.
+#
+# bd 1.2.2 resolves an id from any substring of the part after the project prefix,
+# with or without the prefix, case-sensitively (measured: `slot`, `merge`,
+# `erge-slo`, `alpha-merge` and `t` all reach `alpha-merge-slot`). A token is
+# therefore a candidate when it, or what follows one of its hyphens, is a
+# substring of `merge-slot`. The test is deliberately wider than bd (it ignores
+# case): a candidate costs one native read, never a refusal by itself.
+# ---------------------------------------------------------------------------
+MERGE_SLOT_ID_PART = 'merge-slot'
+#: Flags whose value is, or holds, an issue id on create/update.
+_ID_VALUE_FLAGS = ('--parent', '--deps', '--waits-for')
+_DEP_READS = ('list', 'tree', 'cycles')
+
+
+def could_name_merge_slot(token):
+    """Whether bd could resolve this token to a row whose id ends ``-merge-slot``."""
+    if not isinstance(token, str) or not token or token.startswith('-'):
+        return False
+    lowered = token.lower()
+    tails = [lowered] + [lowered[index + 1:] for index, ch in enumerate(lowered) if ch == '-']
+    return any(tail and tail in MERGE_SLOT_ID_PART for tail in tails)
+
+
+def _id_pieces(value):
+    """The ids in a flag value such as ``blocks:a,b`` (a list, each perhaps ``type:id``)."""
+    pieces = []
+    for part in str(value).split(','):
+        # An id holds no colon: in `blocks:pp-1` the id is what follows it.
+        pieces.append(part.rpartition(':')[2].strip())
+    return pieces
+
+
+def merge_slot_candidates(args):
+    """Tokens of a WRITING bd invocation that sit in an id position and could name the slot.
+
+    Empty for a read, and for a write none of whose ids could resolve to the slot,
+    which is every ordinary write: no native read is added to it. ``create`` names no
+    row of its own, only a parent, dependencies and a spawner. When the flags cannot
+    be resolved every token counts, so an unknown flag cannot hide a target.
+    """
+    if not isinstance(args, list) or not args or not isinstance(args[0], str):
+        return []
+    command = args[0]
+    tokens = []
+    if command in ('create', 'update', 'close', 'reopen'):
+        flags, operands, unknown = _bd_scan(args, command)
+        if command != 'create':
+            tokens += operands
+        for name, value in flags:
+            if name in _ID_VALUE_FLAGS and isinstance(value, str):
+                tokens += _id_pieces(value)
+        if unknown:
+            for token in args[1:]:
+                if isinstance(token, str):
+                    tokens += _id_pieces(token.partition('=')[2] if token.startswith('-') else token)
+    elif command == 'comments':
+        target = comment_target(args)
+        if target is not None:
+            tokens.append(target)
+    elif command == 'dep':
+        if _dep_subcommand(args) in _DEP_READS:
+            return []
+        for token in args[1:]:
+            if not isinstance(token, str):
+                continue
+            if token.startswith('--'):
+                tokens += _id_pieces(token.partition('=')[2])
+            elif token.startswith('-'):
+                # `-b ID`, `-bID` and `-b=ID` are the parent form's --blocks.
+                tokens += _id_pieces(token[2:].lstrip('='))
+            else:
+                tokens += _id_pieces(token)
+    found = []
+    for token in tokens:
+        if not token.startswith('@attachment:') and could_name_merge_slot(token) and token not in found:
+            found.append(token)
+    return found
 
 
 # Machine records are canonical UTF-8 with `\n` line endings. A client that

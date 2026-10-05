@@ -26,6 +26,7 @@ from version import report
 from reserved_comments import (carries_record_label, check_raw_request, comment_target,
                                first_reserved_label, is_record_anchor, label_guard_request,
                                operator_only_in_args, raw_file_flag_in_args,
+                               merge_slot_candidates, MERGE_SLOT_LABEL,
                                reserved_label_in_args, refuse_http_actor, status_change_targets,
                                unresolved_bd_flags)
 from http_authority import AuthorityConfig, NativeRunner, http_actor_denial, journal_path, run_guarded
@@ -195,6 +196,30 @@ def _guard_record_anchor_status(root,path,args,actor):
         if is_merge_slot(row):
             raise ValueError('Refusing to %s %s: %s. Its holder changes only through `coordinate`.'
                              %(command,canonical,merge_slot_sentence(canonical)))
+
+def _guard_merge_slot_writes(root,path,args,actor):
+    """Refuse every contributor write that names the project's merge slot (kittrial-5bb.113 review).
+
+    Title, description, priority, labels, comments, dependencies, a child under it:
+    all of it, not only status and assignee. The slot changes through `coordinate`
+    alone. Runs under the coordination lock of the write it guards. Only a token that
+    could resolve to the slot costs a native read (`merge_slot_candidates`), so an
+    ordinary write pays nothing. A candidate bd cannot resolve is left to bd, which
+    refuses the write itself; any other failed read fails closed.
+    """
+    for token in merge_slot_candidates(args):
+        p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,'show',token,'--json'],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=60)
+        if p.returncode:
+            said=(p.stderr or p.stdout or '').strip()
+            if 'no issue found' in said or 'ambiguous' in said.lower():continue
+            raise ValueError('Could not check whether %s names the merge slot of the project before the write, so no native write was attempted: %s'%(token,said[-300:]))
+        try:rows=json.loads(p.stdout)
+        except ValueError:raise ValueError('Could not check whether %s names the merge slot of the project before the write (unreadable native answer), so no native write was attempted.'%(token,))
+        if isinstance(rows,dict):rows=[rows]
+        for row in rows if isinstance(rows,list) else []:
+            if is_merge_slot(row):
+                raise ValueError('Refusing %s on %s: %s. Nothing but `coordinate` writes it; its merge-create operation repairs a damaged slot.'
+                                 %(' '.join(args[:2]) if args[0] in ('comments','dep') else args[0],row.get('id'),merge_slot_sentence(row.get('id'))))
 
 def execute(root,request,authority_config=None,require_authority=False):
     name=request['project'];path=project_dir(root,name)
@@ -543,6 +568,7 @@ def execute(root,request,authority_config=None,require_authority=False):
     # the labels of an existing holder (checked under the lock below, before
     # the native write).
     label=reserved_label_in_args(args)
+    if label==MERGE_SLOT_LABEL:raise ValueError('The label %s marks the merge slot of a project and is reserved: it is not added, removed or replaced on any task. Only `coordinate` writes it (merge-create restores it on a damaged slot).'%label)
     if label is not None:raise ValueError('Reserved coordination/requirement labels are operator-only; use the coordination request workflow (coordination.py) or the requirement command (requirement_records.py draft|revise)')
     # bd 1.2.2 accepts the undocumented `create --label` alias of --labels, so a
     # table built only from --help missed a whole label-writing spelling. Every
@@ -580,8 +606,10 @@ def execute(root,request,authority_config=None,require_authority=False):
             else: final.append(a)
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            _guard_reserved_labels(root,path,args,actor)
+            # The slot guards come first: a write on the slot is told what the slot is.
             _guard_record_anchor_status(root,path,args,actor)
+            _guard_merge_slot_writes(root,path,args,actor)
+            _guard_reserved_labels(root,path,args,actor)
             def bd_dispatch(argv):
                 p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*argv],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
                 return {'returncode':p.returncode,'stdout':p.stdout,'stderr':p.stderr}

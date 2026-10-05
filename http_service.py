@@ -34,7 +34,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import agent_prompts
 import project_setup
-from coordination import is_merge_slot, merge_slot_sentence
+from coordination import MERGE_SLOT_SUFFIX, is_merge_slot, merge_slot_sentence
 from reserved_comments import (ANCHOR_READ_IDS_MAX, carries_record_label, hide_records,
                                is_record_anchor)
 from http_auth import (AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CAP_APPROVE,
@@ -902,9 +902,11 @@ class InProcessBackend:
                           'summary': last['summary'], 'next_action': last.get('next_action'),
                           'open_items': [{'id': item.get('id'),
                                           'kind': item.get('kind') or 'item',
-                                          'text': item.get('text')}
+                                          'text': item.get('text'), 'source': item.get('source')}
                                          for item in last.get('open_items') or []]}
         return {'task': dict(task), 'checkpoint': checkpoint, 'review': self._review_view(task),
+                'carry_open_items': [dict(item) for item in checkpoints[-1].get('open_items') or []
+                                     if isinstance(item, dict)] if checkpoints else [],
                 # The disposable backend records no lifecycle evidence, so every fact is
                 # honestly unknown rather than inferred from the review state.
                 'lifecycle': {}, 'depends_on': [],
@@ -1375,11 +1377,10 @@ class EndpointBackend:
                     ['update', str(task_id), '--status', 'in_progress', '--assignee',
                      str(actor), '--json'], {})
         if route == 'checkpoints.add':
-            missing = [field for field in self.CHECKPOINT_FIELDS if field not in payload]
-            if missing:
-                raise invalid('Canonical checkpoint payload is missing fields: %s'
-                              % ', '.join(missing))
-            body = {field: payload.get(field) for field in self.CHECKPOINT_FIELDS}
+            # A field left out is sent as left out: the canonical validator names it with
+            # every other problem of the record, where refusing it here hid the rest
+            # (kittrial-5bb.113 review).
+            body = {field: payload[field] for field in self.CHECKPOINT_FIELDS if field in payload}
             body['schema_version'] = payload.get('schema_version', 1)
             body['task'] = task_id
             return ('checkpoint', project_id, [str(task_id), '@attachment:0'],
@@ -1667,16 +1668,18 @@ class EndpointBackend:
         if not isinstance(data, dict):
             raise uncertain('Canonical brief returned an unexpected shape')
         checkpoint = None
+        carry = []
         if data.get('checkpoint'):
             point = data['checkpoint']
             unresolved = data.get('unresolved') or {}
+            carry = self._open_items_in_full(project_id, task_id, point.get('comment_id'), unresolved)
             checkpoint = {'id': point.get('comment_id'), 'at': point.get('timestamp'),
                           'author': point.get('author'), 'summary': data.get('current_position'),
                           'next_action': data.get('next_action'),
                           'branch': point.get('branch'), 'source_commit': point.get('source_commit'),
                           'newer_activity': point.get('newer_activity'),
                           'open_items': [{'id': item.get('id'), 'kind': item.get('kind'),
-                                          'text': item.get('text')}
+                                          'text': item.get('text'), 'source': item.get('source')}
                                          for item in unresolved.get('items') or []
                                          if isinstance(item, dict)],
                           'open_items_total': unresolved.get('total')}
@@ -1702,7 +1705,7 @@ class EndpointBackend:
                      for dimension, fact in (data.get('lifecycle') or {}).items()
                      if isinstance(fact, dict)}
         dependencies = (data.get('dependencies') or {}).get('items') or []
-        return {'task': task, 'checkpoint': checkpoint,
+        return {'task': task, 'checkpoint': checkpoint, 'carry_open_items': carry,
                 'review': {'state': review.get('review_state') or 'none',
                            'contribution': contribution, 'requests': requests,
                            'open_requests': review.get('pending_total', len(requests)),
@@ -1728,6 +1731,33 @@ class EndpointBackend:
                 # checkpoint from the brief alone (kittrial-5bb.113).
                 'activity_cursor': data.get('activity_cursor'),
                 'warnings': data.get('warnings') or []}
+
+    def _open_items_in_full(self, project_id, task_id, checkpoint_id, unresolved):
+        """Every open item of the current checkpoint, as recorded, or None when they could not all be read.
+
+        The next checkpoint must carry each one forward unchanged, ``source`` included, so
+        the checkpoint template needs all of them (kittrial-5bb.113 review). The brief pages
+        them ten at a time: a task with more than one page costs one further ``brief`` read
+        per page, at most ``OPEN_ITEM_PAGES``. A checkpoint written between two pages makes
+        the list unusable, and the template then says to read again.
+        """
+        items = [dict(item) for item in unresolved.get('items') or [] if isinstance(item, dict)]
+        offset = unresolved.get('next_offset')
+        for _ in range(self.OPEN_ITEM_PAGES):
+            if offset is None:
+                return items
+            page = self._run('brief', project_id, self.actor_namespace + '/read',
+                             [str(task_id), '--json', '--items-limit', str(self.BRIEF_ITEMS),
+                              '--items-offset', str(offset)])
+            if not isinstance(page, dict) or (page.get('checkpoint') or {}).get('comment_id') != checkpoint_id:
+                return None
+            more = page.get('unresolved') or {}
+            items += [dict(item) for item in more.get('items') or [] if isinstance(item, dict)]
+            offset = more.get('next_offset')
+        return items if offset is None else None
+
+    #: Further ``brief`` reads one task brief may cost to list every open item (100 items, ten a page).
+    OPEN_ITEM_PAGES = 9
 
     @staticmethod
     def _recommendation(value):
@@ -1865,6 +1895,11 @@ class EndpointBackend:
                 raise uncertain('Canonical work queue returned an unexpected shape')
             for row in page.get('items') or []:
                 if not isinstance(row, dict):
+                    continue
+                if row.get('task') == '%s%s' % (project_id, MERGE_SLOT_SUFFIX):
+                    # The row bd keeps as the project's merge slot. This kit's `work` never
+                    # lists it; an older endpoint did, and a slot that lost its label would
+                    # be listed again. It is never offered here (kittrial-5bb.113 review).
                     continue
                 contribution = ({'id': row.get('contribution_id'), 'commit': row.get('commit'),
                                  'revision': None, 'at': None}
@@ -3801,7 +3836,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         brief['project_repository'] = self.service.project_view(ctx.principal, pid).get('repository')
         # The same note wherever the value reaches an agent: it is a label, not an instruction.
         brief['project_repository_note'] = self.service.REPOSITORY_NOTE if brief['project_repository'] else None
-        brief['checkpoint_template'] = self._checkpoint_template(brief, base)
+        brief['checkpoint_template'] = self._checkpoint_template(brief, base, brief.pop('carry_open_items', []))
         brief['generated_at'] = now_iso(self.service._now())
         return 200, brief
 
@@ -3809,27 +3844,34 @@ class ApiHandler(BaseHTTPRequestHandler):
     CHECKPOINT_DEFAULTS = (('source_commit', ''), ('branch', ''), ('open_items', []), ('resolved', []))
 
     @staticmethod
-    def _checkpoint_template(brief, base):
+    def _checkpoint_template(brief, base, carry=()):
         """The checkpoint record to send for this task at this moment (kittrial-5bb.113).
 
         An agent fills the four texts and posts ``body`` to ``send_to``. ``previous`` and
         ``activity_cursor`` are already those of this read; they go stale when the task
-        changes, and the refusal then says to read the brief again.
+        changes, and the refusal then says to read the brief again. ``open_items`` already
+        holds every open item of the previous checkpoint exactly as recorded, source
+        included: sent as it is, the record carries them all forward.
         """
         import briefing
         limits = dict(briefing.CHECKPOINT_FIELD_LIMITS)
         current = brief.get('checkpoint') or {}
-        return {
+        keys = ('id', 'kind', 'text', 'source')
+        carried = [{key: item.get(key) for key in keys} for item in carry or []]
+        template = {
             'send_to': base + '/checkpoints', 'method': 'POST',
             'body': {'schema_version': 1, 'previous': current.get('id'),
                      'activity_cursor': brief.get('activity_cursor'),
                      'intent': '', 'acceptance': '', 'summary': '', 'next_action': '',
-                     'source_commit': '', 'branch': '', 'open_items': [], 'resolved': []},
+                     'source_commit': '', 'branch': '', 'open_items': carried, 'resolved': []},
+            'carried_open_items': len(carried),
             'required': ['intent', 'acceptance', 'summary', 'next_action'],
             'optional': {'source_commit': 'the commit the work is at; leave out when there is none',
                          'branch': 'the branch; leave out when there is none',
-                         'open_items': 'what is unresolved; leave out when nothing is',
-                         'resolved': 'earlier open items this checkpoint resolves; leave out when none'},
+                         'open_items': 'what is unresolved: the ones already in body, unchanged, plus any new one; '
+                                       'leave out only when nothing is',
+                         'resolved': 'open items of the previous checkpoint that this one resolves: take the item '
+                                     'out of open_items and name its id here; leave out when none'},
             'limits': {name: '<= %d characters' % limits[name]
                        for name in ('intent', 'acceptance', 'summary', 'next_action', 'source_commit', 'branch')},
             'open_item': {'id': 'a short id of your choosing', 'kind': sorted(briefing.KINDS),
@@ -3839,7 +3881,15 @@ class ApiHandler(BaseHTTPRequestHandler):
                               'evidence': '<= %d characters' % briefing.CHECKPOINT_SOURCE_LIMIT},
             'items_max': briefing.CHECKPOINT_ITEMS_MAX,
             'note': 'Every open item of the previous checkpoint must be carried forward unchanged or resolved. '
+                    'body.open_items already holds them all, complete with source. '
                     'A refusal names every problem with the record at once.'}
+        if carry is None:
+            # More open items than could be read in one go, or the task changed meanwhile.
+            template['carried_open_items'] = None
+            template['note'] = ('The open items of the previous checkpoint could not all be read, so body.open_items '
+                                'is empty and this record would be refused: read the brief again. '
+                                + template['note'])
+        return template
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/claim')
     def tasks_claim(self, ctx):

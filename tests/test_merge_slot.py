@@ -190,6 +190,45 @@ class HttpTests(fixes.EndpointCase):
         self.assertEqual(200, self.request('POST', '/v1/projects/%s/tasks/%s/claim' % (self.project, self.task), {},
                                            token=self.agent).status)
 
+    def test_a_slot_that_lost_its_label_is_still_never_offered(self):
+        # `work` lists such a row again (it is an ordinary one by the rule); so did an older endpoint.
+        path = self.canonical_root / 'canonical.json'
+        state = json.loads(path.read_text(encoding='utf-8'))
+        for row in state['rows']:
+            if row['id'] == self.slot:
+                row['labels'] = []
+        path.write_text(json.dumps(state), encoding='utf-8')
+        nxt = self.request('GET', '/v1/agents/me/next', token=self.agent).data
+        self.assertEqual([(a['kind'], a['task']) for a in nxt['next_actions']], [('claimable-task', self.task)])
+        self.assertEqual(nxt['attention']['counts']['claimable'], 1)
+        queue = self.request('GET', '/v1/projects/%s/queue' % self.project, token=self.admin).data['items']
+        self.assertNotIn(self.slot, [row['id'] for row in queue])
+
+
+class ReaderTests(unittest.TestCase):
+    """Readers that walk every row skip the slot, even one that somehow carries a review chain."""
+
+    def chained(self, **changes):
+        from requirements import canonical_bytes
+        row = slot_row(status='in_progress', assignee='alice/session', **changes)
+        records = [('delivery', dict(contribute(), task=SLOT)),
+                   ('asked', dict(schema_version=1, operation='request-review', operation_id='ask-1', task=SLOT,
+                                  previous='delivery', contribution='delivery', reviewer='bob'))]
+        row['comments'] = [dict(id=cid, author='alice/session', created_at='2026-10-05T00:00:0%dZ' % index,
+                                text=review_workflow.PREFIX + canonical_bytes(payload).decode())
+                           for index, (cid, payload) in enumerate(records)]
+        return row
+
+    def test_the_newest_contribution_reader_skips_the_slot(self):
+        import lifecycle
+        # The same row without the label is an ordinary task and is read.
+        self.assertEqual(lifecycle.current_contribution_commits([self.chained(labels=[])]), {SLOT: 'a' * 40})
+        self.assertEqual(lifecycle.current_contribution_commits([self.chained()]), {})
+
+    def test_the_open_review_request_count_skips_the_slot(self):
+        self.assertEqual(review_workflow.open_review_requests_by([self.chained(labels=[])], 'alice/session'), 1)
+        self.assertEqual(review_workflow.open_review_requests_by([self.chained()], 'alice/session'), 0)
+
 
 if __name__ == '__main__':
     unittest.main()
