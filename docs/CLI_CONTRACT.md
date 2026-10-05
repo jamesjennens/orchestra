@@ -1651,6 +1651,15 @@ field **and** the limit, for example:
 
 A contributor may run these bd commands through the endpoint: `list`, `show`, `ready`, `search`, `count`, `state`, `lint`, `comments`, `create`, `update`, `close`, `reopen`, `dep`. The first seven, `comments TASK` and `dep list|tree|cycles` only read. Every write must name the rows it writes (kittrial-5bb.113):
 
+The read side is guarded too (kittrial-5bb.135). `bd ready --claim` "atomically claim[s] the first ready issue"; on a real project that is the priority-0 merge slot, so the guard refused none of it while `ready` sat in the read list, and bd damaged the slot. A read whose flags ask bd to choose a row is now refused before any native write:
+
+| Read command | Flag | What bd does with it | Answer |
+|---|---|---|---|
+| `ready` | `--claim` (and `--claim=true`; `--claim=false` stays a read) | claims the first ready row, which the caller did not name | refused: "--claim lets bd choose the row it writes, which is not named in this request; read the rows, then name the one you mean" |
+| `list`, `show`, `search`, `count`, `state`, `lint`, `comments TASK`, `dep list|tree|cycles` | none | they only read, as `bd COMMAND --help` shows | unchanged |
+
+The inventories are `reserved_comments.READ_FLAGS` and `READ_VALUE_FLAGS`; `tests/test_bd_write_flags.py` compares both with `bd COMMAND --help` (reads included) when a bd binary is available, so a read that gains a flag in a later bd fails the suite instead of being trusted. A value-taking read flag's value is consumed (`ready -a --claim` names the actor `--claim` and stays a read); a *short* flag's value is not resolved, which can only refuse more, never less.
+
 | Command | Rows it writes | How they are named | When they are not |
 |---|---|---|---|
 | `create` | a new row | none, or `--id` | `--id` of a row that exists is refused: bd would replace that row |
@@ -1665,11 +1674,14 @@ A contributor may run these bd commands through the endpoint: `list`, `show`, `r
 | `dep add --file` | both ends of every edge | `from`/`to` (or `issue_id`/`depends_on_id`) of each line, sent as an attachment | a list that cannot be read is refused |
 
 Rules that follow:
-- **Every named id is resolved through bd before the write**, in one read. bd resolves an id from any substring of the part after the project prefix, so `slot`, `e-s` and a lone `-` all reach `PROJECT-merge-slot`; the write is judged by the row bd finds, not by the text. That read is one more bd call on each write.
+- **Every named id is resolved through bd before the write**, in one read. bd resolves an id from any substring of the part after the project prefix, so `slot`, `e-s` and a lone `-` all reach `PROJECT-merge-slot`; the write is judged by the row bd finds, not by the text.
+- **Cost, measured (kittrial-5bb.135).** That read is one more bd process on each write: 2 instead of 1, and 3 instead of 2 for a status change. On bd 1.2.2, 30 ordinary writes took 641–662 ms each on the kit before the guard and 749–795 ms on the guard (about 115 ms more), while other suites ran on the same machine. The cost grows with the number of databases the write touches; kittrial-5bb.133 covers that scaling.
 - **An id that does not resolve to exactly one row refuses the write**: "... does not name exactly one task, so the rows this would write are not known. Name each task by its id." So does a read that fails or times out.
-- **`create --id`**: the id must be `PROJECT-NAME` in lower-case letters, digits, dots and hyphens, and must not exist. On bd 1.2.2 `create TITLE --id EXISTING` answers rc 0 and replaces the row: the title is the new one; description, acceptance criteria, notes and assignee are emptied; status returns to open and priority to the default; labels, comments and dependencies stay. An explicit id that does not exist is still allowed. Ids are case-sensitive to bd (`p-ABC` would be a second row beside `p-abc`), which is why upper case is refused.
+- **A read must answer** (kittrial-5bb.135). An empty answer (exit 0 and no output) is a failed read, not "nothing there": bd prints `[]` for an empty JSON list, so `create --id NEW` was accepted against a read that had answered nothing. bd's real absence answer (non-zero exit, "no issue found") is still read as "no such row".
+- **A mistyped id answers rc 2, not rc 1** (kittrial-5bb.135). It used to reach bd, which answered rc 1 with "no issue found"; the guard now refuses it itself, so the exit code is 2 (the endpoint's refusal) and the text is the endpoint's sentence, "... does not name exactly one task, so the rows this would write are not known. Name each task by its id. Nothing was written." A script that matched bd's text or rc 1 must be updated.
+- **`create --id`**: the id must be `PROJECT-NAME` in lower-case letters, digits, dots and hyphens, ending in a letter or digit, and must not exist. On bd 1.2.2 `create TITLE --id EXISTING` answers rc 0 and replaces the row: the title is the new one; description, acceptance criteria, notes and assignee are emptied; status returns to open and priority to the default; labels, comments and dependencies stay. An explicit id that does not exist is still allowed. Ids are case-sensitive to bd (`p-ABC` would be a second row beside `p-abc`), which is why upper case is refused. The existence read is `show`, because `list --all --id` does not see ephemeral (`create --ephemeral`) or gate rows and `create --id` replaced an ephemeral row; an id that merely resembles one is still allowed, since only an exact match is the row bd would replace. An id ending in a dot or hyphen is refused: bd files `VICTIM.` as a child row of `VICTIM`.
 - **`external:PROJECT:CAPABILITY`** in a dependency is not a row and is not resolved.
-- A flag this table does not know refuses the write. The table is `reserved_comments.WRITE_FLAGS`; `tests/test_bd_write_flags.py` compares it with `bd COMMAND --help` when a bd binary is available, so check it when the pinned bd changes.
+- A flag this table does not know refuses the write. The tables are `reserved_comments.WRITE_FLAGS`, `READ_FLAGS` and `READ_VALUE_FLAGS`; `tests/test_bd_write_flags.py` compares them with `bd COMMAND --help`, reads included, when a bd binary is available, so check it when the pinned bd changes.
 - The guard and the write run under the project's coordination lock, which every write through the endpoint holds. A `bd` run on the host outside the kit takes no such lock.
 
 ## Wrapper option ordering

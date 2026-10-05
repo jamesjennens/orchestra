@@ -202,14 +202,25 @@ def _bd_read(root,path,actor,argv):
 
     A read that times out, exits non-zero for any reason but "no issue found", or prints
     something that is not JSON is a failure, never "nothing there": the write it guards
-    is then refused.
+    is then refused. An empty answer (exit 0 and no output) is a failure too: bd prints
+    ``[]`` for an empty JSON list, so an empty stdout means the read did not answer, and
+    reading it as "no such id" let ``create --id NEW`` replace a row the read had not
+    seen (kittrial-5bb.135, after review 01a10c0b).
     """
     try:
         p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*argv],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=60)
     except subprocess.TimeoutExpired:
         return None,'the read of the tasks timed out'
     said=(p.stderr or '').strip()
-    try:rows=record_json.loads(p.stdout) if p.stdout.strip() else []
+    if not (p.stdout or '').strip():
+        if p.returncode and 'no issue found' in said:
+            return [],said                      # bd's own "that id does not exist" answer
+        if p.returncode:
+            return None,'bd could not read the tasks (%s)'%(said[-200:] or 'exit %d'%p.returncode)
+        # Exit 0 with no output: bd prints `[]` for an empty JSON list, so this read did
+        # not answer. Reading it as "no such id" accepted `create --id NEW` (kittrial-5bb.135).
+        return None,'bd gave no answer (%s)'%(said[-200:] or 'exit %d'%p.returncode)
+    try:rows=record_json.loads(p.stdout)
     except ValueError:return None,'bd gave an unreadable answer'
     if isinstance(rows,dict):rows=[rows]
     if not isinstance(rows,list):return None,'bd gave an unreadable answer'
@@ -248,19 +259,29 @@ def _guard_new_id(root,path,name,new_id,actor):
     title is the new one, description, acceptance criteria, notes and assignee are
     emptied, status goes back to open and priority to the default (measured; review
     01a10c0b). On the merge slot that also freed a held slot. An explicit id that does
-    not exist stays allowed. The existence check is exact (`list --id`), not bd's
-    substring resolution, and ids are case-sensitive to bd, so the shape rule is what
-    keeps a look-alike that differs only in case from being made.
+    not exist stays allowed.
+
+    The existence read is ``show``, because ``list --all --id`` does not see every row
+    class: an ephemeral row (``create --ephemeral``) and a gate row are both absent from
+    it, and ``create --id`` replaced the ephemeral row in the review (kittrial-5bb.135).
+    ``show`` answers for both (measured on bd 1.2.2), so the check asks it and refuses on
+    an EXACT id match only: bd resolves an id from any substring, and a row merely near
+    the name is not the row ``create --id`` would replace. Ids are case-sensitive to bd,
+    so the shape rule is what keeps a look-alike that differs only in case from being
+    made.
     """
     shown=shown_token(new_id)
     if is_merge_slot_id(new_id) or any(is_merge_slot_id(new_id[:cut]) for cut,ch in enumerate(new_id) if ch=='.'):
         raise ValueError('Refusing create --id %s: that id belongs to a merge slot, an internal record. Nothing was written.'%shown)
-    if not re.fullmatch(re.escape(name)+r'-[a-z0-9][a-z0-9.-]{0,95}',new_id):
-        raise ValueError('Refusing create --id %s: an explicit id is %s-NAME in lower-case letters, digits, dots and hyphens. Nothing was written.'%(shown,name))
-    rows,said=_bd_read(root,path,actor,['list','--all','--id',new_id,'--limit','0','--json'])
+    # bd files an id with a trailing dot or hyphen as a child of the row it looks like
+    # (`VICTIM.` made a row of that exact id filed under VICTIM; kittrial-5bb.135), so the
+    # last character must be a letter or digit.
+    if not re.fullmatch(re.escape(name)+r'-[a-z0-9](?:[a-z0-9.-]{0,94}[a-z0-9])?',new_id):
+        raise ValueError('Refusing create --id %s: an explicit id is %s-NAME in lower-case letters, digits, dots and hyphens, ending in a letter or digit. Nothing was written.'%(shown,name))
+    rows,said=_bd_read(root,path,actor,['show',new_id,'--json'])
     if rows is None:
         raise ValueError('Refusing create --id %s: could not check whether a task with that id exists (%s). Nothing was written.'%(shown,said))
-    if rows:
+    if any(row['id']==new_id for row in rows):
         raise ValueError('Refusing create --id %s: a task with that id exists, and bd would replace its title, description, status and assignee. Choose another id, or use update. Nothing was written.'%shown)
 
 def _guard_named_rows(root,path,name,args,attachments,actor):
