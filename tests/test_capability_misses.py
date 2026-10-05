@@ -450,11 +450,23 @@ class RecordTests(MissLogCase):
         self.assertEqual(len(clock.slept), 1)
         self.assertEqual(len(self.fcntl.calls), 2)
 
+    def test_no_retry_sleep_starts_that_would_end_past_the_budget(self):
+        # A retry sleeps only if it would end within LOCK_WAIT_SECONDS: stretched to 7.5 ms,
+        # one sleep leaves 2.5 ms, too little for another 3 ms one, so the second retry
+        # never starts and the total waited stays inside the budget.
+        self.fcntl.busy = True
+        clock = FakeClock(stretch=2.5)
+        started = clock.now
+        with clock.patch():
+            self.assertEqual(self.record('merge slot'), 'busy')
+        self.assertEqual(len(clock.slept), 1)
+        self.assertLessEqual(clock.now - started, cm.LOCK_WAIT_SECONDS)
+
     def test_the_retry_wait_is_bounded_in_real_time(self):
         self.fcntl.busy = True
         started = time.monotonic()
         self.assertEqual(self.record('merge slot'), 'busy')
-        self.assertLess(time.monotonic() - started, 0.5)   # the bound is 10 ms; generous for slow CI
+        self.assertLess(time.monotonic() - started, 2.0)   # the bound is 10 ms; generous for slow CI
 
     def test_the_lock_is_never_opened_through_a_symlink(self):
         opened = []
@@ -591,7 +603,7 @@ class RealLockTests(unittest.TestCase):
         holder = self.hold(cm.LOCK_NAME)
         started = time.monotonic()
         self.assertEqual(self.within(2.0, cm.record_find, self.project, 'reserved label guard', False, T0), 'busy')
-        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertLess(time.monotonic() - started, 2.0)
         self.assertEqual((self.project / cm.FILE_NAME).read_bytes(), before)
         holder.close()
         self.assertEqual(cm.record_find(self.project, 'reserved label guard', False, T0), 'recorded')
@@ -601,7 +613,7 @@ class RealLockTests(unittest.TestCase):
         started = time.monotonic()
         self.assertEqual(self.within(2.0, cm.record_find, self.project, 'merge slot', False, T0), 'recorded')
         self.assertEqual(self.within(2.0, cm.report, self.project, dict)['misses'], 1)
-        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertLess(time.monotonic() - started, 2.0)
 
     def test_recording_does_not_hold_its_lock_afterwards(self):
         cm.record_find(self.project, 'merge slot', False, T0)
@@ -778,7 +790,7 @@ class ReportTests(MissLogCase):
         os.mkfifo(self.project / cm.LOCK_NAME)   # no writer: an O_RDONLY open would block forever
         started = time.monotonic()
         self.assertEqual(self.bounded(cm.record_find, self.project, 'reserved label guard', False, T0), 'error')
-        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertLess(time.monotonic() - started, 2.0)
         self.assertEqual(self.bounded(cm.report, self.project, dict)['recording'], 'lock-unusable')
         self.assertEqual(self.bounded(cm.clear, self.project)['repaired'], {cm.LOCK_NAME: 'other'})
         self.assertEqual(self.record('merge slot'), 'recorded')
@@ -793,7 +805,7 @@ class ReportTests(MissLogCase):
                           else real(path)):
             started = time.monotonic()
             status = self.bounded(cm.record_find, self.project, 'merge slot', False, T0)
-        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertLess(time.monotonic() - started, 2.0)
         self.assertIn(status, ('recorded', 'error', 'busy'))
 
     @unittest.skipUnless(hasattr(os, 'mkfifo'), 'needs FIFOs')

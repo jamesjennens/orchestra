@@ -111,12 +111,12 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(record_json.nesting('[' * 5000), MAX + 1)
 
     def test_the_scan_is_linear_and_never_recurses(self):
-        started = time.time()
+        started = time.perf_counter()
         with self.assertRaisesRegex(ValueError, MESSAGE):
             record_json.loads('[' * 2_000_000)
         with self.assertRaisesRegex(ValueError, MESSAGE):
             record_json.loads(b'{"a":' * 300000)
-        self.assertLess(time.time() - started, 5)
+        self.assertLess(time.perf_counter() - started, 5)
 
     def test_malformed_text_of_two_megabytes_costs_a_bounded_time(self):
         # Review of 7c14f6a: with a string literal that is never closed the first scan was
@@ -135,22 +135,29 @@ class GuardTests(unittest.TestCase):
             'brackets inside closed strings': '[' + ','.join(['"[[[{{{"'] * (size // 10)) + ']',
             'an open string after many brackets': '{"a":[' * 30 + '"x' + '[{' * (size // 2),
         }
+        def cost(text):
+            started = time.perf_counter()
+            try:
+                record_json.loads(text)
+            except ValueError:
+                pass
+            return time.perf_counter() - started
+
         for label, text in shapes.items():
             with self.subTest(shape=label):
-                started = time.time()
-                try:
-                    record_json.loads(text)
-                except ValueError:
-                    pass
-                whole = time.time() - started
+                whole = cost(text)
                 self.assertLess(whole, 20, 'the scan is not linear on: ' + label)
                 # Linear, not merely under the bound: half the text takes about half the time.
-                started = time.time()
-                try:
-                    record_json.loads(text[:len(text) // 2])
-                except ValueError:
-                    pass
-                half = time.time() - started
+                # One pause of a shared runner (a collection, a stolen CPU) can inflate a
+                # single timing, so a ratio that looks wrong is measured twice more and the
+                # fastest of each is compared (kittrial-5bb.132); a quadratic scan stays
+                # quadratic however often it is timed.
+                half = cost(text[:len(text) // 2])
+                for _ in range(2):
+                    if whole < 3 * half + 0.5:
+                        break
+                    whole = min(whole, cost(text))
+                    half = min(half, cost(text[:len(text) // 2]))
                 self.assertLess(whole, 3 * half + 0.5, 'doubling the text more than tripled the time: ' + label)
 
     def test_it_is_json_loads_for_everything_else(self):
