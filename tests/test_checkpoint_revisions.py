@@ -109,6 +109,18 @@ class CheckpointRevisionTests(unittest.TestCase):
                 self.assertEqual(normalize.call_count,128)
                 self.assertEqual(snap.call_count,1)
 
+    def test_brief_reuses_the_excluded_snapshot_cursor(self):
+        data=rows();save_cp(data,'cp1')
+        with patch.object(b,'activity_cursor',wraps=b.activity_cursor) as cursor:
+            b.brief(data,PROJECT,TASK)
+            self.assertEqual(cursor.call_count,2)  # whole snapshot and excluded receipt
+
+    def test_all_checkpoint_reads_use_guarded_export_decoding(self):
+        deep='{"unknown":'+('['*65)+'0'+(']'*65)+'}'
+        for args in ([TASK,'--verify'],[TASK,'--provenance']):
+            with self.subTest(args=args),self.assertRaisesRegex(ValueError,'nested too deeply'):
+                b.execute(Path('.'),Path('.'),PROJECT,'alice/session','checkpoint',args,{},lambda argv:deep)
+
     def test_altered_older_map_is_rejected_before_native_write(self):
         data=rows()
         data[0]['comments'] += [comment('z%04d'%n) for n in range(250)]

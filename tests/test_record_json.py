@@ -183,7 +183,7 @@ class NoUnguardedParseTests(unittest.TestCase):
         'admin.py': (28, 'bd output and files on the coordination host, in operator commands'),
         'artifacts.py': (1, 'the artifact index the kit writes'),
         'bootstrap.py': (2, 'bd output on the host'),
-        'briefing.py': (5, 'bd output and the snapshot files the kit writes'),
+        'briefing.py': (3, 'bd comment-write receipt and the snapshot files the kit writes; exports use the guard'),
         'capabilities.py': (1, "a graph.json in the caller's own checkout; it catches RecursionError itself"),
         'capability_misses.py': (1, 'the telemetry file the kit writes; any failure starts a new log'),
         'capability_records.py': (2, 'bd output'),
@@ -234,7 +234,7 @@ class NoUnguardedParseTests(unittest.TestCase):
         # reverted_integrations now delegates to review_state.reverts_by_task, so the
         # raw reject-comment parse that used record_json.loads here is gone.
         self.assertEqual({name: count for name, count in uses.items() if count}, {
-            'briefing.py': 3, 'endpoint.py': 2, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
+            'briefing.py': 4, 'endpoint.py': 2, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
             'handoff.py': 1, 'http_service.py': 2, 'lifecycle.py': 1, 'recovery.py': 1, 'requirements.py': 1,
             'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
 

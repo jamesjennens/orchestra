@@ -507,7 +507,7 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     attention={'attention':attention['attention']+capabilities['attention'],
                'attention_total':attention['attention_total']+capabilities['attention_total'],
                'attention_more':((attention['attention_more'] or 0)+(capabilities['attention_more'] or 0)) or None}
-    newer=None;next_action=review_next.get(review['review_state'],p['next_action'] if p else 'Read the task description, acceptance criteria and any history, then publish a checkpoint.')
+    newer=None;excluded_cursor=None;next_action=review_next.get(review['review_state'],p['next_action'] if p else 'Read the task description, acceptance criteria and any history, then publish a checkpoint.')
     # Outstanding directions persist independently of cursor freshness: an
     # acknowledged-but-unresolved direction stays visible on a current checkpoint,
     # and it qualifies the next action even when the activity cursor is current.
@@ -525,7 +525,8 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
             next_action='OUTSTANDING DIRECTIONS ('+str(dir_out['total'])+'): '+ids+' — resolve or supersede with evidence. '+next_action
     if p is not None:
         excluded=excluding_checkpoint(data,c['id'])
-        if p['activity_cursor']!=activity_cursor(excluded):
+        excluded_cursor=activity_cursor(excluded)
+        if p['activity_cursor']!=excluded_cursor:
             newer=newer_activity_summary(excluded,state['provenance'][str(c['id'])],c.get('created_at'),issue.get('assignee'),dispositions)
             if review['review_state'] not in review_next:
                 dirs=newer.get('unresolved_directions')
@@ -537,7 +538,7 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
                              +'. The recorded checkpoint next action was: '+p['next_action'])
     result={**attention,'reference_drafts_matching':reference_drafts,'task':task,'title':clip(issue.get('title'),200),'owner':clip(issue.get('assignee') or 'unassigned',96),'status':issue.get('status'),
             'activity_cursor':activity_cursor(data),'checkpoint':None if p is None else {'comment_id':str(c['id']),'author':clip(c.get('author'),96),'timestamp':c.get('created_at'),'source_commit':p['source_commit'],'branch':p['branch'],'incorporated_activity_cursor':p['activity_cursor'],
-                'newer_activity':p['activity_cursor']!=activity_cursor(excluded)},
+                'newer_activity':p['activity_cursor']!=excluded_cursor},
             'newer':newer,
             'directions':dir_out,
             'intent':clip(p['intent'] if p else issue.get('description'),600),'acceptance':clip(p['acceptance'] if p else issue.get('acceptance_criteria'),1000),
@@ -895,6 +896,10 @@ def help_notes(action):
             'The server derives provenance and carried dispositions; newest evidence follows linked checkpoint order.',
             'Every unresolved item must be carried forward unchanged or explicitly resolved with reason and evidence.']
 
+def exported_rows(run):
+    """Use the bounded JSON decoder for every briefing export read."""
+    return [record_json.loads(x) for x in run(['export','--all']).splitlines() if x.strip()]
+
 def execute(root,path,project,actor,action,args,attachments,run,operators=None,verifiers=None):
     """Endpoint holds project coordination lock. History caches are disposable."""
     from work import help_payload,help_requested
@@ -910,17 +915,17 @@ def execute(root,path,project,actor,action,args,attachments,run,operators=None,v
         if len(args)==2 and args[1]=='--provenance':
             # Supported read path: return the bounded provenance and cursor that
             # save_checkpoint accepts verbatim — no private snapshot reconstruction.
-            rows=[json.loads(x) for x in run(['export','--all']).splitlines() if x.strip()]
+            rows=exported_rows(run)
             snap=snapshot(rows,project,args[0])
             return json.dumps({'task':args[0],'activity_cursor':activity_cursor(snap),
                                'provenance':bounded_digests(entry_digests(snap))},ensure_ascii=False,indent=2)+'\n'
         if len(args)==2 and args[1]=='--verify':
-            rows=[json.loads(x) for x in run(['export','--all']).splitlines() if x.strip()]
+            rows=exported_rows(run)
             return json.dumps(verify_checkpoint(rows,project,args[0]),ensure_ascii=False,indent=2)+'\n'
         if len(args)!=2 or not args[1].startswith('@attachment:'):raise ValueError('Use checkpoint TASK --file checkpoint.json [--json]')
         item=attachments.get(args[1].partition(':')[2],{})
         if item.get('flag') not in ('--file','-f') or not isinstance(item.get('text'),str):raise ValueError('Checkpoint needs a JSON file attachment')
-        rows=[json.loads(x) for x in run(['export','--all']).splitlines() if x.strip()]
+        rows=exported_rows(run)
         return json.dumps(save_checkpoint(rows,project,args[0],record_json.loads(item['text']),actor,run))+'\n'
     a=parse_args(action,args)
     cache=path/'.history-snapshots'
@@ -934,7 +939,7 @@ def execute(root,path,project,actor,action,args,attachments,run,operators=None,v
         saved=json.loads(file.read_text(encoding='utf-8'));data=saved['data']
         if content_hash(data)!=digest:raise ValueError('History cache integrity mismatch')
     else:
-        rows=[json.loads(x) for x in run(['export','--all']).splitlines() if x.strip()]
+        rows=exported_rows(run)
         if action=='brief':
             result=brief(rows,project,a.task,a.items_offset,a.items_limit,operators=operators,journal=path,
                          verifiers=verifiers,actor=actor)
