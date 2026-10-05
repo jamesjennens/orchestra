@@ -3261,8 +3261,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         reviews capability in the project, and it is a different PERSON from the task's
         assignee and from the contribution's author (not its own, not its owner's, not
         another agent of its owner; see ``_independent``). ``counts`` gains the exact
-        numbers; at most AGENT_REVIEW_LIMIT actions are returned, so the caller can tell
-        from the counts that some were left out.
+        numbers; the caller caps the whole list over every project (``_capped_review_actions``)
+        and can tell from the counts that some were left out.
         """
         agent_id = agent.get('id')
         actor = agent.get('actor') or agent_id
@@ -3293,13 +3293,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                 contribution=contribution.get('id'), commit=contribution.get('commit')))
         # Within the priority: recommended first, then to review; claimable work follows.
         actions.sort(key=lambda action: (0 if action['kind'] == 'review-recommended' else 1, action['task']))
-        return actions[:self.AGENT_REVIEW_LIMIT]
+        return actions
 
     def _capped_review_actions(self, actions):
         """At most AGENT_REVIEW_LIMIT review actions in ALL, over every project (review 01a10c80).
 
-        Each project contributes at most that many already; three full projects would
-        otherwise list three times the limit and push claimable work off the list.
+        A cap on each project's share let three full projects list three times the limit
+        and push claimable work off the list.
         Recommended ones are kept first, then by project and task.
         """
         ordered = sorted(actions, key=lambda action: (0 if action['kind'] == 'review-recommended' else 1,

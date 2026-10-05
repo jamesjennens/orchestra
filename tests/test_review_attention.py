@@ -218,6 +218,21 @@ class InProcessTests(Shared, test_http_agents.AgentHarness):
     def change(self, task, **fields):
         self.backend._task(self.project, task).update(fields)
 
+    def test_a_row_that_is_closed_is_never_a_review_action(self):
+        """The helper itself: the work view may or may not list a closed task that awaits review."""
+        self.people()
+        handler = self.httpd.RequestHandlerClass.__new__(self.httpd.RequestHandlerClass)
+        agent = {'id': self.agent_ids['Osprey'], 'actor': self.agent_ids['Osprey']}
+        row = {'id': 'alpha-1', 'title': 't', 'status': 'in_progress', 'review_state': 'awaiting-review',
+               'assignee': self.agent_ids['Kestrel'], 'contribution_author': self.agent_ids['Kestrel'], 'recommended_by': []}
+        counts = {'to_review': 0, 'review_recommended': 0}
+        offered = handler._agent_review_actions(None, agent, self.project, [row], counts)
+        self.assertEqual(([action['kind'] for action in offered], counts['to_review']), (['to-review'], 1))
+        counts = {'to_review': 0, 'review_recommended': 0}
+        self.assertEqual(handler._agent_review_actions(None, agent, self.project, [dict(row, status='closed')], counts), [])
+        self.assertEqual(counts['to_review'], 0)
+        self.assertEqual(handler._agent_review_actions(None, agent, self.project, [dict(row, review_state='approved')], counts), [])
+
     def test_the_cap_is_on_the_whole_list_not_on_each_project(self):
         """Three projects of deliveries list twenty review actions in all, and claimable work stays (review 01a10c80)."""
         self.people()
