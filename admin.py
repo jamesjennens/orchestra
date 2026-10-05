@@ -533,6 +533,32 @@ def review_workflow_writes(root, strict=False):
             raise ValueError('deployment review_workflow_writes must be true or false')
     return enabled
 
+def checkpoint_provenance_switch(root,action,actor):
+    """Keep the switch and its operator audit in one atomic private generation."""
+    from briefing import checkpoint_writes_enabled
+    from recovery import identity
+    marker=root/'deployment.private.json'
+    if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
+    actor=identity(actor,'Invalid actor identity')
+    if actor not in operators(root,strict=True):
+        raise ValueError('checkpoint-provenance-writes requires an actor on the deployment operator allowlist')
+    current=checkpoint_writes_enabled(root)
+    cfg=config(root)
+    audit=cfg.get('checkpoint_provenance_audit',[])
+    if not isinstance(audit,list) or any(not isinstance(item,dict) for item in audit):
+        raise ValueError('Invalid checkpoint provenance switch audit; reconcile before changing the switch')
+    if action=='status':return dict(checkpoint_provenance_writes=current,audit_records=len(audit))
+    if action not in ('on','off'):raise ValueError('Invalid checkpoint provenance switch action')
+    enabled=action=='on'
+    if enabled:cfg['checkpoint_provenance_writes']=True
+    else:cfg.pop('checkpoint_provenance_writes',None)
+    cfg['checkpoint_provenance_audit']=audit+[dict(actor=actor,at=utc_stamp(),action=action,
+                                                  previous=current,enabled=enabled)]
+    atomic_private_write(marker,json.dumps(cfg))
+    if not enabled:
+        print('Warning: existing provenance tasks refuse new legacy checkpoints; disabling does not make their history readable by older kits.',file=sys.stderr)
+    return dict(checkpoint_provenance_writes=enabled,audit_records=len(audit)+1)
+
 def stored_operators(cfg):
     """The deployment allowlist as a list of identity strings.
 
@@ -3597,6 +3623,9 @@ def main():
     a=sub.add_parser('review-writes',help='read or set the per-installation switch that allows WRITING the new review-workflow record shapes (readers understand them either way; OFF by default)')
     a.add_argument('action',choices=['status','on','off'])
     a.add_argument('--actor',required=True,help='an actor on the deployment operator allowlist')
+    a=sub.add_parser('checkpoint-provenance-writes',help='operator-audited reader-first checkpoint rollout switch; OFF by default, existing provenance tasks refuse legacy writes')
+    a.add_argument('action',choices=['status','on','off'])
+    a.add_argument('--actor',required=True,help='an actor on the deployment operator allowlist')
     a=sub.add_parser('capability-verify',help='record verified capability checks (operator allowlist or verifiers list)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('authorized-keys',help='print the confined contributor and unrestricted operator authorized_keys lines for one public key')
@@ -4077,6 +4106,8 @@ def main():
         else:cfg.pop('verifiers',None)
         atomic_private_write(marker,json.dumps(cfg))
         print(json.dumps({'verifiers':current}))
+    elif args.command=='checkpoint-provenance-writes':
+        print(json.dumps(checkpoint_provenance_switch(root,args.action,args.actor)))
     elif args.command=='review-writes':
         marker=root/'deployment.private.json'
         if not marker.is_file():raise ValueError('Deployment is not installed; run install first')

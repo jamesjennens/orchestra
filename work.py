@@ -49,7 +49,7 @@ def help_payload(action='work'):
         'brief': 'brief TASK [--items-offset N] [--items-limit N] [--json]',
         'history': 'history TASK [--limit N] [--since TIME] [--cursor TOKEN] '
                    '[--body-budget BYTES]',
-        'checkpoint': 'checkpoint TASK --file checkpoint.json [--json]',
+        'checkpoint': 'checkpoint TASK --file checkpoint.json [--json] | checkpoint TASK --provenance | checkpoint TASK --verify | checkpoint TASK --directions [--offset N] [--limit N]',
     }
     payload = {'schema_version': 1, 'contract': CONTRACT_VERSION, 'command': action,
                'usage': usage.get(action, action),
@@ -106,7 +106,9 @@ def help_payload(action='work'):
                             'lifecycle_scope', 'lifecycle_matches_contribution', 'error',
                             'deployed_delivery', 'deployed_delivery_is_current_contribution',
                             'workflow_state', 'integration', 'integration_disagreements',
-                            'integration_warnings', 'review_request', 'review_requests'],
+                            'integration_warnings', 'review_request', 'review_requests',
+                            'newer_activity_by_others', 'newer_activity_own',
+                            'newer_activity_coverage', 'unresolved_directions'],
         }
     elif action == 'review':
         payload['operations'] = ['read (review TASK)', 'contribute', 'request-changes',
@@ -206,6 +208,10 @@ def help_options(action):
         return [
             {'flag': 'TASK', 'description': 'task the checkpoints belong to'},
             {'flag': '--file checkpoint.json', 'description': 'transport the checkpoint payload as text'},
+            {'flag': '--provenance', 'description': 'read the current bounded provenance and activity cursor without writing'},
+            {'flag': '--directions', 'description': 'read full digests for outstanding directions, including outside the stored windows'},
+            {'flag': '--offset N / --limit N', 'description': '--directions page: offset >= 0, limit 1..100 (default 50)'},
+            {'flag': '--verify', 'description': 'classify current entries using newest retained evidence in linked checkpoint order without writing'},
             {'flag': '--json', 'description': 'accepted in any position; the saved checkpoint is always returned as JSON'},
             {'flag': '-h, --help', 'description': 'return this help as JSON on stdout with exit code 0'},
         ]
@@ -284,6 +290,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
             except (OSError,json.JSONDecodeError,ValueError) as exc:
                 journal_errors.append({'path':request_file.name,'error':str(exc)[:300]})
     facts={r['id']:r for r in project_facts(rows)};evidence={r['id']:r['scopes'] for r in integration_evidence(rows)};items=[]
+    checkpoint_states={}
     from review_state import is_integration_warning, reverts_by_task
     if reverts is None:
         revert_map,revert_problems=reverts_by_task(rows,operators,journal)
@@ -362,8 +369,9 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         # request-changes records still unresolved.
         checkpoint_at=None;newer_activity=None
         try:
-            from briefing import checkpoints
-            latest_checkpoint,_=checkpoints(row)
+            from briefing import checkpoint_state
+            checkpoint_states[row['id']]=checkpoint_state(row,normalize=False)
+            latest_checkpoint=checkpoint_states[row['id']]['current']
             open_items=len(latest_checkpoint[0]['open_items']) if latest_checkpoint else 0
             if latest_checkpoint:
                 comments=row.get('comments') or []
@@ -408,6 +416,11 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
     items.sort(key=lambda r:(priority.get(r['review_state'],4),r['task']))
     result={'owner':owner,'total':len(items),'items':items[a.offset:a.offset+a.limit],'next_offset':a.offset+a.limit if a.offset+a.limit<len(items) else None,
             'coverage':'Fresh current view; structured review takes precedence over legacy review-ready labels. Lifecycle facts remain independent; malformed handoff journals are surfaced as errors.'}
+    # .1 adds checkpoint attention after constructing the page. This is separate
+    # from the review/handoff/HTTP queue fields and parses only displayed tasks.
+    from briefing import checkpoint_queue_fields
+    task_rows={row['id']:row for row in rows}
+    for item in result['items']:item.update(checkpoint_queue_fields(rows,task_rows[item['task']],checkpoint_states.get(item['task'])))
     if journal is not None:
         # The standing guidance channel (kittrial-5bb.99): every work queue page
         # carries the current guidance version, so a worker that only runs `work`
