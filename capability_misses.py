@@ -317,14 +317,22 @@ def _lock_descriptor(project, which=CAPABILITY):
 
 
 def _try_lock(flock, descriptor, flags):
-    """At most LOCK_ATTEMPTS non-blocking attempts within LOCK_WAIT_SECONDS. True if held."""
-    deadline = time.monotonic() + LOCK_WAIT_SECONDS
+    """At most LOCK_ATTEMPTS non-blocking attempts within LOCK_WAIT_SECONDS. True if held.
+
+    A retry is skipped when its sleep would end past the budget, measured from the first
+    attempt with ``time.perf_counter``. Not ``time.monotonic``: before Python 3.13 that
+    clock steps by 15.6 ms on Windows, so one step right after the start read as the
+    whole 10 ms budget spent and a busy lock was given up after a single attempt, with
+    no retry at all (kittrial-5bb.132). A sleep the system stretches (Windows rounds short
+    sleeps up) can still carry the total past the budget once; no further sleep follows."""
+    started = time.perf_counter()
     for attempt in range(LOCK_ATTEMPTS):
         try:
             flock(descriptor, flags)
             return True
         except OSError:
-            if attempt + 1 == LOCK_ATTEMPTS or time.monotonic() + LOCK_RETRY_SECONDS > deadline:
+            if (attempt + 1 == LOCK_ATTEMPTS
+                    or time.perf_counter() - started + LOCK_RETRY_SECONDS > LOCK_WAIT_SECONDS):
                 return False
             time.sleep(LOCK_RETRY_SECONDS)
     return False

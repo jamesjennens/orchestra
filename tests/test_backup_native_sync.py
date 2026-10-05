@@ -481,13 +481,17 @@ class SyncClientHandleCase(RuntimeCase):
                           encoding='utf-8')
         script.chmod(0o755)
 
+        never_started = []
+
         def terminate_when_running():
-            for _ in range(200):
-                if pids.is_file():
+            for _ in range(600):
+                if pids.is_file() and pids.read_text().strip():
                     break
                 time.sleep(0.05)
             else:
-                return
+                # Stop anyway, so the test fails at once and says why, rather than waiting
+                # for the client's 30 s sleep (kittrial-5bb.132).
+                never_started.append(True)
             time.sleep(0.3)
             os.kill(os.getpid(), signal.SIGTERM)
 
@@ -498,7 +502,8 @@ class SyncClientHandleCase(RuntimeCase):
             with self.assertRaises(admin.TerminatedBySignal):
                 admin.backup_project(self.root, 'alpha')
         finally:
-            killer.join(15)
+            killer.join(40)
+        self.assertEqual(never_started, [], 'the fake client did not start within 30 s')
         self.assertTrue(pids.is_file(), 'the fake sync client never started')
         client_pid, child_pid = (int(value) for value in pids.read_text().split())
         self.assertNotEqual(client_pid, os.getpid())
