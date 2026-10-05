@@ -146,6 +146,15 @@ class CheckpointThirdReviewTests(unittest.TestCase):
                 self.assertFalse(read['checkpoint']['newer_activity'])
                 self.assertIsNone(read['newer'])
                 self.assertNotIn('STALE CHECKPOINT',read['next_action'])
+                # kittrial-5bb.136: brief still says where the checkpoint was taken, and asks
+                # for the restore to be reconciled; the same project says nothing of the kind.
+                self.assertEqual(read['checkpoint']['taken_in_project'],PROJECT)
+                self.assertTrue(read['next_action'].startswith('CHECKPOINT FROM PROJECT '+PROJECT+':'))
+                self.assertIn('Checkpoint taken in project: '+PROJECT,b.format_brief(read))
+                same=b.brief(data,PROJECT,TASK)
+                self.assertNotIn('taken_in_project',same['checkpoint'])
+                self.assertNotIn('CHECKPOINT FROM PROJECT',same['next_action'])
+                self.assertNotIn('Checkpoint taken in project',b.format_brief(same))
                 self.assertEqual(b.checkpoint_queue_fields(data,data[0])['newer_activity_coverage'],'current')
                 # The cursor written in the new project names it, as before.
                 self.assertEqual(b.untoken(read['activity_cursor'])['project'],'restored-project')
@@ -155,14 +164,22 @@ class CheckpointThirdReviewTests(unittest.TestCase):
                 self.assertTrue(read['checkpoint']['newer_activity'])
                 self.assertEqual(read['newer']['other_count'],1)
                 self.assertEqual(read['newer']['coverage'],'unknown' if shape=='legacy' else 'snapshot')
+                # Stale and from another project: both are said, STALE first.
+                self.assertEqual(read['checkpoint']['taken_in_project'],PROJECT)
+                self.assertTrue(read['next_action'].startswith('STALE CHECKPOINT'))
 
     def test_a_renamed_cursor_matches_only_the_same_task_and_content(self):
         data=rows();snap=b.snapshot(data,PROJECT,TASK);cursor=b.activity_cursor(snap)
         self.assertTrue(b.cursor_matches(cursor,b.snapshot(data,'renamed',TASK)))
         other=rows();other[0]['title']='Another title'
         self.assertFalse(b.cursor_matches(cursor,b.snapshot(other,'renamed',TASK)))
-        forged=b.token(dict(b.untoken(cursor),task='other-task'))
+        # A real cursor of ANOTHER task (its hash recomputed for that task), not a token
+        # edited after the fact: comparing under the cursor's task as well as its project
+        # would match it, so only the project may be taken from the cursor (kittrial-5bb.136).
+        forged=b.activity_cursor(dict(snap,task='other-task'))
+        self.assertEqual(b.untoken(forged)['task'],'other-task')
         self.assertFalse(b.cursor_matches(forged,b.snapshot(data,'renamed',TASK)))
+        self.assertFalse(b.cursor_matches(forged,b.snapshot(data,PROJECT,TASK)))
         self.assertFalse(b.cursor_matches('not a cursor!',b.snapshot(data,'renamed',TASK)))
 
 
@@ -207,13 +224,16 @@ class CheckpointSwitchLockAndAuditTests(unittest.TestCase):
     @unittest.skipIf(sys.platform=='win32','flock is POSIX-only')
     def test_simultaneous_flips_record_every_audit_entry(self):
         # The review measured 18 of 24 entries for twelve rounds of two simultaneous flips.
-        errors=[]
+        # A flip that changes nothing writes nothing (kittrial-5bb.136), so the check is
+        # that the history records exactly the changes made, each naming the value the
+        # previous one set.
+        errors=[];changed=[]
 
         def flip(action,actor,barrier):
             try:
                 barrier.wait(5)
                 with redirect_stderr(io.StringIO()):
-                    admin.checkpoint_provenance_switch(self.root,action,actor)
+                    changed.append(admin.checkpoint_provenance_switch(self.root,action,actor)['changed'])
             except Exception as error:   # reported below, never swallowed
                 errors.append(error)
 
@@ -225,7 +245,15 @@ class CheckpointSwitchLockAndAuditTests(unittest.TestCase):
             for worker in workers:worker.join(10)
         self.assertEqual(errors,[])
         cfg=json.loads(self.marker.read_text())
-        self.assertEqual(len(cfg['checkpoint_provenance_audit']),24)
+        audit=cfg['checkpoint_provenance_audit']
+        self.assertEqual(len(audit),changed.count(True))
+        self.assertGreaterEqual(len(audit),12)          # every round changes the value at least once
+        previous=False
+        for entry in audit:
+            self.assertEqual(entry['previous'],previous)
+            self.assertNotEqual(entry['enabled'],entry['previous'])
+            previous=entry['enabled']
+        self.assertEqual(cfg.get('checkpoint_provenance_writes',False),previous)
         self.assertEqual(cfg['unrelated'],'keep')
 
     @unittest.skipIf(sys.platform=='win32','flock is POSIX-only')
@@ -272,6 +300,37 @@ class CheckpointSwitchLockAndAuditTests(unittest.TestCase):
                 self.assertEqual(cfg['unrelated'],'keep')
                 status,log=self.flip('status')
                 self.assertTrue(status['audit_readable']);self.assertEqual(log,'')
+
+    def test_a_flip_that_changes_nothing_writes_nothing(self):
+        # kittrial-5bb.136: as review-writes does, so the two switches agree.
+        before=self.marker.read_bytes()
+        result,_=self.flip('off')
+        self.assertEqual((result['checkpoint_provenance_writes'],result['changed']),(False,False))
+        self.assertEqual(self.marker.read_bytes(),before)
+        self.flip('on')
+        after_on=self.marker.read_bytes()
+        result,log=self.flip('on')
+        self.assertEqual((result['checkpoint_provenance_writes'],result['changed'],result['audit_records']),(True,False,1))
+        self.assertEqual(self.marker.read_bytes(),after_on)
+        self.assertEqual(log,'')
+
+    def test_entries_of_another_shape_are_damage(self):
+        # kittrial-5bb.136: any list of objects used to read as a history.
+        good=dict(actor='ops',at='2026-10-05T12:00:00Z',action='on',previous=False,enabled=True)
+        for label,entry in (('missing field',{k:v for k,v in good.items() if k!='previous'}),
+                            ('extra field',dict(good,note='x')),('action',dict(good,action='maybe')),
+                            ('previous not a boolean',dict(good,previous='no')),('actor not text',dict(good,actor=7))):
+            with self.subTest(label):
+                cfg=json.loads(self.marker.read_text())
+                cfg['checkpoint_provenance_audit']=[good,entry]
+                self.marker.write_text(json.dumps(cfg))
+                status,log=self.flip('status')
+                self.assertFalse(status['audit_readable'])
+                self.assertIn('entry 1 of checkpoint_provenance_audit',log)
+        cfg=json.loads(self.marker.read_text())
+        cfg['checkpoint_provenance_audit']=[good]
+        self.marker.write_text(json.dumps(cfg))
+        self.assertEqual(self.flip('status')[0]['audit_records'],1)
 
     def test_a_second_damage_is_kept_under_its_own_name(self):
         # Two damages kept in the same second, and a name already taken: nothing that was
