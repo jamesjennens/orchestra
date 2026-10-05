@@ -55,6 +55,8 @@ def task_row(rows,task):
     identity(task)
     found=[r for r in rows if r.get('id')==task]
     if len(found)!=1:raise ValueError('Task missing or duplicated')
+    if found[0].get('malformed'):
+        raise ValueError('Task %s is malformed: %s'%(task,found[0].get('error') or 'JSON nested too deeply'))
     return found[0]
 
 def snapshot(rows,project,task,exclude=None):
@@ -1001,7 +1003,7 @@ def help_notes(action):
 
 def exported_rows(run):
     """Use the bounded JSON decoder for every briefing export read."""
-    return [record_json.loads(x) for x in run(['export','--all']).splitlines() if x.strip()]
+    return record_json.loads_rows(run(['export','--all']))
 
 def checkpoint_writes_enabled(root):
     """Reader-first rollout: only an installation operator enables new writes."""

@@ -202,7 +202,7 @@ class NoUnguardedParseTests(unittest.TestCase):
         'native.py': (2, 'bd output'),
         'office_service.py': (1, 'host configuration'),
         'proposal_records.py': (7, 'bd output, the host session file, and a copy of a structure the kit built'),
-        'record_json.py': (1, 'the guard itself'),
+        'record_json.py': (2, 'the guard itself and row-level parsing'),
         'reference_records.py': (2, 'bd output'),
         'review_recommendations.py': (1, 'bd output (the answer of comments add)'),
         'review_workflow.py': (4, 'bd output and the revert journal the kit writes'),
@@ -238,7 +238,7 @@ class NoUnguardedParseTests(unittest.TestCase):
             # (kittrial-5bb.110 item 3): a deeply nested audit file used to crash
             # `review-writes status` with a RecursionError.
             'admin.py': 1,
-            'briefing.py': 4, 'endpoint.py': 2, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
+            'briefing.py': 3, 'endpoint.py': 2, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
             'handoff.py': 1, 'http_service.py': 2, 'lifecycle.py': 1, 'recovery.py': 1, 'requirements.py': 1,
             'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
 

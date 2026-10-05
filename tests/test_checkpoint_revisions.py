@@ -117,10 +117,24 @@ class CheckpointRevisionTests(unittest.TestCase):
             self.assertEqual(cursor.call_count,2)  # whole snapshot and excluded receipt
 
     def test_all_checkpoint_reads_use_guarded_export_decoding(self):
-        deep='{"unknown":'+('['*65)+'0'+(']'*65)+'}'
-        for args in ([TASK,'--verify'],[TASK,'--provenance']):
-            with self.subTest(args=args),self.assertRaisesRegex(ValueError,'nested too deeply'):
-                b.execute(Path('.'),Path('.'),PROJECT,'alice/session','checkpoint',args,{},lambda argv:deep)
+        data = rows()
+        deep = '{"id":"bad-row","unknown":' + ('['*3000) + '0' + (']'*3000) + '}'
+        export_text = json.dumps(data[0]) + '\n' + deep + '\n'
+        run = lambda argv: export_text
+        # Per-row guarded decoding: reading a valid task succeeds even when another row in the export is over 64 levels
+        for args in ([TASK, '--verify'], [TASK, '--provenance']):
+            with self.subTest(args=args):
+                res = b.execute(Path('.'), Path('.'), PROJECT, 'alice/session', 'checkpoint', args, {}, run)
+                self.assertIn(TASK, res)
+        # Reading the malformed task refuses per-row
+        for args in (['bad-row', '--verify'], ['bad-row', '--provenance']):
+            with self.subTest(args=args), self.assertRaisesRegex(ValueError, 'malformed'):
+                b.execute(Path('.'), Path('.'), PROJECT, 'alice/session', 'checkpoint', args, {}, run)
+        # And brief and history also succeed on the good task and refuse on the bad task
+        brief_res = b.execute(Path('.'), Path('.'), PROJECT, 'alice/session', 'brief', [TASK, '--json'], {}, run)
+        self.assertIn(TASK, brief_res)
+        with self.assertRaisesRegex(ValueError, 'malformed'):
+            b.execute(Path('.'), Path('.'), PROJECT, 'alice/session', 'brief', ['bad-row', '--json'], {}, run)
 
     def test_altered_older_map_is_rejected_before_native_write(self):
         data=rows()
