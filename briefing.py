@@ -94,6 +94,27 @@ def activity_cursor(data):
     compatible={k:v for k,v in data.items() if k!='entry_digests'}
     return token({'v':1,'kind':'activity','project':data['project'],'task':data['task'],'sha256':content_hash(compatible)})
 
+#: A project name as ``admin.validate_name`` accepts it.
+PROJECT_NAME=re.compile(r'[a-z][a-z0-9]{1,23}')
+#: Shown instead of a recorded project name that is not one.
+UNRECOGNISED_PROJECT='(unrecognised project name)'
+
+def checkpoint_taken_in(cursor,project):
+    """The project a checkpoint's cursor was taken in, when it is not ``project``; else None.
+
+    The cursor is text a checkpoint writer supplied, so the name is shown only when it is
+    a project name, never a newline, instruction text or terminal escape: anything else
+    reads as ``UNRECOGNISED_PROJECT`` (kittrial-5bb.142). An unreadable cursor is ignored;
+    checkpoint validation already refuses one, so this only keeps a read from failing.
+    """
+    try:
+        recorded=untoken(cursor)
+    except ValueError:
+        return None
+    named=recorded.get('project') if isinstance(recorded,dict) else None
+    if not isinstance(named,str) or named==project:return None
+    return named if PROJECT_NAME.fullmatch(named) else UNRECOGNISED_PROJECT
+
 def cursor_matches(cursor,data,compatible=None):
     # Read receipts already written by the first provenance kit in their shape.
     if cursor==(compatible if compatible is not None else activity_cursor(data)):return True
@@ -708,20 +729,12 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     # after restore-new under another name an unchanged task reads current, which is true
     # of the copy, but the restore is still worth reconciling before trusting the
     # checkpoint's next action. Before kittrial-5bb.131 the STALE reading was that prompt.
-    taken_in=None
-    if p is not None:
-        try:
-            recorded=untoken(p['activity_cursor'])
-        except ValueError:
-            recorded=None
-        named=recorded.get('project') if isinstance(recorded,dict) else None
-        if isinstance(named,str) and named!=project:
-            taken_in=named[:96]
-            if not stale and review['review_state'] not in review_next:
-                # A prefix, like OUTSTANDING DIRECTIONS, so neither hides the other.
-                next_action=('CHECKPOINT FROM PROJECT '+taken_in+': written before this project was restored or '
-                             'copied under its current name; its task content is unchanged. Confirm the history '
-                             'before relying on it. '+next_action)
+    taken_in=None if p is None else checkpoint_taken_in(p['activity_cursor'],project)
+    if taken_in and not stale and review['review_state'] not in review_next:
+        # A prefix, like OUTSTANDING DIRECTIONS, so neither hides the other.
+        next_action=('CHECKPOINT FROM PROJECT '+taken_in+': written before this project was restored or '
+                     'copied under its current name; its task content is unchanged. Confirm the history '
+                     'before relying on it. '+next_action)
     result={**attention,'reference_drafts_matching':reference_drafts,'task':task,'title':clip(issue.get('title'),200),'owner':clip(issue.get('assignee') or 'unassigned',96),'status':issue.get('status'),
             'activity_cursor':activity_cursor(data),'checkpoint':None if p is None else {'comment_id':str(c['id']),'author':clip(c.get('author'),96),'timestamp':c.get('created_at'),'source_commit':p['source_commit'],'branch':p['branch'],'incorporated_activity_cursor':p['activity_cursor'],
                 'newer_activity':stale,**({'taken_in_project':taken_in} if taken_in else {})},

@@ -205,6 +205,23 @@ class DeploymentLockWaitTests(unittest.TestCase):
         self.assertTrue(result['checkpoint_provenance_writes'])
         self.assertEqual(waits, [admin.DEPLOYMENT_LOCK_POLL_SECONDS])
 
+    def test_the_wait_lasts_ten_seconds_of_the_clock_it_reads(self):
+        # A fake clock: each poll's sleep advances it, so the bound is measured exactly and
+        # the test takes no wall-clock time (kittrial-5bb.142: a 100 s wait survived).
+        self.hold()
+        now = [1000.0]
+
+        def sleep(seconds):
+            now[0] += seconds
+
+        with patch.object(admin.time, 'monotonic', side_effect=lambda: now[0]), \
+                patch.object(admin.time, 'sleep', side_effect=sleep):
+            _, error = self.bounded(lambda: self.flip('on'))
+        waited = now[0] - 1000.0
+        self.assertRegex(error or '', r'still holds its lock \(\.review-writes\.lock\) after 10 s\.')
+        self.assertGreaterEqual(waited, 10)
+        self.assertLess(waited, 10 + 2 * admin.DEPLOYMENT_LOCK_POLL_SECONDS)
+
     def test_a_killed_holder_releases_the_lock(self):
         holder = subprocess.Popen([sys.executable, '-c', textwrap.dedent('''
             import fcntl, sys, time
@@ -213,6 +230,7 @@ class DeploymentLockWaitTests(unittest.TestCase):
             print('held', flush=True)
             time.sleep(600)
         '''), str(self.root / admin.REVIEW_WRITES_LOCK)], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.stdout.close)
         self.addCleanup(holder.kill)
         self.assertEqual(holder.stdout.readline().strip(), 'held')
         with patch.object(admin, 'DEPLOYMENT_LOCK_WAIT_SECONDS', 0):
@@ -221,6 +239,124 @@ class DeploymentLockWaitTests(unittest.TestCase):
         holder.send_signal(signal.SIGKILL)
         holder.wait(30)
         self.assertTrue(self.flip('on')['checkpoint_provenance_writes'])
+
+
+
+@unittest.skipIf(sys.platform == 'win32', 'flock is POSIX-only')
+class PrivateWriteLeftoverTests(unittest.TestCase):
+    """kittrial-5bb.142 item 5: the temporary copy an interrupted write leaves is a full
+    copy of the configuration, password included. It is created 0600 and the next locked
+    write removes it."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.marker = self.root / 'deployment.private.json'
+        self.marker.write_text(json.dumps({'password': 'test-only', 'operators': ['ops']}), encoding='utf-8')
+
+    def flip(self, action):
+        err = StringIO()
+        with redirect_stderr(err):
+            result = admin.checkpoint_provenance_switch(self.root, action, 'ops')
+        return result, err.getvalue()
+
+    def names(self):
+        return sorted(path.name for path in self.root.iterdir())
+
+    def test_a_writer_killed_mid_write_leaves_a_copy_the_next_locked_write_removes(self):
+        killed = subprocess.run([sys.executable, '-c', textwrap.dedent('''
+            import os, signal, sys
+            sys.path.insert(0, sys.argv[2])
+            import admin
+            from pathlib import Path
+            def die(*args):                       # killed between the copy and the rename
+                os.kill(os.getpid(), signal.SIGKILL)
+            admin.os.replace = die
+            admin.review_writes_command(Path(sys.argv[1]), 'ops', 'on')
+        '''), str(self.root), REPO], capture_output=True, text=True, timeout=60)
+        self.assertEqual(killed.returncode, -signal.SIGKILL, killed.stderr)
+        leftovers = [name for name in self.names() if name.startswith('.deployment.private.json.')]
+        self.assertEqual(len(leftovers), 1)
+        leftover = self.root / leftovers[0]
+        self.assertIn('test-only', leftover.read_text(encoding='utf-8'))     # the password
+        self.assertEqual(leftover.stat().st_mode & 0o777, 0o600)
+        # A read takes no lock and leaves it; the next locked write removes it.
+        self.flip('status')
+        self.assertTrue(leftover.exists())
+        result, err = self.flip('on')
+        self.assertTrue(result['checkpoint_provenance_writes'])
+        self.assertFalse(leftover.exists())
+        self.assertIn('Removed 1 temporary copy of deployment.private.json left by an interrupted write: '
+                      + leftovers[0], err)
+        self.assertEqual(json.loads(self.marker.read_text(encoding='utf-8'))['password'], 'test-only')
+
+    def test_only_the_temporary_copies_are_removed_and_only_under_the_lock(self):
+        leftovers = ['.deployment.private.json.abcd_123', '.deployment.private.json.zz99yy88']
+        kept = ['.deployment.private.json.bak', 'deployment.private.json.abcd1234',
+                '.deployment.private.json.abcd12345', '.deployment.private.json.ABCD-123']
+        for name in leftovers + kept:
+            (self.root / name).write_text('{"password": "test-only"}', encoding='utf-8')
+        handle = (self.root / admin.REVIEW_WRITES_LOCK).open('a')
+        import fcntl
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        with patch.object(admin, 'DEPLOYMENT_LOCK_WAIT_SECONDS', 0):
+            with self.assertRaisesRegex(ValueError, 'Nothing was changed'):
+                self.flip('on')
+        handle.close()
+        for name in leftovers:                  # a refused write removed nothing
+            self.assertTrue((self.root / name).exists(), name)
+        _, err = self.flip('on')
+        self.assertIn('Removed 2 temporary copies', err)
+        for name in leftovers:
+            self.assertFalse((self.root / name).exists(), name)
+        for name in kept:
+            self.assertTrue((self.root / name).exists(), name)
+        # Every writer that takes the lock does it, not only the switches.
+        (self.root / leftovers[0]).write_text('{}', encoding='utf-8')
+        with redirect_stderr(StringIO()):
+            admin.merge_operators(self.root, ['another'])
+        self.assertFalse((self.root / leftovers[0]).exists())
+
+    def test_a_platform_without_non_blocking_flock_takes_the_lock_and_cleans_up(self):
+        # The fallback for an fcntl with no LOCK_NB: one blocking flock, then the same work.
+        import types
+        from unittest.mock import Mock
+        fake = types.SimpleNamespace(flock=Mock(), LOCK_EX=2)
+        (self.root / '.deployment.private.json.abcd1234').write_text('{}', encoding='utf-8')
+        with patch.dict(sys.modules, {'fcntl': fake}):
+            result, err = self.flip('on')
+        self.assertTrue(result['checkpoint_provenance_writes'])
+        self.assertEqual(fake.flock.call_count, 1)
+        self.assertEqual(fake.flock.call_args[0][1], 2)
+        self.assertFalse((self.root / '.deployment.private.json.abcd1234').exists())
+        self.assertIn('Removed 1 temporary copy', err)
+
+    def test_without_fcntl_nothing_is_removed(self):
+        # No lock to exclude another writer, so a copy may be one mid-write: kept.
+        (self.root / '.deployment.private.json.abcd1234').write_text('{}', encoding='utf-8')
+        with patch.dict(sys.modules, {'fcntl': None}):
+            result, _ = self.flip('on')
+        self.assertTrue(result['checkpoint_provenance_writes'])
+        self.assertTrue((self.root / '.deployment.private.json.abcd1234').exists())
+
+    def test_the_temporary_copy_is_created_0600(self):
+        modes = []
+        real_fsync = os.fsync
+
+        def fsync(fd):                       # the copy as it is written, before any chmod
+            modes.append(os.fstat(fd).st_mode & 0o777)
+            return real_fsync(fd)
+
+        previous = os.umask(0)                # the mode must not depend on the umask
+        try:
+            with patch.object(admin.os, 'fsync', side_effect=fsync):
+                admin.atomic_private_write(self.marker, '{"password": "test-only"}')
+        finally:
+            os.umask(previous)
+        self.assertEqual(modes[0], 0o600)
+        self.assertEqual(self.marker.stat().st_mode & 0o777, 0o600)
+        self.assertEqual([name for name in self.names() if name.startswith('.deployment')], [])
 
 
 if __name__ == '__main__':
