@@ -67,6 +67,37 @@ class FakeFcntl:
             raise BlockingIOError(11, 'Resource temporarily unavailable')
 
 
+class FakeClock:
+    """``time.perf_counter`` and ``time.sleep`` for capability_misses, so a retry test does
+    not depend on how fast the machine is (kittrial-5bb.132). A sleep advances the clock by
+    what was asked, times ``stretch`` (Windows rounds short sleeps up). ``time.monotonic``
+    is replaced by a clock that steps 15.6 ms on every read, as it does on Windows before
+    Python 3.13: code that measured its budget with it would give up early."""
+
+    def __init__(self, stretch=1.0):
+        self.now = 1000.0
+        self.stretch = stretch
+        self.slept = []
+        self.coarse = 1000.0
+
+    def perf_counter(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+        self.now += seconds * self.stretch
+
+    def monotonic(self):
+        self.coarse += 0.0156
+        return self.coarse
+
+    def patch(self):
+        stack = contextlib.ExitStack()
+        for name in ('perf_counter', 'sleep', 'monotonic'):
+            stack.enter_context(patch.object(cm.time, name, getattr(self, name)))
+        return stack
+
+
 class MissLogCase(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
@@ -369,13 +400,15 @@ class RecordTests(MissLogCase):
         before = self.file.read_bytes()
         self.fcntl.calls.clear()
         self.fcntl.busy = True
-        slept = []
-        with patch.object(cm.time, 'sleep', side_effect=slept.append):
+        clock = FakeClock()
+        with clock.patch():
             self.assertEqual(self.record('reserved label guard'), 'busy')
-        # A few non-blocking attempts, never more than ~10 ms of waiting in total.
+        # A few non-blocking attempts, never more than ~10 ms of waiting in total. The clock
+        # is the test's own (kittrial-5bb.132): with the real one, a 15.6 ms step of
+        # time.monotonic on Windows ended the loop after one attempt ("1 != 4" in CI).
         self.assertEqual(len(self.fcntl.calls), cm.LOCK_ATTEMPTS)
-        self.assertEqual(len(slept), cm.LOCK_ATTEMPTS - 1)
-        self.assertLessEqual(sum(slept), cm.LOCK_WAIT_SECONDS)
+        self.assertEqual(len(clock.slept), cm.LOCK_ATTEMPTS - 1)
+        self.assertLessEqual(sum(clock.slept), cm.LOCK_WAIT_SECONDS)
         self.assertTrue(all(flags & FakeFcntl.LOCK_NB for _, flags in self.fcntl.calls))
         self.assertEqual(self.file.read_bytes(), before)
         self.assertFalse((self.project / cm.TEMP_NAME).exists())
@@ -390,12 +423,32 @@ class RecordTests(MissLogCase):
                 raise BlockingIOError(11, 'Resource temporarily unavailable')
             return real(descriptor, flags)
         self.fcntl.flock = flock
-        # Sleeps are not taken for real: a coarse platform timer (Windows rounds 3 ms up to
-        # about 15 ms) would otherwise use the whole 10 ms budget on the first retry. The
-        # real-time bound has its own test.
-        with patch.object(cm.time, 'sleep'):
+        # Sleeps and the clock are the test's own (FakeClock): a coarse platform timer
+        # (Windows rounds 3 ms up to about 15 ms) would otherwise use the whole 10 ms budget
+        # on the first retry. The real-time bound has its own test.
+        with FakeClock().patch():
             self.assertEqual(self.record('merge slot'), 'recorded')
         self.assertEqual(len(attempts), 3)
+
+    def test_a_coarse_monotonic_clock_does_not_cut_the_retries_short(self):
+        # kittrial-5bb.132: the budget was measured with time.monotonic, which steps by
+        # 15.6 ms on Windows before Python 3.13; one step read as the budget spent. The fake
+        # monotonic steps on every read; the budget must not notice.
+        self.fcntl.busy = True
+        clock = FakeClock()
+        with clock.patch():
+            self.assertEqual(self.record('merge slot'), 'busy')
+        self.assertEqual(len(self.fcntl.calls), cm.LOCK_ATTEMPTS)
+
+    def test_a_stretched_sleep_ends_the_retries(self):
+        # A sleep the system rounds up (3 ms becoming 15.6 ms) uses up the budget: no
+        # further sleep is started, so a busy lock is still skipped, never waited for.
+        self.fcntl.busy = True
+        clock = FakeClock(stretch=0.0156 / cm.LOCK_RETRY_SECONDS)
+        with clock.patch():
+            self.assertEqual(self.record('merge slot'), 'busy')
+        self.assertEqual(len(clock.slept), 1)
+        self.assertEqual(len(self.fcntl.calls), 2)
 
     def test_the_retry_wait_is_bounded_in_real_time(self):
         self.fcntl.busy = True
