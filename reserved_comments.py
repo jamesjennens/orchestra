@@ -1345,7 +1345,8 @@ def status_change_targets(args):
 #   dep add --file     the ends of every edge in the file               from/to/issue_id/depends_on_id of
 #                                                                       each line; unreadable: refused
 #   list, show, ready, search, count, state, lint, comments ID,
-#   dep list/tree/cycles                                                reads: not guarded
+#   dep list/tree/cycles                                                reads: READ_FLAGS decides; a read flag
+#                                                                       that claims a row is refused
 #
 # `external:PROJECT:CAPABILITY` in a dependency is not a row and is not resolved.
 # ---------------------------------------------------------------------------
@@ -1387,6 +1388,117 @@ WRITE_FLAGS = {
     'dep add': {'--blocked-by': 'row', '--depends-on': 'row', '--file': 'file', '--no-cycle-check': 'plain',
                 '--type': 'plain'},
     'dep remove': {}, 'dep relate': {}, 'dep unrelate': {},
+}
+#: Every flag of every READING bd 1.2.2 command a contributor may run, and how it bears on rows:
+#:   'plain'   the invocation only reads
+#:   'write'   the flag makes bd move a row it chooses: refused before any native write
+#: The reviewer of kittrial-5bb.113 revision 3 ran `bd ready --claim` as a contributor and
+#: bd answered "Claimed issue: PROJECT-merge-slot": `ready` was on the read side of the table
+#: above, so nothing looked at its flags, and bd claimed the priority-0 slot by itself. Every
+#: read is now here, and every flag of every read is named, so a flag that makes a read write
+#: is either refused (this table) or noticed when the pinned bd changes (the help comparison
+#: in tests/test_bd_write_flags.py, which covers reads as well as writes).
+#: `comments TASK` uses the `comments` inventory (bd's shorthand for `comments list`).
+READ_FLAGS = {
+    'list': {
+        '--all': 'plain', '--assignee': 'plain', '--closed-after': 'plain', '--closed-before': 'plain',
+        '--created-after': 'plain', '--created-before': 'plain', '--defer-after': 'plain', '--defer-before': 'plain',
+        '--deferred': 'plain', '--desc-contains': 'plain', '--due-after': 'plain', '--due-before': 'plain',
+        '--empty-description': 'plain', '--exclude-label': 'plain', '--exclude-type': 'plain', '--flat': 'plain',
+        '--format': 'plain', '--has-metadata-key': 'plain', '--id': 'plain', '--include-gates': 'plain',
+        '--include-infra': 'plain', '--include-templates': 'plain', '--label': 'plain', '--label-any': 'plain',
+        '--label-pattern': 'plain', '--label-regex': 'plain', '--limit': 'plain', '--long': 'plain',
+        '--metadata-field': 'plain', '--mol-type': 'plain', '--no-assignee': 'plain', '--no-labels': 'plain',
+        '--no-pager': 'plain', '--no-parent': 'plain', '--no-pinned': 'plain', '--notes-contains': 'plain',
+        '--offset': 'plain', '--overdue': 'plain', '--parent': 'plain', '--pinned': 'plain', '--pretty': 'plain',
+        '--priority': 'plain', '--priority-max': 'plain', '--priority-min': 'plain', '--ready': 'plain',
+        '--reverse': 'plain', '--skip-labels': 'plain', '--sort': 'plain', '--spec': 'plain', '--status': 'plain',
+        '--title': 'plain', '--title-contains': 'plain', '--tree': 'plain', '--type': 'plain',
+        '--updated-after': 'plain', '--updated-before': 'plain', '--watch': 'plain', '--wisp-type': 'plain',
+    },
+    'show': {
+        '--as-of': 'plain', '--children': 'plain', '--current': 'plain', '--id': 'plain',
+        '--include-comments': 'plain', '--include-dependents': 'plain', '--local-time': 'plain', '--long': 'plain',
+        '--refs': 'plain', '--short': 'plain', '--thread': 'plain', '--watch': 'plain',
+    },
+    'ready': {
+        '--assignee': 'plain', '--claim': 'write', '--exclude-label': 'plain', '--exclude-type': 'plain',
+        '--explain': 'plain', '--gated': 'plain', '--has-metadata-key': 'plain', '--include-deferred': 'plain',
+        '--include-ephemeral': 'plain', '--label': 'plain', '--label-any': 'plain', '--limit': 'plain',
+        '--metadata-field': 'plain', '--mol': 'plain', '--mol-type': 'plain', '--offset': 'plain',
+        '--parent': 'plain', '--plain': 'plain', '--pretty': 'plain', '--priority': 'plain', '--sort': 'plain',
+        '--type': 'plain', '--unassigned': 'plain',
+    },
+    'search': {
+        '--assignee': 'plain', '--closed-after': 'plain', '--closed-before': 'plain', '--created-after': 'plain',
+        '--created-before': 'plain', '--desc-contains': 'plain', '--empty-description': 'plain',
+        '--external-contains': 'plain', '--has-metadata-key': 'plain', '--label': 'plain', '--label-any': 'plain',
+        '--limit': 'plain', '--long': 'plain', '--metadata-field': 'plain', '--no-assignee': 'plain',
+        '--no-labels': 'plain', '--notes-contains': 'plain', '--priority-max': 'plain', '--priority-min': 'plain',
+        '--query': 'plain', '--reverse': 'plain', '--sort': 'plain', '--status': 'plain', '--type': 'plain',
+        '--updated-after': 'plain', '--updated-before': 'plain',
+    },
+    'count': {
+        '--assignee': 'plain', '--by-assignee': 'plain', '--by-label': 'plain', '--by-priority': 'plain',
+        '--by-status': 'plain', '--by-type': 'plain', '--closed-after': 'plain', '--closed-before': 'plain',
+        '--created-after': 'plain', '--created-before': 'plain', '--desc-contains': 'plain',
+        '--empty-description': 'plain', '--id': 'plain', '--include-infra': 'plain', '--label': 'plain',
+        '--label-any': 'plain', '--no-assignee': 'plain', '--no-labels': 'plain', '--notes-contains': 'plain',
+        '--priority': 'plain', '--priority-max': 'plain', '--priority-min': 'plain', '--status': 'plain',
+        '--title': 'plain', '--title-contains': 'plain', '--type': 'plain', '--updated-after': 'plain',
+        '--updated-before': 'plain',
+    },
+    'state': {},
+    'lint': {
+        '--status': 'plain', '--type': 'plain',
+    },
+    'comments': {
+        '--local-time': 'plain',
+    },
+    'comments list': {},
+    'dep': {
+        '--blocks': 'plain', '--no-cycle-check': 'plain',
+    },
+    'dep list': {
+        '--direction': 'plain', '--type': 'plain',
+    },
+    'dep tree': {
+        '--direction': 'plain', '--format': 'plain', '--max-depth': 'plain', '--reverse': 'plain',
+        '--show-all-paths': 'plain', '--status': 'plain',
+    },
+    'dep cycles': {},
+}
+#: The read flags that take a value, so the read scan consumes the value instead of reading
+#: it as a flag (`bd ready -a --claim` names the actor `--claim`; it does not claim).
+#: From `bd COMMAND --help` of the pinned bd, which prints a type after a value flag.
+READ_VALUE_FLAGS = {
+    'list': frozenset(['--assignee', '--closed-after', '--closed-before', '--created-after', '--created-before',
+                       '--defer-after', '--defer-before', '--desc-contains', '--due-after', '--due-before',
+                       '--exclude-label', '--exclude-type', '--format', '--has-metadata-key', '--id', '--label',
+                       '--label-any', '--label-pattern', '--label-regex', '--limit', '--metadata-field', '--mol-type',
+                       '--notes-contains', '--offset', '--parent', '--priority', '--priority-max', '--priority-min',
+                       '--sort', '--spec', '--status', '--title', '--title-contains', '--type', '--updated-after',
+                       '--updated-before', '--wisp-type']),
+    'show': frozenset(['--as-of', '--id']),
+    'ready': frozenset(['--assignee', '--exclude-label', '--exclude-type', '--has-metadata-key', '--label',
+                        '--label-any', '--limit', '--metadata-field', '--mol', '--mol-type', '--offset', '--parent',
+                        '--priority', '--sort', '--type']),
+    'search': frozenset(['--assignee', '--closed-after', '--closed-before', '--created-after', '--created-before',
+                         '--desc-contains', '--external-contains', '--has-metadata-key', '--label', '--label-any',
+                         '--limit', '--metadata-field', '--notes-contains', '--priority-max', '--priority-min',
+                         '--query', '--sort', '--status', '--type', '--updated-after', '--updated-before']),
+    'count': frozenset(['--assignee', '--closed-after', '--closed-before', '--created-after', '--created-before',
+                        '--desc-contains', '--id', '--label', '--label-any', '--notes-contains', '--priority',
+                        '--priority-max', '--priority-min', '--status', '--title', '--title-contains', '--type',
+                        '--updated-after', '--updated-before']),
+    'state': frozenset(),
+    'lint': frozenset(['--status', '--type']),
+    'comments': frozenset(),
+    'comments list': frozenset(),
+    'dep': frozenset(['--blocks']),
+    'dep list': frozenset(['--direction', '--type']),
+    'dep tree': frozenset(['--direction', '--format', '--max-depth', '--status']),
+    'dep cycles': frozenset(),
 }
 MERGE_SLOT_SUFFIX = '-merge-slot'
 #: A project name holds no hyphen (admin.validate_name), so the slot's id has this exact shape.
@@ -1510,6 +1622,59 @@ def shown_token(token):
     return text if re.fullmatch(r'[A-Za-z0-9_.:=-]+', text) else json.dumps(text, ensure_ascii=True)
 
 
+def read_invocation_label(args):
+    """The READ_FLAGS key of a READ invocation, or None when this is not one of those reads.
+
+    ``comments TASK`` (bd's shorthand for ``comments list``) is a read of the bare
+    ``comments`` inventory; ``comments add`` is a write and answers None, as does every
+    command whose writes are resolved by name (create/update/close/reopen/dep forms).
+    """
+    if not isinstance(args, list) or not args or not isinstance(args[0], str):
+        return None
+    command = args[0]
+    if command == 'comments':
+        parts = _comments_parts(args)
+        if parts is None or parts[0] == 'add':
+            return None
+        return 'comments list' if parts[0] == 'list' else 'comments'
+    if command == 'dep':
+        subcommand = _dep_subcommand(args)
+        return 'dep %s' % subcommand if subcommand in _DEP_READS else None
+    return command if command in READ_FLAGS else None
+
+
+def _read_writes(args, label):
+    """The sentence refusing a READ invoked with a write-shaped flag, or None.
+
+    ``bd ready --claim`` "atomically claim[s] the first ready issue" (bd 1.2.2 ``ready
+    --help``) -- that is the row bd chooses, and on a real project the first ready issue
+    is the priority-0 merge slot the reviewer saw claimed (kittrial-5bb.113 review). The
+    flag is refused before any native write. The value of a value-taking read flag is
+    consumed, so ``ready -a --claim`` names the actor ``--claim`` and stays a read; a
+    short flag's value is not resolved, which can only refuse more, never less.
+    """
+    fields = READ_FLAGS[label]
+    values = READ_VALUE_FLAGS[label]
+    index = len(label.split())
+    while index < len(args):
+        token = args[index]
+        if not isinstance(token, str):
+            return 'an argument is not text'
+        if token == '--':
+            return None
+        if token.startswith('--'):
+            name, joined, value = token.partition('=')
+            if fields.get(name) == 'write':
+                parsed = _parse_go_bool(value) if joined else True
+                if parsed is None or parsed:
+                    return ('%s lets bd choose the row it writes, which is not named in this request; '
+                            'read the rows, then name the one you mean' % shown_token(name))
+            if name in values and not joined:
+                index += 1
+        index += 1
+    return None
+
+
 def write_targets(args, attachments=None):
     """What a bd invocation writes, or None for a read (the table above).
 
@@ -1521,6 +1686,11 @@ def write_targets(args, attachments=None):
     if not isinstance(args, list) or not args or not isinstance(args[0], str):
         return None
     command = args[0]
+    read = read_invocation_label(args)
+    if read is not None:
+        refusal = _read_writes(args, read)
+        return None if refusal is None else {'command': read, 'targets': [], 'new_id': None,
+                                             'refusal': refusal}
     label, targets, new_id, refusal = command, [], None, None
     if command in ('create', 'update', 'close', 'reopen'):
         flags, operands, unknown = _bd_scan(args, command)

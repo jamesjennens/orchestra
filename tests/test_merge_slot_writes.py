@@ -332,9 +332,11 @@ class EndpointTests(unittest.TestCase):
                 self.assertIn(exists, said)
                 self.assertTrue(said.endswith('Nothing was written.'))
         # The check is the first thing done, and it is exact: one read, of that id.
+        # `show`, not `list --all --id`: the list does not see ephemeral or gate rows
+        # (kittrial-5bb.135).
         self.bd.reads = []
         self.refused(['create', 'x', '--id', OTHER, '--parent', THIRD])
-        self.assertEqual(self.bd.reads, [['list --id', OTHER]])
+        self.assertEqual(self.bd.reads, [[OTHER]])
 
     def test_create_with_an_id_of_the_slot_is_refused(self):
         for value in (SLOT, SLOT + '.1', 'zz-merge-slot', 'zz-merge-slot.2.1'):
