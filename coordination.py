@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import record_json
 import re
 import time
 from pathlib import Path
@@ -274,12 +275,12 @@ def repair_merge_slot(run,slot):
     them disagreeing, and bd then refuses both acquire and release. The holder bd
     recorded decides: nothing here names a new holder or releases one.
     """
-    rows=json.loads(run(['show',slot,'--json']))
+    rows=record_json.loads(run(['show',slot,'--json']))
     row=rows[0] if isinstance(rows,list) and rows else rows
     if not isinstance(row,dict) or row.get('id')!=slot:raise ValueError('Could not read the merge slot row %s to check it'%slot)
     metadata=row.get('metadata')
     if isinstance(metadata,str):
-        try:metadata=json.loads(metadata)
+        try:metadata=record_json.loads(metadata)
         except ValueError:metadata=None
     holder=metadata.get('holder') if isinstance(metadata,dict) else None
     wanted='in_progress' if holder else 'open'
@@ -299,7 +300,7 @@ def apply_native(p, actor, run, project):
         identifier(p['request_id']);identifier(p['parent'])
         from reserved_comments import could_name_merge_slot
         if could_name_merge_slot(p['parent']):
-            parents=json.loads(run(['show',p['parent'],'--json']))
+            parents=record_json.loads(run(['show',p['parent'],'--json']))
             for parent in parents if isinstance(parents,list) else [parents]:
                 if is_merge_slot(parent):raise ValueError(merge_slot_sentence(parent.get('id'))+'; it takes no child')
         if not isinstance(p['title'],str) or not p['title'].strip() or not isinstance(p['description'],str):raise ValueError('Child needs title and description')

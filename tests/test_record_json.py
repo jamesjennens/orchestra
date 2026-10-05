@@ -233,8 +233,10 @@ class NoUnguardedParseTests(unittest.TestCase):
         # lifecycle.py is down to one guarded parse (kittrial-5bb.107 rev3): its
         # reverted_integrations now delegates to review_state.reverts_by_task, so the
         # raw reject-comment parse that used record_json.loads here is gone.
+        # coordination.py and one more in endpoint.py (kittrial-5bb.113 revision 2): the merge
+        # slot row as bd prints it, whose metadata a contributor could once write.
         self.assertEqual({name: count for name, count in uses.items() if count}, {
-            'briefing.py': 4, 'endpoint.py': 2, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
+            'briefing.py': 4, 'coordination.py': 3, 'endpoint.py': 3, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
             'handoff.py': 1, 'http_service.py': 2, 'lifecycle.py': 1, 'recovery.py': 1, 'requirements.py': 1,
             'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
 

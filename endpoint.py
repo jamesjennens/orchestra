@@ -213,7 +213,7 @@ def _guard_merge_slot_writes(root,path,args,actor):
             said=(p.stderr or p.stdout or '').strip()
             if 'no issue found' in said or 'ambiguous' in said.lower():continue
             raise ValueError('Could not check whether %s names the merge slot of the project before the write, so no native write was attempted: %s'%(token,said[-300:]))
-        try:rows=json.loads(p.stdout)
+        try:rows=record_json.loads(p.stdout)
         except ValueError:raise ValueError('Could not check whether %s names the merge slot of the project before the write (unreadable native answer), so no native write was attempted.'%(token,))
         if isinstance(rows,dict):rows=[rows]
         for row in rows if isinstance(rows,list) else []:
