@@ -78,15 +78,59 @@ class TerminatedBySignal(BaseException):
 # The active termination guards, innermost last (kittrial-5bb.122). raise_termination
 # consults them, so a stop that the interpreter runs late - at whatever bytecode
 # boundary follows the signal - still lands on the guard's rules. Only the main thread
-# installs a handler, so only main-thread guards are listed. The list holds weak
-# references (kittrial-5bb.124): a guard whose exit never runs - left behind by
+# installs a handler, so only main-thread guards are listed. A record holds the guard
+# weakly (kittrial-5bb.124): a guard whose exit never runs - left behind by
 # contextlib.ExitStack when a stop lands between the block and the exit - is not kept
-# alive by its record, so its finaliser can release it.
+# alive by its record, so its finaliser can release it. The record also keeps what a
+# release needs (kittrial-5bb.125): a guard collected where its finaliser cannot
+# release it - on another thread, where signal.signal is refused - leaves a dead
+# record that the main thread releases at its next chance (_reap_abandoned).
 _termination_guards=[]
+
+class _GuardRecord:
+    """One listed guard: a weak reference to it, the handler it replaced, and whether a
+    stop it recorded is still owed to that handler once the guard is gone."""
+    __slots__=('ref','previous','held')
+
+    def __init__(self,guard,previous):
+        self.ref=weakref.ref(guard)
+        self.previous=previous
+        self.held=False
 
 def _listed_guards():
     """The listed guards still alive, innermost last."""
-    return [guard for guard in (ref() for ref in _termination_guards) if guard is not None]
+    return [guard for guard in (record.ref() for record in _termination_guards) if guard is not None]
+
+def _reap_abandoned():
+    """Release the records of guards that were collected without being released: dead
+    records after the last live one (kittrial-5bb.125).
+
+    Runs only on the main thread, where the handler can be restored: in the handler
+    itself and at the start of every guard's ``__enter__``. The outermost of those
+    records names the handler that was installed before them; it is put back if
+    ``raise_termination`` is still installed. Returns whether one of them had recorded
+    a stop, which the caller then sends to the handler now installed."""
+    if threading.current_thread() is not threading.main_thread():
+        return False
+    live=[index for index,record in enumerate(_termination_guards) if record.ref() is not None]
+    first=live[-1]+1 if live else 0
+    dead=_termination_guards[first:]
+    if not dead:
+        return False
+    del _termination_guards[first:]
+    try:
+        if signal.getsignal(signal.SIGTERM) is raise_termination:
+            signal.signal(signal.SIGTERM,dead[0].previous)
+    except _TERMINATION_ERRORS:
+        pass
+    return any(record.held for record in dead)
+
+def _resend_sigterm():
+    """Send a stop to whatever handler is installed now (it runs at once)."""
+    try: signal.raise_signal(signal.SIGTERM)
+    except _TERMINATION_ERRORS:
+        try: os.kill(os.getpid(),signal.SIGTERM)
+        except _TERMINATION_ERRORS: pass
 
 _TERMINATION_ERRORS=(ValueError,OSError,RuntimeError,AttributeError,TypeError)
 
@@ -102,7 +146,9 @@ def _running_guard(frame):
     caller's frame, never under ``__enter__`` or ``__exit__``, so a stop in the block is
     not mistaken for one in the guard's code. A guard that is no longer listed (its
     exit has unlisted it) does not count: a stop handled in its last lines belongs to
-    the guards still listed, or to the previous handler."""
+    the guards still listed, or to the previous handler. A guard the collector is
+    finalising has lost its weak reference and does not count either: the handler first
+    releases its dead record (``_reap_abandoned``) and passes the stop on."""
     listed=_listed_guards()
     while frame is not None:
         if frame.f_code in _GUARD_CODES:
@@ -138,7 +184,16 @@ def raise_termination(signum,frame):
     raised, so the block does not run (kittrial-5bb.124). ``raise_signal`` or
     ``interrupt_main`` cannot defer it to the block: the interpreter runs the handler
     again at its next check, which is still inside this handler.
+
+    Guards that were collected without being released are released first
+    (``_reap_abandoned``). If that puts the previous handler back, this stop is that
+    handler's: it is sent on to it, after any stop those guards had recorded.
     """
+    if _reap_abandoned():
+        _resend_sigterm()
+    if signal.getsignal(signum) is not raise_termination:
+        _resend_sigterm()
+        return
     listed=_listed_guards()
     if listed:
         guard,code=_running_guard(frame)
@@ -234,6 +289,8 @@ class signal_termination_guard:
     def __enter__(self):
         if threading.current_thread() is not threading.main_thread():
             return self
+        if _reap_abandoned():
+            _resend_sigterm()   # owed to the handler the abandoned guards replaced
         try:
             previous=signal.getsignal(signal.SIGTERM)
         except _TERMINATION_ERRORS:
@@ -241,7 +298,8 @@ class signal_termination_guard:
         if previous is None:
             return self   # installed outside Python: it could not be restored
         self.previous=previous
-        _termination_guards.append(weakref.ref(self))
+        self._record=_GuardRecord(self,previous)
+        _termination_guards.append(self._record)
         self.listed=True
         try:
             signal.signal(signal.SIGTERM,raise_termination)
@@ -268,12 +326,35 @@ class signal_termination_guard:
         ``contextlib.ExitStack`` can drop it when a stop lands in its own code between the
         block and the guard's exit. Release it here, so the previous handler is back and
         no stopped record outlives it; a stop it had recorded goes to the previous
-        handler, as for an abandoned block. The kit itself uses plain ``with``."""
+        handler, as for an abandoned block, or, while an outer guard is still active, to
+        the innermost of those, which raises it at its exit. The kit itself uses plain
+        ``with``.
+
+        Only on the main thread (kittrial-5bb.125): elsewhere ``signal.signal`` is refused,
+        and a stop sent from there would be raised in the main thread wherever it happens
+        to be. There the guard only notes a stop it owes; its record stays, dead, until
+        the main thread's next stop or next guard releases it (``_reap_abandoned``). At
+        interpreter exit the guard is released but a stop it recorded is not sent on: the
+        process is already ending, and the exit status it was asked to end with is kept
+        rather than replaced by death by ``SIGTERM``. Nothing raised here can escape a
+        finaliser usefully, so every exception, ``BaseException`` included, stops here."""
         try:
-            if self.listed:
-                self._release()
+            if not self.listed:
+                return
+            if threading.current_thread() is not threading.main_thread():
+                self._record.held=self.held and not self.stopped
+                return
+            self._release()
+            live=_listed_guards()
+            if live:
+                # Sent on now, the stop would be raised by an outer guard's handler inside
+                # this finaliser, where nothing can catch it: the innermost live guard
+                # takes it instead and raises it at its exit.
+                if self.held and not self.stopped and not any(guard.stopped for guard in live):
+                    live[-1].held=True
+            elif not sys.is_finalizing():
                 self._raise_held(True)
-        except Exception:
+        except BaseException:
             pass
 
     def _release(self):
@@ -299,7 +380,8 @@ class signal_termination_guard:
                     except _TERMINATION_ERRORS: pass
             finally:
                 self.listed=False
-                _termination_guards[:]=[ref for ref in _termination_guards if ref() is not None and ref() is not self]
+                record=getattr(self,'_record',None)
+                _termination_guards[:]=[listed for listed in _termination_guards if listed is not record]
 
     def _raise_held(self,abandoned):
         """Raise a stop recorded in the guard's own code, once for all guards."""
@@ -307,10 +389,7 @@ class signal_termination_guard:
             return
         self.stopped=True
         if abandoned:
-            try: signal.raise_signal(signal.SIGTERM)
-            except _TERMINATION_ERRORS:
-                try: os.kill(os.getpid(),signal.SIGTERM)
-                except _TERMINATION_ERRORS: pass
+            _resend_sigterm()
             return
         _stop_guards()
         raise TerminatedBySignal(signal.SIGTERM)

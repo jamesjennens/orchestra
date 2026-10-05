@@ -374,7 +374,13 @@ has an effect in both directions.
   only when the repairer it names is a configured operator (`deployment.private.json`
   `operators`); a well-formed file naming anyone else, or a project outside a deployment
   root, shows no repair (kittrial-5bb.124). Treat a repair note as a hint, and the audit
-  record's setter and history as the record. If the audit path is a symlink, a
+  record's setter and history as the record. Three consequences (kittrial-5bb.125):
+  a genuine repair stops being shown once its operator is removed from the operator
+  list; nothing is shown at all when no operators are configured; and a file planted by
+  someone who can write the project directory, naming a listed operator, is shown. A
+  repair whose repairer is no longer listed is hidden rather than shown as "repaired by
+  NAME (no longer a listed operator)": a reader cannot tell it from a planted file
+  naming any unlisted name, so marking it would show those too. If the audit path is a symlink, a
   directory or any other non-regular file, the same-text set refuses before it changes
   anything (`Nothing was changed: ...`); remove it and set again. If the audit write
   itself fails after the record was repaired, the set succeeds and prints that the
