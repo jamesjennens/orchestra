@@ -74,11 +74,11 @@ RELEASE_CLIENT_TIMEOUT_SECONDS = 150.0
 # a --live-verified deployment of already-labelled tasks issues one or more extra
 # processes per target (six, or seven once the task was also verified before) for
 # four recorded facts. A clean re-measurement of the delivered kit on real bd
-# 1.2.2 + Dolt measured 0.43 to 0.46 s per `bd` process and 0.79 s per planned
-# fact in the slowest case (DRY_RUN_MEASURED_SECONDS_PER_WRITE); the policy keeps
-# 1.5 s, which also covers the reviewer's measured 1.47 s per planned fact, and
-# replaced the per-TARGET figure taken under a concurrent suite
-# (kittrial-5bb.119 review items 3 and 4).
+# 1.2.2 + Dolt (two runs) measured 0.43 to 0.57 s per `bd` process and up to
+# 0.92 s per planned fact in the slowest case
+# (DRY_RUN_MEASURED_SECONDS_PER_WRITE); the policy keeps 1.5 s, which also covers
+# the reviewer's measured 1.47 s per planned fact, and replaced the per-TARGET
+# figure taken under a concurrent suite (kittrial-5bb.119 review items 3 and 4).
 DRY_RUN_SECONDS_PER_WRITE = 1.5
 DRY_RUN_FIXED_SECONDS = 15.0
 DRY_RUN_WRITES_PLAIN = 3
@@ -91,7 +91,7 @@ DRY_RUN_WRITES_VERIFY_ONLY = 1
 # (the slowest measured run, a first --live-verified deployment to a second
 # environment); DRY_RUN_SECONDS_PER_WRITE is kept above it and above the
 # reviewer's 1.47 s per planned fact.
-DRY_RUN_MEASURED_SECONDS_PER_WRITE = 0.8
+DRY_RUN_MEASURED_SECONDS_PER_WRITE = 1.0
 DRY_RUN_MEASURED_FIXED_SECONDS = 15.0
 # The writing command asks the endpoint which integrations are reverted; the
 # offline dry run cannot, so it says plainly that its local revert view may list a

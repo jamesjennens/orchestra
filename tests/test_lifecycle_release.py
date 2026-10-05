@@ -1763,12 +1763,12 @@ class ReleaseCostEstimateTests(unittest.TestCase):
     def test_the_per_write_estimate_covers_the_measured_cost(self):
         # The floors are hard-coded so weakening the constants the estimate rests
         # on, or zeroing the fixed part, FAILS (.119 p3 item 3). This revision's
-        # clean re-measurement of the delivered kit on real bd 1.2.2 + Dolt
-        # measured 0.43-0.46 s per bd process and 0.79 s per planned fact on the
-        # slowest run (a first --live-verified deployment to a second
-        # environment); the policy figure keeps 1.5 s per planned fact, which
-        # also covers the reviewer's measured 1.47 s.
-        self.assertGreaterEqual(lifecycle.DRY_RUN_MEASURED_SECONDS_PER_WRITE, 0.8)
+        # clean re-measurements of the delivered kit on real bd 1.2.2 + Dolt (two
+        # runs) measured 0.43-0.57 s per bd process and up to 0.92 s per planned
+        # fact on the slowest case (a first --live-verified deployment to a second
+        # environment); the policy figure keeps 1.5 s per planned fact, which also
+        # covers the reviewer's measured 1.47 s.
+        self.assertGreaterEqual(lifecycle.DRY_RUN_MEASURED_SECONDS_PER_WRITE, 1.0)
         self.assertGreaterEqual(lifecycle.DRY_RUN_SECONDS_PER_WRITE, 1.5)
         self.assertGreaterEqual(lifecycle.DRY_RUN_MEASURED_FIXED_SECONDS, 15.0)
         self.assertGreaterEqual(lifecycle.DRY_RUN_SECONDS_PER_WRITE,
