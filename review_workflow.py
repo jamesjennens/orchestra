@@ -1735,6 +1735,8 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
     if len(matches) != 1 or matches[0].get('issue_type') == 'event':
         raise ValueError('Task missing, duplicated or is an event')
     issue = matches[0]
+    if issue.get('malformed'):
+        raise ValueError('Task %s is malformed: %s' % (task, issue.get('error') or 'cannot parse row'))
     closed = issue.get('status') == 'closed'
     ordered, voids, invalid, refused, positions, reverts, invalid_reverts = history(issue, operators, journal)
     state = projection(ordered, voids, invalid, refused, positions, reverts, invalid_reverts, closed=closed)

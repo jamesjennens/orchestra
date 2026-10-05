@@ -145,7 +145,7 @@ def validate_payload(p):
 
 
 def native_event(row):
-    if row.get('issue_type')!='event':return None
+    if not isinstance(row, dict) or row.get('issue_type')!='event' or row.get('malformed') or not row.get('id'):return None
     match=re.fullmatch(r'(?:Set |Changed )([A-Za-z0-9-]+)(?: from [^\n]+)? to ([^\n]+)(?:\n\nReason: ([\s\S]*))?',row.get('description',''))
     parents=[d.get('depends_on_id') for d in row.get('dependencies',[]) if d.get('type')=='parent-child']
     if len(parents)!=1:return None
@@ -232,7 +232,7 @@ def trusted_payloads(rows,events=None):
     if events is None:events=events_by_dimension(rows)
     trusted={}
     for row in rows:
-        if row.get('issue_type')=='event':continue
+        if not isinstance(row, dict) or row.get('issue_type')=='event' or row.get('malformed') or not row.get('id'):continue
         task=row['id'];labels=row.get('labels') or []
         scope_event=latest_event(events,task,'lifecycle-scope')
         scope=scope_event['payload']['scope'] if label_agrees(labels,scope_event,'lifecycle-scope') and scope_event['payload'] else None
@@ -259,7 +259,7 @@ def project_facts(rows):
     history={entry['id']:entry['scopes'] for entry in scoped_evidence(rows,('deployed',LIVE))}
     result=[]
     for row in rows:
-        if row.get('issue_type')=='event':continue
+        if not isinstance(row, dict) or row.get('issue_type')=='event' or row.get('malformed') or not row.get('id'):continue
         dimensions=trusted[row['id']]
         live=dimensions[LIVE]['value']
         current_scope=dimensions[DIMENSIONS[0]]['scope']
@@ -296,7 +296,7 @@ def enabled_states(rows):
     trusted=trusted_payloads(rows)
     result=[]
     for row in rows:
-        if row.get('issue_type')=='event':continue
+        if not isinstance(row, dict) or row.get('issue_type')=='event' or row.get('malformed') or not row.get('id'):continue
         state=trusted[row['id']][ENABLED];payload=state['payload']
         result.append({'id':row['id'],'value':state['value'],'event_id':state['event_id'],
                        'evidence':payload['evidence'] if payload else [],
@@ -355,7 +355,7 @@ def scoped_evidence(rows,dimensions=('integrated',)):
         if event:events.setdefault((event['task'],event['dimension']),[]).append(event)
     result=[]
     for row in rows:
-        if row.get('issue_type')=='event':continue
+        if not isinstance(row, dict) or row.get('issue_type')=='event' or row.get('malformed') or not row.get('id'):continue
         task=row['id'];labels=row.get('labels') or []
         scope_event=latest_event(events,task,'lifecycle-scope')
         scope_trusted=(scope_event is not None and scope_event['payload'] is not None
@@ -1001,6 +1001,8 @@ def _operation_index(rows):
     """``{operation_id: (payload, event_id)}`` from one pass over the export."""
     index={}
     for row in rows:
+        if isinstance(row, dict) and row.get('malformed') and (row.get('issue_type') == 'event' or (row.get('id') and '.' in str(row.get('id')))):
+            raise ValueError('Event row %s cannot be parsed: %s' % (row.get('id'), row.get('error') or 'malformed'))
         event=native_event(row)
         if event and event['payload'] and event['payload']['operation_id'] not in index:
             index[event['payload']['operation_id']]=(event['payload'],event['id'])
@@ -1061,7 +1063,7 @@ def _release_plan(rows,payload,operators=None,journal=None):
     receives a new live fact before verification. Target positives are planned
     after any negative scope writes for the same task.
     """
-    issues={row['id']:row for row in rows if row.get('issue_type')!='event'}
+    issues={row['id']:row for row in rows if row.get('issue_type')!='event' and not row.get('malformed')}
     facts={state['id']:state for state in project_facts(rows)}
     evidence={entry['id']:entry for entry in
               scoped_evidence(rows,('integrated','deployed','live-verified',LIVE))}
@@ -1162,7 +1164,7 @@ def _supersede_plan(rows,payload,issues=None,evidence=None):
     ``(task,planned_payload)``; evidence events are untouched.
     """
     if issues is None:
-        issues={row['id']:row for row in rows if row.get('issue_type')!='event'}
+        issues={row['id']:row for row in rows if row.get('issue_type')!='event' and not row.get('malformed')}
     if evidence is None:
         evidence={entry['id']:entry for entry in
                   scoped_evidence(rows,('integrated','deployed','live-verified',LIVE))}
@@ -1214,7 +1216,7 @@ def _supersede_scope_plan(rows,payload,issues=None,evidence=None):
     ``(task,planned_payload)``; evidence events are untouched.
     """
     if issues is None:
-        issues={row['id']:row for row in rows if row.get('issue_type')!='event'}
+        issues={row['id']:row for row in rows if row.get('issue_type')!='event' and not row.get('malformed')}
     if evidence is None:
         evidence={entry['id']:entry for entry in
                   scoped_evidence(rows,('integrated','deployed','live-verified',LIVE))}
@@ -1295,7 +1297,7 @@ def apply_release(payload,actor,run,operators=None,journal=None):
                                            or payload.get('supersede_scopes')):
         raise ValueError('a release needs at least one integrated target')
     if payload['actor']!=actor:raise ValueError('payload actor must match request actor')
-    rows=[json.loads(x) for x in run(['export','--all']).splitlines() if x.strip()]
+    rows=record_json.loads_rows(run(['export','--all']))
     if payload.get('rollback'):require_rollback_target_deployed(rows,payload['scope'])
     selected,plans,issues,evidence=_release_plan(rows,payload,operators,journal)
     superseded=_supersede_plan(rows,payload,issues,evidence)
@@ -1400,7 +1402,7 @@ def release_query(payload,actor,run,operators=None,journal=None):
     """
     validate_query_payload(payload)
     if payload['actor']!=actor:raise ValueError('payload actor must match request actor')
-    rows=[json.loads(x) for x in run(['export','--all']).splitlines() if x.strip()]
+    rows=record_json.loads_rows(run(['export','--all']))
     environment=payload['scope']['environment']
     reverted=sorted(reverted_integrations(rows,operators,journal))
     live=[]
@@ -1429,8 +1431,8 @@ def apply_native(payload, actor, run, operators=None, journal=None):
         return apply_release(payload,actor,run,operators,journal)
     validate_payload(payload)
     if payload['actor']!=actor:raise ValueError('payload actor must match request actor')
-    rows=[json.loads(x) for x in run(['export','--all']).splitlines() if x.strip()]
-    issues={row['id']:row for row in rows if row.get('issue_type')!='event'}
+    rows=record_json.loads_rows(run(['export','--all']))
+    issues={row['id']:row for row in rows if row.get('issue_type')!='event' and not row.get('malformed')}
     state=next((r for r in project_facts(rows) if r['id']==payload['task']),None)
     current_scope=state['scope'] if state else None
     # A SINGLE fact must name the task's CURRENT scope: a fact recorded under an

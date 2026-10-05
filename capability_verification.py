@@ -268,7 +268,10 @@ class Integrated:
             for line in self.run(['export', '--all']).splitlines():
                 if not line.strip():
                     continue
-                row = json.loads(line)
+                try:
+                    row = json.loads(line)
+                except (ValueError, RecursionError):
+                    continue
                 if is_lifecycle_row(row):
                     rows.append(row)
         self.everything = integrated_commits(rows, self.operators, self.journal)

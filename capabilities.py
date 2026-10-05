@@ -40,6 +40,10 @@ import difflib
 import io
 import json
 import os
+try:
+    import record_json
+except ImportError:
+    record_json = None
 import re
 import subprocess
 import sys
@@ -1058,11 +1062,17 @@ def read_graph(path, max_bytes):
     except UnicodeDecodeError:
         raise ValueError('graph.json is not UTF-8') from None
     try:
+        if record_json is not None:
+            record_json.check(text)
         document = json.loads(text, parse_constant=_refuse_constant)
     except RecursionError:
         raise ValueError('graph.json nests too deeply') from None
-    except ValueError as exc:
-        raise ValueError('graph.json is not valid JSON (%s)' % clean(exc)[:120]) from None
+    except Exception as exc:
+        if record_json is not None and isinstance(exc, getattr(record_json, 'NestingError', ())):
+            raise ValueError('graph.json nests too deeply') from None
+        if isinstance(exc, ValueError):
+            raise ValueError('graph.json is not valid JSON (%s)' % clean(exc)[:120]) from None
+        raise
     if not isinstance(document, dict):
         raise ValueError('graph.json must be a JSON object with "nodes" and "links"')
     nodes = document.get('nodes')

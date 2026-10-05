@@ -53,6 +53,7 @@ import unicodedata
 from pathlib import Path
 
 import keyed_records as core
+import record_json
 from coordination import atomic, identifier
 from export_requirements import parse_json
 from keyed_entries import CATALOG_SHOW_MAX, AnchoredKind, read_labelled
@@ -720,7 +721,7 @@ def session_names(project):
     if project is None:
         return {}
     try:
-        data = json.loads((Path(project) / '.sessions.json').read_text(encoding='utf-8'))
+        data = record_json.loads((Path(project) / '.sessions.json').read_text(encoding='utf-8'))
         return {record['actor']: record['name'] for record in data.get('records', {}).values()
                 if isinstance(record, dict) and isinstance(record.get('actor'), str)
                 and isinstance(record.get('name'), str)}
@@ -1144,7 +1145,7 @@ def read_catalog(run):
     if len(ids) <= CATALOG_SHOW_MAX:
         return AnchoredKind.shown(run, ids)
     wanted = set(ids)
-    exported = (json.loads(line) for line in run(['export', '--all']).splitlines() if line.strip())
+    exported = (r for r in record_json.loads_rows(run(['export', '--all'])) if not r.get('malformed'))
     return [row for row in exported if isinstance(row, dict) and row.get('id') in wanted]
 
 

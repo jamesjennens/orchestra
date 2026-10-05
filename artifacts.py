@@ -279,10 +279,13 @@ class ArtifactStore:
             with self.manifest_path.open("r", encoding="utf-8") as handle:
                 for line in handle:
                     if line.strip():
-                        value = json.loads(line)
+                        try:
+                            value = json.loads(line)
+                        except (json.JSONDecodeError, RecursionError, ValueError) as exc:
+                            raise ArtifactError("cannot read artifact manifest") from exc
                         self._validate_record(value, rows)
                         rows.append(value)
-        except (OSError, json.JSONDecodeError) as exc:
+        except OSError as exc:
             raise ArtifactError("cannot read artifact manifest") from exc
         return rows
 

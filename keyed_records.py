@@ -36,6 +36,7 @@ import json
 import time
 from pathlib import Path
 
+import record_json
 from coordination import atomic, identifier
 from recovery import configured_operators
 from requirements import ACCEPTANCE_FIELDS, SHA256_TEXT, content_hash, load_json
@@ -225,7 +226,7 @@ def apply_controlled_labels(run, task, current, spec, desired):
 
 
 def read_rows(run):
-    return [json.loads(line) for line in run(['export', '--all']).splitlines() if line.strip()]
+    return [r for r in record_json.loads_rows(run(['export', '--all'])) if not r.get('malformed')]
 
 
 def find(rows, task):
@@ -426,6 +427,10 @@ def apply_native(payload, actor, run, project, spec, operator=False, operators=N
         task = spec.resolve_task(rows, payload, operator)
     # Key uniqueness is checked against the pre-write read so a duplicate key is
     # refused with zero native writes.
+    for row in rows:
+        if row.get('malformed'):
+            raise ValueError('Cannot verify %s key uniqueness: anchor %s could not be parsed'
+                             % (spec.noun, row.get('id') or ''))
     spec.check_key_unique(rows, payload, task)
     if task is None:
         request_label = 'request:' + identity

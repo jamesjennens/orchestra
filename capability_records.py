@@ -51,6 +51,7 @@ import unicodedata
 import capability_verification as verification
 import keyed_entries
 import keyed_records as core
+import record_json
 from capabilities import normalized as normalize, safe_relpath, split_pointer, stems, words
 from coordination import atomic, identifier
 from export_requirements import parse_json
@@ -643,7 +644,7 @@ def read_catalog(run):
     `list` and `find` reach the same verdict as `get`, which reads lifecycle facts
     without this split (kittrial-5bb.69 re-review, P3).
     """
-    listed = json.loads(run(['list', '--label', TYPE_LABEL, '--all', '--limit', '0', '--json']) or '[]')
+    listed = record_json.loads_array_rows(run(['list', '--label', TYPE_LABEL, '--all', '--limit', '0', '--json']) or '[]')
     ids = [row['id'] for row in listed or [] if isinstance(row, dict) and isinstance(row.get('id'), str)]
     if len(ids) <= keyed_entries.CATALOG_SHOW_MAX:
         return KIND.shown(run, ids), None
@@ -652,7 +653,7 @@ def read_catalog(run):
     for line in run(['export', '--all']).splitlines():
         if not line.strip():
             continue
-        row = json.loads(line)
+        row = record_json.loads_row(line)
         if isinstance(row, dict) and row.get('id') in wanted:
             rows.append(row)
         if verification.is_lifecycle_row(row):

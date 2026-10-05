@@ -5,6 +5,7 @@ import os
 import re
 import time
 from pathlib import Path
+import record_json
 from requirements import content_hash, load_json
 
 
@@ -95,7 +96,7 @@ def issue_confirmation(issue_id, run):
     """
     try:
         rows=json.loads(run(['show',issue_id,'--json']))
-    except (TypeError,ValueError) as exc:
+    except (TypeError,ValueError,RecursionError) as exc:
         raise ValueError('Could not read native issue %s to confirm its parent, creator and title: %s' % (issue_id,exc))
     if isinstance(rows,dict):rows=[rows]
     if (not isinstance(rows,list) or len(rows)!=1 or not isinstance(rows[0],dict)
@@ -254,9 +255,11 @@ def apply_native(p, actor, run, project):
         reusable=resubmittable(prior,actor)
         if prior and prior['sha256']!=digest and not reusable:raise ValueError('Request ID already reserved for different content or actor')
         label='request:'+identity
-        found=json.loads(run(['list','--all','--limit','0','--label',label,'--json'])) or []
+        found=record_json.loads_array_rows(run(['list','--all','--limit','0','--label',label,'--json'])) or []
         if len(found)>1:raise ValueError('Duplicate native request records; operator reconciliation required')
         if found:
+            if found[0].get('malformed'):
+                raise ValueError('Cannot verify native request: child %s could not be parsed' % (found[0].get('id') or ''))
             if 'request-content:'+digest not in (found[0].get('labels') or []):
                 # A receipt completed by the operator from the native issue has no
                 # recoverable original content; accept its recorded id.
@@ -293,7 +296,7 @@ def apply_native(p, actor, run, project):
                              +' The native create did not confirm an issue; the outcome is uncertain, so the request stays pending. Inspect native state and reconcile this request ID (admin.py reconcile-request) before retrying.')
         try:
             issue=json.loads(raw)
-        except (TypeError,ValueError):
+        except (TypeError,ValueError,RecursionError):
             issue=None
         if not isinstance(issue,dict) or not issue.get('id'):raise ValueError('Create response uncertain; reconcile same request ID')
         atomic(receipt,receipt_record(pending,digest,'complete',id=issue['id'],actor=actor))
@@ -311,8 +314,11 @@ def apply_native(p, actor, run, project):
                          'merge-create, merge-check and merge-release take only operation. The holder is always '
                          'the request actor.'%(op,'; '.join(details)))
     context_path=project/'.merge-context.json'
-    if op=='merge-create':return json.loads(run(['merge-slot','create','--json']))
-    state=json.loads(run(['merge-slot','check','--json']))
+    if op=='merge-create':
+        try:return json.loads(run(['merge-slot','create','--json']))
+        except (ValueError,RecursionError):raise ValueError('Failed to create merge slot')
+    try:state=json.loads(run(['merge-slot','check','--json']))
+    except (ValueError,RecursionError):state={}
     if merge_slot_missing(state):
         detail=''
         if isinstance(state,dict) and state.get('error'):detail=' (%s)' % state['error']
@@ -324,7 +330,8 @@ def apply_native(p, actor, run, project):
     if op=='merge-release':
         if state.get('available'):return {'released':False,'available':True}
         if state.get('holder')!=actor:raise ValueError('Only the current holder may release the merge slot')
-        result=json.loads(run(['merge-slot','release','--holder',actor,'--json']))
+        try:result=json.loads(run(['merge-slot','release','--holder',actor,'--json']))
+        except (ValueError,RecursionError):raise ValueError('Failed to release merge slot')
         # Keep context for recovery/audit; native holder remains authoritative.
         return result
     identifier(p['task'])
@@ -338,7 +345,8 @@ def apply_native(p, actor, run, project):
     # Validate task exists before reserving; check native state on retry.
     run(['show',p['task'],'--json'])
     atomic(context_path,desired)
-    result=json.loads(run(['merge-slot','acquire','--holder',actor,'--json']))
+    try:result=json.loads(run(['merge-slot','acquire','--holder',actor,'--json']))
+    except (ValueError,RecursionError):raise ValueError('Failed to acquire merge slot')
     result['context']=desired if result.get('acquired') else None
     return result
 

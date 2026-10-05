@@ -187,9 +187,17 @@ def stdout_ambiguous(stdout):
             % withheld(lines, stdout or ''))
 
 
+_DEEP_DATA = object()
+
+
 def _decode_whole(text):
     try:
         return _JSON.decode(text)
+    except RecursionError:
+        stripped = text.strip()
+        if (stripped.startswith('{') and stripped.endswith('}')) or (stripped.startswith('[') and stripped.endswith(']')):
+            return _DEEP_DATA
+        return None
     except ValueError:
         return None
 
@@ -200,7 +208,7 @@ def _is_null_result(text):
         return False
     try:
         return _JSON.decode(text) is None
-    except ValueError:
+    except (ValueError, RecursionError):
         return False
 
 
@@ -213,6 +221,8 @@ def _is_note_object(value):
 def _result_value(text):
     """The whole text as one JSON object/array result, or None."""
     value = _decode_whole(text)
+    if value is _DEEP_DATA:
+        return _DEEP_DATA
     if isinstance(value, JSON_RESULT_TYPES) and not _is_note_object(value):
         return value
     return None
@@ -227,6 +237,34 @@ def _line_starts(text):
     """Offsets of ``{``/``[`` that begin a line - where native output starts."""
     for match in re.finditer(r'(?m)^[ \t]*([{\[])', text):
         yield match.start(1)
+
+
+def _find_matching_bracket(text, start):
+    open_char = text[start]
+    close_char = '}' if open_char == '{' else ']'
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        c = text[i]
+        if escape:
+            escape = False
+            continue
+        if c == '\\' and in_string:
+            escape = True
+            continue
+        if c == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if c == open_char:
+            depth += 1
+        elif c == close_char:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    return None
 
 
 def _documents(text):
@@ -245,6 +283,20 @@ def _documents(text):
             continue
         try:
             value, end = _JSON.raw_decode(text, start)
+        except RecursionError:
+            end = _find_matching_bracket(text, start)
+            if end is None:
+                if first_failed_start is None:
+                    first_failed_start = start
+                    line_start = text.rfind('\n', 0, start) + 1
+                    first_failed_indent = start - line_start
+                continue
+            line_start = text.rfind('\n', 0, start) + 1
+            if (first_failed_start is not None and start > first_failed_start
+                    and start - line_start > first_failed_indent):
+                raise ValueError(stdout_failure(text))
+            documents.append((start, end))
+            continue
         except ValueError:
             if first_failed_start is None:
                 first_failed_start = start

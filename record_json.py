@@ -19,6 +19,7 @@ a second line of defence.
 The deepest JSON the kit writes nests 4 levels. NESTING_MAX leaves room for a later
 record and is far below any interpreter limit.
 """
+import hashlib
 import json
 import re
 
@@ -37,17 +38,21 @@ class NestingError(ValueError):
     """JSON text nested deeper than NESTING_MAX."""
 
 
-def nesting(text):
-    """The deepest bracket nesting of a JSON text, counted outside string literals, or
-    NESTING_MAX + 1 as soon as it is exceeded.
+ROW_NESTING_MAX = 1000
+ROW_MESSAGE = 'Tracker row nested too deeply (more than %d levels)' % ROW_NESTING_MAX
 
-    One pass, no recursion, linear in the text. A text with at most NESTING_MAX opening
+
+def nesting(text, max_depth=NESTING_MAX):
+    """The deepest bracket nesting of a JSON text, counted outside string literals, or
+    max_depth + 1 as soon as it is exceeded.
+
+    One pass, no recursion, linear in the text. A text with at most max_depth opening
     brackets cannot nest deeper than that, so it is answered without a scan. Inside a
     string literal brackets are text; a literal that is never closed makes the rest of
     the text a string, which the parser then refuses as malformed. The scan stops at the
     first bracket past the bound, so deep nesting is refused without reading the rest.
     """
-    if text.count('[') + text.count('{') <= NESTING_MAX:
+    if text.count('[') + text.count('{') <= max_depth:
         return 0
     depth = deepest = 0
     in_string = False
@@ -61,7 +66,7 @@ def nesting(text):
             depth += 1
             if depth > deepest:
                 deepest = depth
-                if deepest > NESTING_MAX:
+                if deepest > max_depth:
                     return deepest
         elif depth:
             depth -= 1
@@ -89,25 +94,42 @@ def loads_row(line):
     """Parse one issue row from tracker export (`bd export --all`).
 
     A row main reads (including 65 and 500 levels of nesting) must parse
-    normally. Only rows that truly cannot be parsed by json.loads (e.g.
-    3000-level RecursionError or syntax corruption) are returned as synthetic
-    malformed records. If the row has a recoverable ID, that ID is preserved;
-    if not, id is None. Neither is ever dropped.
+    normally. Only rows that truly cannot be parsed by json.loads or that exceed
+    ROW_NESTING_MAX (1000 levels) are returned as synthetic malformed records.
+    If the row has a recoverable ID, that ID is preserved; if not, id is None.
+    Neither is ever dropped. Status is always unknown and assignee is always None
+    on unparseable rows so attacker-supplied metadata never grants ownership or
+    visibility.
     """
     if not line or not line.strip():
         return None
     try:
+        if nesting(line, ROW_NESTING_MAX) > ROW_NESTING_MAX:
+            raise NestingError(ROW_MESSAGE)
         return json.loads(line)
     except (ValueError, RecursionError) as error:
         m = re.search(r'"id"\s*:\s*"([A-Za-z0-9][A-Za-z0-9_.-]{0,160})"', line)
         task_id = m.group(1) if m else None
+        m_type = re.search(r'"issue_type"\s*:\s*"([A-Za-z0-9_.-]+)"', line)
+        issue_type = m_type.group(1) if m_type else ('event' if (task_id and '.' in task_id) else 'task')
+        m_title = re.search(r'"title"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', line)
+        if m_title:
+            title = re.sub(r'\\(["\\/bfnrt])', lambda m: {'"': '"', '\\': '\\', '/': '/', 'b': '\b', 'f': '\f', 'n': '\n', 'r': '\r', 't': '\t'}.get(m.group(1), m.group(1)), m_title.group(1))
+        else:
+            title = 'Malformed issue row (%s)' % error
+        raw_bytes = line.encode('utf-8')
+        m_labels = re.search(r'"labels"\s*:\s*\[(.*?)\]', line)
+        labels = re.findall(r'"([^"\\]+)"', m_labels.group(1)) if m_labels else []
         return {'id': task_id,
-                'title': 'Malformed issue row (%s)' % error,
+                'title': title,
                 'status': 'unknown',
                 'assignee': None,
-                'issue_type': 'task',
+                'issue_type': issue_type,
+                'labels': labels,
                 'malformed': True,
-                'error': str(error)}
+                'error': str(error),
+                'raw_length': len(raw_bytes),
+                'raw_sha256': hashlib.sha256(raw_bytes).hexdigest()}
 
 
 def loads_rows(lines):
@@ -119,8 +141,88 @@ def loads_rows(lines):
         lines = lines.splitlines()
     rows = []
     for line in lines:
+        if not line or not line.strip():
+            continue
         row = loads_row(line)
         if row is not None:
             rows.append(row)
+    return rows
+
+
+def loads_array_rows(text):
+    """Parse JSON array output from bd (`bd list --json` or `bd show --json`).
+
+    If json.loads succeeds, returns the decoded list (or single object in a list).
+    If a row in the array raises RecursionError or ValueError due to deep nesting
+    or corruption, each element is parsed iteratively without recursion using loads_row,
+    recovering malformed items with their IDs preserved.
+    """
+    if not text or not text.strip() or text.strip() == 'null':
+        return []
+    if nesting(text, ROW_NESTING_MAX) <= ROW_NESTING_MAX:
+        try:
+            res = json.loads(text)
+            if isinstance(res, list):
+                return res
+            if isinstance(res, dict):
+                return [res]
+            return []
+        except (ValueError, RecursionError):
+            pass
+
+    stripped = text.strip()
+    if stripped.startswith('{') and stripped.endswith('}'):
+        row = loads_row(stripped)
+        return [row] if row is not None else []
+
+    rows = []
+    start = text.find('[')
+    if start == -1:
+        if '{' in text:
+            row = loads_row(text)
+            return [row] if row is not None else []
+        return []
+
+    i = start + 1
+    n = len(text)
+    in_string = False
+    escape = False
+    item_start = None
+    depth = 0
+
+    while i < n:
+        c = text[i]
+        if escape:
+            escape = False
+            i += 1
+            continue
+        if c == '\\' and in_string:
+            escape = True
+            i += 1
+            continue
+        if c == '"':
+            in_string = not in_string
+            i += 1
+            continue
+        if in_string:
+            i += 1
+            continue
+
+        if c == '{':
+            if depth == 0:
+                item_start = i
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0 and item_start is not None:
+                item_text = text[item_start:i + 1]
+                row = loads_row(item_text)
+                if row is not None:
+                    rows.append(row)
+                item_start = None
+        elif c == ']' and depth == 0:
+            break
+        i += 1
+
     return rows
 

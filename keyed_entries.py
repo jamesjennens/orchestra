@@ -49,6 +49,7 @@ import time
 from pathlib import Path
 
 import keyed_records as core
+import record_json
 import recovery
 from coordination import atomic, identifier
 from export_requirements import parse_json
@@ -73,7 +74,7 @@ ACCEPTANCE_RECORD_FIELDS = ('schema_version', 'source', 'id', 'key', 'revision',
                             'acceptance_state', 'decision', 'operator', 'at', 'sha256')
 # A native read failure: the endpoint's runner raises ValueError, admin's run_bd
 # raises CalledProcessError.
-NATIVE_FAILURES = (ValueError, OSError, subprocess.CalledProcessError)
+NATIVE_FAILURES = (ValueError, OSError, subprocess.CalledProcessError, RecursionError)
 BATCH_MAX = 100
 # A pause outside the lock between batch items: flock gives no ordering guarantee, so
 # without it the batch could retake the lock before a waiting writer wakes.
@@ -93,12 +94,12 @@ def read_labelled(run, label):
     One label-filtered `bd list` (no comments), then one `bd show --include-comments`
     when there are at most CATALOG_SHOW_MAX rows, or one `bd export --all` above that.
     """
-    listed = json.loads(run(['list', '--label', label, '--all', '--limit', '0', '--json']) or '[]')
+    listed = record_json.loads_array_rows(run(['list', '--label', label, '--all', '--limit', '0', '--json']) or '[]')
     ids = [row['id'] for row in listed or [] if isinstance(row, dict) and isinstance(row.get('id'), str)]
     if len(ids) <= CATALOG_SHOW_MAX:
         return AnchoredKind.shown(run, ids)
     wanted = set(ids)
-    exported = (json.loads(line) for line in run(['export', '--all']).splitlines() if line.strip())
+    exported = (record_json.loads_row(line) for line in run(['export', '--all']).splitlines() if line.strip())
     return [row for row in exported if isinstance(row, dict) and row.get('id') in wanted]
 
 
@@ -230,8 +231,8 @@ class AnchoredKind:
         return self.key_label(record['key']) in self.key_labels(row)
 
     def listed_ids(self, run, extra):
-        listed = json.loads(run(['list', '--label', self.type_label, *extra, '--all', '--limit', '0',
-                                 '--json']) or '[]')
+        listed = record_json.loads_array_rows(run(['list', '--label', self.type_label, *extra, '--all', '--limit', '0',
+                                                   '--json']) or '[]')
         return [row['id'] for row in listed or [] if isinstance(row, dict) and isinstance(row.get('id'), str)]
 
     @staticmethod
@@ -240,11 +241,23 @@ class AnchoredKind:
         if not ids:
             return []
         try:
-            shown = json.loads(run(['show', *ids, '--json', '--include-comments']) or '[]')
+            shown = record_json.loads_array_rows(run(['show', *ids, '--json', '--include-comments']) or '[]')
         except NATIVE_FAILURES as error:
             if all_missing(error):
                 return []   # every named row was deleted after the list
-            raise
+            if len(ids) > 1:
+                rows = []
+                for rid in ids:
+                    try:
+                        one = record_json.loads_array_rows(run(['show', rid, '--json', '--include-comments']) or '[]')
+                        one = one if isinstance(one, list) else [one]
+                        rows.extend(r for r in one if isinstance(r, dict) and r.get('id') == rid)
+                    except NATIVE_FAILURES as err:
+                        if all_missing(err):
+                            continue
+                        rows.append({'id': rid, 'malformed': True, 'error': str(err)})
+                return rows
+            return [{'id': ids[0], 'malformed': True, 'error': str(error)}]
         shown = shown if isinstance(shown, list) else [shown]
         return [row for row in shown if isinstance(row, dict) and row.get('id') in ids]
 
@@ -331,6 +344,10 @@ class AnchoredKind:
         A readable different key sharing the lossy lookup slug is not this key.
         Unknown content cannot establish that distinction and requires repair.
         """
+        for row in rows:
+            if row.get('malformed'):
+                raise ValueError('Cannot verify %s key uniqueness: anchor %s could not be parsed'
+                                 % (self.noun, row.get('id') or ''))
         matches = []
         for row in rows:
             if not isinstance(row, dict) or self.type_label not in (row.get('labels') or []) \
@@ -1313,6 +1330,10 @@ class AnchoredKind:
         view = {'key': None, 'native_id': row.get('id'), 'state': None, 'record': None,
                 'record_comment_id': None, 'acceptance': None, 'acceptance_inert': False,
                 'inert_operator': None, 'proposed': None, 'proposed_comment_id': None, 'warnings': []}
+        if row.get('malformed'):
+            view.update(state='malformed', record=None, acceptance=None, proposed=None)
+            view['warnings'].append({'code': 'malformed', 'detail': str(row.get('error') or 'malformed row')[:200]})
+            return view
         row, notes = self.live_row(row, operators)
         view['warnings'].extend(notes)
         try:
@@ -1428,6 +1449,11 @@ class AnchoredKind:
         for row in rows:
             if not isinstance(row, dict) or self.type_label not in (row.get('labels') or []):
                 continue
+            if row.get('malformed'):
+                entry = view(row, operators)
+                entry['state'] = 'malformed'
+                entries.append((entry, self.key_labels(row)))
+                continue
             if not self.key_labels(row) and self.released(row):
                 continue   # released by an operator: no longer an anchor of any key
             if not self.has_live_record(row, operators):
@@ -1507,6 +1533,11 @@ class AnchoredKind:
         for row in rows:
             if not isinstance(row, dict) or self.type_label not in (row.get('labels') or []) \
                     or label not in self.key_labels(row):
+                continue
+            if row.get('malformed'):
+                entry = view(row, operators)
+                entry.update(key=key, state='malformed')
+                candidates.append(entry)
                 continue
             if not self.has_live_record(row, operators):
                 incomplete.append(row.get('id'))

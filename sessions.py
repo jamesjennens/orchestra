@@ -5,6 +5,7 @@ import re
 import uuid
 from datetime import datetime, timezone
 from coordination import atomic
+import record_json
 from requirements import content_hash
 
 UUID = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
@@ -90,7 +91,7 @@ def execute(path, project, args, export, *, actor=None):
     a=parser.parse_args(args)
     file=path/'.sessions.json'
     if file.is_symlink() or file.with_suffix('.tmp').is_symlink():raise ValueError('Session registry paths must not be symlinks')
-    data=validate(json.loads(file.read_text(encoding='utf-8'))) if file.exists() else {'schema_version':1,'records':{}}
+    data=validate(record_json.loads(file.read_text(encoding='utf-8'))) if file.exists() else {'schema_version':1,'records':{}}
     if a.operation=='show':
         found=[r for r in data['records'].values() if r['actor']==a.actor]
         if not found:raise ValueError('Actor not registered in this project; legacy actors have no registration record')
@@ -169,7 +170,7 @@ def execute(path, project, args, export, *, actor=None):
     if old:
         if old['name']!=a.name:raise ValueError('Registration request-id already used with a different name')
         return dict(project=project,session=old,reconciled=True)
-    rows=[json.loads(line) for line in export().splitlines() if line.strip()]
+    rows=record_json.loads_rows(export())
     occupied=used_actors(rows)|{r['actor'] for r in data['records'].values()}
     for _ in range(20):
         actor='session-'+str(uuid.uuid4())

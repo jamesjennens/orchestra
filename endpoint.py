@@ -68,7 +68,7 @@ def _native_labels(root,path,actor,task):
     p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,'show',task,'--json'],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=60)
     if p.returncode:raise ValueError('Could not read the current labels of %s before the label write, so the reserved-label guard cannot verify it: %s'%(task,(p.stderr or p.stdout).strip()))
     try:rows=json.loads(p.stdout)
-    except ValueError:raise ValueError('Could not parse the current labels of %s before the label write; refusing.'%(task,))
+    except (ValueError, RecursionError):raise ValueError('Could not parse the current labels of %s before the label write; refusing.'%(task,))
     if isinstance(rows,dict):rows=[rows]
     if not isinstance(rows,list):raise ValueError('Unexpected native read for %s; refusing the label write.'%(task,))
     matched={}
@@ -88,7 +88,7 @@ def _native_comments(root,path,actor,task):
     p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,'comments',task,'--json'],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=60)
     if p.returncode:raise ValueError('Could not read the comments of %s before the label write, so the record-anchor guard cannot verify it; refusing.'%(task,))
     try:rows=json.loads(p.stdout)
-    except ValueError:raise ValueError('Could not parse the comments of %s before the label write; refusing.'%(task,))
+    except (ValueError, RecursionError):raise ValueError('Could not parse the comments of %s before the label write; refusing.'%(task,))
     if not isinstance(rows,list):raise ValueError('Unexpected comment read for %s; refusing the label write.'%(task,))
     return rows
 
@@ -143,7 +143,7 @@ def _native_anchor_rows(root,path,actor,tokens):
                      capture_output=True,text=True,encoding='utf-8',timeout=60)
     if p.returncode:raise ValueError('Could not read %s before the status write, so the record-anchor guard cannot verify it: %s'%(', '.join(tokens),(p.stderr or p.stdout).strip()))
     try:rows=json.loads(p.stdout)
-    except ValueError:raise ValueError('Could not parse the current rows of %s before the status write; refusing.'%(', '.join(tokens),))
+    except (ValueError, RecursionError):raise ValueError('Could not parse the current rows of %s before the status write; refusing.'%(', '.join(tokens),))
     if isinstance(rows,dict):rows=[rows]
     if not isinstance(rows,list):raise ValueError('Unexpected native read for %s; refusing the status change.'%(', '.join(tokens),))
     resolved={}
@@ -313,11 +313,11 @@ def execute(root,request,authority_config=None,require_authority=False):
                 rows,warnings=[],completed.stderr or ''
             else:
                 stdout,warnings=native.split(completed)
-                rows=json.loads(stdout or '[]')
-                rows=[r for r in (rows if isinstance(rows,list) else [rows]) if isinstance(r,dict) and r.get('id') in ids]
+                rows=record_json.loads_array_rows(stdout or '[]')
+                rows=[r for r in rows if isinstance(r,dict) and r.get('id') in ids and not r.get('malformed')]
         else:
             stdout,warnings=native.split(native.run(native.argv(root,path,actor,['export','--all']),environment(root)))
-            rows=[json.loads(line) for line in stdout.splitlines() if line.strip()]
+            rows=[r for r in record_json.loads_rows(stdout) if not r.get('malformed')]
         return {'returncode':0,'stdout':json.dumps({'schema_version':1,'anchors':record_anchor_ids(rows)})+'\n','stderr':warnings}
     if action=='ref':
         # The reference catalog (.41 slice 1, kittrial-5bb.66). Reads (get, list, find, help)
@@ -517,7 +517,7 @@ def execute(root,request,authority_config=None,require_authority=False):
             fcntl.flock(lock,fcntl.LOCK_EX)
             p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','export','--all'],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
             if p.returncode:return {'returncode':p.returncode,'stdout':p.stdout,'stderr':p.stderr}
-            rows=[json.loads(line) for line in p.stdout.splitlines() if line.strip()]
+            rows=record_json.loads_rows(p.stdout)
             return {'returncode':0,'stdout':json.dumps(render(rows,path/'views',configured_operators(root),configured_verifiers(root)))+'\n','stderr':p.stderr}
     if action!='bd':raise ValueError('Unknown action')
     args=request.get('args',[])
