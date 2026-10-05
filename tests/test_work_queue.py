@@ -39,6 +39,37 @@ def reviewed_rows():
 
 
 class WorkQueueTests(unittest.TestCase):
+    def test_only_another_exact_actor_wakes_a_checkpoint(self):
+        data=rows();data[0]['assignee']='http/agent/a'
+        append_checkpoint(data,'cp',checkpoint(data))
+        data[0]['comments'].append(dict(id='own',author='http/agent/a',created_at='2026-10-04T10:00:00Z',text='Own progress.'))
+        row=work.queue(data,'http/agent/a',[])['items'][0]
+        self.assertFalse(row['newer_activity'])
+        data[0]['comments'].append(dict(id='other',author='http/agent/b',created_at='2026-10-04T10:00:00Z',text='Other worker.'))
+        self.assertTrue(work.queue(data,'http/agent/a',[])['items'][0]['newer_activity'])
+
+    def test_resolved_checkpoint_has_zero_open_items(self):
+        data=rows();item=dict(id='question',kind='blocker',text='Need a key.',source='build')
+        append_checkpoint(data,'cp-one',checkpoint(data,open_items=[item]))
+        append_checkpoint(data,'cp-two',checkpoint(data,open_items=[],
+            resolved=[dict(id='question',reason='Key supplied.',evidence='owner comment')]))
+        row=work.queue(data,'alice/session',[])['items'][0]
+        self.assertEqual(row['open_items'],0)
+        self.assertEqual(row['checkpoint_at'],data[0]['comments'][-1]['created_at'])
+
+    def test_pending_request_ids_are_capped_but_item_count_is_exact(self):
+        data=rows()
+        # The legacy writer itself caps unresolved items at20. Pin this separate
+        # queue boundary defensively for a larger projection, without claiming
+        # that21 legacy requests form a valid persisted history.
+        projected=dict(review_state='changes-requested',contribution={},
+                       pending_requests=[dict(request='request-'+str(n)) for n in range(21)])
+        with patch.object(work,'workflow',return_value=projected):
+            row=work.queue(data,'alice/session',[])['items'][0]
+        self.assertEqual(row['pending_review_items'],21)
+        self.assertEqual(len(row['pending_change_requests']),20)
+        self.assertEqual(len(set(row['pending_change_requests'])),20)
+
     def test_approval_updates_next_action_even_when_checkpoint_is_older(self):
         data=rows()
         append_checkpoint(data,'cp',checkpoint(data,next_action='Wait for reviewer'))

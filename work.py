@@ -350,7 +350,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         # read. `open_items` is the number of open items in the task's latest valid
         # checkpoint (0 with none, None when its checkpoint history cannot be read);
         # `checkpoint_at` is when that checkpoint was written; `newer_activity` says
-        # whether any comment or record was written on the task after it, so a blocked
+        # whether a comment from another native actor was written after it, so a blocked
         # task with nothing new can be left alone; `pending_change_requests` names the
         # request-changes records still unresolved.
         checkpoint_at=None;newer_activity=None
@@ -363,7 +363,8 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                 position=next(index for index,comment in enumerate(comments)
                               if str(comment.get('id'))==str(latest_checkpoint[1].get('id')))
                 checkpoint_at=latest_checkpoint[1].get('created_at')
-                newer_activity=position<len(comments)-1
+                newer_activity=any(comment.get('author')!=row.get('assignee')
+                                   for comment in comments[position+1:])
         except (ValueError,TypeError,KeyError,StopIteration):
             open_items=None;checkpoint_at=None;newer_activity=None
         pending_change_requests=[]
