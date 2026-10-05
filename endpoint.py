@@ -197,7 +197,14 @@ def _guard_record_anchor_status(root,path,args,actor):
             raise ValueError('Refusing to %s %s: %s. Its holder changes only through `coordinate`.'
                              %(command,canonical,merge_slot_sentence(canonical)))
 
-def _bd_read(root,path,actor,argv):
+#: bd 1.2.2's structured answer when `show ID` resolved to no single row. bd prints it both
+#: for an id that does not exist and for an id that is an ambiguous prefix of several; only
+#: the stderr differs ("no issue found" against "ambiguous ID ... Use more characters to
+#: disambiguate"). An exact id wins over bd's substring resolver (measured), so this answer
+#: means no row has exactly the id asked for (kittrial-5bb.138).
+BD_NO_MATCH_ERROR='no issues found matching the provided IDs'
+
+def _bd_read(root,path,actor,argv,resolver_absence=False):
     """One native read for a guard: ``(rows, stderr)``, or ``(None, why)`` when the read itself failed.
 
     A read that times out, exits non-zero for any reason but "no issue found", or prints
@@ -206,6 +213,12 @@ def _bd_read(root,path,actor,argv):
     ``[]`` for an empty JSON list, so an empty stdout means the read did not answer, and
     reading it as "no such id" let ``create --id NEW`` replace a row the read had not
     seen (kittrial-5bb.135, after review 01a10c0b).
+
+    ``resolver_absence`` is for the ``create --id`` existence check: it additionally reads
+    bd's own structured no-match answer as an absence, which is what makes the check exact.
+    With ``p-abc`` and ``p-abd`` present, ``show p-ab`` answers rc 1 with that object and
+    "ambiguous ID" on stderr, and no row has exactly ``p-ab``, so the create proceeds as it
+    did before kittrial-5bb.135; any other non-zero exit still fails closed (kittrial-5bb.138).
     """
     try:
         p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*argv],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=60)
@@ -220,12 +233,13 @@ def _bd_read(root,path,actor,argv):
         # Exit 0 with no output: bd prints `[]` for an empty JSON list, so this read did
         # not answer. Reading it as "no such id" accepted `create --id NEW` (kittrial-5bb.135).
         return None,'bd gave no answer (%s)'%(said[-200:] or 'exit %d'%p.returncode)
-    try:rows=record_json.loads(p.stdout)
+    try:answer=record_json.loads(p.stdout)
     except ValueError:return None,'bd gave an unreadable answer'
-    if isinstance(rows,dict):rows=[rows]
+    resolver_answer=isinstance(answer,dict) and answer.get('error')==BD_NO_MATCH_ERROR
+    rows=[answer] if isinstance(answer,dict) else answer
     if not isinstance(rows,list):return None,'bd gave an unreadable answer'
     rows=[row for row in rows if isinstance(row,dict) and isinstance(row.get('id'),str)]
-    if p.returncode and not rows and 'no issue found' not in said:
+    if p.returncode and not rows and 'no issue found' not in said and not (resolver_absence and resolver_answer):
         return None,'bd could not read the tasks (%s)'%(said[-200:] or 'exit %d'%p.returncode)
     return rows,said
 
@@ -266,9 +280,13 @@ def _guard_new_id(root,path,name,new_id,actor):
     it, and ``create --id`` replaced the ephemeral row in the review (kittrial-5bb.135).
     ``show`` answers for both (measured on bd 1.2.2), so the check asks it and refuses on
     an EXACT id match only: bd resolves an id from any substring, and a row merely near
-    the name is not the row ``create --id`` would replace. Ids are case-sensitive to bd,
-    so the shape rule is what keeps a look-alike that differs only in case from being
-    made.
+    the name is not the row ``create --id`` would replace. bd answers an id that is an
+    ambiguous prefix of several rows with rc 1 and its structured no-match object, and an
+    exact id wins over that resolver (measured), so ``resolver_absence`` reads the
+    ambiguous answer as "no row has exactly this id" and lets the create proceed; with
+    ``p-abc`` and ``p-abd`` present, ``create --id p-ab`` made the row before
+    kittrial-5bb.135 and does again (kittrial-5bb.138). Ids are case-sensitive to bd, so
+    the shape rule is what keeps a look-alike that differs only in case from being made.
     """
     shown=shown_token(new_id)
     if is_merge_slot_id(new_id) or any(is_merge_slot_id(new_id[:cut]) for cut,ch in enumerate(new_id) if ch=='.'):
@@ -278,7 +296,7 @@ def _guard_new_id(root,path,name,new_id,actor):
     # last character must be a letter or digit.
     if not re.fullmatch(re.escape(name)+r'-[a-z0-9](?:[a-z0-9.-]{0,94}[a-z0-9])?',new_id):
         raise ValueError('Refusing create --id %s: an explicit id is %s-NAME in lower-case letters, digits, dots and hyphens, ending in a letter or digit. Nothing was written.'%(shown,name))
-    rows,said=_bd_read(root,path,actor,['show',new_id,'--json'])
+    rows,said=_bd_read(root,path,actor,['show',new_id,'--json'],resolver_absence=True)
     if rows is None:
         raise ValueError('Refusing create --id %s: could not check whether a task with that id exists (%s). Nothing was written.'%(shown,said))
     if any(row['id']==new_id for row in rows):
