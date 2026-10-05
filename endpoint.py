@@ -26,7 +26,7 @@ from version import report
 from reserved_comments import (carries_record_label, check_raw_request, comment_target,
                                first_reserved_label, is_record_anchor, label_guard_request,
                                operator_only_in_args, raw_file_flag_in_args,
-                               merge_slot_candidates, MERGE_SLOT_LABEL,
+                               is_merge_slot_id, shown_token, write_targets, MERGE_SLOT_LABEL, MERGE_SLOT_SUFFIX,
                                reserved_label_in_args, refuse_http_actor, status_change_targets,
                                unresolved_bd_flags)
 from http_authority import AuthorityConfig, NativeRunner, http_actor_denial, journal_path, run_guarded
@@ -197,29 +197,104 @@ def _guard_record_anchor_status(root,path,args,actor):
             raise ValueError('Refusing to %s %s: %s. Its holder changes only through `coordinate`.'
                              %(command,canonical,merge_slot_sentence(canonical)))
 
-def _guard_merge_slot_writes(root,path,args,actor):
-    """Refuse every contributor write that names the project's merge slot (kittrial-5bb.113 review).
+def _bd_read(root,path,actor,argv):
+    """One native read for a guard: ``(rows, stderr)``, or ``(None, why)`` when the read itself failed.
 
-    Title, description, priority, labels, comments, dependencies, a child under it:
-    all of it, not only status and assignee. The slot changes through `coordinate`
-    alone. Runs under the coordination lock of the write it guards. Only a token that
-    could resolve to the slot costs a native read (`merge_slot_candidates`), so an
-    ordinary write pays nothing. A candidate bd cannot resolve is left to bd, which
-    refuses the write itself; any other failed read fails closed.
+    A read that times out, exits non-zero for any reason but "no issue found", or prints
+    something that is not JSON is a failure, never "nothing there": the write it guards
+    is then refused.
     """
-    for token in merge_slot_candidates(args):
-        p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,'show',token,'--json'],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=60)
-        if p.returncode:
-            said=(p.stderr or p.stdout or '').strip()
-            if 'no issue found' in said or 'ambiguous' in said.lower():continue
-            raise ValueError('Could not check whether %s names the merge slot of the project before the write, so no native write was attempted: %s'%(token,said[-300:]))
-        try:rows=record_json.loads(p.stdout)
-        except ValueError:raise ValueError('Could not check whether %s names the merge slot of the project before the write (unreadable native answer), so no native write was attempted.'%(token,))
-        if isinstance(rows,dict):rows=[rows]
-        for row in rows if isinstance(rows,list) else []:
-            if is_merge_slot(row):
-                raise ValueError('Refusing %s on %s: %s. Nothing but `coordinate` writes it; its merge-create operation repairs a damaged slot.'
-                                 %(' '.join(args[:2]) if args[0] in ('comments','dep') else args[0],row.get('id'),merge_slot_sentence(row.get('id'))))
+    try:
+        p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*argv],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=60)
+    except subprocess.TimeoutExpired:
+        return None,'the read of the tasks timed out'
+    said=(p.stderr or '').strip()
+    try:rows=record_json.loads(p.stdout) if p.stdout.strip() else []
+    except ValueError:return None,'bd gave an unreadable answer'
+    if isinstance(rows,dict):rows=[rows]
+    if not isinstance(rows,list):return None,'bd gave an unreadable answer'
+    rows=[row for row in rows if isinstance(row,dict) and isinstance(row.get('id'),str)]
+    if p.returncode and not rows and 'no issue found' not in said:
+        return None,'bd could not read the tasks (%s)'%(said[-200:] or 'exit %d'%p.returncode)
+    return rows,said
+
+def _resolve_rows(root,path,actor,tokens):
+    """The rows bd resolves ``tokens`` to: ``(rows, problem)``.
+
+    One native read for all of them. bd answers with the rows it found and names the
+    others on stderr; when the count does not account for every token, each is read by
+    itself so the refusal can name the one at fault. ``problem`` is set when a token
+    does not resolve to exactly one row, or when a read failed.
+    """
+    # A token that starts with a dash would be read by bd as a flag of `show`; the lone dash is an id to bd.
+    for token in tokens:
+        if not isinstance(token,str) or not token.strip() or (token.startswith('-') and token!='-'):
+            return [],'%s is not a task id'%shown_token(token)
+    rows,said=_bd_read(root,path,actor,['show',*tokens,'--json'])
+    if rows is None:return [],said
+    if len({row['id'] for row in rows})==len(tokens) and 'no issue found' not in said:return rows,None
+    found=[]
+    for token in tokens:
+        rows,said=_bd_read(root,path,actor,['show',token,'--json'])
+        if rows is None:return [],said
+        if len(rows)!=1:return [],'%s does not name exactly one task'%shown_token(token)
+        found.append(rows[0])
+    return found,None
+
+def _guard_new_id(root,path,name,new_id,actor):
+    """``create --id``: the id must be this project's, in bd's own lower-case shape, and must not exist.
+
+    bd 1.2.2 answers ``create TITLE --id EXISTING`` with rc 0 and REPLACES that row: the
+    title is the new one, description, acceptance criteria, notes and assignee are
+    emptied, status goes back to open and priority to the default (measured; review
+    01a10c0b). On the merge slot that also freed a held slot. An explicit id that does
+    not exist stays allowed. The existence check is exact (`list --id`), not bd's
+    substring resolution, and ids are case-sensitive to bd, so the shape rule is what
+    keeps a look-alike that differs only in case from being made.
+    """
+    shown=shown_token(new_id)
+    if is_merge_slot_id(new_id) or any(is_merge_slot_id(new_id[:cut]) for cut,ch in enumerate(new_id) if ch=='.'):
+        raise ValueError('Refusing create --id %s: that id belongs to a merge slot, an internal record. Nothing was written.'%shown)
+    if not re.fullmatch(re.escape(name)+r'-[a-z0-9][a-z0-9.-]{0,95}',new_id):
+        raise ValueError('Refusing create --id %s: an explicit id is %s-NAME in lower-case letters, digits, dots and hyphens. Nothing was written.'%(shown,name))
+    rows,said=_bd_read(root,path,actor,['list','--all','--id',new_id,'--limit','0','--json'])
+    if rows is None:
+        raise ValueError('Refusing create --id %s: could not check whether a task with that id exists (%s). Nothing was written.'%(shown,said))
+    if rows:
+        raise ValueError('Refusing create --id %s: a task with that id exists, and bd would replace its title, description, status and assignee. Choose another id, or use update. Nothing was written.'%shown)
+
+def _guard_named_rows(root,path,name,args,attachments,actor):
+    """Every contributor write must name the rows it writes, and none may be the merge slot.
+
+    ``write_targets`` (reserved_comments) says which tokens of the command name rows and
+    refuses the forms whose rows are not named: no id (bd would use the last touched
+    row), ``close --claim-next`` and ``--continue`` (bd chooses the row), creation from a
+    file. Every named token is then resolved through bd, because bd resolves an id from
+    any substring of it; a token bd cannot resolve to one row, or a read that fails,
+    refuses the write. Runs under the project's coordination lock, which every write
+    through this endpoint holds, so no row named here is made or replaced by another
+    such write between the read and the write. A host `bd` run outside the kit takes no
+    such lock.
+    """
+    request=write_targets(args,attachments)
+    if request is None:return
+    command=request['command']
+    if request['new_id'] is not None:_guard_new_id(root,path,name,request['new_id'],actor)
+    if request['refusal']:
+        raise ValueError('Refusing %s: %s. Nothing was written.'%(command,request['refusal']))
+    if not request['targets']:return
+    rows,problem=_resolve_rows(root,path,actor,request['targets'])
+    if problem:
+        raise ValueError('Refusing %s: %s, so the rows this would write are not known. Name each task by its id. Nothing was written.'%(command,problem))
+    slot=name+MERGE_SLOT_SUFFIX
+    for row in rows:
+        if row['id']==slot or is_merge_slot(row):
+            if status_change_targets(args) is not None:
+                # A claim, a close, a reopen, an assignment: the sentence these have had since the first delivery.
+                raise ValueError('Refusing to %s %s: %s. Its holder changes only through `coordinate`.'
+                                 %(command,row['id'],merge_slot_sentence(row['id'])))
+            raise ValueError('Refusing %s on %s: %s. Nothing but `coordinate` writes it; its merge-create operation repairs a damaged slot.'
+                             %(command,row['id'],merge_slot_sentence(row['id'])))
 
 def execute(root,request,authority_config=None,require_authority=False):
     name=request['project'];path=project_dir(root,name)
@@ -606,9 +681,10 @@ def execute(root,request,authority_config=None,require_authority=False):
             else: final.append(a)
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            # The slot guards come first: a write on the slot is told what the slot is.
+            # First the rows the write names (an existing id given to create, a write that names
+            # none, the merge slot); then the guards that read what those rows carry.
+            _guard_named_rows(root,path,name,args,request.get('attachments',{}),actor)
             _guard_record_anchor_status(root,path,args,actor)
-            _guard_merge_slot_writes(root,path,args,actor)
             _guard_reserved_labels(root,path,args,actor)
             def bd_dispatch(argv):
                 p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*argv],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)

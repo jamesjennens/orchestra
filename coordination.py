@@ -230,16 +230,20 @@ def is_merge_slot(row):
     bd 1.2.2 creates the slot as an ordinary row of type ``task`` with the id
     ``<project>-merge-slot`` and the label ``gt:slot`` (measured on real bd,
     kittrial-5bb.113), so a check on the issue type alone never matched it and the
-    slot was listed as open, unclaimed work. Both the id ending and the label are
-    required: a contributor cannot hide an ordinary task from the work views by
-    adding the label, or by choosing the id, alone. A row of type ``merge-slot``
-    (what earlier code expected) counts too.
+    slot was listed as open, unclaimed work.
+
+    The rule is the exact id alone (review 01a10c0b). The label is what an accident or
+    a host command removes, and a slot without it was listed and writable again; the
+    id is what the kit provisions. A project name holds no hyphen, so the id has
+    exactly the shape ``NAME-merge-slot``: a row whose id merely ends that way
+    (``p-x-merge-slot``) is an ordinary task, and no contributor can make a row with
+    the slot's shape (the endpoint refuses ``create --id`` for it). A row of type
+    ``merge-slot`` (what earlier code expected) counts too.
     """
     if not isinstance(row,dict):return False
     if row.get('issue_type')=='merge-slot':return True
-    labels=row.get('labels')
-    return (isinstance(row.get('id'),str) and row['id'].endswith(MERGE_SLOT_SUFFIX)
-            and isinstance(labels,list) and MERGE_SLOT_LABEL in labels)
+    from reserved_comments import is_merge_slot_id
+    return is_merge_slot_id(row.get('id'))
 
 def merge_slot_sentence(task):
     """What a write on the slot is told, on every path."""
@@ -298,11 +302,10 @@ def apply_native(p, actor, run, project):
     if op=='create-child':
         if set(p)!={'operation','request_id','parent','title','description','type'}:raise ValueError('Invalid child request fields')
         identifier(p['request_id']);identifier(p['parent'])
-        from reserved_comments import could_name_merge_slot
-        if could_name_merge_slot(p['parent']):
-            parents=record_json.loads(run(['show',p['parent'],'--json']))
-            for parent in parents if isinstance(parents,list) else [parents]:
-                if is_merge_slot(parent):raise ValueError(merge_slot_sentence(parent.get('id'))+'; it takes no child')
+        # bd resolves a parent from any substring of an id, so the row is read, not guessed.
+        parents=record_json.loads(run(['show',p['parent'],'--json']))
+        for parent in parents if isinstance(parents,list) else [parents]:
+            if is_merge_slot(parent):raise ValueError(merge_slot_sentence(parent.get('id'))+'; it takes no child')
         if not isinstance(p['title'],str) or not p['title'].strip() or not isinstance(p['description'],str):raise ValueError('Child needs title and description')
         if p['type'] not in ('task','bug','feature','chore','decision'):raise ValueError('Invalid child type')
         identity=content_hash({'request_id':p['request_id']})

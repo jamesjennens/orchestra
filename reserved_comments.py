@@ -10,6 +10,7 @@ mention "Kind:" mid-text -- remains valid.
 This module is import-safe on all platforms (no fcntl). endpoint.py enforces
 it on the contributor `bd` path before any native mutation.
 """
+import json
 import re
 
 from briefing import PREFIX as CHECKPOINT_PREFIX
@@ -1314,90 +1315,268 @@ def status_change_targets(args):
 
 
 # ---------------------------------------------------------------------------
-# Writes that name the project's merge slot (kittrial-5bb.113 review).
+# The rows a contributor write names (kittrial-5bb.113, reviews 01a109cc and 01a10c0b).
 #
-# The slot is a row of type task with the id `<project>-merge-slot`. Refusing only
-# status and assignee moves left title, description, priority, labels, comments
-# and dependencies writable. Every writing invocation is now checked: the tokens
-# in an id position that COULD name the slot are found here, and the endpoint
-# resolves each through bd before the write.
+# A bd write reaches rows in more ways than an id on the command line: with no id it
+# acts on the row bd touched last; `close --claim-next` claims a row bd chooses;
+# `create --id` replaces the row that has that id; `dep add --file` takes ids from a
+# file; and bd resolves an id from any substring of the part after the project
+# prefix (`slot`, `e-s` and the single character `-` all reach `P-merge-slot`).
+# Guessing which token could reach which row failed twice, so nothing is guessed:
+# `write_targets` says, for every command a contributor may run, exactly which
+# tokens name rows, and refuses the forms whose rows are not named at all. The
+# endpoint then resolves every named token through bd before the write.
 #
-# bd 1.2.2 resolves an id from any substring of the part after the project prefix,
-# with or without the prefix, case-sensitively (measured: `slot`, `merge`,
-# `erge-slo`, `alpha-merge` and `t` all reach `alpha-merge-slot`). A token is
-# therefore a candidate when it, or what follows one of its hyphens, is a
-# substring of `merge-slot`. The test is deliberately wider than bd (it ignores
-# case): a candidate costs one native read, never a refusal by itself.
+#   command            rows it writes                                   how they are named
+#   create             a new row; the row with the same id if --id      --id (must not exist); --parent,
+#                      names one that exists (bd replaces it)           --deps, --waits-for
+#   create -f/--file,  rows described in a file                         not named: refused
+#     --graph
+#   update             each positional id; --parent                     positional ids; none: refused
+#                                                                       (bd would use the last touched row)
+#   close              each positional id                               positional ids; none: refused
+#   close --claim-next the next ready row, chosen by bd                 not named: refused
+#   close --continue   the next step of a molecule, chosen by bd        not named: refused
+#   reopen             each positional id                               positional ids; none: refused
+#   comments add       the first positional                             that operand; none: refused
+#   dep add/remove/    both ends                                        positional ids, --blocked-by,
+#     relate/unrelate                                                   --depends-on
+#   dep ID --blocks    both ends                                        the positional id and -b/--blocks
+#   dep add --file     the ends of every edge in the file               from/to/issue_id/depends_on_id of
+#                                                                       each line; unreadable: refused
+#   list, show, ready, search, count, state, lint, comments ID,
+#   dep list/tree/cycles                                                reads: not guarded
+#
+# `external:PROJECT:CAPABILITY` in a dependency is not a row and is not resolved.
 # ---------------------------------------------------------------------------
-MERGE_SLOT_ID_PART = 'merge-slot'
+#: Every flag of every WRITING bd 1.2.2 command a contributor may run, and how it bears on rows:
+#:   'row'     its value names existing rows; they are resolved before the write
+#:   'new'     the explicit id of a new row; it must not exist
+#:   'chosen'  bd chooses the row it writes: refused
+#:   'file'    rows come from a file: refused, except `dep add --file`, whose edges are read
+#:   'label'   a label write; the reserved-label guard decides
+#:   'plain'   names no row
+#: Taken from `bd COMMAND --help` of the pinned binary plus the hidden `create --label`.
+#: tests/test_bd_write_flags.py compares it with the help of a real bd when one is
+#: available, so a new bd version's flags are noticed before they are trusted.
+WRITE_FLAGS = {
+    'create': {
+        '--acceptance': 'plain', '--append-notes': 'plain', '--assignee': 'plain', '--body-file': 'plain',
+        '--context': 'plain', '--defer': 'plain', '--deps': 'row', '--description': 'plain', '--design': 'plain',
+        '--design-file': 'plain', '--dry-run': 'plain', '--due': 'plain', '--ephemeral': 'plain', '--estimate': 'plain',
+        '--event-actor': 'plain', '--event-category': 'plain', '--event-payload': 'plain', '--event-target': 'plain',
+        '--external-ref': 'plain', '--file': 'file', '--force': 'plain', '--graph': 'file', '--id': 'new',
+        '--label': 'label', '--labels': 'label', '--metadata': 'plain', '--mol-type': 'plain', '--no-history': 'plain',
+        '--no-inherit-labels': 'plain', '--notes': 'plain', '--parent': 'row', '--priority': 'plain', '--repo': 'plain',
+        '--silent': 'plain', '--skills': 'plain', '--spec-id': 'plain', '--stdin': 'plain', '--title': 'plain',
+        '--type': 'plain', '--validate': 'plain', '--waits-for': 'row', '--waits-for-gate': 'plain', '--wisp-type': 'plain'},
+    'update': {
+        '--acceptance': 'plain', '--add-label': 'label', '--allow-empty-description': 'plain', '--append-notes': 'plain',
+        '--assignee': 'plain', '--await-id': 'plain', '--body-file': 'plain', '--claim': 'plain', '--defer': 'plain',
+        '--description': 'plain', '--design': 'plain', '--design-file': 'plain', '--due': 'plain', '--ephemeral': 'plain',
+        '--estimate': 'plain', '--external-ref': 'plain', '--history': 'plain', '--metadata': 'plain',
+        '--no-history': 'plain', '--notes': 'plain', '--parent': 'row', '--persistent': 'plain', '--priority': 'plain',
+        '--remove-label': 'label', '--session': 'plain', '--set-labels': 'label', '--set-metadata': 'plain',
+        '--spec-id': 'plain', '--status': 'plain', '--stdin': 'plain', '--title': 'plain', '--type': 'plain',
+        '--unset-metadata': 'plain'},
+    'close': {'--claim-next': 'chosen', '--continue': 'chosen', '--force': 'plain', '--no-auto': 'plain',
+              '--reason': 'plain', '--reason-file': 'plain', '--session': 'plain', '--suggest-next': 'plain'},
+    'reopen': {'--reason': 'plain'},
+    'comments add': {'--author': 'plain', '--file': 'plain'},
+    'dep': {'--blocks': 'row', '--no-cycle-check': 'plain'},
+    'dep add': {'--blocked-by': 'row', '--depends-on': 'row', '--file': 'file', '--no-cycle-check': 'plain',
+                '--type': 'plain'},
+    'dep remove': {}, 'dep relate': {}, 'dep unrelate': {},
+}
+MERGE_SLOT_SUFFIX = '-merge-slot'
+#: A project name holds no hyphen (admin.validate_name), so the slot's id has this exact shape.
+MERGE_SLOT_ID = re.compile(r'[a-z][a-z0-9]{1,23}-merge-slot')
 #: Flags whose value is, or holds, an issue id on create/update.
 _ID_VALUE_FLAGS = ('--parent', '--deps', '--waits-for')
 _DEP_READS = ('list', 'tree', 'cycles')
+_DEP_VALUE_FLAGS = {'--blocks': True, '--blocked-by': True, '--depends-on': True, '--type': False, '--file': None}
+_DEP_BOOL_FLAGS = {'--no-cycle-check', '--help'}
+_EDGE_FIELDS = ('from', 'to', 'issue_id', 'depends_on_id')
+EDGE_LINES_MAX = 1000
 
 
-def could_name_merge_slot(token):
-    """Whether bd could resolve this token to a row whose id ends ``-merge-slot``."""
-    if not isinstance(token, str) or not token or token.startswith('-'):
-        return False
-    lowered = token.lower()
-    tails = [lowered] + [lowered[index + 1:] for index, ch in enumerate(lowered) if ch == '-']
-    return any(tail and tail in MERGE_SLOT_ID_PART for tail in tails)
+def is_merge_slot_id(value):
+    """Whether ``value`` is the id bd gives a project's merge slot: exactly ``PROJECT-merge-slot``."""
+    return isinstance(value, str) and MERGE_SLOT_ID.fullmatch(value) is not None
 
 
 def _id_pieces(value):
     """The ids in a flag value such as ``blocks:a,b`` (a list, each perhaps ``type:id``)."""
     pieces = []
     for part in str(value).split(','):
+        part = part.strip()
+        if part.startswith('external:'):
+            continue
         # An id holds no colon: in `blocks:pp-1` the id is what follows it.
         pieces.append(part.rpartition(':')[2].strip())
     return pieces
 
 
-def merge_slot_candidates(args):
-    """Tokens of a WRITING bd invocation that sit in an id position and could name the slot.
+def _true_flag(flags, name):
+    """Whether a boolean flag is on: pflag takes the last occurrence; an unparseable value counts."""
+    on = False
+    for flag, value in flags:
+        if flag == name:
+            parsed = _parse_go_bool(value)
+            on = True if parsed is None else parsed
+    return on
 
-    Empty for a read, and for a write none of whose ids could resolve to the slot,
-    which is every ordinary write: no native read is added to it. ``create`` names no
-    row of its own, only a parent, dependencies and a spawner. When the flags cannot
-    be resolved every token counts, so an unknown flag cannot hide a target.
+
+def _edge_ids(text):
+    """The ids named by a ``dep add --file`` JSONL body, or raise ValueError."""
+    import record_json
+    lines = [line for line in str(text).splitlines() if line.strip()]
+    if len(lines) > EDGE_LINES_MAX:
+        raise ValueError('more than %d edges' % EDGE_LINES_MAX)
+    found = []
+    for number, line in enumerate(lines, 1):
+        edge = record_json.loads(line)
+        if not isinstance(edge, dict):
+            raise ValueError('line %d is not an object' % number)
+        ends = [edge[field] for field in _EDGE_FIELDS if field in edge]
+        if len(ends) < 2 or any(not isinstance(end, str) or not end.strip() for end in ends):
+            raise ValueError('line %d does not name both ends as text' % number)
+        found += [piece for end in ends for piece in _id_pieces(end)]
+    return found
+
+
+def _dep_targets(args, attachments):
+    """(targets, refusal) of a writing ``bd dep`` invocation."""
+    targets, index, tokens = [], 1, args
+    subcommand_seen = False
+    while index < len(tokens):
+        token = tokens[index]
+        index += 1
+        if not isinstance(token, str):
+            return [], 'an argument is not text'
+        if token.startswith('@attachment:'):
+            item = (attachments or {}).get(token.partition(':')[2])
+            if not isinstance(item, dict) or item.get('flag') != '--file' or not isinstance(item.get('text'), str):
+                return [], 'a file given to `dep` must be the --file list of edges'
+            try:
+                targets += _edge_ids(item['text'])
+            except ValueError as error:
+                return [], 'the --file list of edges could not be read (%s), so its tasks are not named' % error
+            continue
+        if token == '--':
+            targets += [piece for rest in tokens[index:] if isinstance(rest, str) for piece in _id_pieces(rest)]
+            break
+        if len(token) > 1 and token.startswith('--'):
+            name, joined, value = token.partition('=')
+            if name in _DEP_VALUE_FLAGS:
+                if not joined:
+                    value = tokens[index] if index < len(tokens) and isinstance(tokens[index], str) else ''
+                    index += 1
+                if _DEP_VALUE_FLAGS[name] is None:
+                    return [], 'a raw --file path is not accepted; send the list of edges as an attachment'
+                if _DEP_VALUE_FLAGS[name]:
+                    targets += _id_pieces(value)
+            elif name in _DEP_BOOL_FLAGS or name in BD_GLOBAL_BOOL_FLAGS:
+                pass
+            elif name in BD_GLOBAL_VALUE_FLAGS:
+                index += 0 if joined else 1
+            else:
+                return [], 'the flag %s is not one this interface can resolve to tasks' % shown_token(name)
+            continue
+        if len(token) > 1 and token.startswith('-'):
+            # `-b ID`, `-bID`, `-b=ID` (the parent form's --blocks) and `-t TYPE`; nothing else names a row.
+            letter, rest = token[1], token[2:].lstrip('=')
+            if letter == 'b':
+                if not rest:
+                    rest = tokens[index] if index < len(tokens) and isinstance(tokens[index], str) else ''
+                    index += 1
+                targets += _id_pieces(rest)
+            elif letter == 't':
+                index += 0 if rest else 1
+            elif token not in ('-h', '-q', '-v'):
+                return [], 'the flag %s is not one this interface can resolve to tasks' % shown_token(token)
+            continue
+        if not subcommand_seen and token in BD_DEP_SUBCOMMAND_ALIASES:
+            subcommand_seen = True
+            continue
+        subcommand_seen = True
+        targets += _id_pieces(token)
+    return targets, None
+
+
+def shown_token(token):
+    """A caller-written token for a refusal: bounded, and quoted when it is not a plain word."""
+    text = str(token)[:60]
+    return text if re.fullmatch(r'[A-Za-z0-9_.:=-]+', text) else json.dumps(text, ensure_ascii=True)
+
+
+def write_targets(args, attachments=None):
+    """What a bd invocation writes, or None for a read (the table above).
+
+    ``{'command': label, 'targets': [token, ...], 'new_id': id or None, 'refusal':
+    sentence or None}``. ``targets`` are the tokens that name existing rows, in order,
+    without duplicates; ``new_id`` is the explicit id of a ``create``. ``refusal`` is set
+    when the write reaches rows that are not named, or cannot be read reliably.
     """
     if not isinstance(args, list) or not args or not isinstance(args[0], str):
-        return []
+        return None
     command = args[0]
-    tokens = []
+    label, targets, new_id, refusal = command, [], None, None
     if command in ('create', 'update', 'close', 'reopen'):
         flags, operands, unknown = _bd_scan(args, command)
-        if command != 'create':
-            tokens += operands
-        for name, value in flags:
-            if name in _ID_VALUE_FLAGS and isinstance(value, str):
-                tokens += _id_pieces(value)
+        operands = [token for token in operands if not token.startswith('@attachment:')]
+        files = [token for token in args[1:] if isinstance(token, str) and token.startswith('@attachment:')]
         if unknown:
-            for token in args[1:]:
-                if isinstance(token, str):
-                    tokens += _id_pieces(token.partition('=')[2] if token.startswith('-') else token)
+            refusal = 'the flag %s is not one this interface can resolve to tasks' % shown_token(unknown[0])
+        for name, value in flags:
+            if name in _ID_VALUE_FLAGS and isinstance(value, str) and value.strip():
+                targets += _id_pieces(value)
+        if command == 'create':
+            ids = [value for name, value in flags if name == '--id']
+            if len(ids) > 1 or (ids and not isinstance(ids[0], str)):
+                refusal = refusal or 'give --id once'
+            elif ids:
+                new_id = ids[0]
+            named = {name for name, _ in flags}
+            batch = named & {'--file', '-f', '--graph'} or any(
+                (attachments or {}).get(token.partition(':')[2], {}).get('flag') in ('--file', '-f') for token in files)
+            if batch:
+                refusal = refusal or ('creating several tasks from a file names no task here; create them one by one')
+        else:
+            targets = operands + targets
+            if not operands:
+                refusal = refusal or ('name the task: with no id bd acts on the task it touched last, which is not '
+                                      'named in this request')
+            if command == 'close':
+                for flag in ('--claim-next', '--continue'):
+                    if _true_flag(flags, flag):
+                        refusal = refusal or ('%s lets bd choose the next task, which is not named in this request; '
+                                              'close the task, then claim the next one by its id' % flag)
     elif command == 'comments':
+        parts = _comments_parts(args)
+        if parts is None or parts[0] != 'add':
+            return None
+        label = 'comments add'
         target = comment_target(args)
-        if target is not None:
-            tokens.append(target)
+        if target is None:
+            refusal = 'name the task the comment is for'
+        else:
+            targets.append(target)
     elif command == 'dep':
-        if _dep_subcommand(args) in _DEP_READS:
-            return []
-        for token in args[1:]:
-            if not isinstance(token, str):
-                continue
-            if token.startswith('--'):
-                tokens += _id_pieces(token.partition('=')[2])
-            elif token.startswith('-'):
-                # `-b ID`, `-bID` and `-b=ID` are the parent form's --blocks.
-                tokens += _id_pieces(token[2:].lstrip('='))
-            else:
-                tokens += _id_pieces(token)
-    found = []
-    for token in tokens:
-        if not token.startswith('@attachment:') and could_name_merge_slot(token) and token not in found:
-            found.append(token)
-    return found
+        subcommand = _dep_subcommand(args)
+        if subcommand in _DEP_READS:
+            return None
+        label = 'dep %s' % subcommand if subcommand else 'dep'
+        targets, refusal = _dep_targets(args, attachments)
+        if refusal is None and not targets:
+            return None                      # `bd dep` alone prints its help
+    else:
+        return None
+    ordered = []
+    for token in targets:
+        if token not in ordered:
+            ordered.append(token)
+    return {'command': label, 'targets': ordered, 'new_id': new_id, 'refusal': refusal}
 
 
 # Machine records are canonical UTF-8 with `\n` line endings. A client that

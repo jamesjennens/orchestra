@@ -1736,13 +1736,31 @@ class EndpointBackend:
         """Every open item of the current checkpoint, as recorded, or None when they could not all be read.
 
         The next checkpoint must carry each one forward unchanged, ``source`` included, so
-        the checkpoint template needs all of them (kittrial-5bb.113 review). The brief pages
-        them ten at a time: a task with more than one page costs one further ``brief`` read
-        per page, at most ``OPEN_ITEM_PAGES``. A checkpoint written between two pages makes
-        the list unusable, and the template then says to read again.
+        the checkpoint template needs all of them (kittrial-5bb.113 review). The task page
+        shows the first ten. A task with more costs ONE further ``brief`` read that asks for
+        all of them (a checkpoint holds at most 100). An endpoint older than that page size
+        refuses it, and the items are then read ten at a time, at most ``OPEN_ITEM_PAGES``
+        reads. A checkpoint written between two reads makes the list unusable, and the
+        template then says to read again.
         """
         items = [dict(item) for item in unresolved.get('items') or [] if isinstance(item, dict)]
         offset = unresolved.get('next_offset')
+        if offset is None:
+            return items
+        try:
+            whole = self._run('brief', project_id, self.actor_namespace + '/read',
+                              [str(task_id), '--json', '--items-limit', str(self.OPEN_ITEMS_MAX), '--items-offset', '0'])
+        except HttpError as refusal:
+            if refusal.status != 422:
+                raise
+            whole = None
+        if whole is not None:
+            if not isinstance(whole, dict) or (whole.get('checkpoint') or {}).get('comment_id') != checkpoint_id:
+                return None
+            every = whole.get('unresolved') or {}
+            if every.get('next_offset') is not None:
+                return None
+            return [dict(item) for item in every.get('items') or [] if isinstance(item, dict)]
         for _ in range(self.OPEN_ITEM_PAGES):
             if offset is None:
                 return items
@@ -1756,7 +1774,9 @@ class EndpointBackend:
             offset = more.get('next_offset')
         return items if offset is None else None
 
-    #: Further ``brief`` reads one task brief may cost to list every open item (100 items, ten a page).
+    #: The page size that holds every open item a checkpoint may have (briefing.CHECKPOINT_ITEMS_MAX).
+    OPEN_ITEMS_MAX = 100
+    #: Reads of ten that an older endpoint may cost instead (100 items, ten a page).
     OPEN_ITEM_PAGES = 9
 
     @staticmethod

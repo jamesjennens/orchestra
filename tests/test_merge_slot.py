@@ -38,13 +38,16 @@ class PredicateTests(unittest.TestCase):
         self.assertTrue(coordination.is_merge_slot(slot_row()))
         self.assertTrue(coordination.is_merge_slot({'id': 'anything', 'issue_type': 'merge-slot'}))
 
-    def test_neither_the_label_nor_the_id_alone_hides_a_task(self):
-        # A contributor can add a label, or choose an id ending: neither alone makes a task disappear.
-        self.assertFalse(coordination.is_merge_slot(slot_row(labels=[])))
-        self.assertFalse(coordination.is_merge_slot(slot_row(labels=['bug'])))
+    def test_the_rule_is_the_exact_id_alone(self):
+        # The label is what an accident removes: without it the row is still the slot (review 01a10c0b).
+        self.assertTrue(coordination.is_merge_slot(slot_row(labels=[])))
+        self.assertTrue(coordination.is_merge_slot(slot_row(labels=['bug'])))
+        # A row that only carries the label, or whose id only ends that way, is a task.
         self.assertFalse(coordination.is_merge_slot(slot_row(slot_id=PROJECT + '-abc')))
+        self.assertFalse(coordination.is_merge_slot(slot_row(slot_id=PROJECT + '-x-merge-slot')))
+        self.assertFalse(coordination.is_merge_slot(slot_row(slot_id=SLOT + '.1')))
         self.assertFalse(coordination.is_merge_slot(slot_row(slot_id='merge-slot-notes')))
-        for value in (None, 'row', [], {'id': 7, 'labels': ['gt:slot']}, {'id': SLOT, 'labels': 'gt:slot'}):
+        for value in (None, 'row', [], {'id': 7, 'labels': ['gt:slot']}, {'labels': ['gt:slot']}):
             self.assertFalse(coordination.is_merge_slot(value))
 
     def test_the_sentence_names_the_record(self):
@@ -62,6 +65,9 @@ class CanonicalTests(unittest.TestCase):
         listed = [item['task'] for item in work.queue(with_slot, 'alice/session', [])['items']]
         self.assertEqual(listed, [TASK])
         self.assertEqual(work.queue(with_slot, 'alice/session', [])['total'], 1)
+        # A slot that lost its label is still not work.
+        self.assertEqual([item['task'] for item in work.queue(data + [slot_row(labels=[])], 'alice/session', [])['items']],
+                         [TASK])
         # A task that only carries the label is still work.
         labelled = copy.deepcopy(data[0]); labelled.update(id=PROJECT + '-zzz', labels=['gt:slot'])
         listed = [item['task'] for item in work.queue(data + [labelled], 'alice/session', [])['items']]
@@ -190,8 +196,8 @@ class HttpTests(fixes.EndpointCase):
         self.assertEqual(200, self.request('POST', '/v1/projects/%s/tasks/%s/claim' % (self.project, self.task), {},
                                            token=self.agent).status)
 
-    def test_a_slot_that_lost_its_label_is_still_never_offered(self):
-        # `work` lists such a row again (it is an ordinary one by the rule); so did an older endpoint.
+    def test_a_slot_that_lost_its_label_is_still_the_slot_on_every_route(self):
+        # The rule is the id alone: nothing lists it, reads answer 404 and writes 409 as before.
         path = self.canonical_root / 'canonical.json'
         state = json.loads(path.read_text(encoding='utf-8'))
         for row in state['rows']:
@@ -203,6 +209,33 @@ class HttpTests(fixes.EndpointCase):
         self.assertEqual(nxt['attention']['counts']['claimable'], 1)
         queue = self.request('GET', '/v1/projects/%s/queue' % self.project, token=self.admin).data['items']
         self.assertNotIn(self.slot, [row['id'] for row in queue])
+        listed = [row['id'] for row in self.request('GET', '/v1/projects/%s/tasks' % self.project,
+                                                    token=self.alex).data['items']]
+        self.assertEqual(listed, [self.task])
+        self.assertEqual(404, self.request('GET', self.base, token=self.alex).status)
+        self.assertEqual(409, self.request('PATCH', self.base, {'title': 'mine now'}, token=self.alex).status)
+        self.assertEqual(409, self.request('POST', self.base + '/claim', {}, token=self.agent).status)
+
+
+    def test_an_endpoint_that_lists_the_slot_in_work_does_not_get_it_offered(self):
+        # An endpoint older than kittrial-5bb.113 listed the slot as an ordinary open task.
+        run = self.backend._run
+
+        def older(action, project_id, actor, args, *rest, **kwargs):
+            answer = run(action, project_id, actor, args, *rest, **kwargs)
+            if action == 'work' and isinstance(answer, dict):
+                listed = dict(answer['items'][0], task=self.slot, title='Merge Slot', owner=None, status='open',
+                              review_state='none', contribution_id=None) if answer.get('items') else None
+                if listed:
+                    answer = dict(answer, items=[listed] + list(answer['items']))
+            return answer
+        self.backend._run = older
+        self.addCleanup(setattr, self.backend, '_run', run)
+        nxt = self.request('GET', '/v1/agents/me/next', token=self.agent).data
+        self.assertEqual([(a['kind'], a['task']) for a in nxt['next_actions']], [('claimable-task', self.task)])
+        queue = self.request('GET', '/v1/projects/%s/queue' % self.project, token=self.admin).data['items']
+        self.assertNotIn(self.slot, [row['id'] for row in queue])
+        self.assertEqual(nxt['attention']['counts']['claimable'], 1)
 
 
 class ReaderTests(unittest.TestCase):
@@ -211,8 +244,8 @@ class ReaderTests(unittest.TestCase):
     def chained(self, **changes):
         from requirements import canonical_bytes
         row = slot_row(status='in_progress', assignee='alice/session', **changes)
-        records = [('delivery', dict(contribute(), task=SLOT)),
-                   ('asked', dict(schema_version=1, operation='request-review', operation_id='ask-1', task=SLOT,
+        records = [('delivery', dict(contribute(), task=row['id'])),
+                   ('asked', dict(schema_version=1, operation='request-review', operation_id='ask-1', task=row['id'],
                                   previous='delivery', contribution='delivery', reviewer='bob'))]
         row['comments'] = [dict(id=cid, author='alice/session', created_at='2026-10-05T00:00:0%dZ' % index,
                                 text=review_workflow.PREFIX + canonical_bytes(payload).decode())
@@ -221,13 +254,17 @@ class ReaderTests(unittest.TestCase):
 
     def test_the_newest_contribution_reader_skips_the_slot(self):
         import lifecycle
-        # The same row without the label is an ordinary task and is read.
-        self.assertEqual(lifecycle.current_contribution_commits([self.chained(labels=[])]), {SLOT: 'a' * 40})
+        # The same row under an id that only ends like the slot's is an ordinary task and is read.
+        near = PROJECT + '-x-merge-slot'
+        self.assertEqual(lifecycle.current_contribution_commits([self.chained(slot_id=near)]), {near: 'a' * 40})
         self.assertEqual(lifecycle.current_contribution_commits([self.chained()]), {})
+        self.assertEqual(lifecycle.current_contribution_commits([self.chained(labels=[])]), {})
 
     def test_the_open_review_request_count_skips_the_slot(self):
-        self.assertEqual(review_workflow.open_review_requests_by([self.chained(labels=[])], 'alice/session'), 1)
+        near = PROJECT + '-x-merge-slot'
+        self.assertEqual(review_workflow.open_review_requests_by([self.chained(slot_id=near)], 'alice/session'), 1)
         self.assertEqual(review_workflow.open_review_requests_by([self.chained()], 'alice/session'), 0)
+        self.assertEqual(review_workflow.open_review_requests_by([self.chained(labels=[])], 'alice/session'), 0)
 
 
 if __name__ == '__main__':

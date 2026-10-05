@@ -513,9 +513,10 @@ class EndpointSetupTests(fixes.EndpointCase):
         self.assertEqual(201, self.create_task(self.admin, self.project, 'first').status)
         step = by_id(self.setup())['first-task']
         self.assertEqual((step['state'], step['detail']), ('done', '1 task(s) defined.'))
-        # One rule, the kit's: the id ending AND the label (or the merge-slot type).
+        # One rule, the kit's: the exact id PROJECT-merge-slot (or the merge-slot type).
         self.assertTrue(project_setup.is_merge_slot({'id': 'alpha-merge-slot', 'labels': ['gt:slot']}, 'alpha'))
-        self.assertFalse(project_setup.is_merge_slot({'id': 'alpha-merge-slot', 'labels': []}, 'alpha'))
+        self.assertTrue(project_setup.is_merge_slot({'id': 'alpha-merge-slot', 'labels': []}, 'alpha'))
+        self.assertFalse(project_setup.is_merge_slot({'id': 'alpha-x-merge-slot', 'labels': ['gt:slot']}, 'alpha'))
         self.assertFalse(project_setup.is_merge_slot({'id': 'x', 'labels': ['gt:slot']}, 'alpha'))
         self.assertFalse(project_setup.is_merge_slot({'id': 'alpha-1', 'labels': ['bug']}, 'alpha'))
 

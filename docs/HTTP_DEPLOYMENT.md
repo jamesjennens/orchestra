@@ -568,8 +568,8 @@ agent can write its first one from the brief alone.
     not all be read (the task changed during the read); `body.open_items` is then
     empty, the note says so, and the brief is read again.
   - The brief's own `checkpoint.open_items` shows the first ten, each now with its
-    `source`; a task with more costs one further canonical read per ten to fill the
-    template.
+    `source`; a task with more costs one further canonical read, which asks for all
+    of them (the canonical `brief --items-limit` now goes up to 100).
   - `required`: the four texts to fill (`intent`, `acceptance`, `summary`,
     `next_action`); `optional`: what may be left out and when; `limits`; the shape of an
     `open_item` (with the allowed `kind` values) and of a `resolved_item`.
@@ -600,14 +600,16 @@ offered it to agents.
 - Reading it as a task (the task, its brief, its history) answers 404.
 - Claiming it, editing it, or posting a checkpoint or a review on it answers 409 with
   "PROJECT-merge-slot is the project's merge slot, an internal record, not a task".
-- A row counts as the slot only when it has both the id ending `-merge-slot` and the
-  label `gt:slot` (or the type `merge-slot`). A task that only carries the label, or only
-  has such an id, is still a task.
-- **No contributor write reaches it over SSH either.** Every `bd` write that names the
-  slot is refused before anything is written: title, description, priority, notes,
-  metadata, labels, a comment, a dependency in either direction, a child under it. bd
-  resolves a short id from any part of it (`slot`, `merge`), so each id in the command
-  that could resolve to the slot is looked up first; an ordinary write is not slowed.
+- **The slot is the row with the exact id `PROJECT-merge-slot`** (or the type
+  `merge-slot`), on every path: listings, reads and writes. The label is not part of
+  the rule: a slot whose label was removed on the host is still the slot. A project
+  name holds no hyphen, so a task whose id only ends in `-merge-slot`
+  (`PROJECT-x-merge-slot`), or that only carries the label, is still a task.
+- **No contributor write reaches it over SSH either.** Every `bd` write names the rows
+  it writes, each name is resolved through bd before the write (bd resolves an id
+  from any part of it: `slot`, `merge`, even a lone `-`), and a write that resolves
+  to the slot is refused. See CLI_CONTRACT.md, "Raw bd writes: which rows a command
+  names".
 - **The label `gt:slot` is reserved.** No contributor adds, removes or replaces it on
   any row, so a task cannot be hidden with it and the slot cannot be exposed by taking
   it off.
@@ -617,7 +619,7 @@ offered it to agents.
   answer lists what was changed in `repaired`. `merge-check`, `merge-acquire` and
   `merge-release` on a slot that is unavailable with no holder now say to run it.
 - The web service never offers the row with the id `PROJECT-merge-slot`, whatever the
-  endpoint lists: a slot that lost its label on the host is not handed to an agent.
+  endpoint lists (an older endpoint listed it in `work`).
 
 ### Personal agents
 

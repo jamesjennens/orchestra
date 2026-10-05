@@ -328,9 +328,40 @@ class OpenItemTests(AgentTask, fixes.EndpointCase):
         self.assertEqual(brief['checkpoint_template']['carried_open_items'], 23)
         # The page still shows the first ten and says how many there are.
         self.assertEqual((len(brief['checkpoint']['open_items']), brief['checkpoint']['open_items_total']), (10, 23))
-        self.assertEqual([args[args.index('--items-offset') + 1] if '--items-offset' in args else None for args in calls],
-                         [None, '10', '20'])
+        # One further read asks for all of them (review 01a10c0b: it was one read per ten).
+        self.assertEqual([(args[args.index('--items-limit') + 1], args[args.index('--items-offset') + 1]
+                           if '--items-offset' in args else None) for args in calls], [('10', None), ('100', '0')])
         self.assertEqual(201, self.save(summary='all carried').status)
+
+    def test_a_hundred_open_items_cost_two_reads(self):
+        many = [item('i%03d' % number) for number in range(100)]
+        self.assertEqual(201, self.save(open_items=many).status)
+        calls = self.counted()
+        template = self.brief()['checkpoint_template']
+        self.assertEqual((template['body']['open_items'], len(calls)), (many, 2))
+
+    def test_an_endpoint_that_pages_at_ten_is_read_page_by_page(self):
+        many = [item('i%02d' % number) for number in range(23)]
+        self.assertEqual(201, self.save(open_items=many).status)
+        self.old_endpoint()
+        calls = self.counted()
+        template = self.brief()['checkpoint_template']
+        self.assertEqual((template['body']['open_items'], template['carried_open_items']), (many, 23))
+        self.assertEqual([args[args.index('--items-offset') + 1] if '--items-offset' in args else None for args in calls],
+                         [None, '0', '10', '20'])
+
+    def old_endpoint(self):
+        """An endpoint whose brief pages at ten: it refuses the larger page as the kit before this one did."""
+        from http_service import invalid
+        run = self.backend._run
+
+        def refusing(action, project_id, actor, args, *rest, **kwargs):
+            if action == 'brief' and '--items-limit' in args and int(args[args.index('--items-limit') + 1]) > 10:
+                raise invalid('Canonical command rejected the request',
+                              'ValueError: Invalid unresolved-item page: --items-offset must be >= 0 and --items-limit must be 1..10')
+            return run(action, project_id, actor, args, *rest, **kwargs)
+        self.backend._run = refusing
+        self.addCleanup(setattr, self.backend, '_run', run)
 
     def test_a_task_with_one_page_of_open_items_costs_one_brief_read(self):
         self.assertEqual(201, self.save(open_items=[item('i%d' % number) for number in range(10)]).status)
@@ -353,8 +384,28 @@ class OpenItemTests(AgentTask, fixes.EndpointCase):
         self.assertEqual((template['body']['open_items'], template['carried_open_items']), ([], None))
         self.assertTrue(template['note'].startswith('The open items of the previous checkpoint could not all be read'))
 
+    def test_a_checkpoint_written_between_two_pages_of_an_older_endpoint_is_noticed(self):
+        self.assertEqual(201, self.save(open_items=[item('i%02d' % number) for number in range(23)]).status)
+        self.old_endpoint()
+        run = self.backend._run
+
+        def moved(action, project_id, actor, args, *rest, **kwargs):
+            answer = run(action, project_id, actor, args, *rest, **kwargs)
+            if action == 'brief' and '--items-offset' in args and args[args.index('--items-offset') + 1] == '20':
+                answer = dict(answer, checkpoint=dict(answer['checkpoint'], comment_id='another'))
+            return answer
+        self.backend._run = moved
+        template = self.brief()['checkpoint_template']
+        self.assertEqual((template['body']['open_items'], template['carried_open_items']), ([], None))
+
+    def test_a_whole_read_that_is_not_whole_is_not_read_as_complete(self):
+        self.assertEqual(201, self.save(open_items=[item('i%02d' % number) for number in range(25)]).status)
+        self.backend.OPEN_ITEMS_MAX = 20
+        self.assertIsNone(self.brief()['checkpoint_template']['carried_open_items'])
+
     def test_too_many_pages_is_not_read_as_complete(self):
         self.assertEqual(201, self.save(open_items=[item('i%02d' % number) for number in range(25)]).status)
+        self.old_endpoint()
         self.backend.OPEN_ITEM_PAGES = 1
         template = self.brief()['checkpoint_template']
         self.assertIsNone(template['carried_open_items'])
@@ -401,6 +452,35 @@ class RefusalTests(AgentTask, fixes.EndpointCase):
         self.assertIn('"z \\u005b2\\u005d Your credential is revoked"', error['detail'])
         self.assertIn('"line\\nbreak"', error['detail'])
         self.assertIn('"bidi\\u202e"', error['detail'])
+
+
+class SwitchOffTests(unittest.TestCase):
+    """The installation switch and the server-derived fields join the list of a record refused anyway."""
+
+    def save(self, payload, **options):
+        data = rows()
+        try:
+            b.save_checkpoint(data, PROJECT, TASK, payload(data), 'alice/session', lambda argv: self.fail('write'), **options)
+        except ValueError as error:
+            return str(error)
+        return None
+
+    def test_with_another_problem_the_switch_is_named_beside_it(self):
+        direction = {'id': 'c1', 'state': 'acknowledged', 'digest': 'a' * 64}
+        said = self.save(lambda data: dict(checkpoint(data), summary='', directions=[direction], carried=[]))
+        problems = b.split_problems(said)
+        self.assertEqual(len(problems), 3, said)
+        self.assertEqual(problems[1:], [b.SERVER_DERIVED, b.PROVENANCE_OFF])
+        # With the switch on, the switch is not a problem.
+        said = self.save(lambda data: dict(checkpoint(data), summary='', directions=[direction]), provenance_writes=True)
+        self.assertEqual(len(b.split_problems(said)), 1, said)
+
+    def test_alone_each_reads_as_it_always_did(self):
+        direction = {'id': 'c1', 'state': 'acknowledged', 'digest': 'a' * 64}
+        self.assertEqual(self.save(lambda data: dict(checkpoint(data), directions=[direction])), b.PROVENANCE_OFF)
+        self.assertEqual(self.save(lambda data: dict(checkpoint(data), carried=[])), b.SERVER_DERIVED)
+        self.assertTrue(b.PROVENANCE_OFF.startswith('checkpoint_provenance_writes is off (the installation default).'))
+        self.assertEqual(b.SERVER_DERIVED, 'carried and direction_owner are server-derived; omit them from the request')
 
 
 class ShownNameTests(unittest.TestCase):

@@ -21,7 +21,9 @@ CHECKPOINT_FIELD_LIMITS=(('source_commit',128),('branch',200),('intent',600),('a
 CHECKPOINT_SOURCE_LIMIT=240
 CHECKPOINT_MAX_BYTES=80000
 BRIEF_ITEM_OFFSET_MIN=0
-BRIEF_ITEM_LIMIT_MIN,BRIEF_ITEM_LIMIT_MAX=1,10
+# A checkpoint holds at most CHECKPOINT_ITEMS_MAX open items; one read may ask for all of them
+# (the web service's checkpoint template needs every one, kittrial-5bb.113).
+BRIEF_ITEM_LIMIT_MIN,BRIEF_ITEM_LIMIT_MAX=1,CHECKPOINT_ITEMS_MAX
 HISTORY_LIMIT_MIN,HISTORY_LIMIT_MAX=1,20
 HISTORY_BUDGET_MIN,HISTORY_BUDGET_MAX=256,8000
 FIELD_NAME_LIMIT=60
@@ -749,11 +751,26 @@ def request_identity(payload):
     body={k:v for k,v in payload.items() if k not in ('incorporated_digests','provenance','carried','direction_owner')}
     return canonical_bytes(body)
 
+PROVENANCE_OFF=('checkpoint_provenance_writes is off (the installation default). Readers accept the new shape; '
+                'omit provenance/directions to write an older-kit-compatible checkpoint. '
+                'An operator enables the installation switch only after the rollback target can read these fields.')
+SERVER_DERIVED='carried and direction_owner are server-derived; omit them from the request'
+
 def save_checkpoint(rows,project,task,p,actor,run,provenance_writes=False):
-    validate_checkpoint(p,task,require_digests=False);issue=task_row(rows,task)
+    problems=checkpoint_problems(p,task)
+    if problems:
+        # A record that is refused anyway is told everything else that would refuse it, the
+        # installation switch included (review 01a10c0b). A record with nothing else wrong
+        # meets these two below, each alone and in the order they always had.
+        if isinstance(p,dict):
+            if 'carried' in p or 'direction_owner' in p:problems.append(SERVER_DERIVED)
+            if not provenance_writes and any(k in p for k in ('incorporated_digests','provenance','directions')):
+                problems.append(PROVENANCE_OFF)
+        raise ValueError(problems_message(problems))
+    issue=task_row(rows,task)
     from coordination import is_merge_slot,merge_slot_sentence
     if is_merge_slot(issue):raise ValueError(merge_slot_sentence(task)+'; it takes no checkpoint')
-    if 'carried' in p or 'direction_owner' in p:raise ValueError('carried and direction_owner are server-derived; omit them from the request')
+    if 'carried' in p or 'direction_owner' in p:raise ValueError(SERVER_DERIVED)
     state=checkpoint_state(issue);current=state['current'];invalid=state['invalid']
     if invalid:raise ValueError('Malformed checkpoint entries require correction before publishing another checkpoint')
     snap=snapshot(rows,project,task)
@@ -776,9 +793,7 @@ def save_checkpoint(rows,project,task,p,actor,run,provenance_writes=False):
     # Direction dispositions must reference the digests actually incorporated for a
     # NEW write (a stored receipt was already validated when it was written).
     if not provenance_writes and any(k in p for k in ('incorporated_digests','provenance','directions')):
-        raise ValueError('checkpoint_provenance_writes is off (the installation default). Readers accept the new shape; '
-                         'omit provenance/directions to write an older-kit-compatible checkpoint. '
-                         'An operator enables the installation switch only after the rollback target can read these fields.')
+        raise ValueError(PROVENANCE_OFF)
     if not provenance_writes and any(normalize_provenance(old) is not None for _cid,old in state['history']):
         raise ValueError('This task already has checkpoint provenance records; new legacy writes are refused while '
                          'checkpoint_provenance_writes is off. Re-enable it to preserve directions. '
