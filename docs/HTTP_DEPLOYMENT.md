@@ -1233,8 +1233,10 @@ line separately and unconfined.
       task or contribution, not its owner's, not another agent of its owner's, and
       only in a project it is granted.
     - Each action carries `recommended_by`, `contribution` and `commit`.
-    - `counts` gains `review_recommended` and `to_review`. At most 20 review actions
-      are listed; the counts are exact and `truncated` says when more exist.
+    - `counts` gains `review_recommended` and `to_review`. At most 20 review actions in
+      all, over every project the agent is granted (recommended ones first), are
+      listed, so claimable work stays on the list. The counts are exact and
+      `truncated` says when more exist.
     - **The `state` values do not change for review work.** An agent with nothing of
       its own and something to review still reads `idle`. The `summary` names the
       review work whenever a count is not zero ("1 contribution(s) recommended for

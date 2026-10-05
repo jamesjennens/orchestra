@@ -229,11 +229,16 @@ def execute(root,request,authority_config=None,require_authority=False):
         # The instrumented runner is the work effect's only route to native state, so
         # a validation refusal raised before any write is provably pre-effect.
         runner=NativeRunner(run)
+        # A malformed review_workflow_writes value reads as OFF and warns instead of
+        # failing every work/review action (kittrial-5bb.110 item 2).
+        switch_warnings=[]
+        review_writes=configured_review_writes(root,warnings=switch_warnings)
+        run_warnings.extend(switch_warnings)
         def work_effect():
             return {'returncode':0,'stdout':json.dumps(work_execute(path,actor,action,args,request.get('attachments',{}),runner,
                                                                     operators=configured_operators(root),
                                                                     verifiers=configured_verifiers(root),
-                                                                    review_writes=configured_review_writes(root)),ensure_ascii=False,indent=2)+'\n','stderr':''.join(run_warnings)}
+                                                                    review_writes=review_writes),ensure_ascii=False,indent=2)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             return run_guarded(request,journal_path(path),work_effect,

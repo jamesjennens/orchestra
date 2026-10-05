@@ -374,7 +374,13 @@ has an effect in both directions.
   only when the repairer it names is a configured operator (`deployment.private.json`
   `operators`); a well-formed file naming anyone else, or a project outside a deployment
   root, shows no repair (kittrial-5bb.124). Treat a repair note as a hint, and the audit
-  record's setter and history as the record. If the audit path is a symlink, a
+  record's setter and history as the record. Three consequences (kittrial-5bb.125):
+  a genuine repair stops being shown once its operator is removed from the operator
+  list; nothing is shown at all when no operators are configured; and a file planted by
+  someone who can write the project directory, naming a listed operator, is shown. A
+  repair whose repairer is no longer listed is hidden rather than shown as "repaired by
+  NAME (no longer a listed operator)": a reader cannot tell it from a planted file
+  naming any unlisted name, so marking it would show those too. If the audit path is a symlink, a
   directory or any other non-regular file, the same-text set refuses before it changes
   anything (`Nothing was changed: ...`); remove it and set again. If the audit write
   itself fails after the record was repaired, the set succeeds and prints that the
@@ -416,11 +422,13 @@ them is therefore staged in two steps, and this kit is step one.
 * **Readers understand the new shapes unconditionally.** `review`, `brief`, `work`
   and `history` parse and project them whatever the switch below says.
 * **Writers are off by default.** `deployment.private.json` gains one boolean,
-  `review_workflow_writes`; absent or `false` means **OFF**, and a non-boolean value
-  is refused. With it off, a review write of any new shape is refused before any
-  native write, and a legacy request-changes item (`{id, text}`, no severity, no
-  summary) still works. An exact retry of an operation id already in the chain still
-  reconciles, so records written while it was on stay recoverable.
+  `review_workflow_writes`; absent or `false` means **OFF**, and a value that is not
+  a boolean (a hand-set `"yes"`, say) is **read as OFF with a warning** rather than
+  refused, so a malformed value cannot make `work` or `review` fail for every actor
+  while `brief` still answers. With it off, a review write of any new shape is
+  refused before any native write, and a legacy request-changes item (`{id, text}`,
+  no severity, no summary) still works. An exact retry of an operation id already in
+  the chain still reconciles, so records written while it was on stay recoverable.
 * **The coordinator turns it on** once the rollback target is a kit that reads the
   new shapes:
 
@@ -436,6 +444,23 @@ python3 admin.py review-writes off --actor OPERATOR        # back to refusing th
 supplies the value to the review write path, so a contributor cannot set it.
 `off` removes the key, so a deployment that never turned it on and one that turned
 it back off read identically.
+
+Every flip also appends one entry to a short **append-only history** in
+`review-writes.audit.json` beside the deployment file, under an exclusive
+deployment lock (kittrial-5bb.110 item 3). Each entry names who set the switch,
+when, and the value it replaced; the history keeps the last 20 flips, and a flip
+that does not change the value appends nothing instead of overwriting the record.
+`review-writes status` prints `audit` (the last entry), `audit_history` and
+`audit_agrees`, and **warns when the switch and the last recorded entry disagree**
+- what an older kit, which does not know the audit file, or a hand edit leaves
+behind. A **damaged** audit file - not JSON, not an object, an unknown schema, or
+malformed entries - is reported the same way and reads `audit_agrees: false`; the
+next flip does not silently overwrite it. Before writing the fresh history the flip
+renames the damaged bytes aside, in the same directory, as
+`review-writes.audit.json.damaged-<UTC date-time>` (`.N` on a collision) and says so
+in its warning. The audit file is read through the same bounded-nesting JSON guard as
+every other caller-written file, so a deeply nested one is refused cleanly instead of
+crashing `status` with a `RecursionError`.
 
 **Deployment order and rollback.** Deploy this kit with the switch off, verify the
 reads (`review`, `brief`, `work`, `history`), and leave it off for as long as a

@@ -150,6 +150,44 @@ class Shared:
         line = next(line for line in owner.splitlines() if line.startswith('- task %s ' % one[0]))
         self.assertIn('; recommended by 1 reviewer(s)', line)
 
+    def offered(self, name):
+        return sorted(task for kind, task in kinds(self.next(name)) if kind in ('to-review', 'review-recommended'))
+
+    def test_both_the_assignee_and_the_author_are_compared(self):
+        """Each half of the independence check, alone (review 01a10c80)."""
+        (one, two), spare = self.scenario()
+        # Kestrel (Carl's) delivered `one`; the task is then reassigned to Osprey (Rita's).
+        self.change(one[0], assignee=self.agent_ids['Osprey'])
+        # The author's person is not offered it although it is no longer the assignee ...
+        self.assertNotIn(one[0], self.offered('Kestrel'))
+        self.assertNotIn(one[0], self.offered('Merlin'))
+        # ... and the assignee's person is not offered it although someone else delivered it.
+        self.assertNotIn(one[0], self.offered('Osprey'))
+        # A third person's agent is.
+        self.assertIn(one[0], self.offered('Heron'))
+        # The other delivery is untouched: Osprey may review it, Kestrel may not.
+        self.assertIn(two[0], self.offered('Osprey'))
+        self.assertNotIn(two[0], self.offered('Kestrel'))
+
+    def test_a_closed_task_is_not_offered_for_review(self):
+        (one, two), spare = self.scenario()
+        self.change(one[0], status='closed')
+        self.assertEqual(self.offered('Osprey'), [two[0]])
+        self.assertEqual(self.next('Osprey')['attention']['counts']['to_review'], 1)
+
+    def test_a_revoked_or_expired_credential_does_not_count_for_the_reviews_capability(self):
+        self.scenario()
+        standing = self.service.agent_review_standing
+        agent = self.agent_ids['Osprey']
+        self.assertEqual(standing(agent, self.project), (True, False))
+        mine = [c for c in self.service.state['credentials'].values() if c.get('agent_id') == agent]
+        self.assertEqual(len(mine), 1)
+        mine[0]['revoked'] = True
+        self.assertEqual(standing(agent, self.project), (False, False))
+        mine[0]['revoked'] = False
+        mine[0]['expires_at'] = 1
+        self.assertEqual(standing(agent, self.project), (False, False))
+
     def test_review_work_comes_after_the_agents_own_actionable_work(self):
         (one, two), spare = self.scenario()
         claimed = self.request('POST', self.base(spare) + '/claim', {}, token=self.agents['Osprey'])
@@ -177,6 +215,40 @@ class Shared:
 
 
 class InProcessTests(Shared, test_http_agents.AgentHarness):
+    def change(self, task, **fields):
+        self.backend._task(self.project, task).update(fields)
+
+    def test_the_cap_is_on_the_whole_list_not_on_each_project(self):
+        """Three projects of deliveries list twenty review actions in all, and claimable work stays (review 01a10c80)."""
+        self.people()
+        admin = self.admin_token()
+        projects = [self.project] + [self.create_project(admin, name) for name in ('Beta', 'Gamma')]
+        for project in projects[1:]:
+            for name, role in (('olive', 'owner'), ('carl', 'contributor'), ('rita', 'contributor')):
+                self.request('PUT', '/v1/projects/%s/members/%s' % (project, self.ids[name]), {'role': role}, token=admin)
+        made = self.request('POST', '/v1/agents', {'name': 'Kite', 'working_directory': '/home/carl/kite',
+                                                   'projects': projects}, token=self.tokens['carl'])
+        wide = self.request('POST', '/v1/agents', {'name': 'Wide', 'working_directory': '/home/rita/wide',
+                                                   'projects': projects}, token=self.tokens['rita'])
+        self.assertEqual((201, 201), (made.status, wide.status))
+        kite, reviewer = made.data['credential']['secret'], wide.data['credential']['secret']
+        for index, project in enumerate(projects):
+            base = '/v1/projects/%s/tasks' % project
+            for number in range(12):
+                task = self.request('POST', base, {'title': 'd %d' % number}, token=self.tokens['olive']).data['id']
+                self.assertEqual(200, self.request('POST', '%s/%s/claim' % (base, task), token=kite).status)
+                sent = self.request('POST', '%s/%s/reviews' % (base, task), {
+                    'operation': 'contribute', 'commit': '%040x' % (index * 100 + number + 1),
+                    'base_commit': test_http_agents.BASE, 'bundle_sha256': test_http_agents.BUNDLE, 'summary': 'd'}, token=kite)
+                self.assertEqual(201, sent.status, sent.data)
+            self.request('POST', base, {'title': 'spare'}, token=self.tokens['olive'])
+        answer = self.request('GET', '/v1/agents/me/next', token=reviewer).data
+        listed = [kind for kind, _ in kinds(answer)]
+        self.assertEqual(listed.count('to-review'), 20)
+        self.assertEqual(answer['attention']['counts']['to_review'], 36)
+        self.assertTrue(answer['attention']['truncated'])
+        self.assertEqual(listed.count('claimable-task'), 3)
+        self.assertEqual(listed[:20], ['to-review'] * 20)
     def new_task(self, title):
         return self.request('POST', '/v1/projects/%s/tasks' % self.project, {'title': title},
                             token=self.tokens['olive']).data['id']
@@ -229,6 +301,40 @@ class InProcessTests(Shared, test_http_agents.AgentHarness):
 
 class EndpointTests(Shared, fixes.EndpointCase):
     """The same over the strict canonical stub: the kit's own work view and review rules."""
+
+    def change(self, task, **fields):
+        import json
+        path = self.canonical_root / 'canonical.json'
+        state = json.loads(path.read_text(encoding='utf-8'))
+        next(row for row in state['rows'] if row['id'] == task).update(fields)
+        path.write_text(json.dumps(state), encoding='utf-8')
+
+    def older_endpoint(self):
+        """An endpoint from before this delivery: its work rows do not say who delivered."""
+        run = self.backend._run
+
+        def older(action, project_id, actor, args, *rest, **kwargs):
+            answer = run(action, project_id, actor, args, *rest, **kwargs)
+            if action == 'work' and isinstance(answer, dict):
+                answer = dict(answer, items=[{k: v for k, v in row.items() if k != 'contribution_author'}
+                                             for row in answer.get('items') or []])
+            return answer
+        self.backend._run = older
+        self.addCleanup(setattr, self.backend, '_run', run)
+
+    def test_over_an_older_endpoint_nobody_is_offered_their_own_delivery(self):
+        (one, two), spare = self.scenario()
+        self.assertEqual(201, self.recommend(self.agents['Osprey'], *one).status)
+        self.older_endpoint()
+        for name in ('Kestrel', 'Merlin'):
+            self.assertEqual(self.offered(name), [], name)
+        self.assertEqual(self.offered('Osprey'), [two[0]])
+        # The queue compares with the assignee when the row names no author: a recommendation by
+        # the delivering agent's own person is not shown.
+        self.change(one[0], assignee=self.agent_ids['Osprey'])
+        queue = self.request('GET', '/v1/projects/%s/queue' % self.project, token=self.tokens['olive']).data['items']
+        row = next(row for row in queue if row['id'] == one[0])
+        self.assertEqual((row['recommended_by'], row['recommended']), ([], False))
 
     def new_task(self, title):
         return self.create_task(self.tokens['olive'], self.project, title).data['id']

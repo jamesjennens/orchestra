@@ -234,6 +234,10 @@ class NoUnguardedParseTests(unittest.TestCase):
         # reverted_integrations now delegates to review_state.reverts_by_task, so the
         # raw reject-comment parse that used record_json.loads here is gone.
         self.assertEqual({name: count for name, count in uses.items() if count}, {
+            # admin.py reads the review-writes audit history through the guard
+            # (kittrial-5bb.110 item 3): a deeply nested audit file used to crash
+            # `review-writes status` with a RecursionError.
+            'admin.py': 1,
             'briefing.py': 4, 'endpoint.py': 2, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
             'handoff.py': 1, 'http_service.py': 2, 'lifecycle.py': 1, 'recovery.py': 1, 'requirements.py': 1,
             'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})

@@ -8,6 +8,7 @@ from pathlib import Path
 KIT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(KIT))
 sys.path.insert(0, str(KIT / 'tests'))
+import http_service
 import review_recommendations as rec
 import test_http_agents
 import test_http_review_fixes as fixes
@@ -75,14 +76,25 @@ class Shared:
                 self.assertIn(words, message)
                 self.assertNotEqual(message, 'Canonical command rejected the request')
                 self.assertNotIn('ValueError', message)
-        for label, extra in (('approved', {'approved': True}), ('previous', {'previous': contribution}),
-                             ('a made-up field', {'surprise': 1})):
+        # One refusal for every review operation (kittrial-5bb.110): a field the operation does
+        # not take is named, at most five plain names, and never echoed when it is not one.
+        for label, extra, shown in (('approved', {'approved': True}, 'approved'), ('a made-up field', {'surprise': 1}, 'surprise'),
+                                    ('a name that is not an identifier', {'x\x1b[31m <b>': 1}, '<non-identifier name>'),
+                                    ('many', {'f%d' % n: 1 for n in range(9)}, 'f0, f1, f2, f3, f4, (+4 more)')):
             with self.subTest(unknown=label):
                 answer = self.recommend(self.reviewer, task, contribution, commit, **extra)
                 self.assertEqual(422, answer.status, answer.data)
-                self.assertIn('unknown field(s): %s' % list(extra)[0], answer.data['error']['message'])
+                self.assertEqual(answer.data['error']['message'],
+                                 'Unsupported review payload field(s) for recommend: %s' % shown)
+                self.assertNotIn('\x1b', json.dumps(answer.data, ensure_ascii=False))
         self.assertEqual(self.review(self.owner, task)['recommendations'], [])
-        self.assertEqual(201, self.recommend(self.reviewer, task, contribution, commit).status)
+        # The released client sends every optional field of every operation as null, and
+        # `previous` for every operation: both are accepted and ignored for a recommendation.
+        union = {name: None for name in ('previous', 'supersedes', 'follows', 'repository', 'base_commit', 'delivery',
+                                         'request', 'resolutions', 'reviewer', 'reason', 'item', 'disposition')}
+        self.assertEqual(201, self.recommend(self.reviewer, task, contribution, commit, **union).status)
+        self.assertEqual(201, self.recommend(self.reviewer_agent, task, contribution, commit, previous=contribution).status)
+        self.assertEqual(len(self.review(self.owner, task)['recommendations']), 2)
 
     def test_the_queue_applies_the_same_person_rule_as_the_brief(self):
         """A recommendation by another agent of the AUTHOR is left out of the queue too, when author and assignee differ."""
@@ -116,6 +128,31 @@ class Shared:
         # Written now, by the assignee's own person, it is refused as before.
         again = self.recommend(self.reviewer, task, contribution, commit)
         self.assertEqual(403, again.status, again.data)
+
+    def test_a_row_that_does_not_say_who_delivered_is_compared_with_the_assignee(self):
+        """An endpoint older than this delivery sends no contribution_author (review 01a10c80)."""
+        commit = test_http_agents.COMMIT
+        task, contribution = self.deliver('first', commit)
+        sibling = self.request('POST', '/v1/agents', {'name': 'Merlin', 'working_directory': '/home/carl/m',
+                                                      'projects': [self.project]}, token=self.contributor)
+        self.plant_recommendation(task, contribution, commit, sibling.data['agent']['id'])
+        read = {'items': [{'id': task, 'assignee': self.review(self.owner, task)['contribution']['author'],
+                           'recommended_by': [sibling.data['agent']['id']], 'recommended': True,
+                           'contribution_author': None, 'review_state': 'awaiting-review'}]}
+        kept = self.handler_class()._independent_queue(read)['items'][0]
+        self.assertEqual((kept['recommended_by'], kept['recommended']), ([], False))
+        # With the author given, the author decides and the assignee is not compared.
+        vera = self.reviewer_actor_for_reassignment()
+        named = {'items': [dict(read['items'][0], assignee=vera, recommended_by=[vera], recommended=True,
+                                contribution_author=read['items'][0]['assignee'])]}
+        self.assertEqual(self.handler_class()._independent_queue(named)['items'][0]['recommended_by'], [vera])
+        self.assertEqual(http_service.ApiHandler._read_parties('a', None), ['a'])
+        self.assertEqual(http_service.ApiHandler._read_parties('a', ''), ['a'])
+        self.assertEqual(http_service.ApiHandler._read_parties('a', 'b'), ['b'])
+
+    def handler_class(self):
+        """A handler bound to this test's service and backend, for calling its helpers directly."""
+        return self.httpd.RequestHandlerClass.__new__(self.httpd.RequestHandlerClass)
 
     def check_the_scenario(self, task, other, contribution, commit, approve):
         """`task` has a contribution by the agent; `other` has one too, with no recommendation."""

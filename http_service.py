@@ -999,10 +999,49 @@ class InProcessBackend:
 
 #: Review states that still need someone to act (``work.queue`` keeps these even on a
 #: closed task). ``approved`` is the in-process name for ``awaiting-integration``.
+#: ``withdrawn``/``superseded`` are additive (kittrial-5bb.94): the canonical ``work``
+#: queue lists such a task while a blocking item is still open, so the HTTP queue and
+#: its ``state=`` filter accept them too or the two transports disagree
+#: (kittrial-5bb.110 item 9).
 ACTIVE_REVIEW_STATES = ('changes-requested', 'error', 'awaiting-review', 'legacy-review-ready',
-                        'awaiting-integration', 'approved')
+                        'awaiting-integration', 'approved', 'withdrawn', 'superseded')
 QUEUE_PRIORITY = {'changes-requested': 0, 'error': 1, 'awaiting-review': 2,
                   'legacy-review-ready': 2, 'awaiting-integration': 3, 'approved': 3}
+
+#: Review-payload fields the HTTP route accepts beyond the canonical per-operation
+#: set. ``task_id`` is filled from the path and ``actor`` is bound to the
+#: authenticated principal; ``contribution_revision``/``contribution_commit`` are the
+#: web page's presentation copies of the revision the reviewer saw. A contribution may
+#: also carry the two legacy in-process delivery fields ``bundle_sha256``/``branch``.
+#: Anything else -- an unknown key, or a canonical field on the WRONG operation (a
+#: top-level ``severity``, a ``disposition`` on a request-changes) -- is refused
+#: instead of silently dropped (kittrial-5bb.110 item 4: those used to be dropped and
+#: answered 201).
+REVIEW_HTTP_FIELDS = frozenset({'task_id', 'actor', 'contribution_revision',
+                                'contribution_commit'})
+REVIEW_HTTP_OPERATION_FIELDS = {'contribute': frozenset({'bundle_sha256', 'branch'})}
+#: How many unsupported field names one refusal reports, and how long each may be. The
+#: refusal used to echo every name in full: a 300-character key came back whole, and 400
+#: unknown keys produced a 2,429-character error (kittrial-5bb.110 item 4).
+UNSUPPORTED_FIELDS_SHOWN = 5
+#: A field name is echoed only when it is a plain identifier. Anything else (control
+#: characters, punctuation, a name built to read as a sentence in the error) is not
+#: repeated to the caller.
+UNSUPPORTED_FIELD_NAME = re.compile(r'[A-Za-z_][A-Za-z0-9_]{0,39}\Z')
+
+
+def unsupported_fields_text(keys):
+    """A bounded, non-echoing list of the caller's unsupported review field names.
+
+    At most ``UNSUPPORTED_FIELDS_SHOWN`` names, each echoed only when it is a plain
+    identifier, with ``(+N more)`` for the rest (kittrial-5bb.110 item 4 P3).
+    """
+    names = sorted(str(key) for key in keys)
+    shown = [name if UNSUPPORTED_FIELD_NAME.match(name) else '<non-identifier name>'
+             for name in names[:UNSUPPORTED_FIELDS_SHOWN]]
+    if len(names) > UNSUPPORTED_FIELDS_SHOWN:
+        shown.append('(+%d more)' % (len(names) - UNSUPPORTED_FIELDS_SHOWN))
+    return ', '.join(shown)
 
 
 def queue_order(item):
@@ -1308,15 +1347,29 @@ class EndpointBackend:
         # A reviewer's recommendation (kittrial-5bb.115): a record beside the chain, so
         # it carries no `previous` (see REVIEW_NO_PREVIOUS).
         'recommend': ('contribution', 'commit', 'verdict', 'summary', 'items'),
+        # The additive review-workflow operations (kittrial-5bb.94, checked over HTTP by
+        # kittrial-5bb.110 item 9). Without these the canonical backend refused every
+        # one of them as an unknown operation, so the new states could not be reached
+        # over HTTP at all.
+        'withdraw': ('contribution', 'reason'),
+        'request-review': ('contribution', 'reviewer'),
+        'resolve-item': ('contribution', 'request', 'item', 'reason'),
+        'decline-review': ('contribution', 'request', 'reason'),
     }
     #: Operations whose canonical record takes no ``previous``.
     REVIEW_NO_PREVIOUS = ('recommend',)
     #: Optional canonical review fields: forwarded only when the caller supplied them,
     #: so old payloads keep the exact legacy field set (no operation-inappropriate
     #: nulls) and a follow-on's additive ``follows`` relation is not silently dropped
-    #: into a first contribution or a supersede.
+    #: into a first contribution or a supersede. The request-changes summary, a
+    #: request-review summary and the withdrawn/resolve dispositions are the same kind
+    #: of additive field (kittrial-5bb.94 items 3 and 5).
     REVIEW_OPTIONAL_FIELDS = {
         'contribute': ('follows',),
+        'request-changes': ('summary',),
+        'request-review': ('summary',),
+        'withdraw': ('disposition',),
+        'resolve-item': ('disposition',),
     }
     CHECKPOINT_FIELDS = ('schema_version', 'previous', 'activity_cursor', 'source_commit',
                          'branch', 'intent', 'acceptance', 'summary', 'next_action',
@@ -1384,12 +1437,19 @@ class EndpointBackend:
                     {'0': {'flag': '--file', 'text': json.dumps(body)}})
         if route == 'reviews.add':
             operation = payload.get('operation')
-            if operation not in self.REVIEW_FIELDS:
-                raise invalid('Review operation must be contribute, request-changes, '
-                              'respond, approve or recommend')
+            # A fixed sentence, never the caller's value: `%r` of a 5,000-character
+            # operation came back in a 5,204-character error (kittrial-5bb.110 item 4).
+            # An operation sent as a list or object used to raise TypeError (an
+            # unhashable dict key) and answer 500; the str check makes it this 422.
+            if not isinstance(operation, str) or operation not in self.REVIEW_FIELDS:
+                raise invalid('Unsupported review operation; expected one of: %s'
+                              % ', '.join(sorted(self.REVIEW_FIELDS)))
             common = tuple(field for field in self.REVIEW_COMMON
                            if not (field == 'previous' and operation in self.REVIEW_NO_PREVIOUS))
-            if operation == 'recommend' and 'items' not in payload:
+            if operation == 'recommend' and payload.get('items') is None:
+                # A NULL items is absent, exactly like every other null optional field the
+                # released clients send (kittrial-5bb.110 items 1 and 2): a recommendation
+                # with no notes is the empty list the canonical record requires.
                 payload = dict(payload, items=[])
             fields = common + self.REVIEW_FIELDS[operation]
             missing = [field for field in fields
@@ -1400,7 +1460,12 @@ class EndpointBackend:
                               % ', '.join(missing))
             body = {field: payload.get(field) for field in fields}
             for field in self.REVIEW_OPTIONAL_FIELDS.get(operation, ()):
-                if field in payload:
+                # A null optional field is ABSENT, not a value: the kit's own client used
+                # to send every optional field as null, and forwarding `"summary": null`
+                # made the canonical writer refuse a legacy request-changes
+                # (kittrial-5bb.110 item 1). The canonical required fields (built above)
+                # keep their null, because their ABSENCE is an invalid field set.
+                if payload.get(field) is not None:
                     body[field] = payload.get(field)
             body['schema_version'] = payload.get('schema_version', 1)
             body['operation_id'] = payload.get('operation_id') or operation_id
@@ -1691,8 +1756,43 @@ class EndpointBackend:
         requests = [{'id': item.get('item'), 'request': item.get('request'),
                      'text': item.get('text'), 'contribution': item.get('contribution'),
                      'author': item.get('author'), 'at': item.get('timestamp'),
-                     'status': 'open', 'resolution': None}
+                     'status': 'open', 'resolution': None,
+                     # Additive (kittrial-5bb.94, exposed over HTTP by kittrial-5bb.110
+                     # item 9): the item's severity and the request-changes summary that
+                     # asked for it. Absent severity reads as blocking.
+                     'severity': item.get('severity') or 'blocking',
+                     'summary': item.get('summary')}
                     for item in review.get('pending_requests') or [] if isinstance(item, dict)]
+
+        def note_view(item):
+            return {'id': item.get('item'), 'request': item.get('request'),
+                    'text': item.get('text'), 'contribution': item.get('contribution'),
+                    'author': item.get('author'), 'at': item.get('timestamp'),
+                    'status': 'open', 'severity': item.get('severity') or 'note',
+                    'summary': item.get('summary')}
+
+        def request_view(entry):
+            return {'request': entry.get('request'), 'reviewer': entry.get('reviewer'),
+                    'summary': entry.get('summary'), 'contribution': entry.get('contribution'),
+                    'author': entry.get('author'), 'at': entry.get('timestamp')}
+
+        # The additive review-workflow states (kittrial-5bb.94): non-blocking items,
+        # open first-class review requests, the requests their named reviewer declined
+        # and the withdraw/supersede record for the current contribution.
+        note_requests = [note_view(item) for item in review.get('note_requests') or []
+                         if isinstance(item, dict)]
+        pending_review_requests = [request_view(entry)
+                                   for entry in review.get('pending_review_requests') or []
+                                   if isinstance(entry, dict)]
+        declined_review_requests = [dict(request_view(entry), reason=entry.get('reason'))
+                                    for entry in review.get('declined_review_requests') or []
+                                    if isinstance(entry, dict)]
+        raw_withdrawal = review.get('withdrawal')
+        withdrawal = ({'disposition': raw_withdrawal.get('disposition'),
+                       'reason': raw_withdrawal.get('reason'),
+                       'author': raw_withdrawal.get('author'),
+                       'at': raw_withdrawal.get('timestamp')}
+                      if isinstance(raw_withdrawal, dict) else None)
         lifecycle = {dimension: {'value': fact.get('value'), 'note': None}
                      for dimension, fact in (data.get('lifecycle') or {}).items()
                      if isinstance(fact, dict)}
@@ -1702,6 +1802,12 @@ class EndpointBackend:
                            'contribution': contribution, 'requests': requests,
                            'open_requests': review.get('pending_total', len(requests)),
                            'latest_id': review.get('latest_comment_id'),
+                           # Additive (kittrial-5bb.94): the new states travel with every
+                           # brief read, exactly as `review TASK` reports them.
+                           'note_requests': note_requests,
+                           'pending_review_requests': pending_review_requests,
+                           'declined_review_requests': declined_review_requests,
+                           'withdrawal': withdrawal,
                            # Additive (kittrial-5bb.115): the standing recommendation.
                            'recommendation': self._recommendation(review.get('recommendation')),
                            # The newest few carry their whole content (a kit before that
@@ -2409,6 +2515,18 @@ class ApiHandler(BaseHTTPRequestHandler):
         return [actor for actor in actors
                 if isinstance(actor, str) and self.service.actor_person(actor) not in persons]
 
+    @staticmethod
+    def _read_parties(assignee, author):
+        """Whom a standing recommendation is compared with when it is READ.
+
+        The contribution's author, and nobody else: the assignee rule is applied when a
+        recommendation is written, so a reassignment hides nothing. A row or brief that
+        does not say who delivered (an endpoint older than kittrial-5bb.115's second
+        delivery, in a staged upgrade or a rollback) is compared with the assignee, as
+        before, and never with nobody (review 01a10c80).
+        """
+        return [author] if isinstance(author, str) and author else [assignee]
+
     def _independent_queue(self, read):
         """Drop from each row's ``recommended_by`` anyone who is the contribution author's person.
 
@@ -2421,7 +2539,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         changed = False
         for item in read.get('items') or []:
             names = item.get('recommended_by') or []
-            kept = self._independent(names, [item.get('contribution_author')]) if names else names
+            kept = self._independent(names, self._read_parties(item.get('assignee'), item.get('contribution_author'))) \
+                if names else names
             if len(kept) != len(names):
                 item['recommended_by'], item['recommended'], changed = kept, bool(kept), True
         if changed:
@@ -3176,6 +3295,17 @@ class ApiHandler(BaseHTTPRequestHandler):
         actions.sort(key=lambda action: (0 if action['kind'] == 'review-recommended' else 1, action['task']))
         return actions[:self.AGENT_REVIEW_LIMIT]
 
+    def _capped_review_actions(self, actions):
+        """At most AGENT_REVIEW_LIMIT review actions in ALL, over every project (review 01a10c80).
+
+        Each project contributes at most that many already; three full projects would
+        otherwise list three times the limit and push claimable work off the list.
+        Recommended ones are kept first, then by project and task.
+        """
+        ordered = sorted(actions, key=lambda action: (0 if action['kind'] == 'review-recommended' else 1,
+                                                       action['project'], action['task']))
+        return ordered[:self.AGENT_REVIEW_LIMIT]
+
     @staticmethod
     def _agent_review_summary(counts):
         """What to add to an agent's summary when there is review work, whatever its state.
@@ -3356,6 +3486,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         # so a long claimable list can never hide the agent's own feedback.
         if counts['claimable'] > len(claimable_actions):
             truncated = True
+        review_actions = self._capped_review_actions(review_actions)
         if counts['review_recommended'] + counts['to_review'] > len(review_actions):
             truncated = True
         actions = own_actions + review_actions + claimable_actions
@@ -3849,7 +3980,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         # as in the canonical reader. When the newest one is left out, the newest of the
         # others is shown in its place: the backend gives the newest few in full
         # (kittrial-5bb.115 review). Past those, one is still named and has no text here.
-        parties = [(contribution or {}).get('author')]
+        parties = self._read_parties(brief['task'].get('assignee'), (contribution or {}).get('author'))
         standing = [entry for entry in review.get('recommendations') or [] if isinstance(entry, dict)]
         kept = set(self._independent([entry.get('author') for entry in standing], parties))
         shown = [entry for entry in standing if entry.get('author') in kept]
@@ -3931,13 +4062,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         recommending = payload.get('operation') == 'recommend'
         current = None
         if recommending:
-            # A recommendation says exactly what it is: a field this kit does not know is
-            # refused, not dropped, so `approved: true` or `previous` cannot ride along
-            # unnoticed (kittrial-5bb.115 review).
-            unknown = sorted(set(payload) - self.RECOMMEND_FIELDS)
-            if unknown:
-                raise invalid('A recommendation takes contribution, commit, verdict, summary and items; '
-                              'unknown field(s): %s' % ', '.join(name[:40] for name in unknown[:8]))
+            # A field this kit does not know is refused, not dropped, by the one rule for
+            # every review operation below (kittrial-5bb.110): at most five plain names.
             # One read serves the record-anchor check and the person rule below.
             current = self.backend.task_brief(ctx.params['pid'], ctx.params['tid'])
             self._refuse_record_anchor(current.get('task'))
@@ -3945,6 +4071,38 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
         if 'actor' in payload:
             payload['actor'] = self.service.bind_actor(ctx.principal, payload.get('actor'))
+        operation = payload.get('operation')
+        if isinstance(operation, str) and operation in EndpointBackend.REVIEW_FIELDS:
+            # Unknown and misplaced fields are refused, not dropped (kittrial-5bb.110
+            # item 4). The allowed set is the canonical field set for THIS operation
+            # plus the documented transport/presentation keys, so a `disposition` on a
+            # request-changes or a top-level `severity` is a 422 instead of a silent
+            # 201. An operation the canonical writer does not know is left to the
+            # backend, which names it in a fixed sentence.
+            #
+            # A key whose VALUE is null is ABSENT, not a misplaced field (kittrial-5bb.110
+            # items 1 and 2): the released Client at cbf6d01 and at b0a4fbd sends every
+            # optional field of every operation as null (one 16-key union), and counting
+            # those nulls here refused switch on/off, contribute, request-changes,
+            # respond, approve, withdraw and recommend alike. The check therefore runs on
+            # the SUPPLIED keys only. The nulls stay in the payload: the canonical build
+            # below drops a null optional field itself and keeps the null on the required
+            # fields whose ABSENCE -- unlike their null -- is an invalid field set.
+            allowed = ({'schema_version', 'operation', 'operation_id', 'previous'}
+                       | set(EndpointBackend.REVIEW_FIELDS[operation])
+                       | set(EndpointBackend.REVIEW_OPTIONAL_FIELDS.get(operation, ()))
+                       | set(REVIEW_HTTP_FIELDS)
+                       | set(REVIEW_HTTP_OPERATION_FIELDS.get(operation, ())))
+            # `previous` is deliberately NOT removed for REVIEW_NO_PREVIOUS: a
+            # recommendation is a record beside the chain and carries none, but the
+            # released clients send the key (null, or the chain's latest comment id) for
+            # every operation, so it is accepted and IGNORED here (the canonical body
+            # builder omits it for `recommend`; kittrial-5bb.110 items 1 and 2).
+            supplied = {key for key, value in payload.items() if value is not None}
+            unknown = sorted(str(key) for key in supplied - allowed)
+            if unknown:
+                raise invalid('Unsupported review payload field(s) for %s: %s'
+                              % (operation, unsupported_fields_text(unknown)))
 
         def add():
             if recommending:
@@ -3985,9 +4143,6 @@ class ApiHandler(BaseHTTPRequestHandler):
                             capability=capability, serialize=False, canonical=True)
 
     #: Every field a recommendation may carry over HTTP (``task_id`` is set by the route).
-    RECOMMEND_FIELDS = frozenset(('operation', 'schema_version', 'operation_id', 'contribution', 'commit', 'verdict',
-                                  'summary', 'items', 'actor', 'task_id'))
-
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/history')
     def tasks_history(self, ctx):
         self._project(ctx, CAP_READ)
