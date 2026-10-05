@@ -1416,6 +1416,34 @@ class GuidanceAdminTests(unittest.TestCase):
         self.assertEqual((self.project / '.guidance.json').read_bytes(), before)
 
     @unittest.skipIf(sys.platform == 'win32', 'admin.py host commands take the POSIX lock')
+    def test_a_repair_whose_audit_write_fails_succeeds_and_says_so(self):
+        # kittrial-5bb.125: the warning path, forced for real. The audit is written through
+        # .guidance-repair.tmp (coordination.atomic); a directory there makes that write
+        # fail with an OSError after the record was already repaired, and only that write.
+        (self.root / 'deployment.private.json').write_text(
+            json.dumps({'operators': ['operator-1']}), encoding='utf-8')
+        self.run_admin(['set-guidance', 'example', '--actor', 'operator-1', '--file', str(self.document)])
+        meta = guidance.read_meta(self.project)
+        meta['history'].append({'version': 'bad', 'set_by': None, 'set_at': None, 'previous_version': None})
+        (self.project / '.guidance.json').write_text(json.dumps(meta), encoding='utf-8')
+        with self.assertRaises(ValueError):
+            guidance.validate_meta(guidance.read_meta(self.project))
+        blocker = self.project / '.guidance-repair.tmp'
+        blocker.mkdir()
+        stdout, _ = self.run_admin(['set-guidance', 'example', '--actor', 'operator-1', '--file', str(self.document)])
+        self.assertIn('Project guidance repaired', stdout)
+        self.assertIn('The guidance record was repaired, but the repair audit .guidance-repair.json could not be '
+                      'written, so readers show the original setter without the repair.', stdout)
+        result = json.loads(stdout.strip().splitlines()[-1])
+        self.assertTrue(result['repaired'])
+        self.assertIn('warning', result)
+        guidance.validate_meta(guidance.read_meta(self.project))     # the record is repaired
+        self.assertFalse((self.project / guidance.REPAIR_NAME).exists())
+        self.assertNotIn('repaired_by', guidance.state(self.project, 'worker-1'))
+        self.assertTrue(blocker.is_dir())
+        self.assertNotIn(str(self.root), stdout)
+
+    @unittest.skipIf(sys.platform == 'win32', 'admin.py host commands take the POSIX lock')
     def test_guidance_status_cli_is_operator_only(self):
         (self.root / 'deployment.private.json').write_text(
             json.dumps({'operators': ['operator-1']}), encoding='utf-8')
