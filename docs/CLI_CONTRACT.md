@@ -179,8 +179,13 @@ fields (kittrial-5bb.114) carry what an agent's attention read needs:
 most 20), `open_items` (how many open items the task's latest valid checkpoint lists;
 `0` with none or no checkpoint, `null` when its checkpoint history cannot be read),
 `checkpoint_at` (when that checkpoint was written, or `null`) and `newer_activity`
-(`true` when any comment or record was written on the task after that checkpoint,
-`false` when none was, `null` with no checkpoint). `review_state` may be
+(`true` when a comment by someone other than the current assignee was written
+after that checkpoint, `false` when none was, `null` with no checkpoint).
+The additive `blocking_items` counts only its open `blocker` and `dependency`
+items, with the same zero/unknown conventions as `open_items`. Questions,
+decisions and corrections do not block agent work. Delivered tasks follow their
+review state regardless of either count. Native title/description edits without
+an attributed editor stay quiet; comment to wake the agent. `review_state` may be
 `integrated`; `workflow_state` keeps the raw workflow state. See
 [REVIEWS.md](REVIEWS.md) for their meaning.
 

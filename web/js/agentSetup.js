@@ -95,7 +95,7 @@ export function agentGuide(payload) {
     '',
     `1. Ask for your next action: GET ${server}/v1/agents/me/next, for example curl.exe -fsS -K "${file.powershell}" ${server}/v1/agents/me/next`,
     '2. The reply says what to do next: feedback to address, work to continue, or tasks you could claim. Before coding, read the task brief it links to.',
-    '3. Record a checkpoint when you stop, and deliver work for review through the API, always with curl -K as above.',
+    '3. Record a checkpoint when you stop, and deliver work for review through the API, always with curl -K as above. If an answer is needed before you can proceed, record an open item of kind blocker, not only a question. Only blockers and dependencies mark undelivered work as blocked; delivered work follows its review state.',
     `4. If a call returns 401, the secret file is missing or wrong: stop and ask your owner to check ${file.windows}.`,
     '5. Stop and ask your owner if anything is unclear.',
     '',
