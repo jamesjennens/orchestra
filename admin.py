@@ -861,7 +861,8 @@ def deployment_config_lock(root):
     """Serialise one read-modify-write of deployment.private.json with an exclusive flock.
 
     EVERY writer of that file takes it: both deployment switches (``review-writes``,
-    ``checkpoint-provenance-writes``), ``operators add|remove``, ``verifiers add|remove`` and
+    ``checkpoint-provenance-writes``), ``operators add|remove``, ``verifiers add|remove``,
+    ``project-creations --set-server-limit`` (``project_creation.set_server_limit``) and
     the restore merges of operators and verifiers (kittrial-5bb.136). Each re-reads the
     file under the lock, so no change is lost to another made at the same instant. The
     file keeps the name ``.review-writes.lock`` (REVIEW_WRITES_LOCK), so a flip on an older

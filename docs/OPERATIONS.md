@@ -500,7 +500,8 @@ already on, or an `off` when it is already off, writes nothing and answers `chan
 false`, as `review-writes` does (kittrial-5bb.136; before, it appended an entry).
 
 **One lock for every change to `deployment.private.json`.** Both switches,
-`operators add|remove`, `verifiers add|remove` and the `--restore-operators` /
+`operators add|remove`, `verifiers add|remove`, `project-creations --set-server-limit`
+and the `--restore-operators` /
 `--restore-verifiers` merges of `restore-new` take the deployment lock
 (`.review-writes.lock`) across their whole read-modify-write and re-read the file under
 it, so two changes made at the same instant, from any two of these commands, never lose
