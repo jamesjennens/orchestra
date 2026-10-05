@@ -746,8 +746,8 @@ class ReviewV5Tests(unittest.TestCase):
                         note='done', evidence='commit x')
         # Carry 100 resolved dispositions, then add one new resolved disposition:
         # the merged record stays readable and within the cap.
-        data[0]['comments'] += [comment('old'+str(n)) for n in range(99)]
-        data[0]['comments'] += [comment('openn'+str(n)) for n in range(100)]+[comment('new')]
+        data[0]['comments'] += [comment('old'+str(n),author='coordinator/session') for n in range(99)]
+        data[0]['comments'] += [comment('openn'+str(n),author='coordinator/session') for n in range(100)]+[comment('new',author='coordinator/session')]
         digests = b.entry_digests(b.snapshot(data, PROJECT, TASK))
         many = [dict(disposition(0), id=f'{TASK}-cold{n}', digest=digests[f'{TASK}-cold{n}']) for n in range(99)]
         many.append(disposition(1))
@@ -798,7 +798,7 @@ class ReviewV6Tests(unittest.TestCase):
                     note='done', evidence='commit a')
         # 100 resolutions recorded, then one more: the earliest is retired from the
         # newest payload to respect the cap but must stay authoritatively resolved.
-        data[0]['comments'] += [comment('old'+str(n)) for n in range(99)]+[comment('new1')]
+        data[0]['comments'] += [comment('old'+str(n),author='coordinator/session') for n in range(99)]+[comment('new1',author='coordinator/session')]
         digests = b.entry_digests(b.snapshot(data,PROJECT,TASK))
         first = [dict(head, id=f'{TASK}-cold{n}',digest=digests[f'{TASK}-cold{n}']) for n in range(99)] + [head]
         self.save(data, 'cp1', checkpoint(data, directions=first))

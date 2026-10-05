@@ -278,7 +278,11 @@ references, own/other counts and explicit unknown/windowed coverage; the latter
 keeps other-actor comment directions visible until explicit resolution or
 supersession. Reading never acknowledges or completes them.
 `work --mine` adds `newer_activity_by_others`, `newer_activity_own`,
-`newer_activity_coverage` and `unresolved_directions` to displayed task rows. Session resume returns task IDs, not rows; read work --mine for the checkpoint fields.
+`newer_activity_coverage` and `unresolved_directions` to displayed task rows.
+`session resume` records a resume event and returns session, resume and guidance
+metadata; it returns neither task IDs nor task rows. Read `work --mine` for tasks
+and checkpoint attention. The `worker.py resume` wrapper also runs onboarding,
+which prints that queue.
 Malformed/conflicting checkpoint history gives null counts. These fields do not
 set review state or lifecycle facts. See [BRIEFINGS.md](BRIEFINGS.md) for limits,
 direction dispositions and compatibility with older kits.

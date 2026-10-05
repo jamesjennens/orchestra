@@ -27,6 +27,8 @@ def run(args):
 rows=[json.loads(x) for x in run(['export','--all']).splitlines() if x.strip()]
 result=b.brief(rows,'pp',task)
 assert result['checkpoint'] is not None and not any('Malformed checkpoint' in x for x in result['warnings']),result
+if result['checkpoint'] is not None:
+ assert not result['checkpoint']['newer_activity'],result
 payload=dict(schema_version=1,task=task,previous=result['checkpoint']['comment_id'],
  activity_cursor=result['activity_cursor'],source_commit='',branch='',intent='compatibility',
  acceptance='both kits read and write',summary='old writer',next_action='continue',open_items=[],resolved=[])
@@ -64,6 +66,7 @@ class RealBdCheckpointCompatibilityTests(unittest.TestCase):
         current,invalid=b.checkpoints(b.task_row(self.export_rows(),task))
         self.assertEqual(invalid,[])
         self.assertNotIn('provenance',current[0])
+        self.assertFalse(b.brief(self.export_rows(),'pp',task)['checkpoint']['newer_activity'])
 
     def old_write(self,task,first=False):
         script=OLD_RUN
@@ -77,6 +80,7 @@ class RealBdCheckpointCompatibilityTests(unittest.TestCase):
         read=b.brief(self.export_rows(),'pp',task)
         self.assertIsNotNone(read['checkpoint'])
         self.assertFalse(any('Malformed checkpoint' in x for x in read['warnings']))
+        self.assertFalse(read['checkpoint']['newer_activity'])
 
     def test_tip_then_previous_kit_then_tip(self):
         task=self.create();self.tip_write(task);self.old_write(task);self.tip_write(task)

@@ -84,7 +84,17 @@ def entry_digests(data):
     found=data.get('entry_digests')
     return found if isinstance(found,dict) else {e['entry_id']:content_hash(e) for e in data['entries']}
 
-def activity_cursor(data):return token({'v':1,'kind':'activity','project':data['project'],'task':data['task'],'sha256':content_hash(data)})
+def activity_cursor(data):
+    # entry_digests is derived entirely from entries, not extra activity. Keep
+    # the released hash shape so staged writes remain fresh on older readers.
+    compatible={k:v for k,v in data.items() if k!='entry_digests'}
+    return token({'v':1,'kind':'activity','project':data['project'],'task':data['task'],'sha256':content_hash(compatible)})
+
+def cursor_matches(cursor,data,compatible=None):
+    # Read receipts already written by the first provenance kit in their shape.
+    if cursor==(compatible if compatible is not None else activity_cursor(data)):return True
+    previous=token({'v':1,'kind':'activity','project':data['project'],'task':data['task'],'sha256':content_hash(data)})
+    return cursor==previous
 
 def text(value,label,limit,empty=False):
     # Names the field, the length it had and the limit (kittrial-5bb.97).
@@ -427,7 +437,7 @@ def direction_context(issue,state):
 def direction_entries(data,context):
     owner,baseline,previous=context
     return [e for e in data['entries']
-            if (baseline is None or parse_moment(e['timestamp'])>baseline)
+            if (baseline is None or parse_moment(e['timestamp'])>=baseline)
             # Native timestamps may have only second precision. A tied comment
             # may have arrived AFTER the owner's checkpoint; retain it rather
             # than inventing an ordering from its opaque native ID.
@@ -457,7 +467,7 @@ def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=No
     coverage='unknown' if prov is None else ('snapshot' if prov['complete'] else 'windowed')
     if prov is None and checkpoint_timestamp:
         data=dict(data,entries=[e for e in data['entries']
-                               if parse_moment(e['timestamp'])>parse_moment(checkpoint_timestamp)])
+                               if parse_moment(e['timestamp'])>=parse_moment(checkpoint_timestamp)])
     entries,fresh,changed_late,unverified=unincorporated(data,prov)
     own=[e for e in entries if e['author']==owner]
     others=[e for e in entries if e['author']!=owner]
@@ -583,7 +593,8 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     if p is not None:
         excluded=excluding_checkpoint(data,c['id'])
         excluded_cursor=activity_cursor(excluded)
-        if p['activity_cursor']!=excluded_cursor:
+        stale=not cursor_matches(p['activity_cursor'],excluded,compatible=excluded_cursor)
+        if stale:
             newer=newer_activity_summary(excluded,retained_provenance(state),c.get('created_at'),context[0],dispositions,direction_data)
             if review['review_state'] not in review_next:
                 dirs=newer.get('unresolved_directions')
@@ -595,7 +606,7 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
                              +'. The recorded checkpoint next action was: '+p['next_action'])
     result={**attention,'reference_drafts_matching':reference_drafts,'task':task,'title':clip(issue.get('title'),200),'owner':clip(issue.get('assignee') or 'unassigned',96),'status':issue.get('status'),
             'activity_cursor':activity_cursor(data),'checkpoint':None if p is None else {'comment_id':str(c['id']),'author':clip(c.get('author'),96),'timestamp':c.get('created_at'),'source_commit':p['source_commit'],'branch':p['branch'],'incorporated_activity_cursor':p['activity_cursor'],
-                'newer_activity':p['activity_cursor']!=excluded_cursor},
+                'newer_activity':stale},
             'newer':newer,
             'directions':dir_out,
             'intent':clip(p['intent'] if p else issue.get('description'),600),'acceptance':clip(p['acceptance'] if p else issue.get('acceptance_criteria'),1000),
@@ -616,7 +627,7 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
             'lifecycle_scope':{k:clip(v,160) for k,v in (facts['scope'] or {}).items()},
             'warnings':(['Malformed checkpoint comments ignored: '+', '.join(invalid[:5])] if invalid else [])
                        +integration_warnings
-                       +(['Direction baseline: comments at/before the newest legacy checkpoint have UNKNOWN coverage and are not outstanding directions.'] if context[1] is not None else [])
+                       +(['Direction baseline: comments strictly before the newest legacy checkpoint have UNKNOWN coverage and are not outstanding directions; timestamp ties remain possible directions.'] if context[1] is not None else [])
                        +['Newer activity also includes edits, deletions or changed task fields. Prose resolutions never silently clear explicit items.'],
             'evidence':{'issue':'show '+task,'history':'history '+task,'checkpoint_entry':task+'-c'+str(c['id']) if c else None}}
     if journal is not None:
@@ -686,10 +697,18 @@ def save_checkpoint(rows,project,task,p,actor,run,provenance_writes=False):
         raise ValueError('checkpoint_provenance_writes is off (the installation default). Readers accept the new shape; '
                          'omit provenance/directions to write an older-kit-compatible checkpoint. '
                          'An operator enables the installation switch only after the rollback target can read these fields.')
+    if not provenance_writes and any(normalize_provenance(old) is not None for _cid,old in state['history']):
+        raise ValueError('This task already has checkpoint provenance records; new legacy writes are refused while '
+                         'checkpoint_provenance_writes is off. Re-enable it to preserve directions. '
+                         'Disabling the switch cannot make this task readable by a pre-provenance kit.')
     if p.get('directions'):
         if issue.get('assignee')!=actor:raise ValueError('Only the current task assignee may record direction dispositions')
         for d in p['directions']:
             if d['id'] not in computed:raise ValueError('Direction '+d['id']+' is not an entry on this task')
+            entry=next(e for e in snap['entries'] if e['entry_id']==d['id'])
+            if (entry['kind']!='comment' or entry['author']==actor
+                    or str(entry.get('body','')).startswith(('Kind: task-checkpoint-v1','Kind: contribution-review-v1'))):
+                raise ValueError('Direction '+d['id']+' must target another actor\'s ordinary comment, not own activity or a checkpoint/review record')
             if d['digest']!=computed[d['id']]:
                 raise ValueError('Direction '+d['id']+' digest does not match the incorporated entry; reconcile before resolving')
     # Bounded carry with explicit retirement: dispositions from the previous
@@ -806,7 +825,7 @@ def checkpoint_queue_fields(rows,row,state=None):
         data=excluding_checkpoint(snapshot(rows,project,row['id']),c['id'])
         dispositions=chain_dispositions(state['history'])
         context=direction_context(row,state);direction_data=direction_entries(data,context)
-        if p['activity_cursor']==activity_cursor(data):own=others=0;coverage='current'
+        if cursor_matches(p['activity_cursor'],data):own=others=0;coverage='current'
         else:
             newer=newer_activity_summary(data,retained_provenance(state),c.get('created_at'),
                                          context[0],dispositions,direction_data)
@@ -993,7 +1012,10 @@ def checkpoint_writes_enabled(root):
     settings=config(root)
     if not isinstance(settings,dict):raise ValueError('Deployment configuration must be a JSON object')
     value=settings.get('checkpoint_provenance_writes',False)
-    if type(value) is not bool:raise ValueError('checkpoint_provenance_writes must be a boolean')
+    if type(value) is not bool:
+        import sys
+        print('Warning: checkpoint_provenance_writes must be a boolean; treating the malformed value as OFF.',file=sys.stderr)
+        return False
     return value
 
 def direction_page(rows,project,task,offset=0,limit=50):

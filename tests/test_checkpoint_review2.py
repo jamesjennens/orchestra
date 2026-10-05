@@ -47,11 +47,17 @@ class CheckpointSecondReviewTests(unittest.TestCase):
             root=Path(temp)
             self.assertFalse(b.checkpoint_writes_enabled(root))
             marker=root/'deployment.private.json'
+            marker.write_text('{}',encoding='utf-8')
+            self.assertFalse(b.checkpoint_writes_enabled(root))
             for value in (False,True,'true',1,None):
                 marker.write_text(json.dumps({'checkpoint_provenance_writes':value}),encoding='utf-8')
                 if type(value) is bool:self.assertEqual(b.checkpoint_writes_enabled(root),value)
                 else:
-                    with self.assertRaisesRegex(ValueError,'boolean'):b.checkpoint_writes_enabled(root)
+                    import io
+                    from contextlib import redirect_stderr
+                    log=io.StringIO()
+                    with redirect_stderr(log):self.assertFalse(b.checkpoint_writes_enabled(root))
+                    self.assertIn('Warning:',log.getvalue())
 
     def test_endpoint_default_and_enabled_writer_use_installation_setting(self):
         for enabled in (False,True):
@@ -91,7 +97,7 @@ class CheckpointSecondReviewTests(unittest.TestCase):
             self.assertIsNone(page['next_offset']);self.assertEqual(len(page['items']),1)
 
     def test_legacy_checkpoint_baselines_old_comments_and_says_unknown_once(self):
-        data=rows();data[0]['comments'] += [comment(str(n),'Old',author='reviewer') for n in range(300)]
+        data=rows();data[0]['comments'] += [comment(str(n),'Old','2026-09-14T00:00:00Z',author='reviewer') for n in range(300)]
         append_checkpoint(data,'old',checkpoint(data))
         result=b.brief(data,PROJECT,TASK)
         self.assertEqual(result['directions']['total'],0)
