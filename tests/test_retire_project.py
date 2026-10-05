@@ -316,6 +316,7 @@ class RetireCase(unittest.TestCase):
         self.assertEqual((self.bd, self.journal()), ([], []))
         self.assertEqual(admin.restore_lock_path(self.root, 'gamma'), self.root / 'backups' / 'gamma.restore.lock')
 
+    @unittest.skipUnless(os.name == 'posix', 'the stand-in is for fcntl; on Windows the creation lock is taken with msvcrt')
     def test_a_retire_is_refused_while_a_project_is_being_created(self):
         # kittrial-5bb.118 part 2, review 01a109cc: a creation in flight holds project-creations/.lock.
         creations = self.root / 'project-creations'
@@ -336,6 +337,7 @@ class RetireCase(unittest.TestCase):
         self.assertEqual(tree(self.root), before)
         self.assertEqual((self.bd, self.journal()), ([], []))
 
+    @moves
     def test_where_no_creation_was_ever_started_a_retire_takes_no_creation_lock(self):
         stdout, stderr, code = self.retire('gamma', OPERATOR)
         self.assertEqual(code, 0, stderr)

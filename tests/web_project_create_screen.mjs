@@ -13,6 +13,8 @@ const admin = await import(adminUrl);
 const setup = await import(setupUrl);
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 400));
+// A page draws a part after its own read; on a busy machine that takes longer than one settle.
+const until = async (ready) => { for (let waited = 0; waited < 50 && !ready(); waited += 1) await settle(); };
 function person(spec) {
   const [name, token, id] = spec.split('=');
   const transport = async (method, path, headers, body) => {
@@ -36,6 +38,7 @@ if (phase === 'create') {
   const page = await admin.users(who.admin);
   await settle();
   const grants = () => page.querySelector('#project-grants');
+  await until(() => grants() && grants().querySelector('#grant-add'));
   out.before = grants().textContent.includes('Nobody else may create projects yet.');
   const add = grants().querySelector('#grant-add');
   out.choices = add.all((e) => e.tagName === 'OPTION').map((o) => o.textContent).sort();
@@ -46,6 +49,7 @@ if (phase === 'create') {
   add.querySelector('#g-limit').value = '2';
   await add.dispatch('submit');
   await settle();
+  await until(() => grants().all((e) => e.tagName === 'FORM' && e.attributes['data-grant']).length);
   out.holders = grants().all((e) => e.tagName === 'FORM' && e.attributes['data-grant']).map((f) => f.textContent);
   out.debug = grants().textContent.slice(0, 400);
 
@@ -69,6 +73,7 @@ if (phase === 'create') {
   const page2 = await setup.page(who.olive, { pid: 'alpha' });
   await settle();
   const step = () => page2.all((e) => e.tagName === 'LI').find((li) => li.attributes['data-step'] === 'onboarding');
+  await until(() => step());
   out.onboardingBefore = { state: step().attributes['data-state'], who: step().textContent.includes('A project owner, on this page') };
   const editor = () => step().querySelector('#onboarding-form').querySelector('form');
   // The form is drawn after its own read of the text; on a busy machine that takes longer than one settle.
