@@ -49,7 +49,7 @@ def help_payload(action='work'):
         'brief': 'brief TASK [--items-offset N] [--items-limit N] [--json]',
         'history': 'history TASK [--limit N] [--since TIME] [--cursor TOKEN] '
                    '[--body-budget BYTES]',
-        'checkpoint': 'checkpoint TASK --file checkpoint.json [--json]',
+        'checkpoint': 'checkpoint TASK --file checkpoint.json [--json] | checkpoint TASK --provenance | checkpoint TASK --verify',
     }
     payload = {'schema_version': 1, 'contract': CONTRACT_VERSION, 'command': action,
                'usage': usage.get(action, action),
@@ -106,7 +106,9 @@ def help_payload(action='work'):
                             'lifecycle_scope', 'lifecycle_matches_contribution', 'error',
                             'deployed_delivery', 'deployed_delivery_is_current_contribution',
                             'workflow_state', 'integration', 'integration_disagreements',
-                            'integration_warnings', 'review_request', 'review_requests'],
+                            'integration_warnings', 'review_request', 'review_requests',
+                            'newer_activity_by_others', 'newer_activity_own',
+                            'newer_activity_coverage', 'unresolved_directions'],
         }
     elif action == 'review':
         payload['operations'] = ['read (review TASK)', 'contribute', 'request-changes',
@@ -206,6 +208,8 @@ def help_options(action):
         return [
             {'flag': 'TASK', 'description': 'task the checkpoints belong to'},
             {'flag': '--file checkpoint.json', 'description': 'transport the checkpoint payload as text'},
+            {'flag': '--provenance', 'description': 'read the current bounded provenance and activity cursor without writing'},
+            {'flag': '--verify', 'description': 'classify current entries using newest retained evidence in linked checkpoint order without writing'},
             {'flag': '--json', 'description': 'accepted in any position; the saved checkpoint is always returned as JSON'},
             {'flag': '-h, --help', 'description': 'return this help as JSON on stdout with exit code 0'},
         ]
@@ -408,6 +412,11 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
     items.sort(key=lambda r:(priority.get(r['review_state'],4),r['task']))
     result={'owner':owner,'total':len(items),'items':items[a.offset:a.offset+a.limit],'next_offset':a.offset+a.limit if a.offset+a.limit<len(items) else None,
             'coverage':'Fresh current view; structured review takes precedence over legacy review-ready labels. Lifecycle facts remain independent; malformed handoff journals are surfaced as errors.'}
+    # .1 adds checkpoint attention after constructing the page. This is separate
+    # from the review/handoff/HTTP queue fields and parses only displayed tasks.
+    from briefing import checkpoint_queue_fields
+    task_rows={row['id']:row for row in rows}
+    for item in result['items']:item.update(checkpoint_queue_fields(rows,task_rows[item['task']]))
     if journal is not None:
         # The standing guidance channel (kittrial-5bb.99): every work queue page
         # carries the current guidance version, so a worker that only runs `work`
