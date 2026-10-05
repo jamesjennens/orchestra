@@ -262,6 +262,10 @@ class Fivebb90Case(RegisterHarness):
         self.assertIn('is archived', message)
         self.assertIn('cannot be confirmed', message)
         self.assertNotIn('A superuser confirms it', message)
+        # kittrial-5bb.140 item 1: the second named route is project-scoped, so unlike the
+        # PATCH it is not available to the agent's owner; the sentence says who may use it.
+        self.assertIn('DELETE /v1/projects/ID/agents/AGENT, which a project owner or superuser may use',
+                      message)
         # The named route: remove the grant, then the rest of the agent works again.
         kept = self.request('PATCH', '/v1/agents/%s' % agent_id, {'projects': []}, token=alex)
         self.assertEqual(200, kept.status, kept.data)
@@ -269,6 +273,24 @@ class Fivebb90Case(RegisterHarness):
         issued = self.request('POST', '/v1/agents/%s/credentials' % agent_id,
                               {'label': 'again'}, token=alex)
         self.assertEqual(201, issued.status, issued.data)
+
+    # -- kittrial-5bb.140 item 2: an agent id with no record is not judged ----
+    def test_a_patch_for_an_agent_with_no_record_is_the_agent_404(self):
+        """(item 2, mutation A5) The agent record is looked up before anything is judged, so
+        an id with no record reaches the service's own ``404 Agent not found``. Judging the
+        grant for an agent that is not there answers the unusable-record 409 to the owner
+        and to a superuser instead, and nothing is written either way."""
+        admin, alex = self.alex()
+        alex_id = self.user_id(alex)
+        self.legacy('legacy', alex_id)                       # unusable; alex is a member
+        self.assertNotIn(self.admin_user['id'], self.service.state['memberships']['legacy'])
+        for token in (alex, admin):                          # the owner, then a superuser
+            missing = self.request('PATCH', '/v1/agents/nosuchagent', {'projects': ['legacy']},
+                                   token=token)
+            self.assertEqual(404, missing.status, missing.data)
+            self.assertEqual('Agent not found', missing.data['error']['message'])
+            self.assertNotIn('no superuser has confirmed it', missing.data['error']['message'])
+        self.assertNotIn('nosuchagent', self.service.state['agents'])
 
     # -- kittrial-5bb.84 item 2 -----------------------------------------------
     def test_the_task_list_is_not_served_from_cache_after_the_creator_is_demoted(self):
