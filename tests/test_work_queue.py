@@ -122,6 +122,22 @@ class WorkQueueTests(unittest.TestCase):
             self.assertIn('changes-requested',current)
             self.assertIn('Pending feedback',current)
             self.assertNotIn('deployed: passed',current)
+    def test_render_shows_a_closed_withdrawn_contribution_that_still_has_an_item(self):
+        """kittrial-5bb.110 item 9: the rendered view carries the withdrawn state."""
+        data=reviewed_rows()
+        add(data,dict(schema_version=1,operation='withdraw',operation_id='withdraw-1',task=TASK,
+                      previous='feedback',contribution='delivery',reason='Re-scoped'),
+            'withdraw','alice/session')
+        data[0]['status']='closed'
+        with tempfile.TemporaryDirectory() as temp:
+            render.render(data,temp)
+            current=(Path(temp)/'CURRENT.md').read_text(encoding='utf-8')
+            # The closed withdrawn task with a blocking item still open is listed with
+            # its true state, exactly as `work` reports it.
+            self.assertIn('withdrawn',current)
+            self.assertIn('| 1 |',current)                      # pending_review_items
+            page=(Path(temp)/'jobs'/(TASK+'.md')).read_text(encoding='utf-8')
+            self.assertIn('withdraw-1',page)
     def test_old_integration_evidence_does_not_hide_new_approved_contribution(self):
         store=NativeStore().seed('integrated')
         store.rows[0].update(status='closed',comments=[],assignee='alice/session')
