@@ -118,7 +118,9 @@ class CheckpointRevisionTests(unittest.TestCase):
 
     def test_all_checkpoint_reads_use_guarded_export_decoding(self):
         data = rows()
-        deep = '{"id":"bad-row","unknown":' + ('['*3000) + '0' + (']'*3000) + '}'
+        # 200,000 levels, not 3,000: Python 3.13 on Linux parses 3,000 levels, so that row was
+        # an ordinary one there and the refusals below never happened (candidate CI, 1005ae).
+        deep = '{"id":"bad-row","unknown":' + ('['*200000) + '0' + (']'*200000) + '}'
         export_text = json.dumps(data[0]) + '\n' + deep + '\n'
         run = lambda argv: export_text
         # Per-row guarded decoding: reading a valid task succeeds even when another row in the export is over 64 levels
