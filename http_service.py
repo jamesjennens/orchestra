@@ -3291,9 +3291,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             actions.append(self._agent_action(
                 4, kind, project_id, row, reason, who=who, recommended_by=recommended_by[:20],
                 contribution=contribution.get('id'), commit=contribution.get('commit')))
-        # Within the priority: recommended first, then to review; claimable work follows.
-        actions.sort(key=lambda action: (0 if action['kind'] == 'review-recommended' else 1, action['task']))
-        return actions
+        return actions                        # ordered by the caller, over every project
 
     def _capped_review_actions(self, actions):
         """At most AGENT_REVIEW_LIMIT review actions in ALL, over every project (review 01a10c80).
