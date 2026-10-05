@@ -9,6 +9,10 @@ lists what needs doing in each of the person's projects, tailored by their role 
 * workers (contributors, and owners for their own tasks): changes requested on their
   tasks (with the pending request ids), their claimed tasks, their delivered work
   awaiting review, and tasks they could claim;
+* reviewers who cannot approve (anyone holding the reviews capability): the
+  contributions of other people that await review and that they have not recommended
+  yet, to review and recommend (kittrial-5bb.115). An approver's review lines say how
+  many reviewers already recommend a contribution;
 * viewers: no actions at all. A person who can only view gets a read-only status
   summary instead, which tells the agent not to change anything;
 * an agent with no project (none granted, or none its owner can still open) gets only a
@@ -24,7 +28,7 @@ import unicodedata
 from datetime import datetime, timezone
 
 from http_auth import agent_secret_file
-from http_authority import CAP_APPROVE, CAP_TASKS
+from http_authority import CAP_APPROVE, CAP_REVIEWS, CAP_TASKS
 
 #: At most this many items are listed per prompt; the rest are counted.
 PROMPT_ITEM_LIMIT = 25
@@ -90,18 +94,22 @@ def age_hours(value, now):
 
 
 # -- classification -----------------------------------------------------------------
-def classify(project, capabilities, items, actor, blocked, now, names=None):
+def classify(project, capabilities, items, actor, blocked, now, names=None, reviewable=()):
     """Sort one project's queue rows into the prompt's action classes.
 
     ``capabilities`` is the caller's live capability set on the project; ``items`` the
     project's review-queue rows (open tasks and closed tasks with an active review);
     ``blocked`` the task ids whose latest checkpoint has unresolved items; ``names``
     maps assignee actors to display names (rendered as untrusted labels).
+    ``reviewable`` is the ids of the contributions this person could recommend: someone
+    else's, by person, and not recommended by them already. The web service works it
+    out with the rule it applies to a recommendation that is written (kittrial-5bb.115).
     """
     names = names or {}
     can_approve = CAP_APPROVE in capabilities
     can_work = CAP_TASKS in capabilities
-    out = {'review': [], 'integrate': [], 'blocked': [], 'unclaimed': [], 'stale': [],
+    can_recommend = CAP_REVIEWS in capabilities and not can_approve
+    out = {'recommend': [], 'review': [], 'integrate': [], 'blocked': [], 'unclaimed': [], 'stale': [],
            'changes': [], 'working': [], 'delivered': [], 'claimable': [], 'status': []}
     from reserved_comments import is_record_anchor
     for item in items:
@@ -127,6 +135,9 @@ def classify(project, capabilities, items, actor, blocked, now, names=None):
             if not closed and item.get('assignee') and state == 'none' and \
                     hours is not None and hours >= STALE_CLAIM_HOURS:
                 out['stale'].append(item)
+        if (can_recommend and not mine and not closed and state == 'awaiting-review'
+                and item.get('id') in reviewable):
+            out['recommend'].append(item)
         if can_work and mine and not closed:
             if state == 'changes-requested':
                 out['changes'].append(item)
@@ -175,15 +186,26 @@ def _requests(item):
             if count else 'read the task brief for the pending request items')
 
 
+def _recommended(item):
+    """How many reviewers recommend the current contribution, when any does."""
+    count = len(item.get('recommended_by') or [])
+    return '; recommended by %d reviewer(s)' % count if count else ''
+
+
 #: class -> (heading, line builder, waiting-since field)
 CLASSES = [
     ('changes', 'Changes requested on your tasks: address every pending item, then deliver a new revision',
      lambda i: 'state changes-requested; %s; %s' % (_requests(i), _revision(i)), 'waiting_since'),
     ('review', 'Contributions awaiting your review: approve, or request changes with item ids',
-     lambda i: 'state %s; %s%s; delivered by %s' % (
+     lambda i: 'state %s; %s%s; delivered by %s%s' % (
          token(i.get('review_state')), 'RE-REVIEW of ' if int(
              (i.get('contribution') or {}).get('revision') or 1) > 1 else '', _revision(i),
-         _assignee(i)),
+         _assignee(i), _recommended(i)),
+     'waiting_since'),
+    ('recommend', 'Contributions you could review: read the work, then record a recommendation or request '
+                  'changes (you cannot approve; an owner decides)',
+     lambda i: 'state %s; %s; delivered by %s%s' % (
+         token(i.get('review_state')), _revision(i), _assignee(i), _recommended(i)),
      'waiting_since'),
     ('integrate', 'Approved, not yet integrated: integrate and record integration evidence',
      lambda i: 'state %s; %s' % (token(i.get('review_state')), _revision(i)), 'waiting_since'),
@@ -247,7 +269,7 @@ def _sections(projects, now, classes):
     return lines, listed, omitted
 
 
-ACTION_CLASSES = ('changes', 'review', 'integrate', 'blocked', 'stale', 'unclaimed',
+ACTION_CLASSES = ('changes', 'review', 'recommend', 'integrate', 'blocked', 'stale', 'unclaimed',
                   'working', 'delivered', 'claimable')
 
 

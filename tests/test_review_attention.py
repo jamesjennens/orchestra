@@ -126,6 +126,30 @@ class Shared:
         self.assertEqual(kinds(self.next('Heron')), [('to-review', two[0]), ('claimable-task', spare)])
         self.assertEqual(kinds(self.next('Osprey')), [('to-review', two[0]), ('claimable-task', spare)])
 
+    def test_the_copied_prompt_names_the_same_review_work(self):
+        (one, two), spare = self.scenario()
+
+        def prompt(name):
+            data = self.request('GET', '/v1/me/work', token=self.tokens[name]).data
+            return data['agent_prompts'][0]['text']
+        heading = 'Contributions you could review:'
+        rita = prompt('rita')
+        self.assertIn(heading, rita)
+        for task in (one[0], two[0]):
+            self.assertIn('- task %s ' % task, rita.split(heading)[1])
+        # The person who delivered them is not asked to review them.
+        self.assertNotIn(heading, prompt('carl'))
+        # Once Rita's agent has recommended one, Rita's prompt no longer lists it there,
+        # and the owner's review line says it is recommended.
+        self.assertEqual(201, self.recommend(self.agents['Osprey'], *one).status)
+        after = prompt('rita').split(heading)[1]
+        self.assertNotIn('- task %s ' % one[0], after)
+        self.assertIn('- task %s ' % two[0], after)
+        owner = prompt('olive')
+        self.assertNotIn(heading, owner)
+        line = next(line for line in owner.splitlines() if line.startswith('- task %s ' % one[0]))
+        self.assertIn('; recommended by 1 reviewer(s)', line)
+
     def test_review_work_comes_after_the_agents_own_actionable_work(self):
         (one, two), spare = self.scenario()
         claimed = self.request('POST', self.base(spare) + '/claim', {}, token=self.agents['Osprey'])

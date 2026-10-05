@@ -1240,6 +1240,10 @@ line separately and unconfined.
       review work whenever a count is not zero ("1 contribution(s) recommended for
       approval: tell the owner; 2 contribution(s) to review."), so an owner looking at
       the agent list is not told there is nothing to do.
+    - The prompt copied from My work (`GET /v1/me/work`, `agent_prompts`) names the
+      same work. A person who may review but not approve gets "Contributions you could
+      review" with the contributions of other people that nobody of theirs has
+      recommended yet; an approver's review lines add "recommended by N reviewer(s)".
   - **Order within a priority is part of the contract; the numbers are not.**
     `review-recommended`, `to-review` and `claimable-task` all carry priority 4 and
     are listed in that order. No kind was renumbered when these two were added. A

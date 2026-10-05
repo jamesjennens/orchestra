@@ -4073,8 +4073,14 @@ class ApiHandler(BaseHTTPRequestHandler):
             blocked |= {pid_tid[1] for pid_tid, detail in details.items()
                         if pid_tid[0] == project['id'] and detail.get('blocked')}
             names = self.service.actor_names([i.get('assignee') for i in items])
+            # What this person could recommend: someone else's contribution, by person, that
+            # nobody of theirs has recommended yet (the rule of _agent_review_actions).
+            reviewable = {i.get('id') for i in items if CAP_REVIEWS in capabilities
+                          and self._independent([actor], [i.get('assignee'), i.get('contribution_author')])
+                          and len(self._independent(i.get('recommended_by') or [], [actor]))
+                          == len(i.get('recommended_by') or [])}
             classified.append(agent_prompts.classify(project, capabilities, items,
-                                                     actor, blocked, now, names))
+                                                     actor, blocked, now, names, reviewable))
             for item in items:
                 row = dict(item, project_name=project['name'])
                 if item.get('id') in blocked and item.get('status') != 'closed':
