@@ -44,6 +44,9 @@ ITEM_FIELDS = {
     'review_request', 'review_requests',
     # Additive liveness (kittrial-5bb.107 rev2).
     'deployed_live',
+    # Additive checkpoint attention (.1), independent of review completion.
+    'newer_activity_by_others', 'newer_activity_own',
+    'newer_activity_coverage', 'unresolved_directions',
 }
 BRIEF_FIELDS = {
     'task', 'title', 'owner', 'status', 'activity_cursor', 'checkpoint', 'intent',
@@ -152,7 +155,7 @@ class WorkHelpContractTests(unittest.TestCase):
         # reference-review attention fields (kittrial-5bb.66, .41 7.1).
         self.assertLessEqual(BRIEF_FIELDS, set(result))
         self.assertEqual(set(result) - BRIEF_FIELDS, {'attention', 'attention_total', 'attention_more',
-                                                      'reference_drafts_matching'})
+                                                      'reference_drafts_matching','newer','directions'})
 
 
 class CheckpointErrorContractTests(unittest.TestCase):
@@ -845,7 +848,10 @@ class CheckpointJsonFlagTests(unittest.TestCase):
         for args in positions:
             with self.subTest(args=args):
                 result, calls = self.run_checkpoint(args)
-                self.assertEqual(result, {'comment_id': 'cp-new', 'reconciled': False})
+                self.assertEqual(result['comment_id'],'cp-new')
+                self.assertFalse(result['reconciled'])
+                self.assertEqual(result['covered'],0)  # default writer keeps legacy shape/unknown coverage
+                self.assertLessEqual(result['bytes'],briefing.CHECKPOINT_MAX_BYTES)
                 self.assertEqual(calls[-1][:2], ['comments', 'add'])
 
     def test_json_does_not_change_the_saved_checkpoint(self):

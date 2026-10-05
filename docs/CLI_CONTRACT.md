@@ -272,6 +272,31 @@ per-environment `live=superseded`) therefore never hides the current scope's fac
 which the previous reader got wrong. The native `dim:` label is still matched
 against the newest event of that dimension, so an unstructured or tampered event
 still reads `unknown` and its `event_id` names the event that caused it.
+`brief` also adds `newer` (null when current or without a checkpoint) and
+`directions` (null without a checkpoint). The former gives bounded activity
+references, own/other counts and explicit unknown/windowed coverage; the latter
+keeps other-actor comment directions visible until explicit resolution or
+supersession. Reading never acknowledges or completes them.
+`work --mine` adds `newer_activity_by_others`, `newer_activity_own`,
+`newer_activity_coverage` and `unresolved_directions` to displayed task rows.
+`session resume` records a resume event and returns session, resume and guidance
+metadata; it returns neither task IDs nor task rows. Read `work --mine` for tasks
+and checkpoint attention. The `worker.py resume` wrapper also runs onboarding,
+which prints that queue.
+Malformed/conflicting checkpoint history gives null counts. These fields do not
+set review state or lifecycle facts. See [BRIEFINGS.md](BRIEFINGS.md) for limits,
+direction dispositions and compatibility with older kits.
+
+`checkpoint TASK --provenance [--json]` is a read returning `task`, the complete
+`activity_cursor` and bounded `provenance`. `checkpoint TASK --verify [--json]`
+is a read returning newest-checkpoint identity, coverage and current entry counts
+(`fresh`, `changed`, `unchanged`, `unverified`), plus bounded changed entry IDs
+when evidence exists. The installation checkpoint_provenance_writes switch is OFF by default; old-shaped checkpoints are written until the operator enables new shapes after the rollback target reads them. With it enabled the server derives provenance deltas and carried acknowledgements on
+write; callers cannot authoritatively assert them. Verification follows linked
+checkpoint order, with newest per-entry evidence winning; a newest legacy
+checkpoint has unknown coverage even if an older one contains evidence. No read
+changes a checkpoint, direction disposition or lifecycle fact. Saved checkpoint
+receipts retain `comment_id`/`reconciled` and add `covered`/`bytes`.
 
 `brief` adds an `attention` array, plus `attention_total` and `attention_more`. It
 holds at most 3 items of each kind: `reference-review` items first, then `reference`
@@ -1721,3 +1746,4 @@ liveness receipt after intervening state changes fails before any writes with
 Plain CLI deploy is incremental and never automatically drops an uncarried task.
 See the exact two-step hotfix procedure and interim tracker state in
 [OPERATIONAL_WORKFLOW.md](OPERATIONAL_WORKFLOW.md).
+`checkpoint TASK --directions [--offset N] [--limit N] [--json]` returns full current digests for all outstanding directions, including entries outside stored evidence windows, in fresh pages (offset >= 0, limit 1..100, default 50). Fields: task, activity_cursor, total, items (id, digest, clipped author, timestamp), next_offset, coverage. Compare cursors across pages and restart on change. Only the current assignee can submit dispositions, and IDs/digests must match task history. See BRIEFINGS.md for legacy and reassignment baselines.

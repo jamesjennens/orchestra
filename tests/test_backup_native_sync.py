@@ -899,6 +899,122 @@ class TerminationGuardRealSignalCase(unittest.TestCase):
         self.assert_restored()
         self.assertEqual(self.received, [])
 
+    def test_a_stop_at_the_end_of_enter_is_raised_before_the_block(self):
+        # kittrial-5bb.124: a stop handled in __enter__ after its held check used to be
+        # recorded and raised only at the exit, after the whole block ran. Now the handler
+        # releases the guard and raises from __enter__, as for a stop during setup. The
+        # handler is run where the interpreter would run it: in __enter__'s last line.
+        ran = []
+
+        def profile(frame, event, arg):
+            if event == 'return' and frame.f_code is admin.signal_termination_guard.__enter__.__code__:
+                sys.setprofile(None)
+                admin.raise_termination(signal.SIGTERM, frame)
+
+        with self.assertRaises(admin.TerminatedBySignal):
+            sys.setprofile(profile)
+            with admin.signal_termination_guard():
+                sum(range(3))                 # a call: the interpreter's first check
+                for _ in range(3):
+                    pass                      # backward jumps: more checks
+                ran.append('rest of the block')
+        sys.setprofile(None)
+        self.assertEqual(ran, [])
+        self.settle()
+        self.assert_restored()
+        self.assertEqual(self.received, [])
+
+    def test_a_stop_at_any_line_of_enter_after_the_install_never_lets_the_block_run_first(self):
+        # The guard is armed BEFORE its held check, so every line after the install either
+        # records the stop for that check or releases and raises; none leaves it for the
+        # exit. The handler is run, as the interpreter would, at each line in turn.
+        enter = admin.signal_termination_guard.__enter__.__code__
+        count = 0
+        while True:
+            lines = []
+
+            def tracer(frame, event, arg):
+                if frame.f_code is not enter:
+                    return None
+                if event == 'line' and signal.getsignal(signal.SIGTERM) is admin.raise_termination:
+                    if len(lines) == count:
+                        lines.append(frame.f_lineno)
+                        sys.settrace(None)
+                        frame.f_trace = None
+                        admin.raise_termination(signal.SIGTERM, frame)
+                    else:
+                        lines.append(frame.f_lineno)
+                return tracer
+
+            ran = []
+            sys.settrace(tracer)
+            try:
+                with admin.signal_termination_guard():
+                    ran.append('block')
+            except admin.TerminatedBySignal:
+                pass
+            finally:
+                sys.settrace(None)
+            if len(lines) <= count:
+                break                         # every line after the install was tried
+            with self.subTest(line=lines[count]):
+                self.assertEqual(ran, [])
+                self.settle()
+                self.assert_restored()
+            count += 1
+        self.assertGreaterEqual(count, 3)
+
+    def test_a_guard_whose_exit_never_runs_is_released_when_collected(self):
+        # kittrial-5bb.124: through contextlib.ExitStack a stop in contextlib's own code
+        # between the block and the guard's exit skipped the exit, and the guard stayed
+        # installed for good (handler raise_termination, a record marked stopped, later
+        # stops ignored). Here the exit is skipped the same way - the stack's callbacks are
+        # moved out and dropped - with a stop already recorded.
+        import contextlib
+        import gc
+        with contextlib.ExitStack() as stack:
+            guard = stack.enter_context(admin.signal_termination_guard())
+            self.assertIs(signal.getsignal(signal.SIGTERM), admin.raise_termination)
+            guard.held = True                 # a stop it recorded, never raised
+            stack.pop_all()                   # the exit will not run
+        del guard
+        gc.collect()
+        self.settle()
+        self.assert_restored()
+        self.assertEqual(self.received, [signal.SIGTERM])   # handed to the previous handler
+        # A stopped record no longer silences later stops.
+        with self.assertRaises(admin.TerminatedBySignal):
+            with admin.signal_termination_guard():
+                os.kill(os.getpid(), signal.SIGTERM)
+                sum(range(10))
+        self.assert_restored()
+
+    def test_a_stop_in_an_unlisted_guards_last_lines_belongs_to_the_guards_still_listed(self):
+        # kittrial-5bb.124 mutation: the stack walk must only match a guard that is still
+        # listed. Once the inner guard's exit has unlisted it, a stop handled in its
+        # _raise_held is the outer guard's to raise; recorded on the inner guard it was lost.
+        inner = admin.signal_termination_guard()
+        outcome = []
+
+        def profile(frame, event, arg):
+            if (event == 'return' and frame.f_code is admin.signal_termination_guard._raise_held.__code__
+                    and frame.f_locals.get('self') is inner):
+                sys.setprofile(None)
+                try:
+                    admin.raise_termination(signal.SIGTERM, frame)
+                    outcome.append('recorded')
+                except admin.TerminatedBySignal:
+                    outcome.append('raised')
+
+        with admin.signal_termination_guard():
+            sys.setprofile(profile)
+            with inner:
+                pass
+            sys.setprofile(None)
+        self.assertEqual(outcome, ['raised'])
+        self.assertFalse(inner.held)
+        self.assert_restored()
+
     @staticmethod
     def in_inner_exit(frame, inner):
         while frame is not None:
@@ -939,21 +1055,38 @@ class TerminationGuardStressCase(unittest.TestCase):
     CHILD = Path(__file__).resolve().parent / 'sigterm_stress_child.py'
     REPO = str(Path(__file__).resolve().parent.parent)
 
+    SKIP = 77
+
     def run_child(self, previous, seconds):
-        return subprocess.run([sys.executable, str(self.CHILD), self.REPO, previous, str(seconds)],
-                              capture_output=True, text=True, timeout=60)
+        result = subprocess.run([sys.executable, str(self.CHILD), self.REPO, previous, str(seconds)],
+                                capture_output=True, text=True, timeout=60)
+        if result.returncode == self.SKIP:
+            self.skipTest(result.stdout.strip())     # no kernel timer on this machine
+        return result
 
     def test_custom_and_ignored_previous_handlers(self):
         for previous in ('custom', 'ignore'):
             with self.subTest(previous=previous):
                 result = self.run_child(previous, 1)
+                # A wrong state after any trial is exit 1: that is the guard failing.
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 counts = json.loads(result.stdout.splitlines()[-1])
-                # A late timer (a VM can fire one milliseconds late) lengthens each trial;
-                # the child adapts the block so stops land on both sides of its end.
-                self.assertGreater(counts['trials'], 20)
-                self.assertGreater(counts['raised'], 0)
-                self.assertGreater(counts['trials'] - counts['raised'], 0)
+                # Coverage, not correctness: the child keeps going (up to 5 s) until it has
+                # 20 trials with stops on both sides of the guard's end. A machine too slow
+                # or too loaded for that has not exercised the guard, which is a skip, not
+                # a failure (kittrial-5bb.124).
+                if not (counts['trials'] >= 20 and 0 < counts['raised'] < counts['trials']):
+                    self.skipTest('the guard was not exercised on both sides here: %r' % counts)
+
+    def test_a_machine_without_a_kernel_timer_skips(self):
+        # kittrial-5bb.124: a refused or missing timer_create used to exit 1 and fail the test.
+        with tempfile.TemporaryDirectory() as folder:
+            child = Path(folder) / 'child.py'
+            child.write_text("print('SKIP: timer_create was refused (errno 1)'); raise SystemExit(77)\n",
+                             encoding='utf-8')
+            with patch.object(self, 'CHILD', child):
+                with self.assertRaisesRegex(unittest.SkipTest, 'timer_create was refused'):
+                    self.run_child('custom', 1)
 
     def test_default_previous_handler(self):
         # A stop the previous SIG_DFL owns ends the child with SIGTERM: allowed. Any wrong
