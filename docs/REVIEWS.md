@@ -368,14 +368,19 @@ Sent with `review TASK --file payload.json`, like the other review operations. I
 * It does not move `latest_comment_id`, so an owner's `approve` with the contribution as `previous` is not stale.
 * It does not make approval allowed and does not resolve or create an item. Nothing in the approval rules reads it.
 
-**Who may write one.** Anyone who may write on the task, except the contribution's author and the task's assignee (compared with the name rule of the follow-on gate, so an agent of the same owner under another session id is the same author). The rule is applied when it is written **and again every time it is read**.
+**Who may write one.** Anyone who may write on the task, except the contribution's author and the task's assignee (compared with the name rule of the follow-on gate, so an agent of the same owner under another session id is the same author).
+
+* **The author rule is applied when a recommendation is written and again every time it is read.** A record by the contribution's author is never shown, however it reached the task. That is what stops a forged or natively written self-recommendation from displaying.
+* **The assignee rule is applied when it is written and is not re-checked on read.** The reader sees only who is assigned now. If the task is later reassigned to someone who had already recommended it, their honest recommendation must not disappear.
 
 **Independence by person, over HTTP only.** The rule above compares actor names. A person and their agent have different names, so over SSH the kit cannot tell that a recommender is the owner of the agent that delivered the work. The web service knows who owns each agent, and it also refuses (403) a recommendation from:
 
 * the person who owns the agent that authored the contribution or is the task's assignee;
 * another agent owned by the same person as the author or the assignee.
 
-The web service applies the same rule when it reads: such a record is left out of the brief's `recommendations` and of a row's `recommended_by`. Two limits follow. If the newest standing recommendation is left out this way, the brief's `recommendation` is null even when an older one by an independent reviewer stands (that reviewer is still named in `recommendations`, and the text is in the task history). The queue compares with the task's assignee only, because its rows do not carry the contribution's author. `review`, `brief` and `work` over SSH show every recommendation that passes the name rule.
+The web service applies the same rule when it reads, in the brief and in the queue alike: a record by the contribution author's own person is left out of the brief's `recommendations` and of a row's `recommended_by` (queue rows carry `contribution_author` for this). A row that does not say who delivered, as an endpoint older than this rule sends it during a staged upgrade or a rollback, is compared with the task's assignee instead, never with nobody. When the newest standing recommendation is left out, the brief shows the newest of the others in its place. The canonical read returns the five newest in full; if all five are left out, a sixth is named in `recommendations` and its text is in the task history. `review`, `brief` and `work` over SSH show every recommendation that passes the name rule. **SSH and HTTP readers agree on the assignee:** neither compares a standing recommendation with the task's current assignee. Over both, a recommendation by the assignee's person is refused when it is written, and one written before a reassignment stays shown after it.
+
+Over HTTP a refused recommendation says which rule it hit: the 422 message is the canonical sentence (for example "The recommendation names a commit that is not the current contribution's commit; re-read the review before recommending"). A field the operation does not take (`approved`, anything made up) is refused by the one rule for every review operation: "Unsupported review payload field(s) for recommend: ...", naming at most five, plain identifiers only, then "(+N more)". A field sent as null is absent, and `previous` is accepted and ignored for a recommendation, because the released client sends both for every operation.
 
 **When it stands.** A recommendation is shown only while all of these hold:
 
@@ -388,12 +393,13 @@ A new revision, a decision or a withdrawal makes it lapse. The newest recommenda
 
 **Where it shows.**
 
-* `review TASK` and `brief TASK`: `recommendation` (the newest standing one, in full, or `null`), `recommendations` (each standing one's comment id, author and time, newest first, at most 20) and `recommended` (true or false).
-* `work`: each item carries `recommended` and `recommended_by`.
+* `review TASK` and `brief TASK`: `recommendation` (the newest standing one, in full, or `null`), `recommendations` (each standing one's comment id, author and time, newest first, at most 20; the five newest also carry their verdict, summary, items, contribution and commit) and `recommended` (true or false).
+* `work`: each item carries `recommended`, `recommended_by` and `contribution_author` (who delivered the current contribution).
+* An agent's next actions over HTTP (`GET /v1/agents/me/next`): `to-review` for a contribution it could itself recommend, and `review-recommended` for an agent whose owner can approve. See HTTP_DEPLOYMENT.md, "What an agent is told to do next".
 * Over HTTP: the same operation on `POST /v1/projects/{id}/tasks/{task}/reviews` (the `reviews` capability; a viewer is refused). The task brief's `review` carries `recommendation` and `recommendations`; rows of `GET /v1/projects/{id}/queue` and of `/v1/me/work` carry `recommended` and `recommended_by`, and a recommended contribution comes first among those of its project that await review.
 * The web interface shows it on the task page above the owner's review form, and marks the row in the Reviews list. A member who can review but is not an owner gets a form to record one.
 
-**Compatibility.** No write switch. A kit that predates this ignores the record: its `review`, `brief`, `work` and `history` reads of a task that carries one are unchanged (`history` lists it as an ordinary comment). The older kit does not reserve the prefix, so on that kit anyone could post a raw comment that starts with it. This kit shows such a comment only if it is a fully valid record that passes every rule above, which is what this kit would have accepted.
+**Compatibility.** No write switch. A kit that predates this ignores the record: its `review`, `brief`, `work` and `history` reads of a task that carries one are unchanged (`history` lists it as an ordinary comment). The older kit does not reserve the prefix, so on that kit anyone could post a raw comment that starts with it. This kit shows such a comment only if it is a fully valid record that passes every rule above, which is what this kit would have accepted. The reader applies the plain-text rule too: a record whose summary or a note holds a control, bidi, zero-width or other hidden character is never shown, whoever wrote it.
 
 **Known limits.**
 

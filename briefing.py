@@ -98,7 +98,23 @@ def cursor_matches(cursor,data,compatible=None):
     # Read receipts already written by the first provenance kit in their shape.
     if cursor==(compatible if compatible is not None else activity_cursor(data)):return True
     previous=token({'v':1,'kind':'activity','project':data['project'],'task':data['task'],'sha256':content_hash(data)})
-    return cursor==previous
+    if cursor==previous:return True
+    # A project restored under another name (restore-new) keeps its tasks and checkpoints,
+    # but the project name is part of the cursor and of the hashed snapshot, so every
+    # checkpoint read as stale although nothing changed (kittrial-5bb.131). The cursor
+    # names the project it was taken in: the same task with the same content under that
+    # name is the same activity. Only reading changes; cursors are written as before, so
+    # every kit still reads what every other kit writes, and an older kit keeps reporting
+    # the renamed project's checkpoints as stale until a fresh checkpoint is written.
+    try:
+        recorded=untoken(cursor)
+    except ValueError:
+        return False
+    project=recorded.get('project') if isinstance(recorded,dict) else None
+    if not isinstance(project,str) or project==data['project']:return False
+    # The task and the content hash are inside the token, so only the same task with the
+    # same content can match.
+    return cursor_matches(cursor,dict(data,project=project))
 
 def text(value,label,limit,empty=False):
     # Names the field, the length it had and the limit (kittrial-5bb.97).
@@ -688,9 +704,27 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
                              +('' if newer['coverage']!='unknown' else ', coverage UNKNOWN — reconcile with history before trusting counts')
                              +'). Read newer activity first: '+newer['history']
                              +'. The recorded checkpoint next action was: '+p['next_action'])
+    # The project the checkpoint was taken in, when it is not this one (kittrial-5bb.136):
+    # after restore-new under another name an unchanged task reads current, which is true
+    # of the copy, but the restore is still worth reconciling before trusting the
+    # checkpoint's next action. Before kittrial-5bb.131 the STALE reading was that prompt.
+    taken_in=None
+    if p is not None:
+        try:
+            recorded=untoken(p['activity_cursor'])
+        except ValueError:
+            recorded=None
+        named=recorded.get('project') if isinstance(recorded,dict) else None
+        if isinstance(named,str) and named!=project:
+            taken_in=named[:96]
+            if not stale and review['review_state'] not in review_next:
+                # A prefix, like OUTSTANDING DIRECTIONS, so neither hides the other.
+                next_action=('CHECKPOINT FROM PROJECT '+taken_in+': written before this project was restored or '
+                             'copied under its current name; its task content is unchanged. Confirm the history '
+                             'before relying on it. '+next_action)
     result={**attention,'reference_drafts_matching':reference_drafts,'task':task,'title':clip(issue.get('title'),200),'owner':clip(issue.get('assignee') or 'unassigned',96),'status':issue.get('status'),
             'activity_cursor':activity_cursor(data),'checkpoint':None if p is None else {'comment_id':str(c['id']),'author':clip(c.get('author'),96),'timestamp':c.get('created_at'),'source_commit':p['source_commit'],'branch':p['branch'],'incorporated_activity_cursor':p['activity_cursor'],
-                'newer_activity':stale},
+                'newer_activity':stale,**({'taken_in_project':taken_in} if taken_in else {})},
             'newer':newer,
             'directions':dir_out,
             'intent':clip(p['intent'] if p else issue.get('description'),600),'acceptance':clip(p['acceptance'] if p else issue.get('acceptance_criteria'),1000),
@@ -1009,6 +1043,7 @@ def format_brief(result):
     if cp:lines += [f'Checkpoint: {cp["comment_id"]} by {excerpt(cp["author"])} at {cp["timestamp"]}',f'Branch: {cp["branch"] or "unknown"} | Source commit: {cp["source_commit"] or "unknown"}',
                     'Newer/changed activity: '+str(cp['newer_activity']), 'Incorporated activity cursor: '+cp['incorporated_activity_cursor']]
     else:lines += ['No checkpoint yet; unresolved items are UNKNOWN, not zero.']
+    if cp and cp.get('taken_in_project'):lines.append('Checkpoint taken in project: '+cp['taken_in_project'])
     newer=result['newer']
     if newer:
         authors=', '.join(a['text'] for a in newer['other_authors']['items']) or 'none'

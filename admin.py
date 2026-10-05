@@ -624,8 +624,51 @@ def review_workflow_writes(root, strict=False, warnings=None):
                 print('WARNING: ' + message,file=sys.stderr)
     return enabled
 
+#: The key of the checkpoint switch's audit list inside deployment.private.json, and the
+#: prefix a damaged value is kept aside under (kittrial-5bb.131).
+CHECKPOINT_AUDIT_KEY='checkpoint_provenance_audit'
+
+#: The fields of one audit entry, exactly as every kit since kittrial-5bb.1 writes them.
+CHECKPOINT_AUDIT_FIELDS=frozenset({'actor','at','action','previous','enabled'})
+
+def checkpoint_audit_entry(item):
+    """Whether one audit entry has the shape ``checkpoint-provenance-writes`` writes."""
+    return (isinstance(item,dict) and set(item)==CHECKPOINT_AUDIT_FIELDS
+            and isinstance(item['actor'],str) and isinstance(item['at'],str)
+            and item['action'] in ('on','off') and isinstance(item['previous'],bool)
+            and isinstance(item['enabled'],bool))
+
+def checkpoint_provenance_audit(cfg):
+    """``(entries, damage)`` for the checkpoint switch audit in a deployment config.
+
+    A list of entries of the written shape reads as the history; anything else is
+    ``([], reason)``: not a list (kittrial-5bb.131), or an entry that is not a record of
+    exactly the fields the switch writes (kittrial-5bb.136; a list of arbitrary objects
+    used to count as a readable history). The reason names what is there, never its
+    content."""
+    value=cfg.get(CHECKPOINT_AUDIT_KEY,[])
+    if not isinstance(value,list):
+        return [],'%s is a %s, not a list of records'%(CHECKPOINT_AUDIT_KEY,type(value).__name__)
+    for index,item in enumerate(value):
+        if not checkpoint_audit_entry(item):
+            return [],'entry %d of %s is not a record of the shape the switch writes'%(index,CHECKPOINT_AUDIT_KEY)
+    return value,None
+
 def checkpoint_provenance_switch(root,action,actor):
-    """Keep the switch and its operator audit in one atomic private generation."""
+    """Read or flip ``checkpoint_provenance_writes`` with its operator audit.
+
+    A flip holds the deployment switch lock (``review_writes_lock``) across the whole
+    read-modify-write of deployment.private.json, as ``review-writes`` does: without it
+    two simultaneous flips each rewrote the file from the same read and one audit entry
+    was lost (kittrial-5bb.131: 18 of 24 recorded). The one lock serialises both switches,
+    which rewrite the same file.
+
+    A damaged audit (``checkpoint_provenance_audit`` not a list of records, a hand edit)
+    no longer blocks the switch. ``status`` reads it as an empty history and warns; the
+    next flip keeps the damaged value aside in the same file under
+    ``checkpoint_provenance_audit_damaged_<UTC stamp>`` and starts a fresh list, as
+    ``review-writes`` keeps a damaged audit file aside under a dated name. Warnings go to
+    stderr; the result says whether the audit read."""
     from briefing import checkpoint_writes_enabled
     from recovery import identity
     marker=root/'deployment.private.json'
@@ -633,22 +676,42 @@ def checkpoint_provenance_switch(root,action,actor):
     actor=identity(actor,'Invalid actor identity')
     if actor not in operators(root,strict=True):
         raise ValueError('checkpoint-provenance-writes requires an actor on the deployment operator allowlist')
-    current=checkpoint_writes_enabled(root)
-    cfg=config(root)
-    audit=cfg.get('checkpoint_provenance_audit',[])
-    if not isinstance(audit,list) or any(not isinstance(item,dict) for item in audit):
-        raise ValueError('Invalid checkpoint provenance switch audit; reconcile before changing the switch')
-    if action=='status':return dict(checkpoint_provenance_writes=current,audit_records=len(audit))
-    if action not in ('on','off'):raise ValueError('Invalid checkpoint provenance switch action')
+    if action not in ('status','on','off'):raise ValueError('Invalid checkpoint provenance switch action')
+    if action=='status':
+        current=checkpoint_writes_enabled(root)
+        audit,damage=checkpoint_provenance_audit(config(root))
+        if damage is not None:
+            print('WARNING: the checkpoint provenance switch audit is damaged (%s); it reads as an empty history. '
+                  'The next on/off keeps it aside in deployment.private.json under %s_damaged_<UTC stamp> and '
+                  'starts a fresh list.'%(damage,CHECKPOINT_AUDIT_KEY),file=sys.stderr)
+        return dict(checkpoint_provenance_writes=current,audit_records=len(audit),audit_readable=damage is None)
     enabled=action=='on'
-    if enabled:cfg['checkpoint_provenance_writes']=True
-    else:cfg.pop('checkpoint_provenance_writes',None)
-    cfg['checkpoint_provenance_audit']=audit+[dict(actor=actor,at=utc_stamp(),action=action,
-                                                  previous=current,enabled=enabled)]
-    atomic_private_write(marker,json.dumps(cfg))
+    with review_writes_lock(root):
+        current=checkpoint_writes_enabled(root)
+        cfg=config(root)
+        audit,damage=checkpoint_provenance_audit(cfg)
+        if enabled==current:
+            # A flip that changes nothing writes nothing, as `review-writes` does
+            # (kittrial-5bb.136): the history records changes, and a repeated `on` cannot
+            # rewrite the file or set a damaged audit aside.
+            return dict(checkpoint_provenance_writes=current,audit_records=len(audit),
+                        audit_readable=damage is None,changed=False)
+        if damage is not None:
+            kept='%s_damaged_%s'%(CHECKPOINT_AUDIT_KEY,utc_stamp().replace(':','').replace('-',''))
+            suffix=1
+            while kept+('' if suffix==1 else '_%d'%suffix) in cfg:suffix+=1
+            kept+=('' if suffix==1 else '_%d'%suffix)
+            cfg[kept]=cfg.pop(CHECKPOINT_AUDIT_KEY)
+            print('WARNING: the checkpoint provenance switch audit was damaged (%s); it is kept aside in '
+                  'deployment.private.json as %s and this flip starts a fresh list.'%(damage,kept),file=sys.stderr)
+        if enabled:cfg['checkpoint_provenance_writes']=True
+        else:cfg.pop('checkpoint_provenance_writes',None)
+        cfg[CHECKPOINT_AUDIT_KEY]=audit+[dict(actor=actor,at=utc_stamp(),action=action,
+                                              previous=current,enabled=enabled)]
+        atomic_private_write(marker,json.dumps(cfg))
     if not enabled:
         print('Warning: existing provenance tasks refuse new legacy checkpoints; disabling does not make their history readable by older kits.',file=sys.stderr)
-    return dict(checkpoint_provenance_writes=enabled,audit_records=len(audit)+1)
+    return dict(checkpoint_provenance_writes=enabled,audit_records=len(audit)+1,audit_readable=True,changed=True)
 
 #: Audit record of the switch flips, beside deployment.private.json. It is
 #: deployment-level (there is one switch per installation, not per project), so it
@@ -786,27 +849,57 @@ def write_review_writes_audit(root, enabled, actor, previous, entries=None):
     return entry
 
 
-@contextmanager
-def review_writes_lock(root):
-    """Serialise one switch flip (and its audit record) with an exclusive flock.
+#: How long a change to deployment.private.json waits for another one to finish before it
+#: refuses (kittrial-5bb.136). Every such change takes milliseconds, so a holder that keeps
+#: the lock this long is stuck; refusing says so instead of hanging the command for good.
+DEPLOYMENT_LOCK_WAIT_SECONDS = 10
+DEPLOYMENT_LOCK_POLL_SECONDS = 0.05
 
-    POSIX-only, like every other coordination lock in the kit: on a host without
-    ``fcntl`` the atomic file writes still stand. The lock file is deployment-level
-    and holds no state, so a leftover file is harmless and is never backed up. The lock
-    is held across the WHOLE read-modify-write, so the audit entry names the value that
-    was actually replaced; removing it loses that guarantee under concurrency, which is
-    why ``ReviewWritesCommandTests`` pins it.
+
+@contextmanager
+def deployment_config_lock(root):
+    """Serialise one read-modify-write of deployment.private.json with an exclusive flock.
+
+    EVERY writer of that file takes it: both deployment switches (``review-writes``,
+    ``checkpoint-provenance-writes``), ``operators add|remove``, ``verifiers add|remove`` and
+    the restore merges of operators and verifiers (kittrial-5bb.136). Each re-reads the
+    file under the lock, so no change is lost to another made at the same instant. The
+    file keeps the name ``.review-writes.lock`` (REVIEW_WRITES_LOCK), so a flip on an older
+    kit still excludes a change here.
+
+    A holder that does not finish within ``DEPLOYMENT_LOCK_WAIT_SECONDS`` makes the change
+    refuse with nothing changed, rather than wait for good; reads never take the lock, and
+    a killed holder releases it with its process. POSIX-only, like every other
+    coordination lock in the kit: on a host without ``fcntl`` the atomic file writes still
+    stand. The lock file holds no state and is never backed up.
     """
     handle=(root/REVIEW_WRITES_LOCK).open('a')
     try:
-        import fcntl
-        fcntl.flock(handle,fcntl.LOCK_EX)
-    except ImportError:
-        pass
-    try:
+        try:
+            import fcntl
+        except ImportError:
+            fcntl=None
+        if fcntl is not None and not hasattr(fcntl,'LOCK_NB'):
+            fcntl.flock(handle,fcntl.LOCK_EX)   # a platform without non-blocking flock waits
+        elif fcntl is not None:
+            deadline=time.monotonic()+DEPLOYMENT_LOCK_WAIT_SECONDS
+            while True:
+                try:
+                    fcntl.flock(handle,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic()>=deadline:
+                        raise ValueError('Nothing was changed: another change to deployment.private.json still holds '
+                                         'its lock (%s) after %d s. Run the command again; if this repeats, find '
+                                         'the process holding it (for example `fuser %s`).'
+                                         %(REVIEW_WRITES_LOCK,DEPLOYMENT_LOCK_WAIT_SECONDS,REVIEW_WRITES_LOCK)) from None
+                    time.sleep(DEPLOYMENT_LOCK_POLL_SECONDS)
         yield handle
     finally:
         handle.close()
+
+#: The name the switch code and kittrial-5bb.110's tests use.
+review_writes_lock=deployment_config_lock
 
 
 def review_writes_command(root, actor, action):
@@ -3546,12 +3639,13 @@ def merge_verifiers(root,actors):
     if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
     from recovery import identity
     wanted=[identity(item,'Invalid verifier identity') for item in actors]
-    cfg=config(root)
-    current=stored_verifiers(cfg)
-    added=[item for item in wanted if item not in current]
-    if not added:return []
-    cfg['verifiers']=current+added
-    atomic_private_write(marker,json.dumps(cfg))
+    with deployment_config_lock(root):
+        cfg=config(root)
+        current=stored_verifiers(cfg)
+        added=[item for item in wanted if item not in current]
+        if not added:return []
+        cfg['verifiers']=current+added
+        atomic_private_write(marker,json.dumps(cfg))
     return added
 
 def missing_verifiers(root,source):
@@ -3574,12 +3668,13 @@ def merge_operators(root,actors):
     from recovery import identity
     if isinstance(actors,str):actors=[actors]
     wanted=[identity(item,'Invalid operator identity') for item in actors]
-    cfg=config(root)
-    current=stored_operators(cfg)
-    added=[item for item in wanted if item not in current]
-    if not added:return []
-    cfg['operators']=current+added
-    atomic_private_write(marker,json.dumps(cfg))
+    with deployment_config_lock(root):
+        cfg=config(root)
+        current=stored_operators(cfg)
+        added=[item for item in wanted if item not in current]
+        if not added:return []
+        cfg['operators']=current+added
+        atomic_private_write(marker,json.dumps(cfg))
     return added
 
 
@@ -4524,10 +4619,17 @@ def main():
                                  ' (re-add restores them).' + revoked_keyed_voids(root,actor,limit) +
                                  revoked_proposal_records(root,actor,limit) +
                                  ' Re-run with --confirm-revoke to acknowledge this.')
-            if actor in current:current.remove(actor)
-        if current:cfg['operators']=current
-        else:cfg.pop('operators',None)
-        atomic_private_write(marker,json.dumps(cfg))
+        # The change is applied to a fresh read under the deployment lock, so an add or
+        # remove made at the same instant by another command is not lost (kittrial-5bb.136).
+        with deployment_config_lock(root):
+            cfg=config(root)
+            current=stored_operators(cfg)
+            if args.action=='add':
+                if actor not in current:current.append(actor)
+            elif actor in current:current.remove(actor)
+            if current:cfg['operators']=current
+            else:cfg.pop('operators',None)
+            atomic_private_write(marker,json.dumps(cfg))
         print(json.dumps({'operators':current}))
     elif args.command=='verifiers':
         marker=root/'deployment.private.json'
@@ -4548,10 +4650,15 @@ def main():
                                  'recorded reads `reported` instead of `verified`, and drift that only their '
                                  'passes had cleared reappears' + revoked_verifications(root,actor) +
                                  ' (re-add restores them). Re-run with --confirm-revoke to acknowledge this.')
-            if actor in current:current.remove(actor)
-        if current:cfg['verifiers']=current
-        else:cfg.pop('verifiers',None)
-        atomic_private_write(marker,json.dumps(cfg))
+        with deployment_config_lock(root):
+            cfg=config(root)
+            current=stored_verifiers(cfg)
+            if args.action=='add':
+                if actor not in current:current.append(actor)
+            elif actor in current:current.remove(actor)
+            if current:cfg['verifiers']=current
+            else:cfg.pop('verifiers',None)
+            atomic_private_write(marker,json.dumps(cfg))
         print(json.dumps({'verifiers':current}))
     elif args.command=='checkpoint-provenance-writes':
         print(json.dumps(checkpoint_provenance_switch(root,args.action,args.actor)))

@@ -10,6 +10,7 @@ import reserved_comments
 import review_recommendations as rec
 import review_workflow as w
 import work
+from requirements import canonical_bytes
 
 TASK = 'task-1'
 COMMIT = 'a' * 40
@@ -82,8 +83,8 @@ class WriteRuleTests(Harness):
             'contribution': contribution, 'commit': COMMIT, 'verdict': 'approve',
             'summary': 'Read the diff and ran the tests; did not check the docs.',
             'items': [{'id': 'naming', 'text': 'Consider a clearer name.'}]})
-        self.assertEqual(view['recommendations'], [{'comment_id': stored['id'], 'author': 'reviewer',
-                                                    'timestamp': stored['created_at']}])
+        # The newest few are listed in full (FULL_MAX), so a reader that leaves one out has the next.
+        self.assertEqual(view['recommendations'], [view['recommendation']])
         self.assertEqual(result['recommendation'], view['recommendation'])
 
     def test_it_is_never_an_approval_and_never_makes_an_approve_stale(self):
@@ -235,6 +236,58 @@ class ReaderRuleTests(Harness):
         view = self.view()
         self.assertEqual(len(view['recommendations']), 20)
         self.assertEqual(view['recommendation']['author'], 'reviewer-24')
+        # Five in full, newest first; the rest by name and time only.
+        self.assertEqual([sorted(entry) == ['author', 'comment_id', 'timestamp'] for entry in view['recommendations']],
+                         [False] * rec.FULL_MAX + [True] * (20 - rec.FULL_MAX))
+        self.assertEqual([entry['author'] for entry in view['recommendations']][:6],
+                         ['reviewer-%02d' % index for index in range(24, 18, -1)])
+        self.assertEqual(view['recommendations'][1]['summary'], view['recommendation']['summary'])
+
+    def test_a_record_with_a_hidden_character_is_never_displayed_whoever_wrote_it(self):
+        """The reader holds a record to the plain-text rule, as the writer does (review of the first delivery)."""
+        contribution = self.contribute()
+        for index, summary in enumerate(('escape \x1b[31m here', 'a bidi \u202e override', 'a zero\u200bwidth space')):
+            with self.subTest(summary=ascii(summary)):
+                payload = self.payload(contribution, summary=summary)
+                rec.validate(payload, TASK)                      # the shape is fine: only the text rule fails
+                self.issue['comments'].append(dict(
+                    id='raw%d' % index, author='independent-%d' % index, created_at='2026-10-04T00:01:00Z',
+                    text=rec.PREFIX + canonical_bytes(payload).decode()))
+                view = self.view()
+                self.assertEqual((view['recommended'], view['recommendation'], view['recommendations']),
+                                 (False, None, []))
+        note = self.payload(contribution, items=[{'id': 'n', 'text': 'hidden\u2066 text'}])
+        self.issue['comments'].append(dict(id='raw9', author='independent-9', created_at='2026-10-04T00:01:00Z',
+                                           text=rec.PREFIX + canonical_bytes(note).decode()))
+        self.assertFalse(self.view()['recommended'])
+        # A clean one beside them is shown.
+        self.recommend(contribution, actor='honest')
+        self.assertEqual([entry['author'] for entry in self.view()['recommendations']], ['honest'])
+
+    def test_a_reassignment_does_not_hide_an_honest_recommendation(self):
+        """The assignee is refused at write time and not re-checked on read; the author always is."""
+        contribution = self.contribute()
+        self.recommend(contribution, actor='reviewer')
+        self.issue['assignee'] = 'reviewer'                     # reassigned to someone who had already recommended
+        view = self.view()
+        self.assertEqual([entry['author'] for entry in view['recommendations']], ['reviewer'])
+        # Writing one as the assignee is still refused.
+        with self.assertRaises(ValueError) as caught:
+            self.recommend(contribution, actor='reviewer')
+        self.assertIn('Nobody recommends their own contribution', str(caught.exception))
+        # And a record by the contribution's AUTHOR never displays, however it got there.
+        forged = self.payload(contribution)
+        self.issue['comments'].append(dict(id='forged', author='worker', created_at='2026-10-04T00:02:00Z',
+                                           text=rec.PREFIX + canonical_bytes(forged).decode()))
+        self.assertEqual([entry['author'] for entry in self.view()['recommendations']], ['reviewer'])
+
+    def test_the_work_row_names_who_delivered(self):
+        contribution = self.contribute()
+        self.recommend(contribution)
+        item = work.queue([self.issue], 'owner', [])['items'][0]
+        self.assertEqual((item['contribution_author'], item['recommended_by']), ('worker', ['reviewer']))
+        for name in ('recommended', 'recommended_by', 'contribution_author'):       # and the help lists them
+            self.assertIn(name, work.help_payload('work')['output']['item_fields'])
 
     def test_a_raw_comment_with_the_prefix_never_displays_unless_it_passes_every_rule(self):
         # What a kit that did not reserve the prefix, or a host write, could leave behind.

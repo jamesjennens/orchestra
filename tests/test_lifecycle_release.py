@@ -1143,6 +1143,128 @@ class SilentDropAndConflictTests(unittest.TestCase):
         self.assertEqual(store.calls[calls:], [['export', '--all']])
 
 
+class ReceiptPreflightTests(unittest.TestCase):
+    """The receipt-preflight guards the coordinator asked to pin (.119 added point 1).
+
+    Each test kills the mutation named in comment 01a10962-dcdf: refusing every
+    reused liveness receipt even when it is still current; skipping the
+    release/environment binding of a reused id; accepting a duplicate planned id
+    inside one request.
+    """
+
+    R3_SCOPE_A = scope(source=SOURCE_A, integration=MERGE_A, release='r-3', environment='production')
+    R3_SCOPE_B = scope(source=SOURCE_B, integration=MERGE_B, release='r-3', environment='production')
+
+    def rolled_back(self):
+        """trial-a is carried back to r-1 while its r-3 scope is named; trial-b is dropped.
+
+        The payload carries BOTH supersede lists the way the real client sends
+        them, so the dropped task's r-3 scope is written twice (task-level and
+        scope-level) and trial-a's r-3 scope rides ``supersede_scopes``.
+        """
+        store = (NativeStore(tasks=('trial-a', 'trial-b'))
+                 .seed('trial-a')
+                 .seed('trial-b', integration=MERGE_B, source=SOURCE_B))
+        store.record(release_payload([target('trial-a')], operation='release-r1', release='r-1'))
+        store.record(release_payload([target('trial-a'),
+                                      target('trial-b', integration=MERGE_B, source=SOURCE_B)],
+                                     operation='release-r3', release='r-3'))
+        rollback = release_payload([target('trial-a')], operation='rollback-r1', release='r-1',
+                                   rollback=True, supersede=['trial-b'],
+                                   supersede_scopes=[{'task': 'trial-a', 'scope': dict(self.R3_SCOPE_A)},
+                                                     {'task': 'trial-b', 'scope': dict(self.R3_SCOPE_B)}])
+        return store, rollback
+
+    def superseded_events(self, store, task):
+        events = []
+        for row in store.rows:
+            if row.get('issue_type') != 'event':
+                continue
+            event = lifecycle.native_event(row)
+            if event and event.get('payload') and event['payload']['task'] == task \
+                    and event['payload']['dimension'] == LIVE \
+                    and event['payload']['value'] == 'superseded':
+                events.append(event['payload'])
+        return events
+
+    def test_a_reused_liveness_receipt_that_is_still_current_is_accepted(self):
+        # Kills "every reused liveness receipt is refused, even a still-current
+        # one": the exact retry of the SAME rollback on the SAME export must
+        # reconcile, which is how an interrupted run completes.
+        store, rollback = self.rolled_back()
+        store.record(rollback)
+        before = len(store.rows)
+        calls = len(store.calls)
+        again = store.record(rollback)
+        self.assertEqual(len(store.rows), before, 'an exact retry writes nothing')
+        self.assertEqual(store.calls[calls:], [['export', '--all']], 'no write is attempted')
+        self.assertTrue(all(entry['reconciled'] for entry in again['targets']))
+
+    def test_a_reused_id_bound_to_a_different_release_is_refused(self):
+        # Kills "the release/environment binding of a reused id is not checked".
+        # The second request names a DIFFERENT task, so no derived id collides and
+        # only _check_release_identity can catch the reused base id.
+        store = (NativeStore(tasks=('trial-a', 'trial-b')).seed('trial-a')
+                 .seed('trial-b', integration=MERGE_B, source=SOURCE_B))
+        store.record(release_payload([target('trial-a')], operation='release-1', release='release-1'))
+        before = json.dumps(store.rows)
+        calls = len(store.calls)
+        with self.assertRaisesRegex(ValueError, r'different content \(release/environment\)'):
+            store.record(release_payload([target('trial-b', integration=MERGE_B, source=SOURCE_B)],
+                                         operation='release-1', release='release-9'))
+        self.assertEqual(json.dumps(store.rows), before, 'nothing is written')
+        self.assertEqual(store.calls[calls:], [['export', '--all']], 'refused before the first write')
+
+    def test_a_duplicate_planned_id_inside_one_request_is_refused(self):
+        # Kills "a duplicate planned id inside one request is accepted". Derived
+        # ids are label- and task-tagged, so a well-formed payload cannot produce
+        # two conflicting facts under one id; this drives the guard directly and
+        # the contribution says so.
+        planned = dict(schema_version=1, task='trial-a', dimension='deployed', value='passed',
+                       scope=scope(), evidence=['commit:' + SOURCE_A], provenance='performed',
+                       actor=ACTOR, operation_id='release-1/deployed/trial-a')
+        other = dict(planned, task='trial-b')
+        with self.assertRaisesRegex(ValueError, 'different content in the same plan'):
+            lifecycle._check_release_operations({'trial-a': [(None, planned)],
+                                                 'trial-b': [(None, other)]},
+                                                [], {}, {}, 'release-1')
+
+    def test_a_rollback_pins_both_superseded_receipts_of_a_dropped_task(self):
+        # Coordinator added point 3: the task-level and the scope-level receipt for
+        # the SAME dropped-task scope are both written today, and removing either
+        # was caught by no test. Pin both, with their shared scope and both ids.
+        store, rollback = self.rolled_back()
+        store.record(rollback)
+        events = self.superseded_events(store, 'trial-b')
+        self.assertEqual(len(events), 2,
+                         'a dropped task gets the task-level and the scope-level receipt')
+        self.assertEqual({tuple(sorted(event['scope'].items())) for event in events},
+                         {tuple(sorted(self.R3_SCOPE_B.items()))},
+                         'both receipts are for the same r-3 scope')
+        self.assertEqual(sorted(event['operation_id'] for event in events),
+                         sorted(['rollback-r1/superseded/trial-b',
+                                 lifecycle.derived_scope_id('rollback-r1', 'trial-b',
+                                                            self.R3_SCOPE_B)]))
+
+    def test_a_stale_liveness_receipt_names_the_operators_id(self):
+        # Coordinator added point 4: the refusal must name the id the operator's
+        # file carries (rel-r3), not the derived per-task id.
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        store.record(release_payload([target('trial-a')], operation='rel-r1', release='r-1'))
+        store.record(release_payload([target('trial-a')], operation='rel-r3', release='r-3'))
+        store.record(release_payload([target('trial-a')], operation='rel-r1-rb', release='r-1',
+                                     rollback=True,
+                                     supersede_scopes=[{'task': 'trial-a',
+                                                        'scope': dict(self.R3_SCOPE_A)}]))
+        with self.assertRaisesRegex(ValueError, 'state that has since changed') as caught:
+            store.record(release_payload([target('trial-a')], operation='rel-r3', release='r-3'))
+        message = str(caught.exception)
+        self.assertIn('rel-r3', message)
+        self.assertNotIn('rel-r3/live/', message,
+                         'the refusal names the operator id, not the derived id')
+        self.assertNotIn('rel-r3/scope/', message)
+
+
 class SmallAndTestsTests(unittest.TestCase):
     """defect_task existence, shallow clones, the git guard and scope writes (item 7)."""
 
@@ -1432,6 +1554,123 @@ class LaterLiveVerifiedTests(unittest.TestCase):
         self.assertEqual(store.facts('trial-a')['scope']['release_id'], 'r-1')
 
 
+class ReleaseWriteVolumeTests(unittest.TestCase):
+    """The write count a later release pays at the default group size (.107 item 2).
+
+    These pin that a later release selects only what it ADDS, and that a later
+    ``--live-verified`` appends ONE fact per carried unverified task instead of
+    rewriting its scope, deployed, live and live-verified facts (the pre-fix
+    behaviour, four writes each). The size is the plain default group (25), not
+    the request bound: the behaviour is size-independent and 200 tasks cost the
+    full suite ~33 s (kittrial-5bb.119 p3 item 1). The 200-target figures stay
+    documented from the real-bd measurement.
+    """
+
+    def release_scope(self, release='r-2', environment='production'):
+        return {'source_commit': '', 'integration_commit': RELEASE_COMMIT,
+                'release_id': release, 'environment': environment}
+
+    def writes(self, store):
+        return len([call for call in store.calls if call[0] == 'set-state'])
+
+    def test_a_later_release_selects_only_what_it_adds_at_the_default_group_size(self):
+        carried = tuple('carried-%03d' % index for index in range(25))
+        store = NativeStore(tasks=carried + ('fresh-001',))
+        for task in carried:
+            store.seed(task)
+        store.seed('fresh-001', integration=MERGE_B, source=SOURCE_B)
+        store.record(release_payload([target(task) for task in carried],
+                                     operation='release-r1', release='r-1'))
+        selection = release_selection(store.rows, self.release_scope(),
+                                      lambda commit, release: True)
+        self.assertEqual([item['task'] for item in selection['targets']], ['fresh-001'],
+                         'a plain later release selects only the tasks it adds')
+        self.assertTrue(all('already deployed' in item['reason'] for item in selection['skipped']),
+                        'the carried tasks are skipped as already deployed')
+
+    def test_a_later_live_verified_writes_one_fact_per_carried_task(self):
+        tasks = tuple('task-%03d' % index for index in range(25))
+        store = NativeStore(tasks=tasks)
+        for task in tasks:
+            store.seed(task)
+        first = store.record(release_payload([target(task) for task in tasks],
+                                             operation='release-r1', release='r-1'))
+        self.assertEqual(len(first['targets']), len(tasks))
+        # The second run names a LATER release (r-2), so it verifies the carried
+        # task from a later release rather than re-testing r-1 (.119 p3 item 2).
+        again = release_selection(store.rows, self.release_scope(release='r-2'),
+                                  lambda commit, release: True, live_verified=True)
+        self.assertEqual(again['verify_only'], sorted(tasks),
+                         'every carried unverified task is verification-only')
+        before = self.writes(store)
+        second = store.record(release_payload(list(again['targets']),
+                                              operation='verify-r2', release='r-2',
+                                              live_verified=True))
+        writes = self.writes(store) - before
+        self.assertEqual(writes, len(tasks),
+                         'a later --live-verified must write ONE live-verified fact per carried '
+                         'task, not rewrite scope/deployed/live/live-verified (four each)')
+        self.assertTrue(all(item['verify_only'] for item in second['targets']))
+        self.assertTrue(all(item['deployed'] is None and item['scope_recorded'] is False
+                            for item in second['targets']))
+        # Once verified, a further --live-verified is a no-op: nothing is written.
+        before = self.writes(store)
+        store.record(release_payload(list(again['targets']),
+                                     operation='verify-r2-again', release='r-2',
+                                     live_verified=True))
+        self.assertEqual(self.writes(store) - before, 0,
+                         'a verified carried task costs no further write')
+        self.assertTrue(all(store.facts(task)['facts']['live-verified']['value'] == 'passed'
+                            for task in tasks),
+                        'the verification is filed under the carried deployment, not r-2')
+        self.assertEqual(store.facts(tasks[0])['scope']['release_id'], 'r-1',
+                         'verifying from a later release does not move the carried scope')
+
+
+class ReleaseWriteCostTests(unittest.TestCase):
+    """Why a --live-verified first deployment costs about twice a plain one (.119 p3 item 4).
+
+    The difference is not a slower write: it is MORE bd processes. When a task
+    already carries the target label, ``_apply_fact`` moves it through an
+    intermediate ``pending`` value first, so a second-environment deployment of
+    already-labelled tasks issues six ``set-state`` processes per target for four
+    planned facts (seven once an earlier run also verified the task, when
+    ``live-verified`` is rewritten through ``pending`` too), while a plain first
+    deployment issues three for three. The per-write estimate uses the
+    per-planned-fact cost, which covers them.
+    """
+
+    def processes(self, store, before):
+        return [call for call in store.calls[before:] if call[0] == 'set-state']
+
+    def test_the_extra_cost_is_more_processes_not_a_slower_write(self):
+        tasks = tuple('t-%03d' % index for index in range(3))
+        store = NativeStore(tasks=tasks)
+        for task in tasks:
+            store.seed(task)
+        before = len(store.calls)
+        store.record(release_payload([target(task) for task in tasks],
+                                     operation='rel-r1', release='r-1'))
+        plain = self.processes(store, before)
+        self.assertEqual(len(plain), 3 * len(tasks),
+                         'a plain first deployment is one process per fact')
+        before = len(store.calls)
+        store.record(release_payload([target(task) for task in tasks],
+                                     operation='rel-r3', release='r-3', environment='staging',
+                                     live_verified=True))
+        verified = self.processes(store, before)
+        completed = {}
+        for call in verified:
+            dimension, value = call[2].split('=', 1)
+            completed[(call[1], dimension, value)] = completed.get((call[1], dimension, value), 0) + 1
+        self.assertEqual(len(verified), 2 * len(plain),
+                         'the second-environment --live-verified run issues twice the processes')
+        for task in tasks:
+            self.assertEqual(completed[(task, 'deployed', 'pending')], 1)
+            self.assertEqual(completed[(task, 'live', 'pending')], 1)
+        self.assertEqual(sorted({call[1] for call in verified}), sorted(tasks))
+
+
 class PreviousReleaseValidationTests(ReleaseCommandTests):
     """--previous-release-commit is validated before git is used (.107 item 5)."""
 
@@ -1519,20 +1758,40 @@ class ReleaseGroupReportingTests(ReleaseCommandTests):
 
 
 class ReleaseCostEstimateTests(unittest.TestCase):
-    """expected_seconds is an upper bound and the default group is small (.107 item 6)."""
+    """expected_seconds is a conservative per-WRITE estimate (.107 item 6, .119 items 3-4)."""
 
-    def test_the_estimate_covers_the_measured_cost(self):
-        self.assertLessEqual(lifecycle.RELEASE_CHUNK_DEFAULT, 25)
-        per_target = lifecycle.DRY_RUN_SECONDS_PER_TARGET
-        fixed = lifecycle.DRY_RUN_FIXED_SECONDS
-        # Each target now costs three writes, and the reviewer measured 438 s for
-        # 201 targets (rev3 item 3.3), so the stated upper bound must clear that.
-        self.assertGreaterEqual(round(fixed + per_target * 201, 1), 438.0)
-        self.assertGreaterEqual(round(fixed + per_target * 50, 1), 86.0)
-        self.assertLessEqual(round(fixed + per_target * lifecycle.RELEASE_CHUNK_DEFAULT, 1), 150.0,
-                             'one default group must stay inside the 150 s client timeout')
+    def test_the_per_write_estimate_covers_the_measured_cost(self):
+        # The floors are hard-coded so weakening the constants the estimate rests
+        # on, or zeroing the fixed part, FAILS (.119 p3 item 3). This revision's
+        # clean re-measurements of the delivered kit on real bd 1.2.2 + Dolt (two
+        # runs) measured 0.43-0.57 s per bd process and up to 0.92 s per planned
+        # fact on the slowest case (a first --live-verified deployment to a second
+        # environment); the policy figure keeps 1.5 s per planned fact, which also
+        # covers the reviewer's measured 1.47 s.
+        self.assertGreaterEqual(lifecycle.DRY_RUN_MEASURED_SECONDS_PER_WRITE, 1.0)
+        self.assertGreaterEqual(lifecycle.DRY_RUN_SECONDS_PER_WRITE, 1.5)
+        self.assertGreaterEqual(lifecycle.DRY_RUN_MEASURED_FIXED_SECONDS, 15.0)
+        self.assertGreaterEqual(lifecycle.DRY_RUN_SECONDS_PER_WRITE,
+                                lifecycle.DRY_RUN_MEASURED_SECONDS_PER_WRITE,
+                                'the estimate must cover the measured per-write cost')
+        self.assertGreaterEqual(lifecycle.DRY_RUN_FIXED_SECONDS,
+                                lifecycle.DRY_RUN_MEASURED_FIXED_SECONDS,
+                                'the fixed part must cover the measured request overhead')
+        # The measured runs the estimate must clear: 201 targets at 438 s with
+        # three writes each (rev3 item 3.3), and the reviewer's 25- and 50-target
+        # first --live-verified releases at 139 s and 295 s (.119 item 3).
+        self.assertGreaterEqual(lifecycle.release_group_estimate(3 * 201), 438.0)
+        self.assertGreaterEqual(lifecycle.release_group_estimate(4 * 25), 139.0)
+        self.assertGreaterEqual(lifecycle.release_group_estimate(4 * 50), 295.0)
+        # A plain default group and the smaller --live-verified default group each
+        # stay inside the client timeout.
+        self.assertLessEqual(lifecycle.release_group_estimate(3 * lifecycle.RELEASE_CHUNK_DEFAULT),
+                             lifecycle.RELEASE_CLIENT_TIMEOUT_SECONDS)
+        self.assertLessEqual(
+            lifecycle.release_group_estimate(4 * lifecycle.RELEASE_CHUNK_VERIFIED_DEFAULT),
+            lifecycle.RELEASE_CLIENT_TIMEOUT_SECONDS)
 
-    def test_the_dry_run_uses_the_upper_bound_formula(self):
+    def test_the_estimate_follows_the_planned_writes(self):
         store = (NativeStore(tasks=('trial-a', 'trial-b', 'trial-c'))
                  .seed('trial-a').seed('trial-b').seed('trial-c'))
         client = types.ModuleType('client')
@@ -1541,9 +1800,57 @@ class ReleaseCostEstimateTests(unittest.TestCase):
             argv = ReleaseCommandTests.fixture(self, root, store) + ['--dry-run']
             report = json.loads(ReleaseCommandTests.run_cli(self, argv, client))
         self.assertEqual(report['total_chunks'], 1)
-        self.assertEqual(report['expected_seconds'],
-                         round(lifecycle.DRY_RUN_FIXED_SECONDS
-                               + lifecycle.DRY_RUN_SECONDS_PER_TARGET * 3, 1))
+        self.assertEqual(report['chunk_size'], lifecycle.RELEASE_CHUNK_DEFAULT)
+        self.assertEqual(report['planned_writes'], 3 * 3)
+        self.assertEqual(report['expected_seconds'], lifecycle.release_group_estimate(9))
+
+    def test_a_first_live_verified_run_uses_a_smaller_group_and_warns(self):
+        # A default group of 25 first --live-verified targets is about the client
+        # timeout (measured 139 s), so the default group shrinks and the run says
+        # why (.119 item 3). 30 targets prove the smaller group really chunks.
+        tasks = tuple('trial-%02d' % index for index in range(30))
+        store = NativeStore(tasks=tasks)
+        for task in tasks:
+            store.seed(task)
+        client = types.ModuleType('client')
+        client.request = lambda *args, **kwargs: {'returncode': 0, 'stdout': '{}', 'stderr': ''}
+        with scratch() as root:
+            argv = ReleaseCommandTests.fixture(self, root, store, live_verified=True) + ['--dry-run']
+            report = json.loads(ReleaseCommandTests.run_cli(self, argv, client))
+        self.assertEqual(report['chunk_size'], lifecycle.RELEASE_CHUNK_VERIFIED_DEFAULT)
+        self.assertEqual(report['chunks'], [lifecycle.RELEASE_CHUNK_VERIFIED_DEFAULT] * 2)
+        self.assertEqual(report['planned_writes'], 4 * len(tasks))
+        self.assertEqual(report['expected_seconds'], lifecycle.release_group_estimate(4 * len(tasks)))
+        self.assertTrue(any('FOUR facts per new target' in warning for warning in report['warnings']))
+        self.assertFalse(any('client timeout' in warning for warning in report['warnings']))
+
+    def test_a_plain_run_keeps_the_default_group(self):
+        tasks = tuple('trial-%02d' % index for index in range(30))
+        store = NativeStore(tasks=tasks)
+        for task in tasks:
+            store.seed(task)
+        client = types.ModuleType('client')
+        client.request = lambda *args, **kwargs: {'returncode': 0, 'stdout': '{}', 'stderr': ''}
+        with scratch() as root:
+            argv = ReleaseCommandTests.fixture(self, root, store) + ['--dry-run']
+            report = json.loads(ReleaseCommandTests.run_cli(self, argv, client))
+        self.assertEqual(report['chunk_size'], lifecycle.RELEASE_CHUNK_DEFAULT)
+        self.assertEqual(report['chunks'], [lifecycle.RELEASE_CHUNK_DEFAULT, 5])
+        self.assertEqual(report['planned_writes'], 3 * len(tasks))
+
+    def test_an_explicit_group_over_the_client_timeout_warns(self):
+        tasks = tuple('trial-%02d' % index for index in range(30))
+        store = NativeStore(tasks=tasks)
+        for task in tasks:
+            store.seed(task)
+        client = types.ModuleType('client')
+        client.request = lambda *args, **kwargs: {'returncode': 0, 'stdout': '{}', 'stderr': ''}
+        with scratch() as root:
+            argv = (ReleaseCommandTests.fixture(self, root, store, live_verified=True)
+                    + ['--dry-run', '--chunk-size', '50'])
+            report = json.loads(ReleaseCommandTests.run_cli(self, argv, client))
+        self.assertEqual(report['chunk_size'], 50)
+        self.assertTrue(any('client timeout' in warning for warning in report['warnings']))
 
 
 class RollbackSemanticsTests(unittest.TestCase):

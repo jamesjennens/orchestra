@@ -207,6 +207,7 @@ history](#malformed-structured-history) (`void-record`).
 | `capability-verify PROJECT --actor ACTOR --file payloads.json` | record capability checks as **verified**. The file is what `capability check --repo . --payloads payloads.json` wrote at the commit being verified (one payload, or `{schema_version, items}` of up to 500). Each item is one capability and takes the coordination lock on its own; the result is `recorded`, `already-recorded` or `refused` per item, and re-running the file is safe. This is the only route that writes a verified check: `capability check --record` through the endpoint always writes an unverified report | the deployment operator allowlist or the `verifiers` list, both checked before any read |
 | `verifiers list\|add\|remove [ACTOR] [--confirm-revoke]` | manage the deployment `verifiers` list: actors, other than operators, whose `capability-verify` records readers count as verified. The list is empty by default and grants nothing else. `remove` needs `--confirm-revoke`; the refusal names the capabilities whose verification would change | shell access to the coordination host; `deployment.private.json` is the only authority source |
 | `review-writes status\|on\|off --actor OPERATOR` | read or set the per-installation switch that allows **writing** the new review-workflow record shapes (`withdraw`, `request-review`, `resolve-item`, `decline-review`, an item `severity`, a request-changes `summary`). Readers in this kit understand those shapes either way; with the switch off (the default) a write of one is refused before any native write. See [Review-workflow write switch](#review-workflow-write-switch) | the deployment operator allowlist, checked before any write; `deployment.private.json` is the only source (there is no environment fallback) |
+| `checkpoint-provenance-writes status\|on\|off --actor OPERATOR` | read or set the per-installation switch that allows **writing** checkpoint provenance and direction dispositions (acknowledge, resolve, supersede). Readers in this kit understand them either way; with the switch off (the default) a checkpoint that asks for them is refused before any native write. See [Checkpoint provenance write switch](#checkpoint-provenance-write-switch) | the deployment operator allowlist, checked before any write; `deployment.private.json` is the only source |
 | `proposal-review PROJECT --actor OPERATOR --file review.json` | record a coordinator disposition on a requirement proposal. The payload is `{schema_version, operation_id, key, previous, proposal_sha256, to_state, ...}`: `previous` is the `disposition_comment_id` and `proposal_sha256` the `sha256` that `proposal get` returned, so a stale read is refused before any write. `to_state` is `under-review` (the claim), `rejected` (with `reason`), `duplicate-of` (with `duplicate_of`), `needs-info` (with `question`), `escalated-to-owner` (with `escalation: {question, owner_identity, due_by}`) or `incorporated` (with `incorporation`, checked against the requirement record) | the deployment operator allowlist, checked before any read; the actor must be mapped to a person and must not be the submitter |
 | `proposal-decide PROJECT --actor OPERATOR --file decision.json` | record the owner decision on an escalated proposal: `to_state` `approved` or `rejected` (with `reason`), and `decision: {decision_id}` naming an existing native decision issue. Never a requirement id | the allowlist; the decider must be a different person than the escalator and must not be the submitter |
 | `proposal-settings PROJECT --actor OPERATOR [--map-actor ACTOR --to IDENTITY] [--namespace NAME --to IDENTITY] [--unmap-actor ACTOR] [--unmap-namespace NAME] [--add-decider IDENTITY] [--remove-decider IDENTITY]` | with no change, print the contribution settings; otherwise write the next settings record, composed from the current one and bound to its hash | the allowlist |
@@ -476,6 +477,106 @@ hazard as the `assignee_at_approval` snapshot): reconcile with
 `admin.py void-record` on each affected record, or stay forward. Turning the switch
 off again does not remove records already written; it only stops new ones.
 
+### Checkpoint provenance write switch
+
+kittrial-5bb.1 lets a checkpoint record which activity it incorporated (per-entry
+provenance) and lets the assignee record an explicit disposition for another actor's
+direction: acknowledged, resolved or superseded. A kit built before that change does
+not read those records, so writing them is staged like the review-workflow shapes:
+every kit from `orchestra-06f7807-20261005i` on **reads** them, and writing them is
+off until an operator turns it on. [BRIEFINGS.md](BRIEFINGS.md) describes what workers
+see in each state; this section is the operator's procedure.
+
+```sh
+python3 admin.py checkpoint-provenance-writes status --actor OPERATOR   # current value (default: off)
+python3 admin.py checkpoint-provenance-writes on  --actor OPERATOR      # allow the new records
+python3 admin.py checkpoint-provenance-writes off --actor OPERATOR      # stop new ones (see one-way below)
+```
+
+`--actor` must be on the deployment operator allowlist. Every `on`/`off` appends who,
+when, the previous and the new value to `checkpoint_provenance_audit` in
+`deployment.private.json`, in the same atomic write as the switch. An `on` when it is
+already on, or an `off` when it is already off, writes nothing and answers `changed:
+false`, as `review-writes` does (kittrial-5bb.136; before, it appended an entry).
+
+**One lock for every change to `deployment.private.json`.** Both switches,
+`operators add|remove`, `verifiers add|remove` and the `--restore-operators` /
+`--restore-verifiers` merges of `restore-new` take the deployment lock
+(`.review-writes.lock`) across their whole read-modify-write and re-read the file under
+it, so two changes made at the same instant, from any two of these commands, never lose
+one another (kittrial-5bb.131, kittrial-5bb.136). A change that finds the lock held
+waits up to 10 seconds; these changes take milliseconds, so a holder that keeps it longer
+is stuck, and the command then refuses with `Nothing was changed: another change to
+deployment.private.json still holds its lock ...` instead of waiting for good. Run it
+again; if it repeats, find the holder (`fuser RUNTIME/.review-writes.lock`). A killed
+holder releases the lock with its process. Reads (`status`, `operators list`, every
+endpoint read) never take the lock.
+
+**A damaged audit.** If the audit key has been hand-edited into something that is not
+a list of entries of the shape the switch writes (`actor`, `at`, `action` on/off,
+`previous` and `enabled` true/false, and nothing else), `status` still answers,
+reading it as an empty history with a warning (`audit_readable: false`). The next
+`on`/`off` that changes the value keeps the damaged value aside in the same file under
+`checkpoint_provenance_audit_damaged_<UTC stamp>` (`_2`, `_3` on a collision, never
+overwriting) and starts a fresh list, as `review-writes` keeps a damaged audit file
+aside. A kept value stays in the file for good and is read and rewritten with it by
+every later change; once you have looked at it (or copied it elsewhere), you may delete
+a `checkpoint_provenance_audit_damaged_*` key from `deployment.private.json` by hand. Do
+that while no change to the file is running, and keep the file's permissions (`0600`).
+
+**Before turning it on, check:**
+
+1. **Every installation that could become a rollback target, or that could receive a
+   restored backup of a project from here, runs a reader kit** - any release from
+   `orchestra-06f7807-20261005i` on. A project's checkpoint records travel in its
+   native backup, so `restore-new` on an older kit would meet records it cannot read.
+2. `checkpoint-provenance-writes status` on each installation reads `false` and
+   `audit_readable: true` (or you have looked at the warning and accept a fresh
+   history).
+3. Workers are told (below), so a refusal or a direction that stays outstanding is
+   not a surprise.
+
+**Order across installations.** The switch is per installation; there is no global
+one. Upgrade every installation to a reader kit first and leave all switches off;
+verify `brief`, `work --mine` and `checkpoint TASK --directions` on each. Then turn
+the switch on one installation at a time, starting with the one whose projects you
+can most easily reconcile, and check one checkpoint there (`brief` shows its
+provenance; a disposition is accepted) before the next. Never turn it on where a
+project might later be restored onto a pre-reader kit.
+
+**What changes for workers when it is on:**
+
+* The assignee can acknowledge, resolve or supersede another actor's direction in a
+  checkpoint's `directions`; they persist across later checkpoints.
+* A plain checkpoint no longer clears outstanding directions: a direction stays on
+  `brief` and `work --mine` until it is explicitly resolved or superseded.
+  (With the switch off, the next checkpoint by anyone advances the legacy baseline.)
+* A checkpoint by someone who is not the assignee no longer clears the assignee's
+  directions or moves their cutoff.
+
+**It is one-way per task.** Once a task holds a checkpoint record in the new shape,
+turning the switch off again does not convert it: no kit writes a further checkpoint
+on that task until the switch is back on (a legacy write is refused before mutation
+rather than hiding outstanding directions), and a pre-reader kit still cannot read the
+task. `off` only stops new tasks from starting to use the new records. Plan to stay on.
+
+**If a rollback is needed after it is on.** Roll back only to a reader kit (any release
+from `orchestra-06f7807-20261005i` on): it reads every record the switch let workers
+write, and it honours the switch in `deployment.private.json`, so nothing needs
+changing. Turning the switch off first does not prepare a deeper rollback: records
+already written stay, and the tasks holding them refuse further checkpoints while it
+is off (one-way, above). Going below a reader kit leaves those tasks unreadable there.
+If that cannot be avoided, keep the rollback short, do not write checkpoints on those
+tasks while it lasts, and return to a reader kit before relying on their briefs; there
+is no command that converts the records back.
+
+**Telling workers.** Set standing guidance on each project (`admin.py set-guidance
+PROJECT --actor OPERATOR --file FILE`), which every worker reads at the start of a run,
+with a short note such as: "Checkpoint directions are on: acknowledge or resolve other
+people's instructions in your checkpoint's `directions` (see `checkpoint TASK
+--directions`); a plain checkpoint no longer clears them." Point them at
+[BRIEFINGS.md](BRIEFINGS.md) for the field shapes.
+
 ### Rollback of the release/liveness change
 
 Rolling the deployment back below the kit that reads the additive `live` dimension
@@ -536,7 +637,7 @@ Restore drills deliberately create a new project:
 python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime restore-new example examplerestore
 ```
 
-It refuses a populated destination, restores status and comments, and retains original issue IDs. The native restore is Dolt's own restore through the SQL client (`CALL DOLT_BACKUP('restore', '--force', 'file://.../backups/SOURCE', 'DEST')` over the loopback connection, bounded by the same explicit 30-minute ceiling as `backup`), not `bd backup restore`, which has the same fixed client read timeout of about ten seconds as `bd backup sync`: a 588 MB backup failed under `bd backup restore` at exactly 10 s (`i/o timeout`, `invalid connection`) and takes about a minute through the SQL client. The client runs in its own session/process group with the password in the environment, never on a command line; a normal `SIGTERM`, Ctrl-C or the ceiling stops that whole process group before the source's backup lock is released. Because bd does not run the restore, the kit then performs the one step `bd backup restore --force` would have performed itself: it writes the restored database's `_project_id` into the destination's `.beads/metadata.json` (every other key is kept), so bd accepts the restored project instead of refusing it with `PROJECT IDENTITY MISMATCH`; a backup that records no project identity leaves the file unchanged, as bd does. The command prints `Restored backups/SOURCE into DEST through the Dolt SQL client in N s.` and, when the identity changed, the identity it adopted. A destination with no Dolt server metadata in `.beads/metadata.json` has no SQL coordinates and keeps the `bd backup restore` path, as `backup` keeps `bd backup sync`. The native restore also carries the source project's recorded backup target, so `.beads/dolt-backup.json` and the restored `dolt_backups` row would still name `backups/SOURCE`; `restore-new` re-points the destination at `backups/DEST` immediately after the restore, and `backup` refuses (before any native command) a project whose recorded target is not its own `backups/<name>`, naming the recorded URL and the expected directory, so a clone that was never re-pointed cannot overwrite the source project's backup directory. A clone restored before that re-point existed (or whose re-point failed) is repaired in place with `admin.py backup-repoint DEST`, which runs `bd backup init backups/DEST` under the kit environment and verifies both `.beads/dolt-backup.json` and the `dolt_backups` row before reporting success; do not run a bare `bd backup init` (it fails without the kit environment, `Error 1045 Access denied for user root`) and do not re-run `restore-new` onto an existing name (it is refused and would discard the clone). Re-pointing moves no data: if the clone was ever backed up while still mis-pointed, the SOURCE project's `backups/SOURCE` may hold the clone's data, so back the SOURCE project up again before relying on that backup. Inspect records and comments before any cutover. Checkpoint activity cursors bind the project name: `restore-new` to a different name makes retained checkpoints read as newer activity (the tip calls this STALE CHECKPOINT), even when native task bytes are unchanged. This is a scope change, not proof of a new comment. Reconcile the restored history and write a fresh checkpoint under the destination name before trusting its next action. Do not run both copies as live coordination trackers. A complete host-loss recovery requires reinstalling the pinned kit on a replacement host, placing the saved backup and its coordination sidecar under its backups directory (with timestamps preserved, see below), using restore-new, verifying it, then updating client project/host settings. No manual restore through the SQL client or edit of `.beads/metadata.json` is needed at any project size: `restore-new` does both. Re-grant operators and verifiers deliberately afterwards (the restore reports them as NOT restored), and take a fresh `backup` of the restored project before relying on it. A separate-deployment drill exercises backup transfer; actual replacement-host outage recovery remains an operator exercise.
+It refuses a populated destination, restores status and comments, and retains original issue IDs. The native restore is Dolt's own restore through the SQL client (`CALL DOLT_BACKUP('restore', '--force', 'file://.../backups/SOURCE', 'DEST')` over the loopback connection, bounded by the same explicit 30-minute ceiling as `backup`), not `bd backup restore`, which has the same fixed client read timeout of about ten seconds as `bd backup sync`: a 588 MB backup failed under `bd backup restore` at exactly 10 s (`i/o timeout`, `invalid connection`) and takes about a minute through the SQL client. The client runs in its own session/process group with the password in the environment, never on a command line; a normal `SIGTERM`, Ctrl-C or the ceiling stops that whole process group before the source's backup lock is released. Because bd does not run the restore, the kit then performs the one step `bd backup restore --force` would have performed itself: it writes the restored database's `_project_id` into the destination's `.beads/metadata.json` (every other key is kept), so bd accepts the restored project instead of refusing it with `PROJECT IDENTITY MISMATCH`; a backup that records no project identity leaves the file unchanged, as bd does. The command prints `Restored backups/SOURCE into DEST through the Dolt SQL client in N s.` and, when the identity changed, the identity it adopted. A destination with no Dolt server metadata in `.beads/metadata.json` has no SQL coordinates and keeps the `bd backup restore` path, as `backup` keeps `bd backup sync`. The native restore also carries the source project's recorded backup target, so `.beads/dolt-backup.json` and the restored `dolt_backups` row would still name `backups/SOURCE`; `restore-new` re-points the destination at `backups/DEST` immediately after the restore, and `backup` refuses (before any native command) a project whose recorded target is not its own `backups/<name>`, naming the recorded URL and the expected directory, so a clone that was never re-pointed cannot overwrite the source project's backup directory. A clone restored before that re-point existed (or whose re-point failed) is repaired in place with `admin.py backup-repoint DEST`, which runs `bd backup init backups/DEST` under the kit environment and verifies both `.beads/dolt-backup.json` and the `dolt_backups` row before reporting success; do not run a bare `bd backup init` (it fails without the kit environment, `Error 1045 Access denied for user root`) and do not re-run `restore-new` onto an existing name (it is refused and would discard the clone). Re-pointing moves no data: if the clone was ever backed up while still mis-pointed, the SOURCE project's `backups/SOURCE` may hold the clone's data, so back the SOURCE project up again before relying on that backup. Inspect records and comments before any cutover. Checkpoint activity cursors name the project they were taken in, and `restore-new` gives the project a new name. From kittrial-5bb.131 a kit compares a retained checkpoint's cursor under the project it names, so a restored task whose content has not changed reads as current, as it already did on `work --mine`, and real activity after the restore is still reported as newer activity. Because current no longer prompts for it, `brief` says where such a checkpoint was taken (kittrial-5bb.136): `checkpoint.taken_in_project` names the source project, the text form adds `Checkpoint taken in project: NAME`, and the next action starts with `CHECKPOINT FROM PROJECT NAME:` asking you to confirm the history before relying on it. A kit before kittrial-5bb.131 makes every retained checkpoint read as newer activity after a rename (STALE CHECKPOINT in `brief`), even when native task bytes are unchanged; that is a scope change, not proof of a new comment. On such a kit, reconcile the restored history and write a fresh checkpoint under the destination name before trusting its next action. Cursors are written the same way by every kit, so mixed kits read each other's checkpoints. Do not run both copies as live coordination trackers. A complete host-loss recovery requires reinstalling the pinned kit on a replacement host, placing the saved backup and its coordination sidecar under its backups directory (with timestamps preserved, see below), using restore-new, verifying it, then updating client project/host settings. No manual restore through the SQL client or edit of `.beads/metadata.json` is needed at any project size: `restore-new` does both. Re-grant operators and verifiers deliberately afterwards (the restore reports them as NOT restored), and take a fresh `backup` of the restored project before relying on it. A separate-deployment drill exercises backup transfer; actual replacement-host outage recovery remains an operator exercise.
 
 ### Coordination journals and interrupted recovery
 

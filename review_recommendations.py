@@ -49,6 +49,8 @@ ITEMS_MAX = 20
 PAYLOAD_MAX_BYTES = 24000
 #: At most this many standing recommendations are read for one contribution (the newest).
 READ_MAX = 20
+#: How many of the standing recommendations are returned with their whole content.
+FULL_MAX = 5
 COMMIT = re.compile(r'(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})')
 #: The review states in which a recommendation may be written and stands.
 OPEN_STATES = ('awaiting-review',)
@@ -110,7 +112,7 @@ def validate(payload, task):
 
 
 def check_plain_text(payload):
-    """The plain-text rule of review records, on the write path."""
+    """The plain-text rule of review records, on the write path and again on every read."""
     review_workflow.plain_text(payload['summary'], 'summary')
     for item in payload['items']:
         review_workflow.plain_text(item['text'], 'note text')
@@ -133,6 +135,10 @@ def _records(issue):
             validate(payload, issue.get('id'))
             if raw != PREFIX + canonical_bytes(payload).decode():
                 raise ValueError('not the canonical bytes of the record')
+            # The write path refuses hidden and control characters; a record that reached the
+            # task another way (an older kit's raw path, a native write) is held to the same
+            # rule here, so nothing is displayed that this kit would not have accepted.
+            check_plain_text(payload)
             review_workflow.identity(str(comment['id']))
             if not isinstance(comment.get('author'), str) or not comment['author'].strip():
                 raise ValueError('no native author')
@@ -160,8 +166,12 @@ def standing(issue, state):
     ``state`` is the task's review projection (``review_workflow.project``). A
     recommendation stands when the task is open, its review reads awaiting-review, the
     record names the current contribution and its commit, it was written after that
-    contribution by neither its author nor the task's assignee, and no decision on the
-    contribution was written after it. One per author (the newest), at most READ_MAX.
+    contribution by someone other than its author, and no decision on the contribution
+    was written after it. One per author (the newest), at most READ_MAX.
+
+    The task's assignee is refused when the record is WRITTEN, not here: the reader
+    sees only who is assigned now, and a task reassigned to someone who had already
+    recommended must not lose that recommendation (kittrial-5bb.115 review).
     """
     contribution = (state or {}).get('contribution') or {}
     if not contribution.get('comment_id') or (state or {}).get('review_state') not in OPEN_STATES:
@@ -186,8 +196,7 @@ def standing(issue, state):
         if isinstance(record, dict) and record.get('operation') in DECISIONS \
                 and record.get('contribution') == contribution['comment_id']:
             decided = max(decided, position)
-    excluded = {review_workflow.author_key(contribution.get('author')),
-                review_workflow.author_key(issue.get('assignee'))} - {None, ''}
+    excluded = {review_workflow.author_key(contribution.get('author'))} - {None, ''}
     records, _ = _records(issue)
     newest = {}
     for position, payload, comment in records:
@@ -208,9 +217,12 @@ def standing(issue, state):
 def block(issue, state):
     """The additive reader fields: the newest standing recommendation and who recommends."""
     views = standing(issue, state)
+    # Every entry names who and when. The newest FULL_MAX also carry their whole content
+    # (additive): the web service leaves out a recommendation by the author's own person,
+    # and then shows the next one, which it could not do from a name and a time.
+    brief = lambda view: {'comment_id': view['comment_id'], 'author': view['author'], 'timestamp': view['timestamp']}
     return {'recommendation': views[0] if views else None,
-            'recommendations': [{'comment_id': view['comment_id'], 'author': view['author'],
-                                 'timestamp': view['timestamp']} for view in views],
+            'recommendations': [dict(view) if index < FULL_MAX else brief(view) for index, view in enumerate(views)],
             'recommended': bool(views)}
 
 

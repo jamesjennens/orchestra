@@ -188,6 +188,14 @@ The rules:
   second registration is refused with 409, naming the existing record (archived or not).
   An exact retry of a successful registration with the same `Idempotency-Key` replays
   its 201.
+- A few names are reserved for the server's own routes and cannot be registered:
+  `unconfirmed` is the upgrade check below (`GET /v1/projects/unconfirmed`). Registering
+  one is refused with 422 before the host is asked, because the record could never be
+  read back under its own name.
+- Registration writes `registered_by` (the superuser who registered it) on the record.
+  That mark is what makes the mapping count as superuser-backed, so it keeps working even
+  if that superuser is later demoted. A record made by an older kit has no such mark; a
+  confirmation backfills it, and see the limit on that below.
 - If no initialized canonical project `NAME` exists, the request is refused with 422 and
   nothing is stored.
 - Registering makes the superuser the project's only member (owner). Add members
@@ -223,19 +231,47 @@ a `proj_...` record until a superuser decides. After every upgrade to this kit o
      shows the creator and the members first). The canonical project must exist on the
      host. The members keep their access, so review them; the confirmation is recorded
      on the record (`confirmed_by`, `confirmed_at`) and in the audit log
-     (`projects.confirm`); or
+     (`projects.confirm`), and it backfills `registered_by` when the record has no such
+     mark, so the mapping stays superuser-backed if the confirming superuser is later
+     demoted; or
    - **archives** it (`POST /v1/projects/{id}/archive`).
 3. Archive each `no-canonical` entry (a `proj_...` id).
+
+**The backfill's limit (a known exposure, not closed).** A confirmation backfills
+`registered_by` only for a record that has no such mark, and a record can only be
+confirmed while the backend will not serve it. A record whose creator is still a
+superuser is *usable*, so the confirm route refuses it with 409 "This project needs no
+confirmation" and the backfill **cannot** be applied yet. Demote that creator first (or
+wait until nothing else makes the mapping superuser-backed) and the read turns unusable,
+which is exactly when confirm works and stamps `registered_by` beside `confirmed_by`.
+Until then such a record stays usable only for as long as someone is a superuser behind
+it: demoting the creator without confirming first leaves it unusable, and the confirmation
+is then available. There is deliberately no route that stamps the mark on a record the
+service is already serving.
 
 **What an unusable record still allows.** While a record is unconfirmed or has no
 canonical project:
 - Reads of the record, its members and its credentials work. Its task, review and queue
-  routes answer 409 before any endpoint call.
+  routes answer 409 before any endpoint call. Usability is judged live on every read, not
+  from the short read cache, so a record that becomes unusable (for example its creator is
+  demoted) stops being served at once.
 - Nothing that grants or extends access is accepted (409): adding a member or changing a
-  role, issuing a worker credential, a new agent grant.
+  role, issuing a worker credential, a new agent grant, or a new credential for an agent
+  that already holds a grant on the record.
 - Everything that removes access works: removing a member, revoking a worker credential,
   revoking an agent's grant, archiving. Cleaning up a suspicious record never requires
   confirming it first.
+- The refusal is given only to a caller who may touch the thing being changed. On the agent
+  routes an account that may not administer the agent gets the ordinary 404 `Agent not
+  found` (and `Project not found` for a project its owner cannot see), never the
+  unusable-record sentence, so the refusal cannot be used to probe for agent ids, record
+  ids or their owners' memberships.
+- **An archived unusable record** is a special case of the refusal: it cannot be confirmed
+  (the confirm route refuses an archived record), so the 409 says so and names the route
+  that works — removing the access being added (an agent grant, a membership, a
+  credential). An agent that still holds a grant on an archived record therefore gets a new
+  credential as soon as its owner removes that grant, instead of being told to confirm or
+  archive a record that is already archived.
 
 With `--backend inprocess` (disposable local validation) everything is service-local, so
 "New project" still creates the project directly (`project_create: create`), and no record
@@ -1486,8 +1522,9 @@ line separately and unconfined.
   - **One action per own task, in this order:** `changes-requested` (priority 1, with
     `requests`, the request-changes record ids), `blocked` (2: the latest checkpoint
     lists open items; with `open_items`, `blocked_since` and `newer_activity`),
-    `in-progress` (3: claimed, not closed, nothing delivered yet), then
-    `claimable-task` (4), then `awaiting-review` and `awaiting-integration` (5).
+    `in-progress` (3: claimed, not closed, nothing delivered yet), then review work
+    and `claimable-task` (4, see below), then `awaiting-review` and
+    `awaiting-integration` (5).
     `review-error` names the malformed state and asks an operator to reconcile it;
     other own states get `review-state`, naming the state and who acts next. Neither
     silently disappears from the action list. Action **kind names** are the client
@@ -1498,6 +1535,36 @@ line separately and unconfined.
     Explicitly unreadable checkpoint history keeps `open_items: null` and gets
     `checkpoint-error`, asking an operator to reconcile it. Unknown does not count
     as zero unresolved items or as undelivered work the agent can safely continue.
+  - **Review work (kittrial-5bb.115).** Two kinds, for an agent that holds the reviews
+    capability in the project. They come from the same `work` snapshot: no further
+    read.
+    - `to-review`: a contribution that awaits review and that this agent has not
+      recommended yet. The agent reviews it and records a recommendation or requests
+      changes. `who` is `agent`.
+    - `review-recommended`: a contribution that awaits review and has a standing
+      recommendation, shown to an agent **whose owner can approve**. An agent cannot
+      approve: the action says to tell the owner it is ready. `who` is `owner`.
+    - An agent is shown a delivery only if it could itself recommend it: not its own
+      task or contribution, not its owner's, not another agent of its owner's, and
+      only in a project it is granted.
+    - Each action carries `recommended_by`, `contribution` and `commit`.
+    - `counts` gains `review_recommended` and `to_review`. At most 20 review actions in
+      all, over every project the agent is granted (recommended ones first), are
+      listed, so claimable work stays on the list. The counts are exact and
+      `truncated` says when more exist.
+    - **The `state` values do not change for review work.** An agent with nothing of
+      its own and something to review still reads `idle`. The `summary` names the
+      review work whenever a count is not zero ("1 contribution(s) recommended for
+      approval: tell the owner; 2 contribution(s) to review."), so an owner looking at
+      the agent list is not told there is nothing to do.
+    - The prompt copied from My work (`GET /v1/me/work`, `agent_prompts`) names the
+      same work. A person who may review but not approve gets "Contributions you could
+      review" with the contributions of other people that nobody of theirs has
+      recommended yet; an approver's review lines add "recommended by N reviewer(s)".
+  - **Order within a priority is part of the contract; the numbers are not.**
+    `review-recommended`, `to-review` and `claimable-task` all carry priority 4 and
+    are listed in that order. No kind was renumbered when these two were added. A
+    client relies on the order of `next_actions` and on the kind names.
   - **Why the two waiting kinds are last.** An agent, and anything that wakes it,
     takes the first action. The agent can do nothing about a contribution that waits
     for a reviewer or for integration, so those never sit ahead of work it can do.
