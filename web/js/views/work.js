@@ -99,15 +99,19 @@ export async function welcome(ctx) {
 // project is made on the server and registered in one step; the creator is its owner.
 // `creation` is the session's project_host_create: null where the server has no host.
 export function hostCreatePanel(ctx, creation) {
-  if (!creation || !(creation.allowed || creation.reason === 'limit')) return null;
+  if (!creation || !(creation.allowed || creation.reason === 'limit' || creation.reason === 'server-limit')) return null;
   const numbers = creation.limit == null ? null : `You have created ${creation.used} of the ${creation.limit} projects you may have at one time. Archiving one frees a place.`;
   if (!creation.allowed) {
+    // Two different limits: this account's own, and the server's (an operator's setting).
+    const why = creation.reason === 'server-limit'
+      ? 'This server is at its limit of projects, so no new one can be created. Ask an operator of the server to raise the limit or to make room.'
+      : [numbers, ' Ask a superuser to raise the limit.'];
     return h('section', { class: 'panel', id: 'host-create' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Create a project')),
-      h('div', { class: 'panel-body' }, h('p', { class: 'small muted' }, numbers, ' Ask a superuser to raise the limit.')));
+      h('div', { class: 'panel-body' }, h('p', { class: 'small muted' }, why)));
   }
   const status = h('div', { class: 'banner crit', role: 'alert', hidden: true });
   const form = h('form', { class: 'form', novalidate: true },
-    h('p', { class: 'small muted' }, 'This creates the project on the server (it takes a few seconds) and makes you its owner. You then set it up step by step.', numbers ? ' ' + numbers : ''),
+    h('p', { class: 'small muted' }, 'This creates the project on the server and makes you its owner. It can take from a few seconds to a few minutes: the more projects the server holds, the longer. Keep this page open. You then set it up step by step.', numbers ? ' ' + numbers : ''),
     status,
     field({ id: 'new_project_id', label: 'Project name', hint: '2–24 lowercase letters or digits, beginning with a letter. It becomes the start of every task id and cannot be changed.', required: true, maxlength: 24 }),
     field({ id: 'new_project_name', label: 'Display name (optional)', hint: 'Defaults to the project name.', maxlength: 64 }),
@@ -124,6 +128,8 @@ export function hostCreatePanel(ctx, creation) {
       onError: (e) => {
         // A creation that stopped half way: the server's sentence names the project and says who must act.
         if (e.status === 409 && e.detail && e.detail.state === 'incomplete') { status.replaceChildren(e.message); status.hidden = false; return true; }
+        // Another project is being created: nothing was done, and the same request can be sent again.
+        if (e.status === 503 && e.code === 'busy') { status.replaceChildren(e.message); status.hidden = false; return true; }
         if (e.status === 422 || e.status === 409 || e.status === 403) { setFieldError(form, 'new_project_id', e.message); return true; }
         return false;
       },
@@ -133,21 +139,31 @@ export function hostCreatePanel(ctx, creation) {
   return h('section', { class: 'panel', id: 'host-create' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Create a project')), h('div', { class: 'panel-body' }, form));
 }
 
-// Superuser only: project creations that stopped half way, so that none is forgotten.
+// Superuser only: project creations that run, stopped or finished without being registered,
+// so that none is forgotten; and how full the server is.
+const CREATION_CHIPS = { running: ['Being created', 'plain'], incomplete: ['Did not finish', 'warn'], stalled: ['Did not start', 'warn'],
+  damaged: ['Record damaged', 'warn'], 'created-unregistered': ['Made, not registered', 'warn'] };
 export async function incompleteCreations(ctx) {
   if (!ctx.me.superuser) return null;
   const found = await ctx.api.projectCreations().catch(() => null);
-  const items = (found && found.items) || [];
-  if (!items.length) return null;
+  const items = [...((found && found.items) || []), ...((found && found.unregistered) || [])];
+  const server = found && found.server;
+  if (!items.length && !server) return null;
+  const needing = items.filter((item) => item.state !== 'running').length;
   return h('section', { class: 'panel', id: 'incomplete-creations' },
-    h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Project creations that did not finish ', h('span', { class: 'nav-count' }, items.length))),
+    h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Projects on the server ', needing ? h('span', { class: 'nav-count' }, needing) : null)),
     h('div', { class: 'panel-body stack' },
-      h('p', { class: 'small muted' }, 'Each was started from the web interface and stopped on the server. Nothing is registered here and the name is held. An operator finishes it or removes it on the server; this page does not run anything there.'),
-      items.map((item) => h('div', { class: 'card', 'data-creation': item.project },
-        h('div', { class: 'toolbar' }, h('h2', { class: 'small mono' }, item.project), h('span', { class: 'chip warn' }, item.state === 'damaged' ? 'Record damaged' : 'Did not finish')),
-        h('p', { class: 'small' }, 'Started by ', item.by_name || item.by || 'unknown', item.started_at ? [' ', time(item.started_at)] : null, item.stage ? `; stopped at the step “${item.stage}”.` : '.'),
-        h('p', { class: 'small muted' }, 'To finish it:'), h('pre', { class: 'json' }, item.finish),
-        h('p', { class: 'small muted' }, 'To remove it (the name stays retired):'), h('pre', { class: 'json' }, item.remove)))));
+      server ? h('p', { class: 'small', id: 'server-usage' }, `This server holds ${server.used} of the ${server.limit} project databases its operator allows. `, h('span', { class: 'muted' }, server.note || '')) : null,
+      items.length ? h('p', { class: 'small muted' }, 'Each of these was started from the web interface. Nothing is registered here for it and its name is held. An operator acts on the server; this page does not run anything.') : null,
+      items.map((item) => {
+        const [label, tone] = CREATION_CHIPS[item.state] || [item.state, 'warn'];
+        return h('div', { class: 'card', 'data-creation': item.project, 'data-state': item.state },
+          h('div', { class: 'toolbar' }, h('h2', { class: 'small mono' }, item.project), h('span', { class: 'chip ' + tone }, label)),
+          h('p', { class: 'small' }, 'Started by ', item.by_name || item.by || 'unknown', item.started_at ? [' ', time(item.started_at)] : null, item.stage && item.state !== 'running' ? `; stopped at the step “${item.stage}”.` : '.'),
+          item.what ? h('p', { class: 'small muted' }, item.what) : null,
+          item.finish ? [h('p', { class: 'small muted' }, 'To finish it:'), h('pre', { class: 'json' }, item.finish)] : null,
+          item.remove ? [h('p', { class: 'small muted' }, item.state === 'stalled' ? 'To remove it (nothing was made, so the name is free again):' : 'To remove it (the name stays retired):'), h('pre', { class: 'json' }, item.remove)] : null);
+      })));
 }
 
 export async function directory(ctx) {

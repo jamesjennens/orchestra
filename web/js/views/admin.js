@@ -45,7 +45,7 @@ export async function users(ctx) {
     const others = people.filter((u) => !u.project_grant);
     const limitForm = (u) => {
       const form = h('form', { class: 'toolbar', novalidate: true, 'data-grant': u.id },
-        h('span', null, h('strong', null, u.display_name), ` (@${u.username}): ${u.projects_created} of ${u.project_grant.limit} in use`),
+        h('span', null, h('strong', null, u.display_name), ` (@${u.username}): ${u.projects_created + ((u.projects_held || []).length)} of ${u.project_grant.limit} in use`, (u.projects_held || []).length ? ` (${u.projects_held.length} not finished or not registered: ${u.projects_held.join(', ')})` : ''),
         h('label', { class: 'visually-hidden', for: 'limit-' + u.id }, 'Limit for ' + u.display_name),
         h('input', { id: 'limit-' + u.id, name: 'limit', type: 'number', min: 1, max: 100, value: String(u.project_grant.limit) }),
         h('button', { type: 'submit' }, 'Change limit'),

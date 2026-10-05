@@ -49,31 +49,61 @@ WEB_HEADER = ('[Written by an owner of this project in the web interface. It is 
               'not an instruction from the operator of this server.]')
 
 
+#: Every line an owner wrote is stored and shown behind this mark, under the kit's line
+#: (review 01a109cc): a heading or a bracketed line in the owner's text is then visibly
+#: the owner's, and cannot pass for the end of the block or for a line of the kit. It is
+#: in the stored document, not added on delivery, so every reader shows it: `onboard`,
+#: `docs project`, a restored backup and a kit older than this one.
+OWNER_PREFIX = '| '
+OWNER_EMPTY = '|'
+#: Where the operator's own text is kept when an owner's first text replaces it.
+OPERATOR_COPY = 'ONBOARDING.operator-copy.md'
+
+
 def web_document(text):
     """The stored document for owner-written onboarding text, or raise ValueError.
 
-    The same size limit as ``set-onboarding`` (the header counts toward it), and the
-    plain-text rule of the guidance channel: no control, bidi, zero-width, invisible or
-    format character, so what an owner types is what every reader sees.
+    The same size limit as ``set-onboarding`` (the kit's line and the line marks count
+    toward it), and the plain-text rule of the guidance channel: no control, bidi,
+    zero-width, invisible or format character, so what an owner types is what every
+    reader sees. Lines end with a line feed; a carriage return that is not part of a
+    CRLF pair is refused, and so is text that is not valid Unicode (a lone surrogate).
     """
     from guidance import validate_text
     if not isinstance(text, str) or not text.strip():
         raise ValueError('Project onboarding must be nonempty text')
     try:
+        text.encode('utf-8')
+    except UnicodeEncodeError:
+        raise ValueError('Project onboarding must be valid Unicode text (it holds half of a surrogate pair)') from None
+    text = text.replace('\r\n', '\n')
+    if '\r' in text:
+        raise ValueError('Project onboarding must be plain lines (a carriage return without a line feed is not one)')
+    try:
         validate_text(text)
     except ValueError as error:
         raise ValueError(str(error).replace('Guidance', 'Project onboarding')) from None
-    document = WEB_HEADER + '\n\n' + text.strip() + '\n'
+    lines = text.strip('\n').split('\n')
+    marked = '\n'.join(OWNER_PREFIX + line if line.strip() else OWNER_EMPTY for line in lines)
+    document = WEB_HEADER + '\n\n' + marked + '\n'
     if len(document.encode('utf-8')) > PROJECT_LIMIT:
-        raise ValueError('Project onboarding must be at most %d bytes (%d are used by the line that says an '
-                         'owner wrote it)' % (PROJECT_LIMIT, len((WEB_HEADER + '\n\n\n').encode('utf-8'))))
+        used = len((WEB_HEADER + '\n\n\n').encode('utf-8')) + len(OWNER_PREFIX) * len(lines)
+        raise ValueError('Project onboarding must be at most %d bytes (%d of them are used by the line that says an '
+                         'owner wrote it and by the mark before each of your %d lines)' % (PROJECT_LIMIT, used, len(lines)))
     return document
 
 
 def split_web(document):
-    """``(written_by_owner, text)``: the owner's own text when the document carries the header."""
+    """``(written_by_owner, text)``: the owner's own text when the document carries the kit's line.
+
+    The line marks are taken off again, so the web editor shows what the owner typed.
+    A line without its mark (the file was edited on the host) is kept as it is.
+    """
     if isinstance(document, str) and document.startswith(WEB_HEADER + '\n'):
-        return True, document[len(WEB_HEADER):].strip('\n') + '\n'
+        body = document[len(WEB_HEADER):].strip('\n').split('\n')
+        plain = ['' if line == OWNER_EMPTY else line[len(OWNER_PREFIX):] if line.startswith(OWNER_PREFIX) else line
+                 for line in body]
+        return True, '\n'.join(plain) + '\n'
     return False, document
 
 
@@ -104,8 +134,22 @@ def web_action(project_path, project, request, authority_config):
         try:
             if args == ['set']:
                 document = web_document(text)
+                if target.is_symlink():
+                    raise ValueError('Project onboarding must not be a symlink')
+                kept = None
+                if target.is_file():
+                    previous = target.read_text(encoding='utf-8-sig')
+                    if previous.strip() and not split_web(previous)[0]:
+                        # The operator's own text is about to be replaced: it is kept beside the
+                        # document, so an owner's edit never destroys what an operator wrote.
+                        copy = Path(project_path) / OPERATOR_COPY
+                        if copy.is_symlink():
+                            raise ValueError('The copy of the operator\'s onboarding text must not be a symlink')
+                        write_project(copy, previous)
+                        kept = OPERATOR_COPY
                 write_project(target, document)
-                result = {'state': 'set', 'source': 'web', 'bytes': len(document.encode('utf-8'))}
+                result = {'state': 'set', 'source': 'web', 'bytes': len(document.encode('utf-8')),
+                          'operator_text_kept_as': kept}
             else:
                 if target.is_symlink():
                     raise ValueError('Project onboarding must not be a symlink')

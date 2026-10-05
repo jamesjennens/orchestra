@@ -90,7 +90,7 @@ function stepItem(ctx, pid, item, redraw) {
   const [label, tone] = STATE_LABELS[item.state] || [item.state, 'plain'];
   const route = stepRoute(item.id, pid);
   const body = [h('p', null, item.detail)];
-  // The value is accepted, and part of it begins like an access token: say so plainly.
+  // The value is accepted, and part of it looks like an access token: say so plainly.
   if (item.warning) body.push(h('div', { class: 'banner crit', role: 'alert', 'data-warning': item.id }, item.warning));
   if (item.id === 'onboarding' && item.who === 'owner-or-operator') body.push(onboardingForm(ctx, pid, redraw));
   if (item.id === 'repository') body.push(repositoryForm(ctx, pid, (ctx.setupProject || {}).repository, redraw));

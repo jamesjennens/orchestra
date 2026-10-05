@@ -216,7 +216,9 @@ history](#malformed-structured-history) (`void-record`).
 | `record-reconcile PROJECT --kind requirement\|reference\|capability\|proposal ...` | the same reconcile for any record kind | as above |
 | `reconcile-request PROJECT --request-id ID --actor OPERATOR --reason TEXT --disposition ...` | resolve a stuck coordination request receipt ([operational workflow](OPERATIONAL_WORKFLOW.md)) | the deployment operator allowlist, checked first; then its own actor-binding rules (`--any-actor`) |
 | `finish-project PROJECT` | complete a project creation that the web interface started and that stopped half way, when the project was initialized: settings, backup target, merge slot and a backup, each safe to repeat. It prints the creation record. See [HTTP deployment](HTTP_DEPLOYMENT.md#creating-a-project-from-the-web-interface) | whoever runs commands on the host |
-| `project-creations [--attention]` | list the creation records in `project-creations/` as JSON; `--attention` lists only the ones an operator must finish or remove | whoever runs commands on the host |
+| `project-creations [--attention] [--usage]` | list the creation records in `project-creations/` as JSON; `--attention` lists only the ones that are running or that an operator must finish or remove, each with its command; `--usage` prints the number of project databases on the server and its limit | whoever runs commands on the host |
+| `project-creations --set-server-limit N --actor OPERATOR` | set the most project databases this server may hold (default 20); see [The cost of many projects on one server](#the-cost-of-many-projects-on-one-server) | a listed operator |
+| `remove-creation PROJECT --actor OPERATOR --reason TEXT` | remove a project creation from the web interface that did not finish. Refuses a finished project, a name with no creation record and a running creation. An incomplete one is retired (nothing deleted, the name stays retired); a stalled one, for which nothing was made, loses only its record and its name is free | a listed operator |
 | `retire-project PROJECT --actor OPERATOR --reason TEXT [--force]` | retire a partial or drill project: move `projects/PROJECT` to `retired/PROJECT-<UTC stamp>`. Nothing is deleted; see [Retiring a project](#retiring-a-project) | the deployment operator allowlist, checked first |
 | `reference-misses-clear PROJECT` | delete the project's [reference lookup-miss log](#the-reference-lookup-miss-log). Same behaviour and output as `capability-misses-clear`, on `.reference-misses.json`, `.reference-misses.json.tmp` and `.reference-misses.lock` | none beyond the service account: it deletes telemetry only |
 | `capability-misses-clear PROJECT` | delete the project's [capability lookup-miss log](#the-capability-lookup-miss-log). It prints what was removed (`finds`, `misses`, `phrases`), and in `repaired` any symlink, directory or unopenable lock file it removed from the three miss-log names (never following a link). It writes nothing to the tracker, takes no coordination lock and calls no `bd` | none beyond the service account: it deletes telemetry only, so there is no allowlist check and no `--actor` |
@@ -635,6 +637,42 @@ python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime bac
 `backup-copy DEST` applies exactly the `--require-complete` gate and refuses, naming what is missing, when any initialized project is not complete. It then copies each project's last complete pair — the native backup directory as `DEST/PROJECT`, the complete sidecar as `DEST/PROJECT.coordination.json`, and, when the project has one, its operation-journal snapshot as `DEST/PROJECT.http-operations.sqlite3` (the same shape a runtime's `backups/` directory has, so the copy can be copied back and restored) — and copies the record that gated the copy. Each project's `backups/PROJECT.lock` is held for that project's whole staging, while its coordination lock is held only long enough to re-check the pair and copy the small sidecar and journal snapshot; the long native copy runs after the coordination lock is released, so copying a large database does not block endpoint writes on it (both commands take the two locks in the same order, so no deadlock is possible). Files are staged in a per-run directory and then moved into place by rename rather than merged, so a concurrent `backup --all` cannot yield a mixed native directory beside a complete sidecar and stale destination files do not survive. Each project's native directory is also checked against the `mtime_ns`-keyed manifest its complete sidecar records, before and after that project's copy: a directory that no longer matches — a killed or interrupted run can leave it partly rewritten — is refused rather than copied, a directory that changes while it is being copied is refused, and a sidecar that records no manifest is reported as unverifiable instead of being called clean. The completeness record is published only after every project is in place: a failure exits non-zero with a clear error, removes the staging directory and leaves no completeness record, so the destination never looks complete when it is not. It prints exactly what it copied, is credential-free and never touches a unit, timer or schedule. The scheduled, encrypted off-machine system, its encryption, retention and destination, remain the operator's: this helper is the reference the operator can gate and schedule, not a replacement for that system, and it cannot see whether a copy actually left the host.
 
 If restore is interrupted, the new destination may exist with only part of the restore completed. When the native step of `restore-new` fails, reaches its ceiling or is stopped (`SIGTERM`/Ctrl-C), the kit stops the restore client's process group, prints `restore-new did not complete: ...` naming the cause and the partial project, and exits non-zero without the re-point, the coordination sidecar, the journals or the operation journal: the destination then exists with an initialized but partial database (its `.beads/metadata.json` still holds its own fresh identity, so bd may refuse it). A `kill -9` of `admin.py` itself runs no cleanup, so the client may still be writing the destination's database for a while. Preserve it for inspection; retry recovery into another unused destination. Do not delete the source or force reuse of the partially restored target. While a destination left by a stopped or timed-out restore remains in the runtime, a `backup` of it fails (`backup 'default' not found`), so expect `backup --all`, `backup-status --require-complete` and `backup-copy` to report the runtime incomplete until it is dealt with; the source project's own backup pair is not touched. Retire such a project with `retire-project` ([Retiring a project](#retiring-a-project)); recovery drills are still better run in a separate runtime than in a live one. When the native step fails on a damaged backup or a refused password instead, the destination is an empty, working project rather than a partial one, and the notice says so; retiring it needs no flag. When the restore stops before `add-project` initialized the destination, the notice says the directory exists but is not a working project. A `SIGTERM` during the identity step that follows the native restore is reported like a stop during the restore itself. Every way the restore can stop after the destination starts to exist prints the notice, naming the step: a failure, `SIGTERM` or Ctrl-C in the `add-project` step, in the native restore, or in the re-point and coordination step. If the destination's directory has disappeared by then, the notice says that instead. Ctrl-C ends with exit status 130, and a refusal ends with one line (`ValueError: ...`), not a traceback. Only the kit's own refusals are shortened: any other error keeps its traceback. A `deployment.private.json` or `--file` payload that is not valid JSON is a refusal that names the file. Verify pending reservations, comments, lifecycle events, baselines and slot context before switching clients.
+
+### The cost of many projects on one server
+
+Every project is a database on the one Dolt server, and **every bd write on that server
+gets slower with each database it holds**, whichever project the write is for. Reads do
+not. Measured on one machine with the pinned bd 1.2.2 (kittrial-5bb.118 part 2 review):
+
+| Project databases on the server | `add-project` | one bd write (create, update, claim, comment, close, merge-slot, config) | one bd read (show, list, export) |
+|---|---|---|---|
+| 1 | 6 s | 0.2 to 0.4 s | 0.2 s |
+| 10 | 12 s | | |
+| 20 | 21 s | | |
+| 30 | 32 s | | |
+| 40 | 42 s | | |
+| 50 | 60 s | | |
+| 52 | 64 s | 1.9 to 2.4 s | 0.2 s |
+
+- The cause, as far as it was traced: bd checks its schema when it opens a database for
+  writing, with queries on `information_schema.columns`; Dolt answers such a query from
+  every database on the server (0.9 s at 52 databases, 0.07 s for an ordinary query),
+  and a write makes about two of them. bd's own SQL was not captured; the number of
+  queries is inferred from the timings.
+- **Archived and retired projects and unfinished creations cost the same as live ones**:
+  their databases stay on the server. The kit never drops a database.
+- **The limit.** `admin.py project-creations --usage` prints how many project databases
+  the server holds and its limit. The limit is 20 unless set:
+  `admin.py project-creations --set-server-limit N --actor OPERATOR` (a listed operator;
+  the change is recorded in `deployment.private.json` with who and when). At the limit
+  the web interface creates no project. `add-project` is the operator's own command and
+  is not stopped by the limit, but what it makes counts.
+- **Raising the limit** buys room at the price in the table: at 50 databases every task
+  write, claim, comment and merge-slot call takes about two seconds, and a creation
+  about a minute. A creation from the web interface may take up to `--create-timeout`
+  (900 seconds) of the web service.
+- The count is over everything under `projects/`, everything under `retired/`, and the
+  creations that hold a name. So twelve visible projects can reach a limit of 20.
 
 ### Retiring a project
 

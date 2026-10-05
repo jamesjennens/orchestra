@@ -306,8 +306,17 @@ def execute(root,request,authority_config=None,require_authority=False):
     if request.get('action')=='project-creations':
         import project_creation
         return project_creation.list_action(root,request,authority_config)
+    if request.get('action')=='creation-standing':
+        import project_creation
+        return project_creation.standing_action(root,request,authority_config)
     name=request['project'];path=project_dir(root,name)
     if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+    # A creation the web interface started and that has not finished is not a project yet
+    # (kittrial-5bb.118 part 2, review 01a109cc): it has no backup target, merge slot or first
+    # backup, so nothing is served from it and the web service cannot register it.
+    import project_creation
+    unfinished=project_creation.registrable(root,name)
+    if unfinished:raise ValueError('Unknown/uninitialized project: '+unfinished)
     actor=request.get('actor','')
     refuse_http_actor(actor,authority_config is not None)
     # Launched by the HTTP service, an HTTP-shaped actor still needs the verified
@@ -733,6 +742,10 @@ def main():
                        require_authority=a.require_authority)
     except subprocess.TimeoutExpired:
         answer={'returncode':124,'stdout':'','stderr':'Command timed out; mutation outcome may be uncertain. Inspect state before retrying.\n'}
+    except TimeoutError as waited:
+        # A wait for a lock ran out before anything was done (file_lock raises it while acquiring):
+        # the server is busy, and the request may be sent again. Not a rejection of the request.
+        answer={'returncode':75,'stdout':'','stderr':'Busy: %s. Nothing was done; try again shortly.\n'%waited}
     except Exception as e:
         answer={'returncode':2,'stdout':'','stderr':f'{type(e).__name__}: {e}\n'}
     print(json.dumps(answer,ensure_ascii=False))

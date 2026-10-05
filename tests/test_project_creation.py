@@ -162,7 +162,7 @@ class StopTests(Host):
         result = self.create(initialize=self.initialize(fail_at='merge-slot'))
         self.assertEqual((result['status'], result['project'], result['stage']), ('incomplete', 'alpha', 'merge-slot'))
         for words in ('Project alpha was started on the server and did not finish', 'An operator must finish it',
-                      'admin.py finish-project alpha', 'admin.py retire-project alpha', 'Nothing is registered'):
+                      'admin.py finish-project alpha', 'admin.py remove-creation alpha', 'Nothing is registered'):
             self.assertIn(words, result['message'])
         record = pc.read_record(self.root, 'alpha')
         self.assertEqual((record['state'], record['stage']), ('incomplete', 'merge-slot'))
@@ -200,8 +200,9 @@ class StopTests(Host):
         pc.write_record(self.root, 'alpha', {'project': 'alpha', 'by': ALICE, 'operation_id': 'op-alpha',
                                              'state': 'started', 'stage': None, 'started_at': 'x'})
         (self.root / 'projects' / 'alpha').mkdir()            # an empty directory, as add-project resumes
-        self.assertEqual(pc.attention(self.root), [])
+        self.assertEqual([item['state'] for item in pc.attention(self.root)], ['stalled'])
         self.assertEqual(self.create(limit=1)['status'], 'created')
+        self.assertEqual(pc.attention(self.root), [])
 
 
 class OperatorTests(Host):
@@ -220,8 +221,10 @@ class OperatorTests(Host):
         self.assertEqual(self.calls, calls)
         with self.assertRaises(pc.NothingMade):       # still nobody else's
             self.create(account=BOB)
-        # Finishing twice changes nothing.
-        self.assertEqual(pc.finish(self.root, 'alpha', finish_steps=self.finish_steps)['state'], 'created')
+        # Finishing twice changes nothing, and says so.
+        again = pc.finish(self.root, 'alpha', finish_steps=self.finish_steps)
+        self.assertEqual((again['state'], again['already']), ('created', True))
+        self.assertNotIn('already', record)
         self.assertEqual(self.calls, calls)
 
     def test_finish_refuses_what_was_never_initialized(self):
@@ -239,7 +242,9 @@ class OperatorTests(Host):
         with self.assertRaises(ValueError) as caught:
             pc.finish(self.root, 'beta', finish_steps=self.finish_steps)
         self.assertIn('was not initialized', str(caught.exception))
-        self.assertIn('retire-project beta', str(caught.exception))
+        self.assertIn('remove-creation beta', str(caught.exception))
+        self.assertIn('its name cannot be used again', str(caught.exception))
+        self.assertNotIn('retire-project', str(caught.exception))
         self.assertNotIn(('beta', 'finished'), self.calls)
 
     def test_a_removed_creation_holds_nothing_and_its_record_says_who_removed_it(self):
@@ -269,6 +274,283 @@ class OperatorTests(Host):
         self.create('two', initialize=self.initialize(fail_at='first-backup'))
         self.assertEqual([(r['project'], r['effective']) for r in pc.records(self.root)],
                          [('one', 'created'), ('two', 'incomplete')])
+
+
+def in_thread(fn):
+    """Run ``fn`` in another thread (a second holder of nothing) and return its result or its exception."""
+    import threading
+    box = {}
+
+    def run():
+        try:
+            box['value'] = fn()
+        except BaseException as error:           # noqa: BLE001
+            box['error'] = error
+    worker = threading.Thread(target=run)
+    worker.start()
+    worker.join(30)
+    if 'error' in box:
+        raise box['error']
+    return box['value']
+
+
+class Operators(Host):
+    def setUp(self):
+        super().setUp()
+        (self.root / 'deployment.private.json').write_text(json.dumps({'operators': ['ops']}), encoding='utf-8')
+        self.retired = []
+
+    def retire(self, root, name, actor, reason, force=False, creation_locked=False):
+        self.retired.append((name, actor, reason, force, creation_locked))
+        os.rename(root / 'projects' / name, root / ('gone-' + name))
+
+
+class StateTests(Operators):
+    """What a record reads as: running, incomplete, stalled (review 01a109cc)."""
+
+    def test_a_creation_in_flight_reads_running_and_nothing_else_touches_it(self):
+        seen = {}
+
+        def work(root, name, stage):
+            self.initialize()(root, name, stage)
+            seen['records'] = in_thread(lambda: [(r['project'], r['effective']) for r in pc.records(root)])
+            seen['attention'] = in_thread(lambda: [(i['project'], i['state'], i['command']) for i in pc.attention(root)])
+            seen['registrable'] = in_thread(lambda: pc.registrable(root, name))
+            for label, call in (('create', lambda: pc.create(root, 'beta', BOB, 'op-beta', initialize=self.initialize())),
+                                ('remove', lambda: pc.remove(root, name, 'ops', 'why', retire=self.retire))):
+                try:
+                    in_thread(call)
+                    seen[label] = 'done'
+                except (pc.Busy, ValueError) as refusal:
+                    seen[label] = refusal
+        self.assertEqual(self.create(initialize=work)['status'], 'created')
+        self.assertEqual(seen['records'], [('alpha', 'running')])
+        self.assertEqual(seen['attention'], [('alpha', 'running', 'nothing: it is being created now')])
+        self.assertIn('has not finished (running)', seen['registrable'])
+        self.assertIsInstance(seen['create'], pc.Busy)
+        self.assertEqual(str(seen['create']), pc.BUSY)
+        self.assertIn('a creation is running on this server (alpha)', str(seen['remove']))
+        self.assertEqual(self.retired, [])
+        # Afterwards nothing runs, and nothing needs attention.
+        self.assertIsNone(pc.running_name(self.root))
+        self.assertEqual(pc.attention(self.root), [])
+        self.assertFalse((pc.records_dir(self.root) / pc.RUN_NAME).exists())
+        self.assertFalse((self.root / 'projects' / 'beta').exists())
+
+    def test_a_stale_name_beside_the_lock_means_nothing_runs(self):
+        self.create(initialize=self.initialize(fail_at='configure'))
+        (pc.records_dir(self.root) / pc.RUN_NAME).write_text('alpha\n', encoding='utf-8')
+        self.assertIsNone(pc.running_name(self.root))
+        self.assertEqual([(r['project'], r['effective']) for r in pc.records(self.root)], [('alpha', 'incomplete')])
+
+    def test_a_kill_before_anything_was_made_reads_stalled_and_is_listed(self):
+        pc.write_record(self.root, 'alpha', {'project': 'alpha', 'by': ALICE, 'operation_id': 'op-alpha',
+                                             'state': 'started', 'stage': None, 'started_at': 'x'})
+        self.assertEqual([(i['project'], i['state']) for i in pc.attention(self.root)], [('alpha', 'stalled')])
+        self.assertIn('the same web request resumes it', pc.attention(self.root)[0]['command'])
+        self.assertIn('remove-creation alpha', pc.attention(self.root)[0]['command'])
+        self.assertEqual(pc.holds(self.root, ALICE), ['alpha'])               # it holds a place
+        self.assertIn('has not finished (stalled)', pc.registrable(self.root, 'alpha'))
+        with self.assertRaises(pc.NothingMade):                               # and the name, against others
+            self.create(account=BOB)
+
+    def test_registrable_only_when_there_is_no_record_or_it_finished(self):
+        self.assertIsNone(pc.registrable(self.root, 'never'))
+        self.create('done')
+        self.assertIsNone(pc.registrable(self.root, 'done'))
+        self.create('half', initialize=self.initialize(fail_at='merge-slot'))
+        said = pc.registrable(self.root, 'half')
+        self.assertIn('has not finished (incomplete)', said)
+        self.assertIn('admin.py finish-project half', said)
+        pc.mark_removed(self.root, 'half', 'ops')
+        self.assertIsNone(pc.registrable(self.root, 'half'))
+        pc.record_path(self.root, 'done').write_text('{"project": "other"}', encoding='utf-8')
+        self.assertIn('is damaged', pc.registrable(self.root, 'done'))
+
+    @unittest.skipIf(sys.platform == 'win32', 'endpoint imports fcntl (POSIX-only)')
+    def test_the_endpoint_serves_nothing_from_a_creation_that_has_not_finished(self):
+        import endpoint
+        self.create('half', initialize=self.initialize(fail_at='merge-slot'))       # initialized, not finished
+        for action, args in (('bd', ['list', '--json']), ('onboard', []), ('setup-status', [])):
+            with self.subTest(action=action), self.assertRaises(ValueError) as caught:
+                endpoint.execute(self.root, {'project': 'half', 'actor': 'alice', 'action': action, 'args': args})
+            self.assertEqual(str(caught.exception),
+                             'Unknown/uninitialized project: Project half is a creation that has not finished '
+                             '(incomplete). It cannot be registered until an operator finishes it '
+                             '(admin.py finish-project half).')
+
+
+class RemoveTests(Operators):
+    """`remove-creation` is tied to a creation that did not finish (review 01a109cc)."""
+
+    def test_an_incomplete_creation_is_retired_and_its_name_stays_retired(self):
+        self.create(initialize=self.initialize(fail_at='merge-slot'))
+        result = pc.remove(self.root, 'alpha', 'ops', 'it stopped', retire=self.retire)
+        self.assertEqual(result, {'project': 'alpha', 'removed': 'directory', 'name': 'retired', 'by': ALICE})
+        self.assertEqual(self.retired, [('alpha', 'ops', 'it stopped', True, True)])
+        record = pc.read_record(self.root, 'alpha')
+        self.assertEqual((record['state'], record['removed_by']), ('removed', 'ops'))
+        self.assertEqual((pc.holds(self.root, ALICE), pc.attention(self.root)), ([], []))
+
+    def test_a_stalled_creation_is_cleared_and_its_name_is_free(self):
+        pc.write_record(self.root, 'alpha', {'project': 'alpha', 'by': ALICE, 'operation_id': 'op-alpha',
+                                             'state': 'started', 'stage': None, 'started_at': 'x'})
+        (self.root / 'projects' / 'alpha').mkdir()
+        result = pc.remove(self.root, 'alpha', 'ops', 'never started', retire=self.retire)
+        self.assertEqual(result, {'project': 'alpha', 'removed': 'record', 'name': 'free', 'by': ALICE})
+        self.assertEqual(self.retired, [])
+        self.assertEqual(self.left_behind(), (False, False))
+        self.assertEqual(self.create(account=BOB)['status'], 'created')        # anyone may use the name now
+
+    def test_it_cannot_touch_a_finished_project_a_name_without_a_record_or_a_removed_one(self):
+        self.create()
+        (self.root / 'projects' / 'plain' / '.beads').mkdir(parents=True)
+        (self.root / 'projects' / 'plain' / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+        self.create('half', initialize=self.initialize(fail_at='configure'))
+        pc.remove(self.root, 'half', 'ops', 'x', retire=self.retire)
+        self.retired = []
+        for name, part in (('alpha', 'finished: it is a project, not an unfinished creation'),
+                           ('plain', 'There is no project creation record for plain'),
+                           ('never', 'There is no project creation record for never'),
+                           ('half', 'was already removed')):
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError) as caught:
+                    pc.remove(self.root, name, 'ops', 'why', retire=self.retire)
+                self.assertIn(part, str(caught.exception))
+                self.assertIn('Nothing was changed.', str(caught.exception))
+        self.assertEqual(self.retired, [])
+        self.assertEqual(pc.read_record(self.root, 'alpha')['state'], 'created')
+        self.assertTrue((self.root / 'projects' / 'alpha').is_dir() and (self.root / 'projects' / 'plain').is_dir())
+
+    def test_it_needs_a_listed_operator_and_a_reason(self):
+        self.create(initialize=self.initialize(fail_at='configure'))
+        with self.assertRaises(ValueError):
+            pc.remove(self.root, 'alpha', 'mallory', 'why', retire=self.retire)
+        with self.assertRaisesRegex(ValueError, 'A reason is required'):
+            pc.remove(self.root, 'alpha', 'ops', '  ', retire=self.retire)
+        self.assertEqual(self.retired, [])
+
+    def test_the_messages_name_the_new_command_and_never_retire_force(self):
+        result = self.create(initialize=self.initialize(fail_at='merge-slot'))
+        self.assertIn('admin.py remove-creation alpha --actor OPERATOR --reason REASON', result['message'])
+        self.assertNotIn('retire-project', result['message'])
+        self.assertNotIn('retire-project', json.dumps(pc.attention(self.root)))
+        self.assertNotIn('--force', json.dumps(pc.attention(self.root)) + pc.incomplete_message('x'))
+
+
+class ServerLimitTests(Operators):
+    """A limit on project databases for the whole server (review 01a109cc)."""
+
+    def limit(self, value):
+        pc.set_server_limit(self.root, value, 'ops')
+
+    def test_the_default_and_the_setting(self):
+        self.assertEqual((pc.SERVER_LIMIT_DEFAULT, pc.server_limit(self.root)), (20, 20))
+        self.assertEqual(pc.set_server_limit(self.root, 3, 'ops'), {'used': 0, 'limit': 3})
+        stored = json.loads((self.root / 'deployment.private.json').read_text(encoding='utf-8'))
+        self.assertEqual(stored['project_database_limit'], 3)
+        audit = stored['project_database_limit_audit']
+        self.assertEqual([(a['actor'], a['from'], a['to']) for a in audit], [('ops', 20, 3)])
+        self.assertEqual(stored['operators'], ['ops'])                        # the rest of the file is kept
+        with self.assertRaises(ValueError):
+            pc.set_server_limit(self.root, 5, 'mallory')
+        for bad in (0, -1, 501, True, '5', 2.0, None):
+            with self.subTest(value=bad), self.assertRaises(ValueError):
+                pc.set_server_limit(self.root, bad, 'ops')
+        self.assertEqual(pc.server_limit(self.root), 3)
+        (self.root / 'deployment.private.json').write_text(json.dumps({'project_database_limit': 'many'}), encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'must be a whole number'):
+            pc.server_limit(self.root)
+
+    def test_everything_that_has_or_will_have_a_database_counts(self):
+        self.create('made')
+        self.create('half', initialize=self.initialize(fail_at='merge-slot'))
+        (self.root / 'projects' / 'byoperator' / '.beads').mkdir(parents=True)       # add-project, no record
+        (self.root / 'projects' / 'partial').mkdir()
+        (self.root / 'projects' / 'partial' / 'x').write_text('x', encoding='utf-8')
+        (self.root / 'retired' / 'gone-20260101T000000Z').mkdir(parents=True)        # retired: the database stays
+        pc.write_record(self.root, 'stalled', {'project': 'stalled', 'by': BOB, 'operation_id': 'o', 'state': 'started',
+                                               'stage': None, 'started_at': 'x'})        # holds a name, nothing made
+        self.create('removed', initialize=self.initialize(fail_at='configure'))
+        pc.mark_removed(self.root, 'removed', 'ops')                                  # its directory still counts
+        self.assertEqual(sorted(pc.server_names(self.root)),
+                         ['byoperator', 'gone', 'half', 'made', 'partial', 'removed', 'stalled'])
+        self.assertEqual(pc.server_usage(self.root), {'used': 7, 'limit': 20})
+
+    def test_at_the_limit_a_creation_is_refused_and_told_no_numbers(self):
+        self.limit(2)
+        self.create('one')
+        self.create('two', account=BOB)
+        with self.assertRaises(pc.NothingMade) as caught:
+            self.create('three')
+        self.assertEqual(str(caught.exception), pc.AT_SERVER_LIMIT)
+        self.assertNotRegex(str(caught.exception), r'\d')
+        self.assertEqual(self.left_behind('three'), (False, False))
+        # The account's own limit is told first when it is the one reached.
+        with self.assertRaisesRegex(pc.NothingMade, 'The limit of 1 project'):
+            self.create('three', limit=1)
+        self.limit(3)
+        self.assertEqual(self.create('three')['status'], 'created')
+
+    def test_a_reservation_counts_from_the_moment_it_is_written(self):
+        self.limit(1)
+        seen = {}
+
+        def work(root, name, stage):
+            seen['usage'] = pc.server_usage(root)['used']                    # before anything is made
+            self.initialize()(root, name, stage)
+        self.create(initialize=work)
+        self.assertEqual(seen['usage'], 1)
+
+    def test_a_creation_that_stalled_is_resumed_even_at_the_limit(self):
+        self.limit(1)
+        pc.write_record(self.root, 'alpha', {'project': 'alpha', 'by': ALICE, 'operation_id': 'op-alpha',
+                                             'state': 'started', 'stage': None, 'started_at': 'x'})
+        self.assertEqual(self.create()['status'], 'created')
+
+    def test_a_stalled_creation_is_not_resumed_when_the_others_alone_fill_the_server(self):
+        """Its own place is not counted against it; it is refused before anything is made, not after."""
+        pc.write_record(self.root, 'alpha', {'project': 'alpha', 'by': ALICE, 'operation_id': 'op-alpha',
+                                             'state': 'started', 'stage': None, 'started_at': 'x'})
+        (self.root / 'projects' / 'byoperator' / '.beads').mkdir(parents=True)
+        self.limit(1)                                                         # lowered while it was stalled
+        with self.assertRaises(pc.NothingMade) as caught:
+            self.create()
+        self.assertEqual(str(caught.exception), pc.AT_SERVER_LIMIT)
+        self.assertEqual(self.calls, [])
+        self.assertFalse((self.root / 'projects' / 'alpha').exists())
+        self.limit(2)
+        self.assertEqual(self.create()['status'], 'created')
+
+    def test_the_database_servers_own_names_are_refused_before_anything_is_made(self):
+        for name in sorted(pc.RESERVED_NAMES):
+            with self.subTest(name=name):
+                with self.assertRaises(pc.NothingMade) as caught:
+                    self.create(name)
+                self.assertIn('is used by the database server itself', str(caught.exception))
+                self.assertEqual(self.left_behind(name), (False, False))
+        with self.assertRaisesRegex(ValueError, 'is used by the database server itself'):
+            admin.initialize_project(self.root, 'mysql')
+        self.assertFalse((self.root / 'projects' / 'mysql').exists())
+
+
+class FailureTests(Host):
+    def test_a_failure_with_nothing_made_tells_the_caller_no_host_detail_and_keeps_it_for_the_operator(self):
+        secret = RuntimeError('bd init --server --database alpha failed in /srv/orchestra/rt/projects/alpha')
+        with self.assertRaises(pc.NothingMade) as caught:
+            self.create(initialize=self.initialize(fail_at='init', error=secret))
+        said = str(caught.exception)
+        self.assertEqual(said, 'The project could not be created and nothing was made. Try again; if it fails again, '
+                               'ask an operator of the server.')
+        kept = json.loads((pc.records_dir(self.root) / 'last-failure.txt').read_text(encoding='utf-8'))
+        self.assertEqual((kept['project'], kept['by']), ('alpha', ALICE))
+        self.assertIn('/srv/orchestra/rt/projects/alpha', kept['error'])
+
+    def test_an_incomplete_creation_keeps_the_detail_in_its_record_only(self):
+        secret = RuntimeError('bd backup init /srv/orchestra/rt/backups/alpha failed')
+        result = self.create(initialize=self.initialize(fail_at='backup-target', error=secret))
+        self.assertNotIn('/srv/', json.dumps(result))
+        self.assertIn('/srv/orchestra', pc.read_record(self.root, 'alpha')['error'])
 
 
 class AddProjectStillTests(unittest.TestCase):
@@ -311,6 +593,20 @@ class AddProjectStillTests(unittest.TestCase):
         self.assertEqual(seen, ['init', 'init', 'configure', 'config no-git-ops', 'config dolt.auto-push',
                                 'config dolt.auto-commit', 'config backup.git-push', 'backup-target', 'backup',
                                 'merge-slot', 'slot', 'first-backup', 'first backup'])
+
+
+class BackupHintTests(Operators):
+    def test_an_unfinished_creation_that_failed_its_backup_is_named_with_the_two_commands(self):
+        self.create('half', initialize=self.initialize(fail_at='backup-target'))
+        self.create('fine')
+        said = admin.unfinished_creation_hint(self.root, ['half', 'fine', 'other'])
+        self.assertIn('half is a project creation from the web interface that did not finish', said)
+        self.assertIn('admin.py finish-project half', said)
+        self.assertIn('admin.py remove-creation half --actor OPERATOR --reason REASON', said)
+        self.assertIn('Until then every backup --all is incomplete.', said)
+        self.assertNotIn('fine is', said)
+        self.assertEqual(admin.unfinished_creation_hint(self.root, ['fine', 'other']), '')
+        self.assertEqual(admin.unfinished_creation_hint(self.root / 'nowhere', ['x']), '')
 
 
 if __name__ == '__main__':

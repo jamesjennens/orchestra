@@ -361,7 +361,9 @@ class HostStatusTests(unittest.TestCase):
 
     def test_a_bare_project(self):
         status = self.status()
-        self.assertEqual(sorted(status), ['backup', 'guidance', 'onboarding', 'project', 'schema_version'])
+        self.assertEqual(sorted(status), ['backup', 'guidance', 'onboarding', 'project', 'project_databases',
+                                          'schema_version'])
+        self.assertEqual(status['project_databases'], {'used': 1, 'limit': 20})
         self.assertEqual(status['guidance'], {'state': 'not-set', 'version': None, 'set_at': None})
         self.assertEqual(status['onboarding'], {'state': 'not-set', 'updated_at': None})
         self.assertEqual((status['backup']['scheduled'], status['backup']['last_run']), ('not-covered', None))
@@ -676,15 +678,33 @@ class FollowUpTests(test_http_agents.AgentHarness):
                          ('git@git.example:team/alpha.git', False))
 
     def test_a_user_name_or_path_segment_that_begins_like_a_token_is_accepted_with_a_warning(self):
-        for value in ('ssh://ghp_0123456789abcdef@git.example/team/alpha.git', 'glpat-abcdef@git.example:team/alpha.git',
-                      'https://git.example/team/github_pat_11ABC/alpha.git', '/srv/git/xoxb-1234/alpha.git'):
+        token = '0123456789abcdefghij'
+        for value in ('ssh://ghp_0123456789abcdef@git.example/team/alpha.git', 'glpat-%s@git.example:team/alpha.git' % token,
+                      'https://git.example/team/github_pat_%s/alpha.git' % token, '/srv/git/xoxb-%s/alpha.git' % token,
+                      # Review 01a109cc: upper case, a beginning inside a segment, forty hexadecimal digits.
+                      'https://git.example/team/GHP_%s/alpha.git' % token.upper(), 'https://git.example/x.ghp_%s.git' % token,
+                      'https://git.example/team/' + '0123456789abcdef0123456789abcdef01234567' + '/alpha.git'):
             with self.subTest(value=value[:24]):
                 self.assertEqual(200, self.patch_repository(value).status)
                 one = self.request('GET', self.url, token=self.olive).data
-                self.assertIn('begins like an access token', one['repository_warning'])
+                self.assertIn('looks like an access token', one['repository_warning'])
                 self.assertNotIn(value, one['repository_warning'])
                 step = by_id(self.request('GET', self.url + '/setup', token=self.olive).data)['repository']
                 self.assertEqual((step['state'], step['warning']), ('done', one['repository_warning']))
+        # A name that only starts like a token is a name: no warning.
+        for value in ('git@git.example:team/alpha.git', 'ssh://sk-team@git.example/team/alpha.git',
+                      'https://git.example/sk-tools/alpha.git', 'https://git.example/team/' + 'a1' * 21 + '/x.git'):
+            with self.subTest(plain=value[:30]):
+                self.assertEqual(200, self.patch_repository(value).status)
+                one = self.request('GET', self.url, token=self.olive).data
+                self.assertIsNone(one['repository_warning'])
+        # Leftovers of the same review: these are refused, and their well-formed neighbours accepted.
+        for value in ('https://git.example:00080/team/a.git', '/', 'git@c:x.git', 'https://git.example/a/.../b.git'):
+            with self.subTest(refused=value):
+                self.assertEqual(422, self.patch_repository(value).status)
+        for value in ('https://git.example:8080/team/a.git', '/srv/git/a.git', 'git@gh:x.git', 'https://git.example/a/.b/c.git'):
+            with self.subTest(accepted=value):
+                self.assertEqual(200, self.patch_repository(value).status)
         self.assertEqual(200, self.patch_repository('git@git.example:team/alpha.git').status)
         one = self.request('GET', self.url, token=self.olive).data
         self.assertIsNone(one['repository_warning'])
@@ -812,7 +832,7 @@ class SetupScreenTests(test_http_agents.AgentHarness):
         self.assertEqual(seen['uncheckedHint'], '1 setup step could not be checked. See the setup steps')
         self.assertIsNone(seen['noHintWhenAllDone'])
         self.assertEqual(len(seen['warning']), 1)
-        self.assertIn('begins like an access token', seen['warning'][0])
+        self.assertIn('looks like an access token', seen['warning'][0])
         self.assertEqual(seen['noWarning'], 0)
 
 

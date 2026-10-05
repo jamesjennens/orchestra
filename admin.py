@@ -1729,6 +1729,14 @@ def project_setup_status(root,name,path=None):
     except (ValueError,OSError):
         pass
     result['backup']=backup
+    # How full the server is (kittrial-5bb.118 part 2 revision): every project database on it
+    # counts, and every bd write gets slower as they grow. The web service shows it to a
+    # superuser only.
+    try:
+        import project_creation
+        result['project_databases']=project_creation.server_usage(root)
+    except (ValueError,OSError):
+        result['project_databases']=None
     return result
 
 def scheduled_backup_coverage(root,name):
@@ -1974,7 +1982,7 @@ def retire_blockers(findings):
                         %counts(findings['unreadable_reservations']))
     return blockers
 
-def retire_project(root,name,actor,reason,force=False):
+def retire_project(root,name,actor,reason,force=False,creation_locked=False):
     """Retire one project: move its directory aside. Nothing is deleted.
 
     For a project a stopped ``restore-new`` left behind, or a drill project. One rename
@@ -1990,10 +1998,26 @@ def retire_project(root,name,actor,reason,force=False):
     not be read. Refused even with ``force`` while a ``restore-new`` into the name is
     running. The operator allowlist is checked first, strictly. Both steps are journaled in
     ``retired/journal.jsonl`` (intent before the move, the result after it).
+
+    It holds the project creation lock (kittrial-5bb.118 part 2, review 01a109cc), without
+    waiting: retiring under a creation in flight pulled the directory away from it, and the
+    creation then deleted the record this had just marked. ``creation_locked`` is for
+    ``remove-creation``, which holds that lock already.
     """
     import fcntl
     from keyed_records import require_configured_operator
     require_configured_operator(actor,operators(root,strict=True),'retire a project')
+    import project_creation
+    # Where no creation was ever started there is no lock to take, and a refusal must leave
+    # nothing behind, not even the lock file.
+    if not creation_locked and project_creation.records_dir(root).is_dir():
+        try:
+            with project_creation.creation_lock(root,wait=0):
+                return retire_project(root,name,actor,reason,force=force,creation_locked=True)
+        except project_creation.Busy:
+            raise ValueError('Refusing to retire %s: a project is being created on this server (%s). Wait for it '
+                             'to finish, then retry. Nothing was changed.'
+                             %(name,project_creation.running_name(root) or 'unknown')) from None
     path=project_dir(root,name)
     if not path.is_dir():raise ValueError('Unknown project: there is no projects/%s'%name)
     if not isinstance(reason,str) or not reason.strip():raise ValueError('A reason is required')
@@ -2062,6 +2086,9 @@ def initialize_project(root,name,stage=None):
     """
     at=stage or (lambda label:None)
     path=project_dir(root,name)
+    import project_creation
+    if name in project_creation.RESERVED_NAMES:
+        raise ValueError('Project name %s is used by the database server itself: choose another name'%name)
     refuse_retired_name(root,name)
     if path.exists() and any(path.iterdir()): raise ValueError('Project already exists; use it rather than initializing again')
     path.mkdir(exist_ok=True)
@@ -3410,7 +3437,25 @@ def backup_projects(root,names,all_projects=False):
         print('Backup of %s is complete but degraded: %s'%degraded[0])
     if incomplete:
         raise SystemExit('backup incomplete for: '+' '.join(incomplete)+
-                         ' (see %s)'%(root/'backups'/BACKUP_STATUS_NAME))
+                         ' (see %s)'%(root/'backups'/BACKUP_STATUS_NAME)+unfinished_creation_hint(root,incomplete))
+
+def unfinished_creation_hint(root,names):
+    """What to do when a project that failed its backup is a web creation that did not finish.
+
+    Such a project is initialized (so ``backup --all`` covers it) and has no backup target
+    yet, so the run is incomplete and the nightly gate is red until an operator finishes
+    or removes it (kittrial-5bb.118 part 2, review 01a109cc). Never raises.
+    """
+    try:
+        import project_creation
+        waiting=[record['project'] for record in project_creation.records(root)
+                 if record['project'] in names and record['effective'] in ('incomplete',project_creation.STALLED)]
+    except (ValueError,OSError):
+        return ''
+    if not waiting:return ''
+    return ('. '+'; '.join('%s is a project creation from the web interface that did not finish: finish it (admin.py '
+                           'finish-project %s) or remove it (admin.py remove-creation %s --actor OPERATOR --reason REASON)'
+                           %(name,name,name) for name in waiting)+'. Until then every backup --all is incomplete.')
 
 def validate_coordination_operators(value,noun='operators'):
     """Validate the optional operator (or verifier) snapshot carried by a backup sidecar."""
@@ -3908,8 +3953,13 @@ def main():
     a=sub.add_parser('add-project');a.add_argument('project')
     a=sub.add_parser('finish-project',help='complete a project creation the web interface started and that stopped half way')
     a.add_argument('project')
-    a=sub.add_parser('project-creations',help='list the project creations the web interface started (JSON)')
-    a.add_argument('--attention',action='store_true',help='only the ones an operator must finish or remove')
+    a=sub.add_parser('project-creations',help='list the project creations the web interface started (JSON), or set the limit of project databases on this server')
+    a.add_argument('--attention',action='store_true',help='only the ones that are running or that an operator must finish or remove')
+    a.add_argument('--usage',action='store_true',help='how many project databases this server holds, and its limit')
+    a.add_argument('--set-server-limit',type=int,metavar='N',help='set the limit of project databases (operator allowlist, audited); needs --actor')
+    a.add_argument('--actor')
+    a=sub.add_parser('remove-creation',help='remove a project creation that did not finish (operator allowlist); refuses a finished project and a running creation')
+    a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--reason',required=True)
     a=sub.add_parser('set-onboarding');a.add_argument('project');a.add_argument('--file',required=True)
     a=sub.add_parser('set-guidance',help='set the standing coordinator guidance every actor reads each run (operator allowlist, audited)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
@@ -4059,14 +4109,39 @@ def main():
     elif args.command=='finish-project':
         import project_creation
         result=project_creation.finish(root,args.project)
+        already=result.pop('already',False)
         print(json.dumps(result,sort_keys=True))
-        print('Finished %s on the server. It is not registered in the web interface yet: the account that '
-              'started it creates it again there (the same name), or a superuser registers it.'%args.project,
-              file=sys.stderr)
+        if already:
+            print('%s is complete on the server already: there was nothing to finish. If it is not in the web '
+                  'interface, the account that started it creates it again there (the same name), or a superuser '
+                  'registers it.'%args.project,file=sys.stderr)
+        else:
+            print('Finished %s on the server. If it is not in the web interface yet, the account that started it '
+                  'creates it again there (the same name), or a superuser registers it.'%args.project,file=sys.stderr)
     elif args.command=='project-creations':
         import project_creation
-        found=project_creation.attention(root) if args.attention else project_creation.records(root)
-        print(json.dumps(found,sort_keys=True,indent=1))
+        if args.set_server_limit is not None:
+            if not args.actor:raise ValueError('--set-server-limit requires --actor (an operator on the allowlist)')
+            from recovery import identity
+            print(json.dumps(project_creation.set_server_limit(root,args.set_server_limit,identity(args.actor,'Invalid actor identity')),sort_keys=True))
+            print('The limit counts every project database on this server: archived and retired projects and '
+                  'unfinished creations too. Every bd write gets slower as their number grows; see OPERATIONS, '
+                  '"The cost of many projects on one server".',file=sys.stderr)
+        elif args.usage:
+            print(json.dumps(project_creation.server_usage(root),sort_keys=True))
+        else:
+            found=project_creation.attention(root) if args.attention else project_creation.records(root)
+            print(json.dumps(found,sort_keys=True,indent=1))
+    elif args.command=='remove-creation':
+        import project_creation
+        result=project_creation.remove(root,args.project,args.actor,args.reason)
+        print(json.dumps(result,sort_keys=True))
+        if result['name']=='free':
+            print('Removed the creation record of %s. Nothing had been made for it, so the name is free again.'
+                  %args.project,file=sys.stderr)
+        else:
+            print('Removed the unfinished creation of %s: its directory is retired and nothing was deleted. The '
+                  'name stays retired, because a database of that name may be on the server.'%args.project,file=sys.stderr)
     elif args.command=='set-onboarding':
         import fcntl
         from onboarding import probe_endpoints, write_project

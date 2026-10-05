@@ -428,6 +428,11 @@ def emulated_initialize(root, name, stage):
         if label == 'init':
             (path / '.beads').mkdir(exist_ok=True)
             (path / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+            # A test may run code here, in the middle of the work (what holds which lock; a
+            # grant revoked meanwhile): ``STRICT_ENDPOINT_CREATE_HOOK`` names a Python file.
+            hook = os.environ.get('STRICT_ENDPOINT_CREATE_HOOK')
+            if hook:
+                exec(compile(Path(hook).read_text(encoding='utf-8'), hook, 'exec'), {'root': root, 'name': name})
     print('Created project %s' % name)
 
 
@@ -442,6 +447,8 @@ def service_action(root, request, arguments):
         if request.get('action') == 'create-project':
             admin.project_dir(root, request.get('project'))
             return project_creation.create_action(root, request, config, initialize=emulated_initialize)
+        if request.get('action') == 'creation-standing':
+            return project_creation.standing_action(root, request, config)
         return project_creation.list_action(root, request, config)
     except Exception as error:  # noqa: BLE001
         return envelope(2, stderr='%s: %s\n' % (type(error).__name__, error))
@@ -460,7 +467,7 @@ def main():
         print(json.dumps(envelope(2, stderr='bad request: %s\n' % error)))
         return
     root = Path(arguments.root)
-    if request.get('action') in ('create-project', 'project-creations'):
+    if request.get('action') in ('create-project', 'project-creations', 'creation-standing'):
         # endpoint.py's two service-only actions (kittrial-5bb.118 part 2). The rules are
         # the kit's own (project_creation); only the work of initializing a project is
         # emulated: the directory and the marker add-project leaves, stage by stage.
@@ -479,6 +486,12 @@ def main():
             return
         if not (root / 'projects' / name / '.beads' / 'metadata.json').is_file():
             print(json.dumps(envelope(2, stderr='ValueError: Unknown/uninitialized project\n')))
+            return
+        # endpoint.py serves nothing from a creation that has not finished (part 2 revision).
+        import project_creation
+        unfinished = project_creation.registrable(root, name)
+        if unfinished:
+            print(json.dumps(envelope(2, stderr='ValueError: Unknown/uninitialized project: %s\n' % unfinished)))
             return
     canonical = Canonical(root, request.get('project', 'project'), actor=request.get('actor'))
     canonical.authority_config = None

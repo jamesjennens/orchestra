@@ -381,6 +381,19 @@ and the limit. The People page has a panel "Who may create projects".
 - **The limit counts** the projects that account created that are not archived, plus any
   name it holds on the host through a creation that has not finished. Handing a project
   to another owner does not free a place. Archiving it does.
+- **The server has a limit of its own**, set by an operator (20 unless changed): the
+  number of project databases it holds. It counts every database, also those of archived
+  and retired projects and of creations that did not finish, because none is ever
+  dropped. So an account that creates, archives and creates again stays within its own
+  limit and still fills the server. At the server's limit a creation is refused with
+  "This server is at its limit of projects, so no new one can be created. Ask an operator
+  of the server to raise the limit or to make room." The answer gives no numbers: they
+  would say how many projects other people have. A superuser sees the numbers on the
+  Projects page, in `GET /v1/project-creations` (`server`) and on a project's setup page.
+  Why there is a limit: see OPERATIONS.md, "The cost of many projects on one server".
+- **What the page is told matches what the endpoint will answer.** `project_host_create`
+  in `GET /v1/sessions/current` counts the names the account holds on the host (`held`),
+  and its `reason` is `limit` (the account's own) or `server-limit`.
 
 **Creating.** `POST /v1/projects` with `{"project_id": NAME, "name": "...", "create": true}`.
 Without `"create": true` the route registers an existing project, as before.
@@ -388,8 +401,25 @@ Without `"create": true` the route registers an existing project, as before.
   letter.
 - The service asks the host through one endpoint action, `create-project`, which runs
   the same code as `add-project`: database, settings, backup target, merge slot and a
-  first backup. It takes a few seconds, and the service's authority lock is held for
-  that time, so other writes wait.
+  first backup.
+- **It takes from a few seconds to a few minutes**: about six seconds on a server with
+  no other project and about one second more for each project database the server
+  already holds (measured; see OPERATIONS.md). The action has its own timeout,
+  `--create-timeout` (900 seconds), separate from `--endpoint-timeout`.
+- **Nothing else waits for it.** The creation is done in three steps: the request is
+  reserved under the service's authority lock (the grant, both limits and the name are
+  checked, and the name is held from that moment), the project is initialized with that
+  lock released, and the result is confirmed under the lock again. While a project is
+  being created every other request is served as usual: reads, task writes in any
+  project, grants, sign-ins.
+- **One creation at a time.** A second creation while one runs answers 503 `busy` at
+  once, with `Retry-After: 60` and "Another project is being created on this server. Try
+  again in a minute." Nothing was done; the same request can be sent again.
+- **If the grant is revoked or the account disabled while the project is being made**,
+  the request is refused (403) and the project stays on the host, complete and not
+  registered. A superuser sees it on the Projects page as "Made, not registered" and
+  either registers it (New project, with that name) or has an operator retire it. The
+  same holds if the server is over its limit when the work ends.
 - **The project appears in the web interface only after the host reports it created**,
   first backup included. The creator is its only member, as owner, and is sent to the
   setup page. Only a superuser adds a second owner.
@@ -420,28 +450,60 @@ creation lock.
 `<root>/project-creations/NAME.json`: the intent is written before the first write and
 the result after the last.
 - **Nothing was made yet** (no directory, or an empty one): the request answers 409
-  "nothing was made", and the same request can be sent again.
+  "The project could not be created and nothing was made. Try again; if it fails again,
+  ask an operator of the server." The same request can be sent again. The cause is not
+  in the answer (it may name paths and commands of the host); the operator finds it in
+  `<root>/project-creations/last-failure.txt`.
 - **Something was made** (the database exists; a later step stopped): the request
   answers 409 with a sentence that names the project and says an operator must finish
   or remove it. Nothing is registered in the web interface, so no member, list or agent
   sees the project. The name is held and counts toward the creator's limit. **The kit
   never removes it**: that would mean dropping a database from a web request.
-- **The process was killed**: the same request answers 503 "outcome unknown". The record
-  still says what was started.
-- **A superuser sees every such creation** on the Projects page ("Project creations that
-  did not finish") and in `GET /v1/project-creations`, with who started it, the step it
-  stopped at and the two commands.
+- **The process was killed**: the request that was running answers 503 "outcome unknown".
+  The record still says what was started. Sent again, with the same idempotency key or a
+  new one, the request is answered from that record: it resumes when nothing was made, and otherwise answers 409 with the sentence
+  that an operator must finish or remove it. What the record reads as afterwards:
+  - `incomplete`, when something was made;
+  - `stalled`, when nothing was made (the kill came before the first write). It holds
+    the name and a place. The same request resumes it; `remove-creation` clears it and
+    frees the name, because no database exists for it.
+  - A creation killed **during** `bd init` is `incomplete` and cannot be finished: the
+    database may exist half made. `remove-creation` retires it and **the name is lost
+    for good**, as for any retired project. The messages say so.
+- **A creation that is running reads `running`**, not incomplete, and has no command:
+  wait for it.
+- **Nothing is served from a creation that has not finished**, and it cannot be
+  registered. The endpoint answers every request for it "Unknown/uninitialized project:
+  ... is a creation that has not finished", so the plain register route
+  (`POST /v1/projects` without `create`) refuses it too, with 409 and that sentence. It
+  has no backup target, merge slot or first backup yet.
+- **A superuser sees every such creation** on the Projects page ("Projects on the
+  server") and in `GET /v1/project-creations`: `items` (running, incomplete, stalled or
+  damaged, each with who started it, the step it stopped at and the command for that
+  reading), `unregistered` (made and not registered) and `server` (`used`, `limit`).
 - **To finish it**, an operator runs `admin.py finish-project NAME`. It works when the
   project was initialized (`projects/NAME/.beads/metadata.json` exists): the settings,
   the backup target, the merge slot and a backup are each done or done again. The
   creator then creates the project again in the web interface with the same name, which
   registers it without doing the work twice; or a superuser registers it.
 - **To remove it**, an operator runs
-  `admin.py retire-project NAME --actor OPERATOR --reason REASON --force`. The directory
-  moves to `retired/`, nothing is deleted, the name stays retired, and the creator's
-  place is free again.
-- `admin.py project-creations` lists every record; `--attention` lists only the ones
-  that need an operator.
+  `admin.py remove-creation NAME --actor OPERATOR --reason REASON`. It acts only on a
+  creation that reads `incomplete` or `stalled`. It refuses a finished project, a name
+  with no creation record and a creation that is running, and changes nothing then. For
+  an incomplete one the directory moves to `retired/`, nothing is deleted and the name
+  stays retired; for a stalled one only the record is removed and the name is free. The
+  creator's place is free again either way. `retire-project --force` is not the command
+  for this: aimed at the wrong name it retires a healthy project.
+- `retire-project` and `remove-creation` both refuse while a creation is running.
+- `admin.py project-creations` lists every record; `--attention` lists the ones that are
+  running or need an operator, each with its command; `--usage` prints how many project
+  databases the server holds and its limit; `--set-server-limit N --actor OPERATOR` sets
+  the limit (a listed operator; audited in `deployment.private.json`).
+- **`admin.py backup --all` is incomplete while an initialized creation is unfinished**:
+  the project has no backup target yet, so the nightly gate is red until an operator
+  finishes or removes it. The backup's last line names the project and both commands.
+- A project cannot be named `mysql`, `sys`, `dolt` or `doltcfg`: the database server
+  uses those names itself. `add-project` refuses them too.
 - The records are not part of a project's backup: they belong to the runtime, not to a
   project. A runtime rebuilt from backups has none, which loses only the notes about
   creations that had not finished; a finished project is in the web service's state.
@@ -463,13 +525,25 @@ to read it for editing. Owners and superusers, session only.
   the project, not an instruction from the operator of this server.]" The line is part
   of the stored document, so it is in what `onboard` gives a worker, it travels with a
   backup and a restore, and an earlier kit shows it too.
+- **Every line the owner wrote is stored behind a mark, `| `** (an empty line is `|`).
+  A heading, or a line written to look like the kit's own, is then visibly inside the
+  owner's text: nothing an owner writes can start a line of the document, so it cannot
+  close its own block or pass for a section of the kit or of the operator. The service
+  adds the mark to every line whatever the request sent (a line that already begins
+  with `| ` becomes `| | ...`). The editor shows and saves the text without the marks,
+  and saving unchanged text changes no byte. Text an operator sets with
+  `admin.py set-onboarding` has no kit line and no marks.
 - The rules are those of `admin.py set-onboarding` (nonempty, at most 8000 bytes, of
-  which the line and the blank line after it use 152) plus the plain-text rule of the guidance channel: no control,
-  bidi, zero-width, invisible or format character.
-- An owner may replace text an operator set. `DELETE` removes only owner-written text:
-  the operator's own document is not removable from the web interface. `GET` returns
-  owner-written text for editing and reports an operator's document as set without
-  returning it.
+  which the kit's line uses 152 and each line's mark 2) plus the plain-text rule of the
+  guidance channel: no control, bidi, zero-width, invisible or format character. Lines
+  end with a line feed (a CRLF pair is read as one); a carriage return alone is refused.
+- Text that is not valid Unicode (half of a surrogate pair) answers 422, here and on
+  every other route; it used to answer 500.
+- An owner may replace text an operator set. The operator's text is then kept beside the
+  document as `ONBOARDING.operator-copy.md`, and the audit says so. `DELETE` removes
+  only owner-written text: the operator's own document is not removable from the web
+  interface. `GET` returns owner-written text for editing and reports an operator's
+  document as set without returning it.
 - Audited as `projects.onboarding` with the account and the size, never the text.
 - The write goes through the service-only endpoint action `set-onboarding`, which
   re-checks project administration under the authority lock.

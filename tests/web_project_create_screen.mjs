@@ -55,7 +55,7 @@ if (phase === 'create') {
   out.carlPanel = work.hostCreatePanel(who.carl, (await who.carl.api.current()).project_host_create);
   const panel = work.hostCreatePanel(who.olive, session.project_host_create);
   const form = panel.querySelector('form');
-  out.panelText = panel.textContent.slice(0, 260);
+  out.panelText = panel.textContent.slice(0, 600);
   form.querySelector('#new_project_id').value = 'Not A Name';
   await form.dispatch('submit');
   out.badName = fieldError(form, 'new_project_id');
@@ -71,6 +71,8 @@ if (phase === 'create') {
   const step = () => page2.all((e) => e.tagName === 'LI').find((li) => li.attributes['data-step'] === 'onboarding');
   out.onboardingBefore = { state: step().attributes['data-state'], who: step().textContent.includes('A project owner, on this page') };
   const editor = () => step().querySelector('#onboarding-form').querySelector('form');
+  // The form is drawn after its own read of the text; on a busy machine that takes longer than one settle.
+  for (let waited = 0; !editor() && waited < 50; waited += 1) await settle();
   editor().querySelector('#onboarding').value = '   ';
   await editor().dispatch('submit');
   out.emptyText = fieldError(editor(), 'onboarding');
@@ -80,6 +82,7 @@ if (phase === 'create') {
   editor().querySelector('#onboarding').value = 'Start with docs/README.md.';
   await editor().dispatch('submit');
   await settle();
+  for (let waited = 0; !editor() && waited < 50; waited += 1) await settle();
   out.onboardingAfter = { state: step().attributes['data-state'], value: editor().querySelector('#onboarding').value,
     buttons: texts(editor(), 'BUTTON') };
   const guidance = page2.all((e) => e.tagName === 'LI').find((li) => li.attributes['data-step'] === 'guidance');

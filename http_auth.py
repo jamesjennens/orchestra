@@ -196,6 +196,17 @@ def uncertain(message='Outcome unknown'):
     return HttpError(503, 'uncertain', message)
 
 
+def busy(message='The server is busy; nothing was done. Try again shortly.', retry_after=30):
+    """503 for a request that did nothing because the server was occupied: safe to send again.
+
+    Unlike ``uncertain`` there is no outcome to reconcile. ``retry_after`` becomes the
+    ``Retry-After`` header.
+    """
+    error = HttpError(503, 'busy', message)
+    error.retry_after = retry_after
+    return error
+
+
 # --------------------------------------------------------------------- token helpers
 def new_token():
     return secrets.token_urlsafe(32)
@@ -1516,7 +1527,8 @@ class Service:
     #: A plain account name. Short on purpose: an opaque token does not fit as a user name.
     REPOSITORY_USER_MAX = 32
     _REPO_USER = r'(?P<user>[A-Za-z0-9_][A-Za-z0-9._-]{0,%d})' % (REPOSITORY_USER_MAX - 1)
-    _REPO_PORT = r'(?::(?P<port>[0-9]{1,5}))?'
+    #: No leading zero: ``:00080`` is not how anyone writes a port.
+    _REPO_PORT = r'(?::(?P<port>[1-9][0-9]{0,4}))?'
     _REPO_PATH = r'(?P<path>[A-Za-z0-9._~+=,/-]+)'
     _REPOSITORY_FORMS = (
         # https://host[:port]/path - no user name at all, so no token can ride in it.
@@ -1529,7 +1541,8 @@ class Service:
         # is a network share on Windows. Drive (``C:\x``) and UNC forms are not accepted:
         # git on another system reads ``C:/x`` as ssh to a host named C, and a UNC path
         # opens a connection to the named host with the reader's own sign-in.
-        re.compile(r'/(?!/)(?P<path>[A-Za-z0-9._~+=,/-]*)', re.ASCII),
+        # At least one character after the slash: ``/`` alone names nothing.
+        re.compile(r'/(?!/)(?P<path>[A-Za-z0-9._~+=,/-]+)', re.ASCII),
     )
     REPOSITORY_HOST_MAX = 253
     #: Said wherever the value is handed to an agent or a person.
@@ -1541,6 +1554,13 @@ class Service:
     #: warning shown to the owner; nothing here claims the list is complete.
     TOKEN_PREFIXES = ('ghp_', 'gho_', 'ghu_', 'ghs_', 'ghr_', 'github_pat_', 'glpat-', 'gldt-', 'xoxb-', 'xoxp-',
                       'xoxa-', 'sk-', 'pat_', 'AKIA', 'ASIA', 'hf_', 'npm_', 'dop_v1_')
+    #: What makes a piece look like a token (review 01a109cc): one of the beginnings above, in
+    #: any case and anywhere in the piece, followed by sixteen or more token characters; or
+    #: forty hexadecimal digits in a row. A short name that only starts like one (``sk-team``)
+    #: is a name.
+    TOKEN_TAIL = 16
+    _TOKEN_LIKE = re.compile(r'(?:%s)[A-Za-z0-9_-]{%d,}|(?<![0-9A-Fa-f])[0-9A-Fa-f]{40}(?![0-9A-Fa-f])'
+                             % ('|'.join(re.escape(prefix) for prefix in TOKEN_PREFIXES), TOKEN_TAIL), re.I | re.ASCII)
     REPOSITORY_FORMS_SENTENCE = ('repository must be one of: https://host/path, ssh://[user@]host[:port]/path, '
                                  'user@host:path, or an absolute path beginning with one /; with letters, digits '
                                  'and . _ ~ + = , / - only (no spaces, quotes, percent-escapes or control characters)')
@@ -1557,7 +1577,13 @@ class Service:
                 return None
             if parts.get('port') is not None and not 1 <= int(parts['port']) <= 65535:
                 return None
-            if '..' in (parts.get('path') or '').split('/'):
+            # No segment made of dots only (``..``, ``...``): the first climbs out of the path,
+            # the others name nothing a repository is at.
+            if any(len(segment) > 1 and not segment.strip('.') for segment in (parts.get('path') or '').split('/')):
+                return None
+            # ``c:x.git`` after a user name: a one-letter host is how a drive is written, and
+            # git on another system reads it as one.
+            if form is cls._REPOSITORY_FORMS[2] and len(parts['host']) < 2:
                 return None
             return found
         return None
@@ -1574,8 +1600,9 @@ class Service:
         * an absolute path beginning with exactly one ``/``.
 
         ASCII only; the scheme in lower case; a host is dot-separated labels that each
-        start and end with a letter or digit; a port is 1 to 65535; no ``..`` path
-        segment; no percent-escape, space, quote, control or format character; at most
+        start and end with a letter or digit (two characters at least in the
+        ``user@host:path`` form); a port is 1 to 65535 with no leading zero; no path
+        segment made of dots only; no percent-escape, space, quote, control or format character; at most
         REPOSITORY_MAX characters. The kit does not judge where a host points
         (``localhost`` and an address are hosts like any other). The refusal never
         repeats the value: it may hold a secret.
@@ -1604,8 +1631,8 @@ class Service:
             return None
         parts = found.groupdict()
         pieces = [parts.get('user') or ''] + (parts.get('path') or '').split('/')
-        if any(piece.startswith(cls.TOKEN_PREFIXES) for piece in pieces if piece):
-            return ('Part of this value begins like an access token. Every member and agent of the project can '
+        if any(cls._TOKEN_LIKE.search(piece) for piece in pieces if piece):
+            return ('Part of this value looks like an access token. Every member and agent of the project can '
                     'read it. If it is a token, replace the value with the location only and revoke the token.')
         return None
 
