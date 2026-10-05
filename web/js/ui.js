@@ -13,6 +13,10 @@ const REVIEW = {
   'approved': ['Approved · not integrated', 'ok'],
   'awaiting-integration': ['Awaiting integration', 'ok'],
   'integrated': ['Integrated', 'ok'],
+  // Additive review-workflow states (kittrial-5bb.94): a withdrawn or superseded
+  // revision is final and needs a new contribution to continue review.
+  'withdrawn': ['Withdrawn', 'plain'],
+  'superseded': ['Superseded', 'plain'],
   'error': ['Needs operator attention', 'crit'],
 };
 const STATUS = { open: ['Open', ''], in_progress: ['In progress', 'accent'], blocked: ['Blocked', 'crit'], closed: ['Closed', 'plain'] };
