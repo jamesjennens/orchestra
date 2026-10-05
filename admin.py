@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+import weakref
 from pathlib import Path
 from contextlib import contextmanager
 from bootstrap import install as install_binaries
@@ -77,13 +78,21 @@ class TerminatedBySignal(BaseException):
 # The active termination guards, innermost last (kittrial-5bb.122). raise_termination
 # consults them, so a stop that the interpreter runs late - at whatever bytecode
 # boundary follows the signal - still lands on the guard's rules. Only the main thread
-# installs a handler, so only main-thread guards are listed.
+# installs a handler, so only main-thread guards are listed. The list holds weak
+# references (kittrial-5bb.124): a guard whose exit never runs - left behind by
+# contextlib.ExitStack when a stop lands between the block and the exit - is not kept
+# alive by its record, so its finaliser can release it.
 _termination_guards=[]
+
+def _listed_guards():
+    """The listed guards still alive, innermost last."""
+    return [guard for guard in (ref() for ref in _termination_guards) if guard is not None]
 
 _TERMINATION_ERRORS=(ValueError,OSError,RuntimeError,AttributeError,TypeError)
 
 def _running_guard(frame):
-    """The listed guard whose own setup or exit is on the stack at ``frame``, or None.
+    """``(guard, code)``: the innermost listed guard whose own setup or exit is on the
+    stack at ``frame`` and the guard method running there, or ``(None, None)``.
 
     Python passes the handler the frame that was running when it checked for signals.
     That can be a helper the guard calls - ``signal.signal`` and ``signal.pthread_sigmask``
@@ -91,18 +100,21 @@ def _running_guard(frame):
     the frame passed (kittrial-5bb.122 review: the guard's own frame is not the one
     Python passes while it is inside those wrappers). A guard's block runs in the
     caller's frame, never under ``__enter__`` or ``__exit__``, so a stop in the block is
-    not mistaken for one in the guard's code."""
+    not mistaken for one in the guard's code. A guard that is no longer listed (its
+    exit has unlisted it) does not count: a stop handled in its last lines belongs to
+    the guards still listed, or to the previous handler."""
+    listed=_listed_guards()
     while frame is not None:
         if frame.f_code in _GUARD_CODES:
             owner=frame.f_locals.get('self')
-            for guard in _termination_guards:
-                if guard is owner:return guard
+            for guard in listed:
+                if guard is owner:return guard,frame.f_code
         frame=frame.f_back
-    return None
+    return None,None
 
 def _stop_guards():
     """Mark every listed guard stopped: the stop is raised once, for all of them."""
-    for guard in _termination_guards:guard.stopped=True
+    for guard in _listed_guards():guard.stopped=True
 
 def raise_termination(signum,frame):
     """Signal handler that turns a stop into an exception so the cleanup path runs.
@@ -119,13 +131,26 @@ def raise_termination(signum,frame):
     run inside a guard's own setup or exit, or in a function they call. There it never
     raises (the guard's restore would be skipped): the stop is recorded on THAT guard,
     which raises it once its previous handler and mask are back (kittrial-5bb.122).
+    The one exception is the end of ``__enter__``, once the handler is installed and the
+    guard is armed: a stop recorded there was only raised at the block's exit, after the
+    whole block ran. There the handler releases the guard itself (previous handler,
+    mask, record) and raises from ``__enter__``, exactly as a stop taken during setup is
+    raised, so the block does not run (kittrial-5bb.124). ``raise_signal`` or
+    ``interrupt_main`` cannot defer it to the block: the interpreter runs the handler
+    again at its next check, which is still inside this handler.
     """
-    if _termination_guards:
-        guard=_running_guard(frame)
+    listed=_listed_guards()
+    if listed:
+        guard,code=_running_guard(frame)
         if guard is not None:
             guard.held=True
+            if code is _GUARD_ENTER_CODE and guard.entered:
+                # The end of __enter__: release here and raise from __enter__, as a stop
+                # taken during setup is, so the block does not run (kittrial-5bb.124).
+                guard._release()
+                guard._raise_held(False)
             return
-        if any(guard.stopped for guard in _termination_guards):
+        if any(guard.stopped for guard in listed):
             return
         _stop_guards()
         raise TerminatedBySignal(signum)
@@ -203,6 +228,7 @@ class signal_termination_guard:
         self.stopped=False
         self.held=False
         self.listed=False
+        self.entered=False
         self.previous=None
 
     def __enter__(self):
@@ -215,7 +241,7 @@ class signal_termination_guard:
         if previous is None:
             return self   # installed outside Python: it could not be restored
         self.previous=previous
-        _termination_guards.append(self)
+        _termination_guards.append(weakref.ref(self))
         self.listed=True
         try:
             signal.signal(signal.SIGTERM,raise_termination)
@@ -225,6 +251,7 @@ class signal_termination_guard:
         except BaseException:
             self._release()
             raise
+        self.entered=True   # from here a stop releases the guard and raises (raise_termination)
         if self.held:
             self._release()
             self._raise_held(False)
@@ -235,6 +262,19 @@ class signal_termination_guard:
             self._release()
             self._raise_held(kind is not None and issubclass(kind,GeneratorExit))
         return False
+
+    def __del__(self):
+        """A guard collected while still listed never ran its exit (kittrial-5bb.124):
+        ``contextlib.ExitStack`` can drop it when a stop lands in its own code between the
+        block and the guard's exit. Release it here, so the previous handler is back and
+        no stopped record outlives it; a stop it had recorded goes to the previous
+        handler, as for an abandoned block. The kit itself uses plain ``with``."""
+        try:
+            if self.listed:
+                self._release()
+                self._raise_held(True)
+        except Exception:
+            pass
 
     def _release(self):
         """Restore the previous handler and the mask and unlist the guard, on every path."""
@@ -259,14 +299,11 @@ class signal_termination_guard:
                     except _TERMINATION_ERRORS: pass
             finally:
                 self.listed=False
-                for index,guard in enumerate(_termination_guards):
-                    if guard is self:
-                        del _termination_guards[index]
-                        break
+                _termination_guards[:]=[ref for ref in _termination_guards if ref() is not None and ref() is not self]
 
     def _raise_held(self,abandoned):
         """Raise a stop recorded in the guard's own code, once for all guards."""
-        if not self.held or self.stopped or any(guard.stopped for guard in _termination_guards):
+        if not self.held or self.stopped or any(guard.stopped for guard in _listed_guards()):
             return
         self.stopped=True
         if abandoned:
@@ -280,7 +317,8 @@ class signal_termination_guard:
 
 _GUARD_CODES=frozenset(method.__code__ for method in (
     signal_termination_guard.__enter__,signal_termination_guard.__exit__,
-    signal_termination_guard._release,signal_termination_guard._raise_held))
+    signal_termination_guard._release,signal_termination_guard._raise_held,signal_termination_guard.__del__))
+_GUARD_ENTER_CODE=signal_termination_guard.__enter__.__code__
 
 @contextmanager
 def sigterm_blocked():
@@ -3661,6 +3699,8 @@ def main():
               %(outcome,result['version']))
         if result.get('repaired') and not result['changed']:
             print('The audit record was missing or did not match the text; it is now bound to the text you set.')
+        if result.get('warning'):
+            print(result['warning']+'.')
         if result.get('replaced_unreadable'):
             print('The guidance file that was on disk could not be read as guidance (a refused character, over the '
                   'limit, or not UTF-8) and was replaced. Nothing of it was kept in the record.')
