@@ -239,14 +239,19 @@ def set_server_limit(root, value, actor):
     marker = Path(root) / 'deployment.private.json'
     if not marker.is_file():
         raise ValueError('Deployment is not installed; run install first')
-    cfg = admin.config(root)
-    audit = cfg.get(SERVER_LIMIT_KEY + '_audit', [])
-    if not isinstance(audit, list) or any(not isinstance(item, dict) for item in audit):
-        raise ValueError('Invalid audit of the project database limit; reconcile before changing it')
-    previous = server_limit(root)
-    cfg[SERVER_LIMIT_KEY] = value
-    cfg[SERVER_LIMIT_KEY + '_audit'] = (audit + [{'actor': actor, 'at': _stamp(), 'from': previous, 'to': value}])[-50:]
-    admin.atomic_private_write(marker, json.dumps(cfg))
+    # Under the one lock every writer of this file takes (kittrial-5bb.136), and read again
+    # under it, so a switch flip or an allowlist change made at the same instant is not lost,
+    # and neither is this one. A holder that keeps the lock past its bound refuses this change.
+    with admin.deployment_config_lock(root):
+        cfg = admin.config(root)
+        audit = cfg.get(SERVER_LIMIT_KEY + '_audit', [])
+        if not isinstance(audit, list) or any(not isinstance(item, dict) for item in audit):
+            raise ValueError('Invalid audit of the project database limit; reconcile before changing it')
+        previous = server_limit(root)
+        cfg[SERVER_LIMIT_KEY] = value
+        cfg[SERVER_LIMIT_KEY + '_audit'] = (audit + [{'actor': actor, 'at': _stamp(), 'from': previous,
+                                                      'to': value}])[-50:]
+        admin.atomic_private_write(marker, json.dumps(cfg))
     return server_usage(root)
 
 
