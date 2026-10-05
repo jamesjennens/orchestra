@@ -94,7 +94,23 @@ def cursor_matches(cursor,data,compatible=None):
     # Read receipts already written by the first provenance kit in their shape.
     if cursor==(compatible if compatible is not None else activity_cursor(data)):return True
     previous=token({'v':1,'kind':'activity','project':data['project'],'task':data['task'],'sha256':content_hash(data)})
-    return cursor==previous
+    if cursor==previous:return True
+    # A project restored under another name (restore-new) keeps its tasks and checkpoints,
+    # but the project name is part of the cursor and of the hashed snapshot, so every
+    # checkpoint read as stale although nothing changed (kittrial-5bb.131). The cursor
+    # names the project it was taken in: the same task with the same content under that
+    # name is the same activity. Only reading changes; cursors are written as before, so
+    # every kit still reads what every other kit writes, and an older kit keeps reporting
+    # the renamed project's checkpoints as stale until a fresh checkpoint is written.
+    try:
+        recorded=untoken(cursor)
+    except ValueError:
+        return False
+    project=recorded.get('project') if isinstance(recorded,dict) else None
+    if not isinstance(project,str) or project==data['project']:return False
+    # The task and the content hash are inside the token, so only the same task with the
+    # same content can match.
+    return cursor_matches(cursor,dict(data,project=project))
 
 def text(value,label,limit,empty=False):
     # Names the field, the length it had and the limit (kittrial-5bb.97).
