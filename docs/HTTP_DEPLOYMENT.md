@@ -188,6 +188,14 @@ The rules:
   second registration is refused with 409, naming the existing record (archived or not).
   An exact retry of a successful registration with the same `Idempotency-Key` replays
   its 201.
+- A few names are reserved for the server's own routes and cannot be registered:
+  `unconfirmed` is the upgrade check below (`GET /v1/projects/unconfirmed`). Registering
+  one is refused with 422 before the host is asked, because the record could never be
+  read back under its own name.
+- Registration writes `registered_by` (the superuser who registered it) on the record.
+  That mark is what makes the mapping count as superuser-backed, so it keeps working even
+  if that superuser is later demoted. A record made by an older kit has no such mark; a
+  confirmation backfills it, and see the limit on that below.
 - If no initialized canonical project `NAME` exists, the request is refused with 422 and
   nothing is stored.
 - Registering makes the superuser the project's only member (owner). Add members
@@ -223,19 +231,47 @@ a `proj_...` record until a superuser decides. After every upgrade to this kit o
      shows the creator and the members first). The canonical project must exist on the
      host. The members keep their access, so review them; the confirmation is recorded
      on the record (`confirmed_by`, `confirmed_at`) and in the audit log
-     (`projects.confirm`); or
+     (`projects.confirm`), and it backfills `registered_by` when the record has no such
+     mark, so the mapping stays superuser-backed if the confirming superuser is later
+     demoted; or
    - **archives** it (`POST /v1/projects/{id}/archive`).
 3. Archive each `no-canonical` entry (a `proj_...` id).
+
+**The backfill's limit (a known exposure, not closed).** A confirmation backfills
+`registered_by` only for a record that has no such mark, and a record can only be
+confirmed while the backend will not serve it. A record whose creator is still a
+superuser is *usable*, so the confirm route refuses it with 409 "This project needs no
+confirmation" and the backfill **cannot** be applied yet. Demote that creator first (or
+wait until nothing else makes the mapping superuser-backed) and the read turns unusable,
+which is exactly when confirm works and stamps `registered_by` beside `confirmed_by`.
+Until then such a record stays usable only for as long as someone is a superuser behind
+it: demoting the creator without confirming first leaves it unusable, and the confirmation
+is then available. There is deliberately no route that stamps the mark on a record the
+service is already serving.
 
 **What an unusable record still allows.** While a record is unconfirmed or has no
 canonical project:
 - Reads of the record, its members and its credentials work. Its task, review and queue
-  routes answer 409 before any endpoint call.
+  routes answer 409 before any endpoint call. Usability is judged live on every read, not
+  from the short read cache, so a record that becomes unusable (for example its creator is
+  demoted) stops being served at once.
 - Nothing that grants or extends access is accepted (409): adding a member or changing a
-  role, issuing a worker credential, a new agent grant.
+  role, issuing a worker credential, a new agent grant, or a new credential for an agent
+  that already holds a grant on the record.
 - Everything that removes access works: removing a member, revoking a worker credential,
   revoking an agent's grant, archiving. Cleaning up a suspicious record never requires
   confirming it first.
+- The refusal is given only to a caller who may touch the thing being changed. On the agent
+  routes an account that may not administer the agent gets the ordinary 404 `Agent not
+  found` (and `Project not found` for a project its owner cannot see), never the
+  unusable-record sentence, so the refusal cannot be used to probe for agent ids, record
+  ids or their owners' memberships.
+- **An archived unusable record** is a special case of the refusal: it cannot be confirmed
+  (the confirm route refuses an archived record), so the 409 says so and names the route
+  that works — removing the access being added (an agent grant, a membership, a
+  credential). An agent that still holds a grant on an archived record therefore gets a new
+  credential as soon as its owner removes that grant, instead of being told to confirm or
+  archive a record that is already archived.
 
 With `--backend inprocess` (disposable local validation) everything is service-local, so
 "New project" still creates the project directly (`project_create: create`), and no record

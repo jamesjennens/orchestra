@@ -323,6 +323,22 @@ UNCONFIRMED = ('This project was created before registering a project was limite
                'has confirmed it, so it cannot be used. A superuser confirms it (Projects page, or POST '
                '/v1/projects/ID/confirm) or archives it.')
 
+#: Said instead of the record's own sentence when the record is ARCHIVED and the backend
+#: will not serve it (kittrial-5bb.90 review item 2.1): the confirm route refuses an
+#: archived record and the record is already archived, so "confirm it or archive it" is
+#: two dead ends. Only removing the access being added works, and this says which call
+#: does it.
+ARCHIVED_UNUSABLE = ('This project is archived and this server will not serve its record; an archived record '
+                     'cannot be confirmed, so nothing that grants access is accepted on it. Remove the access '
+                     'being added instead, which does work on an archived record: an agent grant (PATCH the '
+                     'agent with its projects without this one, or DELETE /v1/projects/ID/agents/AGENT), a '
+                     'membership, or a worker credential.')
+
+#: Canonical names that cannot be registered: the same segment is a literal route under
+#: ``/v1/projects/...`` (``GET /v1/projects/unconfirmed`` is the upgrade check), so a
+#: project with that name could never be read back (kittrial-5bb.90).
+RESERVED_PROJECTS = frozenset({'unconfirmed'})
+
 
 def project_unusable(service, project_id):
     """Why the endpoint backend will not serve a project record: (kind, reason), or None.
@@ -2635,9 +2651,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         server's small read cache for that long, keyed by the *principal* (user id and
         credential id, so an agent never sees its owner's entry or the reverse), the
         project and the read kind. Callers re-check live authority before every read;
-        authorization is never cached. The principal's own successful write drops its
-        entries for that project (:meth:`_forget_cached_reads`). The cache is bounded
-        to :data:`READ_CACHE_MAX_ENTRIES` entries.
+        authorization is never cached, and neither is usability (kittrial-5bb.90): each
+        entry carries the verdict it was stored under, and a record that became usable
+        or unusable is a miss, so the loader's own refusal or fresh read wins at once.
+        The principal's own successful write drops its entries for that project
+        (:meth:`_forget_cached_reads`). The cache is bounded to
+        :data:`READ_CACHE_MAX_ENTRIES` entries.
         """
         memo = getattr(self, '_request_reads', None)
         if memo is None:
@@ -2649,10 +2668,13 @@ class ApiHandler(BaseHTTPRequestHandler):
         key = (getattr(principal, 'user_id', None), getattr(principal, 'credential_id', None)
                or '-', project_id, kind)
         now = time.monotonic()
+        usable = (self._unusable(project_id) is None) if ttl else None
         if ttl and self.read_cache is not None:
             with self.read_cache_lock:
                 hit = self.read_cache.get(key)
-            if hit is not None and hit[0] > now:
+            # A two-tuple is an entry written before this rule (or aged by a test): it
+            # carries no verdict, so it is served as before.
+            if hit is not None and hit[0] > now and (len(hit) < 3 or hit[2] == usable):
                 memo[(kind, project_id)] = hit[1]
                 return hit[1]
         result = load()
@@ -2663,7 +2685,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     for stale in [k for k, v in self.read_cache.items() if v[0] <= now] or \
                             list(self.read_cache)[:READ_CACHE_MAX_ENTRIES // 2]:
                         self.read_cache.pop(stale, None)
-                self.read_cache[key] = (now + ttl, result)
+                self.read_cache[key] = (now + ttl, result, usable)
         return result
 
     def _forget_cached_reads(self, principal, project_id):
@@ -2860,6 +2882,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         if not isinstance(project_id, str) or not CANONICAL_PROJECT.fullmatch(project_id):
             raise invalid('project_id must be the canonical project name: 2-24 lowercase letters or digits, '
                           'beginning with a letter (the NAME given to admin.py add-project)')
+        if project_id in RESERVED_PROJECTS:
+            # A literal route of the same name is registered before `/v1/projects/{pid}`
+            # (kittrial-5bb.90): the record could never be read back, so refuse it here
+            # rather than on every later read.
+            raise invalid('project_id %s is reserved for this server\'s own routes; choose another canonical '
+                          'project name' % project_id)
         name = payload.get('name') or project_id
         existing = self.service.state['projects'].get(project_id)
         if existing is not None:
@@ -2915,11 +2943,21 @@ class ApiHandler(BaseHTTPRequestHandler):
         new agent grant. Whatever REMOVES access stays open on such a record (removing
         a member, revoking a credential or an agent grant, archiving), so cleaning one
         up never requires confirming it first. Called after the route's authority
-        check, so it never tells a caller without access that the record exists."""
+        check, so it never tells a caller without access that the record exists.
+
+        An ARCHIVED record is answered with :data:`ARCHIVED_UNUSABLE` instead of the
+        record's own sentence (kittrial-5bb.90 review item 2.1): an archived record
+        cannot be confirmed, so advising "confirm it or archive it" points at two dead
+        ends, while removing the access does work.
+        """
         verdict = self._unusable(project_id)
-        if verdict is not None:
-            raise conflict(verdict[1] + ' Until then nothing that grants access is accepted on it; removing a '
-                           'member, revoking a credential or an agent grant, and archiving still work.')
+        if verdict is None:
+            return
+        record = self.service.state.get('projects', {}).get(project_id)
+        if isinstance(record, dict) and record.get('archived'):
+            raise conflict(ARCHIVED_UNUSABLE)
+        raise conflict(verdict[1] + ' Until then nothing that grants access is accepted on it; removing a '
+                       'member, revoking a credential or an agent grant, and archiving still work.')
 
     def _usable(self, view):
         """Mark a project the backend cannot serve (kittrial-5bb.80, .84)."""
@@ -2978,6 +3016,10 @@ class ApiHandler(BaseHTTPRequestHandler):
             item = next(item for item in unusable_projects(self.service) if item['id'] == project_id)
             record['confirmed_by'] = principal.user_id
             record['confirmed_at'] = now_iso(self.service._now())
+            # Backfill the mark the register route writes: a record a superuser stands
+            # behind stays usable even if that superuser is later demoted (kittrial-5bb.90).
+            # A record that already names its registrant keeps it.
+            record.setdefault('registered_by', principal.user_id)
             result = {'id': project_id, 'name': record.get('name'), 'usable': True,
                       'confirmed_by': principal.user_id, 'confirmed_at': record['confirmed_at'],
                       'created_by': item['created_by'], 'members': item['members']}
@@ -3175,24 +3217,51 @@ class ApiHandler(BaseHTTPRequestHandler):
         payload = dict(ctx.payload or {})
 
         def update():
-            held = (self.service.state['agents'].get(ctx.params['aid']) or {}).get('projects') or ()
-            self._require_grantable(ctx.principal, payload.get('projects'), held)
+            record = self.service.state['agents'].get(ctx.params['aid'])
+            if isinstance(record, dict):
+                # An id with no agent record is the service's own 404: judging a grant
+                # here would answer the usability refusal for an agent that is not there
+                # (kittrial-5bb.90 item 1).
+                self._require_grantable(ctx.principal, payload.get('projects'),
+                                        record.get('projects') or (),
+                                        owner_id=record.get('owner'))
             result = self.service.update_agent(ctx.principal, ctx.params['aid'], payload)
             return result, result
         return self._mutate(ctx, 'agents.update', None, update, capability=CAP_AGENTS)
 
-    def _require_grantable(self, principal, projects, held):
-        """Refuse a NEW agent grant on a record the backend will not serve (kittrial-5bb.84).
+    def _require_grantable(self, principal, projects, held, owner_id=None):
+        """Refuse a NEW agent grant on a record the backend will not serve (kittrial-5bb.84, .90).
 
-        Only projects the caller is a member of are judged here, so the refusal never
-        reveals a record the caller cannot see (the service refuses those itself); a
-        grant the agent already holds is left alone, so its other fields stay editable.
+        Judged against the *agent owner's* live membership, not the caller's: a superuser
+        editing somebody else's agent is not a member of the owner's projects, and a
+        record's usability is the same for everyone. A project the owner cannot see is
+        left to the service's own not-found refusal, so no record is revealed to either
+        account; a grant the agent already holds is left alone, so its other fields stay
+        editable.
+
+        Nothing is judged for a caller who may not administer the agent (kittrial-5bb.90
+        item 1): the owner's membership is not the caller's business, and answering the
+        usability refusal to an outsider would tell a caller with no rights that the agent
+        id exists, that the record exists and is unusable, and that the owner is a member.
+        The service's own ``_agent_owned`` then answers its unchanged 404, exactly as the
+        credential route in the same commit leaves an unauthorized caller to it.
         """
         if not isinstance(projects, (list, tuple)):
             return
+        owner_id = owner_id or principal.user_id
+        caller = self.service.state.get('users', {}).get(principal.user_id) or {}
+        if not (caller.get('superuser') or owner_id == principal.user_id):
+            return
+        owner = self.service.state.get('users', {}).get(owner_id) or {}
+        owner_is_superuser = bool(owner.get('superuser'))
         for project_id in projects:
-            if isinstance(project_id, str) and project_id not in held \
-                    and principal.user_id in self.service.state['memberships'].get(project_id, {}):
+            if not isinstance(project_id, str) or project_id in held:
+                continue
+            # An id with no record is the service's own not-found refusal; this only judges
+            # records that exist and that the owner could otherwise be granted.
+            if project_id not in self.service.state['projects']:
+                continue
+            if owner_is_superuser or owner_id in self.service.state['memberships'].get(project_id, {}):
                 self._require_usable(project_id)
 
     @route('POST', r'/v1/agents/(?P<aid>' + ID + r')/disable')
@@ -3214,6 +3283,19 @@ class ApiHandler(BaseHTTPRequestHandler):
         payload = dict(ctx.payload or {})
 
         def issue():
+            agent = self.service.state['agents'].get(ctx.params['aid'])
+            user = self.service.state.get('users', {}).get(ctx.principal.user_id) or {}
+            if isinstance(agent, dict) and agent.get('enabled') and (
+                    user.get('superuser') or agent.get('owner') == ctx.principal.user_id):
+                # A new credential extends the agent's access to the projects it already
+                # holds, so on a record the backend will not serve it is refused like any
+                # other grant (kittrial-5bb.90). Checked only for an agent this principal
+                # may administer, so an unauthorized caller still gets the service's 404.
+                # Never checked for a DISABLED agent: the service's own earlier "A disabled
+                # agent cannot receive a credential" must answer first, not this record's
+                # sentence (kittrial-5bb.90 review item 3.2).
+                for project_id in agent.get('projects') or ():
+                    self._require_usable(project_id)
             result = self.service.issue_agent_credential(
                 ctx.principal, ctx.params['aid'], scopes=payload.get('scopes'),
                 label=payload.get('label'), request_id=ctx.request_id)
