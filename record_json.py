@@ -83,3 +83,44 @@ def loads(text, **options):
         return json.loads(text, **options)
     except RecursionError:
         raise NestingError(MESSAGE) from None
+
+
+def loads_row(line):
+    """Parse one issue row from tracker export (`bd export --all`).
+
+    A row main reads (including 65 and 500 levels of nesting) must parse
+    normally. Only rows that truly cannot be parsed by json.loads (e.g.
+    3000-level RecursionError or syntax corruption) are returned as synthetic
+    malformed records. If the row has a recoverable ID, that ID is preserved;
+    if not, id is None. Neither is ever dropped.
+    """
+    if not line or not line.strip():
+        return None
+    try:
+        return json.loads(line)
+    except (ValueError, RecursionError) as error:
+        m = re.search(r'"id"\s*:\s*"([A-Za-z0-9][A-Za-z0-9_.-]{0,160})"', line)
+        task_id = m.group(1) if m else None
+        return {'id': task_id,
+                'title': 'Malformed issue row (%s)' % error,
+                'status': 'unknown',
+                'assignee': None,
+                'issue_type': 'task',
+                'malformed': True,
+                'error': str(error)}
+
+
+def loads_rows(lines):
+    """Parse lines from tracker export (`bd export --all`) through `loads_row`.
+
+    Accepts a string (which it splits into lines) or an iterable of line strings.
+    """
+    if isinstance(lines, str):
+        lines = lines.splitlines()
+    rows = []
+    for line in lines:
+        row = loads_row(line)
+        if row is not None:
+            rows.append(row)
+    return rows
+
