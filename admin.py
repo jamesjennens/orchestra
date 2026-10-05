@@ -22,6 +22,7 @@ import weakref
 from pathlib import Path
 from contextlib import contextmanager
 from bootstrap import install as install_binaries
+import record_json
 from requirements import content_hash
 from urllib.parse import unquote, urlsplit
 from urllib.request import url2pathname
@@ -576,34 +577,134 @@ def checkpoint_provenance_switch(root,action,actor):
 #: ``REVIEW_WRITES_LOCK`` so a flip records the value it replaced.
 REVIEW_WRITES_AUDIT = 'review-writes.audit.json'
 REVIEW_WRITES_LOCK = '.review-writes.lock'
+#: The append-only audit history's schema. Version 1 was the single-record form an
+#: earlier kit wrote; it is still READ as its one entry so an upgrade keeps the record.
+REVIEW_WRITES_AUDIT_SCHEMA = 2
+#: How many flips the short history keeps. The audit exists to answer "who turned it
+#: on, when, and who turned it off", not to be an unbounded log.
+REVIEW_WRITES_AUDIT_MAX = 20
 
 
-def review_writes_audit(root):
-    """The last switch flip this kit recorded, or None when it is absent or unreadable."""
-    path = root/REVIEW_WRITES_AUDIT
+def _review_writes_entry(record):
+    """Whether one audit entry is the shape `review-writes` writes."""
+    return (isinstance(record,dict) and record.get('schema_version')==1
+            and isinstance(record.get('review_workflow_writes'),bool)
+            and isinstance(record.get('set_by'),str) and isinstance(record.get('set_at'),str)
+            and isinstance(record.get('previous'),bool))
+
+
+def _review_writes_history(record):
+    """``(entries, damage)`` for a decoded audit file; ``damage`` is None when it reads.
+
+    One place decides what a readable audit history is, so the reader and the flip that
+    keeps a DAMAGED file aside cannot disagree (kittrial-5bb.110 item 3 P3). ``not JSON``
+    never reaches here: the caller reports the parse failure itself.
+    """
+    if not isinstance(record,dict):
+        return [],'not a JSON object'
+    if record.get('schema_version')==1:
+        return ([record],None) if _review_writes_entry(record) else ([],'malformed entry')
+    if record.get('schema_version')!=REVIEW_WRITES_AUDIT_SCHEMA:
+        return [],'schema %r is not 1 or %d'%(record.get('schema_version'),REVIEW_WRITES_AUDIT_SCHEMA)
+    entries=record.get('entries')
+    if not isinstance(entries,list):
+        return [],'entries is not a list'
+    kept=[entry for entry in entries if _review_writes_entry(entry)]
+    if len(kept)!=len(entries):
+        return kept,'malformed entr%s'%('y' if len(entries)-len(kept)==1 else 'ies')
+    return kept,None
+
+
+def _read_review_writes_audit(root):
+    """``(entries, damage)`` for the audit file; ``(None, None)`` when it is absent.
+
+    The ONE place the audit file is parsed, so the reader, the damage report and the flip
+    that keeps a damaged file aside cannot disagree (kittrial-5bb.110 item 3 P3).
+    ``damage`` is None when the file is absent or reads cleanly.
+    """
+    path=root/REVIEW_WRITES_AUDIT
     if not path.is_file():
-        return None
+        return None,None
     try:
-        record = read_json_file(path,'Review-writes audit record')
-    except (OSError, ValueError):
+        record=record_json.loads(path.read_text(encoding='utf-8'))
+    except (OSError,UnicodeError,ValueError):
+        return [],'unreadable or not valid JSON'
+    return _review_writes_history(record)
+
+
+def _review_writes_audit_damage(root):
+    """Why the audit file is not a readable history, or None when it is absent/readable."""
+    return _read_review_writes_audit(root)[1]
+
+
+def keep_damaged_review_writes_audit(root,stamp=None):
+    """Rename a DAMAGED audit file aside under a dated name; None when it reads cleanly.
+
+    The next flip REPLACES the history with a fresh readable one, so a file this kit
+    cannot read used to be destroyed silently and `status` then reported
+    ``audit_agrees: true`` beside an empty history (kittrial-5bb.110 item 3 P3). The
+    damaged bytes are kept beside the deployment file instead, under
+    ``review-writes.audit.json.damaged-<UTC date-time>`` (``.N`` on collision), and the
+    caller says so. Returns the path kept aside.
+    """
+    if _review_writes_audit_damage(root) is None:
         return None
-    if not isinstance(record,dict) or record.get('schema_version')!=1:
-        return None
-    return record
+    from datetime import datetime,timezone
+    path=root/REVIEW_WRITES_AUDIT
+    stamp=stamp or datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    aside=root/('%s.damaged-%s'%(REVIEW_WRITES_AUDIT,stamp))
+    number=1
+    while aside.exists():
+        aside=root/('%s.damaged-%s.%d'%(REVIEW_WRITES_AUDIT,stamp,number));number+=1
+    os.replace(path,aside)
+    return aside
 
 
-def write_review_writes_audit(root, enabled, actor, previous):
-    """Record WHO flipped ``review_workflow_writes``, WHEN, and the value replaced.
+def review_writes_audit(root,warnings=None):
+    """The switch-flip history this kit recorded, oldest first; ``[]`` when unreadable.
 
-    Written atomically at mode 0600 like the deployment file itself. The caller
-    holds ``REVIEW_WRITES_LOCK`` for the whole read-modify-write so two concurrent
-    flips cannot lose one another (kittrial-5bb.110 item 3).
+    A SHORT APPEND-ONLY HISTORY, not the last flip (kittrial-5bb.110 item 3): after one
+    operator turns the switch on and another turns it off, both entries stay, each naming
+    WHO, WHEN and the value replaced, so the audit says how the switch got where it is.
+    Schema 2 is ``{schema_version, entries: [...]}``, bounded to the last
+    ``REVIEW_WRITES_AUDIT_MAX`` flips. The pre-history schema-1 single-record form an
+    older kit wrote is read as its one entry.
+
+    Read through ``record_json.loads``: a deeply nested file raises ``NestingError`` (a
+    ``ValueError``) instead of ``RecursionError``, so `review-writes status` can never
+    die with a traceback. A file that exists but is not a readable history -- not JSON, a
+    list, schema 3, malformed entries -- is reported in `warnings` and the entries that
+    ARE readable are returned, rather than silently reading as "no history"
+    (kittrial-5bb.110 item 3 P3).
+    """
+    entries,damage = _read_review_writes_audit(root)
+    if entries is None:
+        return []
+    if damage is not None and warnings is not None:
+        warnings.append('WARNING: the review-writes audit file %s is damaged (%s); the switch history '
+                        'shown is incomplete, and the next flip keeps the file aside under a dated name '
+                        'before writing a fresh history' % (root/REVIEW_WRITES_AUDIT,damage))
+    return entries
+
+
+def write_review_writes_audit(root, enabled, actor, previous, entries=None):
+    """APPEND who flipped ``review_workflow_writes``, when, and the value replaced.
+
+    The history passed in (`entries`, oldest first) plus the new entry is written as one
+    atomic 0600 record, trimmed to the last ``REVIEW_WRITES_AUDIT_MAX`` flips. The caller
+    holds ``REVIEW_WRITES_LOCK`` for the whole read-modify-write so two concurrent flips
+    cannot lose one another (kittrial-5bb.110 item 3).
     """
     from datetime import datetime,timezone
-    record = {'schema_version':1,'review_workflow_writes':bool(enabled),'set_by':actor,
-              'set_at':datetime.now(timezone.utc).isoformat(),'previous':bool(previous)}
-    atomic_private_write(root/REVIEW_WRITES_AUDIT,json.dumps(record))
-    return record
+    entry = {'schema_version':1,'review_workflow_writes':bool(enabled),'set_by':actor,
+             'set_at':datetime.now(timezone.utc).isoformat(),'previous':bool(previous)}
+    history = [item for item in (entries or []) if _review_writes_entry(item)]
+    history.append(entry)
+    history = history[-REVIEW_WRITES_AUDIT_MAX:]
+    atomic_private_write(root/REVIEW_WRITES_AUDIT,
+                         json.dumps({'schema_version':REVIEW_WRITES_AUDIT_SCHEMA,
+                                     'entries':history}))
+    return entry
 
 
 @contextmanager
@@ -612,7 +713,10 @@ def review_writes_lock(root):
 
     POSIX-only, like every other coordination lock in the kit: on a host without
     ``fcntl`` the atomic file writes still stand. The lock file is deployment-level
-    and holds no state, so a leftover file is harmless and is never backed up.
+    and holds no state, so a leftover file is harmless and is never backed up. The lock
+    is held across the WHOLE read-modify-write, so the audit entry names the value that
+    was actually replaced; removing it loses that guarantee under concurrency, which is
+    why ``ReviewWritesCommandTests`` pins it.
     """
     handle=(root/REVIEW_WRITES_LOCK).open('a')
     try:
@@ -631,9 +735,13 @@ def review_writes_command(root, actor, action):
 
     The actor must be on the deployment operator allowlist, so a contributor that
     reaches the host command line cannot turn the switch on or off
-    (kittrial-5bb.110 item 1 / review mutation M15). A flip then records who set it
-    and when under the deployment lock (item 3). Extracted from the CLI so the
-    allowlist and audit behaviour are unit-testable without a subprocess.
+    (kittrial-5bb.110 item 1 / review mutation M15). A flip then APPENDS who set it and
+    when to the audit history under the deployment lock (item 3). An action that does not
+    change the value writes nothing at all, so an on-that-changes-nothing cannot
+    overwrite the history. `status` reports ``audit_agrees`` and warns when the switch
+    value and the last recorded flip disagree (an older kit, or a hand edit, changed one
+    without the other). Extracted from the CLI so the allowlist and audit behaviour are
+    unit-testable without a subprocess.
     """
     marker=root/'deployment.private.json'
     if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
@@ -646,20 +754,48 @@ def review_writes_command(root, actor, action):
     if action=='status':
         warnings=[]
         enabled=review_workflow_writes(root,warnings=warnings)
-        return {'review_workflow_writes':enabled,'audit':review_writes_audit(root)},warnings
+        history=review_writes_audit(root,warnings=warnings)
+        last=history[-1] if history else None
+        # The switch and the audit are written together by a flip, so they disagree only
+        # when something else changed one of them: an older kit (which does not know the
+        # audit file at all) or a hand edit. A DAMAGED audit file is a disagreement too:
+        # it must not read as "no history, everything agrees" (kittrial-5bb.110 item 3).
+        damage=_review_writes_audit_damage(root)
+        agrees=damage is None and (last is None or last['review_workflow_writes']==enabled)
+        if last is not None and not agrees:
+            warnings.append('WARNING: deployment review_workflow_writes is %s but the recorded audit '
+                            'history last says %s (set by %s at %s); the switch was changed without '
+                            'recording it here (an older kit or a hand edit), so the audit is stale'
+                            % ('on' if enabled else 'off',
+                               'on' if last['review_workflow_writes'] else 'off',
+                               last['set_by'],last['set_at']))
+        return {'review_workflow_writes':enabled,'audit':last,'audit_history':history,
+                'audit_agrees':agrees},warnings
     # One hold of the deployment lock for the whole read-modify-write, so the audit
-    # record names the value that was actually replaced (item 3).
+    # history records the value that was actually replaced (item 3).
     with review_writes_lock(root):
         cfg=config(root)
         previous=review_workflow_writes(root)
         enabled=action=='on'
+        if enabled==previous:
+            # An on that changes nothing is not a flip: it must not add an entry or
+            # overwrite the history (item 3).
+            return {'review_workflow_writes':previous,'changed':False},[]
+        # A DAMAGED history is kept aside under a dated name before it is replaced, and
+        # the caller is told; it used to be silently destroyed (kittrial-5bb.110 item 3).
+        warnings=[]
+        aside=keep_damaged_review_writes_audit(root)
+        if aside is not None:
+            warnings.append('WARNING: the review-writes audit file was damaged and has been kept aside '
+                            'as %s; this flip starts a fresh history' % aside)
         # OFF is the absent key, so a deployment that never turned it on and one
         # that turned it back off read identically.
         if enabled:cfg['review_workflow_writes']=True
         else:cfg.pop('review_workflow_writes',None)
         atomic_private_write(marker,json.dumps(cfg))
-        write_review_writes_audit(root,enabled,actor,previous)
-    return {'review_workflow_writes':review_workflow_writes(root)},[]
+        write_review_writes_audit(root,enabled,actor,previous,entries=review_writes_audit(root))
+    return {'review_workflow_writes':review_workflow_writes(root),'changed':True},warnings
+
 
 def stored_operators(cfg):
     """The deployment allowlist as a list of identity strings.

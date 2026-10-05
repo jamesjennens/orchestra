@@ -123,6 +123,12 @@ SEVERITIES = ('blocking', 'note')
 WITHDRAW_DISPOSITIONS = ('withdrawn', 'superseded')
 #: How the requester disposes of their own item: resolve it, or leave it as a note.
 RESOLVE_DISPOSITIONS = ('resolved', 'note')
+#: What a resolve-item record with NO disposition means. An older kit could store an
+#: explicit null, and that record still reads: it is the operation's default, which
+#: RESOLVES the item. Named so the default is one greppable token rather than an inline
+#: literal (kittrial-5bb.110 item 3 P3: a mutation that read a stored null as anything
+#: else survived).
+RESOLVE_DEFAULT = 'resolved'
 # Optional additive field on an ``approve`` record: the task assignee at the moment
 # the approval was written. Stamped server-side by ``execute``; approve records
 # written before this field existed keep validating without it, and a null value is
@@ -245,6 +251,26 @@ def check_plain_text(payload):
                 for key in ('reason', 'evidence'):
                     if isinstance(item.get(key), str):
                         plain_text(item[key], 'resolution ' + key)
+
+
+def check_write_fields(payload):
+    """Refuse an explicitly null OPTIONAL field on the WRITE path (kittrial-5bb.110 item 2).
+
+    ``validate`` stays tolerant so a record an older kit stored with ``"disposition":
+    null`` still validates and reads (``projection`` reads it as the operation default,
+    never ``None``). The canonical WRITER refuses a NEW one: null is not a disposition,
+    and storing it made ``review_state`` read None and a second withdraw raise a
+    ``TypeError``. The HTTP service also treats a null optional field as absent and does
+    not forward it, so this refusal only catches a raw payload (``review --file`` with an
+    explicit null) before any native write.
+    """
+    op = payload.get('operation')
+    if op not in ('withdraw', 'resolve-item') or 'disposition' not in payload:
+        return
+    if payload['disposition'] is None:
+        allowed = WITHDRAW_DISPOSITIONS if op == 'withdraw' else RESOLVE_DISPOSITIONS
+        raise ValueError('%s disposition must be %s or absent, not null'
+                         % (op, ' or '.join(allowed)))
 
 
 def new_write_field(payload):
@@ -423,6 +449,10 @@ def validate(p, task):
             limited(p['reason'], 'decline reason')
         elif op == 'withdraw':
             limited(p['reason'], 'withdraw reason')
+            # The READ path stays tolerant: a record an older kit stored with an
+            # explicit null disposition still validates here and reads as the default
+            # (see `projection`). The WRITE path refuses it (`check_write_fields`), so a
+            # new null can never be stored (kittrial-5bb.110 item 2).
             if p.get('disposition') is not None and p['disposition'] not in WITHDRAW_DISPOSITIONS:
                 raise ValueError('withdraw disposition must be withdrawn or superseded')
         elif op == 'resolve-item':
@@ -1373,7 +1403,13 @@ def projection(ordered, voids=None, invalid=None, refused=None, positions=None, 
                     raise ValueError('Resolution must reference an unresolved request/item')
                 if author_key(c['author']) != author_key(entry['author']):
                     raise ValueError('Only the requester may resolve their own review item')
-                if p.get('disposition', 'resolved') == 'note':
+                disposition = p.get('disposition')
+                if disposition is None:
+                    # A stored null is the operation's DEFAULT (RESOLVE_DEFAULT), never a
+                    # downgrade to a note and never the item's own severity: such a record
+                    # RESOLVES the item for a blocking item and for a note item alike.
+                    disposition = RESOLVE_DEFAULT
+                if disposition == 'note':
                     pending.pop(key, None)
                     notes[key] = dict(entry, severity='note')
                 else:
@@ -1405,7 +1441,11 @@ def projection(ordered, voids=None, invalid=None, refused=None, positions=None, 
                     # one is warned about below.
                     ignored_withdrawals.append(cid)
                 else:
-                    withdrawal = dict(request=cid, disposition=p.get('disposition', 'withdrawn'),
+                    # A stored record an older kit wrote with an explicit null
+                    # disposition reads as the operation default, never as None: the
+                    # state, `review`, `brief` and `work` all show `withdrawn`
+                    # (kittrial-5bb.110 item 2).
+                    withdrawal = dict(request=cid, disposition=p.get('disposition') or 'withdrawn',
                                       reason=p['reason'], contribution=current, author=c['author'],
                                       timestamp=c['created_at'])
                     # A withdraw closes the contribution's review requests, exactly
@@ -1688,6 +1728,9 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
         raise ValueError('Integration revert records are not accepted over the contributor review '
                          'transport; an operator must use admin.py revert-record on the coordination host')
     validate(payload, task); text(actor, 'actor', 300)
+    # A null optional disposition is refused on the WRITE path before anything else, so
+    # the writer never stores the shape `validate` must keep reading (item 2).
+    check_write_fields(payload)
     matches = [r for r in rows if r.get('id') == task]
     if len(matches) != 1 or matches[0].get('issue_type') == 'event':
         raise ValueError('Task missing, duplicated or is an event')

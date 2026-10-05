@@ -1004,6 +1004,41 @@ ACTIVE_REVIEW_STATES = ('changes-requested', 'error', 'awaiting-review', 'legacy
 QUEUE_PRIORITY = {'changes-requested': 0, 'error': 1, 'awaiting-review': 2,
                   'legacy-review-ready': 2, 'awaiting-integration': 3, 'approved': 3}
 
+#: Review-payload fields the HTTP route accepts beyond the canonical per-operation
+#: set. ``task_id`` is filled from the path and ``actor`` is bound to the
+#: authenticated principal; ``contribution_revision``/``contribution_commit`` are the
+#: web page's presentation copies of the revision the reviewer saw. A contribution may
+#: also carry the two legacy in-process delivery fields ``bundle_sha256``/``branch``.
+#: Anything else -- an unknown key, or a canonical field on the WRONG operation (a
+#: top-level ``severity``, a ``disposition`` on a request-changes) -- is refused
+#: instead of silently dropped (kittrial-5bb.110 item 4: those used to be dropped and
+#: answered 201).
+REVIEW_HTTP_FIELDS = frozenset({'task_id', 'actor', 'contribution_revision',
+                                'contribution_commit'})
+REVIEW_HTTP_OPERATION_FIELDS = {'contribute': frozenset({'bundle_sha256', 'branch'})}
+#: How many unsupported field names one refusal reports, and how long each may be. The
+#: refusal used to echo every name in full: a 300-character key came back whole, and 400
+#: unknown keys produced a 2,429-character error (kittrial-5bb.110 item 4).
+UNSUPPORTED_FIELDS_SHOWN = 5
+#: A field name is echoed only when it is a plain identifier. Anything else (control
+#: characters, punctuation, a name built to read as a sentence in the error) is not
+#: repeated to the caller.
+UNSUPPORTED_FIELD_NAME = re.compile(r'[A-Za-z_][A-Za-z0-9_]{0,39}\Z')
+
+
+def unsupported_fields_text(keys):
+    """A bounded, non-echoing list of the caller's unsupported review field names.
+
+    At most ``UNSUPPORTED_FIELDS_SHOWN`` names, each echoed only when it is a plain
+    identifier, with ``(+N more)`` for the rest (kittrial-5bb.110 item 4 P3).
+    """
+    names = sorted(str(key) for key in keys)
+    shown = [name if UNSUPPORTED_FIELD_NAME.match(name) else '<non-identifier name>'
+             for name in names[:UNSUPPORTED_FIELDS_SHOWN]]
+    if len(names) > UNSUPPORTED_FIELDS_SHOWN:
+        shown.append('(+%d more)' % (len(names) - UNSUPPORTED_FIELDS_SHOWN))
+    return ', '.join(shown)
+
 
 def queue_order(item):
     # Among contributions that await review, one a reviewer recommends approving comes
@@ -1395,12 +1430,19 @@ class EndpointBackend:
                     {'0': {'flag': '--file', 'text': json.dumps(body)}})
         if route == 'reviews.add':
             operation = payload.get('operation')
-            if operation not in self.REVIEW_FIELDS:
-                raise invalid('Unsupported review operation %r; expected one of: %s'
-                              % (operation, ', '.join(sorted(self.REVIEW_FIELDS))))
+            # A fixed sentence, never the caller's value: `%r` of a 5,000-character
+            # operation came back in a 5,204-character error (kittrial-5bb.110 item 4).
+            # An operation sent as a list or object used to raise TypeError (an
+            # unhashable dict key) and answer 500; the str check makes it this 422.
+            if not isinstance(operation, str) or operation not in self.REVIEW_FIELDS:
+                raise invalid('Unsupported review operation; expected one of: %s'
+                              % ', '.join(sorted(self.REVIEW_FIELDS)))
             common = tuple(field for field in self.REVIEW_COMMON
                            if not (field == 'previous' and operation in self.REVIEW_NO_PREVIOUS))
-            if operation == 'recommend' and 'items' not in payload:
+            if operation == 'recommend' and payload.get('items') is None:
+                # A NULL items is absent, exactly like every other null optional field the
+                # released clients send (kittrial-5bb.110 items 1 and 2): a recommendation
+                # with no notes is the empty list the canonical record requires.
                 payload = dict(payload, items=[])
             fields = common + self.REVIEW_FIELDS[operation]
             missing = [field for field in fields
@@ -1411,7 +1453,12 @@ class EndpointBackend:
                               % ', '.join(missing))
             body = {field: payload.get(field) for field in fields}
             for field in self.REVIEW_OPTIONAL_FIELDS.get(operation, ()):
-                if field in payload:
+                # A null optional field is ABSENT, not a value: the kit's own client used
+                # to send every optional field as null, and forwarding `"summary": null`
+                # made the canonical writer refuse a legacy request-changes
+                # (kittrial-5bb.110 item 1). The canonical required fields (built above)
+                # keep their null, because their ABSENCE is an invalid field set.
+                if payload.get(field) is not None:
                     body[field] = payload.get(field)
             body['schema_version'] = payload.get('schema_version', 1)
             body['operation_id'] = payload.get('operation_id') or operation_id
@@ -3886,6 +3933,38 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
         if 'actor' in payload:
             payload['actor'] = self.service.bind_actor(ctx.principal, payload.get('actor'))
+        operation = payload.get('operation')
+        if isinstance(operation, str) and operation in EndpointBackend.REVIEW_FIELDS:
+            # Unknown and misplaced fields are refused, not dropped (kittrial-5bb.110
+            # item 4). The allowed set is the canonical field set for THIS operation
+            # plus the documented transport/presentation keys, so a `disposition` on a
+            # request-changes or a top-level `severity` is a 422 instead of a silent
+            # 201. An operation the canonical writer does not know is left to the
+            # backend, which names it in a fixed sentence.
+            #
+            # A key whose VALUE is null is ABSENT, not a misplaced field (kittrial-5bb.110
+            # items 1 and 2): the released Client at cbf6d01 and at b0a4fbd sends every
+            # optional field of every operation as null (one 16-key union), and counting
+            # those nulls here refused switch on/off, contribute, request-changes,
+            # respond, approve, withdraw and recommend alike. The check therefore runs on
+            # the SUPPLIED keys only. The nulls stay in the payload: the canonical build
+            # below drops a null optional field itself and keeps the null on the required
+            # fields whose ABSENCE -- unlike their null -- is an invalid field set.
+            allowed = ({'schema_version', 'operation', 'operation_id', 'previous'}
+                       | set(EndpointBackend.REVIEW_FIELDS[operation])
+                       | set(EndpointBackend.REVIEW_OPTIONAL_FIELDS.get(operation, ()))
+                       | set(REVIEW_HTTP_FIELDS)
+                       | set(REVIEW_HTTP_OPERATION_FIELDS.get(operation, ())))
+            # `previous` is deliberately NOT removed for REVIEW_NO_PREVIOUS: a
+            # recommendation is a record beside the chain and carries none, but the
+            # released clients send the key (null, or the chain's latest comment id) for
+            # every operation, so it is accepted and IGNORED here (the canonical body
+            # builder omits it for `recommend`; kittrial-5bb.110 items 1 and 2).
+            supplied = {key for key, value in payload.items() if value is not None}
+            unknown = sorted(str(key) for key in supplied - allowed)
+            if unknown:
+                raise invalid('Unsupported review payload field(s) for %s: %s'
+                              % (operation, unsupported_fields_text(unknown)))
 
         def add():
             if payload.get('operation') == 'recommend':

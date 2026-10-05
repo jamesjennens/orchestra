@@ -366,6 +366,97 @@ class WithdrawTests(Base):
         self.assertTrue(any(line.startswith('Integration after withdrawal') for line in state['warnings']))
 
 
+class NullDispositionTests(Base):
+    """kittrial-5bb.110 item 2: a null disposition is refused, and never reads as None.
+
+    The tip accepted ``"disposition": null`` on withdraw/resolve-item, so the projection
+    read ``review_state`` as None and a second withdraw raised
+    ``TypeError: can only concatenate str (not NoneType) to str``. A record an older kit
+    already stored with a null disposition must keep READING as a defined state.
+    """
+
+    def stored(self, payload, author='worker', comment_id='9'):
+        self.issue['comments'].append(dict(id=comment_id, text=w.PREFIX + json.dumps(payload),
+                                           author=author,
+                                           created_at='2026-09-16T00:00:00Z'))
+
+    def test_the_writer_refuses_an_explicit_null_disposition(self):
+        contribution = self.send(self.contribution())['comment_id']
+        for op, extra in (('withdraw', dict(reason='Re-scoped')),
+                          ('resolve-item', dict(request='1', item='i1', reason='Handled'))):
+            with self.subTest(operation=op):
+                payload = self.payload(op, contribution=contribution, disposition=None, **extra)
+                # validate stays tolerant so a stored old record still reads ...
+                w.validate(payload, 'task-1')
+                # ... and the canonical WRITER refuses the shape before any native write.
+                with self.assertRaisesRegex(ValueError, 'disposition'):
+                    w.check_write_fields(payload)
+                before = self.review_count()
+                with self.assertRaisesRegex(ValueError, 'disposition'):
+                    self.send(payload)
+                self.assertEqual(self.review_count(), before)
+
+    def test_a_stored_null_disposition_reads_as_withdrawn_never_none(self):
+        contribution = self.send(self.contribution())['comment_id']
+        payload = self.payload('withdraw', contribution=contribution, reason='Re-scoped')
+        payload['disposition'] = None
+        self.stored(payload)
+        state = w.project(self.issue)
+        self.assertEqual(state['review_state'], 'withdrawn')
+        self.assertEqual(state['withdrawal']['disposition'], 'withdrawn')
+        self.assertIsNotNone(state['review_state'])
+
+    def test_a_second_withdraw_on_a_null_disposition_chain_is_a_clean_refusal(self):
+        contribution = self.send(self.contribution())['comment_id']
+        payload = self.payload('withdraw', contribution=contribution, reason='Re-scoped')
+        payload['disposition'] = None
+        self.stored(payload)
+        # Before the fix the refusal message concatenated None and raised TypeError.
+        with self.assertRaisesRegex(ValueError, 'already withdrawn'):
+            self.send(self.payload('withdraw', contribution=contribution, reason='Again'))
+        self.assertEqual(self.review_count(), 2)
+
+    def test_a_stored_null_resolve_disposition_reads_as_resolved(self):
+        contribution = self.send(self.contribution())['comment_id']
+        self.send(self.payload('request-changes', contribution=contribution,
+                               items=[dict(id='i1', text='Fix')]), 'reviewer')
+        pending = w.project(self.issue)['pending_requests'][0]
+        payload = self.payload('resolve-item', contribution=contribution,
+                               request=pending['request'], item=pending['item'],
+                               reason='Handled')
+        payload['disposition'] = None
+        self.stored(payload, author='reviewer')
+        state = w.project(self.issue)
+        self.assertEqual(state['pending_requests'], [])
+        self.assertEqual(state['note_requests'], [])
+
+    def test_a_stored_null_resolve_disposition_resolves_a_note_item_too(self):
+        """The default is RESOLVED whatever the item's severity (item 3 P3).
+
+        The blocking case above does not pin this: a mutant whose null default falls back
+        to the item's own severity reads a null resolve of a NOTE as a note, leaving it in
+        ``note_requests``. The operation default is resolved, so the note is removed.
+        """
+        contribution = self.send(self.contribution())['comment_id']
+        self.send(self.payload('request-changes', contribution=contribution,
+                               items=[dict(id='n1', text='Consider a clearer name',
+                                           severity='note')]), 'reviewer')
+        noted = w.project(self.issue)['note_requests']
+        self.assertEqual([item['item'] for item in noted], ['n1'])
+        payload = self.payload('resolve-item', contribution=contribution,
+                               request=noted[0]['request'], item='n1', reason='Handled')
+        payload['disposition'] = None
+        self.stored(payload, author='reviewer')
+        state = w.project(self.issue)
+        self.assertEqual(state['pending_requests'], [])
+        self.assertEqual(state['note_requests'], [])
+        self.assertEqual(state['review_state'], 'awaiting-review')
+        # A later approval is not held up by the resolved note either.
+        self.send(self.payload('approve', contribution=contribution, summary='Approved'),
+                  'reviewer2')
+        self.assertEqual(w.project(self.issue)['review_state'], 'awaiting-integration')
+
+
 class SeverityTests(Base):
     def test_a_note_never_blocks_approval_but_a_blocking_item_does(self):
         contribution = self.send(self.contribution())['comment_id']
@@ -767,9 +858,10 @@ class ReviewWritesCommandTests(unittest.TestCase):
 
     def tearDown(self):
         self._env.stop()
-        for name in ('deployment.private.json', admin.REVIEW_WRITES_AUDIT, admin.REVIEW_WRITES_LOCK):
-            path = self.root / name
-            if path.exists():
+        for path in (sorted(self.root.iterdir()) if self.root.is_dir() else []):
+            # REVIEW_WRITES_AUDIT.* covers the damaged histories a flip keeps aside.
+            if path.name in ('deployment.private.json', admin.REVIEW_WRITES_LOCK) or \
+                    path.name.startswith(admin.REVIEW_WRITES_AUDIT):
                 path.unlink()
         if self.root.is_dir():
             self.root.rmdir()
@@ -778,23 +870,170 @@ class ReviewWritesCommandTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'operator allowlist'):
             admin.review_writes_command(self.root, 'mallory', 'on')
         self.assertFalse(admin.review_workflow_writes(self.root))
-        self.assertIsNone(admin.review_writes_audit(self.root))
+        self.assertEqual(admin.review_writes_audit(self.root), [])
 
     def test_a_flip_records_who_and_when_and_the_value_it_replaced(self):
         result, warnings = admin.review_writes_command(self.root, 'coord', 'on')
         self.assertTrue(result['review_workflow_writes'])
+        self.assertTrue(result['changed'])
         self.assertEqual(warnings, [])
-        record = admin.review_writes_audit(self.root)
+        history = admin.review_writes_audit(self.root)
+        self.assertEqual(len(history), 1)
+        record = history[-1]
         self.assertEqual((record['set_by'], record['review_workflow_writes'], record['previous']),
                          ('coord', True, False))
         self.assertTrue(record['set_at'])
         result, _ = admin.review_writes_command(self.root, 'coord', 'off')
         self.assertFalse(result['review_workflow_writes'])
-        record = admin.review_writes_audit(self.root)
-        self.assertEqual((record['set_by'], record['review_workflow_writes'], record['previous']),
-                         ('coord', False, True))
+        history = admin.review_writes_audit(self.root)
+        self.assertEqual([entry['review_workflow_writes'] for entry in history], [True, False])
+        self.assertEqual((history[-1]['set_by'], history[-1]['previous']), ('coord', True))
         self.assertIsNone(json.loads(self.marker.read_text(encoding='utf-8'))
                           .get('review_workflow_writes'))
+
+    def test_the_audit_is_an_append_only_history_of_every_flip(self):
+        """The last flip is not the whole record: both operators must stay visible."""
+        self.marker.write_text(json.dumps({'operators': ['coord', 'coord2']}), encoding='utf-8')
+        admin.review_writes_command(self.root, 'coord', 'on')
+        admin.review_writes_command(self.root, 'coord2', 'off')
+        history = admin.review_writes_audit(self.root)
+        self.assertEqual([(entry['set_by'], entry['review_workflow_writes']) for entry in history],
+                         [('coord', True), ('coord2', False)])
+        # An `off` that changes nothing is not a flip: it appends nothing and cannot
+        # overwrite the history.
+        before = json.dumps(admin.review_writes_audit(self.root))
+        result, warnings = admin.review_writes_command(self.root, 'coord2', 'off')
+        self.assertFalse(result['changed'])
+        self.assertEqual(warnings, [])
+        self.assertEqual(json.dumps(admin.review_writes_audit(self.root)), before)
+
+    def test_the_audit_history_is_bounded_and_keeps_the_newest_flips(self):
+        self.marker.write_text(json.dumps({'operators': ['coord', 'coord2']}), encoding='utf-8')
+        for index in range(admin.REVIEW_WRITES_AUDIT_MAX + 3):
+            admin.review_writes_command(self.root, 'coord' if index % 2 else 'coord2',
+                                        'on' if index % 2 == 0 else 'off')
+        history = admin.review_writes_audit(self.root)
+        self.assertEqual(len(history), admin.REVIEW_WRITES_AUDIT_MAX)
+        self.assertEqual(history[-1]['review_workflow_writes'], True)
+
+    def test_the_pre_history_single_record_is_still_read(self):
+        """An older kit wrote one record; an upgrade must keep it visible."""
+        (self.root / admin.REVIEW_WRITES_AUDIT).write_text(json.dumps(
+            {'schema_version': 1, 'review_workflow_writes': True, 'set_by': 'old-kit',
+             'set_at': '2026-01-01T00:00:00+00:00', 'previous': False}), encoding='utf-8')
+        history = admin.review_writes_audit(self.root)
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]['set_by'], 'old-kit')
+        result, warnings = admin.review_writes_command(self.root, 'coord', 'status')
+        self.assertFalse(result['review_workflow_writes'])
+        self.assertFalse(result['audit_agrees'])
+        self.assertTrue(any('stale' in line for line in warnings))
+
+    def test_status_reports_a_disagreement_between_the_switch_and_the_audit(self):
+        # One operator turns it on, then an older kit (which does not know the audit
+        # file) or a hand edit turns the switch off without recording it.
+        admin.review_writes_command(self.root, 'coord', 'on')
+        cfg = json.loads(self.marker.read_text(encoding='utf-8'))
+        cfg.pop('review_workflow_writes', None)
+        self.marker.write_text(json.dumps(cfg), encoding='utf-8')
+        result, warnings = admin.review_writes_command(self.root, 'coord', 'status')
+        self.assertFalse(result['review_workflow_writes'])
+        self.assertFalse(result['audit_agrees'])
+        self.assertEqual(result['audit']['review_workflow_writes'], True)
+        self.assertTrue(any('stale' in line for line in warnings))
+        # A recorded flip brings them back into agreement.
+        admin.review_writes_command(self.root, 'coord', 'on')
+        result, warnings = admin.review_writes_command(self.root, 'coord', 'status')
+        self.assertTrue(result['audit_agrees'])
+        self.assertEqual(warnings, [])
+
+    def test_a_deeply_nested_audit_file_does_not_crash_status(self):
+        """Removing the record_json guard makes this a RecursionError traceback."""
+        admin.review_writes_command(self.root, 'coord', 'on')
+        (self.root / admin.REVIEW_WRITES_AUDIT).write_text('[' * 2000 + ']' * 2000,
+                                                           encoding='utf-8')
+        result, warnings = admin.review_writes_command(self.root, 'coord', 'status')
+        # The switch itself still reads; the unreadable audit is reported, not fatal.
+        self.assertTrue(result['review_workflow_writes'])
+        self.assertIsNone(result['audit'])
+        self.assertEqual(result['audit_history'], [])
+        self.assertTrue(any('audit' in line for line in warnings))
+
+    def test_a_damaged_audit_history_is_kept_aside_and_reported(self):
+        """A damaged history is not silently replaced by a fresh one (item 3 P3).
+
+        It used to be overwritten at the next flip, and `status` then reported
+        ``audit_agrees: true`` beside an empty history.
+        """
+        admin.review_writes_command(self.root, 'coord', 'on')
+        path = self.root / admin.REVIEW_WRITES_AUDIT
+        damaged = {'schema_version': 3, 'entries': [{'set_by': 'x'}]}
+        path.write_text(json.dumps(damaged), encoding='utf-8')
+        result, warnings = admin.review_writes_command(self.root, 'coord', 'status')
+        self.assertEqual(result['audit_history'], [])
+        self.assertFalse(result['audit_agrees'])
+        self.assertTrue(any('damaged' in line for line in warnings), warnings)
+        # The next flip keeps the damaged bytes aside under a dated name and says so.
+        result, warnings = admin.review_writes_command(self.root, 'coord', 'off')
+        self.assertTrue(result['changed'])
+        kept = [item for item in self.root.iterdir()
+                if item.name.startswith(admin.REVIEW_WRITES_AUDIT + '.damaged-')]
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(json.loads(kept[0].read_text(encoding='utf-8')), damaged)
+        self.assertTrue(any(str(kept[0]) in line for line in warnings), warnings)
+        # The fresh history is readable and agrees with the switch it recorded.
+        history = admin.review_writes_audit(self.root)
+        self.assertEqual([entry['review_workflow_writes'] for entry in history], [False])
+        result, warnings = admin.review_writes_command(self.root, 'coord', 'status')
+        self.assertTrue(result['audit_agrees'])
+        self.assertEqual(warnings, [])
+
+    def test_every_damaged_audit_shape_is_kept_aside(self):
+        """Not JSON, a list, an unknown schema and malformed entries are all kept."""
+        shapes = ('not json at all', json.dumps([1, 2, 3]),
+                  json.dumps({'schema_version': 2, 'entries': [{'set_by': 'no'}]}),
+                  json.dumps({'schema_version': 1, 'set_by': 'x'}))
+        for shape in shapes:
+            with self.subTest(shape=shape[:40]):
+                for item in list(self.root.iterdir()):
+                    if item.name.startswith(admin.REVIEW_WRITES_AUDIT):
+                        item.unlink()
+                self.marker.write_text(json.dumps({'operators': ['coord']}), encoding='utf-8')
+                (self.root / admin.REVIEW_WRITES_AUDIT).write_text(shape, encoding='utf-8')
+                result, warnings = admin.review_writes_command(self.root, 'coord', 'on')
+                self.assertTrue(result['changed'])
+                self.assertTrue(any('kept aside' in line for line in warnings), warnings)
+                self.assertTrue([item for item in self.root.iterdir()
+                                 if item.name.startswith(admin.REVIEW_WRITES_AUDIT + '.damaged-')])
+                history = admin.review_writes_audit(self.root)
+                self.assertEqual(len(history), 1)
+                self.assertTrue(history[0]['review_workflow_writes'])
+
+    @unittest.skipIf(sys.platform == 'win32', 'flock is POSIX-only')
+    def test_a_flip_holds_the_deployment_lock_across_the_read_modify_write(self):
+        """Removing the flock makes the audit entry race the switch value."""
+        import fcntl
+        from unittest.mock import patch
+        real = admin.atomic_private_write
+        seen = []
+
+        def probing(path, text):
+            if Path(path).name == admin.REVIEW_WRITES_AUDIT:
+                with (self.root / admin.REVIEW_WRITES_LOCK).open('a') as handle:
+                    try:
+                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        seen.append(True)
+                    else:
+                        seen.append(False)
+                        fcntl.flock(handle, fcntl.LOCK_UN)
+            return real(path, text)
+
+        with patch.object(admin, 'atomic_private_write', side_effect=probing):
+            admin.review_writes_command(self.root, 'coord', 'on')
+        # A second lock attempt from another file description blocks while the flip
+        # holds it. Without the flock, `seen` is [False].
+        self.assertEqual(seen, [True])
 
     def test_status_reads_a_malformed_switch_as_off_with_a_warning(self):
         self.marker.write_text(json.dumps({'operators': ['coord'], 'review_workflow_writes': 'yes'}),
