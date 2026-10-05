@@ -1583,20 +1583,24 @@ class ReleaseGroupReportingTests(ReleaseCommandTests):
 
 
 class ReleaseCostEstimateTests(unittest.TestCase):
-    """expected_seconds is an upper bound and the default group is small (.107 item 6)."""
+    """expected_seconds is a conservative estimate, not a guarantee (.107 item 6)."""
 
     def test_the_estimate_covers_the_measured_cost(self):
         self.assertLessEqual(lifecycle.RELEASE_CHUNK_DEFAULT, 25)
         per_target = lifecycle.DRY_RUN_SECONDS_PER_TARGET
         fixed = lifecycle.DRY_RUN_FIXED_SECONDS
-        # Each target now costs three writes, and the reviewer measured 438 s for
-        # 201 targets (rev3 item 3.3), so the stated upper bound must clear that.
+        # Each target costs three writes. The reviewer measured 438 s for 201
+        # targets (rev3 item 3.3) and the real-bd 200-target run measured 913.3 s
+        # (kittrial-5bb.119 item 4), so the printed estimate must clear both.
         self.assertGreaterEqual(round(fixed + per_target * 201, 1), 438.0)
+        self.assertGreaterEqual(round(fixed + per_target * 200, 1),
+                                lifecycle.DRY_RUN_MEASURED_200_TARGET_SECONDS,
+                                'the estimate must cover the measured 200-target real-bd run')
         self.assertGreaterEqual(round(fixed + per_target * 50, 1), 86.0)
         self.assertLessEqual(round(fixed + per_target * lifecycle.RELEASE_CHUNK_DEFAULT, 1), 150.0,
                              'one default group must stay inside the 150 s client timeout')
 
-    def test_the_dry_run_uses_the_upper_bound_formula(self):
+    def test_the_dry_run_uses_the_estimate_formula(self):
         store = (NativeStore(tasks=('trial-a', 'trial-b', 'trial-c'))
                  .seed('trial-a').seed('trial-b').seed('trial-c'))
         client = types.ModuleType('client')

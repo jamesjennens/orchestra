@@ -58,17 +58,27 @@ RELEASE_OPERATION_MAX = 110
 # real project paid 1.6 to 1.7 s per target, so the old default of 50 could reach
 # ~86 s and a group of 200 timed out at 150 s. 25 targets is ~45 s at that rate.
 RELEASE_CHUNK_DEFAULT = 25
-# Conservative per-target budget quoted by `release --dry-run`. The measured
-# in-memory harness on the authoritative Linux host is far below it, but a real
-# `bd` binary on a large project paid 1.6 to 1.7 s per target when each target cost
+# Conservative per-target budget quoted by `release --dry-run` as an ESTIMATE,
+# not a guaranteed bound (kittrial-5bb.119 item 4). The measured in-memory
+# harness on the authoritative Linux host is far below it, but a real `bd`
+# binary on a large project paid 1.6 to 1.7 s per target when each target cost
 # ONE write. Rev2 made each target cost THREE writes (scope, deployed, live) and
-# the reviewer then measured 438 s for 201 targets (2.18 s per target), against the
-# old 2.0 s/target figure, so that figure was no longer an upper bound (rev3 item
-# 3.3). The budget is now 3.0 s per target - about 1.0 s per native write - plus
-# 15 s of per-request overhead, so 201 targets estimate 618 s and a 25-target group
-# (the default) 90 s, well inside the client's 150 s timeout.
-DRY_RUN_SECONDS_PER_TARGET = 3.0
+# the reviewer then measured 438 s for 201 targets (2.18 s per target), against
+# the old 2.0 s/target figure, so that figure was no longer an upper bound
+# (rev3 item 3.3). A fresh 200-target release on real bd 1.2.2 + Dolt measured
+# 913.3 s for one export and 600 native writes (4.57 s per target) on
+# 2026-10-05, partly under a concurrent full-suite run, so the arithmetic
+# 3.0 s/target no longer covered it. The budget is now 5.0 s per target - about
+# 1.7 s per native write - plus 15 s of per-request overhead: 200 targets
+# estimate 1015 s and a 25-target group (the default) 140 s, inside the client's
+# 150 s timeout. It stays an estimate and can still be exceeded on a slower host.
+DRY_RUN_SECONDS_PER_TARGET = 5.0
 DRY_RUN_FIXED_SECONDS = 15.0
+# The 200-target real-bd measurement the estimate was checked against
+# (kittrial-5bb.119): bd 1.2.2 + Dolt, one export and 600 native writes for a
+# plain 200-target release. ReleaseCostEstimateTests asserts the printed value
+# stays at or above it.
+DRY_RUN_MEASURED_200_TARGET_SECONDS = 913.3
 # The writing command asks the endpoint which integrations are reverted; the
 # offline dry run cannot, so it says plainly that its local revert view may list a
 # target the writing run skips (rev3 item 3.4).
