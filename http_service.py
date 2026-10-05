@@ -34,6 +34,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import agent_prompts
 import project_setup
+from coordination import is_merge_slot, merge_slot_sentence
 from reserved_comments import (ANCHOR_READ_IDS_MAX, carries_record_label, hide_records,
                                is_record_anchor)
 from http_auth import (AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CAP_APPROVE,
@@ -906,7 +907,9 @@ class InProcessBackend:
         return {'task': dict(task), 'checkpoint': checkpoint, 'review': self._review_view(task),
                 # The disposable backend records no lifecycle evidence, so every fact is
                 # honestly unknown rather than inferred from the review state.
-                'lifecycle': {}, 'depends_on': []}
+                'lifecycle': {}, 'depends_on': [],
+                # This backend keeps no activity cursor; its checkpoints need none.
+                'activity_cursor': None}
 
     #: The disposable backend is cheap to read and tests expect fresh reads.
     READ_CACHE_SECONDS = 0
@@ -1211,10 +1214,15 @@ class EndpointBackend:
         reply = self._endpoint(action, project, actor, args, attachments,
                                operation_id=operation_id, authority=authority,
                                require_authority=require_authority, route=route)
-        return self._checked(reply)
+        return self._checked(reply, action)
 
-    @staticmethod
-    def _checked(reply):
+    #: How much of a canonical refusal's last line is handed on. A checkpoint refusal lists
+    #: every problem with the record (kittrial-5bb.113), so it gets room for all of them.
+    DETAIL_LIMIT = 200
+    DETAIL_LIMITS = {'checkpoint': 6000}
+
+    @classmethod
+    def _checked(cls, reply, action=None):
         """The payload of one canonical reply, or the HttpError its return code means."""
         code = reply.get('returncode') if isinstance(reply, dict) else None
         stderr = (reply.get('stderr') or '') if isinstance(reply, dict) else ''
@@ -1229,7 +1237,8 @@ class EndpointBackend:
         if code == 124:
             raise uncertain('Canonical command timed out; outcome may be unknown')
         if code:
-            detail = stderr.strip().splitlines()[-1][:200] if stderr.strip() else None
+            limit = cls.DETAIL_LIMITS.get(action, cls.DETAIL_LIMIT)
+            detail = stderr.strip().splitlines()[-1][:limit] if stderr.strip() else None
             if code == 2:
                 raise invalid('Canonical command rejected the request', detail)
             raise uncertain('Canonical command failed; outcome may be unknown')
@@ -1491,6 +1500,9 @@ class EndpointBackend:
         # (kittrial-5bb.64; the shared hidden-surface list).
         rows = hide_records(self._without_record_anchors(project_id,
                                                          self._in_project(rows, project_id)))
+        # The project's merge slot is an internal record too (kittrial-5bb.113): on real
+        # bd it is a row of type task, and was offered to agents as claimable work.
+        rows = [row for row in rows if not is_merge_slot(row)]
         return {'items': rows, 'total': len(rows)}
 
     def _without_record_anchors(self, project_id, rows):
@@ -1711,6 +1723,10 @@ class EndpointBackend:
                 'depends_on': [{'id': d.get('depends_on_id'), 'title': d.get('depends_on_id'),
                                 'status': 'unknown', 'type': d.get('type')}
                                for d in dependencies if isinstance(d, dict)],
+                # What a checkpoint must carry to say which activity it has seen. It is in
+                # the canonical brief; without it here an agent could not write a first
+                # checkpoint from the brief alone (kittrial-5bb.113).
+                'activity_cursor': data.get('activity_cursor'),
                 'warnings': data.get('warnings') or []}
 
     @staticmethod
@@ -3351,7 +3367,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('PATCH', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')')
     def tasks_update(self, ctx):
         self._project(ctx, CAP_TASKS)
-        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
+        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']), write=True)
         payload = self._task_payload(ctx)
 
         def update():
@@ -3421,11 +3437,19 @@ class ApiHandler(BaseHTTPRequestHandler):
         return 200, self._task_views([row])[0]
 
     @staticmethod
-    def _refuse_record_anchor(row):
+    def _refuse_record_anchor(row, write=False):
         """A record anchor is not a task: the task, brief and history routes answer
         404 for it, never its row or raw record comments, and the task write routes
-        (PATCH, claim, checkpoints, reviews) refuse it the same way (kittrial-5bb.64)."""
+        (PATCH, claim, checkpoints, reviews) refuse it the same way (kittrial-5bb.64).
+
+        The project's merge slot is not a task either (kittrial-5bb.113). The read
+        routes answer 404 for it; a write route says what it is, so an agent that was
+        once offered it learns why the claim is refused."""
         if is_record_anchor(row):
+            raise not_found('Task not found')
+        if is_merge_slot(row):
+            if write:
+                raise conflict(merge_slot_sentence(row.get('id')))
             raise not_found('Task not found')
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/references')
@@ -3777,13 +3801,50 @@ class ApiHandler(BaseHTTPRequestHandler):
         brief['project_repository'] = self.service.project_view(ctx.principal, pid).get('repository')
         # The same note wherever the value reaches an agent: it is a label, not an instruction.
         brief['project_repository_note'] = self.service.REPOSITORY_NOTE if brief['project_repository'] else None
+        brief['checkpoint_template'] = self._checkpoint_template(brief, base)
         brief['generated_at'] = now_iso(self.service._now())
         return 200, brief
+
+    #: The fields of a checkpoint that may be left out over HTTP, with what is sent for them.
+    CHECKPOINT_DEFAULTS = (('source_commit', ''), ('branch', ''), ('open_items', []), ('resolved', []))
+
+    @staticmethod
+    def _checkpoint_template(brief, base):
+        """The checkpoint record to send for this task at this moment (kittrial-5bb.113).
+
+        An agent fills the four texts and posts ``body`` to ``send_to``. ``previous`` and
+        ``activity_cursor`` are already those of this read; they go stale when the task
+        changes, and the refusal then says to read the brief again.
+        """
+        import briefing
+        limits = dict(briefing.CHECKPOINT_FIELD_LIMITS)
+        current = brief.get('checkpoint') or {}
+        return {
+            'send_to': base + '/checkpoints', 'method': 'POST',
+            'body': {'schema_version': 1, 'previous': current.get('id'),
+                     'activity_cursor': brief.get('activity_cursor'),
+                     'intent': '', 'acceptance': '', 'summary': '', 'next_action': '',
+                     'source_commit': '', 'branch': '', 'open_items': [], 'resolved': []},
+            'required': ['intent', 'acceptance', 'summary', 'next_action'],
+            'optional': {'source_commit': 'the commit the work is at; leave out when there is none',
+                         'branch': 'the branch; leave out when there is none',
+                         'open_items': 'what is unresolved; leave out when nothing is',
+                         'resolved': 'earlier open items this checkpoint resolves; leave out when none'},
+            'limits': {name: '<= %d characters' % limits[name]
+                       for name in ('intent', 'acceptance', 'summary', 'next_action', 'source_commit', 'branch')},
+            'open_item': {'id': 'a short id of your choosing', 'kind': sorted(briefing.KINDS),
+                          'text': '<= %d characters' % briefing.CHECKPOINT_TEXT_LIMIT,
+                          'source': 'where it came from, <= %d characters' % briefing.CHECKPOINT_SOURCE_LIMIT},
+            'resolved_item': {'id': 'the id of the open item', 'reason': '<= %d characters' % briefing.CHECKPOINT_TEXT_LIMIT,
+                              'evidence': '<= %d characters' % briefing.CHECKPOINT_SOURCE_LIMIT},
+            'items_max': briefing.CHECKPOINT_ITEMS_MAX,
+            'note': 'Every open item of the previous checkpoint must be carried forward unchanged or resolved. '
+                    'A refusal names every problem with the record at once.'}
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/claim')
     def tasks_claim(self, ctx):
         self._project(ctx, CAP_TASKS)
-        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
+        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']), write=True)
         payload = self._task_payload(ctx)
         actor = self.service.bind_actor(ctx.principal, payload.pop('actor', None))
         payload['actor'] = actor
@@ -3800,17 +3861,32 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/checkpoints')
     def checkpoints_add(self, ctx):
         self._project(ctx, CAP_CHECKPOINTS)
-        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
+        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']), write=True)
         payload = self._task_payload(ctx)
         payload.setdefault('schema_version', 1)
+        # Over HTTP these four may be left out (kittrial-5bb.113): an agent with no commit
+        # yet, or nothing unresolved, need not send empty values. The canonical record is
+        # unchanged: what is left out is sent as the empty value.
+        for name, empty in self.CHECKPOINT_DEFAULTS:
+            payload.setdefault(name, type(empty)())
         if 'actor' in payload:
             payload['actor'] = self.service.bind_actor(ctx.principal, payload.get('actor'))
 
         def add():
-            result = self.backend.invoke('checkpoints.add', ctx.principal, ctx.params['pid'],
-                                         payload, ctx.idempotency_key,
-                                         target=ctx.route_target, authorize=ctx.authorize,
-                                         capability=CAP_CHECKPOINTS)
+            try:
+                result = self.backend.invoke('checkpoints.add', ctx.principal, ctx.params['pid'],
+                                             payload, ctx.idempotency_key,
+                                             target=ctx.route_target, authorize=ctx.authorize,
+                                             capability=CAP_CHECKPOINTS)
+            except HttpError as refusal:
+                # The canonical refusal names every problem with the record. Hand them over
+                # as a list too, so an agent need not parse the sentence.
+                if refusal.status == 422 and isinstance(refusal.detail, str):
+                    import briefing
+                    said = refusal.detail[len('ValueError: '):] if refusal.detail.startswith('ValueError: ') \
+                        else refusal.detail
+                    refusal.problems = briefing.split_problems(said)
+                raise
             return result, result
         return self._mutate(ctx, 'checkpoints.add', ctx.params['pid'], add, status=201,
                             capability=CAP_CHECKPOINTS, serialize=False, canonical=True)
@@ -3824,7 +3900,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         # approve at all.
         capability = CAP_APPROVE if payload.get('operation') == 'approve' else CAP_REVIEWS
         self._project(ctx, capability)
-        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
+        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']), write=True)
         if 'actor' in payload:
             payload['actor'] = self.service.bind_actor(ctx.principal, payload.get('actor'))
 

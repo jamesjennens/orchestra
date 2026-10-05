@@ -291,8 +291,11 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         revert_map,revert_problems=reverts,{}
     from reserved_comments import is_record_anchor
     from review_workflow import author_key
+    from coordination import is_merge_slot
     for row in rows:
-        if row.get('issue_type') in ('event','gate','merge-slot'):continue
+        # The merge slot is an internal record (kittrial-5bb.113): on real bd it is a
+        # row of type task, so the type alone never excluded it.
+        if row.get('issue_type') in ('event','gate') or is_merge_slot(row):continue
         # Record anchors (kittrial-5bb.64) are never work, whatever their status.
         if is_record_anchor(row):continue
         task_reverts=revert_map.get(row['id'],[])

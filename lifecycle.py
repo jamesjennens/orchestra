@@ -685,7 +685,8 @@ def current_contribution_commits(rows):
     result={}
     for row in rows:
         if not isinstance(row,dict) or not isinstance(row.get('id'),str):continue
-        if row.get('issue_type') in ('event','gate','merge-slot'):continue
+        from coordination import is_merge_slot
+        if row.get('issue_type') in ('event','gate') or is_merge_slot(row):continue
         try:
             state=projection(records(row,None))
         except (ValueError,KeyError,TypeError):continue

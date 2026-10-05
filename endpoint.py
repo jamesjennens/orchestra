@@ -19,6 +19,7 @@ import tempfile
 from pathlib import Path
 from admin import environment,project_dir,root_path,operators as configured_operators,verifiers as configured_verifiers,review_workflow_writes as configured_review_writes
 import native
+from coordination import is_merge_slot, merge_slot_sentence
 from render import render
 from lifecycle import apply_native
 from version import report
@@ -190,6 +191,10 @@ def _guard_record_anchor_status(root,path,args,actor):
         if is_record_anchor(row):
             raise ValueError('Refusing to %s %s: it is a reference/proposal/settings/capability record anchor, '
                              'whose status only its record operations may change.'%(command,canonical))
+        # The merge slot is held and released only through `coordinate` (kittrial-5bb.113).
+        if is_merge_slot(row):
+            raise ValueError('Refusing to %s %s: %s. Its holder changes only through `coordinate`.'
+                             %(command,canonical,merge_slot_sentence(canonical)))
 
 def execute(root,request,authority_config=None,require_authority=False):
     name=request['project'];path=project_dir(root,name)

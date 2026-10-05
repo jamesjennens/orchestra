@@ -142,10 +142,16 @@ class HttpError(Exception):
         self.message = message
         self.detail = detail
 
+    #: Optional: every problem a refusal found, one sentence each (kittrial-5bb.113). It is
+    #: beside ``detail``, which keeps its text, so a client that reads ``detail`` is unaffected.
+    problems = None
+
     def body(self, request_id):
         error = {'code': self.code, 'message': self.message}
         if self.detail is not None:
             error['detail'] = self.detail
+        if self.problems:
+            error['problems'] = list(self.problems)
         return {'error': error, 'request_id': request_id}
 
 

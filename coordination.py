@@ -219,6 +219,31 @@ def reconcile_request(project, request_id, actor, reason, disposition, run, at=N
     return {'request_id':request_id,'status':disposition,'reconciled':True,'reconciliation':audit}
 
 
+#: The label bd puts on a project's merge slot, and the end of its id.
+MERGE_SLOT_LABEL='gt:slot'
+MERGE_SLOT_SUFFIX='-merge-slot'
+
+def is_merge_slot(row):
+    """True for a project's merge slot row: an internal record, never work.
+
+    bd 1.2.2 creates the slot as an ordinary row of type ``task`` with the id
+    ``<project>-merge-slot`` and the label ``gt:slot`` (measured on real bd,
+    kittrial-5bb.113), so a check on the issue type alone never matched it and the
+    slot was listed as open, unclaimed work. Both the id ending and the label are
+    required: a contributor cannot hide an ordinary task from the work views by
+    adding the label, or by choosing the id, alone. A row of type ``merge-slot``
+    (what earlier code expected) counts too.
+    """
+    if not isinstance(row,dict):return False
+    if row.get('issue_type')=='merge-slot':return True
+    labels=row.get('labels')
+    return (isinstance(row.get('id'),str) and row['id'].endswith(MERGE_SLOT_SUFFIX)
+            and isinstance(labels,list) and MERGE_SLOT_LABEL in labels)
+
+def merge_slot_sentence(task):
+    """What a write on the slot is told, on every path."""
+    return '%s is the project\'s merge slot, an internal record, not a task'%task
+
 def merge_slot_missing(state):
     """True when a native merge-slot check reports no slot for this project.
 

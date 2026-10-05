@@ -92,42 +92,105 @@ def field_names(values):
     if len(names)>FIELD_NAME_COUNT:shown.append('(+%d more)'%(len(names)-FIELD_NAME_COUNT))
     return ', '.join(shown)
 
-def validate_checkpoint(p,task):
+#: At most this many problems are named in one checkpoint refusal; the rest are counted.
+CHECKPOINT_PROBLEMS_MAX=20
+PROBLEMS_PREFIX='Invalid checkpoint (%d problems):'
+
+def checkpoint_problems(p,task):
+    """Every problem with a checkpoint payload that can be found without reading the task, in order.
+
+    Each entry is the sentence ``validate_checkpoint`` has always raised for that problem
+    alone (kittrial-5bb.113): an agent that sends a payload with five faults is told all
+    five at once instead of one per round trip. The sentences are unchanged, so a caller
+    that matches on one still finds it.
+    """
     fields={'schema_version','task','previous','activity_cursor','source_commit','branch','intent','acceptance','summary','next_action','open_items','resolved'}
-    if not isinstance(p,dict):raise ValueError('Invalid checkpoint: expected a JSON object')
+    if not isinstance(p,dict):return ['Invalid checkpoint: expected a JSON object']
+    problems=[]
+    def attempt(check,*args,**kwargs):
+        try:check(*args,**kwargs)
+        except ValueError as error:problems.append(str(error))
     unknown=sorted(set(p)-fields);missing=sorted(fields-set(p));details=[]
     if unknown:details.append('unknown fields: '+field_names(unknown))
     if missing:details.append('missing fields: '+field_names(missing))
-    if not details and (type(p['schema_version']) is not int or p['schema_version']!=1):details.append('schema_version must be integer 1')
-    if details:raise ValueError('Invalid checkpoint: '+'; '.join(details))
-    if p['task']!=task:raise ValueError('Checkpoint task mismatch')
-    if p['previous'] is not None:identity(p['previous'])
-    for key,limit in CHECKPOINT_FIELD_LIMITS:text(p[key],key,limit,empty=key in ('source_commit','branch'))
-    cursor=untoken(p['activity_cursor'])
-    if not isinstance(cursor,dict) or cursor.get('kind')!='activity' or cursor.get('task')!=task:raise ValueError('Expected task activity cursor from brief/history')
+    if details:problems.append('Invalid checkpoint: '+'; '.join(details))
+    if 'schema_version' in p and (type(p['schema_version']) is not int or p['schema_version']!=1):
+        problems.append('Invalid checkpoint: schema_version must be integer 1')
+    if 'task' in p and p['task']!=task:problems.append('Checkpoint task mismatch')
+    if p.get('previous') is not None:attempt(identity,p['previous'])
+    for key,limit in CHECKPOINT_FIELD_LIMITS:
+        if key in p:attempt(text,p[key],key,limit,empty=key in ('source_commit','branch'))
+    if 'activity_cursor' in p:
+        def cursor_check():
+            cursor=untoken(p['activity_cursor'])
+            if not isinstance(cursor,dict) or cursor.get('kind')!='activity' or cursor.get('task')!=task:raise ValueError('Expected task activity cursor from brief/history')
+        attempt(cursor_check)
     for field in ('open_items','resolved'):
+        if field not in p:continue
         items=p[field]
         if not isinstance(items,list) or len(items)>CHECKPOINT_ITEMS_MAX:
-            raise ValueError('%s: expected a list of at most %d items' % (field,CHECKPOINT_ITEMS_MAX))
+            problems.append('%s: expected a list of at most %d items' % (field,CHECKPOINT_ITEMS_MAX));continue
         ids=[]
         for index,item in enumerate(items):
             path='%s[%d]' % (field,index)
             keys={'id','kind','text','source'} if field=='open_items' else {'id','reason','evidence'}
             if not isinstance(item,dict):
-                raise ValueError('%s: expected an object with fields %s' % (path,', '.join(sorted(keys))))
+                problems.append('%s: expected an object with fields %s' % (path,', '.join(sorted(keys))));continue
             unknown=sorted(set(item)-keys);missing=sorted(keys-set(item));details=[]
             if unknown:details.append('unknown fields: '+field_names(unknown))
             if missing:details.append('missing fields: '+field_names(missing))
-            if details:raise ValueError('%s: %s; allowed fields: %s' % (path,'; '.join(details),', '.join(sorted(keys))))
-            ids.append(identity(item['id']))
+            if details:
+                problems.append('%s: %s; allowed fields: %s' % (path,'; '.join(details),', '.join(sorted(keys))));continue
+            try:ids.append(identity(item['id']))
+            except ValueError as error:
+                problems.append(str(error));continue
             # The path form `open_items[0].text` is the existing contract; the id is added after it.
             named=lambda name:'%s.%s (id %s)' % (path,name,item['id'])
             if field=='open_items':
-                if item['kind'] not in KINDS:raise ValueError('%s.kind: expected one of %s' % (path,', '.join(sorted(KINDS))))
-                text(item['text'],named('text'),CHECKPOINT_TEXT_LIMIT);text(item['source'],named('source'),CHECKPOINT_SOURCE_LIMIT)
-            else:text(item['reason'],named('reason'),CHECKPOINT_TEXT_LIMIT);text(item['evidence'],named('evidence'),CHECKPOINT_SOURCE_LIMIT)
-        if len(set(ids))!=len(ids):raise ValueError('Duplicate item IDs')
-    if len(canonical_bytes(p))>CHECKPOINT_MAX_BYTES:raise ValueError('Checkpoint: %d canonical bytes, the limit is %d (%d KB)' % (len(canonical_bytes(p)),CHECKPOINT_MAX_BYTES,CHECKPOINT_MAX_BYTES//1000))
+                try:known=item['kind'] in KINDS
+                except TypeError:known=False
+                if not known:problems.append('%s.kind: expected one of %s' % (path,', '.join(sorted(KINDS))))
+                attempt(text,item['text'],named('text'),CHECKPOINT_TEXT_LIMIT);attempt(text,item['source'],named('source'),CHECKPOINT_SOURCE_LIMIT)
+            else:
+                attempt(text,item['reason'],named('reason'),CHECKPOINT_TEXT_LIMIT);attempt(text,item['evidence'],named('evidence'),CHECKPOINT_SOURCE_LIMIT)
+        if len(set(ids))!=len(ids):problems.append('Duplicate item IDs')
+    try:size=len(canonical_bytes(p))
+    except (TypeError,ValueError):size=None
+    if size is not None and size>CHECKPOINT_MAX_BYTES:
+        problems.append('Checkpoint: %d canonical bytes, the limit is %d (%d KB)' % (size,CHECKPOINT_MAX_BYTES,CHECKPOINT_MAX_BYTES//1000))
+    return problems
+
+def problems_message(problems):
+    """One refusal for a list of problems: the sentence itself for one, a numbered list for more."""
+    if len(problems)==1:return problems[0]
+    shown=problems[:CHECKPOINT_PROBLEMS_MAX]
+    more=' (+%d more)'%(len(problems)-len(shown)) if len(problems)>len(shown) else ''
+    return (PROBLEMS_PREFIX%len(problems))+''.join(' [%d] %s'%(number,sentence) for number,sentence in enumerate(shown,1))+more
+
+def split_problems(message):
+    """The sentences of a refusal made by ``problems_message``; a single sentence is a list of one.
+
+    The list is a convenience for the caller that sent the record. The only caller text in
+    a sentence is a field name it chose itself; a name written to look like the next list
+    number (``x [2] y``) can make this split its own refusal differently. Nothing else
+    reads the result.
+    """
+    found=re.match(r'Invalid checkpoint \((\d+) problems\):',message or '')
+    if not found:return [message] if message else []
+    parts=re.split(r' \[(\d+)\] ',message[found.end():])
+    sentences=[];expected=1
+    for index in range(1,len(parts)-1,2):
+        if parts[index]!=str(expected):
+            # A "[n] " that is not the next number is part of the sentence before it.
+            if sentences:sentences[-1]+=' [%s] %s'%(parts[index],parts[index+1])
+            continue
+        sentences.append(parts[index+1]);expected+=1
+    if sentences:sentences[-1]=re.sub(r' \(\+\d+ more\)$','',sentences[-1])
+    return sentences
+
+def validate_checkpoint(p,task):
+    problems=checkpoint_problems(p,task)
+    if problems:raise ValueError(problems_message(problems))
 
 def transition(previous,current):
     old={x['id'] for x in previous['open_items']} if previous else set()
@@ -268,6 +331,8 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
 
 def save_checkpoint(rows,project,task,p,actor,run):
     validate_checkpoint(p,task);issue=task_row(rows,task)
+    from coordination import is_merge_slot,merge_slot_sentence
+    if is_merge_slot(issue):raise ValueError(merge_slot_sentence(task)+'; it takes no checkpoint')
     for c in issue.get('comments') or []:
         if c.get('text')==PREFIX+canonical_bytes(p).decode() and c.get('author')==actor:
             return {'comment_id':str(c['id']),'reconciled':True}
@@ -417,6 +482,15 @@ def help_notes(action):
     if action=='history':
         return ['Pages are snapshot-bound; pass next_cursor back to continue the same snapshot.']
     return ['A JSON file attachment is required; payload.task must equal TASK.',
+            'The record has exactly these fields: schema_version (1), task, previous (the current checkpoint\'s '
+            'comment_id, or null for the first), activity_cursor (from brief or history), source_commit and branch '
+            '(text; empty when there is none), intent, acceptance, summary, next_action, open_items (each: id, kind, '
+            'text, source; kind is one of blocker, correction, decision, dependency, question) and resolved (each: '
+            'id, reason, evidence).',
+            'A refusal names every problem with the record at once: the sentence itself for one problem, and for '
+            'more a numbered list of the same sentences ("Invalid checkpoint (N problems): [1] ... [2] ..."), at '
+            'most %d of them. A stale previous and a changed activity cursor are separate refusals.'
+            % CHECKPOINT_PROBLEMS_MAX,
             '--json is accepted in any position; the saved checkpoint is always returned as JSON on stdout.',
             'Every unresolved item must be carried forward unchanged or explicitly resolved with reason and evidence.']
 

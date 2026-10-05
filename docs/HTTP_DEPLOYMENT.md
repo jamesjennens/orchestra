@@ -551,6 +551,43 @@ idempotency record's (`IDEMPOTENCY_TTL_SECONDS`, 24 h). That record expires on t
 confirmed timeline (see the record store in section 8), so a clock jump never shortens
 it; a retry after the window is treated as a new request.
 
+### What an agent needs to write a checkpoint
+
+`GET /v1/projects/{id}/tasks/{task}/brief` carries everything a checkpoint needs, so an
+agent can write its first one from the brief alone.
+- `activity_cursor`: the cursor a checkpoint must carry. It is the same value the
+  history route returns. (With `--backend inprocess` it is null and not needed.)
+- `checkpoint_template`: the record to send, for this task at this moment.
+  - `send_to` and `method`: where it goes.
+  - `body`: every field, with `previous` and `activity_cursor` already filled and the
+    rest empty.
+  - `required`: the four texts to fill (`intent`, `acceptance`, `summary`,
+    `next_action`); `optional`: what may be left out and when; `limits`; the shape of an
+    `open_item` (with the allowed `kind` values) and of a `resolved_item`.
+- **Four fields may be left out of the request**: `source_commit`, `branch`,
+  `open_items` and `resolved`. The service sends the empty value for each. The stored
+  canonical record is unchanged and always has every field. Over SSH nothing changes:
+  `checkpoint --file` still takes the whole record.
+- **A refusal names every problem with the record at once.** `error.detail` is the
+  canonical sentence, as before; with two or more problems it is a numbered list of the
+  same sentences. `error.problems` is the list, one sentence each. A stale `previous`
+  and a changed cursor stay separate refusals: read the brief again and send its
+  template.
+
+### The merge slot is not a task
+
+Each project has one merge slot, `PROJECT-merge-slot`, an internal record. On the host it
+is stored as an ordinary row, so earlier kits listed it as open, unclaimed work and
+offered it to agents.
+- It is in no task list, queue, `GET /v1/me/work` or `GET /v1/agents/me/next`, and it
+  is not counted as claimable.
+- Reading it as a task (the task, its brief, its history) answers 404.
+- Claiming it, editing it, or posting a checkpoint or a review on it answers 409 with
+  "PROJECT-merge-slot is the project's merge slot, an internal record, not a task".
+- A row counts as the slot only when it has both the id ending `-merge-slot` and the
+  label `gt:slot` (or the type `merge-slot`). A task that only carries the label, or only
+  has such an id, is still a task.
+
 ### Personal agents
 
 An agent is a personal identity owned by one user; it pulls work over the same REST
