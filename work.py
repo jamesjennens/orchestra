@@ -108,7 +108,8 @@ def help_payload(action='work'):
                             'workflow_state', 'integration', 'integration_disagreements',
                             'integration_warnings', 'review_request', 'review_requests',
                             'newer_activity_by_others', 'newer_activity_own',
-                            'newer_activity_coverage', 'unresolved_directions'],
+                            'newer_activity_coverage', 'unresolved_directions',
+                            'recommended', 'recommended_by', 'contribution_author'],
         }
     elif action == 'review':
         payload['operations'] = ['read (review TASK)', 'contribute', 'request-changes',
@@ -409,6 +410,9 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                       # contribution and nobody has decided yet; and who recommends it.
                       'recommended':bool(review.get('recommended')),
                       'recommended_by':[entry['author'] for entry in review.get('recommendations') or []],
+                      # Additive (kittrial-5bb.115 review): who delivered the current contribution, so a
+                      # reader that knows people (the web service) can apply its person rule to a row.
+                      'contribution_author':(review.get('contribution') or {}).get('author'),
                       # Additive (kittrial-5bb.52): the integration disagreement entries
                       # naming both facts and both scopes, and their rendered warnings.
                       'integration_disagreements':disagreements,'integration_warnings':integration_warnings})

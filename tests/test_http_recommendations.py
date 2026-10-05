@@ -58,6 +58,65 @@ class Shared:
         self.assertEqual(201, self.recommend(self.reviewer_agent, task, contribution, commit).status)
         self.assertEqual(len(self.review(self.owner, task)['recommendations']), 2)
 
+    def test_a_refusal_says_which_rule_was_hit_and_unknown_fields_are_refused(self):
+        """Review of the first delivery: an opaque 422, and fields dropped silently."""
+        commit = test_http_agents.COMMIT
+        task, contribution = self.deliver('first', commit)
+        for label, changes, words in (
+                ('another commit', {'commit': 'e' * 40}, 'not the current contribution'),
+                ('another contribution', {'contribution': 'nope-1'}, 'not the task'),
+                ('another verdict', {'verdict': 'reject'}, 'verdict'),
+                ('a long summary', {'summary': 'x' * 1201}, '1200')):
+            with self.subTest(refused=label):
+                sent = dict({'contribution': contribution, 'commit': commit}, **changes)
+                answer = self.recommend(self.reviewer, task, sent.pop('contribution'), sent.pop('commit'), **sent)
+                self.assertIn(answer.status, (409, 422), answer.data)
+                message = answer.data['error']['message']
+                self.assertIn(words, message)
+                self.assertNotEqual(message, 'Canonical command rejected the request')
+                self.assertNotIn('ValueError', message)
+        for label, extra in (('approved', {'approved': True}), ('previous', {'previous': contribution}),
+                             ('a made-up field', {'surprise': 1})):
+            with self.subTest(unknown=label):
+                answer = self.recommend(self.reviewer, task, contribution, commit, **extra)
+                self.assertEqual(422, answer.status, answer.data)
+                self.assertIn('unknown field(s): %s' % list(extra)[0], answer.data['error']['message'])
+        self.assertEqual(self.review(self.owner, task)['recommendations'], [])
+        self.assertEqual(201, self.recommend(self.reviewer, task, contribution, commit).status)
+
+    def test_the_queue_applies_the_same_person_rule_as_the_brief(self):
+        """A recommendation by another agent of the AUTHOR is left out of the queue too, when author and assignee differ."""
+        commit = test_http_agents.COMMIT
+        task, contribution = self.deliver('first', commit)
+        self.assertEqual(201, self.recommend(self.reviewer_agent, task, contribution, commit).status)
+        sibling = self.request('POST', '/v1/agents', {'name': 'Merlin', 'working_directory': '/home/carl/m',
+                                                      'projects': [self.project]}, token=self.contributor)
+        self.assertEqual(201, sibling.data and sibling.status, sibling.data)
+        self.plant_recommendation(task, contribution, commit, sibling.data['agent']['id'])
+        # Reassign the task away from the author: the assignee is now someone unrelated.
+        self.reassign(task, self.reviewer_actor_for_reassignment())
+        row = next(row for row in self.queue(self.owner) if row['id'] == task)
+        self.assertNotIn(sibling.data['agent']['id'], row['recommended_by'])
+        review = self.review(self.owner, task)
+        self.assertNotIn(sibling.data['agent']['id'], [entry['author'] for entry in review['recommendations']])
+        self.assertEqual(row['recommended_by'], [entry['author'] for entry in review['recommendations']])
+
+    def test_a_reassignment_to_the_recommender_does_not_hide_the_recommendation(self):
+        """The assignee rule is for the write; no reader, over SSH or HTTP, re-checks it."""
+        commit = test_http_agents.COMMIT
+        task, contribution = self.deliver('first', commit)
+        self.assertEqual(201, self.recommend(self.reviewer, task, contribution, commit).status)
+        vera = self.review(self.owner, task)['recommendation']['author']      # the person who recommended
+        self.reassign(task, vera)
+        review = self.review(self.owner, task)
+        self.assertEqual([entry['author'] for entry in review['recommendations']], [vera])
+        self.assertEqual(review['recommendation']['author'], vera)
+        row = next(row for row in self.queue(self.owner) if row['id'] == task)
+        self.assertEqual((row['recommended'], row['recommended_by']), (True, [vera]))
+        # Written now, by the assignee's own person, it is refused as before.
+        again = self.recommend(self.reviewer, task, contribution, commit)
+        self.assertEqual(403, again.status, again.data)
+
     def check_the_scenario(self, task, other, contribution, commit, approve):
         """`task` has a contribution by the agent; `other` has one too, with no recommendation."""
         before = self.review(self.owner, task)
@@ -155,6 +214,19 @@ class InProcessTests(Shared, test_http_agents.AgentHarness):
                                 token=token)
         self.check_the_scenario(task, other, contribution, commit, approve)
 
+    def plant_recommendation(self, task, contribution, commit, actor):
+        stored = self.backend.state.setdefault('recommendations', {}).setdefault(task, [])
+        records = self.backend.state['contributions'][task]
+        stored.append({'id': 'rec_planted', 'task_id': task, 'kind': 'recommendation', 'contribution_id': contribution,
+                       'commit': commit, 'verdict': 'approve', 'summary': 'planted', 'items': [], 'actor': actor,
+                       'created_at': '2099-01-01T00:00:00Z', 'after': len(records)})
+
+    def reassign(self, task, actor):
+        self.backend._task(self.project, task)['assignee'] = actor
+
+    def reviewer_actor_for_reassignment(self):
+        return next(uid for uid, user in self.service.state['users'].items() if user.get('username') == 'vera')
+
     def test_a_new_revision_and_a_later_request_clear_it(self):
         task, contribution = self.deliver('first', test_http_agents.COMMIT)
         self.assertEqual(201, self.recommend(self.reviewer_agent, task, contribution, test_http_agents.COMMIT).status)
@@ -193,9 +265,12 @@ class InProcessTests(Shared, test_http_agents.AgentHarness):
         stored = self.backend.state['recommendations'][task]
         stored.append(dict(stored[0], id='rec_owner', actor=carl, created_at='2099-01-01T00:00:00Z', summary='my own agent did well'))
         review = self.review(self.owner, task)
-        # The newest is the owner's: it is dropped, and the other reviewer is still named.
-        self.assertIsNone(review['recommendation'])
+        # The newest is the owner's: it is dropped, and the newest INDEPENDENT one is shown in its place.
+        self.assertEqual((review['recommendation']['author'], review['recommendation']['summary']),
+                         (self.reviewer_actor, SUMMARY))
+        self.assertNotIn('my own agent did well', json.dumps(review))
         self.assertEqual([entry['author'] for entry in review['recommendations']], [self.reviewer_actor])
+        self.assertEqual(sorted(review['recommendations'][0]), ['at', 'author', 'author_name', 'id'])
         row = next(row for row in self.queue(self.owner) if row['id'] == task)
         self.assertEqual((row['recommended'], row['recommended_by']), (True, [self.reviewer_actor]))
         del stored[0]
@@ -284,6 +359,36 @@ class EndpointTests(Shared, fixes.EndpointCase):
         record = json.loads(stored[0]['text'][len(rec.PREFIX):])
         rec.validate(record, task)
         self.assertNotIn('previous', record)
+
+    def _canonical(self, change):
+        path = self.canonical_root / 'canonical.json'
+        state = json.loads(path.read_text(encoding='utf-8'))
+        change(state)
+        path.write_text(json.dumps(state), encoding='utf-8')
+
+    def plant_recommendation(self, task, contribution, commit, actor):
+        """A record written natively, as over SSH: only the name rule stood in its way."""
+        from requirements import canonical_bytes
+        payload = {'schema_version': 1, 'operation': 'recommend', 'operation_id': 'planted-1', 'task': task,
+                   'contribution': contribution, 'commit': commit, 'verdict': 'approve', 'summary': 'planted',
+                   'items': []}
+        rec.validate(payload, task)
+
+        def change(state):
+            row = next(r for r in state['rows'] if r['id'] == task)
+            state['comments'] = state.get('comments', 0) + 1
+            row['comments'].append({'id': 'planted%d' % state['comments'], 'author': actor,
+                                    'created_at': '2099-01-01T00:00:00Z',
+                                    'text': rec.PREFIX + canonical_bytes(payload).decode()})
+        self._canonical(change)
+
+    def reassign(self, task, actor):
+        def change(state):
+            next(r for r in state['rows'] if r['id'] == task)['assignee'] = actor
+        self._canonical(change)
+
+    def reviewer_actor_for_reassignment(self):
+        return next(uid for uid, user in self.service.state['users'].items() if user.get('username') == 'vera')
 
     def test_an_exact_retry_replays_and_writes_once(self):
         task, contribution = self.deliver('first', fixes.COMMIT)

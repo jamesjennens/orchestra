@@ -707,7 +707,9 @@ class InProcessBackend:
         decided = max([position for position, record in enumerate(records)
                        if record['kind'] in ('request-changes', 'approve')
                        and record.get('contribution_id') == contribution['id']] or [-1])
-        excluded = {author_key(contribution['actor']), author_key(task.get('assignee'))}
+        # The author is excluded on every read; the assignee only when a recommendation is
+        # written, so a later reassignment does not hide an honest one (as canonically).
+        excluded = {author_key(contribution['actor'])}
         newest = {}
         for record in self.state.get('recommendations', {}).get(task['id']) or []:
             if record['contribution_id'] != contribution['id'] or record['after'] <= decided:
@@ -883,7 +885,8 @@ class InProcessBackend:
         return {'state': task.get('review_state') or 'none', 'contribution': contribution,
                 # Additive (kittrial-5bb.115): advice to approve the current contribution.
                 'recommendation': standing[0] if standing else None,
-                'recommendations': [{'id': r['id'], 'author': r['author'], 'at': r['at']} for r in standing],
+                # Each in full: the brief route leaves out the author's own person and shows the next.
+                'recommendations': [dict(r) for r in standing],
                 'requests': requests,
                 'open_requests': sum(1 for r in requests if r['status'] == 'open'),
                 'latest_id': records[-1]['id'] if records else None,
@@ -988,7 +991,8 @@ class InProcessBackend:
                 pending_request_ids=[r['id'] for r in review['requests'] if r['status'] == 'open'],
                 waiting_since=review['latest_at'],
                 attention=self._agent_fields(task, review),
-                recommended_by=[r['author'] for r in review['recommendations']]))
+                recommended_by=[r['author'] for r in review['recommendations']],
+                contribution_author=(review['contribution'] or {}).get('author')))
         items.sort(key=queue_order)
         return {'items': items, 'complete': True, 'warnings': []}
 
@@ -1009,7 +1013,7 @@ def queue_order(item):
 
 def queue_item(project_id, task, review_state, contribution, open_requests,
                pending_request_ids=None, waiting_since=None, integration=None,
-               integration_warnings=None, attention=None, recommended_by=None):
+               integration_warnings=None, attention=None, recommended_by=None, contribution_author=None):
     """One review-queue row, in the shape both backends return.
 
     ``pending_request_ids`` and ``waiting_since`` (time of the latest review record)
@@ -1039,7 +1043,10 @@ def queue_item(project_id, task, review_state, contribution, open_requests,
             # Additive (kittrial-5bb.115): reviewers who recommend approving the current
             # contribution while nobody has decided. Never an approval.
             'recommended': bool(recommended_by),
-            'recommended_by': list(recommended_by or [])}
+            'recommended_by': list(recommended_by or []),
+            # Additive (kittrial-5bb.115 review): who delivered the current contribution, so
+            # the person rule can be applied to a row as it is to a brief.
+            'contribution_author': contribution_author}
 
 
 def own_queue_tasks(queue, actor=None):
@@ -1697,7 +1704,10 @@ class EndpointBackend:
                            'latest_id': review.get('latest_comment_id'),
                            # Additive (kittrial-5bb.115): the standing recommendation.
                            'recommendation': self._recommendation(review.get('recommendation')),
-                           'recommendations': [{'id': entry.get('comment_id'), 'author': entry.get('author'),
+                           # The newest few carry their whole content (a kit before that
+                           # change gives a name and a time only, and is read the same way).
+                           'recommendations': [self._recommendation(entry) if 'summary' in entry else
+                                               {'id': entry.get('comment_id'), 'author': entry.get('author'),
                                                 'at': entry.get('timestamp')}
                                                for entry in review.get('recommendations') or []
                                                if isinstance(entry, dict)],
@@ -1866,7 +1876,9 @@ class EndpointBackend:
                                         integration_warnings=row_warnings,
                                         attention=self._attention_fields(row),
                                         recommended_by=[name for name in row.get('recommended_by') or []
-                                                        if isinstance(name, str)]))
+                                                        if isinstance(name, str)],
+                                        contribution_author=row.get('contribution_author')
+                                        if isinstance(row.get('contribution_author'), str) else None))
             offset = page.get('next_offset')
             if offset is None:
                 complete = True
@@ -2398,11 +2410,18 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if isinstance(actor, str) and self.service.actor_person(actor) not in persons]
 
     def _independent_queue(self, read):
-        """Drop from each row's ``recommended_by`` anyone who is the assignee's person."""
+        """Drop from each row's ``recommended_by`` anyone who is the contribution author's person.
+
+        The same party as the brief compares with (kittrial-5bb.115 review): a
+        recommendation by another agent of the contribution's author is left out of the
+        queue and My work as it is left out of the brief. The assignee is not compared
+        on a read, here or in the canonical reader: that rule is applied when a
+        recommendation is written, so a later reassignment hides nothing.
+        """
         changed = False
         for item in read.get('items') or []:
             names = item.get('recommended_by') or []
-            kept = self._independent(names, [item.get('assignee')]) if names else names
+            kept = self._independent(names, [item.get('contribution_author')]) if names else names
             if len(kept) != len(names):
                 item['recommended_by'], item['recommended'], changed = kept, bool(kept), True
         if changed:
@@ -3102,6 +3121,80 @@ class ApiHandler(BaseHTTPRequestHandler):
         return {'tasks': [task for task in read['tasks'] if task.get('assignee') == actor],
                 'complete': read['complete']}
 
+    #: At most this many reviewer actions are listed per read; the counts stay exact.
+    AGENT_REVIEW_LIMIT = 20
+
+    def _agent_review_actions(self, principal, agent, project_id, rows, counts):
+        """The review work one agent is shown in one project: the actions to list.
+
+        Two kinds, both at the priority of claimable work and listed before it
+        (kittrial-5bb.115). Everything comes from ``rows``, the review-queue snapshot the
+        caller already holds: no further read.
+
+        ``review-recommended``: a contribution that awaits review and has a standing
+        recommendation, shown to an agent whose OWNER can approve it. The agent cannot
+        approve; the action says to tell the owner it is ready.
+
+        ``to-review``: a contribution that awaits review and that this agent has not
+        recommended yet, shown to any agent that may review.
+
+        An agent is shown a delivery only if it could itself recommend it: it holds the
+        reviews capability in the project, and it is a different PERSON from the task's
+        assignee and from the contribution's author (not its own, not its owner's, not
+        another agent of its owner; see ``_independent``). ``counts`` gains the exact
+        numbers; at most AGENT_REVIEW_LIMIT actions are returned, so the caller can tell
+        from the counts that some were left out.
+        """
+        agent_id = agent.get('id')
+        actor = agent.get('actor') or agent_id
+        may_review, owner_approves = self.service.agent_review_standing(agent_id, project_id)
+        if not may_review:
+            return []
+        actions = []
+        for row in rows:
+            if row.get('review_state') != 'awaiting-review' or row.get('status') == 'closed':
+                continue
+            if not self._independent([actor], [row.get('assignee'), row.get('contribution_author')]):
+                continue
+            recommended_by = [name for name in row.get('recommended_by') or [] if isinstance(name, str)]
+            if recommended_by and owner_approves:
+                kind, count, who = 'review-recommended', 'review_recommended', 'owner'
+                reason = ('A reviewer recommends approving this contribution. Tell your owner it is ready to '
+                          'approve; an agent cannot approve.')
+            elif actor not in recommended_by:
+                kind, count, who = 'to-review', 'to_review', 'agent'
+                reason = ('A contribution by someone else awaits review. Review it, then record a recommendation '
+                          'or request changes.')
+            else:
+                continue                      # this agent has recommended it, and its owner cannot approve
+            counts[count] += 1
+            contribution = row.get('contribution') if isinstance(row.get('contribution'), dict) else {}
+            actions.append(self._agent_action(
+                4, kind, project_id, row, reason, who=who, recommended_by=recommended_by[:20],
+                contribution=contribution.get('id'), commit=contribution.get('commit')))
+        # Within the priority: recommended first, then to review; claimable work follows.
+        actions.sort(key=lambda action: (0 if action['kind'] == 'review-recommended' else 1, action['task']))
+        return actions[:self.AGENT_REVIEW_LIMIT]
+
+    @staticmethod
+    def _agent_review_summary(counts):
+        """What to add to an agent's summary when there is review work, whatever its state.
+
+        The state values do not change for review work, so without this an agent with
+        nothing of its own would read "idle, nothing in flight" while contributions wait
+        for it or for its owner.
+        """
+        parts = []
+        if counts.get('review_recommended'):
+            parts.append('%d contribution(s) recommended for approval: tell the owner' % counts['review_recommended'])
+        if counts.get('to_review'):
+            parts.append('%d contribution(s) to review' % counts['to_review'])
+        return (' ' + '; '.join(parts) + '.') if parts else ''
+
+    #: The order of the kinds that share a priority. The ORDER of ``next_actions`` is the
+    #: contract; the priority numbers are not renumbered when a kind is added.
+    AGENT_KIND_ORDER = {'review-recommended': 0, 'to-review': 1, 'claimable-task': 2}
+
     def _agent_action(self, priority, kind, project_id, task, reason, **extra):
         task_id = task.get('id')
         base = '/v1/projects/%s/tasks/%s' % (project_id, task_id)
@@ -3176,9 +3269,11 @@ class ApiHandler(BaseHTTPRequestHandler):
         """
         actor = agent.get('actor') or agent.get('id')
         counts = {'claimable': 0, 'claimed': 0, 'changes_requested': 0,
-                  'awaiting_review': 0, 'blocked': 0, 'in_progress': 0, 'awaiting_integration': 0}
+                  'awaiting_review': 0, 'blocked': 0, 'in_progress': 0, 'awaiting_integration': 0,
+                  'review_recommended': 0, 'to_review': 0}
         own_actions = []
         claimable_actions = []
+        review_actions = []
         truncated = False
         for project_id in agent.get('projects') or []:
             if not self._agent_may_read(principal, project_id):
@@ -3255,12 +3350,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                         claimable_actions.append(self._agent_action(
                             4, 'claimable-task', project_id, task,
                             'Open, unclaimed work the agent may take.'))
+            # Review work for this agent, from the same snapshot (kittrial-5bb.115): one call.
+            review_actions += self._agent_review_actions(principal, agent, project_id, read['tasks'], counts)
         # The count is exact over every page; only the collected suggestions are capped,
         # so a long claimable list can never hide the agent's own feedback.
         if counts['claimable'] > len(claimable_actions):
             truncated = True
-        actions = own_actions + claimable_actions
-        actions.sort(key=lambda a: (a['priority'], a['project'], a['task']))
+        if counts['review_recommended'] + counts['to_review'] > len(review_actions):
+            truncated = True
+        actions = own_actions + review_actions + claimable_actions
+        actions.sort(key=lambda a: (a['priority'], self.AGENT_KIND_ORDER.get(a['kind'], 0), a['project'], a['task']))
         if len(actions) > AGENT_ACTION_LIMIT:
             actions = actions[:AGENT_ACTION_LIMIT]
             truncated = True
@@ -3278,7 +3377,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             state = 'working'
         else:
             state = 'idle'
-        return {'state': state, 'summary': self._agent_summary(state, counts),
+        return {'state': state, 'summary': self._agent_summary(state, counts) + self._agent_review_summary(counts),
                 'counts': counts, 'actions': actions, 'truncated': truncated,
                 'computed_at': now_iso(self.service._now())}
 
@@ -3745,16 +3844,21 @@ class ApiHandler(BaseHTTPRequestHandler):
         actors += [checkpoint.get('author')] if checkpoint else []
         actors += [contribution.get('author')] if contribution else []
         actors += [r.get('author') for r in review.get('requests') or []]
-        # Only a recommendation by a different person from the author and the assignee is
-        # shown (see _independent). The canonical read gives the newest one in full; when
-        # that one is dropped here the full text of an older one is not available, so the
-        # list still names who else recommends and `recommendation` is null.
-        parties = [brief['task'].get('assignee'), (contribution or {}).get('author')]
-        standing = review.get('recommendations') or []
+        # Only a recommendation by a different person from the contribution's author is
+        # shown (see _independent); the assignee is checked when one is written, not here,
+        # as in the canonical reader. When the newest one is left out, the newest of the
+        # others is shown in its place: the backend gives the newest few in full
+        # (kittrial-5bb.115 review). Past those, one is still named and has no text here.
+        parties = [(contribution or {}).get('author')]
+        standing = [entry for entry in review.get('recommendations') or [] if isinstance(entry, dict)]
         kept = set(self._independent([entry.get('author') for entry in standing], parties))
-        review['recommendations'] = [entry for entry in standing if entry.get('author') in kept]
-        if review.get('recommendation') and review['recommendation'].get('author') not in kept:
-            review['recommendation'] = None
+        shown = [entry for entry in standing if entry.get('author') in kept]
+        newest = review.get('recommendation')
+        if not (newest and newest.get('author') in kept):
+            newest = next((dict(entry) for entry in shown if 'summary' in entry), None)
+        review['recommendation'] = newest
+        review['recommendations'] = [{'id': entry.get('id'), 'author': entry.get('author'), 'at': entry.get('at')}
+                                     for entry in shown]
         advice = [review.get('recommendation')] if review.get('recommendation') else []
         advice += review.get('recommendations') or []
         actors += [entry.get('author') for entry in advice]
@@ -3824,15 +3928,28 @@ class ApiHandler(BaseHTTPRequestHandler):
         # approve at all.
         capability = CAP_APPROVE if payload.get('operation') == 'approve' else CAP_REVIEWS
         self._project(ctx, capability)
-        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
+        recommending = payload.get('operation') == 'recommend'
+        current = None
+        if recommending:
+            # A recommendation says exactly what it is: a field this kit does not know is
+            # refused, not dropped, so `approved: true` or `previous` cannot ride along
+            # unnoticed (kittrial-5bb.115 review).
+            unknown = sorted(set(payload) - self.RECOMMEND_FIELDS)
+            if unknown:
+                raise invalid('A recommendation takes contribution, commit, verdict, summary and items; '
+                              'unknown field(s): %s' % ', '.join(name[:40] for name in unknown[:8]))
+            # One read serves the record-anchor check and the person rule below.
+            current = self.backend.task_brief(ctx.params['pid'], ctx.params['tid'])
+            self._refuse_record_anchor(current.get('task'))
+        else:
+            self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
         if 'actor' in payload:
             payload['actor'] = self.service.bind_actor(ctx.principal, payload.get('actor'))
 
         def add():
-            if payload.get('operation') == 'recommend':
+            if recommending:
                 # Independence by PERSON, which only the web service can know; the
                 # canonical write then applies the name rule and every other rule.
-                current = self.backend.task_brief(ctx.params['pid'], ctx.params['tid'])
                 parties = [(current.get('task') or {}).get('assignee'),
                            ((current.get('review') or {}).get('contribution') or {}).get('author')]
                 actor = payload.get('actor') or ctx.principal.actor or ctx.principal.user_id
@@ -3850,13 +3967,26 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if not isinstance(task, dict) or not task.get('assignee') or \
                         task['assignee'] != actor:
                     raise forbidden('Only the task assignee may respond to requested changes')
-            result = self.backend.invoke('reviews.add', ctx.principal, ctx.params['pid'],
-                                         payload, ctx.idempotency_key,
-                                         target=ctx.route_target, authorize=ctx.authorize,
-                                         capability=capability)
+            try:
+                result = self.backend.invoke('reviews.add', ctx.principal, ctx.params['pid'],
+                                             payload, ctx.idempotency_key,
+                                             target=ctx.route_target, authorize=ctx.authorize,
+                                             capability=capability)
+            except HttpError as refusal:
+                # A refused recommendation says which rule it hit: the canonical sentence is
+                # fixed text of this kit (it names the contribution id the caller sent and
+                # nothing else of theirs), so it is the message, not only the detail.
+                if recommending and refusal.status == 422 and isinstance(refusal.detail, str) \
+                        and refusal.detail.startswith('ValueError: '):
+                    raise invalid(refusal.detail[len('ValueError: '):], refusal.detail) from None
+                raise
             return result, result
         return self._mutate(ctx, 'reviews.add', ctx.params['pid'], add, status=201,
                             capability=capability, serialize=False, canonical=True)
+
+    #: Every field a recommendation may carry over HTTP (``task_id`` is set by the route).
+    RECOMMEND_FIELDS = frozenset(('operation', 'schema_version', 'operation_id', 'contribution', 'commit', 'verdict',
+                                  'summary', 'items', 'actor', 'task_id'))
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/history')
     def tasks_history(self, ctx):
