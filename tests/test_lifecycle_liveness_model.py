@@ -1,7 +1,16 @@
 """Independent DAG/delivery oracle: expected state never reads lifecycle events."""
 import copy
 import random
+import sys
 import unittest
+from pathlib import Path
+
+# The kit root is on sys.path when this module is run with `python -m unittest
+# tests.<name>`, but the sibling test module is only importable when the tests
+# directory itself is on the path (discover does that). Insert it so the module
+# also runs standalone (kittrial-5bb.119 added point 2).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import lifecycle
 import briefing
 import work

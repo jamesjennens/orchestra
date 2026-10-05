@@ -54,31 +54,37 @@ RELEASE_TARGETS_MAX = 200
 RELEASE_OPERATION_MAX = 110
 # A release is sent as one request per group so the project lock is released
 # between groups and no single request can approach the client's 150 s timeout.
-# A smaller default group keeps one request well inside that timeout: a measured
-# real project paid 1.6 to 1.7 s per target, so the old default of 50 could reach
-# ~86 s and a group of 200 timed out at 150 s. 25 targets is ~45 s at that rate.
+# A smaller default group keeps one request well inside that timeout. A plain
+# deploy writes three facts per new target and keeps the historical default; a
+# `--live-verified` run that carries NEW targets writes four and uses the smaller
+# RELEASE_CHUNK_VERIFIED_DEFAULT, because a 25-target group of those was measured
+# at about the client timeout (kittrial-5bb.119 rev2, review item 3).
 RELEASE_CHUNK_DEFAULT = 25
-# Conservative per-target budget quoted by `release --dry-run` as an ESTIMATE,
-# not a guaranteed bound (kittrial-5bb.119 item 4). The measured in-memory
-# harness on the authoritative Linux host is far below it, but a real `bd`
-# binary on a large project paid 1.6 to 1.7 s per target when each target cost
-# ONE write. Rev2 made each target cost THREE writes (scope, deployed, live) and
-# the reviewer then measured 438 s for 201 targets (2.18 s per target), against
-# the old 2.0 s/target figure, so that figure was no longer an upper bound
-# (rev3 item 3.3). A fresh 200-target release on real bd 1.2.2 + Dolt measured
-# 913.3 s for one export and 600 native writes (4.57 s per target) on
-# 2026-10-05, partly under a concurrent full-suite run, so the arithmetic
-# 3.0 s/target no longer covered it. The budget is now 5.0 s per target - about
-# 1.7 s per native write - plus 15 s of per-request overhead: 200 targets
-# estimate 1015 s and a 25-target group (the default) 140 s, inside the client's
-# 150 s timeout. It stays an estimate and can still be exceeded on a slower host.
-DRY_RUN_SECONDS_PER_TARGET = 5.0
+RELEASE_CHUNK_VERIFIED_DEFAULT = 15
+# A single request must stay inside the client's 150 s timeout.
+RELEASE_CLIENT_TIMEOUT_SECONDS = 150.0
+# `release --dry-run` prints `expected_seconds`, a conservative ESTIMATE for the
+# resolved page and not a guaranteed bound (kittrial-5bb.119 item 4). It is
+# computed per NATIVE WRITE, because one `bd set-state` process is what a release
+# really pays for. A new target costs THREE writes (scope, deployed, live) and a
+# `--live-verified` first deployment costs FOUR (the extra live-verified fact); a
+# verify-only target costs ONE. The per-write figure is the measured worst case
+# per planned fact on real bd 1.2.2 + Dolt; it also absorbs the intermediate
+# `pending` rewrite `_apply_fact` performs when the task already carries the
+# target label, which is why a second-environment `--live-verified` deployment
+# of already-labelled tasks costs six processes per target for four facts.
+# A per-TARGET figure from a run taken under a concurrent suite was replaced by
+# this one (kittrial-5bb.119 review items 3 and 4).
+DRY_RUN_SECONDS_PER_WRITE = 1.5
 DRY_RUN_FIXED_SECONDS = 15.0
-# The 200-target real-bd measurement the estimate was checked against
-# (kittrial-5bb.119): bd 1.2.2 + Dolt, one export and 600 native writes for a
-# plain 200-target release. ReleaseCostEstimateTests asserts the printed value
-# stays at or above it.
-DRY_RUN_MEASURED_200_TARGET_SECONDS = 913.3
+DRY_RUN_WRITES_PLAIN = 3
+DRY_RUN_WRITES_VERIFIED = 4
+DRY_RUN_WRITES_VERIFY_ONLY = 1
+# The measured floors ReleaseCostEstimateTests hard-codes, so weakening the
+# constants the estimate rests on - or zeroing the fixed part - fails the suite
+# (kittrial-5bb.119 p3 item 3).
+DRY_RUN_MEASURED_SECONDS_PER_WRITE = 1.47
+DRY_RUN_MEASURED_FIXED_SECONDS = 15.0
 # The writing command asks the endpoint which integrations are reverted; the
 # offline dry run cannot, so it says plainly that its local revert view may list a
 # target the writing run skips (rev3 item 3.4).
@@ -1262,23 +1268,30 @@ def _check_release_identity(payload,op_index):
             raise ValueError('operation ID already used for different content (release/environment); a new operation ID is needed: '+payload['operation_id'])
 
 
-def _check_release_operations(plans,negative,op_index,evidence):
-    """Check every receipt before writing, including historical liveness retries."""
+def _check_release_operations(plans,negative,op_index,evidence,operation_id):
+    """Check every receipt before writing, including historical liveness retries.
+
+    ``operation_id`` is the OPERATOR's base id from the request payload. Every
+    derived per-task id is reported as that base id, because the derived id is
+    not something the operator wrote or can choose (kittrial-5bb.119 added point
+    4). An exact retry whose recorded state is still current is accepted, so an
+    interrupted run completes by retrying the same export with the same id.
+    """
     identities={}
     for planned in [p for plan in plans.values() for _,p in plan]+[p for _,p in negative]:
         earlier=identities.setdefault(planned['operation_id'],planned)
-        if earlier!=planned:raise ValueError('operation ID already used for different content in the same plan; a new operation ID is needed')
+        if earlier!=planned:raise ValueError('operation ID already used for different content in the same plan; a new operation ID is needed: '+operation_id)
         prior=op_index.get(planned['operation_id'])
         if prior is None:continue
         if prior[0]!=planned:
-            raise ValueError('operation ID already used for different content; a new operation ID is needed: '+planned['operation_id'])
+            raise ValueError('operation ID already used for different content; a new operation ID is needed: '+operation_id)
         if planned['dimension']!=LIVE:continue
         current,value=environment_liveness(evidence.get(planned['task'],{}).get('scopes',[]),
                                            planned['scope']['environment'])
         effective=(current is not None and current['scope']==planned['scope'] and value==planned['value'])
         if planned['value']=='live' and any(p['task']==planned['task'] for _,p in negative):effective=False
         if not effective:
-            raise ValueError('operation ID was already used for a state that has since changed; a new operation ID is needed: '+planned['operation_id'])
+            raise ValueError('operation ID was already used for a state that has since changed; a new operation ID is needed: '+operation_id)
 
 
 def apply_release(payload,actor,run,operators=None,journal=None):
@@ -1313,7 +1326,7 @@ def apply_release(payload,actor,run,operators=None,journal=None):
     current=current_contribution_commits(rows)
     op_index=_operation_index(rows)
     _check_release_identity(payload,op_index)
-    _check_release_operations(plans,superseded+superseded_scopes,op_index,evidence)
+    _check_release_operations(plans,superseded+superseded_scopes,op_index,evidence,payload['operation_id'])
     # Scope tokens already recorded for a task, so a verify-only fact under the
     # release's older scope, and a per-environment supersede under the environment's
     # live scope, are accepted without moving the task's current scope (item 3,
@@ -1481,6 +1494,40 @@ def _chunks(items,size):
     return [items[index:index+size] for index in range(0,len(items),size)]
 
 
+def release_planned_writes(page,verify_only,live_verified):
+    """Native fact writes the resolved page will cost (kittrial-5bb.119 item 4).
+
+    A verify-only target (already deployed, only the verification is owed) costs
+    ONE write. A new target costs THREE writes (scope, deployed, live) and FOUR
+    with ``--live-verified`` (the extra live-verified fact). The count is what
+    ``expected_seconds`` is computed from, so the estimate follows the writes
+    instead of a fixed per-target figure.
+    """
+    verifying=set(verify_only)
+    return sum(DRY_RUN_WRITES_VERIFY_ONLY if item['task'] in verifying else
+               (DRY_RUN_WRITES_VERIFIED if live_verified else DRY_RUN_WRITES_PLAIN)
+               for item in page)
+
+
+def release_default_chunk(page,verify_only,live_verified):
+    """The default group size: smaller when --live-verified carries new targets.
+
+    A first ``--live-verified`` deployment writes FOUR facts per target and the
+    measured 25-target group ran at about the client's 150 s timeout, so the
+    default group is smaller there (review item 3). A plain deploy keeps the
+    historical default.
+    """
+    verifying=set(verify_only)
+    if live_verified and any(item['task'] not in verifying for item in page):
+        return RELEASE_CHUNK_VERIFIED_DEFAULT
+    return RELEASE_CHUNK_DEFAULT
+
+
+def release_group_estimate(writes):
+    """The printed estimate for a group/page with ``writes`` native writes."""
+    return round(DRY_RUN_FIXED_SECONDS+DRY_RUN_SECONDS_PER_WRITE*writes,1)
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__);sub=parser.add_subparsers(dest='command',required=True)
     record=sub.add_parser('record')
@@ -1498,7 +1545,10 @@ def main():
     release.add_argument('--previous-release-commit')
     release.add_argument('--page',type=int,default=1)
     release.add_argument('--page-size',type=int)
-    release.add_argument('--chunk-size',type=int,default=RELEASE_CHUNK_DEFAULT)
+    # The group size. Unset means the command chooses one from the page: a
+    # `--live-verified` run that carries new targets writes four facts per target
+    # and uses a smaller default group (kittrial-5bb.119 review item 3).
+    release.add_argument('--chunk-size',type=int,default=None)
     # The project directory holding the host journal (.integration-reverts/). When
     # given, revert records are read with the SAME operator/journal rule as review;
     # without it (a remote worker usually cannot read the host journal) no revert
@@ -1606,7 +1656,33 @@ def main():
             if a.page_size is not None:
                 start=(a.page-1)*a.page_size
                 page=targets[start:start+a.page_size]
-            chunks=_chunks(page,a.chunk_size)
+            page_verify_only=sorted(set(verify_only)&{item['task'] for item in page})
+            explicit_chunk=a.chunk_size is not None
+            chunk_size=(a.chunk_size if explicit_chunk
+                        else release_default_chunk(page,page_verify_only,data['live_verified']))
+            chunk_size=max(1,min(int(chunk_size),RELEASE_TARGETS_MAX))
+            chunks=_chunks(page,chunk_size)
+            # The negative facts (task-level supersede and per-scope supersede) ride
+            # only the FIRST group of the FIRST page, so they are counted in that
+            # page's estimate and nowhere else.
+            negatives_here=bool(supersede or supersede_scopes) and (not a.page_size or a.page==1)
+            negative_writes=(len(supersede)+len(supersede_scopes)) if negatives_here else 0
+            new_targets=[item for item in page if item['task'] not in set(page_verify_only)]
+            if data['live_verified'] and new_targets and not explicit_chunk:
+                warnings.append('--live-verified writes FOUR facts per new target (scope, deployed, live, '
+                                'live-verified), so this run uses a group of %d target(s), not the plain '
+                                'default of %d; pass --chunk-size to override (kittrial-5bb.119 review item 3)'
+                                %(chunk_size,RELEASE_CHUNK_DEFAULT))
+            group_estimates=[]
+            for index,chunk in enumerate(chunks):
+                writes=(release_planned_writes(chunk,page_verify_only,data['live_verified'])
+                        +(negative_writes if index==0 else 0))
+                group_estimates.append(release_group_estimate(writes))
+            if max(group_estimates or [0.0])>RELEASE_CLIENT_TIMEOUT_SECONDS:
+                warnings.append('expected_seconds estimates %s s for one group of %d target(s), above the '
+                                'client timeout of %s s; lower --chunk-size so no single request can time '
+                                'out (kittrial-5bb.119 review item 3)'
+                                %(max(group_estimates),chunk_size,RELEASE_CLIENT_TIMEOUT_SECONDS))
             # The supersede list rides the first group payload, so a rollback or a
             # hotfix deploy that drops tasks is one logical operation beside the rest
             # of the release. The field is only present when it is non-empty, so a
@@ -1632,7 +1708,12 @@ def main():
                                          for item in supersede_scopes],
                     'total_targets':len(targets),'page':a.page,'page_size':a.page_size,
                     'chunks':[len(chunk) for chunk in chunks],'total_chunks':len(chunks),
-                    'expected_seconds':round(DRY_RUN_FIXED_SECONDS+DRY_RUN_SECONDS_PER_TARGET*len(page),1),
+                    'chunk_size':chunk_size,
+                    'planned_writes':release_planned_writes(page,page_verify_only,data['live_verified'])
+                                     +negative_writes,
+                    'expected_seconds':release_group_estimate(
+                        release_planned_writes(page,page_verify_only,data['live_verified'])
+                        +negative_writes),
                     'reader_note':SCOPE_ROLL_NOTE,'dry_run':bool(a.dry_run),
                     'rollback':bool(data['rollback'])}
             if a.dry_run:
@@ -1655,7 +1736,7 @@ def main():
                     for chunk_payload in chunk_payloads:
                         _selected,plans,_issues,_evidence=_release_plan(rows,chunk_payload,journal=journal)
                         negative=_supersede_plan(rows,chunk_payload)+_supersede_scope_plan(rows,chunk_payload)
-                        _check_release_operations(plans,negative,op_index,_evidence)
+                        _check_release_operations(plans,negative,op_index,_evidence,data['operation_id'])
                 except ValueError as exc:
                     report['results']=[]
                     report['groups_completed']=0
