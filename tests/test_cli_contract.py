@@ -850,7 +850,7 @@ class CheckpointJsonFlagTests(unittest.TestCase):
                 result, calls = self.run_checkpoint(args)
                 self.assertEqual(result['comment_id'],'cp-new')
                 self.assertFalse(result['reconciled'])
-                self.assertEqual(result['covered'],1)
+                self.assertEqual(result['covered'],0)  # default writer keeps legacy shape/unknown coverage
                 self.assertLessEqual(result['bytes'],briefing.CHECKPOINT_MAX_BYTES)
                 self.assertEqual(calls[-1][:2], ['comments', 'add'])
 

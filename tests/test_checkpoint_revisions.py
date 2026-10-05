@@ -48,7 +48,8 @@ class CheckpointRevisionTests(unittest.TestCase):
             self.resolve(data,'cp2',['a','b'])
             latest=self.resolve(data,'cp3',['c'])
             self.assertNotIn(TASK+'-cz',b.direction_index(latest))
-            self.assertIn(TASK+'-ca',b.direction_index(latest))
+            self.assertNotIn('carried',latest)  # completed dispositions stay in history, not repeated
+            self.assertIn(TASK+'-ca',b.chain_dispositions(b.checkpoint_history(data[0])))
             self.assertEqual(b.brief(data,PROJECT,TASK)['directions']['total'],0)
 
     def test_latest_truncated_evidence_overrides_old_exact_and_old_truncated(self):
@@ -128,7 +129,7 @@ class CheckpointRevisionTests(unittest.TestCase):
         supplied['older'][next(iter(supplied['older']))]='b'*16
         calls=[]
         with self.assertRaisesRegex(ValueError,'does not match'):
-            b.save_checkpoint(data,PROJECT,TASK,checkpoint(data,provenance=supplied),'alice/session',calls.append)
+            b.save_checkpoint(data,PROJECT,TASK,checkpoint(data,provenance=supplied),'alice/session',calls.append, provenance_writes=True)
         self.assertEqual(calls,[])
 
     def test_deep_json_and_raw_carried_forgery_are_not_accepted(self):
@@ -169,10 +170,12 @@ class CheckpointRevisionTests(unittest.TestCase):
         data=[]
         for n in range(12):
             row=rows()[0];row['id']='task-%02d'%n;data.append(row)
-        with patch.object(b,'checkpoint_state',wraps=b.checkpoint_state) as state:
+        with patch.object(b,'checkpoint_queue_fields',wraps=b.checkpoint_queue_fields) as fields, \
+             patch.object(b,'normalize_provenance',wraps=b.normalize_provenance) as normalize:
             result=work.queue(data,'alice/session',['--mine','--limit','2'])
             self.assertEqual(result['total'],12)
-            self.assertEqual(state.call_count,2)
+            self.assertEqual(fields.call_count,2)
+            self.assertEqual(normalize.call_count,0)  # no provenance work on undisplayed rows
 
 
 if __name__=='__main__':unittest.main()

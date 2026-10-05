@@ -102,15 +102,17 @@ def field_names(values):
     return ', '.join(shown)
 
 def validate_checkpoint(p,task,require_digests=True):
-    fields={'schema_version','task','previous','activity_cursor','source_commit','branch','intent','acceptance','summary','next_action','open_items','resolved','incorporated_digests','provenance','directions','carried'}
+    optional={'incorporated_digests','provenance','directions','carried','direction_owner'}
+    fields={'schema_version','task','previous','activity_cursor','source_commit','branch','intent','acceptance','summary','next_action','open_items','resolved'}|optional
     if not isinstance(p,dict):raise ValueError('Invalid checkpoint: expected a JSON object')
-    unknown=sorted(set(p)-fields);missing=sorted(fields-set(p)-{'incorporated_digests','provenance','directions','carried'});details=[]
+    unknown=sorted(set(p)-fields);missing=sorted(fields-set(p)-optional);details=[]
     if unknown:details.append('unknown fields: '+field_names(unknown))
     if missing:details.append('missing fields: '+field_names(missing))
     if not details and (type(p['schema_version']) is not int or p['schema_version']!=1):details.append('schema_version must be integer 1')
     if details:raise ValueError('Invalid checkpoint: '+'; '.join(details))
     if p['task']!=task:raise ValueError('Checkpoint task mismatch')
     if p['previous'] is not None:identity(p['previous'])
+    if 'direction_owner' in p and p['direction_owner'] is not None:text(p['direction_owner'],'direction_owner',96)
     for key,limit in CHECKPOINT_FIELD_LIMITS:text(p[key],key,limit,empty=key in ('source_commit','branch'))
     cursor=untoken(p['activity_cursor'])
     if not isinstance(cursor,dict) or cursor.get('kind')!='activity' or cursor.get('task')!=task:raise ValueError('Expected task activity cursor from brief/history')
@@ -122,7 +124,8 @@ def validate_checkpoint(p,task,require_digests=True):
         if not isinstance(digests,dict) or len(digests)>DIGEST_WINDOW or not valid_digest_map(digests,64):raise ValueError('Invalid incorporated_digests')
     if 'provenance' in p:
         prov=p['provenance']
-        if not isinstance(prov,dict) or not set(prov)<={'digests','older','chain','covered','window'} or not isinstance(prov.get('digests'),dict):raise ValueError('Invalid provenance')
+        if not isinstance(prov,dict) or not set(prov)<={'digests','older','chain','covered','window','delta'} or not isinstance(prov.get('digests'),dict):raise ValueError('Invalid provenance')
+        if 'delta' in prov and prov['delta'] is not True:raise ValueError('Invalid provenance delta')
         if not re.fullmatch(r'[a-f0-9]{64}',str(prov.get('chain',''))):raise ValueError('Invalid provenance chain')
         if type(prov.get('covered')) is not int or prov['covered']<0:raise ValueError('Invalid provenance covered count')
         if len(prov['digests'])>DIGEST_WINDOW:raise ValueError('Provenance window exceeds the digest window')
@@ -179,7 +182,7 @@ def transition(previous,current):
     old_items={x['id']:x for x in previous['open_items']} if previous else {}
     if any(item['id'] in old_items and item!=old_items[item['id']] for item in current['open_items']):raise ValueError('Carry unresolved items unchanged; explicitly resolve/supersede changed items with new IDs')
 
-def checkpoint_state(issue):
+def checkpoint_state(issue,normalize=True):
     """Parse once and follow links, irrespective of native comment ordering.
 
     Each retained provenance is normalized once for consumers of this read. The
@@ -206,7 +209,8 @@ def checkpoint_state(issue):
         if cid in visited:raise ValueError('Checkpoint cycle')
         transition(current[0] if current else None,p)
         current=(p,c);parent=cid;visited.add(cid)
-        history.append((cid,p));provenance[cid]=normalize_provenance(p)
+        history.append((cid,p))
+        if normalize:provenance[cid]=normalize_provenance(p)
     if len(visited)!=len(records):raise ValueError('Unlinked checkpoint history; reconcile missing/conflicting revisions')
     return {'current':current,'invalid':invalid,'history':history,'provenance':provenance}
 
@@ -259,10 +263,10 @@ def bounded_digests(digests,window=DIGEST_WINDOW,older=OLDER_MAX):
     chain hash over everything outside the window. Entries beyond `older` are
     covered only by the chain and are reported as unverified rather than fresh."""
     keys=sorted(digests)
-    keep=keys[len(keys)-window:] if window>0 else []
+    keep=keys[-window:] if window>0 else []
     kept=set(keep)
     rest=[k for k in keys if k not in kept]
-    prefix={k:digests[k][:OLDER_DIGEST] for k in rest[len(rest)-older:]} if older>0 else {}
+    prefix={k:digests[k][:OLDER_DIGEST] for k in rest[-older:]} if older>0 else {}
     return {'digests':{k:digests[k] for k in keep},'older':prefix,
             'chain':provenance_chain({k:digests[k] for k in rest}),'covered':len(digests),'window':len(keep)}
 
@@ -318,7 +322,9 @@ def chain_evidence(payloads,normalized=None):
     for cid,payload in payloads:
         prov=normalized[cid] if normalized is not None else normalize_provenance(payload)
         recorded=prov is not None
-        if prov is None:continue
+        if prov is None:
+            exact.clear();trunc.clear()
+            continue
         for k,v in prov['digests'].items():exact[k]=v;trunc.pop(k,None)
         for k,v in prov['older'].items():trunc[k]=v;exact.pop(k,None)
     if not recorded:return {},{},False
@@ -390,7 +396,39 @@ def unresolved_directions(entries,direction_idx,owner):
             outstanding.append(e)
     return outstanding
 
-def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=None):
+def direction_context(issue,state):
+    """Apply the migration baseline and observed checkpoint owner boundaries.
+
+    The newest legacy checkpoint is an unknown-history baseline. Previous owners
+    are recorded by new checkpoints; old checkpoints use their native author.
+    A previous owner's entries at/before their last checkpoint are not directions
+    for the new owner. Later comments still require explicit dispositions.
+    """
+    current=state['current']
+    owner=issue.get('assignee') or (current[1].get('author') if current else None)
+    baseline=None;previous={}
+    comments={str(c['id']):c for c in issue.get('comments') or []}
+    for cid,p in state['history']:
+        c=comments[cid];stamp=parse_moment(c['created_at'])
+        if state['provenance'][cid] is None:baseline=stamp
+        old=p.get('direction_owner',c.get('author'))
+        if old and old!=owner:previous[old]=stamp
+    return owner,baseline,previous
+
+def direction_entries(data,context):
+    owner,baseline,previous=context
+    return [e for e in data['entries']
+            if (baseline is None or parse_moment(e['timestamp'])>baseline)
+            and (e['author'] not in previous or parse_moment(e['timestamp'])>previous[e['author']])]
+
+def retained_provenance(state):
+    exact,trunc,recorded=chain_evidence(state['history'],state['provenance'])
+    if not recorded:return None
+    latest=state['provenance'][state['history'][-1][0]]
+    return dict(latest,digests=exact,older=trunc,verifiable=len(exact)+len(trunc),
+                complete=not trunc and len(exact)>=latest['covered'])
+
+def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=None,direction_data=None):
     """Bounded, per-entry view of activity the current checkpoint did not incorporate.
 
     `prov` is the checkpoint's normalized provenance, so edited entries (same ID,
@@ -402,6 +440,9 @@ def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=No
     collection is bounded with an explicit omitted count. Reading changes nothing.
     """
     coverage='unknown' if prov is None else ('snapshot' if prov['complete'] else 'windowed')
+    if prov is None and checkpoint_timestamp:
+        data=dict(data,entries=[e for e in data['entries']
+                               if parse_moment(e['timestamp'])>parse_moment(checkpoint_timestamp)])
     entries,fresh,changed_late,unverified=unincorporated(data,prov)
     own=[e for e in entries if e['author']==owner]
     others=[e for e in entries if e['author']!=owner]
@@ -428,7 +469,7 @@ def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=No
             'verify':'checkpoint '+data['task']+' --verify',
             'note':note}
     if direction_idx is not None:
-        outstanding=unresolved_directions(data['entries'],direction_idx,owner)
+        outstanding=unresolved_directions(data['entries'] if direction_data is None else direction_data,direction_idx,owner)
         result['unresolved_directions']={'total':len(outstanding),
             'items':[{'entry_id':e['entry_id'],'timestamp':e['timestamp'],'author':clip(e['author'],96),
                       'state':(direction_idx.get(e['entry_id']) or {}).get('state','unacknowledged')} for e in outstanding[:NEWER_MAX]],
@@ -512,9 +553,10 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     # acknowledged-but-unresolved direction stays visible on a current checkpoint,
     # and it qualifies the next action even when the activity cursor is current.
     dir_out=None
+    context=direction_context(issue,state);direction_data=direction_entries(data,context)
     if p is not None:
         dispositions=chain_dispositions(state['history'])
-        outstanding=unresolved_directions(data['entries'],dispositions,issue.get('assignee'))
+        outstanding=unresolved_directions(direction_data,dispositions,context[0])
         dir_out={'total':len(outstanding),
                  'items':[{'entry_id':e['entry_id'],'timestamp':e['timestamp'],'author':clip(e['author'],96),
                            'state':(dispositions.get(e['entry_id']) or {}).get('state','unacknowledged')} for e in outstanding[:NEWER_MAX]],
@@ -527,7 +569,7 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
         excluded=excluding_checkpoint(data,c['id'])
         excluded_cursor=activity_cursor(excluded)
         if p['activity_cursor']!=excluded_cursor:
-            newer=newer_activity_summary(excluded,state['provenance'][str(c['id'])],c.get('created_at'),issue.get('assignee'),dispositions)
+            newer=newer_activity_summary(excluded,retained_provenance(state),c.get('created_at'),context[0],dispositions,direction_data)
             if review['review_state'] not in review_next:
                 dirs=newer.get('unresolved_directions')
                 dir_note='' if not dirs else '; '+str(dirs['total'])+' outstanding direction(s) not yet resolved/superseded'
@@ -559,6 +601,7 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
             'lifecycle_scope':{k:clip(v,160) for k,v in (facts['scope'] or {}).items()},
             'warnings':(['Malformed checkpoint comments ignored: '+', '.join(invalid[:5])] if invalid else [])
                        +integration_warnings
+                       +(['Direction baseline: comments at/before the newest legacy checkpoint have UNKNOWN coverage and are not outstanding directions.'] if context[1] is not None else [])
                        +['Newer activity also includes edits, deletions or changed task fields. Prose resolutions never silently clear explicit items.'],
             'evidence':{'issue':'show '+task,'history':'history '+task,'checkpoint_entry':task+'-c'+str(c['id']) if c else None}}
     if journal is not None:
@@ -568,7 +611,7 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
         result['guidance']=brief_block(journal,actor)
     return result
 
-def fit_provenance(payload,digests):
+def fit_provenance(payload,digests,previous=None):
     """Attach provenance to `payload`, shrinking the digest window until the FINAL
     serialized record fits RECORD_MAX. The chain always covers every entry outside
     the window, so coverage stays truthful at any window size. Returns the fitted
@@ -578,9 +621,15 @@ def fit_provenance(payload,digests):
     window=DIGEST_WINDOW
     while True:
         prov=bounded_digests(digests,window)
+        if previous is not None:
+            exact,trunc=previous
+            prov['digests']={k:v for k,v in prov['digests'].items() if exact.get(k)!=v}
+            prov['older']={k:v for k,v in prov['older'].items()
+                           if exact.get(k)!=digests[k] and trunc.get(k)!=v}
+            prov['window']=len(prov['digests']);prov['delta']=True
         candidate=dict(payload,provenance=prov)
         size=len(canonical_bytes(candidate))
-        if size<=RECORD_MAX:return candidate,size
+        if size+len(PREFIX.encode())<=RECORD_MAX:return candidate,size
         if window==0:
             raise ValueError('Checkpoint record would be '+str(size)+' bytes, over the '+str(RECORD_MAX)+'-byte record cap, even with an empty provenance window; '
                              'shorten intent/acceptance/summary/next_action or reduce open items/directions')
@@ -591,11 +640,12 @@ def request_identity(payload):
     server-carried dispositions — so an original request reconciles against its own
     committed receipt even after later checkpoints or edits, while a changed
     payload still differs."""
-    body={k:v for k,v in payload.items() if k not in ('incorporated_digests','provenance','carried')}
+    body={k:v for k,v in payload.items() if k not in ('incorporated_digests','provenance','carried','direction_owner')}
     return canonical_bytes(body)
 
-def save_checkpoint(rows,project,task,p,actor,run):
+def save_checkpoint(rows,project,task,p,actor,run,provenance_writes=False):
     validate_checkpoint(p,task,require_digests=False);issue=task_row(rows,task)
+    if 'carried' in p or 'direction_owner' in p:raise ValueError('carried and direction_owner are server-derived; omit them from the request')
     state=checkpoint_state(issue);current=state['current'];invalid=state['invalid']
     if invalid:raise ValueError('Malformed checkpoint entries require correction before publishing another checkpoint')
     snap=snapshot(rows,project,task)
@@ -606,7 +656,7 @@ def save_checkpoint(rows,project,task,p,actor,run):
     # dispositions or an already-saved direction is edited. Server-derived fields
     # (provenance, carried dispositions) are excluded from identity; a changed
     # payload still differs and is not reconciled.
-    body={k:v for k,v in p.items() if k not in ('incorporated_digests','provenance','carried')}
+    body={k:v for k,v in p.items() if k not in ('incorporated_digests','provenance','carried','direction_owner')}
     identity=request_identity(body)
     comments={str(c['id']):c for c in issue.get('comments') or []}
     for cid,existing in state['history']:
@@ -617,16 +667,22 @@ def save_checkpoint(rows,project,task,p,actor,run):
             return {'comment_id':str(c['id']),'reconciled':True,'covered':recorded['covered'],'bytes':len(str(c['text']))}
     # Direction dispositions must reference the digests actually incorporated for a
     # NEW write (a stored receipt was already validated when it was written).
+    if not provenance_writes and any(k in p for k in ('incorporated_digests','provenance','directions')):
+        raise ValueError('checkpoint_provenance_writes is off (the installation default). Readers accept the new shape; '
+                         'omit provenance/directions to write an older-kit-compatible checkpoint. '
+                         'An operator enables the installation switch only after the rollback target can read these fields.')
     if p.get('directions'):
+        if issue.get('assignee')!=actor:raise ValueError('Only the current task assignee may record direction dispositions')
         for d in p['directions']:
-            if d['id'] in computed and d['digest']!=computed[d['id']]:
+            if d['id'] not in computed:raise ValueError('Direction '+d['id']+' is not an entry on this task')
+            if d['digest']!=computed[d['id']]:
                 raise ValueError('Direction '+d['id']+' digest does not match the incorporated entry; reconcile before resolving')
     # Bounded carry with explicit retirement: dispositions from the previous
     # checkpoint are carried in a separate server field (so recorded request fields
     # stay distinct), retired only when they are already resolved/superseded, and
     # never silently dropped while unresolved. Overflow beyond the cap is refused
     # with guidance instead of producing an unreadable record.
-    carried=direction_index(current[0]) if current else {}
+    carried=chain_dispositions(state['history'])
     effective={k:dict(v) for k,v in carried.items()}
     requested={d['id'] for d in (p.get('directions') or [])}
     for d in (p.get('directions') or []):effective[d['id']]=dict(d)
@@ -644,7 +700,9 @@ def save_checkpoint(rows,project,task,p,actor,run):
             unresolved=sorted(k for k,v in effective.items() if v['state'] not in RESOLUTION_STATES)
             raise ValueError('Merged dispositions would exceed the '+str(DIRECTIONS_MAX)+'-entry cap with '+str(len(unresolved))
                              +' unresolved direction(s) carried; resolve or explicitly retire them before adding more')
-    inherited={k:v for k,v in effective.items() if k not in {d['id'] for d in (p.get('directions') or [])}}
+    # Completed dispositions remain authoritative in history; only unresolved
+    # acknowledgements need repeating in the bounded newest payload.
+    inherited={k:v for k,v in effective.items() if k not in requested and v['state'] not in RESOLUTION_STATES}
     if inherited:body['carried']=sorted(inherited.values(),key=lambda d:d['id'])
     # Authoritative binding for new writes: the caller may not assert which
     # entries the checkpoint incorporated. Accept either the exact full digest map
@@ -658,7 +716,13 @@ def save_checkpoint(rows,project,task,p,actor,run):
         bounded_ok=(isinstance(p.get('provenance'),dict) and p['provenance']==bounded)
         if not (full_ok or bounded_ok):
             raise ValueError('incorporated_digests/provenance does not match the current snapshot; fetch it with "checkpoint TASK --provenance" and embed the returned provenance verbatim')
-    payload,size=fit_provenance(body,computed)
+    if provenance_writes:
+        body['direction_owner']=issue.get('assignee') or actor
+        exact,trunc,recorded=chain_evidence(state['history'],state['provenance'])
+        payload,size=fit_provenance(body,computed,(exact,trunc) if recorded else None)
+    else:
+        payload={k:v for k,v in body.items() if k not in ('directions','carried')}
+        size=len(canonical_bytes(payload))
     # Validate the COMPLETE final server-normalized record (carried arrays, schema,
     # caps and byte size) before any native mutation, so an accepted write is
     # always readable by the same reader.
@@ -668,7 +732,7 @@ def save_checkpoint(rows,project,task,p,actor,run):
     if p['activity_cursor']!=activity_cursor(snap):raise ValueError('Activity changed; read/reconcile history and obtain a fresh activity cursor')
     transition(current[0] if current else None,payload)
     result=json.loads(run(['comments','add',task,PREFIX+canonical_bytes(payload).decode(),'--json']))
-    return {'comment_id':str(result['id']),'reconciled':False,'covered':payload['provenance']['covered'],'bytes':size}
+    return {'comment_id':str(result['id']),'reconciled':False,'covered':payload.get('provenance',{}).get('covered',0),'bytes':size}
 
 def verify_checkpoint(rows,project,task):
     """Verify retained evidence using one linked, parsed checkpoint state."""
@@ -688,7 +752,7 @@ def verify_checkpoint(rows,project,task):
                 'note':'The newest checkpoint has no per-entry evidence (legacy record). Older evidence cannot '
                        'establish what it incorporated. Coverage is UNKNOWN: '+str(total)+' entries were NOT checked. '
                        'Publish a checkpoint to record evidence for current history; reconcile manually via history/show.'}
-    latest=state['provenance'][cid]
+    latest=retained_provenance(state)
     gap=latest['covered']>latest['verifiable']
     fresh=changed=unchanged=unverified=0;changed_ids=[]
     for eid,digest in entry_digests(snap).items():
@@ -714,24 +778,27 @@ def verify_checkpoint(rows,project,task):
                     +'There is no shortcut that verifies never-recorded entries: publish a checkpoint to record '
                     'current evidence; reconcile history manually via history/show.')}
 
-def checkpoint_queue_fields(rows,row):
+def checkpoint_queue_fields(rows,row,state=None):
     """Bounded queue fields; share the brief's linked state and full-row snapshot."""
     empty={'newer_activity_by_others':None,'newer_activity_own':None,
            'newer_activity_coverage':None,'unresolved_directions':None}
     try:
-        state=checkpoint_state(row)
+        if state is None:state=checkpoint_state(row)
+        elif not state['provenance']:
+            state=dict(state,provenance={cid:normalize_provenance(p) for cid,p in state['history']})
         if state['current'] is None or state['invalid']:return empty
         p,c=state['current'];project=untoken(p['activity_cursor']).get('project','work-queue')
         data=excluding_checkpoint(snapshot(rows,project,row['id']),c['id'])
         dispositions=chain_dispositions(state['history'])
+        context=direction_context(row,state);direction_data=direction_entries(data,context)
         if p['activity_cursor']==activity_cursor(data):own=others=0;coverage='current'
         else:
-            newer=newer_activity_summary(data,state['provenance'][str(c['id'])],c.get('created_at'),
-                                         row.get('assignee'),dispositions)
+            newer=newer_activity_summary(data,retained_provenance(state),c.get('created_at'),
+                                         context[0],dispositions,direction_data)
             own=newer['own_count'];others=newer['other_count'];coverage=newer['coverage']
         return {'newer_activity_by_others':others,'newer_activity_own':own,
                 'newer_activity_coverage':coverage,
-                'unresolved_directions':len(unresolved_directions(data['entries'],dispositions,row.get('assignee')))}
+                'unresolved_directions':len(unresolved_directions(direction_data,dispositions,context[0]))}
     except (ValueError,TypeError,KeyError):return empty
 
 def history_page(data,project,task,limit=5,since=None,cursor=None,body_budget=4000):
@@ -892,13 +959,41 @@ def help_notes(action):
         return ['Pages are snapshot-bound; pass next_cursor back to continue the same snapshot.']
     return ['A JSON file attachment is required; payload.task must equal TASK.',
             '--json is accepted in any position; the saved checkpoint is always returned as JSON on stdout.',
-            '--provenance and --verify are read-only alternatives to --file; they change no checkpoint or direction disposition.',
-            'The server derives provenance and carried dispositions; newest evidence follows linked checkpoint order.',
+            '--provenance, --verify and --directions are read-only alternatives to --file; they change no checkpoint or direction disposition.',
+            'checkpoint_provenance_writes is off by default: writers emit the older-kit shape until an operator enables new writes after a reader-first rollout.',
+            'The server derives provenance deltas and carried acknowledgements; newest evidence follows linked checkpoint order.',
+            'Only the current assignee may record direction dispositions; --directions returns full current digests in pages of 1..100.',
             'Every unresolved item must be carried forward unchanged or explicitly resolved with reason and evidence.']
 
 def exported_rows(run):
     """Use the bounded JSON decoder for every briefing export read."""
     return [record_json.loads(x) for x in run(['export','--all']).splitlines() if x.strip()]
+
+def checkpoint_writes_enabled(root):
+    """Reader-first rollout: only an installation operator enables new writes."""
+    from admin import config
+    marker=root/'deployment.private.json'
+    if marker.is_symlink():raise ValueError('Deployment configuration must not be a symlink')
+    if not marker.exists():return False
+    settings=config(root)
+    if not isinstance(settings,dict):raise ValueError('Deployment configuration must be a JSON object')
+    value=settings.get('checkpoint_provenance_writes',False)
+    if type(value) is not bool:raise ValueError('checkpoint_provenance_writes must be a boolean')
+    return value
+
+def direction_page(rows,project,task,offset=0,limit=50):
+    if offset<0 or not 1<=limit<=100:raise ValueError('Direction page requires --offset >= 0 and --limit 1..100')
+    issue=task_row(rows,task);state=checkpoint_state(issue)
+    if state['invalid']:raise ValueError('Malformed checkpoint entries require correction before reading directions')
+    data=snapshot(rows,project,task);context=direction_context(issue,state)
+    entries=unresolved_directions(direction_entries(data,context),chain_dispositions(state['history']),context[0])
+    if offset>len(entries):raise ValueError('Direction offset exceeds total')
+    return {'task':task,'activity_cursor':activity_cursor(data),'total':len(entries),
+            'items':[{'id':e['entry_id'],'digest':entry_digests(data)[e['entry_id']],
+                      'author':clip(e['author'],96),'timestamp':e['timestamp']} for e in entries[offset:offset+limit]],
+            'next_offset':offset+limit if offset+limit<len(entries) else None,
+            'coverage':'Current full digests for outstanding directions, including entries outside stored provenance windows. '
+                       'Pages are fresh reads; compare activity_cursor across pages and restart if it changes.'}
 
 def execute(root,path,project,actor,action,args,attachments,run,operators=None,verifiers=None):
     """Endpoint holds project coordination lock. History caches are disposable."""
@@ -912,6 +1007,11 @@ def execute(root,path,project,actor,action,args,attachments,run,operators=None,v
         # `checkpoint --json TASK --file x` and `checkpoint TASK --json --file x`
         # all behave the same.
         args=[token for token in args if token!='--json']
+        if len(args)>=2 and args[1]=='--directions':
+            parser=Parser(add_help=False);parser.add_argument('task');parser.add_argument('--directions',action='store_true')
+            parser.add_argument('--offset',type=int,default=0);parser.add_argument('--limit',type=int,default=50)
+            page=parser.parse_args(args)
+            return json.dumps(direction_page(exported_rows(run),project,page.task,page.offset,page.limit),ensure_ascii=False,indent=2)+'\n'
         if len(args)==2 and args[1]=='--provenance':
             # Supported read path: return the bounded provenance and cursor that
             # save_checkpoint accepts verbatim — no private snapshot reconstruction.
@@ -926,7 +1026,8 @@ def execute(root,path,project,actor,action,args,attachments,run,operators=None,v
         item=attachments.get(args[1].partition(':')[2],{})
         if item.get('flag') not in ('--file','-f') or not isinstance(item.get('text'),str):raise ValueError('Checkpoint needs a JSON file attachment')
         rows=exported_rows(run)
-        return json.dumps(save_checkpoint(rows,project,args[0],record_json.loads(item['text']),actor,run))+'\n'
+        return json.dumps(save_checkpoint(rows,project,args[0],record_json.loads(item['text']),actor,run,
+                                          provenance_writes=checkpoint_writes_enabled(root)))+'\n'
     a=parse_args(action,args)
     cache=path/'.history-snapshots'
     if cache.is_symlink():raise ValueError('History cache must not be a symlink')

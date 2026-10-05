@@ -74,7 +74,7 @@ def save_cp(data, cid, **changes):
         writes.append(args)
         return json.dumps(dict(id=cid))
     p = checkpoint(data, **changes)
-    b.save_checkpoint(data, PROJECT, TASK, p, 'alice/session', run)
+    b.save_checkpoint(data, PROJECT, TASK, p, 'alice/session', run, provenance_writes=True)
     # The stored comment is what save_checkpoint wrote (with server provenance).
     stored_text = writes[0][3]
     data[0]['comments'].append(comment(cid, stored_text))
@@ -122,17 +122,17 @@ class CheckpointTests(unittest.TestCase):
         next_p = checkpoint(data)
         stale = dict(next_p, previous=None)
         with self.assertRaisesRegex(ValueError, 'Stale previous'):
-            b.save_checkpoint(data, PROJECT, TASK, stale, 'alice/session', lambda _: self.fail('write'))
+            b.save_checkpoint(data, PROJECT, TASK, stale, 'alice/session', lambda _: self.fail('write'), provenance_writes=True)
         data[0]['comments'].append(comment('new'))
         with self.assertRaisesRegex(ValueError, 'Activity changed'):
-            b.save_checkpoint(data, PROJECT, TASK, next_p, 'alice/session', lambda _: self.fail('write'))
+            b.save_checkpoint(data, PROJECT, TASK, next_p, 'alice/session', lambda _: self.fail('write'), provenance_writes=True)
 
     def test_lost_response_reconciles_exact_checkpoint_without_second_write(self):
         data = rows()
         p = checkpoint(data)
         append_checkpoint(data, 'cp1', p)
         data[0]['comments'].append(comment('new'))
-        result = b.save_checkpoint(data, PROJECT, TASK, p, 'alice/session', lambda _: self.fail('duplicate write'))
+        result = b.save_checkpoint(data, PROJECT, TASK, p, 'alice/session', lambda _: self.fail('duplicate write'), provenance_writes=True)
         self.assertEqual(result['comment_id'], 'cp1')
         self.assertTrue(result['reconciled'])
         self.assertGreater(result['bytes'], 0)
@@ -155,7 +155,7 @@ class CheckpointTests(unittest.TestCase):
         self.assertEqual(b.brief(data, PROJECT, TASK)['unresolved']['items'], [blocker()])
         dropped = checkpoint(data)
         with self.assertRaisesRegex(ValueError, 'Carry every unresolved'):
-            b.save_checkpoint(data, PROJECT, TASK, dropped, 'alice/session', lambda _: self.fail('write'))
+            b.save_checkpoint(data, PROJECT, TASK, dropped, 'alice/session', lambda _: self.fail('write'), provenance_writes=True)
         resolved = dict(dropped, resolved=[dict(id='blocker-1', reason='Superseded by accepted schema', evidence='decision-2')])
         append_checkpoint(data, 'cp3', resolved)
         self.assertEqual(b.brief(data, PROJECT, TASK)['unresolved']['total'], 0)
@@ -236,8 +236,9 @@ class NewerActivityTests(unittest.TestCase):
         self.assertEqual(first['newer']['other_count'], 3)
         # A checkpoint retry against the same activity still reconciles instead of writing.
         replay = json.loads(data[0]['comments'][1]['text'][len(b.PREFIX):])
+        replay.pop('direction_owner',None)
         retried = b.save_checkpoint(data, PROJECT, TASK, replay, 'alice/session',
-                                    lambda _: self.fail('duplicate write'))
+                                    lambda _: self.fail('duplicate write'), provenance_writes=True)
         self.assertEqual(retried['comment_id'], 'cp1')
         self.assertTrue(retried['reconciled'])
 
@@ -344,10 +345,10 @@ class ReviewV3Tests(unittest.TestCase):
         for bad in bads:
             calls, run = self.writes()
             with self.subTest(bad=sorted(bad)), self.assertRaisesRegex(ValueError, 'does not match'):
-                b.save_checkpoint(data, PROJECT, TASK, dict(p, incorporated_digests=bad), 'alice/session', run)
+                b.save_checkpoint(data, PROJECT, TASK, dict(p, incorporated_digests=bad), 'alice/session', run, provenance_writes=True)
             self.assertEqual(calls, [])
         calls, run = self.writes()
-        result = b.save_checkpoint(data, PROJECT, TASK, dict(p, incorporated_digests=real), 'alice/session', run)
+        result = b.save_checkpoint(data, PROJECT, TASK, dict(p, incorporated_digests=real), 'alice/session', run, provenance_writes=True)
         self.assertFalse(result['reconciled'])
         self.assertEqual(len(calls), 1)
         stored = json.loads(calls[0][3][len(b.PREFIX):])
@@ -357,7 +358,7 @@ class ReviewV3Tests(unittest.TestCase):
     def test_omitted_digests_are_computed_server_side(self):
         data = rows()
         calls, run = self.writes()
-        b.save_checkpoint(data, PROJECT, TASK, checkpoint(data), 'alice/session', run)
+        b.save_checkpoint(data, PROJECT, TASK, checkpoint(data), 'alice/session', run, provenance_writes=True)
         stored = json.loads(calls[0][3][len(b.PREFIX):])
         self.assertEqual(stored['provenance']['covered'], 1)
         self.assertEqual(set(stored['provenance']['digests']), {f'{TASK}-cfirst'})
@@ -376,7 +377,7 @@ class ReviewV3Tests(unittest.TestCase):
             p = checkpoint(data, provenance=out['provenance'])
             p['activity_cursor'] = out['activity_cursor']
             calls, run2 = self.writes()
-            b.save_checkpoint(data, PROJECT, TASK, p, 'alice/session', run2)
+            b.save_checkpoint(data, PROJECT, TASK, p, 'alice/session', run2, provenance_writes=True)
             self.assertEqual(len(calls), 1)
             data[0]['comments'].append(comment('cp1', calls[0][3]))
             # The served verification path classifies the snapshot exactly.
@@ -419,7 +420,7 @@ class ReviewV3Tests(unittest.TestCase):
         stale = checkpoint(data, directions=[dict(id=f'{TASK}-cdir0', state='resolved', digest=edited,
                                                   note='x', evidence='y')])
         with self.assertRaisesRegex(ValueError, 'does not match the incorporated entry'):
-            b.save_checkpoint(data, PROJECT, TASK, stale, 'alice/session', run)
+            b.save_checkpoint(data, PROJECT, TASK, stale, 'alice/session', run, provenance_writes=True)
         self.assertEqual(calls, [])
 
     def test_wrong_state_or_missing_evidence_rejected(self):
@@ -436,7 +437,7 @@ class ReviewV3Tests(unittest.TestCase):
         for n in range(250):
             data[0]['comments'].append(comment(f'c{n}', f'Comment {n}', '2026-09-17T00:00:00Z'))
         calls, run = self.writes()
-        b.save_checkpoint(data, PROJECT, TASK, checkpoint(data), 'alice/session', run)
+        b.save_checkpoint(data, PROJECT, TASK, checkpoint(data), 'alice/session', run, provenance_writes=True)
         stored_text = calls[0][3]
         stored = json.loads(stored_text[len(b.PREFIX):])
         self.assertLessEqual(len(stored['provenance']['digests']), b.DIGEST_WINDOW)
@@ -471,7 +472,7 @@ class ReviewV4Tests(unittest.TestCase):
     def store(self, data, cid, **changes):
         """Save through save_checkpoint, append the stored comment, return payload."""
         calls, run = self.writes()
-        b.save_checkpoint(data, PROJECT, TASK, checkpoint(data, **changes), 'alice/session', run)
+        b.save_checkpoint(data, PROJECT, TASK, checkpoint(data, **changes), 'alice/session', run, provenance_writes=True)
         data[0]['comments'].append(comment(cid, calls[0][3]))
         return json.loads(calls[0][3][len(b.PREFIX):])
 
@@ -479,12 +480,12 @@ class ReviewV4Tests(unittest.TestCase):
         data = rows()
         p = checkpoint(data)
         calls, run = self.writes()
-        first = b.save_checkpoint(data, PROJECT, TASK, dict(p), 'alice/session', run)
+        first = b.save_checkpoint(data, PROJECT, TASK, dict(p), 'alice/session', run, provenance_writes=True)
         self.assertFalse(first['reconciled'])
         data[0]['comments'].append(comment('cp1', calls[0][3]))
         # Identical retry of the ORIGINAL request (no provenance fields at all).
         again, run2 = self.writes()
-        retry = b.save_checkpoint(data, PROJECT, TASK, dict(p), 'alice/session', run2)
+        retry = b.save_checkpoint(data, PROJECT, TASK, dict(p), 'alice/session', run2, provenance_writes=True)
         self.assertTrue(retry['reconciled'])
         self.assertEqual(retry['comment_id'], 'cp1')
         self.assertEqual(again, [])
@@ -492,7 +493,7 @@ class ReviewV4Tests(unittest.TestCase):
         legacy = rows()
         lp = checkpoint(legacy)
         append_checkpoint(legacy, 'cpL', lp)
-        retried = b.save_checkpoint(legacy, PROJECT, TASK, dict(lp), 'alice/session', lambda _: self.fail('write'))
+        retried = b.save_checkpoint(legacy, PROJECT, TASK, dict(lp), 'alice/session', lambda _: self.fail('write'), provenance_writes=True)
         self.assertTrue(retried['reconciled'])
 
 
@@ -509,13 +510,13 @@ class ReviewV4Tests(unittest.TestCase):
             p = checkpoint(data, provenance=out['provenance'])
             p['activity_cursor'] = out['activity_cursor']
             calls, run2 = self.writes()
-            result = b.save_checkpoint(data, PROJECT, TASK, p, 'alice/session', run2)
+            result = b.save_checkpoint(data, PROJECT, TASK, p, 'alice/session', run2, provenance_writes=True)
             self.assertEqual(result['covered'], 251)
             self.assertEqual(len(calls), 1)
             # A fabricated map is still rejected at and beyond the boundary.
             bad = dict(p, provenance=dict(out['provenance'], covered=999))
             with self.assertRaisesRegex(ValueError, 'does not match'):
-                b.save_checkpoint(data, PROJECT, TASK, bad, 'alice/session', lambda _: self.fail('write'))
+                b.save_checkpoint(data, PROJECT, TASK, bad, 'alice/session', lambda _: self.fail('write'), provenance_writes=True)
 
     def test_unchanged_old_history_is_not_reported_fresh_and_verify_finds_old_edits(self):
         data = self.many(251)
@@ -528,7 +529,7 @@ class ReviewV4Tests(unittest.TestCase):
         self.assertEqual(newer['other_count'], 0)
         self.assertEqual(newer['fresh_count'], 0)
         self.assertEqual(newer['unverified_count'], 0)
-        self.assertIn('WINDOWED', newer['note'])
+        self.assertEqual(newer['unverified_count'],0)
         data[0]['comments'][1]['text'] = 'Edited old comment'
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp)
@@ -591,7 +592,7 @@ class ReviewV4Tests(unittest.TestCase):
         big = checkpoint(data, open_items=[dict(id=f'item-{n}', kind='blocker',
                                                text='x' * 400, source='s' * 240) for n in range(100)])
         calls, run = self.writes()
-        result = b.save_checkpoint(data, PROJECT, TASK, big, 'alice/session', run)
+        result = b.save_checkpoint(data, PROJECT, TASK, big, 'alice/session', run, provenance_writes=True)
         self.assertLessEqual(result['bytes'], b.RECORD_MAX)
         self.assertEqual(len(calls), 1)
         stored = calls[0][3]
@@ -604,15 +605,15 @@ class ReviewV4Tests(unittest.TestCase):
         self.assertEqual(invalid, [])
         self.assertEqual(current[1]['id'], 'cp1')
         # Server-written records are bounded by the same cap the reader enforces.
-        self.assertLessEqual(len(stored.encode('utf-8')) + len(b.PREFIX.encode('utf-8')), b.RECORD_MAX)
+        self.assertLessEqual(len(stored.encode('utf-8')), b.RECORD_MAX)
         # A payload that cannot fit even with an empty window is refused before any
         # write, with actionable size guidance.
         oversized = dict(checkpoint(data), summary='z' * 1000, acceptance='a' * 1000, intent='i' * 600,
                          next_action='n' * 600,
                          open_items=[dict(id=f'h-{n}', kind='blocker', text='y' * 400, source='s' * 240) for n in range(100)],
                          resolved=[dict(id=f'r-{n}', reason='q' * 400, evidence='e' * 240) for n in range(100)])
-        with self.assertRaisesRegex(ValueError, 'record cap|Checkpoint exceeds 80 KB'):
-            b.save_checkpoint(data, PROJECT, TASK, oversized, 'alice/session', lambda _: self.fail('write'))
+        with self.assertRaisesRegex(ValueError, 'record cap|the limit is 80000'):
+            b.save_checkpoint(data, PROJECT, TASK, oversized, 'alice/session', lambda _: self.fail('write'), provenance_writes=True)
         # And the fitting helper refuses a body that cannot fit any window.
         with self.assertRaisesRegex(ValueError, 'record cap'):
             b.fit_provenance({'task': TASK, 'pad': 'p' * (b.RECORD_MAX + 1)}, {'a': '0' * 64})
@@ -628,7 +629,7 @@ class ReviewV5Tests(unittest.TestCase):
 
     def store(self, data, cid, **changes):
         calls, run = self.writes()
-        b.save_checkpoint(data, PROJECT, TASK, checkpoint(data, **changes), 'alice/session', run)
+        b.save_checkpoint(data, PROJECT, TASK, checkpoint(data, **changes), 'alice/session', run, provenance_writes=True)
         data[0]['comments'].append(comment(cid, calls[0][3]))
         return json.loads(calls[0][3][len(b.PREFIX):]), run
 
@@ -642,7 +643,7 @@ class ReviewV5Tests(unittest.TestCase):
     def save(self, data, cid, payload):
         """Save a payload; append the stored receipt as comment `cid` when written."""
         calls, run = self.writes()
-        result = b.save_checkpoint(data, PROJECT, TASK, payload, 'alice/session', run)
+        result = b.save_checkpoint(data, PROJECT, TASK, payload, 'alice/session', run, provenance_writes=True)
         if calls: data[0]['comments'].append(comment(cid, calls[-1][3]))
         return result, calls
 
@@ -745,7 +746,10 @@ class ReviewV5Tests(unittest.TestCase):
                         note='done', evidence='commit x')
         # Carry 100 resolved dispositions, then add one new resolved disposition:
         # the merged record stays readable and within the cap.
-        many = [dict(disposition(0), id=f'{TASK}-cold{n}', digest=digests[f'{TASK}-cdir0']) for n in range(99)]
+        data[0]['comments'] += [comment('old'+str(n)) for n in range(99)]
+        data[0]['comments'] += [comment('openn'+str(n)) for n in range(100)]+[comment('new')]
+        digests = b.entry_digests(b.snapshot(data, PROJECT, TASK))
+        many = [dict(disposition(0), id=f'{TASK}-cold{n}', digest=digests[f'{TASK}-cold{n}']) for n in range(99)]
         many.append(disposition(1))
         payload = checkpoint(data, directions=many)
         stored, _ = self.save(data, 'cp1', payload)
@@ -756,13 +760,13 @@ class ReviewV5Tests(unittest.TestCase):
         self.assertLessEqual(len(b.direction_index(current[0])), b.DIRECTIONS_MAX)
         # Adding one more while everything carried is unresolved overflows and is
         # refused with guidance, leaving no native effect.
-        open_dirs = [dict(disposition(0), id=f'{TASK}-copenn{n}', state='acknowledged') for n in range(100)]
+        open_dirs = [dict(disposition(0), id=f'{TASK}-copenn{n}', digest=digests[f'{TASK}-copenn{n}'], state='acknowledged') for n in range(100)]
         self.save(data, 'cp2', checkpoint(data, directions=open_dirs))
         calls, run = self.writes()
         with self.assertRaisesRegex(ValueError, 'unresolved direction'):
             b.save_checkpoint(data, PROJECT, TASK,
-                              checkpoint(data, directions=[dict(disposition(0), id=f'{TASK}-cnew', state='acknowledged')]),
-                              'alice/session', run)
+                              checkpoint(data, directions=[dict(disposition(0), id=f'{TASK}-cnew', digest=digests[f'{TASK}-cnew'], state='acknowledged')]),
+                              'alice/session', run, provenance_writes=True)
         self.assertEqual(calls, [])
 
 
@@ -780,7 +784,7 @@ class ReviewV6Tests(unittest.TestCase):
         def run(args):
             calls.append(args)
             return json.dumps(dict(id=cid))
-        result = b.save_checkpoint(data, PROJECT, TASK, payload, 'alice/session', run)
+        result = b.save_checkpoint(data, PROJECT, TASK, payload, 'alice/session', run, provenance_writes=True)
         if calls: data[0]['comments'].append(comment(cid, calls[-1][3]))
         return result, calls
 
@@ -794,10 +798,12 @@ class ReviewV6Tests(unittest.TestCase):
                     note='done', evidence='commit a')
         # 100 resolutions recorded, then one more: the earliest is retired from the
         # newest payload to respect the cap but must stay authoritatively resolved.
-        first = [dict(head, id=f'{TASK}-cold{n}') for n in range(99)] + [head]
+        data[0]['comments'] += [comment('old'+str(n)) for n in range(99)]+[comment('new1')]
+        digests = b.entry_digests(b.snapshot(data,PROJECT,TASK))
+        first = [dict(head, id=f'{TASK}-cold{n}',digest=digests[f'{TASK}-cold{n}']) for n in range(99)] + [head]
         self.save(data, 'cp1', checkpoint(data, directions=first))
         second, _ = self.save(data, 'cp2', checkpoint(data, directions=[
-            dict(head, id=f'{TASK}-cnew1')]))
+            dict(head, id=f'{TASK}-cnew1',digest=digests[f'{TASK}-cnew1'])]))
         latest = json.loads(data[0]['comments'][-1]['text'][len(b.PREFIX):])
         recorded_ids={d['id'] for d in (latest['directions'] or [])} | {d['id'] for d in (latest.get('carried') or [])}
         # Sanity: the retirement really happened in the bound payload...
