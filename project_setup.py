@@ -27,10 +27,15 @@ OPERATOR_NOTE = ('The web interface cannot do this step. It is done on the serve
                  'shown. If you are also the operator, run it there; otherwise send the command to whoever is.')
 
 
-def is_merge_slot(row, project_id):
-    """The project's merge slot row: an internal record, not a task (see kittrial-5bb.113)."""
-    return isinstance(row, dict) and (row.get('id') == '%s-merge-slot' % project_id
-                                      or 'gt:slot' in (row.get('labels') or []))
+def is_merge_slot(row, project_id=None):
+    """The project's merge slot row: an internal record, not a task.
+
+    One rule for the whole kit (``coordination.is_merge_slot``, kittrial-5bb.113). The
+    web service's task list no longer carries the slot at all; this stays so that a
+    backend that still returned it would not count it as a first task.
+    """
+    from coordination import is_merge_slot as shared
+    return shared(row)
 
 
 def step(identifier, title, state, detail, who, **where):

@@ -1573,7 +1573,7 @@ it by failing.
 | `proposal` | proposals scanned by a list or the queue | first 1,000 |
 | `admin.py proposal-settings` | actor map / deciders | <= 200 actors, 100 namespaces / <= 50 |
 | `brief` | `--items-offset` | >= 0 |
-| `brief` | `--items-limit` | 1..10 |
+| `brief` | `--items-limit` | 1..100 (default 5; a checkpoint holds at most 100 open items) |
 | `history` | `--limit` | 1..20 |
 | `history` | `--body-budget` | 256..8000 encoded bytes |
 | `review` | `items`/`resolutions` | 1..20 entries |
@@ -1646,6 +1646,31 @@ field **and** the limit, for example:
 | `previous = latest_comment_id` in a review payload | `contribution = contribution.comment_id` | review workflow names the misused ID |
 | reading `brief.owner` as a string | read `brief.owner.text` | excerpt-object contract above |
 | `work --owner -h` | `work --owner ACTOR` | argparse `expected one argument`; `-h` is the option's value, not a help request |
+
+## Raw bd writes: which rows a command names
+
+A contributor may run these bd commands through the endpoint: `list`, `show`, `ready`, `search`, `count`, `state`, `lint`, `comments`, `create`, `update`, `close`, `reopen`, `dep`. The first seven, `comments TASK` and `dep list|tree|cycles` only read. Every write must name the rows it writes (kittrial-5bb.113):
+
+| Command | Rows it writes | How they are named | When they are not |
+|---|---|---|---|
+| `create` | a new row | none, or `--id` | `--id` of a row that exists is refused: bd would replace that row |
+| `create --parent`, `--deps`, `--waits-for` | a link to existing rows | the flag's value | |
+| `create -f`/`--file`, `--graph` | rows described in a file | not named | refused; create them one by one |
+| `update` | each positional id, and `--parent` | positional ids | with no id bd uses the row it touched last: refused |
+| `close`, `reopen` | each positional id | positional ids | with no id: refused |
+| `close --claim-next`, `--continue` | the next row, chosen by bd | not named | refused; close, then claim the next task by its id |
+| `comments add` | the first positional | that id | with no id: refused |
+| `dep add`, `remove`, `relate`, `unrelate` | both ends | positional ids, `--blocked-by`, `--depends-on` | |
+| `dep ID --blocks ID` | both ends | the id and `-b`/`--blocks` | |
+| `dep add --file` | both ends of every edge | `from`/`to` (or `issue_id`/`depends_on_id`) of each line, sent as an attachment | a list that cannot be read is refused |
+
+Rules that follow:
+- **Every named id is resolved through bd before the write**, in one read. bd resolves an id from any substring of the part after the project prefix, so `slot`, `e-s` and a lone `-` all reach `PROJECT-merge-slot`; the write is judged by the row bd finds, not by the text. That read is one more bd call on each write.
+- **An id that does not resolve to exactly one row refuses the write**: "... does not name exactly one task, so the rows this would write are not known. Name each task by its id." So does a read that fails or times out.
+- **`create --id`**: the id must be `PROJECT-NAME` in lower-case letters, digits, dots and hyphens, and must not exist. On bd 1.2.2 `create TITLE --id EXISTING` answers rc 0 and replaces the row: the title is the new one; description, acceptance criteria, notes and assignee are emptied; status returns to open and priority to the default; labels, comments and dependencies stay. An explicit id that does not exist is still allowed. Ids are case-sensitive to bd (`p-ABC` would be a second row beside `p-abc`), which is why upper case is refused.
+- **`external:PROJECT:CAPABILITY`** in a dependency is not a row and is not resolved.
+- A flag this table does not know refuses the write. The table is `reserved_comments.WRITE_FLAGS`; `tests/test_bd_write_flags.py` compares it with `bd COMMAND --help` when a bd binary is available, so check it when the pinned bd changes.
+- The guard and the write run under the project's coordination lock, which every write through the endpoint holds. A `bd` run on the host outside the kit takes no such lock.
 
 ## Wrapper option ordering
 

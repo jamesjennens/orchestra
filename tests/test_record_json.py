@@ -240,13 +240,16 @@ class NoUnguardedParseTests(unittest.TestCase):
         # lifecycle.py is down to one guarded parse (kittrial-5bb.107 rev3): its
         # reverted_integrations now delegates to review_state.reverts_by_task, so the
         # raw reject-comment parse that used record_json.loads here is gone.
+        # coordination.py and one more in endpoint.py (kittrial-5bb.113 revision 2): the merge
+        # slot row as bd prints it, whose metadata a contributor could once write.
+        # reserved_comments.py (revision 3): the lines of a `dep add --file` list of edges.
         self.assertEqual({name: count for name, count in uses.items() if count}, {
             # admin.py reads the review-writes audit history through the guard
             # (kittrial-5bb.110 item 3): a deeply nested audit file used to crash
             # `review-writes status` with a RecursionError.
             'admin.py': 1,
-            'briefing.py': 3, 'endpoint.py': 2, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
-            'handoff.py': 1, 'http_service.py': 2, 'lifecycle.py': 1, 'recovery.py': 1, 'requirements.py': 1,
+            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 3, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
+            'handoff.py': 1, 'http_service.py': 2, 'lifecycle.py': 1, 'recovery.py': 1, 'requirements.py': 1, 'reserved_comments.py': 1,
             'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
 
     def test_the_parsers_that_do_not_call_it_directly_reach_it(self):

@@ -63,6 +63,7 @@ import record_json
 import re
 from pathlib import Path
 import recovery
+from coordination import is_merge_slot, merge_slot_sentence
 from field_limits import check_text, describe
 from requirements import canonical_bytes, content_hash
 
@@ -1694,7 +1695,7 @@ def open_review_requests_by(rows, actor, operators=None, journal=None):
     """
     total = 0
     for row in rows or []:
-        if not isinstance(row, dict) or row.get('issue_type') in ('event', 'gate', 'merge-slot'):
+        if not isinstance(row, dict) or row.get('issue_type') in ('event', 'gate') or is_merge_slot(row):
             continue
         if not any(isinstance(c, dict) and isinstance(c.get('text'), str) and c['text'].startswith(PREFIX)
                    for c in row.get('comments') or []):
@@ -1721,6 +1722,9 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
     ``deployment.private.json``; the default is OFF). The readers understand the
     new operations and fields either way - see the module docstring.
     """
+    for row in rows or []:
+        if isinstance(row, dict) and row.get('id') == task and is_merge_slot(row):
+            raise ValueError(merge_slot_sentence(task) + '; it takes no review record')
     if isinstance(payload, dict) and payload.get('operation') == recovery.OPERATION:
         raise ValueError('Operator void records are not accepted over the contributor review transport; '
                          'an operator must use admin.py void-record on the coordination host')

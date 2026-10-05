@@ -551,6 +551,76 @@ idempotency record's (`IDEMPOTENCY_TTL_SECONDS`, 24 h). That record expires on t
 confirmed timeline (see the record store in section 8), so a clock jump never shortens
 it; a retry after the window is treated as a new request.
 
+### What an agent needs to write a checkpoint
+
+`GET /v1/projects/{id}/tasks/{task}/brief` carries everything a checkpoint needs, so an
+agent can write its first one from the brief alone.
+- `activity_cursor`: the cursor a checkpoint must carry. It is the same value the
+  history route returns. (With `--backend inprocess` it is null and not needed.)
+- `checkpoint_template`: the record to send, for this task at this moment.
+  - `send_to` and `method`: where it goes.
+  - `body`: every field, with `previous` and `activity_cursor` already filled, the four
+    texts empty, and `open_items` already holding **every open item of the previous
+    checkpoint exactly as recorded**, `source` included. Sent as it is, the record
+    carries them all forward. To resolve one, take it out of `open_items` and name its
+    id in `resolved` with a reason and evidence.
+  - `carried_open_items`: how many open items `body` holds. It is null when they could
+    not all be read (the task changed during the read); `body.open_items` is then
+    empty, the note says so, and the brief is read again.
+  - The brief's own `checkpoint.open_items` shows the first ten, each now with its
+    `source`; a task with more costs one further canonical read, which asks for all
+    of them (the canonical `brief --items-limit` now goes up to 100).
+  - `required`: the four texts to fill (`intent`, `acceptance`, `summary`,
+    `next_action`); `optional`: what may be left out and when; `limits`; the shape of an
+    `open_item` (with the allowed `kind` values) and of a `resolved_item`.
+- **Four fields may be left out of the request**: `source_commit`, `branch`,
+  `open_items` and `resolved`. The service sends the empty value for each. The stored
+  canonical record is unchanged and always has every field. Over SSH nothing changes:
+  `checkpoint --file` still takes the whole record.
+- **A refusal names every problem with the record at once.** `error.detail` is the
+  canonical sentence, as before; with two or more problems it is a numbered list of the
+  same sentences. `error.problems` is the list, one sentence each. A stale `previous`
+  and a changed cursor stay separate refusals: read the brief again and send its
+  template.
+  - A required field left out is one of those problems (`Invalid checkpoint: missing
+    fields: summary`), named beside the others. The service no longer refuses it by
+    itself first.
+  - A field name the caller wrote is shown as it is only when it is letters, digits,
+    `_`, `.` and `-`. Any other name is shown as a quoted string with control, bidi and
+    non-ASCII characters and square brackets escaped, so a name cannot break the line
+    or pass for another numbered problem.
+
+### The merge slot is not a task
+
+Each project has one merge slot, `PROJECT-merge-slot`, an internal record. On the host it
+is stored as an ordinary row, so earlier kits listed it as open, unclaimed work and
+offered it to agents.
+- It is in no task list, queue, `GET /v1/me/work` or `GET /v1/agents/me/next`, and it
+  is not counted as claimable.
+- Reading it as a task (the task, its brief, its history) answers 404.
+- Claiming it, editing it, or posting a checkpoint or a review on it answers 409 with
+  "PROJECT-merge-slot is the project's merge slot, an internal record, not a task".
+- **The slot is the row with the exact id `PROJECT-merge-slot`** (or the type
+  `merge-slot`), on every path: listings, reads and writes. The label is not part of
+  the rule: a slot whose label was removed on the host is still the slot. A project
+  name holds no hyphen, so a task whose id only ends in `-merge-slot`
+  (`PROJECT-x-merge-slot`), or that only carries the label, is still a task.
+- **No contributor write reaches it over SSH either.** Every `bd` write names the rows
+  it writes, each name is resolved through bd before the write (bd resolves an id
+  from any part of it: `slot`, `merge`, even a lone `-`), and a write that resolves
+  to the slot is refused. See CLI_CONTRACT.md, "Raw bd writes: which rows a command
+  names".
+- **The label `gt:slot` is reserved.** No contributor adds, removes or replaces it on
+  any row, so a task cannot be hidden with it and the slot cannot be exposed by taking
+  it off.
+- **A damaged slot is repaired by `merge-create`** (`coordinate`). It restores the
+  label, clears an assignee, and sets the status from the holder bd recorded: in
+  progress while held, open when free. It names no new holder and releases nobody. The
+  answer lists what was changed in `repaired`. `merge-check`, `merge-acquire` and
+  `merge-release` on a slot that is unavailable with no holder now say to run it.
+- The web service never offers the row with the id `PROJECT-merge-slot`, whatever the
+  endpoint lists (an older endpoint listed it in `work`).
+
 ### Personal agents
 
 An agent is a personal identity owned by one user; it pulls work over the same REST

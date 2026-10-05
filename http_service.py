@@ -34,6 +34,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import agent_prompts
 import project_setup
+from coordination import MERGE_SLOT_SUFFIX, is_merge_slot, merge_slot_sentence
 from reserved_comments import (ANCHOR_READ_IDS_MAX, carries_record_label, hide_records,
                                is_record_anchor)
 from http_auth import (AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CAP_APPROVE,
@@ -901,12 +902,16 @@ class InProcessBackend:
                           'summary': last['summary'], 'next_action': last.get('next_action'),
                           'open_items': [{'id': item.get('id'),
                                           'kind': item.get('kind') or 'item',
-                                          'text': item.get('text')}
+                                          'text': item.get('text'), 'source': item.get('source')}
                                          for item in last.get('open_items') or []]}
         return {'task': dict(task), 'checkpoint': checkpoint, 'review': self._review_view(task),
+                'carry_open_items': [dict(item) for item in checkpoints[-1].get('open_items') or []
+                                     if isinstance(item, dict)] if checkpoints else [],
                 # The disposable backend records no lifecycle evidence, so every fact is
                 # honestly unknown rather than inferred from the review state.
-                'lifecycle': {}, 'depends_on': []}
+                'lifecycle': {}, 'depends_on': [],
+                # This backend keeps no activity cursor; its checkpoints need none.
+                'activity_cursor': None}
 
     #: The disposable backend is cheap to read and tests expect fresh reads.
     READ_CACHE_SECONDS = 0
@@ -1250,10 +1255,15 @@ class EndpointBackend:
         reply = self._endpoint(action, project, actor, args, attachments,
                                operation_id=operation_id, authority=authority,
                                require_authority=require_authority, route=route)
-        return self._checked(reply)
+        return self._checked(reply, action)
 
-    @staticmethod
-    def _checked(reply):
+    #: How much of a canonical refusal's last line is handed on. A checkpoint refusal lists
+    #: every problem with the record (kittrial-5bb.113), so it gets room for all of them.
+    DETAIL_LIMIT = 200
+    DETAIL_LIMITS = {'checkpoint': 6000}
+
+    @classmethod
+    def _checked(cls, reply, action=None):
         """The payload of one canonical reply, or the HttpError its return code means."""
         code = reply.get('returncode') if isinstance(reply, dict) else None
         stderr = (reply.get('stderr') or '') if isinstance(reply, dict) else ''
@@ -1268,7 +1278,8 @@ class EndpointBackend:
         if code == 124:
             raise uncertain('Canonical command timed out; outcome may be unknown')
         if code:
-            detail = stderr.strip().splitlines()[-1][:200] if stderr.strip() else None
+            limit = cls.DETAIL_LIMITS.get(action, cls.DETAIL_LIMIT)
+            detail = stderr.strip().splitlines()[-1][:limit] if stderr.strip() else None
             if code == 2:
                 raise invalid('Canonical command rejected the request', detail)
             raise uncertain('Canonical command failed; outcome may be unknown')
@@ -1419,11 +1430,10 @@ class EndpointBackend:
                     ['update', str(task_id), '--status', 'in_progress', '--assignee',
                      str(actor), '--json'], {})
         if route == 'checkpoints.add':
-            missing = [field for field in self.CHECKPOINT_FIELDS if field not in payload]
-            if missing:
-                raise invalid('Canonical checkpoint payload is missing fields: %s'
-                              % ', '.join(missing))
-            body = {field: payload.get(field) for field in self.CHECKPOINT_FIELDS}
+            # A field left out is sent as left out: the canonical validator names it with
+            # every other problem of the record, where refusing it here hid the rest
+            # (kittrial-5bb.113 review).
+            body = {field: payload[field] for field in self.CHECKPOINT_FIELDS if field in payload}
             body['schema_version'] = payload.get('schema_version', 1)
             body['task'] = task_id
             return ('checkpoint', project_id, [str(task_id), '@attachment:0'],
@@ -1556,6 +1566,9 @@ class EndpointBackend:
         # (kittrial-5bb.64; the shared hidden-surface list).
         rows = hide_records(self._without_record_anchors(project_id,
                                                          self._in_project(rows, project_id)))
+        # The project's merge slot is an internal record too (kittrial-5bb.113): on real
+        # bd it is a row of type task, and was offered to agents as claimable work.
+        rows = [row for row in rows if not is_merge_slot(row)]
         return {'items': rows, 'total': len(rows)}
 
     def _without_record_anchors(self, project_id, rows):
@@ -1720,16 +1733,18 @@ class EndpointBackend:
         if not isinstance(data, dict):
             raise uncertain('Canonical brief returned an unexpected shape')
         checkpoint = None
+        carry = []
         if data.get('checkpoint'):
             point = data['checkpoint']
             unresolved = data.get('unresolved') or {}
+            carry = self._open_items_in_full(project_id, task_id, point.get('comment_id'), unresolved)
             checkpoint = {'id': point.get('comment_id'), 'at': point.get('timestamp'),
                           'author': point.get('author'), 'summary': data.get('current_position'),
                           'next_action': data.get('next_action'),
                           'branch': point.get('branch'), 'source_commit': point.get('source_commit'),
                           'newer_activity': point.get('newer_activity'),
                           'open_items': [{'id': item.get('id'), 'kind': item.get('kind'),
-                                          'text': item.get('text')}
+                                          'text': item.get('text'), 'source': item.get('source')}
                                          for item in unresolved.get('items') or []
                                          if isinstance(item, dict)],
                           'open_items_total': unresolved.get('total')}
@@ -1790,7 +1805,7 @@ class EndpointBackend:
                      for dimension, fact in (data.get('lifecycle') or {}).items()
                      if isinstance(fact, dict)}
         dependencies = (data.get('dependencies') or {}).get('items') or []
-        return {'task': task, 'checkpoint': checkpoint,
+        return {'task': task, 'checkpoint': checkpoint, 'carry_open_items': carry,
                 'review': {'state': review.get('review_state') or 'none',
                            'contribution': contribution, 'requests': requests,
                            'open_requests': review.get('pending_total', len(requests)),
@@ -1817,7 +1832,58 @@ class EndpointBackend:
                 'depends_on': [{'id': d.get('depends_on_id'), 'title': d.get('depends_on_id'),
                                 'status': 'unknown', 'type': d.get('type')}
                                for d in dependencies if isinstance(d, dict)],
+                # What a checkpoint must carry to say which activity it has seen. It is in
+                # the canonical brief; without it here an agent could not write a first
+                # checkpoint from the brief alone (kittrial-5bb.113).
+                'activity_cursor': data.get('activity_cursor'),
                 'warnings': data.get('warnings') or []}
+
+    def _open_items_in_full(self, project_id, task_id, checkpoint_id, unresolved):
+        """Every open item of the current checkpoint, as recorded, or None when they could not all be read.
+
+        The next checkpoint must carry each one forward unchanged, ``source`` included, so
+        the checkpoint template needs all of them (kittrial-5bb.113 review). The task page
+        shows the first ten. A task with more costs ONE further ``brief`` read that asks for
+        all of them (a checkpoint holds at most 100). An endpoint older than that page size
+        refuses it, and the items are then read ten at a time, at most ``OPEN_ITEM_PAGES``
+        reads. A checkpoint written between two reads makes the list unusable, and the
+        template then says to read again.
+        """
+        items = [dict(item) for item in unresolved.get('items') or [] if isinstance(item, dict)]
+        offset = unresolved.get('next_offset')
+        if offset is None:
+            return items
+        try:
+            whole = self._run('brief', project_id, self.actor_namespace + '/read',
+                              [str(task_id), '--json', '--items-limit', str(self.OPEN_ITEMS_MAX), '--items-offset', '0'])
+        except HttpError as refusal:
+            if refusal.status != 422:
+                raise
+            whole = None
+        if whole is not None:
+            if not isinstance(whole, dict) or (whole.get('checkpoint') or {}).get('comment_id') != checkpoint_id:
+                return None
+            every = whole.get('unresolved') or {}
+            if every.get('next_offset') is not None:
+                return None
+            return [dict(item) for item in every.get('items') or [] if isinstance(item, dict)]
+        for _ in range(self.OPEN_ITEM_PAGES):
+            if offset is None:
+                return items
+            page = self._run('brief', project_id, self.actor_namespace + '/read',
+                             [str(task_id), '--json', '--items-limit', str(self.BRIEF_ITEMS),
+                              '--items-offset', str(offset)])
+            if not isinstance(page, dict) or (page.get('checkpoint') or {}).get('comment_id') != checkpoint_id:
+                return None
+            more = page.get('unresolved') or {}
+            items += [dict(item) for item in more.get('items') or [] if isinstance(item, dict)]
+            offset = more.get('next_offset')
+        return items if offset is None else None
+
+    #: The page size that holds every open item a checkpoint may have (briefing.CHECKPOINT_ITEMS_MAX).
+    OPEN_ITEMS_MAX = 100
+    #: Reads of ten that an older endpoint may cost instead (100 items, ten a page).
+    OPEN_ITEM_PAGES = 9
 
     @staticmethod
     def _recommendation(value):
@@ -1955,6 +2021,11 @@ class EndpointBackend:
                 raise uncertain('Canonical work queue returned an unexpected shape')
             for row in page.get('items') or []:
                 if not isinstance(row, dict):
+                    continue
+                if row.get('task') == '%s%s' % (project_id, MERGE_SLOT_SUFFIX):
+                    # The row bd keeps as the project's merge slot. This kit's `work` never
+                    # lists it; an older endpoint did, and a slot that lost its label would
+                    # be listed again. It is never offered here (kittrial-5bb.113 review).
                     continue
                 contribution = ({'id': row.get('contribution_id'), 'commit': row.get('commit'),
                                  'revision': None, 'at': None}
@@ -3457,7 +3528,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('PATCH', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')')
     def tasks_update(self, ctx):
         self._project(ctx, CAP_TASKS)
-        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
+        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']), write=True)
         payload = self._task_payload(ctx)
 
         def update():
@@ -3527,11 +3598,19 @@ class ApiHandler(BaseHTTPRequestHandler):
         return 200, self._task_views([row])[0]
 
     @staticmethod
-    def _refuse_record_anchor(row):
+    def _refuse_record_anchor(row, write=False):
         """A record anchor is not a task: the task, brief and history routes answer
         404 for it, never its row or raw record comments, and the task write routes
-        (PATCH, claim, checkpoints, reviews) refuse it the same way (kittrial-5bb.64)."""
+        (PATCH, claim, checkpoints, reviews) refuse it the same way (kittrial-5bb.64).
+
+        The project's merge slot is not a task either (kittrial-5bb.113). The read
+        routes answer 404 for it; a write route says what it is, so an agent that was
+        once offered it learns why the claim is refused."""
         if is_record_anchor(row):
+            raise not_found('Task not found')
+        if is_merge_slot(row):
+            if write:
+                raise conflict(merge_slot_sentence(row.get('id')))
             raise not_found('Task not found')
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/references')
@@ -3883,13 +3962,65 @@ class ApiHandler(BaseHTTPRequestHandler):
         brief['project_repository'] = self.service.project_view(ctx.principal, pid).get('repository')
         # The same note wherever the value reaches an agent: it is a label, not an instruction.
         brief['project_repository_note'] = self.service.REPOSITORY_NOTE if brief['project_repository'] else None
+        brief['checkpoint_template'] = self._checkpoint_template(brief, base, brief.pop('carry_open_items', []))
         brief['generated_at'] = now_iso(self.service._now())
         return 200, brief
+
+    #: The fields of a checkpoint that may be left out over HTTP, with what is sent for them.
+    CHECKPOINT_DEFAULTS = (('source_commit', ''), ('branch', ''), ('open_items', []), ('resolved', []))
+
+    @staticmethod
+    def _checkpoint_template(brief, base, carry=()):
+        """The checkpoint record to send for this task at this moment (kittrial-5bb.113).
+
+        An agent fills the four texts and posts ``body`` to ``send_to``. ``previous`` and
+        ``activity_cursor`` are already those of this read; they go stale when the task
+        changes, and the refusal then says to read the brief again. ``open_items`` already
+        holds every open item of the previous checkpoint exactly as recorded, source
+        included: sent as it is, the record carries them all forward.
+        """
+        import briefing
+        limits = dict(briefing.CHECKPOINT_FIELD_LIMITS)
+        current = brief.get('checkpoint') or {}
+        keys = ('id', 'kind', 'text', 'source')
+        carried = [{key: item.get(key) for key in keys} for item in carry or []]
+        template = {
+            'send_to': base + '/checkpoints', 'method': 'POST',
+            'body': {'schema_version': 1, 'previous': current.get('id'),
+                     'activity_cursor': brief.get('activity_cursor'),
+                     'intent': '', 'acceptance': '', 'summary': '', 'next_action': '',
+                     'source_commit': '', 'branch': '', 'open_items': carried, 'resolved': []},
+            'carried_open_items': len(carried),
+            'required': ['intent', 'acceptance', 'summary', 'next_action'],
+            'optional': {'source_commit': 'the commit the work is at; leave out when there is none',
+                         'branch': 'the branch; leave out when there is none',
+                         'open_items': 'what is unresolved: the ones already in body, unchanged, plus any new one; '
+                                       'leave out only when nothing is',
+                         'resolved': 'open items of the previous checkpoint that this one resolves: take the item '
+                                     'out of open_items and name its id here; leave out when none'},
+            'limits': {name: '<= %d characters' % limits[name]
+                       for name in ('intent', 'acceptance', 'summary', 'next_action', 'source_commit', 'branch')},
+            'open_item': {'id': 'a short id of your choosing', 'kind': sorted(briefing.KINDS),
+                          'text': '<= %d characters' % briefing.CHECKPOINT_TEXT_LIMIT,
+                          'source': 'where it came from, <= %d characters' % briefing.CHECKPOINT_SOURCE_LIMIT},
+            'resolved_item': {'id': 'the id of the open item', 'reason': '<= %d characters' % briefing.CHECKPOINT_TEXT_LIMIT,
+                              'evidence': '<= %d characters' % briefing.CHECKPOINT_SOURCE_LIMIT},
+            'items_max': briefing.CHECKPOINT_ITEMS_MAX,
+            'note': 'Every open item of the previous checkpoint must be carried forward unchanged or resolved. '
+                    'body.open_items already holds them all, complete with source. '
+                    'A refusal names every problem with the record at once.'}
+        if carry is None:
+            # More open items than could be read in one go, or the task changed meanwhile.
+            template['carried_open_items'] = None
+            template['note'] = ('The open items of the previous checkpoint could not all be read, so body.open_items '
+                                'is empty and this record would be refused: read the brief again. '
+                                + template['note'])
+        return template
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/claim')
     def tasks_claim(self, ctx):
         self._project(ctx, CAP_TASKS)
-        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
+        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']), write=True)
         payload = self._task_payload(ctx)
         actor = self.service.bind_actor(ctx.principal, payload.pop('actor', None))
         payload['actor'] = actor
@@ -3906,17 +4037,32 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/checkpoints')
     def checkpoints_add(self, ctx):
         self._project(ctx, CAP_CHECKPOINTS)
-        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
+        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']), write=True)
         payload = self._task_payload(ctx)
         payload.setdefault('schema_version', 1)
+        # Over HTTP these four may be left out (kittrial-5bb.113): an agent with no commit
+        # yet, or nothing unresolved, need not send empty values. The canonical record is
+        # unchanged: what is left out is sent as the empty value.
+        for name, empty in self.CHECKPOINT_DEFAULTS:
+            payload.setdefault(name, type(empty)())
         if 'actor' in payload:
             payload['actor'] = self.service.bind_actor(ctx.principal, payload.get('actor'))
 
         def add():
-            result = self.backend.invoke('checkpoints.add', ctx.principal, ctx.params['pid'],
-                                         payload, ctx.idempotency_key,
-                                         target=ctx.route_target, authorize=ctx.authorize,
-                                         capability=CAP_CHECKPOINTS)
+            try:
+                result = self.backend.invoke('checkpoints.add', ctx.principal, ctx.params['pid'],
+                                             payload, ctx.idempotency_key,
+                                             target=ctx.route_target, authorize=ctx.authorize,
+                                             capability=CAP_CHECKPOINTS)
+            except HttpError as refusal:
+                # The canonical refusal names every problem with the record. Hand them over
+                # as a list too, so an agent need not parse the sentence.
+                if refusal.status == 422 and isinstance(refusal.detail, str):
+                    import briefing
+                    said = refusal.detail[len('ValueError: '):] if refusal.detail.startswith('ValueError: ') \
+                        else refusal.detail
+                    refusal.problems = briefing.split_problems(said)
+                raise
             return result, result
         return self._mutate(ctx, 'checkpoints.add', ctx.params['pid'], add, status=201,
                             capability=CAP_CHECKPOINTS, serialize=False, canonical=True)
@@ -3930,7 +4076,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         # approve at all.
         capability = CAP_APPROVE if payload.get('operation') == 'approve' else CAP_REVIEWS
         self._project(ctx, capability)
-        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
+        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']), write=True)
         if 'actor' in payload:
             payload['actor'] = self.service.bind_actor(ctx.principal, payload.get('actor'))
         operation = payload.get('operation')
