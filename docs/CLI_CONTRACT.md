@@ -171,7 +171,8 @@ Each `items[]` entry has `task` (the **native task ID**, e.g. `kittrial-5bb.7`),
 record's comment ID**, not a Git SHA and not `latest_comment_id`), `commit`,
 `pending_review_items`, `pending_handoff_requests`, `pending_handoff_total`,
 `pending_handoff_next_offset`, `lifecycle`, `lifecycle_scope`,
-`lifecycle_matches_contribution`, `error`, and the additive `workflow_state` and
+`lifecycle_matches_contribution`, `deployed_delivery`,
+`deployed_delivery_is_current_contribution`, `deployed_live`, `error`, and the additive `workflow_state` and
 `integration` fields from the shared review-state projection. Four more additive
 fields (kittrial-5bb.114) carry what an agent's attention read needs:
 `pending_change_requests` (the ids of the request-changes records still unresolved, at
@@ -241,6 +242,36 @@ objects**:
 a bare string; treat `omitted_chars > 0` as "read `show`/`history` for the full value".
 Opaque cursor fields (`activity_cursor`, `next_cursor`) are never excerpted: they are
 complete tokens.
+
+`brief` and each `work` item also carry three additive lifecycle delivery fields
+(kittrial-5bb.107 item 7, rev2 item 6.1). `deployed_delivery` is the delivery a passed
+`deployed` fact belongs to, or `null` when the task has no trusted `deployed=passed`
+fact. It is an object with the four scope fields `release_id`, `environment`,
+`source_commit` and `integration_commit`, each a **plain string clipped to 160
+characters** - the shape the field was released with; rev1 briefly changed the values
+to excerpt objects and rev2 restores the released shape. `deployed_delivery_is_current_contribution`
+is `true` when `deployed_delivery.source_commit` equals the current contribution's
+`commit`, `false` when it does not, and `null` when either the delivery or the
+current contribution is absent. A deployed release may ship a superseded revision,
+so the two are independent of `lifecycle_matches_contribution`. `deployed_live` is
+the `live` fact recorded for the task's **current** scope: `live` (the named release
+scope is the live release for its environment), `superseded` (an explicit rollback
+or a later release the task is not in moved the environment past it; `deployed` then
+reads `unknown` and `deployed_delivery` is `null`), or `unknown` for a task written
+before liveness existed (which reads exactly as it did before). Liveness itself is
+decided **per environment** from the scope history (rev3 item 1), so a task can be
+live in production and superseded in staging; `deployed_live` reports the fact for
+the task's current scope, while release/rollback selection and `release-query`
+answer per environment.
+
+**The six lifecycle facts are read for the task's current scope (rev3 item 2).**
+`brief`, `work`, `review` and `evidence-owed` report, for each dimension, the newest
+event whose payload scope IS the task's current `lifecycle_scope`. A fact recorded
+later under an older, already-recorded scope (a verify-only `live-verified`, a
+per-environment `live=superseded`) therefore never hides the current scope's fact,
+which the previous reader got wrong. The native `dim:` label is still matched
+against the newest event of that dimension, so an unstructured or tampered event
+still reads `unknown` and its `event_id` names the event that caused it.
 
 `brief` adds an `attention` array, plus `attention_total` and `attention_more`. It
 holds at most 3 items of each kind: `reference-review` items first, then `reference`
@@ -1671,3 +1702,22 @@ request ID instead of creating a duplicate.
 Consumers should key on documented fields, tolerate additional fields, and treat any
 nonzero exit code as failure. The envelope, `work` top-level shape, `brief`
 excerpt-object fields, opaque cursors and the ID meanings above are stable for v1.
+
+
+### Release verification binding and retries
+
+Incremental `lifecycle.py release --live-verified` selection can add
+`targets[].verify_scope`, the four-field recorded scope of the currently live
+deployment. It is valid only with `live_verified=true`, without rollback, in the
+same environment, with the target's exact source/integration commits. The endpoint
+requires that scope to remain live and deployed=passed; otherwise it refuses before
+writing and requests a fresh export. The field is request-only: native scope and
+fact payloads retain their old shape. A target being restored receives live before
+verification on the first command, without a verification-only binding.
+
+An exact operation ID reconciles only a still-current assertion. Reusing a
+liveness receipt after intervening state changes fails before any writes with
+`a new operation ID is needed`. Use new IDs for new membership transitions.
+Plain CLI deploy is incremental and never automatically drops an uncarried task.
+See the exact two-step hotfix procedure and interim tracker state in
+[OPERATIONAL_WORKFLOW.md](OPERATIONAL_WORKFLOW.md).

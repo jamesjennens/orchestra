@@ -535,9 +535,11 @@ class EndpointSingleDispatchTests(_EndpointRootMixin, unittest.TestCase):
 
     def test_lifecycle_dispatches_exactly_once(self):
         calls = []
+        passed = {}
 
-        def apply(payload, actor, run):
+        def apply(payload, actor, run, **kwargs):
             calls.append(payload)
+            passed.update(kwargs)
             return {'event_id': 'e1', 'reconciled': len(calls) > 1}
 
         with mock.patch.object(endpoint, 'apply_native', apply):
@@ -545,6 +547,10 @@ class EndpointSingleDispatchTests(_EndpointRootMixin, unittest.TestCase):
                                   {'schema_version': 1, 'operation_id': 'lc1'})
         self.assertEqual(len(calls), 1)
         self.assertFalse(self.out(result)['reconciled'])
+        # The endpoint resolves the operator allowlist and the project journal for
+        # the release revert rule (kittrial-5bb.107 item 2) and passes both down.
+        self.assertEqual(set(passed), {'operators', 'journal'})
+        self.assertEqual(passed['journal'], self.root / 'projects' / 'pp')
 
     def test_coordinate_dispatches_exactly_once(self):
         import coordination

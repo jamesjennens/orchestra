@@ -479,7 +479,8 @@ def execute(root,request,authority_config=None,require_authority=False):
             return stdout
         runner=NativeRunner(run)
         def lifecycle_effect():
-            if action=='lifecycle':result=apply_native(payload,actor,runner)
+            if action=='lifecycle':result=apply_native(payload,actor,runner,
+                                                       operators=configured_operators(root),journal=path)
             elif action=='coordinate':
                 from coordination import apply_native as coordinate
                 result=coordinate(payload,actor,runner,path)
