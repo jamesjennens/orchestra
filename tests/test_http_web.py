@@ -2140,11 +2140,11 @@ class CanonicalReadCostCase(EndpointCase):
         self.assertIn('Blocked:', text)
         line = [l for l in text.splitlines() if l.startswith('- task %s ' % waiting)][0]
         self.assertNotIn('wait time unknown', line)
-        # A repeat read within the short cache walks no queue and reads no brief again
-        # (the agent cards' attention still reads its one task snapshot per request).
+        # A repeat read within the short cache walks no queue and reads no brief again.
+        # Agent attention reuses that queue, without an additional native task list.
         self.backend.calls = []
         self.request('GET', '/v1/me/work', token=alex)
-        self.assertEqual(['bd'], self.backend.calls)
+        self.assertEqual([], self.backend.calls)
 
     def test_detail_reads_are_bounded(self):
         alex, project = self.setup_project()

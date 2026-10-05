@@ -186,18 +186,24 @@ own machine and pull work over the API without SSH or shared directories.
   routes use (`Service.check_authority` with `CAP_READ`), so a project the reader can
   no longer read - the owner left it, or the grant was narrowed - is skipped rather
   than read: a stored grant is a ceiling, never a licence. Each project's tasks are
-  read **once per request** through one full snapshot (`Backend.read_tasks`), so
-  `GET /v1/agents` with N agents over P projects performs P reads, not N*P, and a
-  project of any size costs one canonical read rather than one per `MAX_PAGE` page;
-  the snapshot is chunked in memory to the same bound, so an agent's own task is
-  counted however deep it sorts by id. The page-sized cap applies
-  only to the **claimable** suggestions, and `truncated` reports that capped
-  suggestion list rather than a blind first page. `GET /v1/agents/me` returns the
+  read through one current-work snapshot per project, reused by all agents in the
+  request. The endpoint backend reads one `work` command per page of `MAX_PAGE`
+  rows, up to its queue bound; it adds no native task-list or owner-filtered read.
+  The in-process backend reads each project once. Counts include every row read;
+  claimable suggestions and final actions have separate caps. `truncated` reports
+  those caps or an incomplete queue walk. My work keeps its existing short
+  principal-specific queue cache and reuses it for agent cards; standalone agent
+  reads stay fresh. Live authority is checked before either read. `GET /v1/agents/me` returns the
   agent record; `GET /v1/agents/me/next` returns the stable JSON
   `attention`/`next_actions` contract with task/brief (task-detail) links,
   prioritised as changes-requested, blocked, in-progress, claimable task, then
   awaiting review and awaiting integration (see HTTP_DEPLOYMENT.md, "What an agent
   is told to do next").
+  Action kind names are the contract; numeric priority values are relative sorting
+  hints and may change. Other own review states still receive an action naming
+  their state and who acts next, including an operator action for malformed history.
+  A replacement contribution does not answer outstanding review items: submit
+  structured responses against the current contribution as well.
   There is no scheduler, background job, poller or timer: the owner resumes the
   agent manually and re-reads the route.
 - **Owner API.** Session routes `POST /v1/agents`, `GET /v1/agents`,
@@ -389,7 +395,7 @@ call; it does not authorize direct database access. Protected mutation rows requ
 | `PUT /v1/projects/{id}/members/{user}`, `DELETE .../members/{user}` | Owner or superuser | Assigner is current owner or superuser; only superuser may assign/remove owner role under default policy; cannot remove final active owner | Key scoped to principal + project + operation route + target; `200/204`, `403/409` | Membership add/remove and role transition |
 | `POST /v1/projects/{id}/worker-credentials`, `POST .../worker-credentials/{credential}/revoke` | Owner or superuser issues; owner of credential may revoke own | Project membership current; requested scope subset of issuer scope | Issue key scoped to principal + project + route; request hash detects payload conflicts; `201` secret once, exact uncertain retry `200` metadata only; revoke key scoped to principal + project + credential, `204`; `403/409` | Credential registry and revocation |
 | `POST /v1/agents`, `GET /v1/agents`, `GET /v1/agents/{agent}`, `PATCH /v1/agents/{agent}`, `POST /v1/agents/{agent}/disable`, `POST /v1/agents/{agent}/enable`, `POST /v1/agents/{agent}/credentials`, `POST .../credentials/{credential}/revoke` | Authenticated session; the owning user or a superuser per agent | Agent name/fields bounded; a project grant must name a project the **agent's owner** can open (a superuser may not grant a project outside the owner's membership); a disabled agent cannot receive a credential | Personal routes are session-only (an agent or worker credential gets `403`); create/issue key scoped to principal + route; `201` secret once or `200` metadata-only exact retry; `403/404/409`; `working_directory` is returned only to the owner/superuser; attention is filtered per project through `decide` with `CAP_READ` and each project is read once per request | Personal agent registry and credential records (no canonical mapping) |
-| `GET /v1/agents/me`, `GET /v1/agents/me/next` | Agent credential only | The credential is live, the agent is enabled and the owner is a current member; each granted project is re-checked with `decide` (`CAP_READ`) before its tasks are read | Read-only, no idempotency key; stable JSON attention/next-action computed at read time over one full task snapshot per project, with the page cap on the claimable suggestions only; `401/403/404` | Live registry plus one canonical full task read per project, capped by the owner's current role |
+| `GET /v1/agents/me`, `GET /v1/agents/me/next` | Agent credential only | The credential is live, the agent is enabled and the owner is a current member; each granted project is re-checked with `decide` (`CAP_READ`) before its tasks are read | Read-only, no idempotency key; attention/next-action computed from one bounded current-work snapshot per project; counts, claimable and action bounds report `truncated`; `401/403/404` | Live registry plus one canonical `work` command per page, capped by the owner's current role |
 | `GET /v1/projects/{id}/agents`, `GET /v1/projects/{id}/agents/{agent}`, `DELETE /v1/projects/{id}/agents/{agent}` | Project owner/admin (the project's `CAP_PROJECT_ADMIN`), never `agents.manage`; a non-member gets `404` and an agent/worker credential `403` | A grant may only name a project the **agent's owner** can open; the delete requires the project to be in that agent's live grant | Reads are keyless; the delete is a project mutation keyed to principal + project + route + agent and records `agents.project.revoke` in the project audit; `200`, `403/404`; the response is the narrow safe view with no `working_directory` | Live agent registry (grant narrowing); no canonical mapping |
 | `POST /v1/projects/{id}/jobs`, `PATCH /v1/projects/{id}/jobs/{job}`, `POST /v1/projects/{id}/tasks`, `PATCH /v1/projects/{id}/tasks/{task}` | Owner/contributor for create/update according to project policy; viewer denied | Membership current; update carries resource version; task parent/job must be in same project | Key scoped to principal + project + route + client operation ID; `201/200`, `403/409` | Canonical job/task create/update |
 | `GET /v1/projects/{id}/tasks`, `GET .../tasks/{task}` | Project member; viewer may read | Membership checked before query and cursor validation | Opaque cursor bound to principal/project/query; `200`, `401/403/404` | Canonical task/list/show and history views |
@@ -406,7 +412,7 @@ call; it does not authorize direct database access. Protected mutation rows requ
 | `PATCH /v1/projects/{id}` | Owner or superuser, session only | Exactly `{"repository": value}`; shape-checked, no password, at most 300 characters | Idempotent; audited as `projects.repository` without the value; `null` clears it |
 | `GET /v1/projects/{id}/members` | Project member (any role), superuser, the project's own worker credential; a non-member gets `404` | Membership checked before the read | Keyless read; cursor bound to principal/project/query; `200`, `401/404/409/422`; account `disabled`/`superuser` flags only for project administrators | Membership relation (public account fields only) |
 | `GET /v1/projects/{id}/worker-credentials` | Owner or superuser (project administration); contributors, viewers and credentials `403`, non-members `404` | Membership checked before the read | Keyless read; cursor as above; metadata only, never the secret or its hash; agent credentials are listed on the agent routes | Credential registry |
-| `GET /v1/projects/{id}/tasks/{task}/brief` | Project member; viewer may read | Membership checked before the canonical read | Keyless read; `200`, `401/404`; reading acknowledges nothing | Canonical `bd show` + `brief --json` (checkpoint, review projection, lifecycle, dependencies) |
+| `GET /v1/projects/{id}/tasks/{task}/brief` (additive: `activity_cursor`, `checkpoint_template`; see HTTP_DEPLOYMENT "What an agent needs to write a checkpoint") | Project member; viewer may read | Membership checked before the canonical read | Keyless read; `200`, `401/404`; reading acknowledges nothing | Canonical `bd show` + `brief --json` (checkpoint, review projection, lifecycle, dependencies) |
 | `GET /v1/projects/{id}/queue` | Project member; viewer may read (every row is already visible in the task list) | Membership checked before the canonical read | Keyless read; optional `state`; cursor as above; `complete: false` when the bounded canonical walk stopped early | Canonical `work` queue |
 | `GET /v1/me/work` | Browser/session principal only; credentials `403` | Walks the caller's own memberships (bounded), re-authorizing each project live; `to_review` only where the caller holds approval; `agent_prompts` (one per agent the caller owns) tailored by the caller's live capabilities per project, never containing a secret | Keyless read; `truncated` and `unavailable` report partial reads | Canonical `work` queue per project, personal agent registry |
 | `GET /v1/accounts/lookup?username=&project=` | Session principal with project administration on `project` | Exact, case-insensitive username; missing, partial and disabled accounts give one `404`; at most 20 lookups per principal per 10 minutes | Keyless read; `200` `{id, username, display_name}`, `403/404/422/429`; each authorized lookup is audited on the project with a digest of the name | Account registry |

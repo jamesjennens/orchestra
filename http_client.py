@@ -272,22 +272,45 @@ class Client:
     def add_review(self, project, task, operation, *, operation_id=None, previous=None,
                    schema_version=1, commit=None, base_commit=None, bundle_sha256=None,
                    summary=None, actor=None, key=None, repository=None, delivery=None,
-                   supersedes=None, follows=None, contribution=None, items=None, resolutions=None):
+                   supersedes=None, follows=None, contribution=None, items=None, resolutions=None,
+                   reason=None, reviewer=None, request=None, item=None, disposition=None,
+                   verdict=None):
         """Record one contribution/review operation.
 
         The canonical backend forwards exactly the fields the operation needs, so the
         caller supplies the canonical payload (``previous``/``operation_id`` and the
-        operation-specific evidence) rather than a fixed union with nulls. ``follows``
-        is the optional additive follow-on relation (mutually exclusive with
-        ``supersedes``); it must survive the HTTP hop or a follow-on silently becomes a
-        first contribution or a supersede.
+        operation-specific evidence). ``follows`` is the optional additive follow-on
+        relation (mutually exclusive with ``supersedes``); it must survive the HTTP hop
+        or a follow-on silently becomes a first contribution or a supersede.
+        ``reason``/``reviewer``/``request``/``item`` and ``disposition`` carry the
+        additive operations (withdraw, request-review, resolve-item, decline-review) and
+        the request-changes ``summary`` over HTTP (kittrial-5bb.110 item 9).
+
+        A null OPTIONAL field is not sent at all: sending ``"summary": null`` for an
+        unset request-changes summary made the canonical writer refuse every legacy
+        request-changes the kit's own client sent (kittrial-5bb.110 item 1). Only the
+        canonical required fields that are legitimately null for THIS operation are
+        kept, because their ABSENCE -- unlike their null -- is an invalid field set:
+        ``previous`` on everything but a recommendation (which carries none) and
+        ``supersedes`` on a contribution. Every other null is an absent field and is
+        dropped, so a null can never arrive on the wrong operation.
         """
         body = {'schema_version': schema_version, 'operation': operation,
                 'operation_id': operation_id, 'previous': previous, 'actor': actor,
                 'commit': commit, 'base_commit': base_commit, 'bundle_sha256': bundle_sha256,
                 'summary': summary, 'repository': repository, 'delivery': delivery,
                 'supersedes': supersedes, 'follows': follows, 'contribution': contribution,
-                'items': items, 'resolutions': resolutions}
+                'items': items, 'resolutions': resolutions, 'reason': reason,
+                'reviewer': reviewer, 'request': request, 'item': item,
+                'disposition': disposition, 'verdict': verdict}
+        kept_nullable = {'operation_id'}
+        if operation != 'recommend':
+            kept_nullable.add('previous')
+        if operation == 'contribute':
+            kept_nullable.add('supersedes')
+        for field in [name for name, value in body.items()
+                      if value is None and name not in kept_nullable]:
+            del body[field]
         return self.request('POST', '/v1/projects/%s/tasks/%s/reviews'
                             % (quote(project, safe=''), quote(task, safe='')), body, key=key)
 

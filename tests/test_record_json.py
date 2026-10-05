@@ -111,12 +111,12 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(record_json.nesting('[' * 5000), MAX + 1)
 
     def test_the_scan_is_linear_and_never_recurses(self):
-        started = time.time()
+        started = time.perf_counter()
         with self.assertRaisesRegex(ValueError, MESSAGE):
             record_json.loads('[' * 2_000_000)
         with self.assertRaisesRegex(ValueError, MESSAGE):
             record_json.loads(b'{"a":' * 300000)
-        self.assertLess(time.time() - started, 5)
+        self.assertLess(time.perf_counter() - started, 5)
 
     def test_malformed_text_of_two_megabytes_costs_a_bounded_time(self):
         # Review of 7c14f6a: with a string literal that is never closed the first scan was
@@ -135,22 +135,29 @@ class GuardTests(unittest.TestCase):
             'brackets inside closed strings': '[' + ','.join(['"[[[{{{"'] * (size // 10)) + ']',
             'an open string after many brackets': '{"a":[' * 30 + '"x' + '[{' * (size // 2),
         }
+        def cost(text):
+            started = time.perf_counter()
+            try:
+                record_json.loads(text)
+            except ValueError:
+                pass
+            return time.perf_counter() - started
+
         for label, text in shapes.items():
             with self.subTest(shape=label):
-                started = time.time()
-                try:
-                    record_json.loads(text)
-                except ValueError:
-                    pass
-                whole = time.time() - started
+                whole = cost(text)
                 self.assertLess(whole, 20, 'the scan is not linear on: ' + label)
                 # Linear, not merely under the bound: half the text takes about half the time.
-                started = time.time()
-                try:
-                    record_json.loads(text[:len(text) // 2])
-                except ValueError:
-                    pass
-                half = time.time() - started
+                # One pause of a shared runner (a collection, a stolen CPU) can inflate a
+                # single timing, so a ratio that looks wrong is measured twice more and the
+                # fastest of each is compared (kittrial-5bb.132); a quadratic scan stays
+                # quadratic however often it is timed.
+                half = cost(text[:len(text) // 2])
+                for _ in range(2):
+                    if whole < 3 * half + 0.5:
+                        break
+                    whole = min(whole, cost(text))
+                    half = min(half, cost(text[:len(text) // 2]))
                 self.assertLess(whole, 3 * half + 0.5, 'doubling the text more than tripled the time: ' + label)
 
     def test_it_is_json_loads_for_everything_else(self):
@@ -183,7 +190,7 @@ class NoUnguardedParseTests(unittest.TestCase):
         'admin.py': (28, 'bd output and files on the coordination host, in operator commands'),
         'artifacts.py': (1, 'the artifact index the kit writes'),
         'bootstrap.py': (2, 'bd output on the host'),
-        'briefing.py': (5, 'bd output and the snapshot files the kit writes'),
+        'briefing.py': (3, 'bd comment-write receipt and the snapshot files the kit writes; exports use the guard'),
         'capabilities.py': (1, "a graph.json in the caller's own checkout; it catches RecursionError itself"),
         'capability_misses.py': (1, 'the telemetry file the kit writes; any failure starts a new log'),
         'capability_records.py': (2, 'bd output'),
@@ -198,11 +205,11 @@ class NoUnguardedParseTests(unittest.TestCase):
         'http_service.py': (5, "the endpoint's answer to the service, and host configuration"),
         'keyed_entries.py': (4, 'bd output'),
         'keyed_records.py': (3, 'bd output'),
-        'lifecycle.py': (4, 'bd output'),
+        'lifecycle.py': (6, "bd output, plus the endpoint's release-query and group answers on the caller's machine (kittrial-5bb.107 rev3)"),
         'native.py': (2, 'bd output'),
         'office_service.py': (1, 'host configuration'),
         'proposal_records.py': (7, 'bd output, the host session file, and a copy of a structure the kit built'),
-        'record_json.py': (1, 'the guard itself'),
+        'record_json.py': (2, 'the guard itself and row-level parsing'),
         'reference_records.py': (2, 'bd output'),
         'project_creation.py': (1, 'the creation record the kit writes on the coordination host'),
         'review_recommendations.py': (1, 'bd output (the answer of comments add)'),
@@ -231,9 +238,19 @@ class NoUnguardedParseTests(unittest.TestCase):
     def test_the_guard_is_used_where_other_peoples_text_is_parsed(self):
         uses = {path.name: path.read_text(encoding='utf-8').count('record_json.loads(')
                 for path in KIT.glob('*.py') if path.name != 'record_json.py'}
+        # lifecycle.py is down to one guarded parse (kittrial-5bb.107 rev3): its
+        # reverted_integrations now delegates to review_state.reverts_by_task, so the
+        # raw reject-comment parse that used record_json.loads here is gone.
+        # coordination.py and one more in endpoint.py (kittrial-5bb.113 revision 2): the merge
+        # slot row as bd prints it, whose metadata a contributor could once write.
+        # reserved_comments.py (revision 3): the lines of a `dep add --file` list of edges.
         self.assertEqual({name: count for name, count in uses.items() if count}, {
-            'briefing.py': 3, 'endpoint.py': 2, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
-            'handoff.py': 1, 'http_service.py': 2, 'lifecycle.py': 2, 'recovery.py': 1, 'requirements.py': 1,
+            # admin.py reads the review-writes audit history through the guard
+            # (kittrial-5bb.110 item 3): a deeply nested audit file used to crash
+            # `review-writes status` with a RecursionError.
+            'admin.py': 1,
+            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 3, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
+            'handoff.py': 1, 'http_service.py': 2, 'lifecycle.py': 1, 'recovery.py': 1, 'requirements.py': 1, 'reserved_comments.py': 1,
             'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
 
     def test_the_parsers_that_do_not_call_it_directly_reach_it(self):

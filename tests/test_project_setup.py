@@ -544,13 +544,17 @@ class EndpointSetupTests(fixes.EndpointCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(state), encoding='utf-8')
         rows = self.request('GET', '/v1/projects/%s/tasks' % self.project, token=self.admin).data
-        self.assertIn('%s-merge-slot' % self.project, [row['id'] for row in rows['items']], rows)
+        # The slot is not in the task list at all (kittrial-5bb.113), so it cannot be counted.
+        self.assertNotIn('%s-merge-slot' % self.project, [row['id'] for row in rows['items']], rows)
         self.assertEqual(by_id(self.setup())['first-task']['state'], 'todo')
         self.assertEqual(201, self.create_task(self.admin, self.project, 'first').status)
         step = by_id(self.setup())['first-task']
         self.assertEqual((step['state'], step['detail']), ('done', '1 task(s) defined.'))
+        # One rule, the kit's: the exact id PROJECT-merge-slot (or the merge-slot type).
+        self.assertTrue(project_setup.is_merge_slot({'id': 'alpha-merge-slot', 'labels': ['gt:slot']}, 'alpha'))
         self.assertTrue(project_setup.is_merge_slot({'id': 'alpha-merge-slot', 'labels': []}, 'alpha'))
-        self.assertTrue(project_setup.is_merge_slot({'id': 'x', 'labels': ['gt:slot']}, 'alpha'))
+        self.assertFalse(project_setup.is_merge_slot({'id': 'alpha-x-merge-slot', 'labels': ['gt:slot']}, 'alpha'))
+        self.assertFalse(project_setup.is_merge_slot({'id': 'x', 'labels': ['gt:slot']}, 'alpha'))
         self.assertFalse(project_setup.is_merge_slot({'id': 'alpha-1', 'labels': ['bug']}, 'alpha'))
 
     def test_an_endpoint_without_the_action_reads_not_available_and_does_not_fail(self):

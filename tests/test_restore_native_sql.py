@@ -220,13 +220,17 @@ class NativeRestoreCase(RuntimeCase):
         make_destination(self.root, 'beta')
         pids = self.fake_client('sleep 30')
 
+        never_started = []
+
         def terminate_when_running():
-            for _ in range(200):
-                if pids.is_file():
+            for _ in range(600):
+                if pids.is_file() and pids.read_text().strip():
                     break
                 time.sleep(0.05)
             else:
-                return
+                # Stop anyway, so the test fails at once and says why, rather than waiting
+                # for the client's 30 s sleep (kittrial-5bb.132).
+                never_started.append(True)
             time.sleep(0.3)
             os.kill(os.getpid(), signal.SIGTERM)
 
@@ -238,7 +242,8 @@ class NativeRestoreCase(RuntimeCase):
                 with self.assertRaises(admin.TerminatedBySignal):
                     admin.native_restore(self.root, 'alpha', 'beta')
         finally:
-            killer.join(15)
+            killer.join(40)
+        self.assertEqual(never_started, [], 'the fake client did not start within 30 s')
         statement.assert_not_called()
         self.assert_group_stopped(pids)
         self.assertIs(signal.getsignal(signal.SIGTERM), previous)
@@ -247,7 +252,10 @@ class NativeRestoreCase(RuntimeCase):
     def test_the_explicit_ceiling_stops_the_client_group(self):
         make_destination(self.root, 'beta')
         pids = self.fake_client('sleep 30')
-        with patch.object(admin, 'RESTORE_TIMEOUT', 1), patch.object(admin, 'sql') as statement:
+        # 5 s, not 1: the fake client must fork and record its pids before the ceiling, which
+        # a loaded runner can take more than a second to do (kittrial-5bb.132). Its child
+        # sleeps 30 s, so the ceiling is still what stops it.
+        with patch.object(admin, 'RESTORE_TIMEOUT', 5), patch.object(admin, 'sql') as statement:
             with self.assertRaises(subprocess.TimeoutExpired):
                 admin.native_restore(self.root, 'alpha', 'beta')
         statement.assert_not_called()

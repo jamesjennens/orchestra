@@ -63,6 +63,7 @@ import record_json
 import re
 from pathlib import Path
 import recovery
+from coordination import is_merge_slot, merge_slot_sentence
 from field_limits import check_text, describe
 from requirements import canonical_bytes, content_hash
 
@@ -107,12 +108,14 @@ MAX_OPEN_REVIEW_REQUESTS = 10
 REVIEWER = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}')
 #: Plain text for a field another worker reads (the rule ``guidance`` applies):
 #: no C0 control characters other than tab/newline/carriage return and no DEL, no
-#: C1 controls, bidi controls, word joiners, BOM or Unicode tag characters, and a
+#: C1 controls, bidi controls, word joiners, BOM, Unicode tag characters or
+#: variation selectors (U+E0100-U+E01EF, as guidance refuses), and a
 #: ZWNJ/ZWJ only between letters. Applied on the WRITE path, so a record written
 #: before the rule existed still reads.
 PLAIN_CONTROL = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 PLAIN_INVISIBLE = re.compile('[\u0080-\u009f\u00ad\u200b\u200e\u200f\u2028\u2029\u202a-\u202e'
-                             '\u2060-\u2064\u2066-\u2069\ufeff\U000E0000-\U000E007F]')
+                             '\u2060-\u2064\u2066-\u2069\ufeff\U000E0000-\U000E007F'
+                             '\U000E0100-\U000E01EF]')
 PLAIN_JOINER = re.compile('[\u200c\u200d]')
 #: Item severity on a request-changes item. Absent means ``blocking`` so every
 #: record written before severity existed keeps blocking approval.
@@ -121,6 +124,12 @@ SEVERITIES = ('blocking', 'note')
 WITHDRAW_DISPOSITIONS = ('withdrawn', 'superseded')
 #: How the requester disposes of their own item: resolve it, or leave it as a note.
 RESOLVE_DISPOSITIONS = ('resolved', 'note')
+#: What a resolve-item record with NO disposition means. An older kit could store an
+#: explicit null, and that record still reads: it is the operation's default, which
+#: RESOLVES the item. Named so the default is one greppable token rather than an inline
+#: literal (kittrial-5bb.110 item 3 P3: a mutation that read a stored null as anything
+#: else survived).
+RESOLVE_DEFAULT = 'resolved'
 # Optional additive field on an ``approve`` record: the task assignee at the moment
 # the approval was written. Stamped server-side by ``execute``; approve records
 # written before this field existed keep validating without it, and a null value is
@@ -212,7 +221,8 @@ def plain_text(value, name):
     if PLAIN_CONTROL.search(value):
         raise ValueError(f'{name} must be plain text (no control characters)')
     if PLAIN_INVISIBLE.search(value):
-        raise ValueError(f'{name} must be plain text (no bidi, zero-width, C1 or tag characters)')
+        raise ValueError(f'{name} must be plain text (no bidi, zero-width, C1, tag or '
+                         'variation-selector characters)')
     for match in PLAIN_JOINER.finditer(value):
         before = value[match.start() - 1] if match.start() else ''
         after = value[match.end()] if match.end() < len(value) else ''
@@ -244,6 +254,49 @@ def check_plain_text(payload):
                         plain_text(item[key], 'resolution ' + key)
 
 
+def check_write_fields(payload):
+    """Refuse an explicitly null OPTIONAL field on the WRITE path (kittrial-5bb.110 item 2).
+
+    ``validate`` stays tolerant so a record an older kit stored with ``"disposition":
+    null`` still validates and reads (``projection`` reads it as the operation default,
+    never ``None``). The canonical WRITER refuses a NEW one: null is not a disposition,
+    and storing it made ``review_state`` read None and a second withdraw raise a
+    ``TypeError``. The HTTP service also treats a null optional field as absent and does
+    not forward it, so this refusal only catches a raw payload (``review --file`` with an
+    explicit null) before any native write.
+    """
+    op = payload.get('operation')
+    if op not in ('withdraw', 'resolve-item') or 'disposition' not in payload:
+        return
+    if payload['disposition'] is None:
+        allowed = WITHDRAW_DISPOSITIONS if op == 'withdraw' else RESOLVE_DISPOSITIONS
+        raise ValueError('%s disposition must be %s or absent, not null'
+                         % (op, ' or '.join(allowed)))
+
+
+def new_write_field(payload):
+    """The operation or FIELD a validated payload writes that is new in kittrial-5bb.94.
+
+    Returns ``None`` for a legacy shape. A new operation names the operation; a
+    request-changes carrying the additive ``summary`` or an item ``severity`` names
+    that FIELD, so the switch-off refusal points at the field (item 7) instead of
+    only saying ``operation/field request-changes``. Both are named when both are set.
+    """
+    op = payload.get('operation')
+    if op in NEW_WRITE_OPERATIONS:
+        return 'operation ' + str(op)
+    if op == 'request-changes':
+        named = []
+        if 'summary' in payload:
+            named.append('summary')
+        if any(isinstance(item, dict) and item.get('severity') is not None
+               for item in payload.get('items') or []):
+            named.append('item severity')
+        if named:
+            return 'request-changes ' + ' and '.join(named)
+    return None
+
+
 def new_write_requested(payload):
     """Whether a validated payload writes a new-shaped record (item 3).
 
@@ -252,19 +305,12 @@ def new_write_requested(payload):
     are additive fields. A legacy ``{id, text}`` request-changes item is an OLD
     shape and is not gated.
     """
-    if payload.get('operation') in NEW_WRITE_OPERATIONS:
-        return True
-    if payload.get('operation') == 'request-changes':
-        if 'summary' in payload:
-            return True
-        return any(isinstance(item, dict) and item.get('severity') is not None
-                   for item in payload.get('items') or [])
-    return False
+    return new_write_field(payload) is not None
 
 
 def new_write_refusal(payload):
     """The refusal text for a new-shaped write on an installation with the switch off."""
-    return ('Review workflow operation/field ' + str(payload.get('operation')) +
+    return ('Review workflow ' + (new_write_field(payload) or str(payload.get('operation'))) +
             ' writes a new record shape that a kit built before kittrial-5bb.94 cannot read. '
             'This installation has review_workflow_writes off (the default); the readers here '
             'understand the new operations and fields already, so this is a write switch, not a '
@@ -404,6 +450,10 @@ def validate(p, task):
             limited(p['reason'], 'decline reason')
         elif op == 'withdraw':
             limited(p['reason'], 'withdraw reason')
+            # The READ path stays tolerant: a record an older kit stored with an
+            # explicit null disposition still validates here and reads as the default
+            # (see `projection`). The WRITE path refuses it (`check_write_fields`), so a
+            # new null can never be stored (kittrial-5bb.110 item 2).
             if p.get('disposition') is not None and p['disposition'] not in WITHDRAW_DISPOSITIONS:
                 raise ValueError('withdraw disposition must be withdrawn or superseded')
         elif op == 'resolve-item':
@@ -1354,7 +1404,13 @@ def projection(ordered, voids=None, invalid=None, refused=None, positions=None, 
                     raise ValueError('Resolution must reference an unresolved request/item')
                 if author_key(c['author']) != author_key(entry['author']):
                     raise ValueError('Only the requester may resolve their own review item')
-                if p.get('disposition', 'resolved') == 'note':
+                disposition = p.get('disposition')
+                if disposition is None:
+                    # A stored null is the operation's DEFAULT (RESOLVE_DEFAULT), never a
+                    # downgrade to a note and never the item's own severity: such a record
+                    # RESOLVES the item for a blocking item and for a note item alike.
+                    disposition = RESOLVE_DEFAULT
+                if disposition == 'note':
                     pending.pop(key, None)
                     notes[key] = dict(entry, severity='note')
                 else:
@@ -1386,7 +1442,11 @@ def projection(ordered, voids=None, invalid=None, refused=None, positions=None, 
                     # one is warned about below.
                     ignored_withdrawals.append(cid)
                 else:
-                    withdrawal = dict(request=cid, disposition=p.get('disposition', 'withdrawn'),
+                    # A stored record an older kit wrote with an explicit null
+                    # disposition reads as the operation default, never as None: the
+                    # state, `review`, `brief` and `work` all show `withdrawn`
+                    # (kittrial-5bb.110 item 2).
+                    withdrawal = dict(request=cid, disposition=p.get('disposition') or 'withdrawn',
                                       reason=p['reason'], contribution=current, author=c['author'],
                                       timestamp=c['created_at'])
                     # A withdraw closes the contribution's review requests, exactly
@@ -1635,7 +1695,7 @@ def open_review_requests_by(rows, actor, operators=None, journal=None):
     """
     total = 0
     for row in rows or []:
-        if not isinstance(row, dict) or row.get('issue_type') in ('event', 'gate', 'merge-slot'):
+        if not isinstance(row, dict) or row.get('issue_type') in ('event', 'gate') or is_merge_slot(row):
             continue
         if not any(isinstance(c, dict) and isinstance(c.get('text'), str) and c['text'].startswith(PREFIX)
                    for c in row.get('comments') or []):
@@ -1662,6 +1722,9 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
     ``deployment.private.json``; the default is OFF). The readers understand the
     new operations and fields either way - see the module docstring.
     """
+    for row in rows or []:
+        if isinstance(row, dict) and row.get('id') == task and is_merge_slot(row):
+            raise ValueError(merge_slot_sentence(task) + '; it takes no review record')
     if isinstance(payload, dict) and payload.get('operation') == recovery.OPERATION:
         raise ValueError('Operator void records are not accepted over the contributor review transport; '
                          'an operator must use admin.py void-record on the coordination host')
@@ -1669,6 +1732,9 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
         raise ValueError('Integration revert records are not accepted over the contributor review '
                          'transport; an operator must use admin.py revert-record on the coordination host')
     validate(payload, task); text(actor, 'actor', 300)
+    # A null optional disposition is refused on the WRITE path before anything else, so
+    # the writer never stores the shape `validate` must keep reading (item 2).
+    check_write_fields(payload)
     matches = [r for r in rows if r.get('id') == task]
     if len(matches) != 1 or matches[0].get('issue_type') == 'event':
         raise ValueError('Task missing, duplicated or is an event')

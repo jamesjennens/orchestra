@@ -34,6 +34,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import agent_prompts
 import project_setup
+from coordination import MERGE_SLOT_SUFFIX, is_merge_slot, merge_slot_sentence
 from reserved_comments import (ANCHOR_READ_IDS_MAX, carries_record_label, hide_records,
                                is_record_anchor)
 from http_auth import (AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CAP_APPROVE,
@@ -901,12 +902,16 @@ class InProcessBackend:
                           'summary': last['summary'], 'next_action': last.get('next_action'),
                           'open_items': [{'id': item.get('id'),
                                           'kind': item.get('kind') or 'item',
-                                          'text': item.get('text')}
+                                          'text': item.get('text'), 'source': item.get('source')}
                                          for item in last.get('open_items') or []]}
         return {'task': dict(task), 'checkpoint': checkpoint, 'review': self._review_view(task),
+                'carry_open_items': [dict(item) for item in checkpoints[-1].get('open_items') or []
+                                     if isinstance(item, dict)] if checkpoints else [],
                 # The disposable backend records no lifecycle evidence, so every fact is
                 # honestly unknown rather than inferred from the review state.
-                'lifecycle': {}, 'depends_on': []}
+                'lifecycle': {}, 'depends_on': [],
+                # This backend keeps no activity cursor; its checkpoints need none.
+                'activity_cursor': None}
 
     #: The disposable backend is cheap to read and tests expect fresh reads.
     READ_CACHE_SECONDS = 0
@@ -928,26 +933,47 @@ class InProcessBackend:
         and whether a review record is newer than it. A closed task stays listed only
         while its review is still active, as in ``work``.
         """
-        checkpoints = self.state.get('checkpoints') or {}
+        if queue is not None:
+            return own_queue_tasks(queue, actor)
         rows = []
         for task in self._project_rows(project_id):
             if not task.get('assignee') or (actor is not None and task.get('assignee') != actor):
                 continue
             review = self._review_view(task)
-            if task.get('status') == 'closed' and review['state'] not in ACTIVE_REVIEW_STATES:
+            if task.get('status') == 'closed' and review['state'] not in ('changes-requested', 'error',
+                                                                       'awaiting-integration', 'approved'):
                 continue
-            saved = checkpoints.get(task['id'])
-            last = saved[-1] if isinstance(saved, list) and saved and isinstance(saved[-1], dict) else None
-            checkpoint_at = last.get('created_at') if last else None
             rows.append({'id': task['id'], 'title': task.get('title'), 'status': task.get('status'),
                          'assignee': task.get('assignee'), 'review_state': review['state'],
                          'contribution_id': (review['contribution'] or {}).get('id'),
-                         'pending_change_requests': [r['id'] for r in review['requests'] if r['status'] == 'open'],
-                         'open_items': len(last.get('open_items') or []) if last else 0,
-                         'checkpoint_at': checkpoint_at,
-                         'newer_activity': (bool(checkpoint_at and review['latest_at']
-                                                 and review['latest_at'] > checkpoint_at) if last else None)})
+                         **self._agent_fields(task, review)})
         return {'tasks': rows, 'complete': True}
+
+    def _agent_fields(self, task, review):
+        saved=(self.state.get('checkpoints') or {}).get(task['id'])
+        last=saved[-1] if isinstance(saved,list) and saved and isinstance(saved[-1],dict) else None
+        unreadable=saved is not None and (not isinstance(saved,list) or
+                   (bool(saved) and (last is None or not isinstance(last.get('open_items'),list))))
+        at=last.get('created_at') if last and not unreadable else None
+        return {'pending_change_requests':[r['id'] for r in review['requests'] if r['status']=='open'][:20],
+                'open_items':None if unreadable else (len(last.get('open_items') or []) if last else 0),
+                'checkpoint_at':at,
+                'newer_activity':self._other_agent_activity(task,last) if last and not unreadable else None}
+
+    def _other_agent_activity(self, task, checkpoint):
+        events=[e for e in self.state.get('events') or [] if e.get('task')==task['id']]
+        # Real writes have an ordered checkpoint event. Do not count that event
+        # itself, even when an owner wrote the checkpoint for the assignee.
+        anchors=[i for i,e in enumerate(events) if e.get('action')=='checkpoint-added'
+                 and e.get('actor')==checkpoint.get('actor')
+                 and e.get('time','')>=checkpoint.get('created_at','')]
+        if anchors:
+            return any(e.get('actor')!=task.get('assignee') for e in events[anchors[-1]+1:])
+        # Older or directly imported in-process checkpoints have no event anchor.
+        # Only attributed review records can establish external activity there.
+        at=checkpoint.get('created_at')
+        return bool(at and any(r.get('created_at','')>at and r.get('actor')!=task.get('assignee')
+                               for r in self.state.get('contributions',{}).get(task['id'],[])))
 
     def review_queue(self, project_id):
         """Every task with current work, highest-attention review states first.
@@ -958,13 +984,15 @@ class InProcessBackend:
         items = []
         for task in self.read_tasks(project_id)['items']:
             review = self._review_view(task)
-            if task.get('status') == 'closed' and review['state'] not in ACTIVE_REVIEW_STATES:
+            if task.get('status') == 'closed' and review['state'] not in ('changes-requested', 'error',
+                                                                       'awaiting-integration', 'approved'):
                 continue
             items.append(queue_item(
                 project_id, task, review['state'], review['contribution'],
                 review['open_requests'],
                 pending_request_ids=[r['id'] for r in review['requests'] if r['status'] == 'open'],
                 waiting_since=review['latest_at'],
+                attention=self._agent_fields(task, review),
                 recommended_by=[r['author'] for r in review['recommendations']]))
         items.sort(key=queue_order)
         return {'items': items, 'complete': True, 'warnings': []}
@@ -972,10 +1000,49 @@ class InProcessBackend:
 
 #: Review states that still need someone to act (``work.queue`` keeps these even on a
 #: closed task). ``approved`` is the in-process name for ``awaiting-integration``.
+#: ``withdrawn``/``superseded`` are additive (kittrial-5bb.94): the canonical ``work``
+#: queue lists such a task while a blocking item is still open, so the HTTP queue and
+#: its ``state=`` filter accept them too or the two transports disagree
+#: (kittrial-5bb.110 item 9).
 ACTIVE_REVIEW_STATES = ('changes-requested', 'error', 'awaiting-review', 'legacy-review-ready',
-                        'awaiting-integration', 'approved')
+                        'awaiting-integration', 'approved', 'withdrawn', 'superseded')
 QUEUE_PRIORITY = {'changes-requested': 0, 'error': 1, 'awaiting-review': 2,
                   'legacy-review-ready': 2, 'awaiting-integration': 3, 'approved': 3}
+
+#: Review-payload fields the HTTP route accepts beyond the canonical per-operation
+#: set. ``task_id`` is filled from the path and ``actor`` is bound to the
+#: authenticated principal; ``contribution_revision``/``contribution_commit`` are the
+#: web page's presentation copies of the revision the reviewer saw. A contribution may
+#: also carry the two legacy in-process delivery fields ``bundle_sha256``/``branch``.
+#: Anything else -- an unknown key, or a canonical field on the WRONG operation (a
+#: top-level ``severity``, a ``disposition`` on a request-changes) -- is refused
+#: instead of silently dropped (kittrial-5bb.110 item 4: those used to be dropped and
+#: answered 201).
+REVIEW_HTTP_FIELDS = frozenset({'task_id', 'actor', 'contribution_revision',
+                                'contribution_commit'})
+REVIEW_HTTP_OPERATION_FIELDS = {'contribute': frozenset({'bundle_sha256', 'branch'})}
+#: How many unsupported field names one refusal reports, and how long each may be. The
+#: refusal used to echo every name in full: a 300-character key came back whole, and 400
+#: unknown keys produced a 2,429-character error (kittrial-5bb.110 item 4).
+UNSUPPORTED_FIELDS_SHOWN = 5
+#: A field name is echoed only when it is a plain identifier. Anything else (control
+#: characters, punctuation, a name built to read as a sentence in the error) is not
+#: repeated to the caller.
+UNSUPPORTED_FIELD_NAME = re.compile(r'[A-Za-z_][A-Za-z0-9_]{0,39}\Z')
+
+
+def unsupported_fields_text(keys):
+    """A bounded, non-echoing list of the caller's unsupported review field names.
+
+    At most ``UNSUPPORTED_FIELDS_SHOWN`` names, each echoed only when it is a plain
+    identifier, with ``(+N more)`` for the rest (kittrial-5bb.110 item 4 P3).
+    """
+    names = sorted(str(key) for key in keys)
+    shown = [name if UNSUPPORTED_FIELD_NAME.match(name) else '<non-identifier name>'
+             for name in names[:UNSUPPORTED_FIELDS_SHOWN]]
+    if len(names) > UNSUPPORTED_FIELDS_SHOWN:
+        shown.append('(+%d more)' % (len(names) - UNSUPPORTED_FIELDS_SHOWN))
+    return ', '.join(shown)
 
 
 def queue_order(item):
@@ -1017,6 +1084,22 @@ def queue_item(project_id, task, review_state, contribution, open_requests,
             # contribution while nobody has decided. Never an approval.
             'recommended': bool(recommended_by),
             'recommended_by': list(recommended_by or [])}
+
+
+def own_queue_tasks(queue, actor=None):
+    """Split one current review snapshot by assignee, retaining unknown checkpoint state."""
+    tasks=[]
+    for row in queue.get('items') or []:
+        if not isinstance(row,dict) or not row.get('assignee') or (actor is not None and row['assignee']!=actor):
+            continue
+        fields=row.get('attention') if isinstance(row.get('attention'),dict) else {}
+        tasks.append({'id':row.get('id'),'title':row.get('title'),'status':row.get('status'),
+                      'assignee':row.get('assignee'),'review_state':row.get('review_state'),
+                      'contribution_id':(row.get('contribution') or {}).get('id'),
+                      'pending_change_requests':list(fields.get('pending_change_requests') or [])[:20],
+                      'open_items':fields.get('open_items',0),'checkpoint_at':fields.get('checkpoint_at'),
+                      'newer_activity':fields.get('newer_activity')})
+    return {'tasks':tasks,'complete':bool(queue.get('complete'))}
 
 
 class EndpointBackend:
@@ -1172,10 +1255,15 @@ class EndpointBackend:
         reply = self._endpoint(action, project, actor, args, attachments,
                                operation_id=operation_id, authority=authority,
                                require_authority=require_authority, route=route)
-        return self._checked(reply)
+        return self._checked(reply, action)
 
-    @staticmethod
-    def _checked(reply):
+    #: How much of a canonical refusal's last line is handed on. A checkpoint refusal lists
+    #: every problem with the record (kittrial-5bb.113), so it gets room for all of them.
+    DETAIL_LIMIT = 200
+    DETAIL_LIMITS = {'checkpoint': 6000}
+
+    @classmethod
+    def _checked(cls, reply, action=None):
         """The payload of one canonical reply, or the HttpError its return code means."""
         code = reply.get('returncode') if isinstance(reply, dict) else None
         stderr = (reply.get('stderr') or '') if isinstance(reply, dict) else ''
@@ -1190,7 +1278,8 @@ class EndpointBackend:
         if code == 124:
             raise uncertain('Canonical command timed out; outcome may be unknown')
         if code:
-            detail = stderr.strip().splitlines()[-1][:200] if stderr.strip() else None
+            limit = cls.DETAIL_LIMITS.get(action, cls.DETAIL_LIMIT)
+            detail = stderr.strip().splitlines()[-1][:limit] if stderr.strip() else None
             if code == 2:
                 raise invalid('Canonical command rejected the request', detail)
             raise uncertain('Canonical command failed; outcome may be unknown')
@@ -1262,15 +1351,29 @@ class EndpointBackend:
         # A reviewer's recommendation (kittrial-5bb.115): a record beside the chain, so
         # it carries no `previous` (see REVIEW_NO_PREVIOUS).
         'recommend': ('contribution', 'commit', 'verdict', 'summary', 'items'),
+        # The additive review-workflow operations (kittrial-5bb.94, checked over HTTP by
+        # kittrial-5bb.110 item 9). Without these the canonical backend refused every
+        # one of them as an unknown operation, so the new states could not be reached
+        # over HTTP at all.
+        'withdraw': ('contribution', 'reason'),
+        'request-review': ('contribution', 'reviewer'),
+        'resolve-item': ('contribution', 'request', 'item', 'reason'),
+        'decline-review': ('contribution', 'request', 'reason'),
     }
     #: Operations whose canonical record takes no ``previous``.
     REVIEW_NO_PREVIOUS = ('recommend',)
     #: Optional canonical review fields: forwarded only when the caller supplied them,
     #: so old payloads keep the exact legacy field set (no operation-inappropriate
     #: nulls) and a follow-on's additive ``follows`` relation is not silently dropped
-    #: into a first contribution or a supersede.
+    #: into a first contribution or a supersede. The request-changes summary, a
+    #: request-review summary and the withdrawn/resolve dispositions are the same kind
+    #: of additive field (kittrial-5bb.94 items 3 and 5).
     REVIEW_OPTIONAL_FIELDS = {
         'contribute': ('follows',),
+        'request-changes': ('summary',),
+        'request-review': ('summary',),
+        'withdraw': ('disposition',),
+        'resolve-item': ('disposition',),
     }
     CHECKPOINT_FIELDS = ('schema_version', 'previous', 'activity_cursor', 'source_commit',
                          'branch', 'intent', 'acceptance', 'summary', 'next_action',
@@ -1327,23 +1430,29 @@ class EndpointBackend:
                     ['update', str(task_id), '--status', 'in_progress', '--assignee',
                      str(actor), '--json'], {})
         if route == 'checkpoints.add':
-            missing = [field for field in self.CHECKPOINT_FIELDS if field not in payload]
-            if missing:
-                raise invalid('Canonical checkpoint payload is missing fields: %s'
-                              % ', '.join(missing))
-            body = {field: payload.get(field) for field in self.CHECKPOINT_FIELDS}
+            # A field left out is sent as left out: the canonical validator names it with
+            # every other problem of the record, where refusing it here hid the rest
+            # (kittrial-5bb.113 review).
+            body = {field: payload[field] for field in self.CHECKPOINT_FIELDS if field in payload}
             body['schema_version'] = payload.get('schema_version', 1)
             body['task'] = task_id
             return ('checkpoint', project_id, [str(task_id), '@attachment:0'],
                     {'0': {'flag': '--file', 'text': json.dumps(body)}})
         if route == 'reviews.add':
             operation = payload.get('operation')
-            if operation not in self.REVIEW_FIELDS:
-                raise invalid('Review operation must be contribute, request-changes, '
-                              'respond, approve or recommend')
+            # A fixed sentence, never the caller's value: `%r` of a 5,000-character
+            # operation came back in a 5,204-character error (kittrial-5bb.110 item 4).
+            # An operation sent as a list or object used to raise TypeError (an
+            # unhashable dict key) and answer 500; the str check makes it this 422.
+            if not isinstance(operation, str) or operation not in self.REVIEW_FIELDS:
+                raise invalid('Unsupported review operation; expected one of: %s'
+                              % ', '.join(sorted(self.REVIEW_FIELDS)))
             common = tuple(field for field in self.REVIEW_COMMON
                            if not (field == 'previous' and operation in self.REVIEW_NO_PREVIOUS))
-            if operation == 'recommend' and 'items' not in payload:
+            if operation == 'recommend' and payload.get('items') is None:
+                # A NULL items is absent, exactly like every other null optional field the
+                # released clients send (kittrial-5bb.110 items 1 and 2): a recommendation
+                # with no notes is the empty list the canonical record requires.
                 payload = dict(payload, items=[])
             fields = common + self.REVIEW_FIELDS[operation]
             missing = [field for field in fields
@@ -1354,7 +1463,12 @@ class EndpointBackend:
                               % ', '.join(missing))
             body = {field: payload.get(field) for field in fields}
             for field in self.REVIEW_OPTIONAL_FIELDS.get(operation, ()):
-                if field in payload:
+                # A null optional field is ABSENT, not a value: the kit's own client used
+                # to send every optional field as null, and forwarding `"summary": null`
+                # made the canonical writer refuse a legacy request-changes
+                # (kittrial-5bb.110 item 1). The canonical required fields (built above)
+                # keep their null, because their ABSENCE is an invalid field set.
+                if payload.get(field) is not None:
                     body[field] = payload.get(field)
             body['schema_version'] = payload.get('schema_version', 1)
             body['operation_id'] = payload.get('operation_id') or operation_id
@@ -1452,6 +1566,9 @@ class EndpointBackend:
         # (kittrial-5bb.64; the shared hidden-surface list).
         rows = hide_records(self._without_record_anchors(project_id,
                                                          self._in_project(rows, project_id)))
+        # The project's merge slot is an internal record too (kittrial-5bb.113): on real
+        # bd it is a row of type task, and was offered to agents as claimable work.
+        rows = [row for row in rows if not is_merge_slot(row)]
         return {'items': rows, 'total': len(rows)}
 
     def _without_record_anchors(self, project_id, rows):
@@ -1616,16 +1733,18 @@ class EndpointBackend:
         if not isinstance(data, dict):
             raise uncertain('Canonical brief returned an unexpected shape')
         checkpoint = None
+        carry = []
         if data.get('checkpoint'):
             point = data['checkpoint']
             unresolved = data.get('unresolved') or {}
+            carry = self._open_items_in_full(project_id, task_id, point.get('comment_id'), unresolved)
             checkpoint = {'id': point.get('comment_id'), 'at': point.get('timestamp'),
                           'author': point.get('author'), 'summary': data.get('current_position'),
                           'next_action': data.get('next_action'),
                           'branch': point.get('branch'), 'source_commit': point.get('source_commit'),
                           'newer_activity': point.get('newer_activity'),
                           'open_items': [{'id': item.get('id'), 'kind': item.get('kind'),
-                                          'text': item.get('text')}
+                                          'text': item.get('text'), 'source': item.get('source')}
                                          for item in unresolved.get('items') or []
                                          if isinstance(item, dict)],
                           'open_items_total': unresolved.get('total')}
@@ -1645,17 +1764,58 @@ class EndpointBackend:
         requests = [{'id': item.get('item'), 'request': item.get('request'),
                      'text': item.get('text'), 'contribution': item.get('contribution'),
                      'author': item.get('author'), 'at': item.get('timestamp'),
-                     'status': 'open', 'resolution': None}
+                     'status': 'open', 'resolution': None,
+                     # Additive (kittrial-5bb.94, exposed over HTTP by kittrial-5bb.110
+                     # item 9): the item's severity and the request-changes summary that
+                     # asked for it. Absent severity reads as blocking.
+                     'severity': item.get('severity') or 'blocking',
+                     'summary': item.get('summary')}
                     for item in review.get('pending_requests') or [] if isinstance(item, dict)]
+
+        def note_view(item):
+            return {'id': item.get('item'), 'request': item.get('request'),
+                    'text': item.get('text'), 'contribution': item.get('contribution'),
+                    'author': item.get('author'), 'at': item.get('timestamp'),
+                    'status': 'open', 'severity': item.get('severity') or 'note',
+                    'summary': item.get('summary')}
+
+        def request_view(entry):
+            return {'request': entry.get('request'), 'reviewer': entry.get('reviewer'),
+                    'summary': entry.get('summary'), 'contribution': entry.get('contribution'),
+                    'author': entry.get('author'), 'at': entry.get('timestamp')}
+
+        # The additive review-workflow states (kittrial-5bb.94): non-blocking items,
+        # open first-class review requests, the requests their named reviewer declined
+        # and the withdraw/supersede record for the current contribution.
+        note_requests = [note_view(item) for item in review.get('note_requests') or []
+                         if isinstance(item, dict)]
+        pending_review_requests = [request_view(entry)
+                                   for entry in review.get('pending_review_requests') or []
+                                   if isinstance(entry, dict)]
+        declined_review_requests = [dict(request_view(entry), reason=entry.get('reason'))
+                                    for entry in review.get('declined_review_requests') or []
+                                    if isinstance(entry, dict)]
+        raw_withdrawal = review.get('withdrawal')
+        withdrawal = ({'disposition': raw_withdrawal.get('disposition'),
+                       'reason': raw_withdrawal.get('reason'),
+                       'author': raw_withdrawal.get('author'),
+                       'at': raw_withdrawal.get('timestamp')}
+                      if isinstance(raw_withdrawal, dict) else None)
         lifecycle = {dimension: {'value': fact.get('value'), 'note': None}
                      for dimension, fact in (data.get('lifecycle') or {}).items()
                      if isinstance(fact, dict)}
         dependencies = (data.get('dependencies') or {}).get('items') or []
-        return {'task': task, 'checkpoint': checkpoint,
+        return {'task': task, 'checkpoint': checkpoint, 'carry_open_items': carry,
                 'review': {'state': review.get('review_state') or 'none',
                            'contribution': contribution, 'requests': requests,
                            'open_requests': review.get('pending_total', len(requests)),
                            'latest_id': review.get('latest_comment_id'),
+                           # Additive (kittrial-5bb.94): the new states travel with every
+                           # brief read, exactly as `review TASK` reports them.
+                           'note_requests': note_requests,
+                           'pending_review_requests': pending_review_requests,
+                           'declined_review_requests': declined_review_requests,
+                           'withdrawal': withdrawal,
                            # Additive (kittrial-5bb.115): the standing recommendation.
                            'recommendation': self._recommendation(review.get('recommendation')),
                            'recommendations': [{'id': entry.get('comment_id'), 'author': entry.get('author'),
@@ -1672,7 +1832,58 @@ class EndpointBackend:
                 'depends_on': [{'id': d.get('depends_on_id'), 'title': d.get('depends_on_id'),
                                 'status': 'unknown', 'type': d.get('type')}
                                for d in dependencies if isinstance(d, dict)],
+                # What a checkpoint must carry to say which activity it has seen. It is in
+                # the canonical brief; without it here an agent could not write a first
+                # checkpoint from the brief alone (kittrial-5bb.113).
+                'activity_cursor': data.get('activity_cursor'),
                 'warnings': data.get('warnings') or []}
+
+    def _open_items_in_full(self, project_id, task_id, checkpoint_id, unresolved):
+        """Every open item of the current checkpoint, as recorded, or None when they could not all be read.
+
+        The next checkpoint must carry each one forward unchanged, ``source`` included, so
+        the checkpoint template needs all of them (kittrial-5bb.113 review). The task page
+        shows the first ten. A task with more costs ONE further ``brief`` read that asks for
+        all of them (a checkpoint holds at most 100). An endpoint older than that page size
+        refuses it, and the items are then read ten at a time, at most ``OPEN_ITEM_PAGES``
+        reads. A checkpoint written between two reads makes the list unusable, and the
+        template then says to read again.
+        """
+        items = [dict(item) for item in unresolved.get('items') or [] if isinstance(item, dict)]
+        offset = unresolved.get('next_offset')
+        if offset is None:
+            return items
+        try:
+            whole = self._run('brief', project_id, self.actor_namespace + '/read',
+                              [str(task_id), '--json', '--items-limit', str(self.OPEN_ITEMS_MAX), '--items-offset', '0'])
+        except HttpError as refusal:
+            if refusal.status != 422:
+                raise
+            whole = None
+        if whole is not None:
+            if not isinstance(whole, dict) or (whole.get('checkpoint') or {}).get('comment_id') != checkpoint_id:
+                return None
+            every = whole.get('unresolved') or {}
+            if every.get('next_offset') is not None:
+                return None
+            return [dict(item) for item in every.get('items') or [] if isinstance(item, dict)]
+        for _ in range(self.OPEN_ITEM_PAGES):
+            if offset is None:
+                return items
+            page = self._run('brief', project_id, self.actor_namespace + '/read',
+                             [str(task_id), '--json', '--items-limit', str(self.BRIEF_ITEMS),
+                              '--items-offset', str(offset)])
+            if not isinstance(page, dict) or (page.get('checkpoint') or {}).get('comment_id') != checkpoint_id:
+                return None
+            more = page.get('unresolved') or {}
+            items += [dict(item) for item in more.get('items') or [] if isinstance(item, dict)]
+            offset = more.get('next_offset')
+        return items if offset is None else None
+
+    #: The page size that holds every open item a checkpoint may have (briefing.CHECKPOINT_ITEMS_MAX).
+    OPEN_ITEMS_MAX = 100
+    #: Reads of ten that an older endpoint may cost instead (100 items, ten a page).
+    OPEN_ITEM_PAGES = 9
 
     @staticmethod
     def _recommendation(value):
@@ -1788,10 +1999,10 @@ class EndpointBackend:
     @staticmethod
     def _attention_fields(row):
         """The four attention fields of one canonical ``work`` row, type-checked."""
-        open_items = row.get('open_items')
+        open_items = row.get('open_items', 0)
         return {'pending_change_requests': [value for value in row.get('pending_change_requests') or []
-                                            if isinstance(value, str)],
-                'open_items': open_items if type(open_items) is int else 0,
+                                            if isinstance(value, str)][:20],
+                'open_items': open_items if type(open_items) is int and open_items>=0 else None,
                 'checkpoint_at': row.get('checkpoint_at') if isinstance(row.get('checkpoint_at'), str) else None,
                 'newer_activity': row.get('newer_activity') if type(row.get('newer_activity')) is bool else None}
 
@@ -1813,6 +2024,10 @@ class EndpointBackend:
         --owner`` also lists tasks the actor was only NAMED to review; those are not
         the actor's own and are left out here.
         """
+        if actor is not None and (not isinstance(actor,str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}',actor)):
+            return {'tasks':[], 'complete':True}
+        if queue is not None:
+            return own_queue_tasks(queue,actor)
         if actor is None:
             queue = queue if queue is not None else self.review_queue(project_id)
             rows = []
@@ -1824,7 +2039,7 @@ class EndpointBackend:
                              'assignee': item.get('assignee'), 'review_state': item.get('review_state'),
                              'contribution_id': (item.get('contribution') or {}).get('id'),
                              'pending_change_requests': list(attention.get('pending_change_requests') or []),
-                             'open_items': attention.get('open_items') or 0,
+                             'open_items': attention.get('open_items',0),
                              'checkpoint_at': attention.get('checkpoint_at'),
                              'newer_activity': attention.get('newer_activity')})
             return {'tasks': rows, 'complete': bool(queue.get('complete'))}
@@ -1870,6 +2085,11 @@ class EndpointBackend:
                 raise uncertain('Canonical work queue returned an unexpected shape')
             for row in page.get('items') or []:
                 if not isinstance(row, dict):
+                    continue
+                if row.get('task') == '%s%s' % (project_id, MERGE_SLOT_SUFFIX):
+                    # The row bd keeps as the project's merge slot. This kit's `work` never
+                    # lists it; an older endpoint did, and a slot that lost its label would
+                    # be listed again. It is never offered here (kittrial-5bb.113 review).
                     continue
                 contribution = ({'id': row.get('contribution_id'), 'commit': row.get('commit'),
                                  'revision': None, 'at': None}
@@ -3264,30 +3484,20 @@ class ApiHandler(BaseHTTPRequestHandler):
         return blocked
 
     def _agent_own_tasks(self, project_id, actor, many=False):
-        """The agent's own tasks in one project, read once per HTTP request.
+        """Split this request's current review snapshot by the actual assignee.
 
-        One backend read (:meth:`EndpointBackend.agent_tasks`: the canonical ``work``
-        view) gives each task's review state, pending request ids, whether it has a
-        contribution, and the open items and time of its latest checkpoint. For one
-        agent the read is owner-filtered. With ``many`` (the owners' agent list and My
-        work, which compute attention for every agent) the rows come from this
-        request's review-queue read, the same unfiltered ``work`` view the queue and
-        the task list use, split by assignee in memory: the cost does not grow with the
-        number of agents, and a request that has already read the queue pays nothing
-        more. Nothing new is cached across requests.
+        Both own attention and claimable suggestions use the same paged ``work``
+        snapshot. No additional native task-list or owner-filtered read is needed,
+        whether one agent or all the owner's agents are displayed. Authority is
+        still checked per caller/project; nothing is cached across requests here.
         """
         cache = getattr(self, '_agent_own_cache', None)
         if cache is None:
             cache = self._agent_own_cache = {}
         key = (project_id, None if many else actor)
         if key not in cache:
-            if not many:
-                read = self.backend.agent_tasks(project_id, actor)
-            elif getattr(self.backend, 'REVIEW_STATES_FROM_QUEUE', False):
-                read = self.backend.agent_tasks(project_id, None, queue=self._review_queue(project_id))
-            else:
-                # A backend whose own rows carry everything needs no queue read.
-                read = self.backend.agent_tasks(project_id, None)
+            read = self.backend.agent_tasks(project_id, None if many else actor,
+                                            queue=self._review_queue(project_id))
             cache[key] = {'tasks': [task for task in read.get('tasks') or [] if isinstance(task, dict)],
                           'complete': bool(read.get('complete'))}
         read = cache[key]
@@ -3326,26 +3536,21 @@ class ApiHandler(BaseHTTPRequestHandler):
         return True
 
     def _agent_project_tasks(self, project_id):
-        """Every task row of one project from ONE canonical read per HTTP request.
+        """Reuse the bounded current-work snapshot, including unclaimed open tasks.
 
-        The backend's :meth:`read_tasks` snapshot is fetched at most once per project
-        per request (the endpoint binding spawns one ``endpoint.py`` / ``bd list
-        --all`` for it), so attention over a project of any size costs one read, not
-        one read per :data:`MAX_PAGE` page. The snapshot is chunked in memory to the
-        same :data:`AGENT_MAX_PAGES` bound the page walk used, so the ``complete``
-        flag - and therefore ``truncated`` - keeps exactly its rev2 meaning: a bound
-        that is not reached means every page was seen. Nothing is cached across
-        requests; the next request re-reads canonical state.
+        The endpoint costs one work command per page; the in-process backend reads
+        its project once. There is no separate task-list read. Both the backend's
+        page bound and the attention bound are preserved in ``complete``.
         """
         cache = getattr(self, '_agent_task_cache', None)
         if cache is None:
             cache = self._agent_task_cache = {}
         if project_id in cache:
             return cache[project_id]
-        snapshot = self.backend.read_tasks(project_id)
+        snapshot = self._review_queue(project_id)
         rows = [task for task in (snapshot.get('items') or []) if isinstance(task, dict)]
         bound = AGENT_MAX_PAGES * MAX_PAGE
-        result = {'tasks': rows[:bound], 'complete': len(rows) <= bound}
+        result = {'tasks': rows[:bound], 'complete': len(rows) <= bound and bool(snapshot.get('complete'))}
         cache[project_id] = result
         return result
 
@@ -3356,12 +3561,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         task routes apply (:meth:`_agent_may_read`), so a project the principal can no
         longer read drops out of attention instead of leaking its tasks.
 
-        Two reads per project and request. The agent's OWN tasks come from
-        :meth:`_agent_own_tasks` (kittrial-5bb.114): the snapshot's rows carry no review
-        state and no checkpoint on the endpoint backend, so read from them alone an
-        agent with changes requested was told there was nothing to do. The snapshot
-        (:meth:`_agent_project_tasks`) is walked to its last page for the claimable
-        suggestions only.
+        One current-work snapshot per project and request supplies both the agent's
+        own states and the unclaimed open tasks. The endpoint pays one work command
+        per page, with no extra task-list read; every agent in an owner's list reuses
+        those same rows. Nothing is cached across requests here.
 
         One action per own task, the most pressing reason first, then in this order:
         changes requested (1), blocked by its latest checkpoint (2), in progress with no
@@ -3370,7 +3573,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         about those, so they never sit ahead of work the agent can do. ``in_progress`` counts own open tasks with no
         contribution that are NOT blocked. A blocked action
         carries ``blocked_since`` (when the checkpoint was written) and
-        ``newer_activity`` (whether anything was written on the task after it), so an
+        ``newer_activity`` (whether another actor wrote after it), so an
         agent can leave a blocked task with nothing new alone instead of re-reading it
         and writing another checkpoint on every wake. The counts are independent of the
         actions: a task with changes requested AND open checkpoint items counts in both.
@@ -3396,9 +3599,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 counts['claimed'] += 1
                 review = task.get('review_state')
                 is_open = task.get('status') != 'closed'
-                open_items = task.get('open_items') or 0
-                blocked = is_open and open_items > 0
-                in_progress = (is_open and not blocked and not task.get('contribution_id')
+                open_items = task.get('open_items',0)
+                unreadable = is_open and open_items is None
+                blocked = is_open and type(open_items) is int and open_items > 0
+                in_progress = (is_open and not blocked and not unreadable and not task.get('contribution_id')
                                and review in (None, 'none'))
                 integrating = review in ('awaiting-integration', 'approved')
                 counts['changes_requested'] += review == 'changes-requested'
@@ -3406,13 +3610,23 @@ class ApiHandler(BaseHTTPRequestHandler):
                 counts['awaiting_integration'] += integrating
                 counts['blocked'] += blocked
                 counts['in_progress'] += in_progress
-                details = {'requests': list(task.get('pending_change_requests') or []), 'open_items': open_items,
+                details = {'requests': list(task.get('pending_change_requests') or [])[:20], 'open_items': open_items,
                            'blocked_since': task.get('checkpoint_at') if blocked else None,
                            'newer_activity': task.get('newer_activity') if blocked else None}
                 if review == 'changes-requested':
                     own_actions.append(self._agent_action(
                         1, 'changes-requested', project_id, task,
                         'A reviewer requested changes on this contribution.', **details))
+                elif review == 'error':
+                    own_actions.append(self._agent_action(
+                        2, 'review-error', project_id, task,
+                        'Review state error: an operator must reconcile the malformed review history.',
+                        who='operator', **details))
+                elif unreadable:
+                    own_actions.append(self._agent_action(
+                        2,'checkpoint-error',project_id,task,
+                        'Checkpoint history could not be read; an operator must reconcile it.',
+                        who='operator',**details))
                 elif blocked:
                     own_actions.append(self._agent_action(
                         2, 'blocked', project_id, task,
@@ -3430,6 +3644,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                         5, 'awaiting-integration', project_id, task,
                         'Approved; waiting for the coordinator to integrate it. Nothing for the agent to do.',
                         **details))
+                elif is_open or review in ACTIVE_REVIEW_STATES:
+                    action = (next_action(task) if review in ('withdrawn', 'superseded', 'integrated',
+                                                             'legacy-review-ready') else None)
+                    action = action or {'who': 'owner', 'text': 'Check the task and its review history'}
+                    own_actions.append(self._agent_action(
+                        5, 'review-state', project_id, task,
+                        'Review state %s: %s.' % (review or 'unknown', action['text']),
+                        who=action['who'], **details))
             for task in read['tasks']:
                 if task.get('status') == 'open' and task.get('assignee') is None:
                     counts['claimable'] += 1
@@ -3533,7 +3755,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('PATCH', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')')
     def tasks_update(self, ctx):
         self._project(ctx, CAP_TASKS)
-        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
+        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']), write=True)
         payload = self._task_payload(ctx)
 
         def update():
@@ -3603,11 +3825,19 @@ class ApiHandler(BaseHTTPRequestHandler):
         return 200, self._task_views([row])[0]
 
     @staticmethod
-    def _refuse_record_anchor(row):
+    def _refuse_record_anchor(row, write=False):
         """A record anchor is not a task: the task, brief and history routes answer
         404 for it, never its row or raw record comments, and the task write routes
-        (PATCH, claim, checkpoints, reviews) refuse it the same way (kittrial-5bb.64)."""
+        (PATCH, claim, checkpoints, reviews) refuse it the same way (kittrial-5bb.64).
+
+        The project's merge slot is not a task either (kittrial-5bb.113). The read
+        routes answer 404 for it; a write route says what it is, so an agent that was
+        once offered it learns why the claim is refused."""
         if is_record_anchor(row):
+            raise not_found('Task not found')
+        if is_merge_slot(row):
+            if write:
+                raise conflict(merge_slot_sentence(row.get('id')))
             raise not_found('Task not found')
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/references')
@@ -3959,13 +4189,65 @@ class ApiHandler(BaseHTTPRequestHandler):
         brief['project_repository'] = self.service.project_view(ctx.principal, pid).get('repository')
         # The same note wherever the value reaches an agent: it is a label, not an instruction.
         brief['project_repository_note'] = self.service.REPOSITORY_NOTE if brief['project_repository'] else None
+        brief['checkpoint_template'] = self._checkpoint_template(brief, base, brief.pop('carry_open_items', []))
         brief['generated_at'] = now_iso(self.service._now())
         return 200, brief
+
+    #: The fields of a checkpoint that may be left out over HTTP, with what is sent for them.
+    CHECKPOINT_DEFAULTS = (('source_commit', ''), ('branch', ''), ('open_items', []), ('resolved', []))
+
+    @staticmethod
+    def _checkpoint_template(brief, base, carry=()):
+        """The checkpoint record to send for this task at this moment (kittrial-5bb.113).
+
+        An agent fills the four texts and posts ``body`` to ``send_to``. ``previous`` and
+        ``activity_cursor`` are already those of this read; they go stale when the task
+        changes, and the refusal then says to read the brief again. ``open_items`` already
+        holds every open item of the previous checkpoint exactly as recorded, source
+        included: sent as it is, the record carries them all forward.
+        """
+        import briefing
+        limits = dict(briefing.CHECKPOINT_FIELD_LIMITS)
+        current = brief.get('checkpoint') or {}
+        keys = ('id', 'kind', 'text', 'source')
+        carried = [{key: item.get(key) for key in keys} for item in carry or []]
+        template = {
+            'send_to': base + '/checkpoints', 'method': 'POST',
+            'body': {'schema_version': 1, 'previous': current.get('id'),
+                     'activity_cursor': brief.get('activity_cursor'),
+                     'intent': '', 'acceptance': '', 'summary': '', 'next_action': '',
+                     'source_commit': '', 'branch': '', 'open_items': carried, 'resolved': []},
+            'carried_open_items': len(carried),
+            'required': ['intent', 'acceptance', 'summary', 'next_action'],
+            'optional': {'source_commit': 'the commit the work is at; leave out when there is none',
+                         'branch': 'the branch; leave out when there is none',
+                         'open_items': 'what is unresolved: the ones already in body, unchanged, plus any new one; '
+                                       'leave out only when nothing is',
+                         'resolved': 'open items of the previous checkpoint that this one resolves: take the item '
+                                     'out of open_items and name its id here; leave out when none'},
+            'limits': {name: '<= %d characters' % limits[name]
+                       for name in ('intent', 'acceptance', 'summary', 'next_action', 'source_commit', 'branch')},
+            'open_item': {'id': 'a short id of your choosing', 'kind': sorted(briefing.KINDS),
+                          'text': '<= %d characters' % briefing.CHECKPOINT_TEXT_LIMIT,
+                          'source': 'where it came from, <= %d characters' % briefing.CHECKPOINT_SOURCE_LIMIT},
+            'resolved_item': {'id': 'the id of the open item', 'reason': '<= %d characters' % briefing.CHECKPOINT_TEXT_LIMIT,
+                              'evidence': '<= %d characters' % briefing.CHECKPOINT_SOURCE_LIMIT},
+            'items_max': briefing.CHECKPOINT_ITEMS_MAX,
+            'note': 'Every open item of the previous checkpoint must be carried forward unchanged or resolved. '
+                    'body.open_items already holds them all, complete with source. '
+                    'A refusal names every problem with the record at once.'}
+        if carry is None:
+            # More open items than could be read in one go, or the task changed meanwhile.
+            template['carried_open_items'] = None
+            template['note'] = ('The open items of the previous checkpoint could not all be read, so body.open_items '
+                                'is empty and this record would be refused: read the brief again. '
+                                + template['note'])
+        return template
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/claim')
     def tasks_claim(self, ctx):
         self._project(ctx, CAP_TASKS)
-        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
+        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']), write=True)
         payload = self._task_payload(ctx)
         actor = self.service.bind_actor(ctx.principal, payload.pop('actor', None))
         payload['actor'] = actor
@@ -3982,17 +4264,32 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/checkpoints')
     def checkpoints_add(self, ctx):
         self._project(ctx, CAP_CHECKPOINTS)
-        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
+        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']), write=True)
         payload = self._task_payload(ctx)
         payload.setdefault('schema_version', 1)
+        # Over HTTP these four may be left out (kittrial-5bb.113): an agent with no commit
+        # yet, or nothing unresolved, need not send empty values. The canonical record is
+        # unchanged: what is left out is sent as the empty value.
+        for name, empty in self.CHECKPOINT_DEFAULTS:
+            payload.setdefault(name, type(empty)())
         if 'actor' in payload:
             payload['actor'] = self.service.bind_actor(ctx.principal, payload.get('actor'))
 
         def add():
-            result = self.backend.invoke('checkpoints.add', ctx.principal, ctx.params['pid'],
-                                         payload, ctx.idempotency_key,
-                                         target=ctx.route_target, authorize=ctx.authorize,
-                                         capability=CAP_CHECKPOINTS)
+            try:
+                result = self.backend.invoke('checkpoints.add', ctx.principal, ctx.params['pid'],
+                                             payload, ctx.idempotency_key,
+                                             target=ctx.route_target, authorize=ctx.authorize,
+                                             capability=CAP_CHECKPOINTS)
+            except HttpError as refusal:
+                # The canonical refusal names every problem with the record. Hand them over
+                # as a list too, so an agent need not parse the sentence.
+                if refusal.status == 422 and isinstance(refusal.detail, str):
+                    import briefing
+                    said = refusal.detail[len('ValueError: '):] if refusal.detail.startswith('ValueError: ') \
+                        else refusal.detail
+                    refusal.problems = briefing.split_problems(said)
+                raise
             return result, result
         return self._mutate(ctx, 'checkpoints.add', ctx.params['pid'], add, status=201,
                             capability=CAP_CHECKPOINTS, serialize=False, canonical=True)
@@ -4006,9 +4303,41 @@ class ApiHandler(BaseHTTPRequestHandler):
         # approve at all.
         capability = CAP_APPROVE if payload.get('operation') == 'approve' else CAP_REVIEWS
         self._project(ctx, capability)
-        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
+        self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']), write=True)
         if 'actor' in payload:
             payload['actor'] = self.service.bind_actor(ctx.principal, payload.get('actor'))
+        operation = payload.get('operation')
+        if isinstance(operation, str) and operation in EndpointBackend.REVIEW_FIELDS:
+            # Unknown and misplaced fields are refused, not dropped (kittrial-5bb.110
+            # item 4). The allowed set is the canonical field set for THIS operation
+            # plus the documented transport/presentation keys, so a `disposition` on a
+            # request-changes or a top-level `severity` is a 422 instead of a silent
+            # 201. An operation the canonical writer does not know is left to the
+            # backend, which names it in a fixed sentence.
+            #
+            # A key whose VALUE is null is ABSENT, not a misplaced field (kittrial-5bb.110
+            # items 1 and 2): the released Client at cbf6d01 and at b0a4fbd sends every
+            # optional field of every operation as null (one 16-key union), and counting
+            # those nulls here refused switch on/off, contribute, request-changes,
+            # respond, approve, withdraw and recommend alike. The check therefore runs on
+            # the SUPPLIED keys only. The nulls stay in the payload: the canonical build
+            # below drops a null optional field itself and keeps the null on the required
+            # fields whose ABSENCE -- unlike their null -- is an invalid field set.
+            allowed = ({'schema_version', 'operation', 'operation_id', 'previous'}
+                       | set(EndpointBackend.REVIEW_FIELDS[operation])
+                       | set(EndpointBackend.REVIEW_OPTIONAL_FIELDS.get(operation, ()))
+                       | set(REVIEW_HTTP_FIELDS)
+                       | set(REVIEW_HTTP_OPERATION_FIELDS.get(operation, ())))
+            # `previous` is deliberately NOT removed for REVIEW_NO_PREVIOUS: a
+            # recommendation is a record beside the chain and carries none, but the
+            # released clients send the key (null, or the chain's latest comment id) for
+            # every operation, so it is accepted and IGNORED here (the canonical body
+            # builder omits it for `recommend`; kittrial-5bb.110 items 1 and 2).
+            supplied = {key for key, value in payload.items() if value is not None}
+            unknown = sorted(str(key) for key in supplied - allowed)
+            if unknown:
+                raise invalid('Unsupported review payload field(s) for %s: %s'
+                              % (operation, unsupported_fields_text(unknown)))
 
         def add():
             if payload.get('operation') == 'recommend':

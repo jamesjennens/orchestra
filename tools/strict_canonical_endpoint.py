@@ -293,7 +293,17 @@ def dispatch(canonical, request, tmp, run=None):
     if action == 'review':
         from work import execute as work_execute
         items = {k: dict(v, path=str(Path(tmp) / k)) for k, v in attachments.items()}
-        result = work_execute(canonical.path, actor, 'review', args, items, run)
+        # endpoint.py supplies the per-installation review_workflow_writes switch from
+        # the deployment configuration; mirror that here so the HTTP binding tests can
+        # reach the new record shapes (kittrial-5bb.110 item 9). A revision that
+        # predates the switch keeps its old behaviour.
+        try:
+            from admin import review_workflow_writes
+            review_writes = review_workflow_writes(canonical.root)
+        except ImportError:
+            review_writes = None
+        result = work_execute(canonical.path, actor, 'review', args, items, run,
+                              review_writes=review_writes)
         return envelope(0, json.dumps(result, ensure_ascii=False) + '\n')
     if action in ('work', 'handoff'):
         from work import execute as work_execute

@@ -20,6 +20,15 @@ PREFIX = 'Kind: lifecycle-v1\n'
 ENABLED = 'enabled'
 ENABLED_VALUES = ('enabled','disabled','enabled-with-known-defect')
 DEFECT_VALUE = 'enabled-with-known-defect'
+# Liveness, deliberately outside the six facts AND separate from the evidence
+# scope (kittrial-5bb.107 rev2 item 4). A `live` fact names the recorded release
+# scope that is - or is no longer - the live release for the task's environment,
+# so an explicit rollback can say what is live without rewriting where evidence
+# for an older release was recorded. `live` says the named scope is live;
+# `superseded` says it is not live any more.
+LIVE = 'live'
+LIVE_VALUES = ('live','superseded')
+LIVE_SUPERSEDED = 'superseded'
 OPTIONAL_FIELDS = ('note','trigger','defect_task')
 PAYLOAD_FIELDS = {'schema_version','operation_id','task','dimension','value','scope','evidence','provenance','actor'}
 TEXT_MAX = 500
@@ -27,19 +36,46 @@ TEXT_MAX = 500
 # payload on the wire, one native event per recorded fact. Bounded in the number
 # of targets and in every text field.
 RELEASE = 'release-deploy'
+# A read-only release pre-flight: the client asks the endpoint which integrations
+# are reverted by a host-issued operator record (item 5), so the default release
+# command no longer needs a caller-side journal or ORCHESTRA_OPERATORS. It writes
+# nothing.
+RELEASE_QUERY = 'release-query'
 RELEASE_FIELDS = (PAYLOAD_FIELDS - {'task'}) | {'targets','live_verified'}
+# Additive, optional release fields. `rollback` marks an explicit rollback,
+# `supersede` lists tasks whose live release is being moved back past them, and
+# `supersede_scopes` names the exact recorded scopes the same rollback moves past
+# (a task that is a TARGET of the rollback keeps its newer deployment scope as the
+# live one unless that scope is named here, which is what made a roll forward lose
+# the task's second delivery); all three are absent from every payload written
+# before this revision, so an older kit and an exact older payload still validate.
+RELEASE_OPTIONAL_FIELDS = ('rollback','supersede','supersede_scopes')
 RELEASE_TARGETS_MAX = 200
 RELEASE_OPERATION_MAX = 110
 # A release is sent as one request per group so the project lock is released
 # between groups and no single request can approach the client's 150 s timeout.
-RELEASE_CHUNK_DEFAULT = 50
+# A smaller default group keeps one request well inside that timeout: a measured
+# real project paid 1.6 to 1.7 s per target, so the old default of 50 could reach
+# ~86 s and a group of 200 timed out at 150 s. 25 targets is ~45 s at that rate.
+RELEASE_CHUNK_DEFAULT = 25
 # Conservative per-target budget quoted by `release --dry-run`. The measured
-# in-memory harness on the authoritative Linux host is far below it (200 targets,
-# 900-row export, one export and 400 writes in 0.106 s); the estimate is an upper
-# bound that leaves room for a real `bd` binary's own write latency, and groups are
-# sized so one request stays well inside the client's 150 s timeout.
-DRY_RUN_SECONDS_PER_TARGET = 0.25
-DRY_RUN_FIXED_SECONDS = 5.0
+# in-memory harness on the authoritative Linux host is far below it, but a real
+# `bd` binary on a large project paid 1.6 to 1.7 s per target when each target cost
+# ONE write. Rev2 made each target cost THREE writes (scope, deployed, live) and
+# the reviewer then measured 438 s for 201 targets (2.18 s per target), against the
+# old 2.0 s/target figure, so that figure was no longer an upper bound (rev3 item
+# 3.3). The budget is now 3.0 s per target - about 1.0 s per native write - plus
+# 15 s of per-request overhead, so 201 targets estimate 618 s and a 25-target group
+# (the default) 90 s, well inside the client's 150 s timeout.
+DRY_RUN_SECONDS_PER_TARGET = 3.0
+DRY_RUN_FIXED_SECONDS = 15.0
+# The writing command asks the endpoint which integrations are reverted; the
+# offline dry run cannot, so it says plainly that its local revert view may list a
+# target the writing run skips (rev3 item 3.4).
+DRY_RUN_REVERT_NOTE = ('the dry run is offline: it reads reverts from the local journal view, so '
+                       'without --journal PROJECT it may list a target that the writing run skips, '
+                       'because the writing run asks the endpoint for the host-issued revert set'
+                       ' (kittrial-5bb.107 rev3 item 3.4)')
 # The export-visible marker an operator revert leaves on the task (reserved_comments
 # forbids raw contributors writing it; the host journal stays the review reader's
 # trust anchor, review_workflow.REVERT_PREFIX is the same wire string).
@@ -53,6 +89,10 @@ SCOPE_ROLL_NOTE = ('The release scope becomes each target\'s current scope, so t
                    '(brief, work, lifecycle.py list) show integrated=unknown (and any earlier-scope fact '
                    'unknown) until it is recorded for the release scope; per-scope integration evidence '
                    'and the review reads are unaffected.')
+# A between-group failure leaves the earlier groups written, so the same file with
+# the same export fails again at the same group; the retry needs fresh state.
+FRESH_EXPORT_NOTE = ('the groups before this one were written; take a FRESH export and reconcile before '
+                     'retrying, because the same file with the same export fails again at the same group')
 
 
 def validate_scope(scope):
@@ -88,6 +128,14 @@ def validate_payload(p):
         if p['value']==DEFECT_VALUE and 'defect_task' not in p:raise ValueError('enabled-with-known-defect needs the fixing task')
     elif p['dimension']=='lifecycle-scope':
         if p['value']!=content_hash(p['scope']):raise ValueError('scope token mismatch')
+    elif p['dimension']==LIVE:
+        # A liveness fact names a recorded release scope; it carries no commit of
+        # its own, so it needs the release identity (release_id + environment) and
+        # evidence like any other asserted fact.
+        if p['value'] not in LIVE_VALUES:raise ValueError('invalid lifecycle dimension/value')
+        if not p['evidence']:raise ValueError('asserted facts need evidence')
+        if not p['scope']['release_id'].strip() or not p['scope']['environment'].strip():
+            raise ValueError('a live fact needs a release_id and environment')
     elif p['dimension'] in DIMENSIONS and p['value'] in VALUES:
         if p['value'] in ('passed','failed','not-applicable') and not p['evidence']:raise ValueError('asserted facts need evidence')
         if p['value']=='passed':
@@ -138,12 +186,30 @@ def label_agrees(labels,event,dim):
     return event is not None and [v for v in labels if v.startswith(dim+':')]==[dim+':'+event['value']]
 
 
+def scoped_event(events,task,dim,scope):
+    """Newest event of one task/dimension recorded under ``scope``, or None.
+
+    Ordering is validated across ALL of the dimension's events exactly as
+    ``latest_event`` does: a missing or duplicated order is ambiguous and returns
+    None, so an ambiguous history is never guessed. Among the events whose payload
+    scope IS ``scope`` the newest wins. This is what lets a fact recorded later
+    under an OLDER scope leave the current scope's fact readable (rev3 item 2).
+    """
+    found=events.get((task,dim),[])
+    if not found or any(e['order'] is None for e in found):return None
+    orders=[e['order'] for e in found]
+    if len(set(orders))!=len(orders):return None
+    matching=[e for e in found if e['payload'] is not None and e['payload']['scope']==scope]
+    if not matching:return None
+    return max(matching,key=lambda e:e['order'])
+
+
 def events_by_dimension(rows):
     """Every exported lifecycle-shaped state event, grouped by (task, dimension)."""
     events={}
     for row in rows:
         event=native_event(row)
-        if event and event['dimension'] in (*DIMENSIONS,'lifecycle-scope',ENABLED):
+        if event and event['dimension'] in (*DIMENSIONS,'lifecycle-scope',ENABLED,LIVE):
             events.setdefault((event['task'],event['dimension']),[]).append(event)
     return events
 
@@ -153,10 +219,15 @@ def trusted_payloads(rows,events=None):
 
     Returns ``{task: {dimension: {'scope','value','event_id','payload'}}}``. A
     value is trusted only when the task's newest ``lifecycle-scope`` event agrees
-    with its native label, the dimension's newest event agrees with its native
-    label, event ordering is unambiguous, and the payload's scope is that trusted
-    scope. ``project_facts``, ``enabled_states`` and ``evidence_owed`` all read
-    this, so they cannot disagree about the same events.
+    with its native label, event ordering is unambiguous, and the payload's scope
+    is that trusted scope. ``project_facts``, ``enabled_states`` and
+    ``evidence_owed`` all read this, so they cannot disagree about the same events.
+
+    The value reported for a dimension is the newest event recorded for the task's
+    CURRENT scope (rev3 item 2), not simply the newest event of that dimension. The
+    native ``dim:`` label tracks the newest event of the dimension, so the tamper
+    check compares the label with THAT event; a later fact recorded under an older,
+    already-recorded scope therefore never hides the current scope's fact.
     """
     if events is None:events=events_by_dimension(rows)
     trusted={}
@@ -166,11 +237,18 @@ def trusted_payloads(rows,events=None):
         scope_event=latest_event(events,task,'lifecycle-scope')
         scope=scope_event['payload']['scope'] if label_agrees(labels,scope_event,'lifecycle-scope') and scope_event['payload'] else None
         dimensions={}
-        for dim in (*DIMENSIONS,ENABLED):
-            e=latest_event(events,task,dim)
-            valid=scope is not None and label_agrees(labels,e,dim) and e['payload'] is not None and e['payload']['scope']==scope
+        for dim in (*DIMENSIONS,ENABLED,LIVE):
+            newest=latest_event(events,task,dim)
+            labelled=(newest is not None and newest['payload'] is not None
+                      and label_agrees(labels,newest,dim))
+            e=scoped_event(events,task,dim,scope) if scope is not None else None
+            valid=labelled and e is not None
+            # The event id names the event the value came from when the value is
+            # trusted; when it is not, it still names the newest event of the
+            # dimension, so a caller can see WHICH event made it unknown.
             dimensions[dim]={'scope':scope,'value':e['value'] if valid else 'unknown',
-                             'event_id':e['id'] if e else None,'payload':e['payload'] if valid else None}
+                             'event_id':e['id'] if valid else (newest['id'] if newest is not None else None),
+                             'payload':e['payload'] if valid else None}
         trusted[task]=dimensions
     return trusted
 
@@ -178,18 +256,31 @@ def trusted_payloads(rows,events=None):
 def project_facts(rows):
     events=events_by_dimension(rows)
     trusted=trusted_payloads(rows,events)
+    history={entry['id']:entry['scopes'] for entry in scoped_evidence(rows,('deployed',LIVE))}
     result=[]
     for row in rows:
         if row.get('issue_type')=='event':continue
         dimensions=trusted[row['id']]
+        live=dimensions[LIVE]['value']
+        current_scope=dimensions[DIMENSIONS[0]]['scope']
+        if current_scope is not None and dimensions['deployed']['value']=='passed':
+            winner,value=environment_liveness(history.get(row['id'],[]),current_scope.get('environment',''))
+            if winner is not None and (value==LIVE_SUPERSEDED or winner['scope']!=current_scope):
+                live=LIVE_SUPERSEDED
         facts={}
         for dim in DIMENSIONS:
             state=dimensions[dim];payload=state['payload']
-            facts[dim]={'value':state['value'],'event_id':state['event_id'],
-                        'evidence':payload['evidence'] if payload else [],
-                        'provenance':payload['provenance'] if payload else None}
+            value=state['value'];evidence=payload['evidence'] if payload else []
+            # Liveness override (kittrial-5bb.107 rev2 item 2): a release the task
+            # was rolled back out of is not live, so `deployed` reads unknown rather
+            # than passed-at-an-old-release. Evidence is untouched in the history and
+            # stays visible per scope through `scoped_evidence`/`evidence-owed`.
+            if dim=='deployed' and live==LIVE_SUPERSEDED:
+                value='unknown';evidence=[]
+            facts[dim]={'value':value,'event_id':state['event_id'],
+                        'evidence':evidence,'provenance':payload['provenance'] if payload else None}
         result.append({'id':row['id'],'title':row.get('title',''),'status':row.get('status'),
-                       'scope':dimensions[DIMENSIONS[0]]['scope'],'facts':facts,
+                       'scope':dimensions[DIMENSIONS[0]]['scope'],'facts':facts,'live':live,
                        'has_lifecycle':any((row['id'],dim) in events for dim in (*DIMENSIONS,'lifecycle-scope'))})
     return result
 
@@ -277,13 +368,21 @@ def scoped_evidence(rows,dimensions=('integrated',)):
             if reason is not None:untrusted[dim]=reason
             elif found:trusted[dim]=found
         # One pass per dimension over the trusted events: hash each payload once and
-        # keep the newest event per (scope token, dimension).
-        per_token={}
+        # keep the newest event per (scope token, dimension). The token is memoised
+        # by the scope's canonical bytes (a repeated scope is hashed once), which is
+        # what makes the per-scope readers linear in DISTINCT scopes rather than in
+        # events (kittrial-5bb.107 rev2 item 6.4).
+        per_token={};token_cache={}
         for dim in dims:
             for event in trusted.get(dim,[]):
                 payload=event['payload']
                 if not payload:continue
-                token=content_hash(payload['scope']);key=(event['order'],event['id'])
+                canon=canonical_bytes(payload['scope'])
+                token=token_cache.get(canon)
+                if token is None:
+                    token=hashlib.sha256(canon).hexdigest()
+                    token_cache[canon]=token
+                key=(event['order'],event['id'])
                 slot=per_token.setdefault(token,{})
                 prior=slot.get(dim)
                 if prior is None or key>prior[0]:
@@ -305,9 +404,77 @@ def scoped_evidence(rows,dimensions=('integrated',)):
             for dim in dims:
                 got=per_token.get(token,{}).get(dim)
                 entry[dim]=dict(got[1]) if got else None
+                # The recording order of that scope's fact, so a per-environment
+                # liveness reader can order two scopes by the newest LIVE event
+                # rather than by when each scope token first appeared (rev3 item 1).
+                if got:entry[dim]['order']=got[0][0]
             entries.append(entry)
         result.append({'id':task,'scopes':entries,'untrusted':untrusted})
     return result
+
+
+def scope_liveness(candidate):
+    """``(value, order_key)`` for ONE recorded scope, or ``(None, None)``.
+
+    The single-scope half of the per-environment liveness rule: an explicit ``live``
+    fact names the answer; without one a ``deployed=passed`` scope is a deployment
+    written before the liveness dimension existed and reads ``deployed``, so an
+    upgraded kit keeps the pre-liveness meaning. ``order_key`` is the recording order
+    of the event that decided it, so two scopes can be compared by the NEWEST live
+    event rather than by which scope token appeared first (rev4 item 3 (4)).
+    """
+    fact=candidate.get(LIVE)
+    if fact and fact.get('value'):
+        return fact['value'],(fact.get('order'),fact.get('event_id') or '')
+    deployed=candidate.get('deployed') or {}
+    if deployed.get('value')=='passed':
+        return 'deployed',(deployed.get('order'),deployed.get('event_id') or '')
+    return None,None
+
+
+def scope_is_superseded(candidate):
+    """Does THIS scope's own newest liveness event say the task was moved off it?
+
+    The single-scope half of the rollback rule: an explicit ``live=superseded`` fact
+    written under this scope says the task is no longer live HERE. Any other scope
+    that has been re-lived after it wins, which is what makes a rollback and a roll
+    forward agree on exactly one live scope.
+    """
+    fact=candidate.get(LIVE) or {}
+    return fact.get('value')==LIVE_SUPERSEDED
+
+
+def environment_liveness(scopes,environment):
+    """What the scope history says about one task's liveness in ONE environment.
+
+    Returns ``(scope_entry, value)`` where ``scope_entry`` is the
+    ``scoped_evidence`` entry whose recorded scope carries the answer and ``value``
+    is:
+
+    * ``live`` - an explicit ``live=live`` fact in that environment;
+    * ``superseded`` - the newest thing recorded about this task's liveness in that
+      environment is a ``live=superseded`` fact, so it is deployed there but not live;
+    * ``deployed`` - no ``live`` fact at all but a ``deployed=passed`` scope, i.e.
+      data written before the liveness dimension existed. It is read as live so an
+      upgraded kit keeps the pre-liveness meaning;
+    * ``None`` - nothing is deployed there, with ``scope_entry`` None.
+
+    THE RULE, applied once here for every reader: the scope carrying the NEWEST
+    liveness event wins, where a liveness event is a ``live`` fact or, for a scope
+    with no ``live`` fact, its legacy ``deployed=passed`` recording. A scope whose
+    own newest liveness event is ``superseded`` is not re-lived and loses to any
+    scope that was re-lived after it (a rollback re-lives an OLDER release, so its
+    newer event must win), and when it is the newest event of all the answer is that
+    the task is not live in this environment. A scope that is not ``live`` and has no
+    legacy ``deployed=passed`` is not a liveness event at all.
+    """
+    newest=None
+    for candidate in scopes:
+        if (candidate['scope'].get('environment') or '')!=environment:continue
+        value,key=scope_liveness(candidate)
+        if value is not None and (newest is None or key>newest[0]):
+            newest=(key,candidate,value)
+    return (newest[1],newest[2]) if newest is not None else (None,None)
 
 
 def integration_evidence(rows):
@@ -330,18 +497,23 @@ def evidence_owed(rows):
     earlier debt. Every recorded scope whose ``deployed`` is passed, pending or
     failed gets a row carrying ``remaining_evidence``, the ``enabled`` flag and
     fixing task for a known defect, the responsible actor, and the free-text
-    ``next_trigger`` recorded on a pending fact. ``remaining_evidence`` is the
+    ``next_trigger`` recorded on a pending fact. The enabled flag is the one
+    recorded for THAT row's scope (kittrial-5bb.107 item 8), so a later enabled
+    change never appears on an earlier release's row. ``remaining_evidence`` is the
     deployment dimensions (``deployed``, ``live-verified``) that are not passed or
     not-applicable, plus any dimension explicitly recorded pending or failed in
     that scope. Reading changes nothing; a deployed release with no trusted scope
     is never invented.
     """
-    trusted=trusted_payloads(rows)
     issues={row['id']:row for row in rows if row.get('issue_type')!='event'}
     groups={}
-    for entry in scoped_evidence(rows,DIMENSIONS):
+    for entry in scoped_evidence(rows,DIMENSIONS+(ENABLED,LIVE)):
         task=entry['id'];issue=issues.get(task,{})
-        enabled=trusted.get(task,{}).get(ENABLED,{'value':'unknown','payload':None})
+        # ONE live row per task and environment (rev4): the rule itself says whether
+        # THIS row's scope is the live one, so the row is read with the same call the
+        # other readers use. A scope the task is live on reads ``live``, and a scope it
+        # has been moved off - superseded, or simply not the newest liveness event -
+        # reads ``superseded``. A row written before this revision reads ``unknown``.
         for facts in entry['scopes']:
             deployed_value=(facts.get('deployed') or {}).get('value','unknown')
             if deployed_value not in ('passed','pending','failed'):continue
@@ -355,8 +527,24 @@ def evidence_owed(rows):
                 if trigger is None and value=='pending' and got and got.get('trigger'):
                     trigger=got['trigger']
             scope=facts['scope']
-            item={'task':task,'deployed':deployed_value,'enabled':enabled['value'],
-                  'defect_task':(enabled.get('payload') or {}).get('defect_task') if enabled.get('payload') else None,
+            # The enabled flag is per SCOPE, not retroactively the task's current one:
+            # a historical release row shows the flag recorded for that row's scope
+            # (kittrial-5bb.107 item 8), so a later enabled change never rewrites it.
+            enabled=facts.get(ENABLED) or {'value':'unknown'}
+            # The per-scope liveness fact (rev2 item 2): a row whose release the task
+            # has been rolled back out of reads `superseded` here instead of passing
+            # silently as deployed. A row written before this revision reads `unknown`.
+            recorded=(facts.get(LIVE) or {}).get('value','unknown')
+            live=recorded
+            if recorded in ('live','deployed'):
+                that_scope,that_value=environment_liveness(entry['scopes'],
+                                                           scope.get('environment',''))
+                if that_value not in ('live','deployed') or that_scope is None \
+                        or that_scope['scope']!=scope:
+                    live=LIVE_SUPERSEDED
+            item={'task':task,'deployed':deployed_value,'live':live,
+                  'enabled':enabled.get('value','unknown'),
+                  'defect_task':enabled.get('defect_task'),
                   'remaining_evidence':remaining,
                   'responsible':issue.get('assignee') or (facts.get('deployed') or {}).get('actor'),
                   'next_trigger':trigger}
@@ -367,13 +555,26 @@ def evidence_owed(rows):
 
 
 def validate_release_payload(p,require_targets=True):
-    """A release covers many tasks: one shared evidence block, one scope, targets."""
-    if not isinstance(p,dict) or set(p)!=RELEASE_FIELDS:raise ValueError('invalid release payload')
+    """A release covers many tasks: one shared evidence block, one scope, targets.
+
+    ``rollback``, ``supersede`` and ``supersede_scopes`` are additive optional
+    fields: an older payload (or an older kit's validator) never carries them. Only a
+    stated MOVE may cover no new target at all (a rollback, or a release that names
+    tasks or scopes to supersede - a hotfix that only drops work); every other
+    release needs at least one target. ``supersede`` is allowed on a plain deploy too
+    (rev3 item 1): a deploy of a hotfix release that does not carry a live task makes
+    that task no longer live. A task may never be named as both a target and
+    superseded (rev3 item 3.1), while a TARGET may carry ``supersede_scopes``
+    (rev4 item 2), because a rollback re-lives a task at R and moves the same task
+    past its own newer deployment.
+    """
+    if not isinstance(p,dict) or set(p)-set(RELEASE_OPTIONAL_FIELDS)!=RELEASE_FIELDS:raise ValueError('invalid release payload')
     if type(p['schema_version']) is not int or p['schema_version']!=1:raise ValueError('invalid release payload')
     for key in ('operation_id','actor'):
         if not isinstance(p[key],str) or not LABEL.fullmatch(p[key]) or len(p[key])>RELEASE_OPERATION_MAX:raise ValueError('invalid '+key)
     if p['dimension']!=RELEASE or p['value']!='passed':raise ValueError('invalid lifecycle dimension/value')
     if type(p['live_verified']) is not bool:raise ValueError('live_verified must be true or false')
+    if 'rollback' in p and type(p['rollback']) is not bool:raise ValueError('rollback must be true or false')
     validate_scope(p['scope'])
     if p['scope']['source_commit'].strip():raise ValueError('a release scope names no single source commit')
     if not COMMIT.fullmatch(p['scope']['integration_commit']):raise ValueError('a release needs its full release commit in integration_commit')
@@ -381,19 +582,61 @@ def validate_release_payload(p,require_targets=True):
     if not isinstance(p['evidence'],list) or any(not isinstance(x,str) or not x.strip() for x in p['evidence']):raise ValueError('evidence must be a list of pointers')
     if not p['evidence']:raise ValueError('asserted facts need evidence')
     if p['provenance'] not in ('performed','reported','imported'):raise ValueError('invalid provenance')
+    supersede=p.get('supersede')
+    if supersede is not None:
+        if not isinstance(supersede,list) or any(not isinstance(x,str) or not LABEL.fullmatch(x) for x in supersede):
+            raise ValueError('invalid release supersede list')
+        if len(set(supersede))!=len(supersede):raise ValueError('duplicate supersede task')
+        if len(supersede)>RELEASE_TARGETS_MAX:raise ValueError('a release supersedes at most %d tasks'%RELEASE_TARGETS_MAX)
     targets=p['targets']
     if not isinstance(targets,list):raise ValueError('invalid release targets')
-    if require_targets and not targets:raise ValueError('a release needs at least one integrated target')
+    # A release that covers no new target is only valid when it is a STATED MOVE: a
+    # rollback, a task-level supersede, or the scope-level list a rollback uses to move
+    # past a task's own newer deployment (rev4 item 2). Nothing else may write a
+    # release that covers and moves nothing at all.
+    stated_move=bool(p.get('rollback') or p.get('supersede') or p.get('supersede_scopes'))
+    if require_targets and not targets and not stated_move:
+        raise ValueError('a release needs at least one integrated target')
     if len(targets)>RELEASE_TARGETS_MAX:raise ValueError('a release covers at most %d targets'%RELEASE_TARGETS_MAX)
     seen=set()
     for target in targets:
-        if not isinstance(target,dict) or set(target)-{'note'}!={'task','source_commit','integration_commit'}:raise ValueError('invalid release target')
+        if not isinstance(target,dict) or set(target)-{'note','verify_scope'}!={'task','source_commit','integration_commit'}:raise ValueError('invalid release target')
         if not isinstance(target['task'],str) or not LABEL.fullmatch(target['task']):raise ValueError('invalid release target task')
         if target['task'] in seen:raise ValueError('duplicate release target')
         seen.add(target['task'])
         for key in ('source_commit','integration_commit'):
             if not isinstance(target[key],str) or not COMMIT.fullmatch(target[key]):raise ValueError('release target needs a full lowercase '+key)
         if 'note' in target:one_line(target['note'],'note')
+        if 'verify_scope' in target:
+            validate_scope(target['verify_scope'])
+            if (not p['live_verified'] or p.get('rollback')
+                    or target['verify_scope']['environment']!=p['scope']['environment']
+                    or any(target['verify_scope'][key]!=target[key] for key in ('source_commit','integration_commit'))):
+                raise ValueError('invalid release verification scope')
+    if supersede:
+        # A hand-built payload could otherwise name one task as both carried by the
+        # release and dropped by it, and the readers would then disagree about
+        # whether it is live (rev3 item 3.1).
+        overlap=sorted(set(supersede)&seen)
+        if overlap:raise ValueError('a task cannot be both a release target and superseded: '+overlap[0])
+    supersede_scopes=p.get('supersede_scopes')
+    if supersede_scopes is not None:
+        # The additive scope-level companion of `supersede` (rev4 item 2). It names
+        # recorded SCOPES, not tasks, so a TARGET may carry one: a rollback moves an
+        # environment past a task's own newer deployment while it re-records that
+        # task live at R.
+        if not isinstance(supersede_scopes,list):raise ValueError('invalid release supersede_scopes list')
+        if len(supersede_scopes)>RELEASE_TARGETS_MAX:raise ValueError('a release supersedes scopes for at most %d entries'%RELEASE_TARGETS_MAX)
+        filed=set()
+        for item in supersede_scopes:
+            if not isinstance(item,dict) or set(item)!={'task','scope'}:raise ValueError('invalid release supersede scope entry')
+            if not isinstance(item['task'],str) or not LABEL.fullmatch(item['task']):raise ValueError('invalid release supersede scope task')
+            validate_scope(item['scope'])
+            if item['scope']['environment']!=p['scope']['environment']:
+                raise ValueError('a release supersedes scopes in its own environment only')
+            key=(item['task'],content_hash(item['scope']))
+            if key in filed:raise ValueError('duplicate release supersede scope')
+            filed.add(key)
     return p
 
 
@@ -404,24 +647,26 @@ def derived_id(operation_id,label,task):
     return operation_id+'/'+label+'/'+hashlib.sha256(task.encode('utf-8')).hexdigest()[:24]
 
 
-def reverted_integrations(rows):
-    """``(task, integration_commit_lower)`` named by an operator revert record.
+def reverted_integrations(rows,operators=None,journal=None):
+    """``(task, integration_commit_lower)`` named by a HOST-ISSUED operator revert.
 
-    The revert record is a reserved native comment
-    (``Kind: integration-revert-v1``), so a raw contributor cannot write one;
-    ``review_workflow`` still honours only the host journal when it answers the
-    review reads. This reader exists so a release never records ``deployed=passed``
-    for an integration an operator has reverted.
+    This is the SAME reader every ``review``/``brief``/``work`` answer uses
+    (``review_state.reverts_by_task``), so all four agree: a revert comment is
+    honoured only when the host journal carries its matching entry and its author
+    is on the configured operator allowlist, and a host-journaled retraction
+    removes it. A raw comment written through host ``bd`` by a non-operator, or a
+    revert the operator has retracted, no longer excludes a task here.
+    ``journal`` is the project directory holding ``.integration-reverts/``;
+    without it no revert is trusted, exactly as in review.
     """
+    try:
+        from review_state import reverts_by_task
+    except ImportError:
+        return set()
+    reverts,_invalid=reverts_by_task(rows,operators,journal)
     result=set()
-    for row in rows:
-        task=row.get('id')
-        if not isinstance(task,str) or row.get('issue_type')=='event':continue
-        for comment in row.get('comments') or []:
-            text=comment.get('text') if isinstance(comment,dict) else None
-            if not isinstance(text,str) or not text.startswith(REVERT_PREFIX):continue
-            try:record=record_json.loads(text[len(REVERT_PREFIX):])
-            except ValueError:continue
+    for task,records in reverts.items():
+        for record in records:
             commit=str(record.get('integration_commit') or '').lower()
             if commit:result.add((task,commit))
     return result
@@ -440,7 +685,8 @@ def current_contribution_commits(rows):
     result={}
     for row in rows:
         if not isinstance(row,dict) or not isinstance(row.get('id'),str):continue
-        if row.get('issue_type') in ('event','gate','merge-slot'):continue
+        from coordination import is_merge_slot
+        if row.get('issue_type') in ('event','gate') or is_merge_slot(row):continue
         try:
             state=projection(records(row,None))
         except (ValueError,KeyError,TypeError):continue
@@ -450,48 +696,218 @@ def current_contribution_commits(rows):
     return result
 
 
-def release_selection(rows,scope,is_ancestor,previous_commit=None,subset=None,reverted=None,current_commits=None):
-    """What is NEW in this release, plus why everything else was left out.
+def run_advances_past(live_scope,release,is_ancestor):
+    """Does running ``release`` here ADVANCE the environment past this live scope?
 
-    ``is_ancestor(commit,release_commit)`` decides Git ancestry in the caller's
-    checkout and raises ValueError when ancestry cannot be decided. A task is a
-    target only when its chosen (newest) passing integration commit is an ancestor
-    of the release commit, is not named by an operator revert record, and has not
-    already been recorded deployed for this environment in a release that contains
-    that integration commit and is itself contained in this release. That last
-    rule is what keeps a second release from rewriting the scope and deployed fact
-    of every task ever integrated.
+    THE ONE GATE of the rev4 rule, used by both the supersede resolution and the
+    already-deployed resolution so they can never disagree:
 
-    ``previous_commit`` (a previous release commit) restricts the choice to
-    integrations recorded in ``PREV..R``: the chosen commit must be a descendant
-    of the previous release and an ancestor of this one. ``subset`` is an optional
-    set of task IDs the caller asked for. ``reverted``/``current_commits`` default
-    to the values read from the export.
+    * ``True`` exactly when the live deployment's own integration commit is an
+      ANCESTOR of R and is not R itself - R strictly contains what is live, which is
+      what makes deploying R a move forward that leaves the older deployment behind.
+      That covers the hotfix/mainline release that drops a task it does not carry.
+    * ``False`` when R is an ANCESTOR of the live commit (R is a release this
+      environment has already moved past: a redeploy of an older release, an exact
+      retry of its command, or a late ``--live-verified``), when R IS the live commit
+      (its own redeploy), when the two DIVERGE (a hotfix branch taken before the live
+      release does not replace it), and whenever ancestry cannot be decided.
 
-    Returns ``{'targets','skipped','flags'}``. ``targets`` are wire-shaped; every
-    omission is in ``skipped`` with a cause, including a task whose integrated
-    events cannot be trusted, a reverted integration, an already-deployed
-    integration and an undecidable ancestry. ``flags`` names selected targets
-    whose delivery is not the task's current contribution.
+    A ``False`` therefore means "this run writes no liveness for that task": it can
+    neither supersede it nor move it back, which is exactly review item 1 ("a run
+    without --rollback never writes live=superseded for a task it does not target when
+    its release is an ancestor of, or equal to, a release live in that environment")
+    without also silently dropping a mainline hotfix. Moving an environment backwards
+    on purpose is what ``--rollback`` is for, with its own refusals.
     """
-    release=scope['integration_commit']
-    environment=scope['environment']
-    if reverted is None:reverted=reverted_integrations(rows)
+    if live_scope is None:return False
+    commit=live_scope['scope'].get('integration_commit') or ''
+    if not COMMIT.fullmatch(commit) or commit==release:return False
+    try:return bool(is_ancestor(commit,release))
+    except ValueError:return False
+
+
+def live_scope_is_release(live_scope,scope,chosen,is_ancestor,deployed=None):
+    """Is what is live here already the deployment this run would write for the task?
+
+    THE decision both the client selection and the endpoint write plan use, so a
+    release run can never write a fact the selection said it would not write. It is
+    True when the live deployment is in the release id and environment being run and
+    it is at or past the integration this run would write - the live scope carries
+    either the chosen integration or the release commit being deployed, or it carries
+    a deployment that already contains the chosen integration. Deploying such a task
+    again changes no fact, so it is reported the pre-rev4 way ("already deployed ...;
+    not reselected") instead of being passed over as a task this run moves backwards.
+    Anything else - a newer release, a divergent branch, undecidable ancestry - is not
+    this release and the caller must leave it alone.
+    """
+    if live_scope is None:return False
+    live=live_scope['scope']
+    if not scope.get('release_id'):return False
+    if (live.get('release_id') or '')!=(scope.get('release_id') or ''):return False
+    if (live.get('environment') or '')!=(scope.get('environment') or ''):return False
+    live_commit=live.get('integration_commit') or ''
+    chosen_commit=(deployed or chosen)['scope']['integration_commit']
+    if not COMMIT.fullmatch(live_commit):return False
+    if live_commit in (chosen_commit,scope.get('integration_commit')):return True
+    # The reverse test: the live scope of the SAME release id that does NOT carry the
+    # chosen integration is a DIFFERENT deployment of this release, so this run must
+    # write under it rather than treat the task as already deployed. Ancestry is only
+    # consulted when it can decide that; an undecidable answer reads as "write".
+    if is_ancestor is not None:
+        try:
+            if not is_ancestor(live_commit,chosen_commit):return False
+        except ValueError:return False
+    return True
+
+
+def release_selection(rows,scope,is_ancestor,previous_commit=None,subset=None,reverted=None,current_commits=None,
+                      live_verified=False,operators=None,journal=None):
+    """Incremental deploy, derived from the global task/environment live state.
+
+    Choose the newest trusted integration contained in the release. A deployment
+    already carrying that integration is left at its recorded release; verification
+    may be appended there without moving it. Newer carried integrations advance,
+    and a negative newest liveness event permits restoration. Older/divergent
+    requests and tasks the release does not carry are left alone. Full membership
+    changes require explicit rollback; plain deploy is not a hotfix rollback.
+    """
+    release=scope['integration_commit'];environment=scope['environment']
+    if reverted is None:reverted=reverted_integrations(rows,operators,journal)
     if current_commits is None:current_commits=current_contribution_commits(rows)
     wanted=set(subset) if subset else None
-    targets=[];skipped=[];flags=[]
-    for entry in scoped_evidence(rows,('integrated','deployed')):
-        task=entry['id']
+    targets=[];skipped=[];flags=[];verifying=[];restoring=[]
+    for entry in scoped_evidence(rows,('integrated','deployed','live-verified',LIVE)):
+        task=entry['id'];scopes=entry['scopes']
         if wanted is not None and task not in wanted:continue
-        scopes=entry['scopes']
-        passing=[c for c in scopes if (c.get('integrated') or {}).get('value')=='passed']
-        if not passing:
-            reason=entry['untrusted'].get('integrated')
-            if reason:skipped.append({'task':task,'reason':reason})
+        chosen=None;reason=entry['untrusted'].get('integrated')
+        for candidate in sorted(scopes,key=lambda c:((c.get('integrated') or {}).get('order') or -1,
+                                                      (c.get('integrated') or {}).get('event_id') or ''),reverse=True):
+            if (candidate.get('integrated') or {}).get('value')!='passed':continue
+            commit=candidate['scope']['integration_commit']
+            if not COMMIT.fullmatch(commit):
+                reason='integration commit is not a full lowercase commit: '+str(commit);continue
+            if (task,commit.lower()) in reverted:
+                reason='integration commit was reverted by an operator revert record: '+commit;continue
+            try:
+                if previous_commit is not None and not is_ancestor(previous_commit,commit):
+                    reason='integration commit is not in the previous release..release range: '+commit;continue
+                if is_ancestor(commit,release):chosen=candidate;break
+            except ValueError as exc:reason=str(exc)
+        if chosen is None:
+            if reason or any((c.get('integrated') or {}).get('value')=='passed' for c in scopes):skipped.append({'task':task,'reason':reason or 'no passing integration commit is an ancestor of the release'})
             continue
-        deployed_scopes=[c for c in scopes if (c.get('deployed') or {}).get('value')=='passed']
+        live_scope,live_value=environment_liveness(scopes,environment)
+        active=live_scope if live_value in ('live','deployed') else None
+        if active is not None:
+            deployed_commit=active['scope']['integration_commit']
+            try:
+                carried=is_ancestor(chosen['scope']['integration_commit'],deployed_commit) and is_ancestor(deployed_commit,release)
+                forward=run_advances_past(active,release,is_ancestor)
+            except ValueError as exc:
+                skipped.append({'task':task,'reason':str(exc)});continue
+            if carried:
+                if live_verified and (active.get('live-verified') or {}).get('value')!='passed':
+                    verifying.append(task)
+                else:
+                    skipped.append({'task':task,'reason':'already deployed for %s at release %s (integration commit %s); not reselected'
+                                    %(environment,active['scope'].get('release_id') or 'unknown',deployed_commit)})
+                    continue
+            elif not forward:
+                skipped.append({'task':task,'reason':'already live in %s at release %s, which this run does not advance past; nothing to write'
+                                %(environment,active['scope'].get('release_id') or 'unknown')});continue
+        elif live_value==LIVE_SUPERSEDED:restoring.append(task)
+        target={'task':task,'source_commit':chosen['scope']['source_commit'],
+                'integration_commit':chosen['scope']['integration_commit']}
+        if task in verifying:
+            target.update(source_commit=active['scope']['source_commit'],
+                          integration_commit=active['scope']['integration_commit'],
+                          verify_scope=dict(active['scope']))
+        targets.append(target)
+        current=current_commits.get(task)
+        if current and current.lower()!=target['source_commit'].lower():
+            flags.append({'task':task,'flag':'delivery-not-current',
+                          'reason':'the deployed fact would be for delivery %s but the task\'s current contribution is %s'%(target['source_commit'],current),
+                          'delivery':dict(scope,source_commit=target['source_commit'],integration_commit=target['integration_commit']),
+                          'current_contribution':current})
+    return {'targets':sorted(targets,key=lambda t:t['task']),'skipped':sorted(skipped,key=lambda t:t['task']),
+            'flags':sorted(flags,key=lambda t:t['task']),'verify_only':sorted(verifying),
+            'supersede':[],'restored':sorted(restoring)}
+
+
+def release_targets(rows,scope,is_ancestor,previous_commit=None):
+    """Backward-compatible ``(targets, skipped)`` view of ``release_selection``."""
+    selection=release_selection(rows,scope,is_ancestor,previous_commit=previous_commit)
+    return selection['targets'],selection['skipped']
+
+
+def require_rollback_target_deployed(rows,scope):
+    """Refuse a rollback whose environment or release has no deployment (rev3 3.1).
+
+    A rollback is a move of an existing environment back to a release it once ran.
+    A rollback in an environment with nothing deployed is not a rollback at all (it
+    would act as a full deploy), and a rollback to a release that was never deployed
+    in that environment would supersede everything from an unverifiable position.
+    Both are refused before the first write, on the client and at the endpoint.
+    """
+    environment=scope['environment']
+    release_id=scope.get('release_id') or ''
+    any_deployed=False;release_deployed=False
+    for entry in scoped_evidence(rows,('deployed',)):
+        for candidate in entry['scopes']:
+            if (candidate['scope'].get('environment') or '')!=environment:continue
+            if (candidate.get('deployed') or {}).get('value')!='passed':continue
+            any_deployed=True
+            # A recorded release scope names the RELEASE by release_id (its
+            # integration_commit is the task's own integration commit), so the
+            # release identity is release_id + environment.
+            if (candidate['scope'].get('release_id') or '')==release_id:
+                release_deployed=True
+    if not any_deployed:
+        raise ValueError('refusing a rollback in %s: nothing is deployed in that environment'%environment)
+    if not release_deployed:
+        raise ValueError('refusing a rollback: release %s was never deployed in %s'%(release_id,environment))
+
+
+def rollback_selection(rows,scope,is_ancestor,reverted=None,current_commits=None,
+                       operators=None,journal=None):
+    """Explicit full membership switch to a previously deployed release.
+
+    Choose the newest passing integration event contained in R. Targets are
+    re-lived at R; tasks R does not carry get a negative liveness event. Historical
+    deployed scopes outside R are named for both carried and dropped tasks.
+    Negative writes precede final target positives, so an old positive cannot
+    revive dropped membership and the carried rollback target wins last.
+    """
+    release=scope['integration_commit'];environment=scope['environment']
+    if reverted is None:reverted=reverted_integrations(rows,operators,journal)
+    if current_commits is None:current_commits=current_contribution_commits(rows)
+    require_rollback_target_deployed(rows,scope)
+    targets=[];supersede=[];skipped=[]
+    # (task, scope token) -> the exact scope this rollback moves past. A rollback
+    # keeps R's membership and everything R contains, and stops every OTHER recorded
+    # deployment of the environment from reading live (rev4 item 2).
+    beyond={}
+    for entry in scoped_evidence(rows,('integrated','deployed','live-verified',LIVE)):
+        task=entry['id'];scopes=entry['scopes']
+        # Every recorded deployment of this environment that R does NOT contain is a
+        # scope this rollback moves past, whether the task is carried back by R or
+        # dropped by it (rev4 item 2). Collected in its own pass so a candidate that
+        # ends the selection loop early cannot hide a later scope.
+        for candidate in scopes:
+            if (candidate.get('deployed') or {}).get('value')!='passed':continue
+            if (candidate['scope'].get('environment') or '')!=environment:continue
+            dcommit=candidate['scope']['integration_commit']
+            try:within=bool(COMMIT.fullmatch(dcommit)) and is_ancestor(dcommit,release)
+            except ValueError:within=False
+            # A scope R contains is a deployment the rollback keeps; a scope R does
+            # not contain is one it moves past, unless it is already superseded
+            # (then there is nothing left to write).
+            if not within and scope_liveness(candidate)[0]!=LIVE_SUPERSEDED:
+                beyond[(task,content_hash(candidate['scope']))]={'task':task,'scope':dict(candidate['scope'])}
         chosen=None;reason=None
-        for candidate in passing:
+        for candidate in sorted(scopes,key=lambda c:((c.get('integrated') or {}).get('order') or -1,
+                                                      (c.get('integrated') or {}).get('event_id') or ''),reverse=True):
+            if (candidate.get('integrated') or {}).get('value')!='passed':continue
             commit=candidate['scope']['integration_commit']
             if not COMMIT.fullmatch(commit):
                 reason=reason or 'integration commit is not a full lowercase commit: '+str(commit)
@@ -499,59 +915,42 @@ def release_selection(rows,scope,is_ancestor,previous_commit=None,subset=None,re
             if (task,commit.lower()) in reverted:
                 reason=reason or 'integration commit was reverted by an operator revert record: '+commit
                 continue
-            if previous_commit is not None:
-                try:after_previous=is_ancestor(previous_commit,commit)
-                except ValueError as exc:
-                    reason=reason or str(exc);continue
-                if not after_previous:
-                    reason=reason or 'integration commit is not in the previous release..release range: '+commit
-                    continue
             try:ancestor=is_ancestor(commit,release)
             except ValueError as exc:
                 reason=reason or str(exc);continue
             if ancestor:chosen=candidate;break
-            reason=reason or 'no passing integration commit is an ancestor of the release'
-        if chosen is None:
-            skipped.append({'task':task,'reason':reason or 'no passing integration commit is an ancestor of the release'})
+            reason=reason or 'no passing integration commit is an ancestor of the rollback release'
+        if chosen is not None:
+            targets.append({'task':task,'source_commit':chosen['scope']['source_commit'],
+                            'integration_commit':chosen['scope']['integration_commit']})
             continue
-        already=None
-        for candidate in deployed_scopes:
-            deployed_commit=candidate['scope']['integration_commit']
-            if (candidate['scope'].get('environment') or '')!=environment:continue
-            if not COMMIT.fullmatch(deployed_commit):continue
-            if (task,deployed_commit.lower()) in reverted:continue
-            try:
-                contains=is_ancestor(chosen['scope']['integration_commit'],deployed_commit)
-                within=is_ancestor(deployed_commit,release)
-            except ValueError:
-                continue
-            if contains and within:
-                already=candidate;break
-        if already is not None:
-            skipped.append({'task':task,'reason':'already deployed for %s at release %s (integration commit %s); not reselected'
-                            %(environment,already['scope'].get('release_id') or 'unknown',
-                              already['scope']['integration_commit'])})
+        # Not part of R. Supersede it only when it is live in THIS environment (its
+        # own history, whichever scope is newest overall) at a release R does not
+        # contain. A task with no deployment here is left alone, and a task live in
+        # another environment is not touched by this rollback (rev3 item 1/4.1c).
+        live_scope,live_value=environment_liveness(scopes,environment)
+        if live_value==LIVE_SUPERSEDED:continue
+        if live_scope is None:
+            if reason:skipped.append({'task':task,'reason':reason})
             continue
-        target={'task':task,'source_commit':chosen['scope']['source_commit'],
-                'integration_commit':chosen['scope']['integration_commit']}
-        targets.append(target)
-        current=current_commits.get(task)
-        if current and current.lower()!=target['source_commit'].lower():
-            flags.append({'task':task,'flag':'delivery-not-current',
-                          'reason':('the deployed fact would be for delivery %s but the task\'s current contribution is %s'
-                                    %(target['source_commit'],current)),
-                          'delivery':{'release_id':scope['release_id'],'environment':environment,
-                                      'source_commit':target['source_commit'],
-                                      'integration_commit':target['integration_commit']},
-                          'current_contribution':current})
-    targets.sort(key=lambda t:t['task']);skipped.sort(key=lambda s:s['task']);flags.sort(key=lambda f:f['task'])
-    return {'targets':targets,'skipped':skipped,'flags':flags}
-
-
-def release_targets(rows,scope,is_ancestor,previous_commit=None):
-    """Backward-compatible ``(targets, skipped)`` view of ``release_selection``."""
-    selection=release_selection(rows,scope,is_ancestor,previous_commit=previous_commit)
-    return selection['targets'],selection['skipped']
+        dcommit=live_scope['scope'].get('integration_commit') or ''
+        try:within=COMMIT.fullmatch(dcommit) and is_ancestor(dcommit,release)
+        except ValueError:within=False
+        if within:
+            skipped.append({'task':task,'reason':'already live in %s at a release contained in the rollback target'%environment})
+            continue
+        supersede.append(task)
+    targets.sort(key=lambda t:t['task']);supersede=sorted(set(supersede));skipped.sort(key=lambda s:s['task'])
+    # A task this rollback CARRIES is a target, so it is never named by the
+    # task-level `supersede` (which would be refused as an overlap); the newer
+    # deployment scopes the rollback moves past for it are named scope by scope
+    # instead. That is what leaves exactly ONE live row for the task (rev4 item 2).
+    carried={item['task'] for item in targets}
+    supersede=sorted(set(supersede)-carried)
+    superseded_scopes=sorted(beyond.values(),
+                             key=lambda item:(item['task'],item['scope']['release_id']))
+    return {'targets':targets,'supersede':supersede,'supersede_scopes':superseded_scopes,
+            'skipped':skipped}
 
 
 def git_ancestry(repo):
@@ -609,7 +1008,7 @@ def _operation_index(rows):
     return index
 
 
-def _apply_fact(payload,actor,rows,run,current_scope,op_index,issues):
+def _apply_fact(payload,actor,rows,run,current_scope,op_index,issues,recorded=None):
     """One native fact write against an already-read export (``rows``).
 
     Identical to the single-fact path: an exact operation-ID retry reconciles, a
@@ -618,6 +1017,11 @@ def _apply_fact(payload,actor,rows,run,current_scope,op_index,issues):
     through an intermediate value when it already shows the target. The passed
     ``rows``/``op_index``/``issues`` view is updated after a committed write so a
     release batch never pays for a second full export.
+
+    ``recorded`` is the set of scope tokens already recorded for the task. A fact
+    whose scope is one of them is accepted even when it is not the task's CURRENT
+    scope, so evidence for an older release can be recorded without moving what is
+    live (rev2 item 3). A scope that was never recorded is still refused.
     """
     prior=op_index.get(payload['operation_id'])
     if prior is not None:
@@ -630,7 +1034,8 @@ def _apply_fact(payload,actor,rows,run,current_scope,op_index,issues):
         if fix is None or fix.get('issue_type')=='event':
             raise ValueError('unknown defect_task: '+payload['defect_task'])
     if payload['dimension']!='lifecycle-scope' and current_scope!=payload['scope']:
-        raise ValueError('set matching lifecycle scope before recording facts')
+        if recorded is None or content_hash(payload['scope']) not in recorded:
+            raise ValueError('set matching lifecycle scope before recording facts')
     dim,value=payload['dimension'],payload['value']
     if dim+':'+value in (issue.get('labels') or []):
         intermediate='pending' if value!='pending' else 'unknown'
@@ -647,119 +1052,405 @@ def _apply_fact(payload,actor,rows,run,current_scope,op_index,issues):
     return result
 
 
-def apply_release(payload,actor,run):
-    """One release-level write: record deployed (and optionally live-verified).
+def _release_plan(rows,payload,operators=None,journal=None):
+    """Resolve and verify the complete target write plan without writes.
 
-    One export serves the whole request. Every target is verified against it
-    before the first native write, and every derived operation ID is checked for a
-    conflicting planted fact before the first write too, so a stale target or a
-    used ID refuses the whole release and nothing is written. Each target then gets
-    the release scope recorded only when it differs from the task's current scope,
-    followed by ``deployed=passed`` carrying the shared evidence block and the
-    target's optional note (ONLY on the deployed fact: the scope event keeps
-    exactly the four scope fields, so an older strict reader still reads it) and
-    ``live-verified=passed`` when the payload asks for it. Deterministic per-task
-    operation IDs make an exact retry reconcile; changed content needs a new ID.
-
-    Ancestry is NOT decided here. The endpoint re-verifies that each target is
-    integrated at the commits named in its own export; whether that commit is an
-    ancestor of the release commit is decided by git in the caller's checkout (see
-    ``release_selection``), exactly like ``commit``/``base_commit`` in contribution
-    review.
+    Every target must have passing integration evidence at the named source and
+    integration commits. An optional client verify_scope must still be the live
+    recorded deployment. Historical explicit verification keeps its evidence
+    contract without moving the current scope; a superseded deployment instead
+    receives a new live fact before verification. Target positives are planned
+    after any negative scope writes for the same task.
     """
-    validate_release_payload(payload)
-    if payload['actor']!=actor:raise ValueError('payload actor must match request actor')
-    rows=[json.loads(x) for x in run(['export','--all']).splitlines() if x.strip()]
     issues={row['id']:row for row in rows if row.get('issue_type')!='event'}
     facts={state['id']:state for state in project_facts(rows)}
-    evidence={entry['id']:entry for entry in scoped_evidence(rows,('integrated','deployed'))}
-    reverted=reverted_integrations(rows)
-    current=current_contribution_commits(rows)
-    selected=[]
+    evidence={entry['id']:entry for entry in
+              scoped_evidence(rows,('integrated','deployed','live-verified',LIVE))}
+    reverted=reverted_integrations(rows,operators,journal)
+    selected=[];plans={}
     for target in sorted(payload['targets'],key=lambda t:t['task']):
         task=target['task']
         if issues.get(task) is None:raise ValueError('unknown release target: '+task)
-        match=next((c for c in evidence.get(task,{}).get('scopes',[])
+        scopes=evidence.get(task,{}).get('scopes',[])
+        match=next((c for c in scopes
                     if (c.get('integrated') or {}).get('value')=='passed'
                     and c['scope']['integration_commit']==target['integration_commit']
                     and c['scope']['source_commit']==target['source_commit']),None)
         if match is None:raise ValueError('release target is not integrated at that commit: '+task)
         if (task,target['integration_commit'].lower()) in reverted:
             raise ValueError('release target integration commit was reverted by an operator revert record: '+task)
-        scope=dict(match['scope'])
-        scope['release_id']=payload['scope']['release_id']
-        scope['environment']=payload['scope']['environment']
-        selected.append((target,scope))
-    # Build every write and check every derived ID before the first native write.
-    plans={}
-    for target,scope in selected:
-        task=target['task']
-        common=dict(schema_version=1,task=task,scope=scope,evidence=list(payload['evidence']),
+        release_scope=dict(match['scope'])
+        release_scope['release_id']=payload['scope']['release_id']
+        release_scope['environment']=payload['scope']['environment']
+        live_scope,live_value=environment_liveness(scopes,release_scope['environment'])
+        def same_release(candidate):
+            return ((candidate['scope'].get('environment') or '')==release_scope['environment']
+                    and (candidate['scope'].get('release_id') or '')==release_scope['release_id']
+                    and candidate['scope']['integration_commit']==target['integration_commit']
+                    and candidate['scope']['source_commit']==target['source_commit'])
+        current_scope=facts[task]['scope']
+        at_current=current_scope==release_scope
+        already=next((c for c in scopes if (c.get('deployed') or {}).get('value')=='passed'
+                      and same_release(c)),None)
+        verified=next((c for c in scopes if (c.get('live-verified') or {}).get('value')=='passed'
+                       and same_release(c)),None)
+        is_live=live_value in ('live','deployed') and live_scope['scope']==release_scope
+        if any(item['task']==task for item in payload.get('supersede_scopes') or []):is_live=False
+        common=dict(schema_version=1,task=task,scope=release_scope,evidence=list(payload['evidence']),
                     provenance=payload['provenance'],actor=payload['actor'])
+        # Already deployed here and only the verification is owed: record that
+        # evidence against the scope that really carries the deployment and touch
+        # nothing else (rev4 item 3 (3)). The release scope is used only when no
+        # recorded scope of this task carries this exact deployment, so a task
+        # deployed at an earlier release and verified from a later one no longer has
+        # its `live-verified` fact filed under the later release.
+        verify_only=(already is not None and payload['live_verified'] and not payload.get('rollback')
+                     and live_value in ('live','deployed') and not scope_is_superseded(already))
+        # The client explicitly binds an incremental verification to the currently
+        # live recorded scope. A direct target with no binding retains the historical
+        # release contract; it is never silently redirected to a different release.
+        if 'verify_scope' in target:
+            if live_value not in ('live','deployed') or live_scope['scope']!=target['verify_scope']:
+                raise ValueError('verification target is no longer live; get a fresh export')
+            if (live_scope.get('deployed') or {}).get('value')!='passed':
+                raise ValueError('verification target has no passed deployment')
+            release_scope=dict(live_scope['scope']);common['scope']=release_scope
+            already=live_scope
+            verified=live_scope if (live_scope.get('live-verified') or {}).get('value')=='passed' else None
+            is_live=True;verify_only=True
+        fact_scope=release_scope
+        if verify_only:
+            exact_deployed=next((c for c in scopes if (c.get('deployed') or {}).get('value')=='passed'
+                                 and c['scope']==release_scope),None)
+            fact_scope=(exact_deployed or already or {}).get('scope') or release_scope
         plan=[]
-        if facts[task]['scope']!=scope:
-            plan.append(dict(common,operation_id=derived_id(payload['operation_id'],'scope',task),
-                             dimension='lifecycle-scope',value=content_hash(scope)))
-        deployed=dict(common,operation_id=derived_id(payload['operation_id'],'deployed',task),
-                      dimension='deployed',value='passed')
-        if 'note' in target:deployed['note']=target['note']
-        plan.append(deployed)
-        if payload['live_verified']:
-            plan.append(dict(common,operation_id=derived_id(payload['operation_id'],'verified',task),
-                             dimension='live-verified',value='passed'))
+        if verify_only:
+            if verified is None:
+                plan.append((fact_scope,dict(common,operation_id=derived_id(payload['operation_id'],'verified',task),
+                                             dimension='live-verified',value='passed')))
+        else:
+            if not at_current:
+                plan.append((None,dict(common,operation_id=derived_id(payload['operation_id'],'scope',task),
+                                       dimension='lifecycle-scope',value=content_hash(release_scope))))
+            if not (at_current and already is not None):
+                deployed=dict(common,operation_id=derived_id(payload['operation_id'],'deployed',task),
+                              dimension='deployed',value='passed')
+                if 'note' in target:deployed['note']=target['note']
+                plan.append((release_scope,deployed))
+            if not is_live:
+                plan.append((release_scope,dict(common,operation_id=derived_id(payload['operation_id'],'live',task),
+                                                dimension=LIVE,value='live')))
+            if payload['live_verified'] and verified is None:
+                plan.append((release_scope,dict(common,operation_id=derived_id(payload['operation_id'],'verified',task),
+                                                dimension='live-verified',value='passed')))
+        selected.append({'target':target,'release_scope':release_scope,'already':already,
+                         'verified':verified,'verify_only':verify_only})
         plans[task]=plan
+    return selected,plans,issues,evidence
+
+
+def _supersede_plan(rows,payload,issues=None,evidence=None):
+    """Read-only: the ``live=superseded`` write for every task a release drops.
+
+    ``payload['supersede']`` names tasks the client resolved as no longer live in
+    the payload's environment. Each must exist, must not be a target of the same
+    release, and must be live there according to THAT ENVIRONMENT'S scope history
+    (``environment_liveness``, rev3 item 1) - not according to the task's single
+    newest scope, so a task deployed to production and then to staging can still be
+    superseded in production. The fact is written under the environment's live
+    scope, which may be older than the task's current scope; a task already recorded
+    ``superseded`` there is a no-op, so an exact retry reconciles. Returns a list of
+    ``(task,planned_payload)``; evidence events are untouched.
+    """
+    if issues is None:
+        issues={row['id']:row for row in rows if row.get('issue_type')!='event'}
+    if evidence is None:
+        evidence={entry['id']:entry for entry in
+                  scoped_evidence(rows,('integrated','deployed','live-verified',LIVE))}
+    environment=payload['scope']['environment']
+    target_tasks={target['task'] for target in payload.get('targets') or []}
+    planned=[]
+    for task in sorted(payload.get('supersede') or []):
+        issue=issues.get(task)
+        if issue is None or issue.get('issue_type')=='event':
+            raise ValueError('unknown release supersede task: '+task)
+        if task in target_tasks:
+            raise ValueError('a task cannot be both a release target and superseded: '+task)
+        live_scope,live_value=environment_liveness(evidence.get(task,{}).get('scopes',[]),environment)
+        if live_value==LIVE_SUPERSEDED:
+            continue
+        if live_scope is None:
+            raise ValueError('release supersede task is not deployed in %s: %s'%(environment,task))
+        planned.append((task,dict(schema_version=1,task=task,scope=live_scope['scope'],
+                                  evidence=list(payload['evidence']),provenance=payload['provenance'],
+                                  actor=payload['actor'],
+                                  operation_id=derived_id(payload['operation_id'],'superseded',task),
+                                  dimension=LIVE,value=LIVE_SUPERSEDED)))
+    return planned
+
+
+def derived_scope_id(operation_id,task,scope):
+    """A deterministic per-(task, scope) operation ID, so an exact retry reconciles.
+
+    A rollback may move the same task past more than one recorded deployment, so the
+    scope-level supersede needs an ID that names the SCOPE as well as the task.
+    """
+    token=operation_id+'/superseded-scope/'+task+'/'+content_hash(scope)[:24]
+    if len(token)<=161:return token
+    return operation_id+'/superseded-scope/'+content_hash({'task':task,'scope':scope})[:32]
+
+
+def _supersede_scope_plan(rows,payload,issues=None,evidence=None):
+    """Read-only: the ``live=superseded`` write for every scope a run moves past.
+
+    ``payload['supersede_scopes']`` names recorded SCOPES (rev4 item 2). Each entry's
+    task must exist, the scope must be a scope that task already has recorded IN THE
+    PAYLOAD'S ENVIRONMENT (``_apply_fact`` accepts a fact under any recorded scope of
+    the task), and it must be a real deployment there: ``deployed=passed``. The
+    environment check runs twice - the payload shape, and the recorded scope - because
+    a rollback in one environment must never touch another's row. A scope already
+    recorded ``superseded`` is a no-op, so an exact retry reconciles. Unlike the
+    task-level ``supersede``, a TARGET may be named here: the rollback re-lives the
+    task at R while marking the newer deployment it moves past. Returns a list of
+    ``(task,planned_payload)``; evidence events are untouched.
+    """
+    if issues is None:
+        issues={row['id']:row for row in rows if row.get('issue_type')!='event'}
+    if evidence is None:
+        evidence={entry['id']:entry for entry in
+                  scoped_evidence(rows,('integrated','deployed','live-verified',LIVE))}
+    environment=payload['scope']['environment']
+    planned=[]
+    for item in payload.get('supersede_scopes') or []:
+        task=item['task'];wanted=item['scope']
+        issue=issues.get(task)
+        if issue is None or issue.get('issue_type')=='event':
+            raise ValueError('unknown release supersede scope task: '+task)
+        recorded=next((c for c in evidence.get(task,{}).get('scopes',[]) if c['scope']==wanted),None)
+        if recorded is None:
+            raise ValueError('release supersede scope is not a recorded scope of %s: %s/%s'
+                             %(task,wanted.get('release_id') or 'unknown',wanted.get('integration_commit') or ''))
+        if (recorded['scope'].get('environment') or '')!=environment:
+            raise ValueError('release supersede scope is not in environment %s: %s'%(environment,task))
+        if (recorded.get('deployed') or {}).get('value')!='passed':
+            raise ValueError('release supersede scope is not a deployment of %s: %s'%(task,environment))
+        if (recorded.get(LIVE) or {}).get('value')==LIVE_SUPERSEDED:continue
+        planned.append((task,dict(schema_version=1,task=task,scope=dict(recorded['scope']),
+                                  evidence=list(payload['evidence']),provenance=payload['provenance'],
+                                  actor=payload['actor'],
+                                  operation_id=derived_scope_id(payload['operation_id'],task,recorded['scope']),
+                                  dimension=LIVE,value=LIVE_SUPERSEDED)))
+    return planned
+
+
+def _check_release_identity(payload,op_index):
+    """Bind reused release IDs to their original release/environment before writes."""
+    prefix=payload['operation_id']+'/'
+    for operation,(prior,_event) in op_index.items():
+        if not operation.startswith(prefix):continue
+        if prior['dimension'] not in ('lifecycle-scope','deployed'):continue
+        if any(prior['scope'][key]!=payload['scope'][key] for key in ('release_id','environment')):
+            raise ValueError('operation ID already used for different content (release/environment); a new operation ID is needed: '+payload['operation_id'])
+
+
+def _check_release_operations(plans,negative,op_index,evidence):
+    """Check every receipt before writing, including historical liveness retries."""
+    identities={}
+    for planned in [p for plan in plans.values() for _,p in plan]+[p for _,p in negative]:
+        earlier=identities.setdefault(planned['operation_id'],planned)
+        if earlier!=planned:raise ValueError('operation ID already used for different content in the same plan; a new operation ID is needed')
+        prior=op_index.get(planned['operation_id'])
+        if prior is None:continue
+        if prior[0]!=planned:
+            raise ValueError('operation ID already used for different content; a new operation ID is needed: '+planned['operation_id'])
+        if planned['dimension']!=LIVE:continue
+        current,value=environment_liveness(evidence.get(planned['task'],{}).get('scopes',[]),
+                                           planned['scope']['environment'])
+        effective=(current is not None and current['scope']==planned['scope'] and value==planned['value'])
+        if planned['value']=='live' and any(p['task']==planned['task'] for _,p in negative):effective=False
+        if not effective:
+            raise ValueError('operation ID was already used for a state that has since changed; a new operation ID is needed: '+planned['operation_id'])
+
+
+def apply_release(payload,actor,run,operators=None,journal=None):
+    """Preflight one release against one native export, then apply its facts.
+
+    Validate all target/supersede identities, integrations, scopes and derived
+    operation receipts before the first write. Historical liveness receipts whose
+    state changed are refused with a new-ID instruction. Negative facts are written
+    first, then target scopes/deployed/live facts and optional verification. All
+    native facts keep the old payload shape; verify_scope exists only on requests.
+    Git membership is decided in the client's checkout; the endpoint rechecks
+    integration evidence, the live verification binding, and recorded scopes.
+    Retries of interrupted native writes reconcile still-current facts. A backend
+    failure may leave partial writes, so callers take a fresh export before retry.
+    """
+    validate_release_payload(payload,require_targets=not (payload.get('rollback')
+                                                          or payload.get('supersede')
+                                                          or payload.get('supersede_scopes')))
+    # A release that covers no new target must at least be a STATED move: a rollback,
+    # a task-level supersede, or the scope-level list a rollback uses to move past a
+    # task's own newer deployment (rev4 item 2). Nothing else may write a release that
+    # covers and moves nothing at all.
+    if not payload.get('targets') and not (payload.get('rollback') or payload.get('supersede')
+                                           or payload.get('supersede_scopes')):
+        raise ValueError('a release needs at least one integrated target')
+    if payload['actor']!=actor:raise ValueError('payload actor must match request actor')
+    rows=[json.loads(x) for x in run(['export','--all']).splitlines() if x.strip()]
+    if payload.get('rollback'):require_rollback_target_deployed(rows,payload['scope'])
+    selected,plans,issues,evidence=_release_plan(rows,payload,operators,journal)
+    superseded=_supersede_plan(rows,payload,issues,evidence)
+    superseded_scopes=_supersede_scope_plan(rows,payload,issues,evidence)
+    current=current_contribution_commits(rows)
     op_index=_operation_index(rows)
-    for task,plan in plans.items():
-        for planned in plan:
-            prior=op_index.get(planned['operation_id'])
-            if prior is not None and prior[0]!=planned:
-                raise ValueError('operation ID already used for different content: '+planned['operation_id'])
+    _check_release_identity(payload,op_index)
+    _check_release_operations(plans,superseded+superseded_scopes,op_index,evidence)
+    # Scope tokens already recorded for a task, so a verify-only fact under the
+    # release's older scope, and a per-environment supersede under the environment's
+    # live scope, are accepted without moving the task's current scope (item 3,
+    # rev3 item 1). The SINGLE-fact path deliberately does not get this relaxation.
+    recorded=recorded_scope_tokens(rows)
+    supersede_results=[]
+    for task,planned in superseded:
+        result=_apply_fact(planned,actor,rows,run,planned['scope'],op_index,issues,
+                           recorded=recorded.get(task))
+        supersede_results.append({'task':task,'live':result.get('event_id'),
+                                  'scope':dict(planned['scope']),
+                                  'reconciled':bool(result.get('reconciled'))})
+    superseded_scope_results=[]
+    for task,planned in superseded_scopes:
+        result=_apply_fact(planned,actor,rows,run,planned['scope'],op_index,issues,
+                           recorded=recorded.get(task))
+        superseded_scope_results.append({'task':task,'live':result.get('event_id'),
+                                         'scope':dict(planned['scope']),
+                                         'reconciled':bool(result.get('reconciled'))})
     results=[]
-    for target,scope in selected:
-        task=target['task']
-        plan=plans[task]
-        scope_planned=plan[0]['dimension']=='lifecycle-scope'
-        offset=1 if scope_planned else 0
-        recorded={'task':task,'scope_recorded':scope_planned,'deployed':None,'live_verified':None,
-                  'reconciled':False,
-                  'delivery':{'release_id':scope['release_id'],'environment':scope['environment'],
-                              'source_commit':scope['source_commit'],
-                              'integration_commit':scope['integration_commit']}}
-        if scope_planned:
-            scope_result=_apply_fact(plan[0],actor,rows,run,None,op_index,issues)
-            recorded['reconciled']=recorded['reconciled'] or bool(scope_result.get('reconciled'))
-        deployed_result=_apply_fact(plan[offset],actor,rows,run,scope,op_index,issues)
-        recorded['deployed']=deployed_result['event_id']
-        recorded['reconciled']=recorded['reconciled'] or bool(deployed_result.get('reconciled'))
-        if payload['live_verified']:
-            verified_result=_apply_fact(plan[offset+1],actor,rows,run,scope,op_index,issues)
-            recorded['live_verified']=verified_result['event_id']
-            recorded['reconciled']=recorded['reconciled'] or bool(verified_result.get('reconciled'))
+    for entry in selected:
+        target=entry['target'];release_scope=entry['release_scope']
+        task=target['task'];plan=plans[task]
+        recorded_row={'task':task,'scope_recorded':False,'deployed':None,'live':None,'live_verified':None,
+                      'reconciled':not plan,'already_deployed':entry['already'] is not None,
+                      'verify_only':entry['verify_only'],
+                      'delivery':{'release_id':release_scope['release_id'],
+                                  'environment':release_scope['environment'],
+                                  'source_commit':release_scope['source_commit'],
+                                  'integration_commit':release_scope['integration_commit']}}
+        for fact_scope,planned in plan:
+            result=_apply_fact(planned,actor,rows,run,fact_scope,op_index,issues,
+                               recorded=recorded.get(task))
+            if planned['dimension']=='lifecycle-scope':
+                recorded_row['scope_recorded']=True
+            elif planned['dimension']=='deployed':
+                recorded_row['deployed']=result['event_id']
+            elif planned['dimension']==LIVE:
+                recorded_row['live']=result['event_id']
+            elif planned['dimension']=='live-verified':
+                recorded_row['live_verified']=result['event_id']
+            recorded_row['reconciled']=recorded_row['reconciled'] or bool(result.get('reconciled'))
         current_commit=current.get(task)
-        if current_commit and current_commit.lower()!=scope['source_commit'].lower():
-            recorded['flag']='delivery-not-current'
-            recorded['current_contribution']=current_commit
-            recorded['flag_reason']=('the deployed fact is for delivery %s but the task\'s current contribution is %s'
-                                     %(scope['source_commit'],current_commit))
-        results.append(recorded)
+        if current_commit and current_commit.lower()!=release_scope['source_commit'].lower():
+            recorded_row['flag']='delivery-not-current'
+            recorded_row['current_contribution']=current_commit
+            recorded_row['flag_reason']=('the deployed fact is for delivery %s but the task\'s current contribution is %s'
+                                         %(release_scope['source_commit'],current_commit))
+        results.append(recorded_row)
     return {'operation_id':payload['operation_id'],'release_id':payload['scope']['release_id'],
             'environment':payload['scope']['environment'],'targets':results,
+            'rollback':bool(payload.get('rollback')),
+            'superseded':supersede_results,
+            'superseded_scopes':superseded_scope_results,
             'reader_note':SCOPE_ROLL_NOTE,
             'ancestry_note':('Ancestry/membership in the release is checked by git in the caller\'s checkout '
                              '(lifecycle.py release --repo); this endpoint re-verifies only that each target is '
                              'integrated at the commits named, in its own export.')}
 
 
-def apply_native(payload, actor, run):
+def validate_query_payload(p):
+    """A read-only release pre-flight: the release shape, no writes.
+
+    The client sends it so the endpoint, which always has the host journal and the
+    operator allowlist, answers which integrations are reverted (item 5). Exactly
+    the release field set, so it can never carry an unknown field into a write path.
+    """
+    if not isinstance(p,dict) or set(p)!=RELEASE_FIELDS:raise ValueError('invalid release query payload')
+    if type(p['schema_version']) is not int or p['schema_version']!=1:raise ValueError('invalid release query payload')
+    for key in ('operation_id','actor'):
+        if not isinstance(p[key],str) or not LABEL.fullmatch(p[key]) or len(p[key])>RELEASE_OPERATION_MAX:raise ValueError('invalid '+key)
+    if p['dimension']!=RELEASE_QUERY:raise ValueError('invalid lifecycle dimension')
+    validate_scope(p['scope'])
+    if not p['scope']['environment'].strip():raise ValueError('a release query needs an environment')
+    return p
+
+
+def release_query(payload,actor,run,operators=None,journal=None):
+    """Read-only endpoint answer for the release pre-flight (rev2 item 5).
+
+    Returns the host-issued reverted ``(task, integration_commit)`` set - the same
+    reader ``review`` uses - and the recorded live releases for the environment.
+    Writes nothing and touches no journal.
+
+    ``live_releases`` is decided PER TASK PER ENVIRONMENT from the scope history
+    (rev3 item 3.5): the previous reader looked only at each task's newest live
+    scope and gave up when that scope was in another environment, so an environment
+    that had live tasks reported none. A pre-liveness ``deployed=passed`` scope is
+    reported too, under the value it really is, so an upgraded kit does not invent a
+    ``live`` fact that was never written. That legacy branch is reachable only when
+    the scope read asks for ``deployed`` as well as ``LIVE`` (rev4 item 3 (1)): the
+    previous call asked for the live dimension alone, so the documented branch could
+    never fire and no test could tell.
+    """
+    validate_query_payload(payload)
+    if payload['actor']!=actor:raise ValueError('payload actor must match request actor')
+    rows=[json.loads(x) for x in run(['export','--all']).splitlines() if x.strip()]
+    environment=payload['scope']['environment']
+    reverted=sorted(reverted_integrations(rows,operators,journal))
+    live=[]
+    seen=set()
+    for entry in scoped_evidence(rows,(LIVE,'deployed')):
+        task=entry['id']
+        scope,value=environment_liveness(entry['scopes'],environment)
+        if scope is None or value not in ('live','deployed'):continue
+        # One row PER TASK and environment (rev4): two tasks live at the same release
+        # and integration commit are two live rows, so the key names the task as well.
+        key=(task,scope['scope'].get('release_id') or '',scope['scope'].get('integration_commit') or '')
+        if key in seen:continue
+        seen.add(key)
+        live.append({'task':task,'release_id':key[1],'integration_commit':key[2],'liveness':value})
+    return {'schema_version':1,'dimension':RELEASE_QUERY,'query':True,
+            'environment':environment,
+            'reverted':[{'task':task,'integration_commit':commit} for task,commit in reverted],
+            'live_releases':live}
+
+
+def apply_native(payload, actor, run, operators=None, journal=None):
     """Caller holds project lock; run(argv) invokes pinned bd and returns stdout."""
-    if isinstance(payload,dict) and payload.get('dimension')==RELEASE:return apply_release(payload,actor,run)
+    if isinstance(payload,dict) and payload.get('dimension')==RELEASE_QUERY:
+        return release_query(payload,actor,run,operators,journal)
+    if isinstance(payload,dict) and payload.get('dimension')==RELEASE:
+        return apply_release(payload,actor,run,operators,journal)
     validate_payload(payload)
     if payload['actor']!=actor:raise ValueError('payload actor must match request actor')
     rows=[json.loads(x) for x in run(['export','--all']).splitlines() if x.strip()]
     issues={row['id']:row for row in rows if row.get('issue_type')!='event'}
     state=next((r for r in project_facts(rows) if r['id']==payload['task']),None)
-    return _apply_fact(payload,actor,rows,run,state['scope'] if state else None,
+    current_scope=state['scope'] if state else None
+    # A SINGLE fact must name the task's CURRENT scope: a fact recorded under an
+    # older, previously recorded scope is refused here with main's rule (rev3 item
+    # 2). Only the release operation may write a fact under an already-recorded
+    # older scope - a verify-only target or a per-environment supersede; see
+    # apply_release and docs/OPERATIONAL_WORKFLOW.md.
+    return _apply_fact(payload,actor,rows,run,current_scope,
                        _operation_index(rows),issues)
+
+
+def recorded_scope_tokens(rows):
+    """``{task: {scope token, ...}}`` for every recorded trusted scope.
+
+    One pass over the export, shared by the single-fact and release paths so a fact
+    may be recorded against any scope a task already has, not only its newest.
+    """
+    return {entry['id']:{content_hash(c['scope']) for c in entry['scopes']}
+            for entry in scoped_evidence(rows,())}
 
 
 def _declared_targets(raw):
@@ -789,6 +1480,9 @@ def main():
     for name in ('config','project','actor','file','export','repo'):release.add_argument('--'+name,required=True)
     release.add_argument('--live-verified',action='store_true')
     release.add_argument('--dry-run',action='store_true')
+    # An explicit rollback (rev2 item 2): move the environment's live release back to
+    # this release and mark the tasks it does not carry as no longer live.
+    release.add_argument('--rollback',action='store_true')
     # A caller subset, a previous release to select PREV..R, paging past the bound,
     # and the request group size (the lock is released between groups).
     release.add_argument('--target',action='append',default=None)
@@ -796,6 +1490,11 @@ def main():
     release.add_argument('--page',type=int,default=1)
     release.add_argument('--page-size',type=int)
     release.add_argument('--chunk-size',type=int,default=RELEASE_CHUNK_DEFAULT)
+    # The project directory holding the host journal (.integration-reverts/). When
+    # given, revert records are read with the SAME operator/journal rule as review;
+    # without it (a remote worker usually cannot read the host journal) no revert
+    # is trusted locally and the endpoint, which always has both, is authoritative.
+    release.add_argument('--journal')
     view=sub.add_parser('list');view.add_argument('--export',required=True);view.add_argument('--implemented-not-deployed',action='store_true')
     owed=sub.add_parser('evidence-owed');owed.add_argument('--export',required=True)
     a=parser.parse_args()
@@ -813,17 +1512,72 @@ def main():
             if not isinstance(data,dict):raise ValueError('invalid release payload')
             data['live_verified']=bool(data.get('live_verified',False))
             if a.live_verified:data['live_verified']=True
+            data['rollback']=bool(data.get('rollback',False)) or a.rollback
             declared,declared_identity=_declared_targets(data.get('targets') or [])
             subset=sorted(set(declared)|set(a.target or []))
             if a.page<1:raise ValueError('--page must be >= 1')
             if a.page_size is not None and a.page_size<1:raise ValueError('--page-size must be >= 1')
-            validate_release_payload(dict(data,targets=[]),require_targets=False)
+            check=dict(data,targets=[])
+            validate_release_payload(check,require_targets=False)
+            if data['rollback'] and subset:
+                raise ValueError('--target/--rollback cannot be combined: a rollback resolves its own targets')
             rows=read_export(a.export)
-            selection=release_selection(rows,data['scope'],git_ancestry(a.repo),
-                                        previous_commit=a.previous_release_commit,
-                                        subset=set(subset) if subset else None,
-                                        current_commits=current_contribution_commits(rows))
-            targets=selection['targets'];skipped=list(selection['skipped'])
+            journal=a.journal or None
+            is_ancestor=git_ancestry(a.repo)
+            config=load_json(a.config)
+            warnings=[]
+            # The default (writing) command is endpoint-authoritative about
+            # host-issued reverts (item 5): it asks the endpoint, which always has
+            # the host journal and the operator allowlist, instead of trusting a
+            # caller-side journal. A dry run stays offline and views reverts locally
+            # (pass --journal PROJECT for a host-accurate dry run).
+            endpoint_reverts=None
+            if not a.dry_run:
+                query=dict(data,dimension=RELEASE_QUERY,targets=[],live_verified=False,
+                           operation_id=(data['operation_id'][:RELEASE_OPERATION_MAX-6]+'/query'))
+                query.pop('rollback',None);query.pop('supersede',None)
+                query.pop('supersede_scopes',None)
+                try:
+                    answer=request(config,a.project,a.actor,[canonical_bytes(query).decode()],action='lifecycle')
+                    if answer['returncode']:raise ValueError(answer['stderr'])
+                    endpoint_reverts={(item['task'],str(item['integration_commit']).lower())
+                                      for item in (json.loads(answer['stdout']).get('reverted') or [])}
+                except (ValueError,OSError,RuntimeError) as exc:
+                    warnings.append('the endpoint could not be asked which integrations are reverted (%s); '
+                                    'using the local journal view instead'%exc)
+            # --previous-release-commit must be a full lowercase commit that really is
+            # an ancestor of R and is not R itself: HEAD, a short or uppercase commit,
+            # a descendant and a missing commit are all refused (item 5).
+            previous=a.previous_release_commit
+            if previous is not None:
+                if not COMMIT.fullmatch(previous):
+                    raise ValueError('--previous-release-commit must be a full lowercase 40-character commit: '+previous)
+                if previous==data['scope']['integration_commit']:
+                    raise ValueError('--previous-release-commit must not be the release commit itself')
+                if not is_ancestor(previous,data['scope']['integration_commit']):
+                    raise ValueError('--previous-release-commit must be an ancestor of the release commit: '+previous)
+            if data['rollback']:
+                selection=rollback_selection(rows,data['scope'],is_ancestor,
+                                             reverted=endpoint_reverts,journal=journal,
+                                             current_commits=current_contribution_commits(rows))
+                targets=selection['targets'];supersede=list(selection['supersede'])
+                # The scope-level list of what the rollback moves past (rev4 item 2):
+                # a task the rollback carries back may still have a newer deployment
+                # scope of this environment reading live, and that is what made a
+                # roll forward lose the task's second delivery.
+                supersede_scopes=list(selection['supersede_scopes'])
+                skipped=list(selection['skipped']);flags=[];verify_only=[]
+            else:
+                selection=release_selection(rows,data['scope'],is_ancestor,
+                                            previous_commit=previous,
+                                            subset=set(subset) if subset else None,
+                                            current_commits=current_contribution_commits(rows),
+                                            live_verified=data['live_verified'],journal=journal,
+                                            reverted=endpoint_reverts)
+                targets=selection['targets'];supersede=list(selection['supersede'])
+                supersede_scopes=[]
+                skipped=list(selection['skipped']);flags=selection['flags']
+                verify_only=selection['verify_only']
             seen={item['task'] for item in skipped}
             # A caller-supplied full commit identity must agree with the resolution.
             resolved={item['task']:item for item in targets}
@@ -844,23 +1598,92 @@ def main():
                 start=(a.page-1)*a.page_size
                 page=targets[start:start+a.page_size]
             chunks=_chunks(page,a.chunk_size)
+            # The supersede list rides the first group payload, so a rollback or a
+            # hotfix deploy that drops tasks is one logical operation beside the rest
+            # of the release. The field is only present when it is non-empty, so a
+            # plain incremental deploy still sends the exact pre-rev3 payload shape
+            # (rev3 item 1). The scope-level list rides the first group the same way
+            # (rev4 item 2), so an older client-side payload is unchanged.
+            chunk_payloads=[]
+            for index,chunk in enumerate(chunks):
+                payload_chunk=dict(data,targets=chunk)
+                if supersede:payload_chunk['supersede']=supersede if index==0 else []
+                if supersede_scopes:payload_chunk['supersede_scopes']=supersede_scopes if index==0 else []
+                chunk_payloads.append(payload_chunk)
+            if not chunk_payloads and (supersede or supersede_scopes):
+                payload_chunk=dict(data,targets=[])
+                if supersede:payload_chunk['supersede']=supersede
+                if supersede_scopes:payload_chunk['supersede_scopes']=supersede_scopes
+                chunk_payloads=[payload_chunk]
             report={'operation_id':data['operation_id'],'scope':data['scope'],
-                    'targets':page,'skipped':skipped,'flags':selection['flags'],
+                    'targets':page,'skipped':skipped,'flags':flags,
+                    'verify_only':sorted(set(verify_only)&{item['task'] for item in page}),
+                    'superseded':supersede,
+                    'superseded_scopes':[{'task':item['task'],'scope':item['scope']}
+                                         for item in supersede_scopes],
                     'total_targets':len(targets),'page':a.page,'page_size':a.page_size,
-                    'chunks':[len(chunk) for chunk in chunks],
+                    'chunks':[len(chunk) for chunk in chunks],'total_chunks':len(chunks),
                     'expected_seconds':round(DRY_RUN_FIXED_SECONDS+DRY_RUN_SECONDS_PER_TARGET*len(page),1),
-                    'reader_note':SCOPE_ROLL_NOTE,'dry_run':bool(a.dry_run)}
+                    'reader_note':SCOPE_ROLL_NOTE,'dry_run':bool(a.dry_run),
+                    'rollback':bool(data['rollback'])}
             if a.dry_run:
+                # The dry run is offline, so it cannot ask the endpoint which
+                # integrations a host-issued revert record excludes; say so plainly
+                # instead of letting the reader trust the target list (rev3 item 3.4).
+                report['reverts_source']='local'
+                report['dry_run_revert_note']=DRY_RUN_REVERT_NOTE
+                warnings=warnings+[DRY_RUN_REVERT_NOTE]
+            if warnings:report['warnings']=warnings
+            # Check every target and every derived operation ID for the WHOLE release
+            # before the first group request, so a conflict or a stale target in group
+            # 3 of 4 writes nothing instead of completing groups 1 and 2. A planted
+            # operation id is reported with the SAME JSON failure report as a group
+            # failure, not only the plain error line (item 6.2).
+            if not a.dry_run:
+                op_index=_operation_index(rows)
+                try:
+                    _check_release_identity(data,op_index)
+                    for chunk_payload in chunk_payloads:
+                        _selected,plans,_issues,_evidence=_release_plan(rows,chunk_payload,journal=journal)
+                        negative=_supersede_plan(rows,chunk_payload)+_supersede_scope_plan(rows,chunk_payload)
+                        _check_release_operations(plans,negative,op_index,_evidence)
+                except ValueError as exc:
+                    report['results']=[]
+                    report['groups_completed']=0
+                    report['groups_total']=len(chunk_payloads)
+                    report['failure']=str(exc)
+                    report['fresh_export_required']=False
+                    print(json.dumps(report,ensure_ascii=False,indent=2))
+                    raise SystemExit('release %s failed before the first group: %s'
+                                     %(data['scope']['release_id'],exc))
+            if a.dry_run or not chunk_payloads:
                 print(json.dumps(report,ensure_ascii=False,indent=2))
             else:
                 results=[]
-                for chunk in chunks:
-                    chunk_payload=dict(data,targets=chunk)
-                    validate_release_payload(chunk_payload)
-                    answer=request(load_json(a.config),a.project,a.actor,[canonical_bytes(chunk_payload).decode()],action='lifecycle')
-                    if answer['returncode']:raise ValueError(answer['stderr'])
-                    results.append(json.loads(answer['stdout']))
+                try:
+                    for index,chunk_payload in enumerate(chunk_payloads,1):
+                        print('release %s: group %d/%d (%d target(s))'
+                              %(data['scope']['release_id'],index,len(chunk_payloads),
+                                len(chunk_payload['targets'])),file=sys.stderr,flush=True)
+                        answer=request(config,a.project,a.actor,[canonical_bytes(chunk_payload).decode()],action='lifecycle')
+                        if answer['returncode']:raise ValueError(answer['stderr'])
+                        results.append(json.loads(answer['stdout']))
+                except (ValueError,OSError,RuntimeError) as exc:
+                    # Report what actually completed and say plainly that a fresh
+                    # export is needed, because the written groups cannot be replayed
+                    # from the same file with the same export (item 6.3).
+                    report['results']=results
+                    report['groups_completed']=len(results)
+                    report['groups_total']=len(chunk_payloads)
+                    report['failure']=str(exc)
+                    report['fresh_export_required']=True
+                    report['fresh_export_note']=FRESH_EXPORT_NOTE
+                    print(json.dumps(report,ensure_ascii=False,indent=2))
+                    raise SystemExit('release %s failed after %d of %d group(s): %s. %s'
+                                     %(data['scope']['release_id'],len(results),len(chunk_payloads),exc,FRESH_EXPORT_NOTE))
                 report['results']=results
+                report['groups_completed']=len(results)
+                report['groups_total']=len(chunk_payloads)
                 report['result']=results[0] if len(results)==1 else None
                 print(json.dumps(report,ensure_ascii=False,indent=2))
         elif a.command=='evidence-owed':

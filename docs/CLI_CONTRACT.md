@@ -171,7 +171,8 @@ Each `items[]` entry has `task` (the **native task ID**, e.g. `kittrial-5bb.7`),
 record's comment ID**, not a Git SHA and not `latest_comment_id`), `commit`,
 `pending_review_items`, `pending_handoff_requests`, `pending_handoff_total`,
 `pending_handoff_next_offset`, `lifecycle`, `lifecycle_scope`,
-`lifecycle_matches_contribution`, `error`, and the additive `workflow_state` and
+`lifecycle_matches_contribution`, `deployed_delivery`,
+`deployed_delivery_is_current_contribution`, `deployed_live`, `error`, and the additive `workflow_state` and
 `integration` fields from the shared review-state projection. Four more additive
 fields (kittrial-5bb.114) carry what an agent's attention read needs:
 `pending_change_requests` (the ids of the request-changes records still unresolved, at
@@ -241,6 +242,61 @@ objects**:
 a bare string; treat `omitted_chars > 0` as "read `show`/`history` for the full value".
 Opaque cursor fields (`activity_cursor`, `next_cursor`) are never excerpted: they are
 complete tokens.
+
+`brief` and each `work` item also carry three additive lifecycle delivery fields
+(kittrial-5bb.107 item 7, rev2 item 6.1). `deployed_delivery` is the delivery a passed
+`deployed` fact belongs to, or `null` when the task has no trusted `deployed=passed`
+fact. It is an object with the four scope fields `release_id`, `environment`,
+`source_commit` and `integration_commit`, each a **plain string clipped to 160
+characters** - the shape the field was released with; rev1 briefly changed the values
+to excerpt objects and rev2 restores the released shape. `deployed_delivery_is_current_contribution`
+is `true` when `deployed_delivery.source_commit` equals the current contribution's
+`commit`, `false` when it does not, and `null` when either the delivery or the
+current contribution is absent. A deployed release may ship a superseded revision,
+so the two are independent of `lifecycle_matches_contribution`. `deployed_live` is
+the `live` fact recorded for the task's **current** scope: `live` (the named release
+scope is the live release for its environment), `superseded` (an explicit rollback
+or a later release the task is not in moved the environment past it; `deployed` then
+reads `unknown` and `deployed_delivery` is `null`), or `unknown` for a task written
+before liveness existed (which reads exactly as it did before). Liveness itself is
+decided **per environment** from the scope history (rev3 item 1), so a task can be
+live in production and superseded in staging; `deployed_live` reports the fact for
+the task's current scope, while release/rollback selection and `release-query`
+answer per environment.
+
+**The six lifecycle facts are read for the task's current scope (rev3 item 2).**
+`brief`, `work`, `review` and `evidence-owed` report, for each dimension, the newest
+event whose payload scope IS the task's current `lifecycle_scope`. A fact recorded
+later under an older, already-recorded scope (a verify-only `live-verified`, a
+per-environment `live=superseded`) therefore never hides the current scope's fact,
+which the previous reader got wrong. The native `dim:` label is still matched
+against the newest event of that dimension, so an unstructured or tampered event
+still reads `unknown` and its `event_id` names the event that caused it.
+`brief` also adds `newer` (null when current or without a checkpoint) and
+`directions` (null without a checkpoint). The former gives bounded activity
+references, own/other counts and explicit unknown/windowed coverage; the latter
+keeps other-actor comment directions visible until explicit resolution or
+supersession. Reading never acknowledges or completes them.
+`work --mine` adds `newer_activity_by_others`, `newer_activity_own`,
+`newer_activity_coverage` and `unresolved_directions` to displayed task rows.
+`session resume` records a resume event and returns session, resume and guidance
+metadata; it returns neither task IDs nor task rows. Read `work --mine` for tasks
+and checkpoint attention. The `worker.py resume` wrapper also runs onboarding,
+which prints that queue.
+Malformed/conflicting checkpoint history gives null counts. These fields do not
+set review state or lifecycle facts. See [BRIEFINGS.md](BRIEFINGS.md) for limits,
+direction dispositions and compatibility with older kits.
+
+`checkpoint TASK --provenance [--json]` is a read returning `task`, the complete
+`activity_cursor` and bounded `provenance`. `checkpoint TASK --verify [--json]`
+is a read returning newest-checkpoint identity, coverage and current entry counts
+(`fresh`, `changed`, `unchanged`, `unverified`), plus bounded changed entry IDs
+when evidence exists. The installation checkpoint_provenance_writes switch is OFF by default; old-shaped checkpoints are written until the operator enables new shapes after the rollback target reads them. With it enabled the server derives provenance deltas and carried acknowledgements on
+write; callers cannot authoritatively assert them. Verification follows linked
+checkpoint order, with newest per-entry evidence winning; a newest legacy
+checkpoint has unknown coverage even if an older one contains evidence. No read
+changes a checkpoint, direction disposition or lifecycle fact. Saved checkpoint
+receipts retain `comment_id`/`reconciled` and add `covered`/`bytes`.
 
 `brief` adds an `attention` array, plus `attention_total` and `attention_more`. It
 holds at most 3 items of each kind: `reference-review` items first, then `reference`
@@ -1517,7 +1573,7 @@ it by failing.
 | `proposal` | proposals scanned by a list or the queue | first 1,000 |
 | `admin.py proposal-settings` | actor map / deciders | <= 200 actors, 100 namespaces / <= 50 |
 | `brief` | `--items-offset` | >= 0 |
-| `brief` | `--items-limit` | 1..10 |
+| `brief` | `--items-limit` | 1..100 (default 5; a checkpoint holds at most 100 open items) |
 | `history` | `--limit` | 1..20 |
 | `history` | `--body-budget` | 256..8000 encoded bytes |
 | `review` | `items`/`resolutions` | 1..20 entries |
@@ -1590,6 +1646,31 @@ field **and** the limit, for example:
 | `previous = latest_comment_id` in a review payload | `contribution = contribution.comment_id` | review workflow names the misused ID |
 | reading `brief.owner` as a string | read `brief.owner.text` | excerpt-object contract above |
 | `work --owner -h` | `work --owner ACTOR` | argparse `expected one argument`; `-h` is the option's value, not a help request |
+
+## Raw bd writes: which rows a command names
+
+A contributor may run these bd commands through the endpoint: `list`, `show`, `ready`, `search`, `count`, `state`, `lint`, `comments`, `create`, `update`, `close`, `reopen`, `dep`. The first seven, `comments TASK` and `dep list|tree|cycles` only read. Every write must name the rows it writes (kittrial-5bb.113):
+
+| Command | Rows it writes | How they are named | When they are not |
+|---|---|---|---|
+| `create` | a new row | none, or `--id` | `--id` of a row that exists is refused: bd would replace that row |
+| `create --parent`, `--deps`, `--waits-for` | a link to existing rows | the flag's value | |
+| `create -f`/`--file`, `--graph` | rows described in a file | not named | refused; create them one by one |
+| `update` | each positional id, and `--parent` | positional ids | with no id bd uses the row it touched last: refused |
+| `close`, `reopen` | each positional id | positional ids | with no id: refused |
+| `close --claim-next`, `--continue` | the next row, chosen by bd | not named | refused; close, then claim the next task by its id |
+| `comments add` | the first positional | that id | with no id: refused |
+| `dep add`, `remove`, `relate`, `unrelate` | both ends | positional ids, `--blocked-by`, `--depends-on` | |
+| `dep ID --blocks ID` | both ends | the id and `-b`/`--blocks` | |
+| `dep add --file` | both ends of every edge | `from`/`to` (or `issue_id`/`depends_on_id`) of each line, sent as an attachment | a list that cannot be read is refused |
+
+Rules that follow:
+- **Every named id is resolved through bd before the write**, in one read. bd resolves an id from any substring of the part after the project prefix, so `slot`, `e-s` and a lone `-` all reach `PROJECT-merge-slot`; the write is judged by the row bd finds, not by the text. That read is one more bd call on each write.
+- **An id that does not resolve to exactly one row refuses the write**: "... does not name exactly one task, so the rows this would write are not known. Name each task by its id." So does a read that fails or times out.
+- **`create --id`**: the id must be `PROJECT-NAME` in lower-case letters, digits, dots and hyphens, and must not exist. On bd 1.2.2 `create TITLE --id EXISTING` answers rc 0 and replaces the row: the title is the new one; description, acceptance criteria, notes and assignee are emptied; status returns to open and priority to the default; labels, comments and dependencies stay. An explicit id that does not exist is still allowed. Ids are case-sensitive to bd (`p-ABC` would be a second row beside `p-abc`), which is why upper case is refused.
+- **`external:PROJECT:CAPABILITY`** in a dependency is not a row and is not resolved.
+- A flag this table does not know refuses the write. The table is `reserved_comments.WRITE_FLAGS`; `tests/test_bd_write_flags.py` compares it with `bd COMMAND --help` when a bd binary is available, so check it when the pinned bd changes.
+- The guard and the write run under the project's coordination lock, which every write through the endpoint holds. A `bd` run on the host outside the kit takes no such lock.
 
 ## Wrapper option ordering
 
@@ -1671,3 +1752,23 @@ request ID instead of creating a duplicate.
 Consumers should key on documented fields, tolerate additional fields, and treat any
 nonzero exit code as failure. The envelope, `work` top-level shape, `brief`
 excerpt-object fields, opaque cursors and the ID meanings above are stable for v1.
+
+
+### Release verification binding and retries
+
+Incremental `lifecycle.py release --live-verified` selection can add
+`targets[].verify_scope`, the four-field recorded scope of the currently live
+deployment. It is valid only with `live_verified=true`, without rollback, in the
+same environment, with the target's exact source/integration commits. The endpoint
+requires that scope to remain live and deployed=passed; otherwise it refuses before
+writing and requests a fresh export. The field is request-only: native scope and
+fact payloads retain their old shape. A target being restored receives live before
+verification on the first command, without a verification-only binding.
+
+An exact operation ID reconciles only a still-current assertion. Reusing a
+liveness receipt after intervening state changes fails before any writes with
+`a new operation ID is needed`. Use new IDs for new membership transitions.
+Plain CLI deploy is incremental and never automatically drops an uncarried task.
+See the exact two-step hotfix procedure and interim tracker state in
+[OPERATIONAL_WORKFLOW.md](OPERATIONAL_WORKFLOW.md).
+`checkpoint TASK --directions [--offset N] [--limit N] [--json]` returns full current digests for all outstanding directions, including entries outside stored evidence windows, in fresh pages (offset >= 0, limit 1..100, default 50). Fields: task, activity_cursor, total, items (id, digest, clipped author, timestamp), next_offset, coverage. Compare cursors across pages and restart on change. Only the current assignee can submit dispositions, and IDs/digests must match task history. See BRIEFINGS.md for legacy and reassignment baselines.

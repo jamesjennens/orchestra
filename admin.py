@@ -18,9 +18,11 @@ import sys
 import tempfile
 import threading
 import time
+import weakref
 from pathlib import Path
 from contextlib import contextmanager
 from bootstrap import install as install_binaries
+import record_json
 from requirements import content_hash
 from urllib.parse import unquote, urlsplit
 from urllib.request import url2pathname
@@ -77,13 +79,65 @@ class TerminatedBySignal(BaseException):
 # The active termination guards, innermost last (kittrial-5bb.122). raise_termination
 # consults them, so a stop that the interpreter runs late - at whatever bytecode
 # boundary follows the signal - still lands on the guard's rules. Only the main thread
-# installs a handler, so only main-thread guards are listed.
+# installs a handler, so only main-thread guards are listed. A record holds the guard
+# weakly (kittrial-5bb.124): a guard whose exit never runs - left behind by
+# contextlib.ExitStack when a stop lands between the block and the exit - is not kept
+# alive by its record, so its finaliser can release it. The record also keeps what a
+# release needs (kittrial-5bb.125): a guard collected where its finaliser cannot
+# release it - on another thread, where signal.signal is refused - leaves a dead
+# record that the main thread releases at its next chance (_reap_abandoned).
 _termination_guards=[]
+
+class _GuardRecord:
+    """One listed guard: a weak reference to it, the handler it replaced, and whether a
+    stop it recorded is still owed to that handler once the guard is gone."""
+    __slots__=('ref','previous','held')
+
+    def __init__(self,guard,previous):
+        self.ref=weakref.ref(guard)
+        self.previous=previous
+        self.held=False
+
+def _listed_guards():
+    """The listed guards still alive, innermost last."""
+    return [guard for guard in (record.ref() for record in _termination_guards) if guard is not None]
+
+def _reap_abandoned():
+    """Release the records of guards that were collected without being released: dead
+    records after the last live one (kittrial-5bb.125).
+
+    Runs only on the main thread, where the handler can be restored: in the handler
+    itself and at the start of every guard's ``__enter__``. The outermost of those
+    records names the handler that was installed before them; it is put back if
+    ``raise_termination`` is still installed. Returns whether one of them had recorded
+    a stop, which the caller then sends to the handler now installed."""
+    if threading.current_thread() is not threading.main_thread():
+        return False
+    live=[index for index,record in enumerate(_termination_guards) if record.ref() is not None]
+    first=live[-1]+1 if live else 0
+    dead=_termination_guards[first:]
+    if not dead:
+        return False
+    del _termination_guards[first:]
+    try:
+        if signal.getsignal(signal.SIGTERM) is raise_termination:
+            signal.signal(signal.SIGTERM,dead[0].previous)
+    except _TERMINATION_ERRORS:
+        pass
+    return any(record.held for record in dead)
+
+def _resend_sigterm():
+    """Send a stop to whatever handler is installed now (it runs at once)."""
+    try: signal.raise_signal(signal.SIGTERM)
+    except _TERMINATION_ERRORS:
+        try: os.kill(os.getpid(),signal.SIGTERM)
+        except _TERMINATION_ERRORS: pass
 
 _TERMINATION_ERRORS=(ValueError,OSError,RuntimeError,AttributeError,TypeError)
 
 def _running_guard(frame):
-    """The listed guard whose own setup or exit is on the stack at ``frame``, or None.
+    """``(guard, code)``: the innermost listed guard whose own setup or exit is on the
+    stack at ``frame`` and the guard method running there, or ``(None, None)``.
 
     Python passes the handler the frame that was running when it checked for signals.
     That can be a helper the guard calls - ``signal.signal`` and ``signal.pthread_sigmask``
@@ -91,18 +145,23 @@ def _running_guard(frame):
     the frame passed (kittrial-5bb.122 review: the guard's own frame is not the one
     Python passes while it is inside those wrappers). A guard's block runs in the
     caller's frame, never under ``__enter__`` or ``__exit__``, so a stop in the block is
-    not mistaken for one in the guard's code."""
+    not mistaken for one in the guard's code. A guard that is no longer listed (its
+    exit has unlisted it) does not count: a stop handled in its last lines belongs to
+    the guards still listed, or to the previous handler. A guard the collector is
+    finalising has lost its weak reference and does not count either: the handler first
+    releases its dead record (``_reap_abandoned``) and passes the stop on."""
+    listed=_listed_guards()
     while frame is not None:
         if frame.f_code in _GUARD_CODES:
             owner=frame.f_locals.get('self')
-            for guard in _termination_guards:
-                if guard is owner:return guard
+            for guard in listed:
+                if guard is owner:return guard,frame.f_code
         frame=frame.f_back
-    return None
+    return None,None
 
 def _stop_guards():
     """Mark every listed guard stopped: the stop is raised once, for all of them."""
-    for guard in _termination_guards:guard.stopped=True
+    for guard in _listed_guards():guard.stopped=True
 
 def raise_termination(signum,frame):
     """Signal handler that turns a stop into an exception so the cleanup path runs.
@@ -119,13 +178,35 @@ def raise_termination(signum,frame):
     run inside a guard's own setup or exit, or in a function they call. There it never
     raises (the guard's restore would be skipped): the stop is recorded on THAT guard,
     which raises it once its previous handler and mask are back (kittrial-5bb.122).
+    The one exception is the end of ``__enter__``, once the handler is installed and the
+    guard is armed: a stop recorded there was only raised at the block's exit, after the
+    whole block ran. There the handler releases the guard itself (previous handler,
+    mask, record) and raises from ``__enter__``, exactly as a stop taken during setup is
+    raised, so the block does not run (kittrial-5bb.124). ``raise_signal`` or
+    ``interrupt_main`` cannot defer it to the block: the interpreter runs the handler
+    again at its next check, which is still inside this handler.
+
+    Guards that were collected without being released are released first
+    (``_reap_abandoned``). If that puts the previous handler back, this stop is that
+    handler's: it is sent on to it, after any stop those guards had recorded.
     """
-    if _termination_guards:
-        guard=_running_guard(frame)
+    if _reap_abandoned():
+        _resend_sigterm()
+    if signal.getsignal(signum) is not raise_termination:
+        _resend_sigterm()
+        return
+    listed=_listed_guards()
+    if listed:
+        guard,code=_running_guard(frame)
         if guard is not None:
             guard.held=True
+            if code is _GUARD_ENTER_CODE and guard.entered:
+                # The end of __enter__: release here and raise from __enter__, as a stop
+                # taken during setup is, so the block does not run (kittrial-5bb.124).
+                guard._release()
+                guard._raise_held(False)
             return
-        if any(guard.stopped for guard in _termination_guards):
+        if any(guard.stopped for guard in listed):
             return
         _stop_guards()
         raise TerminatedBySignal(signum)
@@ -203,11 +284,14 @@ class signal_termination_guard:
         self.stopped=False
         self.held=False
         self.listed=False
+        self.entered=False
         self.previous=None
 
     def __enter__(self):
         if threading.current_thread() is not threading.main_thread():
             return self
+        if _reap_abandoned():
+            _resend_sigterm()   # owed to the handler the abandoned guards replaced
         try:
             previous=signal.getsignal(signal.SIGTERM)
         except _TERMINATION_ERRORS:
@@ -215,7 +299,8 @@ class signal_termination_guard:
         if previous is None:
             return self   # installed outside Python: it could not be restored
         self.previous=previous
-        _termination_guards.append(self)
+        self._record=_GuardRecord(self,previous)
+        _termination_guards.append(self._record)
         self.listed=True
         try:
             signal.signal(signal.SIGTERM,raise_termination)
@@ -225,6 +310,7 @@ class signal_termination_guard:
         except BaseException:
             self._release()
             raise
+        self.entered=True   # from here a stop releases the guard and raises (raise_termination)
         if self.held:
             self._release()
             self._raise_held(False)
@@ -235,6 +321,42 @@ class signal_termination_guard:
             self._release()
             self._raise_held(kind is not None and issubclass(kind,GeneratorExit))
         return False
+
+    def __del__(self):
+        """A guard collected while still listed never ran its exit (kittrial-5bb.124):
+        ``contextlib.ExitStack`` can drop it when a stop lands in its own code between the
+        block and the guard's exit. Release it here, so the previous handler is back and
+        no stopped record outlives it; a stop it had recorded goes to the previous
+        handler, as for an abandoned block, or, while an outer guard is still active, to
+        the innermost of those, which raises it at its exit. The kit itself uses plain
+        ``with``.
+
+        Only on the main thread (kittrial-5bb.125): elsewhere ``signal.signal`` is refused,
+        and a stop sent from there would be raised in the main thread wherever it happens
+        to be. There the guard only notes a stop it owes; its record stays, dead, until
+        the main thread's next stop or next guard releases it (``_reap_abandoned``). At
+        interpreter exit the guard is released but a stop it recorded is not sent on: the
+        process is already ending, and the exit status it was asked to end with is kept
+        rather than replaced by death by ``SIGTERM``. Nothing raised here can escape a
+        finaliser usefully, so every exception, ``BaseException`` included, stops here."""
+        try:
+            if not self.listed:
+                return
+            if threading.current_thread() is not threading.main_thread():
+                self._record.held=self.held and not self.stopped
+                return
+            self._release()
+            live=_listed_guards()
+            if live:
+                # Sent on now, the stop would be raised by an outer guard's handler inside
+                # this finaliser, where nothing can catch it: the innermost live guard
+                # takes it instead and raises it at its exit.
+                if self.held and not self.stopped and not any(guard.stopped for guard in live):
+                    live[-1].held=True
+            elif not sys.is_finalizing():
+                self._raise_held(True)
+        except BaseException:
+            pass
 
     def _release(self):
         """Restore the previous handler and the mask and unlist the guard, on every path."""
@@ -259,28 +381,24 @@ class signal_termination_guard:
                     except _TERMINATION_ERRORS: pass
             finally:
                 self.listed=False
-                for index,guard in enumerate(_termination_guards):
-                    if guard is self:
-                        del _termination_guards[index]
-                        break
+                record=getattr(self,'_record',None)
+                _termination_guards[:]=[listed for listed in _termination_guards if listed is not record]
 
     def _raise_held(self,abandoned):
         """Raise a stop recorded in the guard's own code, once for all guards."""
-        if not self.held or self.stopped or any(guard.stopped for guard in _termination_guards):
+        if not self.held or self.stopped or any(guard.stopped for guard in _listed_guards()):
             return
         self.stopped=True
         if abandoned:
-            try: signal.raise_signal(signal.SIGTERM)
-            except _TERMINATION_ERRORS:
-                try: os.kill(os.getpid(),signal.SIGTERM)
-                except _TERMINATION_ERRORS: pass
+            _resend_sigterm()
             return
         _stop_guards()
         raise TerminatedBySignal(signal.SIGTERM)
 
 _GUARD_CODES=frozenset(method.__code__ for method in (
     signal_termination_guard.__enter__,signal_termination_guard.__exit__,
-    signal_termination_guard._release,signal_termination_guard._raise_held))
+    signal_termination_guard._release,signal_termination_guard._raise_held,signal_termination_guard.__del__))
+_GUARD_ENTER_CODE=signal_termination_guard.__enter__.__code__
 
 @contextmanager
 def sigterm_blocked():
@@ -470,7 +588,7 @@ def operators(root, strict=False):
                              'or unset ORCHESTRA_OPERATORS before this command.')
     return allowed
 
-def review_workflow_writes(root, strict=False):
+def review_workflow_writes(root, strict=False, warnings=None):
     """The per-installation switch for WRITING the new review-workflow shapes.
 
     kittrial-5bb.94 item 3 asked for a two-step ship: this kit's READERS understand
@@ -484,6 +602,12 @@ def review_workflow_writes(root, strict=False):
     it is a deployment capability, and the endpoint supplies it to the review write
     path. The coordinator turns it on (`admin.py review-writes on --actor OPERATOR`)
     once the rollback target is a kit that reads the new shapes.
+
+    A value that is neither true/false nor absent is read as OFF with a warning
+    (kittrial-5bb.110 item 2): raising made `work` and `review TASK` fail for every
+    actor on the installation while `brief` still answered. When `warnings` is a
+    list the warning is appended to it (the endpoint surfaces it on stderr);
+    otherwise it is printed to stderr here.
     """
     enabled = False
     marker = root/'deployment.private.json'
@@ -492,8 +616,265 @@ def review_workflow_writes(root, strict=False):
         if isinstance(value,bool):
             enabled = value
         elif value is not None:
-            raise ValueError('deployment review_workflow_writes must be true or false')
+            message = ('deployment review_workflow_writes is %r, not true or false; reading it as off '
+                       '(no new-shaped review write is allowed)' % (value,))
+            if warnings is not None:
+                warnings.append('WARNING: ' + message)
+            else:
+                print('WARNING: ' + message,file=sys.stderr)
     return enabled
+
+def checkpoint_provenance_switch(root,action,actor):
+    """Keep the switch and its operator audit in one atomic private generation."""
+    from briefing import checkpoint_writes_enabled
+    from recovery import identity
+    marker=root/'deployment.private.json'
+    if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
+    actor=identity(actor,'Invalid actor identity')
+    if actor not in operators(root,strict=True):
+        raise ValueError('checkpoint-provenance-writes requires an actor on the deployment operator allowlist')
+    current=checkpoint_writes_enabled(root)
+    cfg=config(root)
+    audit=cfg.get('checkpoint_provenance_audit',[])
+    if not isinstance(audit,list) or any(not isinstance(item,dict) for item in audit):
+        raise ValueError('Invalid checkpoint provenance switch audit; reconcile before changing the switch')
+    if action=='status':return dict(checkpoint_provenance_writes=current,audit_records=len(audit))
+    if action not in ('on','off'):raise ValueError('Invalid checkpoint provenance switch action')
+    enabled=action=='on'
+    if enabled:cfg['checkpoint_provenance_writes']=True
+    else:cfg.pop('checkpoint_provenance_writes',None)
+    cfg['checkpoint_provenance_audit']=audit+[dict(actor=actor,at=utc_stamp(),action=action,
+                                                  previous=current,enabled=enabled)]
+    atomic_private_write(marker,json.dumps(cfg))
+    if not enabled:
+        print('Warning: existing provenance tasks refuse new legacy checkpoints; disabling does not make their history readable by older kits.',file=sys.stderr)
+    return dict(checkpoint_provenance_writes=enabled,audit_records=len(audit)+1)
+
+#: Audit record of the switch flips, beside deployment.private.json. It is
+#: deployment-level (there is one switch per installation, not per project), so it
+#: is not part of any project's coordination backup. `review-writes` writes it under
+#: ``REVIEW_WRITES_LOCK`` so a flip records the value it replaced.
+REVIEW_WRITES_AUDIT = 'review-writes.audit.json'
+REVIEW_WRITES_LOCK = '.review-writes.lock'
+#: The append-only audit history's schema. Version 1 was the single-record form an
+#: earlier kit wrote; it is still READ as its one entry so an upgrade keeps the record.
+REVIEW_WRITES_AUDIT_SCHEMA = 2
+#: How many flips the short history keeps. The audit exists to answer "who turned it
+#: on, when, and who turned it off", not to be an unbounded log.
+REVIEW_WRITES_AUDIT_MAX = 20
+
+
+def _review_writes_entry(record):
+    """Whether one audit entry is the shape `review-writes` writes."""
+    return (isinstance(record,dict) and record.get('schema_version')==1
+            and isinstance(record.get('review_workflow_writes'),bool)
+            and isinstance(record.get('set_by'),str) and isinstance(record.get('set_at'),str)
+            and isinstance(record.get('previous'),bool))
+
+
+def _review_writes_history(record):
+    """``(entries, damage)`` for a decoded audit file; ``damage`` is None when it reads.
+
+    One place decides what a readable audit history is, so the reader and the flip that
+    keeps a DAMAGED file aside cannot disagree (kittrial-5bb.110 item 3 P3). ``not JSON``
+    never reaches here: the caller reports the parse failure itself.
+    """
+    if not isinstance(record,dict):
+        return [],'not a JSON object'
+    if record.get('schema_version')==1:
+        return ([record],None) if _review_writes_entry(record) else ([],'malformed entry')
+    if record.get('schema_version')!=REVIEW_WRITES_AUDIT_SCHEMA:
+        return [],'schema %r is not 1 or %d'%(record.get('schema_version'),REVIEW_WRITES_AUDIT_SCHEMA)
+    entries=record.get('entries')
+    if not isinstance(entries,list):
+        return [],'entries is not a list'
+    kept=[entry for entry in entries if _review_writes_entry(entry)]
+    if len(kept)!=len(entries):
+        return kept,'malformed entr%s'%('y' if len(entries)-len(kept)==1 else 'ies')
+    return kept,None
+
+
+def _read_review_writes_audit(root):
+    """``(entries, damage)`` for the audit file; ``(None, None)`` when it is absent.
+
+    The ONE place the audit file is parsed, so the reader, the damage report and the flip
+    that keeps a damaged file aside cannot disagree (kittrial-5bb.110 item 3 P3).
+    ``damage`` is None when the file is absent or reads cleanly.
+    """
+    path=root/REVIEW_WRITES_AUDIT
+    if not path.is_file():
+        return None,None
+    try:
+        record=record_json.loads(path.read_text(encoding='utf-8'))
+    except (OSError,UnicodeError,ValueError):
+        return [],'unreadable or not valid JSON'
+    return _review_writes_history(record)
+
+
+def _review_writes_audit_damage(root):
+    """Why the audit file is not a readable history, or None when it is absent/readable."""
+    return _read_review_writes_audit(root)[1]
+
+
+def keep_damaged_review_writes_audit(root,stamp=None):
+    """Rename a DAMAGED audit file aside under a dated name; None when it reads cleanly.
+
+    The next flip REPLACES the history with a fresh readable one, so a file this kit
+    cannot read used to be destroyed silently and `status` then reported
+    ``audit_agrees: true`` beside an empty history (kittrial-5bb.110 item 3 P3). The
+    damaged bytes are kept beside the deployment file instead, under
+    ``review-writes.audit.json.damaged-<UTC date-time>`` (``.N`` on collision), and the
+    caller says so. Returns the path kept aside.
+    """
+    if _review_writes_audit_damage(root) is None:
+        return None
+    from datetime import datetime,timezone
+    path=root/REVIEW_WRITES_AUDIT
+    stamp=stamp or datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    aside=root/('%s.damaged-%s'%(REVIEW_WRITES_AUDIT,stamp))
+    number=1
+    while aside.exists():
+        aside=root/('%s.damaged-%s.%d'%(REVIEW_WRITES_AUDIT,stamp,number));number+=1
+    os.replace(path,aside)
+    return aside
+
+
+def review_writes_audit(root,warnings=None):
+    """The switch-flip history this kit recorded, oldest first; ``[]`` when unreadable.
+
+    A SHORT APPEND-ONLY HISTORY, not the last flip (kittrial-5bb.110 item 3): after one
+    operator turns the switch on and another turns it off, both entries stay, each naming
+    WHO, WHEN and the value replaced, so the audit says how the switch got where it is.
+    Schema 2 is ``{schema_version, entries: [...]}``, bounded to the last
+    ``REVIEW_WRITES_AUDIT_MAX`` flips. The pre-history schema-1 single-record form an
+    older kit wrote is read as its one entry.
+
+    Read through ``record_json.loads``: a deeply nested file raises ``NestingError`` (a
+    ``ValueError``) instead of ``RecursionError``, so `review-writes status` can never
+    die with a traceback. A file that exists but is not a readable history -- not JSON, a
+    list, schema 3, malformed entries -- is reported in `warnings` and the entries that
+    ARE readable are returned, rather than silently reading as "no history"
+    (kittrial-5bb.110 item 3 P3).
+    """
+    entries,damage = _read_review_writes_audit(root)
+    if entries is None:
+        return []
+    if damage is not None and warnings is not None:
+        warnings.append('WARNING: the review-writes audit file %s is damaged (%s); the switch history '
+                        'shown is incomplete, and the next flip keeps the file aside under a dated name '
+                        'before writing a fresh history' % (root/REVIEW_WRITES_AUDIT,damage))
+    return entries
+
+
+def write_review_writes_audit(root, enabled, actor, previous, entries=None):
+    """APPEND who flipped ``review_workflow_writes``, when, and the value replaced.
+
+    The history passed in (`entries`, oldest first) plus the new entry is written as one
+    atomic 0600 record, trimmed to the last ``REVIEW_WRITES_AUDIT_MAX`` flips. The caller
+    holds ``REVIEW_WRITES_LOCK`` for the whole read-modify-write so two concurrent flips
+    cannot lose one another (kittrial-5bb.110 item 3).
+    """
+    from datetime import datetime,timezone
+    entry = {'schema_version':1,'review_workflow_writes':bool(enabled),'set_by':actor,
+             'set_at':datetime.now(timezone.utc).isoformat(),'previous':bool(previous)}
+    history = [item for item in (entries or []) if _review_writes_entry(item)]
+    history.append(entry)
+    history = history[-REVIEW_WRITES_AUDIT_MAX:]
+    atomic_private_write(root/REVIEW_WRITES_AUDIT,
+                         json.dumps({'schema_version':REVIEW_WRITES_AUDIT_SCHEMA,
+                                     'entries':history}))
+    return entry
+
+
+@contextmanager
+def review_writes_lock(root):
+    """Serialise one switch flip (and its audit record) with an exclusive flock.
+
+    POSIX-only, like every other coordination lock in the kit: on a host without
+    ``fcntl`` the atomic file writes still stand. The lock file is deployment-level
+    and holds no state, so a leftover file is harmless and is never backed up. The lock
+    is held across the WHOLE read-modify-write, so the audit entry names the value that
+    was actually replaced; removing it loses that guarantee under concurrency, which is
+    why ``ReviewWritesCommandTests`` pins it.
+    """
+    handle=(root/REVIEW_WRITES_LOCK).open('a')
+    try:
+        import fcntl
+        fcntl.flock(handle,fcntl.LOCK_EX)
+    except ImportError:
+        pass
+    try:
+        yield handle
+    finally:
+        handle.close()
+
+
+def review_writes_command(root, actor, action):
+    """Read or flip ``review_workflow_writes``; returns ``(result, warnings)``.
+
+    The actor must be on the deployment operator allowlist, so a contributor that
+    reaches the host command line cannot turn the switch on or off
+    (kittrial-5bb.110 item 1 / review mutation M15). A flip then APPENDS who set it and
+    when to the audit history under the deployment lock (item 3). An action that does not
+    change the value writes nothing at all, so an on-that-changes-nothing cannot
+    overwrite the history. `status` reports ``audit_agrees`` and warns when the switch
+    value and the last recorded flip disagree (an older kit, or a hand edit, changed one
+    without the other). Extracted from the CLI so the allowlist and audit behaviour are
+    unit-testable without a subprocess.
+    """
+    marker=root/'deployment.private.json'
+    if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
+    from recovery import identity
+    actor=identity(actor,'Invalid actor identity')
+    authority=operators(root, strict=True)
+    if actor not in authority:
+        raise ValueError('review-writes requires an actor on the deployment operator allowlist '
+                         '(deployment.private.json operators); ' + actor + ' is not on it')
+    if action=='status':
+        warnings=[]
+        enabled=review_workflow_writes(root,warnings=warnings)
+        history=review_writes_audit(root,warnings=warnings)
+        last=history[-1] if history else None
+        # The switch and the audit are written together by a flip, so they disagree only
+        # when something else changed one of them: an older kit (which does not know the
+        # audit file at all) or a hand edit. A DAMAGED audit file is a disagreement too:
+        # it must not read as "no history, everything agrees" (kittrial-5bb.110 item 3).
+        damage=_review_writes_audit_damage(root)
+        agrees=damage is None and (last is None or last['review_workflow_writes']==enabled)
+        if last is not None and not agrees:
+            warnings.append('WARNING: deployment review_workflow_writes is %s but the recorded audit '
+                            'history last says %s (set by %s at %s); the switch was changed without '
+                            'recording it here (an older kit or a hand edit), so the audit is stale'
+                            % ('on' if enabled else 'off',
+                               'on' if last['review_workflow_writes'] else 'off',
+                               last['set_by'],last['set_at']))
+        return {'review_workflow_writes':enabled,'audit':last,'audit_history':history,
+                'audit_agrees':agrees},warnings
+    # One hold of the deployment lock for the whole read-modify-write, so the audit
+    # history records the value that was actually replaced (item 3).
+    with review_writes_lock(root):
+        cfg=config(root)
+        previous=review_workflow_writes(root)
+        enabled=action=='on'
+        if enabled==previous:
+            # An on that changes nothing is not a flip: it must not add an entry or
+            # overwrite the history (item 3).
+            return {'review_workflow_writes':previous,'changed':False},[]
+        # A DAMAGED history is kept aside under a dated name before it is replaced, and
+        # the caller is told; it used to be silently destroyed (kittrial-5bb.110 item 3).
+        warnings=[]
+        aside=keep_damaged_review_writes_audit(root)
+        if aside is not None:
+            warnings.append('WARNING: the review-writes audit file was damaged and has been kept aside '
+                            'as %s; this flip starts a fresh history' % aside)
+        # OFF is the absent key, so a deployment that never turned it on and one
+        # that turned it back off read identically.
+        if enabled:cfg['review_workflow_writes']=True
+        else:cfg.pop('review_workflow_writes',None)
+        atomic_private_write(marker,json.dumps(cfg))
+        write_review_writes_audit(root,enabled,actor,previous,entries=review_writes_audit(root))
+    return {'review_workflow_writes':review_workflow_writes(root),'changed':True},warnings
+
 
 def stored_operators(cfg):
     """The deployment allowlist as a list of identity strings.
@@ -3603,6 +3984,9 @@ def main():
     a=sub.add_parser('review-writes',help='read or set the per-installation switch that allows WRITING the new review-workflow record shapes (readers understand them either way; OFF by default)')
     a.add_argument('action',choices=['status','on','off'])
     a.add_argument('--actor',required=True,help='an actor on the deployment operator allowlist')
+    a=sub.add_parser('checkpoint-provenance-writes',help='operator-audited reader-first checkpoint rollout switch; OFF by default, existing provenance tasks refuse legacy writes')
+    a.add_argument('action',choices=['status','on','off'])
+    a.add_argument('--actor',required=True,help='an actor on the deployment operator allowlist')
     a=sub.add_parser('capability-verify',help='record verified capability checks (operator allowlist or verifiers list)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('authorized-keys',help='print the confined contributor and unrestricted operator authorized_keys lines for one public key')
@@ -3716,6 +4100,8 @@ def main():
               %(outcome,result['version']))
         if result.get('repaired') and not result['changed']:
             print('The audit record was missing or did not match the text; it is now bound to the text you set.')
+        if result.get('warning'):
+            print(result['warning']+'.')
         if result.get('replaced_unreadable'):
             print('The guidance file that was on disk could not be read as guidance (a refused character, over the '
                   'limit, or not UTF-8) and was replaced. Nothing of it was kept in the record.')
@@ -4092,26 +4478,12 @@ def main():
         else:cfg.pop('verifiers',None)
         atomic_private_write(marker,json.dumps(cfg))
         print(json.dumps({'verifiers':current}))
+    elif args.command=='checkpoint-provenance-writes':
+        print(json.dumps(checkpoint_provenance_switch(root,args.action,args.actor)))
     elif args.command=='review-writes':
-        marker=root/'deployment.private.json'
-        if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
-        from recovery import identity
-        actor=identity(args.actor,'Invalid actor identity')
-        authority=operators(root, strict=True)
-        if actor not in authority:
-            raise ValueError('review-writes requires an actor on the deployment operator allowlist '
-                             '(deployment.private.json operators); ' + actor + ' is not on it')
-        cfg=config(root)
-        if args.action=='status':
-            print(json.dumps({'review_workflow_writes':review_workflow_writes(root)}))
-            return
-        enabled=args.action=='on'
-        # OFF is the absent key, so a deployment that never turned it on and one
-        # that turned it back off read identically.
-        if enabled:cfg['review_workflow_writes']=True
-        else:cfg.pop('review_workflow_writes',None)
-        atomic_private_write(marker,json.dumps(cfg))
-        print(json.dumps({'review_workflow_writes':review_workflow_writes(root)}))
+        result,warnings=review_writes_command(root,args.actor,args.action)
+        for line in warnings:print(line,file=sys.stderr)
+        print(json.dumps(result))
     elif args.command=='authorized-keys':
         authorized_keys(root,args.key_file,args.role,args.python,args.comment)
     elif args.command=='backup':backup_projects(root,args.projects,args.all_projects)

@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import record_json
 import re
 import time
 from pathlib import Path
@@ -219,6 +220,35 @@ def reconcile_request(project, request_id, actor, reason, disposition, run, at=N
     return {'request_id':request_id,'status':disposition,'reconciled':True,'reconciliation':audit}
 
 
+#: The label bd puts on a project's merge slot, and the end of its id.
+MERGE_SLOT_LABEL='gt:slot'
+MERGE_SLOT_SUFFIX='-merge-slot'
+
+def is_merge_slot(row):
+    """True for a project's merge slot row: an internal record, never work.
+
+    bd 1.2.2 creates the slot as an ordinary row of type ``task`` with the id
+    ``<project>-merge-slot`` and the label ``gt:slot`` (measured on real bd,
+    kittrial-5bb.113), so a check on the issue type alone never matched it and the
+    slot was listed as open, unclaimed work.
+
+    The rule is the exact id alone (review 01a10c0b). The label is what an accident or
+    a host command removes, and a slot without it was listed and writable again; the
+    id is what the kit provisions. A project name holds no hyphen, so the id has
+    exactly the shape ``NAME-merge-slot``: a row whose id merely ends that way
+    (``p-x-merge-slot``) is an ordinary task, and no contributor can make a row with
+    the slot's shape (the endpoint refuses ``create --id`` for it). A row of type
+    ``merge-slot`` (what earlier code expected) counts too.
+    """
+    if not isinstance(row,dict):return False
+    if row.get('issue_type')=='merge-slot':return True
+    from reserved_comments import is_merge_slot_id
+    return is_merge_slot_id(row.get('id'))
+
+def merge_slot_sentence(task):
+    """What a write on the slot is told, on every path."""
+    return '%s is the project\'s merge slot, an internal record, not a task'%task
+
 def merge_slot_missing(state):
     """True when a native merge-slot check reports no slot for this project.
 
@@ -237,6 +267,34 @@ def merge_slot_missing(state):
     return state.get('available') is False and 'holder' not in state and 'waiters' not in state
 
 
+SLOT_DAMAGED=('The merge slot record is damaged: it is not available and names no holder. '
+              'Run the merge-create operation, which repairs it, then try again.')
+
+def repair_merge_slot(run,slot):
+    """Put a damaged merge slot row back in order; returns what was changed (kittrial-5bb.113 review).
+
+    bd keeps the holder in the row's metadata and the status beside it: in_progress
+    while held, open when free, never an assignee, always the label. A write that went
+    round `coordinate` (a claim after the label was removed, a close while held) leaves
+    them disagreeing, and bd then refuses both acquire and release. The holder bd
+    recorded decides: nothing here names a new holder or releases one.
+    """
+    rows=record_json.loads(run(['show',slot,'--json']))
+    row=rows[0] if isinstance(rows,list) and rows else rows
+    if not isinstance(row,dict) or row.get('id')!=slot:raise ValueError('Could not read the merge slot row %s to check it'%slot)
+    metadata=row.get('metadata')
+    if isinstance(metadata,str):
+        try:metadata=record_json.loads(metadata)
+        except ValueError:metadata=None
+    holder=metadata.get('holder') if isinstance(metadata,dict) else None
+    wanted='in_progress' if holder else 'open'
+    changes=[];fixed=[]
+    if MERGE_SLOT_LABEL not in (row.get('labels') or []):changes+=['--add-label',MERGE_SLOT_LABEL];fixed.append('label')
+    if row.get('status')!=wanted:changes+=['--status',wanted];fixed.append('status')
+    if row.get('assignee'):changes+=['--assignee',''];fixed.append('assignee')
+    if changes:run(['update',slot,*changes,'--json'])
+    return fixed,wanted
+
 def apply_native(p, actor, run, project):
     """Caller holds canonical project lock. Journals belong to runtime, never Git."""
     if not isinstance(p,dict):raise ValueError('Expected object')
@@ -244,6 +302,10 @@ def apply_native(p, actor, run, project):
     if op=='create-child':
         if set(p)!={'operation','request_id','parent','title','description','type'}:raise ValueError('Invalid child request fields')
         identifier(p['request_id']);identifier(p['parent'])
+        # bd resolves a parent from any substring of an id, so the row is read, not guessed.
+        parents=record_json.loads(run(['show',p['parent'],'--json']))
+        for parent in parents if isinstance(parents,list) else [parents]:
+            if is_merge_slot(parent):raise ValueError(merge_slot_sentence(parent.get('id'))+'; it takes no child')
         if not isinstance(p['title'],str) or not p['title'].strip() or not isinstance(p['description'],str):raise ValueError('Child needs title and description')
         if p['type'] not in ('task','bug','feature','chore','decision'):raise ValueError('Invalid child type')
         identity=content_hash({'request_id':p['request_id']})
@@ -311,12 +373,19 @@ def apply_native(p, actor, run, project):
                          'merge-create, merge-check and merge-release take only operation. The holder is always '
                          'the request actor.'%(op,'; '.join(details)))
     context_path=project/'.merge-context.json'
-    if op=='merge-create':return json.loads(run(['merge-slot','create','--json']))
+    if op=='merge-create':
+        # Creates the slot, or says it exists; either way a damaged row is put right.
+        result=json.loads(run(['merge-slot','create','--json']))
+        if isinstance(result,dict) and isinstance(result.get('id'),str):
+            result['repaired'],wanted=repair_merge_slot(run,result['id'])
+            if result['repaired'] and 'status' in result:result['status']=wanted
+        return result
     state=json.loads(run(['merge-slot','check','--json']))
     if merge_slot_missing(state):
         detail=''
         if isinstance(state,dict) and state.get('error'):detail=' (%s)' % state['error']
         raise ValueError('Merge slot does not exist for this project%s; run the merge-create operation to create it before checking, acquiring or releasing' % detail)
+    if state.get('available') is False and not state.get('holder'):raise ValueError(SLOT_DAMAGED)
     context=load_json(context_path) if context_path.exists() else None
     if op=='merge-check':
         state['context']=context if context and context['holder']==state.get('holder') else None

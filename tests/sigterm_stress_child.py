@@ -9,7 +9,14 @@ After every trial the child checks the guard's postconditions and, on the first
 violation, prints it and exits 1. PREVIOUS is the handler installed before the guard:
 ``custom`` (counts deliveries), ``ignore`` (SIG_IGN) or ``default`` (SIG_DFL, so a stop
 the previous handler owns ends this process with SIGTERM, which the parent counts).
-On completion it prints one JSON line of counts and exits 0. Linux only.
+On completion it prints one JSON line of counts and exits 0. Linux only; where the
+kernel timer cannot be created (no ``timer_create`` in libc, or the call is refused)
+it prints a line starting ``SKIP:`` and exits 77, which the test reports as a skip.
+
+It runs at least SECONDS, and on (up to five times that) until it has run
+``MIN_TRIALS`` trials with stops on both sides of the guard's end - raised inside the
+guard and handled after it - so a slow machine samples the guard rather than ending
+with only one kind of trial (kittrial-5bb.124).
 """
 import ctypes
 import json
@@ -25,7 +32,8 @@ import admin  # noqa: E402
 PREVIOUS, SECONDS = sys.argv[2], float(sys.argv[3])
 MIN_SIZE, STEP = 20, 1.06
 
-libc = ctypes.CDLL(None, use_errno=True)
+SKIP = 77
+MIN_TRIALS = 20
 
 
 class Timespec(ctypes.Structure):
@@ -45,8 +53,15 @@ class Sigevent(ctypes.Structure):
 CLOCK_MONOTONIC, SIGEV_SIGNAL = 1, 0
 timer = ctypes.c_void_p()
 event = Sigevent(sigev_signo=signal.SIGTERM, sigev_notify=SIGEV_SIGNAL)
-if libc.timer_create(CLOCK_MONOTONIC, ctypes.byref(event), ctypes.byref(timer)) != 0:
-    raise OSError(ctypes.get_errno(), 'timer_create')
+try:
+    libc = ctypes.CDLL(None, use_errno=True)
+    created = libc.timer_create(CLOCK_MONOTONIC, ctypes.byref(event), ctypes.byref(timer))
+except (OSError, AttributeError) as error:
+    print('SKIP: no kernel timer here (%s)' % error)
+    sys.exit(SKIP)
+if created != 0:
+    print('SKIP: timer_create was refused (errno %d)' % ctypes.get_errno())
+    sys.exit(SKIP)
 
 
 def arm(seconds):
@@ -118,8 +133,14 @@ def main():
     size, floor = MIN_SIZE, calibrate(MIN_SIZE) / 4
     centre = floor
     counts = {'trials': 0, 'raised': 0, 'previous': 0, 'ignored': 0}
-    deadline = time.monotonic() + SECONDS
-    while time.monotonic() < deadline:
+    started = time.monotonic()
+
+    def covered():
+        return (counts['trials'] >= MIN_TRIALS and counts['raised'] > 0
+                and counts['trials'] > counts['raised'])
+
+    while (time.monotonic() < started + SECONDS
+           or (not covered() and time.monotonic() < started + 5 * SECONDS)):
         delay = random.uniform(0.7 * centre, 1.3 * centre)
         before = len(received)
         try:

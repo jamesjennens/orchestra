@@ -13,7 +13,7 @@ import review_workflow as rw
 import work
 from requirements import canonical_bytes
 from lifecycle import DIMENSIONS
-from test_briefing import rows,checkpoint,append_checkpoint,TASK,PROJECT
+from test_briefing import rows,checkpoint,append_checkpoint,save_cp,comment,TASK,PROJECT
 from test_lifecycle import NativeStore
 
 
@@ -39,6 +39,37 @@ def reviewed_rows():
 
 
 class WorkQueueTests(unittest.TestCase):
+    def test_only_another_exact_actor_wakes_a_checkpoint(self):
+        data=rows();data[0]['assignee']='http/agent/a'
+        append_checkpoint(data,'cp',checkpoint(data))
+        data[0]['comments'].append(dict(id='own',author='http/agent/a',created_at='2026-10-04T10:00:00Z',text='Own progress.'))
+        row=work.queue(data,'http/agent/a',[])['items'][0]
+        self.assertFalse(row['newer_activity'])
+        data[0]['comments'].append(dict(id='other',author='http/agent/b',created_at='2026-10-04T10:00:00Z',text='Other worker.'))
+        self.assertTrue(work.queue(data,'http/agent/a',[])['items'][0]['newer_activity'])
+
+    def test_resolved_checkpoint_has_zero_open_items(self):
+        data=rows();item=dict(id='question',kind='blocker',text='Need a key.',source='build')
+        append_checkpoint(data,'cp-one',checkpoint(data,open_items=[item]))
+        append_checkpoint(data,'cp-two',checkpoint(data,open_items=[],
+            resolved=[dict(id='question',reason='Key supplied.',evidence='owner comment')]))
+        row=work.queue(data,'alice/session',[])['items'][0]
+        self.assertEqual(row['open_items'],0)
+        self.assertEqual(row['checkpoint_at'],data[0]['comments'][-1]['created_at'])
+
+    def test_pending_request_ids_are_capped_but_item_count_is_exact(self):
+        data=rows()
+        # The legacy writer itself caps unresolved items at20. Pin this separate
+        # queue boundary defensively for a larger projection, without claiming
+        # that21 legacy requests form a valid persisted history.
+        projected=dict(review_state='changes-requested',contribution={},
+                       pending_requests=[dict(request='request-'+str(n)) for n in range(21)])
+        with patch.object(work,'workflow',return_value=projected):
+            row=work.queue(data,'alice/session',[])['items'][0]
+        self.assertEqual(row['pending_review_items'],21)
+        self.assertEqual(len(row['pending_change_requests']),20)
+        self.assertEqual(len(set(row['pending_change_requests'])),20)
+
     def test_approval_updates_next_action_even_when_checkpoint_is_older(self):
         data=rows()
         append_checkpoint(data,'cp',checkpoint(data,next_action='Wait for reviewer'))
@@ -91,6 +122,22 @@ class WorkQueueTests(unittest.TestCase):
             self.assertIn('changes-requested',current)
             self.assertIn('Pending feedback',current)
             self.assertNotIn('deployed: passed',current)
+    def test_render_shows_a_closed_withdrawn_contribution_that_still_has_an_item(self):
+        """kittrial-5bb.110 item 9: the rendered view carries the withdrawn state."""
+        data=reviewed_rows()
+        add(data,dict(schema_version=1,operation='withdraw',operation_id='withdraw-1',task=TASK,
+                      previous='feedback',contribution='delivery',reason='Re-scoped'),
+            'withdraw','alice/session')
+        data[0]['status']='closed'
+        with tempfile.TemporaryDirectory() as temp:
+            render.render(data,temp)
+            current=(Path(temp)/'CURRENT.md').read_text(encoding='utf-8')
+            # The closed withdrawn task with a blocking item still open is listed with
+            # its true state, exactly as `work` reports it.
+            self.assertIn('withdrawn',current)
+            self.assertIn('| 1 |',current)                      # pending_review_items
+            page=(Path(temp)/'jobs'/(TASK+'.md')).read_text(encoding='utf-8')
+            self.assertIn('withdraw-1',page)
     def test_old_integration_evidence_does_not_hide_new_approved_contribution(self):
         store=NativeStore().seed('integrated')
         store.rows[0].update(status='closed',comments=[],assignee='alice/session')
@@ -188,6 +235,41 @@ class WorkQueueRevertScopeTests(unittest.TestCase):
         self.assertEqual(len(calls),1)
         self.assertEqual(len(calls[0]),len(data))
         self.assertEqual(sorted(item['task'] for item in page['items']),['aaa-task',TASK])
+
+
+class NewerActivityQueueTests(unittest.TestCase):
+    """kittrial-5bb.1: resume/work must flag directions newer than the checkpoint."""
+
+    def directed(self):
+        data=rows()
+        save_cp(data,'cp1',next_action='Nothing pending')
+        for n in range(3):
+            data[0]['comments'].append(comment(f'dir{n}',f'Direction {n}','2026-09-16T00:00:00Z',
+                                               author='coordinator/session'))
+        data[0]['comments'].append(comment('own','Own note','2026-09-16T01:00:00Z'))
+        return data
+
+    def test_queue_flags_newer_activity_by_others_for_the_owner(self):
+        item=work.queue(self.directed(),'alice/session',['--mine'])['items'][0]
+        self.assertEqual(item['newer_activity_by_others'],3)
+        self.assertEqual(item['newer_activity_own'],1)
+
+    def test_queue_flag_clears_once_checkpoint_incorporates_the_activity(self):
+        data=self.directed()
+        save_cp(data,'cp2',next_action='Process the three directions')
+        item=work.queue(data,'alice/session',['--mine'])['items'][0]
+        self.assertEqual(item['newer_activity_by_others'],0)
+        self.assertEqual(item['newer_activity_own'],0)
+
+    def test_queue_without_checkpoint_or_with_malformed_history_is_neutral(self):
+        item=work.queue(rows(),'alice/session',['--mine'])['items'][0]
+        self.assertIsNone(item['newer_activity_by_others'])
+        broken=rows()
+        p=checkpoint(broken)
+        append_checkpoint(broken,'cp1',p)
+        append_checkpoint(broken,'cp2',dict(p,summary='Competing branch'))
+        item=work.queue(broken,'alice/session',['--mine'])['items'][0]
+        self.assertIsNone(item['newer_activity_by_others'])
 
 
 if __name__=='__main__':unittest.main()
