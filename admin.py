@@ -2976,17 +2976,26 @@ def open_item_label_check(root,names=None):
     open-item record. ``open-item:`` became a reserved prefix in this slice, so a row
     already carrying one can no longer have it changed by a contributor. This lists,
     for every initialized project (or the ones named), the rows carrying either, so the
-    operator knows before open-item writes are turned on. No lock, no write.
+    operator knows before open-item writes are turned on. No lock, no write: bd runs
+    only for a project whose metadata records the server coordinates
+    (``project_metadata_state`` is ``server``); any other project is reported unreadable.
     Returns ``(report, clean)``; ``clean`` is false when a project uses a label or
     could not be read.
     """
     report={}
     for name in (names or initialized_projects(root)):
         try:
-            known=(project_dir(root,name)/'.beads/metadata.json').is_file()
-        except (ValueError,OSError):known=False
-        if not known:
+            state=project_metadata_state(root,name)
+        except (ValueError,OSError):state='absent'
+        if state=='absent':
             report[name]={'error':'unknown or uninitialized project'};continue
+        if state!='server':
+            # bd would fall back to an embedded database here: it would CREATE
+            # .beads/embeddeddolt inside the project and list nothing, which would read
+            # as clean (kittrial-5bb.126 review). Nothing is run for such a project.
+            report[name]={'error':'.beads/metadata.json does not record the Dolt server coordinates, so bd '
+                                   'was not run (it would create an embedded database here and list nothing)'}
+            continue
         try:
             rows=json.loads(run_bd(root,name,['list','--all','--limit','0','--json']) or '[]')
             if not isinstance(rows,list):raise ValueError('unexpected list output')

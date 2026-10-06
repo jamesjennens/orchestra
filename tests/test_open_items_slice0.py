@@ -47,6 +47,8 @@ ORDINARY_LABELS = ['open-item', 'open-items', 'open-item-old', 'openitem', 'Open
                    'decision', 'decision:x', 'ops']
 JOURNALS = ('.open-item-requests', '.owner-answers')
 STAMP = '2026-10-06T09:00:00Z'
+SERVER_METADATA = {'dolt_server_host': '127.0.0.1', 'dolt_server_port': 3307, 'dolt_server_user': 'root',
+                   'dolt_database': 'project'}
 
 
 def block(actor='coordinator', route='host', person='person:james'):
@@ -305,6 +307,11 @@ class OwnerEntryTests(unittest.TestCase):
         tampered = copy.deepcopy(good)
         tampered['payload']['at'] = '2026-10-06T09:00:01Z'
         yield 'payload hash', tampered
+        # content_hash leaves out the top-level sha256, so only the payload's own field
+        # being compared catches a payload whose sha256 is wrong while the entry's is right.
+        wrong_own = copy.deepcopy(good)
+        wrong_own['payload']['sha256'] = 'f' * 64
+        yield "payload's own sha256", wrong_own
         for name, payload in (
                 ('answer id', answer_payload(answer='a-XYZ')),
                 ('question revision', answer_payload(question_revision=0)),
@@ -323,6 +330,9 @@ class OwnerEntryTests(unittest.TestCase):
                 ('owner with relayer', answer_payload(authority='owner')),
                 ('relayed without relayer', answer_payload(relayed_by=None)),
                 ('endpoint route', answer_payload(by=dict(block(), route='endpoint', identity='unverified'))),
+                ('endpoint route claiming verified', answer_payload(by=dict(block(), route='endpoint'))),
+                ('endpoint relayer claiming verified', answer_payload(relayed_by=dict(block(), route='endpoint'))),
+                ('extra answer payload field', answer_payload(note='x')),
                 ('unverified', answer_payload(by=dict(block(), identity='unverified'))),
                 ('attribution keys', answer_payload(by=dict(block(), extra=1))),
                 ('person', answer_payload(by=dict(block(), person=None))),
@@ -478,7 +488,8 @@ class LabelCheckTests(unittest.TestCase):
         self.root = Path(temp.name)
         for name in ('alpha', 'beta', 'gamma'):
             (self.root / 'projects' / name / '.beads').mkdir(parents=True)
-            (self.root / 'projects' / name / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+            (self.root / 'projects' / name / '.beads' / 'metadata.json').write_text(json.dumps(SERVER_METADATA),
+                                                                                  encoding='utf-8')
         self.rows = {
             'alpha': [{'id': 'alpha-1', 'labels': ['ops']}, {'id': 'alpha-2', 'labels': None}],
             'beta': [{'id': 'beta-1', 'labels': ['open-item', 'ops']},
@@ -529,6 +540,25 @@ class LabelCheckTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(report['unreadable'], ['../x', 'gamma', 'nosuch'])
         self.assertIn('error', report['projects']['gamma'])
+
+
+    def test_damaged_metadata_is_unreadable_and_bd_never_runs(self):
+        # kittrial-5bb.126 review: bd falls back to an embedded database when the metadata
+        # does not record the server, CREATES .beads/embeddeddolt and lists nothing, so the
+        # project read as clean although it carries the label.
+        metadata = self.root / 'projects' / 'beta' / '.beads' / 'metadata.json'
+        for text in ('not json', '{}', '[]', json.dumps(dict(SERVER_METADATA, dolt_server_port=None)),
+                     json.dumps({key: value for key, value in SERVER_METADATA.items() if key != 'dolt_database'})):
+            with self.subTest(metadata=text):
+                metadata.write_text(text, encoding='utf-8')
+                self.calls = []
+                code, report = self.check()
+                self.assertEqual(code, 1)
+                self.assertEqual((report['using'], report['unreadable']), ([], ['beta']))
+                self.assertIn('was not run', report['projects']['beta']['error'])
+                self.assertNotIn('beta', [name for name, _ in self.calls])
+                self.assertEqual([name for name, _ in self.calls], ['alpha', 'gamma'])
+        self.assertFalse((self.root / 'projects' / 'beta' / '.beads' / 'embeddeddolt').exists())
 
 
 class NoWriterTests(unittest.TestCase):

@@ -1033,7 +1033,9 @@ The design states the consequence the integration-revert journal already documen
 before these paths exist refuses a whole restore whose sidecar names them, with
 `ValueError: Invalid coordination backup path`, so the restore after a rollback must use the new
 kit's `admin.py restore-new`. Concretely, every kit before slice 0 refuses a backup carrying either
-`.open-item-requests/` or `.owner-answers/`; slice 0 itself writes neither.
+`.open-item-requests/` or `.owner-answers/` - its `restore-new --without-coordination` too, so it
+cannot restore even the native data of such a backup - and its own backup of a project holding the
+journals succeeds and silently leaves them out. Slice 0 itself writes neither.
 
 ### 11.2 The rollback limit, and the planted-record hole
 
