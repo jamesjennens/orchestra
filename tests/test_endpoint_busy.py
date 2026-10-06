@@ -45,6 +45,55 @@ class EndpointTests(unittest.TestCase):
     def test_a_rejection_keeps_its_own_code(self):
         self.assertEqual(self.answer(ValueError('no'))['returncode'], 2)
 
+    def test_a_configuration_file_that_cannot_be_read_is_marked_as_a_fault_of_the_server(self):
+        """kittrial-5bb.156: the line still names the file; the mark lets the web service keep it to its log."""
+        import admin
+        line = 'Deployment configuration /srv/rt/deployment.private.json is not valid JSON: Expecting value'
+        answer = self.answer(admin.ConfigurationUnreadable(line))
+        self.assertEqual(answer, {'returncode': 2, 'stdout': '', 'stderr': 'ValueError: %s\n' % line,
+                                  'fault': 'configuration'})
+        self.assertNotIn('fault', self.answer(ValueError(line)))
+
+    def test_a_configuration_file_cut_short_refuses_a_write_before_anything_is_reserved(self):
+        """Seen on real bd (kittrial-5bb.156): read first inside the guarded write, it left the operation
+        "outcome unknown" with nothing written, and the same idempotency key answered that until it expired."""
+        import tempfile
+        import admin
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'projects' / 'pp' / '.beads').mkdir(parents=True)
+            (root / 'projects' / 'pp' / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+            (root / 'deployment.private.json').write_text('{"operators": ["ops"', encoding='utf-8')
+            before = sorted(str(path) for path in root.rglob('*'))
+            for action, args in (('bd', ['create', '--title', 'x', '--json']), ('work', ['--json'])):
+                with self.subTest(action=action), self.assertRaises(admin.ConfigurationUnreadable):
+                    endpoint.execute(root, {'project': 'pp', 'actor': 'someone', 'action': action, 'args': args,
+                                            'operation_id': 'op-0001', 'request_id': 'r1'})
+            self.assertEqual(sorted(str(path) for path in root.rglob('*')), before)     # no journal, no lock, nothing
+
+
+class ConfigurationTests(unittest.TestCase):
+    def test_every_reader_of_a_file_cut_short_raises_the_same_error_with_the_words_it_always_had(self):
+        import tempfile
+        import admin
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = root / 'deployment.private.json'
+            marker.write_text('{"operators": ["ops"', encoding='utf-8')
+            for reader in (admin.config, admin.operators, admin.verifiers, admin.review_workflow_writes):
+                with self.subTest(reader=reader.__name__), self.assertRaises(admin.ConfigurationUnreadable) as caught:
+                    reader(root)
+                self.assertIsInstance(caught.exception, ValueError)
+                self.assertTrue(str(caught.exception).startswith('Deployment configuration %s is not valid JSON: ' % marker),
+                                str(caught.exception))
+            marker.write_bytes(b'\xff\xfe\x00{')
+            with self.assertRaises(admin.ConfigurationUnreadable) as caught:
+                admin.operators(root)
+            self.assertIn('Deployment configuration %s is not ' % marker, str(caught.exception))
+            # A whole file reads as before.
+            marker.write_text('{"operators": ["ops"]}', encoding='utf-8')
+            self.assertEqual(admin.config(root), {'operators': ['ops']})
+
 
 class BackendTests(unittest.TestCase):
     def test_the_busy_code_of_the_endpoint_is_503_busy_with_a_delay(self):
@@ -85,7 +134,7 @@ class ServiceTests(test_http_agents.AgentHarness):
         logged = io.StringIO()
         waited = TimeoutError('Timed out waiting for lock /srv/state.json.lock')
         with mock.patch.object(self.service, 'create_user', side_effect=waited), contextlib.redirect_stderr(logged):
-            answer = self.request('POST', '/v1/accounts', {'username': 'zoe'}, token=admin)
+            answer = self.request('POST', '/v1/accounts', {'username': 'zoe'}, token=admin, key='account-zoe-0001')
         # Which lock reaches the operator in the service's log, and nobody else.
         self.assertIn("busy: a wait for a lock ran out in the service for POST: 'Timed out waiting for lock "
                       "/srv/state.json.lock'", logged.getvalue())

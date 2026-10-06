@@ -552,8 +552,23 @@ def read_json_file(path,what,encoding=None):
     except ValueError as error:
         raise ValueError('%s %s is not valid JSON: %s'%(what,path,error)) from None
 
+class ConfigurationUnreadable(ValueError):
+    """``deployment.private.json`` is not JSON or not text. The message names the file, for the operator.
+
+    A ``ValueError`` with the words it always had, so every host command says what it
+    said. Its own class so that the endpoint can mark the answer as a fault of the server
+    and the web service can keep the path from the people it serves (kittrial-5bb.156).
+    """
+
+def deployment_document(marker):
+    """The parsed ``deployment.private.json`` at ``marker``; not JSON or not text is :class:`ConfigurationUnreadable`."""
+    try:
+        return read_json_file(marker,'Deployment configuration')
+    except ValueError as error:
+        raise ConfigurationUnreadable(str(error)) from None
+
 def config(root):
-    return read_json_file(root/'deployment.private.json','Deployment configuration')
+    return deployment_document(root/'deployment.private.json')
 
 def operators(root, strict=False):
     """Server-side operator allowlist for void records.
@@ -575,7 +590,7 @@ def operators(root, strict=False):
     found=[]
     marker=root/'deployment.private.json'
     if marker.is_file():
-        value=read_json_file(marker,'Deployment configuration').get('operators')
+        value=deployment_document(marker).get('operators')
         if isinstance(value,list):found.extend(value)
         elif isinstance(value,str):found.append(value)
         elif value is not None:raise ValueError('deployment operators must be a list of actor identities')
@@ -613,7 +628,7 @@ def review_workflow_writes(root, strict=False, warnings=None):
     enabled = False
     marker = root/'deployment.private.json'
     if marker.is_file():
-        value = read_json_file(marker,'Deployment configuration').get('review_workflow_writes')
+        value = deployment_document(marker).get('review_workflow_writes')
         if isinstance(value,bool):
             enabled = value
         elif value is not None:
@@ -1038,7 +1053,7 @@ def verifiers(root, strict=False):
     found=[]
     marker=root/'deployment.private.json'
     if marker.is_file():
-        value=read_json_file(marker,'Deployment configuration').get('verifiers')
+        value=deployment_document(marker).get('verifiers')
         if isinstance(value,list):found.extend(value)
         elif isinstance(value,str):found.append(value)
         elif value is not None:raise ValueError('deployment verifiers must be a list of actor identities')

@@ -17,7 +17,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from admin import environment,project_dir,root_path,operators as configured_operators,verifiers as configured_verifiers,review_workflow_writes as configured_review_writes
+from admin import ConfigurationUnreadable,deployment_document,environment,project_dir,root_path,operators as configured_operators,verifiers as configured_verifiers,review_workflow_writes as configured_review_writes
 import native
 from coordination import is_merge_slot, merge_slot_sentence
 from render import render
@@ -365,6 +365,12 @@ def execute(root,request,authority_config=None,require_authority=False):
     import project_creation
     unfinished=project_creation.unfinished(root,name)
     if unfinished:raise ValueError('Unknown/uninitialized project: '+unfinished)
+    # The server's configuration is read before anything is reserved (kittrial-5bb.156). Read
+    # for the first time inside a guarded write, a file cut short left the operation "outcome
+    # unknown" with nothing written, and its idempotency key unusable until that expired
+    # (seen on real bd). Read here, it refuses the request with nothing done or reserved.
+    marker=root/'deployment.private.json'
+    if marker.is_file():deployment_document(marker)
     actor=request.get('actor','')
     refuse_http_actor(actor,authority_config is not None)
     # Launched by the HTTP service, an HTTP-shaped actor still needs the verified
@@ -794,6 +800,11 @@ def main():
         # A wait for a lock ran out before anything was done (file_lock raises it while acquiring):
         # the server is busy, and the request may be sent again. Not a rejection of the request.
         answer={'returncode':75,'stdout':'','stderr':'Busy: %s. Nothing was done; try again shortly.\n'%waited}
+    except ConfigurationUnreadable as damaged:
+        # Not a fault of the request: the server's own configuration file cannot be read. The
+        # line names the file, as it does for the operator; `fault` lets the web service say it
+        # in its own words and keep the path to its log (kittrial-5bb.156).
+        answer={'returncode':2,'stdout':'','stderr':f'ValueError: {damaged}\n','fault':'configuration'}
     except Exception as e:
         answer={'returncode':2,'stdout':'','stderr':f'{type(e).__name__}: {e}\n'}
     print(json.dumps(answer,ensure_ascii=False))

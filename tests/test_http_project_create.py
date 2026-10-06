@@ -141,11 +141,14 @@ class RefusalTests(Case):
         (self.canonical_root / 'retired' / 'gone-20260101T000000Z').mkdir(parents=True)
         self.assertEqual(201, self.create(self.olive, 'mine').status)
         said = {}
-        for project_id in ('operator', 'gone', 'mine'):
-            answer = self.create(self.olive, project_id)
+        self.grant('carl')
+        for project_id, token in (('operator', self.olive), ('gone', self.olive), ('mine', self.carl)):
+            answer = self.create(token, project_id)
             self.assertEqual(409, answer.status, answer.data)
             said[project_id] = answer.data['error']['message'].replace(project_id, 'NAME')
         self.assertEqual(len(set(said.values())), 1, said)
+        # Her own she is told she has (kittrial-5bb.156); the others stay alike to her.
+        self.assertIn('You already have project mine', self.create(self.olive, 'mine').data['error']['message'])
         self.assertEqual(said['gone'], 'Project name NAME is not available: choose another name')
         self.assertIsNone(self.record('operator'))
         self.assertIsNone(self.record('gone'))
@@ -971,6 +974,18 @@ class ScreenTests(Case):
         self.assertIn('archived and retired projects and unfinished creations too', seen['list']['text'])
         self.assertIsNone(seen['oliveList'])
         self.assertIn('The limit of 2 project(s) for this account is reached', seen['limit'])
+        # A name she already has by her own creation (kittrial-5bb.156): a notice with the way to it.
+        self.assertTrue(seen['yours']['shown'])
+        self.assertRegex(seen['yours']['text'], r'^You already have project alpha: you created it on this server on '
+                                                r'\d{4}-\d\d-\d\d\. Nothing was made again\. Open alpha$')
+        self.assertEqual((seen['yours']['links'], seen['yours']['nameError'], seen['yours']['went']), (['#/p/alpha'], '', []))
+        # Each entry of the superuser's list is named in words, a file that is no record too (kittrial-5bb.156).
+        (self.canonical_root / 'project-creations' / 'UPPER.json').write_text('{}', encoding='utf-8')
+        chips = {name: (state, text) for name, state, text in self.run_page(node, 'chips')['chips']}
+        self.assertEqual({name: state for name, (state, _) in chips.items()}, {'UPPER': 'not-a-record', 'beta': 'incomplete'})
+        self.assertIn('Not a creation record', chips['UPPER'][1])
+        self.assertNotIn('not-a-record', chips['UPPER'][1])
+        self.assertIn('Did not finish', chips['beta'][1])
         self.assertFalse(self.on_host('gamma'))
 
 
@@ -1456,6 +1471,403 @@ class BusyAndUnreadableTests(Case):
         self.assertEqual((result['removed'], result['name']), ('damaged-record', 'a project with no creation record'))
         registered = self.request('POST', '/v1/projects', {'project_id': 'beta', 'name': 'Beta'}, token=self.admin)
         self.assertEqual(201, registered.status, registered.data)
+
+
+class HeldLockTests(Case):
+    """kittrial-5bb.156: what the web service answers while another process holds the state lock."""
+
+    BUSY = 'The server is busy and this request was not completed. Send it again in a moment.'
+    KEYED = ('The server was busy and cannot say whether this request was carried out. Look before you repeat it, or '
+             'send it again with the same idempotency key.')
+    NO_KEY = ('The server was busy and cannot say whether this request was carried out. Look before you repeat it: '
+              'sent again without an idempotency key, it may be carried out twice.')
+
+    def setUp(self):
+        super().setUp()
+        import contextlib
+        import http_auth
+        self.grant(limit=5)
+        self.held, self.waits = False, []
+        real, case = http_auth.file_lock, self
+
+        @contextlib.contextmanager
+        def file_lock(path, timeout=60.0, poll=0.02):
+            """The state lock as another process holds it: every wait for it runs out, at once."""
+            if case.held and str(path) == str(case.store.path) + '.lock':
+                case.waits.append(timeout)
+                raise TimeoutError('Timed out waiting for lock %s' % path)
+            with real(path, timeout=timeout, poll=poll):
+                yield
+        patcher = patch.object(http_auth, 'file_lock', file_lock)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def logged(self, call):
+        import contextlib
+        import io
+        log = io.StringIO()
+        with contextlib.redirect_stderr(log):
+            answer = call()
+        return answer, log.getvalue()
+
+    def on_disk(self):
+        return json.loads(self.store.path.read_text(encoding='utf-8'))
+
+    def said(self, answer):
+        error = answer.data['error']
+        return answer.status, error['code'], error['message']
+
+    def taken_while_the_endpoint_works(self, action='create-project', reply=None):
+        """Another process takes the lock while the endpoint works: it is held from the endpoint's answer on."""
+        real = self.backend._endpoint
+
+        def endpoint(asked, *args, **kwargs):
+            answer = dict(reply) if reply is not None and asked == action else real(asked, *args, **kwargs)
+            if asked == action:
+                self.held = True
+            return answer
+        return patch.object(self.backend, '_endpoint', endpoint)
+
+    def session_of(self, token):
+        import http_auth
+        return http_auth.token_hash(token)
+
+    # ---- 1. the creator's repeat --------------------------------------------------------------------------
+    def unsaved_creation(self, name, key):
+        """The review's case: the endpoint finished, and the service could not save its state."""
+        with self.taken_while_the_endpoint_works():
+            first, _ = self.logged(lambda: self.create(self.olive, name, key=key))
+        self.assertEqual(self.said(first), (503, 'uncertain', self.KEYED if key else self.NO_KEY))
+        self.assertTrue(self.on_host(name))
+        self.assertIn(name, self.service.state['projects'])            # registered to her, in memory
+        self.assertNotIn(name, self.on_disk()['projects'])             # and not in the file yet
+        self.assertIsNotNone(self.store.unsaved_since)
+
+    def test_the_same_request_again_answers_201_with_the_project(self):
+        self.unsaved_creation('alpha', 'create-alpha-1')
+        # While the lock is still held nothing is sent to the endpoint, and the answer says so.
+        again, log = self.logged(lambda: self.create(self.olive, 'alpha', key='create-alpha-1'))
+        self.assertEqual(self.said(again), (503, 'busy', self.BUSY))
+        self.assertEqual(again.headers.get('retry-after'), '30')
+        self.assertIn('busy: the state could not be saved before create-project was sent to the endpoint, so it was '
+                      'not sent', log)
+        self.assertNotIn('lock', json.dumps(again.data))
+        self.held = False
+        done = self.create(self.olive, 'alpha', key='create-alpha-1')
+        self.assertEqual((done.status, done.data['id'], done.data['role']), (201, 'alpha', 'owner'), done.data)
+        self.assertIn('alpha', self.on_disk()['projects'])
+        self.assertIsNone(self.store.unsaved_since)
+        self.assertEqual(self.record('alpha')['state'], 'created')
+        committed = [e for e in self.audit('projects.host-create') if e['outcome'] == 'committed']
+        self.assertEqual(len(committed), 1)
+        self.assertIn('create alpha', committed[0]['reason'])
+        self.assertIn('(the same request again; it is registered already)', committed[0]['reason'])
+        self.assertIn('count=1 ', committed[0]['reason'])
+        # The receipt is saved now: the same request replays.
+        replay = self.create(self.olive, 'alpha', key='create-alpha-1')
+        self.assertEqual((replay.status, replay.data['id']), (201, 'alpha'))
+        self.assertEqual(self.visible(self.olive), ['alpha'])
+
+    def test_a_new_key_or_none_from_the_creator_says_they_have_it(self):
+        self.unsaved_creation('alpha', 'create-alpha-1')
+        self.held = False
+        day = self.service.state['projects']['alpha']['created_at'][:10]
+        self.assertRegex(day, r'^\d{4}-\d\d-\d\d$')
+        for key in ('create-alpha-2', None):
+            with self.subTest(key=key):
+                mine = self.create(self.olive, 'alpha', key=key, name='Another name')
+                self.assertEqual(self.said(mine), (409, 'conflict', 'You already have project alpha: you created it on '
+                                                   'this server on %s. Nothing was made again.' % day))
+                self.assertEqual(mine.data['error']['detail'], {'project': 'alpha', 'state': 'yours'})
+        self.assertEqual(self.service.state['projects']['alpha']['name'], 'Alpha')
+        # A project she created in the ordinary way, asked for again: the same sentence.
+        self.assertEqual(201, self.create(self.olive, 'beta').status)
+        self.assertEqual(self.create(self.olive, 'beta', key='create-beta-9').data['error']['detail'],
+                         {'project': 'beta', 'state': 'yours'})
+
+    def test_nobody_else_learns_who_has_the_name_or_since_when(self):
+        self.unsaved_creation('alpha', 'create-alpha-1')
+        self.held = False
+        self.assertEqual(200, self.grant('carl', limit=5).status)
+        day = self.service.state['projects']['alpha']['created_at'][:10]
+        for who, token in (('carl', self.carl), ('the superuser', self.admin)):
+            for key in ('create-alpha-1', 'create-alpha-7', None):
+                with self.subTest(who=who, key=key):
+                    other = self.create(token, 'alpha', key=key)
+                    self.assertEqual(self.said(other), (409, 'conflict', pc.NOT_AVAILABLE % 'alpha'))
+                    self.assertNotIn('detail', other.data['error'])
+                    for leak in ('olive', self.ids['olive'], day, 'already', 'yours'):
+                        self.assertNotIn(leak, json.dumps(other.data))
+
+    def test_the_sentence_is_only_for_a_project_she_created_here_and_still_belongs_to(self):
+        self.assertEqual(201, self.create(self.olive, 'alpha').status)
+        record, members = self.service.state['projects']['alpha'], self.service.state['memberships']['alpha']
+
+        def asked():
+            return self.create(self.olive, 'alpha', key='create-alpha-3').data['error']
+        self.assertEqual(asked()['detail']['state'], 'yours')
+        made = record.pop('host_created')                              # registered some other way
+        self.assertEqual((asked()['message'], asked().get('detail')), (pc.NOT_AVAILABLE % 'alpha', None))
+        record['host_created'] = dict(made, by=self.ids['carl'])       # created by somebody else
+        self.assertEqual(asked()['message'], pc.NOT_AVAILABLE % 'alpha')
+        record['host_created'] = made
+        role = members.pop(self.ids['olive'])                          # no longer a member
+        self.assertEqual(asked()['message'], pc.NOT_AVAILABLE % 'alpha')
+        members[self.ids['olive']] = role
+        record['created_by'] = self.ids['carl']
+        self.assertEqual(asked()['message'], pc.NOT_AVAILABLE % 'alpha')
+        record['created_by'] = self.ids['olive']
+        record['created_at'] = 'yesterday; <b>'                        # a date that is not one is not repeated
+        self.assertEqual(asked()['message'], 'You already have project alpha: you created it on this server. Nothing '
+                                             'was made again.')
+
+    def test_a_record_of_an_earlier_kit_has_no_request_identity_and_is_not_taken_for_the_same_request(self):
+        self.unsaved_creation('alpha', 'create-alpha-1')
+        self.held = False
+        self.assertRegex(self.service.state['projects']['alpha']['host_created']['operation'], r'^[0-9a-f]{64}$')
+        del self.service.state['projects']['alpha']['host_created']['operation']
+        mine = self.create(self.olive, 'alpha', key='create-alpha-1')
+        self.assertEqual((mine.status, mine.data['error']['detail']), (409, {'project': 'alpha', 'state': 'yours'}))
+
+    def test_the_identity_is_of_the_account_the_name_the_key_and_the_body(self):
+        import types
+        olive = types.SimpleNamespace(user_id=self.ids['olive'], credential_id=None)
+        carl = types.SimpleNamespace(user_id=self.ids['carl'], credential_id=None)
+        same = self.backend.creation_identity(olive, 'alpha', 'key-000001', 'body-1')
+        self.assertEqual(same, self.backend.creation_identity(olive, 'alpha', 'key-000001', 'body-1'))
+        for other in ((carl, 'alpha', 'key-000001', 'body-1'), (olive, 'beta', 'key-000001', 'body-1'),
+                      (olive, 'alpha', 'key-000002', 'body-1'), (olive, 'alpha', 'key-000001', 'body-2')):
+            self.assertNotEqual(same, self.backend.creation_identity(*other))
+        self.assertRegex(same, r'^[0-9a-f]{64}$')
+
+    def test_only_the_digest_is_kept_and_the_same_key_with_another_body_is_not_the_same_request(self):
+        self.unsaved_creation('alpha', 'create-alpha-1')
+        self.held = False
+        kept = json.dumps(self.service.state['projects']['alpha'])
+        for secret in ('create-alpha-1', '"create": true', 'project_id'):
+            self.assertNotIn(secret, kept)
+        other = self.create(self.olive, 'alpha', key='create-alpha-1', name='Another name')
+        self.assertEqual((other.status, other.data['error']['detail']), (409, {'project': 'alpha', 'state': 'yours'}))
+        self.assertEqual(self.service.state['projects']['alpha']['name'], 'Alpha')
+        self.assertEqual(201, self.create(self.olive, 'alpha', key='create-alpha-1').status)
+
+    def test_after_a_restart_before_the_registration_was_saved_the_same_request_registers_it(self):
+        """The digest is gone with the unsaved record: the endpoint, which made the project, answers."""
+        self.unsaved_creation('alpha', 'create-alpha-1')
+        self.held = False
+        # What a restart leaves: the state of the file, where the project is not registered.
+        for part in ('projects', 'memberships'):
+            self.service.state[part].pop('alpha')
+        self.assertEqual(self.visible(self.olive), [])
+        done = self.create(self.olive, 'alpha', key='create-alpha-1')
+        self.assertEqual((done.status, done.data['id'], done.data['host_created']['adopted']), (201, 'alpha', False), done.data)
+        self.assertRegex(self.service.state['projects']['alpha']['host_created']['operation'], r'^[0-9a-f]{64}$')
+        again = self.create(self.olive, 'alpha', key='create-alpha-2')
+        self.assertEqual(again.data['error']['detail'], {'project': 'alpha', 'state': 'yours'})
+
+    # ---- 2. the sentence, by whether the request carried a key ---------------------------------------------
+    def test_a_write_without_a_key_is_not_told_to_send_the_same_key(self):
+        waited = TimeoutError('Timed out waiting for lock /srv/state.json.lock')
+        for key, sentence in (('account-zoe-1', self.KEYED), (None, self.NO_KEY)):
+            with self.subTest(key=key), patch.object(self.service, 'create_user', side_effect=waited):
+                answer, _ = self.logged(lambda: self.request('POST', '/v1/accounts', {'username': 'zoe'},
+                                                             token=self.admin, key=key))
+                self.assertEqual(self.said(answer), (503, 'uncertain', sentence))
+                self.assertIsNone(answer.headers.get('retry-after'))
+
+    def test_a_log_in_that_could_not_be_saved_is_answered_busy(self):
+        """A session that was made and not answered is one nobody holds: nothing to look for."""
+        waited = TimeoutError('Timed out waiting for lock /srv/state.json.lock')
+        with patch.object(self.service, 'login', side_effect=waited):
+            answer, log = self.logged(lambda: self.request('POST', '/v1/sessions',
+                                                           {'username': 'olive', 'password': 'olive-password-1'}))
+        self.assertEqual(self.said(answer), (503, 'busy', self.BUSY))
+        self.assertEqual(answer.headers.get('retry-after'), '30')
+        self.assertIn('busy: a wait for a lock ran out in the service for POST', log)
+
+    def test_a_wait_that_runs_out_before_the_route_began_is_busy_for_a_write_too(self):
+        waited = TimeoutError('Timed out waiting for lock /srv/state.json.lock')
+        with patch.object(self.service, 'authenticate', side_effect=waited):
+            answer, _ = self.logged(lambda: self.request('POST', '/v1/accounts', {'username': 'zoe'}, token=self.admin,
+                                                         key='account-zoe-2'))
+        self.assertEqual(self.said(answer), (503, 'busy', self.BUSY))
+
+    def test_an_outcome_the_endpoint_left_unknown_names_the_key_only_when_there_is_one(self):
+        self.assertEqual(201, self.create(self.olive, 'alpha').status)
+        real = self.backend._endpoint
+
+        def endpoint(action, *args, **kwargs):
+            return {'returncode': 124, 'stdout': '', 'stderr': 'Command timed out\n'}
+        for key, sentence in (('task-key-0001', 'The operation may have committed; reconcile with the same idempotency key'),
+                              (None, 'The operation may have committed. Look before you repeat it: sent again without '
+                                     'an idempotency key, it may be carried out twice.')):
+            with self.subTest(key=key), patch.object(self.backend, '_endpoint', endpoint):
+                answer = self.request('POST', '/v1/projects/alpha/tasks', {'title': 'a task'}, token=self.olive, key=key)
+                self.assertEqual(self.said(answer), (503, 'uncertain', sentence))
+
+    # ---- 3. the creation's own busy sentence wins ----------------------------------------------------------
+    def test_made_and_waiting_reaches_the_creator_although_the_refusal_cannot_be_saved(self):
+        reply = {'returncode': 75, 'stdout': '', 'stderr': pc.MADE_WAITING % 'gamma' + '\n'}
+        for key in ('create-gamma-1', None):
+            with self.subTest(key=key):
+                self.held = False
+                self.request('GET', '/v1/projects', token=self.olive)             # the state is current
+                self.assertIsNone(self.store.unsaved_since)
+                before = len(self.on_disk()['audit'])
+                with self.taken_while_the_endpoint_works(reply=reply):
+                    waiting, log = self.logged(lambda: self.create(self.olive, 'gamma', key=key))
+                self.assertEqual(self.said(waiting), (503, 'busy', pc.MADE_WAITING % 'gamma'))
+                self.assertEqual(waiting.headers.get('retry-after'), '60')
+                self.assertEqual(self.waits[-1], 5.0)                             # the refusal did not wait a minute
+                self.assertIn('busy: the audit entry of a refusal was not saved, the state lock could not be had; it is '
+                              'kept in memory and written with the next save', log)
+                # The entry is in memory, and the next save writes it.
+                entry = self.audit('projects.host-create')[-1]
+                self.assertEqual((entry['outcome'], entry['reason'][:4]), ('rejected', 'busy'))
+                self.assertEqual(len(self.on_disk()['audit']), before)
+                self.held = False
+                _, log = self.logged(lambda: self.request('GET', '/v1/projects', token=self.olive))
+                self.assertIn('The state is saved again; what was kept in memory is written.', log)
+                self.assertIn(entry, self.on_disk()['audit'])
+
+    def test_any_refusal_of_a_write_is_answered_as_it_is_while_the_lock_is_held(self):
+        self.assertEqual(201, self.create(self.olive, 'alpha').status)
+        self.held = True
+        refused, _ = self.logged(lambda: self.create(self.olive, 'Not A Name', key='create-bad-01'))
+        self.assertEqual(refused.status, 422, refused.data)
+        denied, _ = self.logged(lambda: self.create(self.tokens['vera'], 'delta', key='create-delta-1'))
+        self.assertEqual(self.said(denied), (403, 'forbidden', http_service.ApiHandler.NOT_ALLOWED_TO_CREATE))
+        yours, _ = self.logged(lambda: self.create(self.olive, 'alpha'))
+        self.assertEqual(yours.data['error']['detail'], {'project': 'alpha', 'state': 'yours'})
+        nobody, _ = self.logged(lambda: self.request('GET', '/v1/projects', token='not-a-session-token'))
+        self.assertEqual(nobody.status, 401)
+        self.assertEqual(self.audit('authorization')[-1]['outcome'], 'denied')
+        self.assertEqual(set(self.waits), {5.0, 0.0})                             # nobody waited a minute
+
+    # ---- 6. a read does not wait a minute for its last-use stamp -------------------------------------------
+    def test_a_read_goes_on_and_its_stamp_is_written_with_the_next_save(self):
+        digest = self.session_of(self.olive)
+        self.request('GET', '/v1/projects', token=self.olive)
+        saved = self.on_disk()['sessions'][digest]
+        self.held = True
+        import time
+        time.sleep(0.01)
+        first, log = self.logged(lambda: self.request('GET', '/v1/projects', token=self.olive))
+        self.assertEqual(first.status, 200, first.data)
+        self.assertEqual(self.waits, [5.0])                                       # five seconds, once
+        self.assertEqual(log.count('busy: a last-use stamp was not saved'), 1)
+        self.assertNotIn(str(self.tmp), json.dumps(first.data))
+        for _ in range(3):                                                        # and then without waiting at all
+            again, log = self.logged(lambda: self.request('GET', '/v1/projects', token=self.olive))
+            self.assertEqual((again.status, log), (200, ''))
+        self.assertEqual(self.waits, [5.0, 0.0, 0.0, 0.0])
+        # In memory the session was used; in the file it reads as used earlier: the safe side.
+        memory = self.service.state['sessions'][digest]
+        self.assertEqual(self.on_disk()['sessions'][digest], saved)
+        self.assertGreater(memory['idle_expires'], saved['idle_expires'])
+        self.assertGreater(memory['last_used_raw'], saved['last_used_raw'])
+        # The next request after the lock is free writes it.
+        self.held = False
+        _, log = self.logged(lambda: self.request('GET', '/v1/projects', token=self.olive))
+        self.assertIn('The state is saved again', log)
+        self.assertIsNone(self.store.unsaved_since)
+        self.assertGreaterEqual(self.on_disk()['sessions'][digest]['idle_expires'], memory['idle_expires'])
+
+    def test_a_session_past_its_deadline_is_refused_while_the_lock_is_held(self):
+        """An unsaved stamp never keeps a session alive: the service decides from its own memory first."""
+        digest = self.session_of(self.olive)
+        self.held = True
+        self.assertEqual(200, self.logged(lambda: self.request('GET', '/v1/projects', token=self.olive))[0].status)
+        self.service.state['sessions'][digest]['idle_expires'] = 1
+        self.assertEqual(401, self.logged(lambda: self.request('GET', '/v1/projects', token=self.olive))[0].status)
+
+    def test_a_write_saves_what_was_left_before_the_endpoint_reads_the_deadline(self):
+        """The endpoint reads the idle deadline from the file. A live session whose stamp is only in
+        memory is never refused as idle for it: the write saves first, or is answered busy."""
+        self.assertEqual(201, self.create(self.olive, 'alpha').status)
+        digest = self.session_of(self.olive)
+        self.held = True
+        self.assertEqual(200, self.logged(lambda: self.request('GET', '/v1/projects', token=self.olive))[0].status)
+        # The deadline in the file runs out during the hold; in memory the session is live.
+        stale = self.on_disk()
+        stale['sessions'][digest]['idle_expires'] = 1
+        self.store.path.write_text(json.dumps(stale), encoding='utf-8')
+        # While the lock is held: busy, and nothing reached the endpoint.
+        sent = []
+        real = self.backend._endpoint.__func__
+
+        def counted(backend, action, *args, **kwargs):
+            answer = real(backend, action, *args, **kwargs)
+            sent.append(action)
+            return answer
+        with patch.object(http_service.EndpointBackend, '_endpoint', counted):
+            waiting, log = self.logged(lambda: self.create_task(self.olive, 'alpha', 'a task'))
+            self.assertEqual(self.said(waiting), (503, 'busy', self.BUSY))
+            self.assertEqual(waiting.headers.get('retry-after'), '30')
+            self.assertEqual(sent, [])
+            self.assertIn(60.0, self.waits)                                       # a write may wait the full time
+            self.assertIn('so it was not sent', log)
+            # The lock is free: the write saves the stamp first, and the endpoint finds the session live.
+            self.held = False
+            made = self.create_task(self.olive, 'alpha', 'a task')
+            self.assertEqual(made.status, 201, made.data)
+            self.assertEqual(sent, ['bd'])
+        self.assertGreater(self.on_disk()['sessions'][digest]['idle_expires'], 1)
+
+    def test_if_the_service_stops_before_the_next_save_the_last_use_is_lost(self):
+        import http_auth
+        digest = self.session_of(self.olive)
+        self.request('GET', '/v1/projects', token=self.olive)
+        saved = self.on_disk()['sessions'][digest]['idle_expires']
+        self.held = True
+        import time
+        time.sleep(0.01)
+        self.logged(lambda: self.request('GET', '/v1/projects', token=self.olive))
+        self.held = False
+        restarted = http_auth.Store(self.store.path)
+        self.assertEqual(restarted.state['sessions'][digest]['idle_expires'], saved)
+        self.assertLess(saved, self.service.state['sessions'][digest]['idle_expires'])
+
+    def test_a_write_the_service_answers_itself_writes_the_stamp_or_says_it_cannot_say(self):
+        digest = self.session_of(self.admin)
+        self.held = True
+        self.logged(lambda: self.request('GET', '/v1/projects', token=self.admin))
+        answer, _ = self.logged(lambda: self.request('POST', '/v1/accounts', {'username': 'zoe', 'password': 'zoe-password-1',
+                                                                              'display_name': 'Zoe'}, token=self.admin))
+        self.assertEqual(self.said(answer), (503, 'uncertain', self.NO_KEY))
+        self.held = False
+        self.request('GET', '/v1/projects', token=self.admin)
+        self.assertEqual(self.on_disk()['sessions'][digest]['idle_expires'],
+                         self.service.state['sessions'][digest]['idle_expires'])
+
+    # ---- 6. the server's configuration file cannot be read --------------------------------------------------
+    def test_a_configuration_fault_is_said_without_the_file(self):
+        self.assertEqual(201, self.create(self.olive, 'alpha').status)
+        self.backend.READ_CACHE_SECONDS = 0
+        self.addCleanup(delattr, self.backend, 'READ_CACHE_SECONDS')
+        path = self.canonical_root / 'deployment.private.json'
+        line = 'ValueError: Deployment configuration %s is not valid JSON: Expecting value: line 3 column 1 (char 40)\n' % path
+        reply = {'returncode': 2, 'stdout': '', 'stderr': line, 'fault': 'configuration'}
+        real = self.backend._endpoint
+
+        def endpoint(action, *args, **kwargs):
+            return dict(reply)
+        sentence = ("The server's configuration cannot be read, so this request was not carried out. Ask an operator of "
+                    'the server to look.')
+        calls = (('a read', lambda: self.request('GET', '/v1/projects/alpha/tasks', token=self.olive)),
+                 ('a write', lambda: self.create_task(self.olive, 'alpha', 'a task')))
+        for label, call in calls:
+            with self.subTest(what=label), patch.object(self.backend, '_endpoint', endpoint):
+                answer, log = self.logged(call)
+                self.assertEqual(self.said(answer), (503, 'server_configuration', sentence))
+                for leak in (str(self.canonical_root), 'deployment.private.json', 'Expecting value', 'JSON', 'ValueError'):
+                    self.assertNotIn(leak, json.dumps(answer.data))
+                self.assertIn('configuration: the endpoint could not read the deployment configuration for', log)
+                self.assertIn('deployment.private.json is not valid JSON', log)
+        # The same line without the mark is a refusal of the request, as before.
+        reply.pop('fault')
+        with patch.object(self.backend, '_endpoint', endpoint):
+            self.assertEqual(422, self.request('GET', '/v1/projects/alpha/tasks', token=self.olive).status)
 
 
 if __name__ == '__main__':
