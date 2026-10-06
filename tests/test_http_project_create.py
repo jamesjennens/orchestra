@@ -23,6 +23,12 @@ REFUSED = 'Only a superuser registers a project on this server.'
 class Case(fixes.EndpointCase):
     def setUp(self):
         super().setUp()
+        # A server always has its configuration file, with the database password; a creation
+        # and every guarded write read it first (kittrial-5bb.156).
+        configuration = self.canonical_root / 'deployment.private.json'
+        if not configuration.exists():
+            configuration.parent.mkdir(parents=True, exist_ok=True)
+            configuration.write_text('{"password": "not-used"}', encoding='utf-8')
         self.admin = self.admin_token()
         self.ids, self.tokens = {}, {}
         for name in ('olive', 'carl', 'vera'):
@@ -377,7 +383,7 @@ looker.join()
     def test_the_server_limit_is_checked_again_when_the_project_is_made(self):
         """An operator added a project while this one was made: it stays on the host, not registered."""
         self.canonical_root.mkdir(parents=True, exist_ok=True)
-        (self.canonical_root / 'deployment.private.json').write_text(json.dumps({'project_database_limit': 1}),
+        (self.canonical_root / 'deployment.private.json').write_text(json.dumps({'password': 'not-used', 'project_database_limit': 1}),
                                                                      encoding='utf-8')
         self.grant()
         self.hook('''
@@ -456,7 +462,7 @@ open(path, 'w', encoding='utf-8').write(json.dumps(state))
 
     def test_the_server_limit_is_told_without_numbers_and_shown_to_a_superuser(self):
         self.canonical_root.mkdir(parents=True, exist_ok=True)
-        (self.canonical_root / 'deployment.private.json').write_text(json.dumps({'project_database_limit': 1}),
+        (self.canonical_root / 'deployment.private.json').write_text(json.dumps({'password': 'not-used', 'project_database_limit': 1}),
                                                                      encoding='utf-8')
         self.grant(limit=5)
         self.grant('carl', limit=5)
@@ -1110,7 +1116,7 @@ class HostFailureTests(Case):
         self.assertEqual(201, self.create(self.olive, 'alpha').status)
         self.assertEqual(sorted(pc.server_names(self.canonical_root)), ['alpha', 'beta'])
         self.assertEqual(pc.holds(self.canonical_root, self.ids['olive'], ['alpha']), [])   # nobody's: it names no author
-        (self.canonical_root / 'deployment.private.json').write_text(json.dumps({'project_database_limit': 2}),
+        (self.canonical_root / 'deployment.private.json').write_text(json.dumps({'password': 'not-used', 'project_database_limit': 2}),
                                                                      encoding='utf-8')
         self.refused(self.create(self.olive, 'gamma'), pc.AT_SERVER_LIMIT)
 
@@ -1432,10 +1438,24 @@ class BusyAndUnreadableTests(Case):
         self.clean(listed)
         self.assertEqual((listed.data['server']['used'], listed.data['server']['limit']), (None, None))
         self.assertIn('could not be read, so no project can be created', listed.data['server']['note'])
-        refused = self.create(self.olive, 'beta')
-        self.assertEqual((409, pc.COULD_NOT), (refused.status, refused.data['error']['message']))
-        self.clean(refused)
-        self.assertFalse(self.on_host('beta'))
+        # A creation is told what every other route is told (review of kittrial-5bb.156, revision 2): it was
+        # "could not be created; try again", and trying again is not what helps.
+        for damage in ('{not json', '[]', '{}', None):
+            with self.subTest(damage=damage):
+                if damage is None:
+                    (self.canonical_root / 'deployment.private.json').unlink()
+                else:
+                    (self.canonical_root / 'deployment.private.json').write_text(damage, encoding='utf-8')
+                refused = self.create(self.olive, 'beta', key='create-beta-1')
+                self.assertEqual((refused.status, refused.data['error']['code'], refused.data['error']['message']),
+                                 (503, 'server_configuration', self.backend.CONFIGURATION_UNREADABLE))
+                self.clean(refused)
+                self.assertFalse(self.on_host('beta'))
+                self.assertEqual(pc.attention(self.canonical_root), [])
+        # Repaired, the SAME key creates it: nothing was reserved.
+        (self.canonical_root / 'deployment.private.json').write_text('{"password": "not-used"}', encoding='utf-8')
+        made = self.create(self.olive, 'beta', key='create-beta-1')
+        self.assertEqual((made.status, made.data.get('id')), (201, 'beta'), made.data)
         self.assertEqual(200, self.request('GET', '/v1/sessions/current', token=self.olive).status)
 
     def test_a_failure_of_the_list_itself_is_one_fixed_sentence(self):
@@ -1478,7 +1498,7 @@ class BusyAndUnreadableTests(Case):
         self.clean(refused)
         # The operator sets the record aside: it is then a project with no creation record, and a
         # superuser may register it, as any project an operator made.
-        (self.canonical_root / 'deployment.private.json').write_text(json.dumps({'operators': ['ops']}), encoding='utf-8')
+        (self.canonical_root / 'deployment.private.json').write_text(json.dumps({'password': 'not-used', 'operators': ['ops']}), encoding='utf-8')
         result = pc.remove(self.canonical_root, 'beta', 'ops', 'unreadable')
         self.assertEqual((result['removed'], result['name']), ('damaged-record', 'a project with no creation record'))
         registered = self.request('POST', '/v1/projects', {'project_id': 'beta', 'name': 'Beta'}, token=self.admin)

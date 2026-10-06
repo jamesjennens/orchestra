@@ -3345,7 +3345,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             except HttpError as failure:
                 # Busy means nothing was done (another creation is running): it is answered as
                 # busy, to be sent again, and is not an outcome to reconcile.
-                if failure.status == 503 and failure.code != 'busy':
+                if failure.status == 503 and failure.code != 'busy' and not getattr(failure, 'nothing_done', False):
                     raise UncertainOutcome() from None
                 if again and failure.status == 409:
                     # The same request for a project that is registered to this account, and the

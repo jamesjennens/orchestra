@@ -358,10 +358,11 @@ def guarded_write(root,request,journal,effect,**options):
     file is not stopped by its damage, and one that reads it on the way fails there, as it
     always did.
     """
-    marker=root/'deployment.private.json'
-    if marker.is_file():
-        deployment_document(marker)
-        deployment_password(root)
+    # Whatever is at the name, or nothing: a file that is missing, a directory, a dangling
+    # link or a FIFO failed in the same place as a damaged one, after the reservation
+    # (review of revision 2). No write of this kind works without the file.
+    deployment_document(root/'deployment.private.json')
+    deployment_password(root)
     return run_guarded(request,journal,effect,**options)
 
 def configuration_fault(root,error):

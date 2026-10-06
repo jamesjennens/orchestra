@@ -604,8 +604,10 @@ the result after the last.
   And a request that arrives while a write or a log-in is itself waiting for the lock
   queues behind it in the service (a read was seen to wait 54 seconds that way).
 - **The server's configuration file cannot be read** (kittrial-5bb.156). Every failure
-  to read `deployment.private.json` is one fault of the server: the file cannot be
-  opened (closed to the service's user, for example), is not text, is not JSON (cut
+  to read `deployment.private.json` is one fault of the server: the file is not there,
+  is not a regular file (a directory, a dangling link, a FIFO: refused at once, the
+  endpoint does not wait on a FIFO), cannot be opened (closed to the service's user,
+  for example), is not text, is not JSON (cut
   short), is not a JSON object, has no `password`, or has an `operators` or `verifiers`
   that is not a list. The endpoint's line names the file with the parser's or the
   system's words; the endpoint marks that answer (`"fault": "configuration"`), and the
@@ -617,7 +619,9 @@ the result after the last.
   - The file is read **only where it is used**. A request that needs nothing from it is
     answered as if it were whole: reading, setting and clearing a project's onboarding
     text, for example. Everything that starts bd needs it (the database password is in
-    it), so task reads and every write are refused while it is damaged.
+    it), so task reads and every write are refused while it is damaged. Creating a
+    project is refused with the same answer (not "could not be created; try again":
+    trying again does not help).
   - A write that reserves an operation identity reads the file before it reserves, so
     it is refused with nothing done and its idempotency key stays usable: the same
     request works once the file is repaired. (Read for the first time inside the guarded

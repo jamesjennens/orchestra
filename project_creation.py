@@ -242,7 +242,7 @@ def server_limit(root):
     import admin
     root = Path(root)
     marker = root / 'deployment.private.json'
-    value = admin.read_json_file(marker, 'Deployment configuration').get(SERVER_LIMIT_KEY) if marker.is_file() else None
+    value = admin.deployment_document(marker).get(SERVER_LIMIT_KEY) if marker.is_file() else None
     if value is None:
         return SERVER_LIMIT_DEFAULT
     if type(value) is not int or not 1 <= value <= SERVER_LIMIT_MAX:
@@ -881,6 +881,11 @@ def create_action(root, request, authority_config, initialize=None):
     admin.validate_name(name)
     account = descriptor['user_id']
     root = Path(root)
+    # A creation starts bd and reads the server's limit: it needs the server's configuration.
+    # A file that cannot be read is the server's fault and is answered as that on every route
+    # (the endpoint marks it), not as "could not be created; try again" (kittrial-5bb.156).
+    admin.deployment_document(root / 'deployment.private.json')
+    admin.deployment_password(root)
     progress = {'step': 'reserve', 'result': None}
     try:
         return _create_steps(root, request, authority_config, initialize, descriptor, name, account, progress)

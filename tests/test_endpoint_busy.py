@@ -116,10 +116,17 @@ class EndpointTests(unittest.TestCase):
                     endpoint.guarded_write(Path(tmp), {}, Path('journal'), lambda: None, runner=None)
                 read.assert_called_once_with(Path(tmp) / 'deployment.private.json')
         self.assertEqual(seen, [])
-        # A root without the file is not stopped here (a test root; bd would refuse later).
+        # A whole file with a password: the write goes on to the reservation, with what it was given.
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(endpoint, 'run_guarded', return_value='ran') as ran:
+            (Path(tmp) / 'deployment.private.json').write_text('{"password": "x"}', encoding='utf-8')
             self.assertEqual(endpoint.guarded_write(Path(tmp), {'r': 1}, Path('j'), len, runner='R'), 'ran')
             ran.assert_called_once_with({'r': 1}, Path('j'), len, runner='R')
+        # A root without the file is stopped here too (review of revision 2): no write works without it.
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(endpoint, 'run_guarded', guarded), \
+                self.assertRaises(FileNotFoundError) as gone:
+            endpoint.guarded_write(Path(tmp), {}, Path('j'), len)
+        self.assertTrue(endpoint.configuration_fault(Path(tmp), gone.exception))
+        self.assertEqual(seen, [])
         # And execute has no other way to the reservation.
         source = (KIT / 'endpoint.py').read_text(encoding='utf-8')
         self.assertEqual([line.strip() for line in source.splitlines() if 'run_guarded(' in line],
@@ -149,6 +156,113 @@ class EndpointTests(unittest.TestCase):
                 # An action that does need the file fails where it reads it, with the kit's own class.
                 with self.assertRaises(admin.ConfigurationUnreadable):
                     endpoint.execute(root, {'project': 'pp', 'actor': 'someone', 'action': 'work', 'args': ['--json']})
+
+    #: What can stand at the name instead of a regular file, and how each is made.
+    NOT_A_FILE = (('missing', lambda marker: None),
+                  ('a directory', lambda marker: marker.mkdir()),
+                  ('a dangling link', lambda marker: marker.symlink_to(marker.parent / 'no-such-file')),
+                  ('a link to a directory', lambda marker: marker.symlink_to(marker.parent / 'projects')),
+                  ('a FIFO', lambda marker: __import__('os').mkfifo(str(marker))))
+
+    def through_main(self, root, request):
+        printed = io.StringIO()
+        with mock.patch.object(sys, 'argv', ['endpoint.py', '--root', str(root)]), \
+                mock.patch.object(sys, 'stdin', io.StringIO(json.dumps(request))), \
+                mock.patch.object(sys, 'stdout', printed):
+            endpoint.main()
+        return json.loads(printed.getvalue())
+
+    def test_a_name_that_is_not_a_regular_file_refuses_a_write_before_anything_is_reserved_and_is_marked(self):
+        """Review of revision 2: the read ahead looked only at a regular file, so a file that was missing, a
+        directory, a dangling link or a FIFO still left the write "outcome unknown" with its key stuck, and a
+        FIFO blocked the endpoint until something wrote to it."""
+        import os
+        import tempfile
+        import threading
+        import time
+        import http_authority
+        for state, make in self.NOT_A_FILE:
+            with tempfile.TemporaryDirectory() as tmp, self.subTest(state=state):
+                root = self.project(tmp, '{"password": "x"}')
+                marker = root / 'deployment.private.json'
+                marker.unlink()
+                make(marker)
+                # Were the read to wait on the FIFO, this lets the test end (and fail on the time).
+                rescue = threading.Timer(8, lambda: os.close(os.open(str(marker), os.O_RDWR | os.O_NONBLOCK))
+                                         if state == 'a FIFO' else None)
+                rescue.start()
+                self.addCleanup(rescue.cancel)
+                before = sorted(str(path) for path in root.rglob('*') if path.name != '.coordination.lock')
+                started = time.monotonic()
+                for action, args in (('bd', ['create', '--title', 'x', '--json']), ('work', ['start', 'pp-1']),
+                                     ('bd', ['list', '--json'])):
+                    request = {'project': 'pp', 'actor': 'someone', 'action': action, 'args': args,
+                               'operation_id': 'op-0001', 'request_id': 'r1'}
+                    with mock.patch.object(http_authority.OperationJournal, 'reserve', side_effect=AssertionError('reserved')):
+                        with self.assertRaises((OSError, ValueError)) as refused:
+                            endpoint.execute(root, request)
+                        self.assertTrue(endpoint.configuration_fault(root, refused.exception), repr(refused.exception))
+                        answer = self.through_main(root, request)
+                    self.assertEqual((answer['returncode'], answer.get('fault')), (2, 'configuration'), (action, answer))
+                    self.assertIn(str(marker), answer['stderr'])           # for the service's log
+                self.assertLess(time.monotonic() - started, 5)           # nothing waited, on a FIFO either
+                rescue.cancel()
+                self.assertEqual(sorted(str(path) for path in root.rglob('*') if path.name != '.coordination.lock'), before)
+                # An action that needs nothing from the file is answered in every one of these states.
+                with self.assertRaises(ValueError) as missing:
+                    endpoint.execute(root, {'project': 'pp', 'actor': 'someone', 'action': 'docs', 'args': ['project']})
+                self.assertIn('Onboarding document missing', str(missing.exception))
+
+    def test_only_a_regular_file_is_read_and_the_others_are_refused_at_once(self):
+        import tempfile
+        import time
+        import admin
+        for state, make in self.NOT_A_FILE:
+            with tempfile.TemporaryDirectory() as tmp, self.subTest(state=state):
+                root = self.project(tmp, '{}')
+                marker = root / 'deployment.private.json'
+                marker.unlink()
+                make(marker)
+                started = time.monotonic()
+                for reader in (admin.config, admin.environment, lambda r: admin.deployment_document(r / 'deployment.private.json')):
+                    with self.assertRaises((OSError, admin.ConfigurationUnreadable)) as refused:
+                        reader(root)
+                    if state in ('missing', 'a dangling link'):
+                        self.assertIsInstance(refused.exception, FileNotFoundError)
+                    else:
+                        self.assertEqual(str(refused.exception), 'Deployment configuration %s is not a regular file' % marker)
+                self.assertLess(time.monotonic() - started, 3)
+        # A link to a regular file is read, as before.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.project(tmp, '{}')
+            marker = root / 'deployment.private.json'
+            marker.unlink()
+            (root / 'real.json').write_text('{"password": "s3"}', encoding='utf-8')
+            marker.symlink_to(root / 'real.json')
+            self.assertEqual(admin.config(root), {'password': 's3'})
+
+    def test_a_creation_under_a_configuration_that_cannot_be_read_is_the_servers_fault(self):
+        """It was answered "could not be created; try again", which is the wrong advice (review of revision 2)."""
+        import tempfile
+        import admin
+        import project_creation
+        made = []
+        for text in ('{"password": "x"', '[]', '{}', None):
+            with tempfile.TemporaryDirectory() as tmp, self.subTest(text=text):
+                root = self.project(tmp, text or '{}')
+                if text is None:
+                    (root / 'deployment.private.json').unlink()
+                before = sorted(str(path) for path in root.rglob('*'))
+                with mock.patch.object(project_creation, '_create_steps', side_effect=lambda *a, **k: made.append(a)), \
+                        mock.patch.object(project_creation, 'service_descriptor', return_value={'user_id': 'usr_1'}), \
+                        self.assertRaises((OSError, admin.ConfigurationUnreadable)) as refused:
+                    endpoint.execute(root, {'project': 'newone', 'actor': 'usr_1', 'action': 'create-project', 'args': [],
+                                            'operation_id': 'op-0001', 'request_id': 'r1',
+                                            'authority': {'user_id': 'usr_1'}},
+                                     authority_config=mock.Mock())
+                self.assertTrue(endpoint.configuration_fault(root, refused.exception), repr(refused.exception))
+                self.assertEqual(sorted(str(path) for path in root.rglob('*')), before)
+        self.assertEqual(made, [])
 
     @unittest.skipIf(not hasattr(__import__('os'), 'geteuid') or __import__('os').geteuid() == 0,
                      'needs a file the process cannot open (POSIX, not root)')

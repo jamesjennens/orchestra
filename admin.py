@@ -564,7 +564,20 @@ class ConfigurationUnreadable(ValueError):
     """
 
 def deployment_document(marker):
-    """The parsed ``deployment.private.json`` at ``marker``, a JSON object; anything else is :class:`ConfigurationUnreadable`."""
+    """The parsed ``deployment.private.json`` at ``marker``, a JSON object; anything else is :class:`ConfigurationUnreadable`.
+
+    Only a regular file is read. A FIFO in its place would block the reader until somebody
+    wrote to it, and a directory has nothing to parse: both are refused at once, by opening
+    without waiting and looking at what was opened (review of kittrial-5bb.156). A file that
+    is not there, or cannot be opened, keeps its ``OSError``.
+    """
+    descriptor=os.open(str(marker),os.O_RDONLY|getattr(os,'O_NONBLOCK',0))
+    try:
+        import stat
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ConfigurationUnreadable('Deployment configuration %s is not a regular file'%marker)
+    finally:
+        os.close(descriptor)
     try:
         document=read_json_file(marker,'Deployment configuration')
     except ValueError as error:
