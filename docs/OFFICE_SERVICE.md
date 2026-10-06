@@ -257,10 +257,32 @@ service bounds what such a connection costs, in all three shapes:
 - At most **200** connections are served at once. One more is closed at once,
   and the log says so the first time (`connections: the limit of 200 open
   connections was reached ...`). So 200 silent connections stop the web
-  interface for up to 30 seconds, and `health` reads `web=down` meanwhile; a
-  client that keeps opening them keeps it stopped. The service has no
-  per-address limit: where that matters, put it behind the approved proxy or
-  a firewall rule and use the loopback shape.
+  interface for up to 30 seconds, and `health` reads `web=down` meanwhile.
+- Of those, at most **50** are from one client address. One more from it is
+  closed at once, before a thread or a handshake is spent on it, and the log
+  says so (`connections: 'ADDRESS' has 50 connections open, the limit for one
+  address; further ones from it are closed at once`), at most one such line a
+  minute; the next one says how many were not shown. So one address that
+  keeps reopening silent connections holds 50 places and no more, and every
+  other address is served meanwhile. What it does not stop: four or more
+  addresses acting together can still take all 200; and the clients of the
+  address that is at its limit, honest ones included, are closed with it
+  until it lets go. An IPv6 address is counted with its whole /64.
+  `"connections_per_address": N` in the service configuration changes the
+  number; 0 means no limit per address. Clients that share an address (an
+  office behind one router, agents on the service's own host) share its 50: a
+  browser keeps about six connections and the worker client one for the time
+  of a command, so raise the number only where that is not enough.
+- **Behind the approved proxy** every connection comes from the proxy, so an
+  address named in `trusted_proxies` is not limited as an address. The limit
+  is then on requests: one forwarded address (the last `X-Forwarded-For`
+  element, the one the proxy itself added) has at most 50 requests being
+  served at once, and one more is answered `503 busy` with `Retry-After: 1`
+  before anything is carried out. Silent connections are then held at the
+  proxy and never reach the service, so bounding those per address is the
+  proxy's business (for nginx: `limit_conn`). A proxy in front that is NOT
+  named in `trusted_proxies` makes all its clients one address with 50
+  connections between them: name it.
 - A handshake that fails is one line in the http log (`tls: 'ADDRESS': 'TLS
   handshake not completed: ...'`), at most one such line every 5 seconds; the
   next one says how many were not shown. A browser that has not accepted a

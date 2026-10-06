@@ -2666,12 +2666,36 @@ class ApiHandler(BaseHTTPRequestHandler):
                                             'message': 'Internal error'},
                                   'request_id': request_id})
 
-    do_GET = lambda self: self._dispatch('GET')
-    do_POST = lambda self: self._dispatch('POST')
-    do_PUT = lambda self: self._dispatch('PUT')
-    do_PATCH = lambda self: self._dispatch('PATCH')
-    do_DELETE = lambda self: self._dispatch('DELETE')
-    do_HEAD = lambda self: self._dispatch('HEAD')
+    def _admit(self, method):
+        """Behind a trusted proxy, one forwarded address has a share of the requests being served.
+
+        The connection is the proxy's, so the limit per address (``GuardedServer``) cannot be
+        taken at accept; it is taken here, for the time this request is served, under the
+        address the service already takes as the request's source. A request over it is
+        answered 503 ``busy`` before its route begins: nothing was carried out.
+        """
+        server = self.server
+        group = self._forwarded_group() if hasattr(server, 'request_begins') else None
+        if group is None:
+            return self._dispatch(method)
+        if not server.request_begins(group):
+            server.unwatch(self.connection)
+            error = busy(ADDRESS_BUSY, retry_after=1)
+            self._retry_after = error.retry_after
+            self._say_close = True                # its body, if it has one, was not read
+            self._current_request_id = self._request_id()
+            return self._send_json(error.status, error.body(self._current_request_id))
+        try:
+            return self._dispatch(method)
+        finally:
+            server.request_ends(group)
+
+    do_GET = lambda self: self._admit('GET')
+    do_POST = lambda self: self._admit('POST')
+    do_PUT = lambda self: self._admit('PUT')
+    do_PATCH = lambda self: self._admit('PATCH')
+    do_DELETE = lambda self: self._admit('DELETE')
+    do_HEAD = lambda self: self._admit('HEAD')
 
     def _request_id(self):
         supplied = self.headers.get('X-Request-Id')
@@ -2711,6 +2735,20 @@ class ApiHandler(BaseHTTPRequestHandler):
         if isinstance(value, str) and value:
             return value.split(',')[0].strip().lower()
         return None
+
+    def _forwarded_group(self):
+        """The address group a trusted proxy forwarded this request for; None for any other request."""
+        if not self._peer_is_trusted_proxy():
+            return None
+        forwarded = self.headers.get('X-Forwarded-For')
+        if not isinstance(forwarded, str) or not forwarded:
+            return None
+        candidate = forwarded.split(',')[-1].strip()
+        try:
+            ipaddress.ip_address(candidate)
+        except ValueError:
+            return None
+        return address_group(candidate)
 
     def _source(self):
         if self._peer_is_trusted_proxy():
@@ -2845,6 +2883,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         if getattr(self, '_retry_after', None):
             self.send_header('Retry-After', str(int(self._retry_after)))
             self._retry_after = None
+        if getattr(self, '_say_close', False):
+            self.send_header('Connection', 'close')         # which also ends the connection after this answer
+            self._say_close = False
         if getattr(self, '_set_cookie_token', None):
             self._send_cookie(self._set_cookie_token)
         self.end_headers()
@@ -5417,6 +5458,32 @@ CLIENT_SECONDS = 30
 #: The bound is what keeps silent connections from using up the process's file descriptors
 #: (1024 by default on Linux), which the endpoint's own processes and files need too.
 CONNECTION_LIMIT = 200
+#: Of those, how many one client address may have at once (kittrial-5bb.170 item 2): without
+#: it one address that keeps reopening silent connections holds every place for as long as it
+#: likes. A quarter of the places. 0: no limit per address.
+ADDRESS_LIMIT = 50
+#: Said to a request that came through a trusted proxy while its forwarded address already
+#: has that many requests being served.
+ADDRESS_BUSY = 'Too many requests from your address are being served at once. Send this one again in a moment.'
+
+
+def address_group(address):
+    """What the limit per address counts as one client.
+
+    An IPv4 address is itself; an IPv6 address is its /64, because one line is given a whole
+    /64 and its holder can use any address in it; an IPv4 address written as IPv6
+    (``::ffff:a.b.c.d``) is that IPv4 address. Anything that is not an address is itself.
+    """
+    text = str(address)
+    try:
+        parsed = ipaddress.ip_address(text.split('%', 1)[0])
+    except ValueError:
+        return text
+    if parsed.version == 6:
+        if parsed.ipv4_mapped is not None:
+            return str(parsed.ipv4_mapped)
+        return str(ipaddress.ip_network((int(parsed) >> 64 << 64, 64)))
+    return str(parsed)
 
 
 class _WatchedWriter:
@@ -5453,15 +5520,23 @@ class GuardedServer(ThreadingHTTPServer):
       reaches the client at once but does not end a read that is already waiting, and the
       timeout does, at most one more such time later. On Linux the shutdown ends it.
     * At most ``connection_limit`` connections at once; one more is closed at once.
+    * At most ``address_limit`` of them from one client address (``address_group``); one more
+      from it is closed at once, before a thread or a handshake is spent on it. A peer named
+      as a trusted proxy is not limited as an address, since every client behind it arrives
+      from it: there the limit is per forwarded address and per request being served
+      (``request_begins``), which only ``ApiHandler`` can know, from the request's headers.
     """
     daemon_threads = True
     request_queue_size = 128
     tls_context = None
     client_seconds = CLIENT_SECONDS
     connection_limit = CONNECTION_LIMIT
+    address_limit = ADDRESS_LIMIT
+    trusted_proxies = ()
     REAP_EVERY = 0.25
     TIMEOUT_MARGIN = 2.0
     TLS_LINE_EVERY = 5.0
+    ADDRESS_LINE_EVERY = 60.0
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -5470,8 +5545,13 @@ class GuardedServer(ThreadingHTTPServer):
         self._open = 0
         self.cut_off = 0                 # connections closed for being too slow
         self.turned_away = 0             # connections closed for being over the limit
+        self.turned_away_for_address = 0  # of those, and requests refused, for the limit per address
         self._said_no_thread = False
-        self._serving = {}
+        self._said_limit = False
+        self._serving = {}              # thread -> (its connection, the address group it is counted in or None)
+        self._by_address = {}            # address group -> its open connections
+        self._requests_by_address = {}   # forwarded address group -> its requests being served
+        self._address_said, self._address_unsaid = None, 0
         self._tls_said, self._tls_unsaid = None, 0
         self._stopping = threading.Event()
         self._reaper = threading.Thread(target=self._reap, name='connection-reaper', daemon=True)
@@ -5504,27 +5584,98 @@ class GuardedServer(ThreadingHTTPServer):
             # A thread that was started and is no longer alive while its connection is still
             # registered died before it served (out of memory in its first steps).
             with self._guard:
-                dead = [(thread, request) for thread, request in self._serving.items()
+                dead = [(thread, entry[0]) for thread, entry in self._serving.items()
                         if thread.ident is not None and not thread.is_alive()]
             for thread, request in dead:
                 self._gave_up(thread, request, 'the thread ended before it served')
 
-    def open_connections(self):
+    def open_connections(self, address=None):
+        """How many connections are open: all of them, or those counted for ``address``."""
         with self._guard:
-            return self._open
+            return self._open if address is None else self._by_address.get(address_group(address), 0)
+
+    def _limited_as(self, client_address):
+        """The group ``client_address`` is counted in, or None when it is not limited as an address."""
+        if not self.address_limit:
+            return None
+        try:
+            peer = client_address[0]
+        except (IndexError, TypeError):
+            return None
+        if any(address_matches(peer, network) for network in self.trusted_proxies):
+            return None
+        return address_group(peer)
+
+    def _address_turned_away(self, group, counted, done):
+        """Count it and make its line (the caller holds the lock): at most one every ADDRESS_LINE_EVERY seconds."""
+        self.turned_away_for_address += 1
+        now = time.monotonic()
+        if self._address_said is not None and now - self._address_said < self.ADDRESS_LINE_EVERY:
+            self._address_unsaid += 1
+            return None
+        unsaid, self._address_unsaid, self._address_said = self._address_unsaid, 0, now
+        return ('connections: %s has %d %s, the limit for one address; further ones from it are %s%s'
+                % (ascii(str(group))[:60], self.address_limit, counted, done,
+                   ' (%d more such, from any address, since the last such line)' % unsaid if unsaid else ''))
+
+    def request_begins(self, group):
+        """A request that came through a trusted proxy for ``group``: False when it has its share already."""
+        with self._guard:
+            if not self.address_limit:
+                return True
+            if self._requests_by_address.get(group, 0) < self.address_limit:
+                self._requests_by_address[group] = self._requests_by_address.get(group, 0) + 1
+                return True
+            line = self._address_turned_away(group, 'requests being served', 'answered 503')
+        if line:
+            print(line, file=sys.stderr, flush=True)
+        return False
+
+    def request_ends(self, group):
+        with self._guard:
+            left = self._requests_by_address.get(group, 0) - 1
+            if left > 0:
+                self._requests_by_address[group] = left
+            else:
+                self._requests_by_address.pop(group, None)
+
+    def _left(self, thread):
+        """Free the place of ``thread``'s connection (the caller holds the lock): its request, or None."""
+        entry = self._serving.pop(thread, None)
+        if entry is None:
+            return None
+        request, group = entry
+        self._open -= 1
+        if group is not None:
+            left = self._by_address.get(group, 0) - 1
+            if left > 0:
+                self._by_address[group] = left
+            else:
+                self._by_address.pop(group, None)
+        return request
 
     def process_request(self, request, client_address):
+        group = self._limited_as(client_address)
+        line = None
         with self._guard:
             over = self._open >= self.connection_limit
             if over:
                 self.turned_away += 1
-                first = self.turned_away == 1
+                if not self._said_limit:
+                    self._said_limit = True
+                    line = ('connections: the limit of %d open connections was reached; further ones are closed '
+                            'at once (said once)' % self.connection_limit)
+            elif group is not None and self._by_address.get(group, 0) >= self.address_limit:
+                over = True
+                self.turned_away += 1
+                line = self._address_turned_away(group, 'connections open', 'closed at once')
             else:
                 self._open += 1
+                if group is not None:
+                    self._by_address[group] = self._by_address.get(group, 0) + 1
         if over:
-            if first:
-                print('connections: the limit of %d open connections was reached; further ones are closed at once '
-                      '(said once)' % self.connection_limit, file=sys.stderr, flush=True)
+            if line:
+                print(line, file=sys.stderr, flush=True)
             self.shutdown_request(request)
             return
         # The thread is started here and not by the base class, so that it is known: one that
@@ -5532,7 +5683,7 @@ class GuardedServer(ThreadingHTTPServer):
         # keep its connection open and its place taken for ever.
         thread = threading.Thread(target=self.process_request_thread, args=(request, client_address), daemon=True)
         with self._guard:
-            self._serving[thread] = request
+            self._serving[thread] = (request, group)
         try:
             thread.start()
         except RuntimeError as failed:
@@ -5542,16 +5693,14 @@ class GuardedServer(ThreadingHTTPServer):
             self._gave_up(thread, request, ascii(str(failed))[:80])
         except BaseException:
             with self._guard:
-                self._serving.pop(thread, None)
-                self._open -= 1
+                self._left(thread)
             raise
 
     def _gave_up(self, thread, request, why):
         """No thread serves ``request``: close it, free its place, and say so the first time."""
         with self._guard:
-            if self._serving.pop(thread, None) is None:
+            if self._left(thread) is None:
                 return
-            self._open -= 1
             self.turned_away += 1
             first = not self._said_no_thread
             self._said_no_thread = True
@@ -5566,8 +5715,7 @@ class GuardedServer(ThreadingHTTPServer):
             super().process_request_thread(request, client_address)
         finally:
             with self._guard:
-                if self._serving.pop(threading.current_thread(), None) is not None:
-                    self._open -= 1
+                self._left(threading.current_thread())
 
     def handle_error(self, request, client_address):
         """A client that went away or was cut off is not an error of the service: no traceback."""
@@ -5621,7 +5769,7 @@ def quiet_memory_errors():
 def create_server(service, backend, *, host='127.0.0.1', port=0, trusted_proxies=(),
                   max_body=MAX_BODY_BYTES, certfile=None, keyfile=None,
                   allow_plaintext_non_loopback=False, web_root=DEFAULT_WEB_ROOT,
-                  client_seconds=None, connection_limit=None):
+                  client_seconds=None, connection_limit=None, address_limit=None):
     """Bind the service. Refuse a non-loopback plaintext listener unless explicitly allowed."""
     loopback = host in LOOPBACK
     if not loopback and certfile is None and not allow_plaintext_non_loopback:
@@ -5647,6 +5795,10 @@ def create_server(service, backend, *, host='127.0.0.1', port=0, trusted_proxies
         httpd.client_seconds = client_seconds
     if connection_limit is not None:
         httpd.connection_limit = connection_limit
+    if address_limit is not None:
+        httpd.address_limit = address_limit
+    # Who is not limited as an address: the same peers whose forwarded headers are believed.
+    httpd.trusted_proxies = tuple(trusted_proxies or ())
     return httpd
 
 
@@ -5686,6 +5838,10 @@ def main(argv=None):
                         help='seconds one project creation may take (never less than --endpoint-timeout); a '
                              'creation is slower the more project databases the server holds')
     parser.add_argument('--max-body', type=int, default=MAX_BODY_BYTES)
+    parser.add_argument('--connections-per-address', type=int, default=ADDRESS_LIMIT, metavar='N',
+                        help='connections one client address may have open at once, of the %d the service '
+                             'serves (default %d; 0: no limit per address). Behind a --trusted-proxy: requests '
+                             'being served at once for one forwarded address.' % (CONNECTION_LIMIT, ADDRESS_LIMIT))
     parser.add_argument('--public-url',
                         help='canonical base URL of this service, used only to render '
                              'copyable agent setup/resume snippets (e.g. https://host)')
@@ -5721,6 +5877,8 @@ def main(argv=None):
         Service.bootstrap_superuser(store, args.bootstrap_user, password)
         print('Bootstrapped %s' % args.bootstrap_user)
         return 0
+    if args.connections_per_address < 0:
+        parser.error('--connections-per-address must be 0 (no limit per address) or more')
     if args.backend == 'endpoint' and (not args.endpoint or not args.root):
         parser.error('--backend endpoint requires --endpoint and --root '
                      '(use --backend inprocess only for a disposable local check)')
@@ -5735,7 +5893,8 @@ def main(argv=None):
                           trusted_proxies=trusted, max_body=args.max_body,
                           certfile=args.cert, keyfile=args.key,
                           allow_plaintext_non_loopback=args.allow_plaintext_on_network,
-                          web_root=None if args.no_web else args.web_root)
+                          web_root=None if args.no_web else args.web_root,
+                          address_limit=args.connections_per_address)
     if args.host not in LOOPBACK and not args.cert:
         print('WARNING: serving plain HTTP on %s:%d. Passwords and session cookies cross the network unencrypted. '
               'Use --cert and --key for HTTPS.' % (args.host, httpd.server_address[1]), file=sys.stderr, flush=True)

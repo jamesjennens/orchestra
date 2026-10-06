@@ -53,7 +53,7 @@ def service_config(path):
     if config.get('schema_version') != 1:
         raise ValueError('Office service configuration must have schema_version 1')
     allowed = {'schema_version', 'http_host', 'http_state', 'cert', 'key',
-               'trusted_proxies', 'public_url', 'endpoint_timeout', PLAINTEXT_SETTING}
+               'trusted_proxies', 'public_url', 'endpoint_timeout', 'connections_per_address', PLAINTEXT_SETTING}
     if set(config) - allowed:
         raise ValueError('Unknown office service setting: ' + ', '.join(sorted(set(config)-allowed)))
     if bool(config.get('cert')) != bool(config.get('key')):
@@ -82,6 +82,10 @@ def service_config(path):
     if (not isinstance(config.get('trusted_proxies', []), list) or
             any(not isinstance(value, str) for value in config.get('trusted_proxies', []))):
         raise ValueError('trusted_proxies must be a list of addresses')
+    per_address = config.get('connections_per_address', 0)
+    if isinstance(per_address, bool) or not isinstance(per_address, int) or per_address < 0:
+        raise ValueError('connections_per_address must be a whole number: how many connections one client address '
+                         'may have open at once, or 0 for no limit per address')
     return config
 
 
@@ -282,6 +286,8 @@ def web_command(settings, root, port, release_python, release_script):
         command.extend(['--public-url', served['public_url']])
     if served['shape'] == 'plain-http-on-network':
         command.append('--allow-plaintext-on-network')
+    if 'connections_per_address' in settings:
+        command.extend(['--connections-per-address', settings['connections_per_address']])
     return command
 
 
