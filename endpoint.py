@@ -218,7 +218,10 @@ def _bd_read(root,path,actor,argv,resolver_absence=False):
     bd's own structured no-match answer as an absence, which is what makes the check exact.
     With ``p-abc`` and ``p-abd`` present, ``show p-ab`` answers rc 1 with that object and
     "ambiguous ID" on stderr, and no row has exactly ``p-ab``, so the create proceeds as it
-    did before kittrial-5bb.135; any other non-zero exit still fails closed (kittrial-5bb.138).
+    did before kittrial-5bb.135; any other non-zero exit still fails closed. The object means
+    absent only at exactly rc 1 and only when ``resolver_absence`` asks for it: rc 0 with an
+    error object is a failed read, and no other guard read reads the object as absence
+    (kittrial-5bb.138 items ``rc0`` and ``absence-pins``).
     """
     try:
         p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*argv],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=60)
@@ -236,10 +239,16 @@ def _bd_read(root,path,actor,argv,resolver_absence=False):
     try:answer=record_json.loads(p.stdout)
     except ValueError:return None,'bd gave an unreadable answer'
     resolver_answer=isinstance(answer,dict) and answer.get('error')==BD_NO_MATCH_ERROR
+    # A structured error object is an answer only at the exit code bd uses for it (1 for the
+    # resolver's no-match object). rc 0 with an error object, or the no-match object with any
+    # other exit code, is a failed read: the rule is exactly "rc 1 and the exact no-match
+    # object means absent, anything else refuses" (kittrial-5bb.138 item rc0).
+    if isinstance(answer,dict) and 'error' in answer and p.returncode!=1:
+        return None,'bd could not read the tasks (%s)'%(said[-200:] or 'exit %d'%p.returncode)
     rows=[answer] if isinstance(answer,dict) else answer
     if not isinstance(rows,list):return None,'bd gave an unreadable answer'
     rows=[row for row in rows if isinstance(row,dict) and isinstance(row.get('id'),str)]
-    if p.returncode and not rows and 'no issue found' not in said and not (resolver_absence and resolver_answer):
+    if p.returncode and not rows and 'no issue found' not in said and not (resolver_absence and resolver_answer and p.returncode==1):
         return None,'bd could not read the tasks (%s)'%(said[-200:] or 'exit %d'%p.returncode)
     return rows,said
 

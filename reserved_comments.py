@@ -1508,8 +1508,10 @@ READ_VALUE_FLAGS = {
 }
 #: The short spellings of READ_FLAGS entries whose class is not 'plain'. bd 1.2.2 prints
 #: `-w, --watch` for `list` and `show`; the short spelling reaches the same pump, so it is
-#: refused with the long one (kittrial-5bb.138). A short flag's value is not resolved, so
-#: this can only refuse more, never less.
+#: refused with the long one (kittrial-5bb.138). The guarded spelling may sit anywhere in a
+#: short cluster before the first value-taking letter (`-qw`, `-vw`), which `_read_writes`
+#: scans letter by letter. A short flag's value is not resolved, so this can only refuse
+#: more, never less.
 READ_SHORT_FLAGS = {
     'list': {'-w': '--watch'},
     'show': {'-w': '--watch'},
@@ -1688,9 +1690,19 @@ def _read_writes(args, label):
     The value of a value-taking read flag is consumed, so ``ready -a --claim`` names the
     actor ``--claim`` and stays a read; a short flag's value is not resolved, which can
     only refuse more, never less.
+
+    A short *cluster* is scanned letter by letter: bd's global booleans ``-q``/``-v`` may
+    precede a guarded ``-w``, so ``list -qw`` and ``show ID -qw`` are ``--watch`` and must
+    be refused (kittrial-5bb.138). Every letter is looked up in this label's guarded short
+    flags, and the scan stops at the first letter whose shorthand takes a value, because the
+    rest of that token is that value and not flags (``list -nw`` limits by the value ``w``).
+    A joined value belongs to the last letter of the cluster, exactly as for a lone ``-w``.
     """
     values = READ_VALUE_FLAGS[label]
-    index = len(label.split())
+    guarded = READ_SHORT_FLAGS.get(label, {})
+    parts = label.split()
+    short_table = _short_flag_table(parts[0], parts[1] if len(parts) > 1 else None) or {}
+    index = len(parts)
     while index < len(args):
         token = args[index]
         if not isinstance(token, str):
@@ -1705,13 +1717,21 @@ def _read_writes(args, label):
             if name in values and not joined:
                 index += 1
         elif len(token) > 1 and token.startswith('-'):
-            # A short spelling of a classified read flag (`-w` is --watch on list and show).
-            name = READ_SHORT_FLAGS.get(label, {}).get(token[:2])
-            if name is not None:
-                joined = '=' in token
-                refusal = _read_flag_refusal(label, name, token.partition('=')[2] if joined else '', joined)
-                if refusal is not None:
-                    return refusal
+            # A short spelling of a classified read flag (`-w` is --watch on list and show),
+            # alone or anywhere in a cluster before the first value-taking letter.
+            body = token[1:]
+            cut = body.find('=')
+            letters = body if cut == -1 else body[:cut]
+            value = '' if cut == -1 else body[cut + 1:]
+            for position, letter in enumerate(letters):
+                name = guarded.get('-'+letter)
+                if name is not None:
+                    joined = cut != -1 and position == len(letters) - 1
+                    refusal = _read_flag_refusal(label, name, value if joined else '', joined)
+                    if refusal is not None:
+                        return refusal
+                if short_table.get(letter) == 'value':
+                    break
         index += 1
     return None
 

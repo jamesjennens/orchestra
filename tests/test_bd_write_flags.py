@@ -147,16 +147,22 @@ class TableTests(unittest.TestCase):
 
     def test_the_watch_flag_is_refused_on_the_reads_that_have_it(self):
         # bd 1.2.2: `list --watch` and `show ID --watch` never return until the endpoint's 120
-        # second timeout and hold the whole project meanwhile (kittrial-5bb.138 item 1).
+        # second timeout and hold the whole project meanwhile (kittrial-5bb.138 item 1). bd's
+        # global booleans -q/-v can precede -w, so a cluster must be scanned letter by letter
+        # (item cluster).
         for argv in (['list', '--watch'], ['list', '--watch=true'], ['list', '--watch=1'],
                      ['show', 'pp-1', '--watch'], ['show', 'pp-1', '--watch=yes'],
-                     ['list', '-w'], ['list', '-wq'], ['show', 'pp-1', '-w']):
+                     ['list', '-w'], ['list', '-wq'], ['list', '-qw'], ['list', '-vw'],
+                     ['show', 'pp-1', '-w'], ['show', 'pp-1', '-qw'], ['show', 'pp-1', '-vw']):
             with self.subTest(argv=argv):
                 request = rc.write_targets(argv)
                 self.assertTrue(request['refusal'], argv)
                 self.assertIn('waits for changes', request['refusal'])
+        # A value-taking letter ends the cluster, so a later w is that flag's value (`-nw` is
+        # `-n w`), and a joined false leaves the read alone (`-qw=false` is -w=false).
         for argv in (['list'], ['list', '--watch=false'], ['list', '--watch=0'], ['list', '-w=false'],
-                     ['show', 'pp-1'], ['show', 'pp-1', '--watch=false']):
+                     ['show', 'pp-1'], ['show', 'pp-1', '--watch=false'],
+                     ['list', '-nw'], ['list', '-qw=false']):
             with self.subTest(argv=argv):
                 self.assertIsNone(rc.write_targets(argv), argv)
 
