@@ -1641,8 +1641,19 @@ line separately and unconfined.
       not counted are on the row as `recommended_unchecked` and are used for that one
       question only. Update the endpoint and the service together and none of this is
       seen (docs/REVIEWS.md, "A mixed installation").
+    - **"Already recommended?" is asked by person** (kittrial-5bb.154), of an agent's
+      actions and of My work alike: an agent is not offered a delivery that it, its
+      owner or another agent of its owner has recommended, and My work does not list
+      it under "Contributions you could review". (An agent used to be asked whether
+      THIS AGENT had recommended it, so a person's second agent was offered it.)
+      Another person's agent is still offered it. A second recommendation by the same
+      person is refused with 409 and the sentence in docs/REVIEWS.md, which names the
+      ways on: request changes, or wait for a revision or a decision.
     - The prompt's "delivered by" names the contribution's author when the row gives
       it, not the task's assignee, so a reassignment does not rename who delivered.
+      When the row does not give it (a mixed installation, above) the prompt reads
+      "delivered by: not stated by this server (the task is assigned to NAME)": the
+      assignee is named as the assignee, and nobody as the one who delivered.
     - After a reassignment the new assignee's agent lists the task as
       `awaiting-review` ("Waiting for a human review decision."). That is meant: the
       task is that agent's now, whoever delivered the contribution on it, and there is
