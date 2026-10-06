@@ -417,8 +417,10 @@ def execute(root,request,authority_config=None,require_authority=False):
         result['provenance'] = {'kit': report(Path(__file__).resolve().parent, 'kit')}
         answer={'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(session_warnings)}
         # The session writes are not guarded writes; they carry the server's time all the same
-        # (kittrial-5bb.97). show, resume and run status only read.
-        if args[:1]==['register'] or (args[:1]==['run'] and args[1:2] in (['start'],['heartbeat'],['end'])):stamp_write(answer)
+        # (kittrial-5bb.97). show and run status only read.
+        # A request that is already recorded writes nothing (`reconciled`) and carries none.
+        writes=args[:1] in (['register'],['resume']) or (args[:1]==['run'] and args[1:2] in (['start'],['heartbeat'],['end']))
+        if writes and result.get('reconciled') is not True:stamp_write(answer)
         return answer
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}',actor):raise ValueError('Supply a short contributor/session actor')
     action=request.get('action','bd')
@@ -440,10 +442,15 @@ def execute(root,request,authority_config=None,require_authority=False):
         review_writes=configured_review_writes(root,warnings=switch_warnings)
         run_warnings.extend(switch_warnings)
         def work_effect():
-            return {'returncode':0,'stdout':json.dumps(work_execute(path,actor,action,args,request.get('attachments',{}),runner,
-                                                                    operators=configured_operators(root),
-                                                                    verifiers=configured_verifiers(root),
-                                                                    review_writes=review_writes),ensure_ascii=False,indent=2)+'\n','stderr':''.join(run_warnings)}
+            result=work_execute(path,actor,action,args,request.get('attachments',{}),runner,
+                                operators=configured_operators(root),
+                                verifiers=configured_verifiers(root),
+                                review_writes=review_writes)
+            # A handoff request and a decline are recorded in the kit's handoff journal and move
+            # nothing in bd, so the runner saw no write; they are writes all the same (review
+            # of kittrial-5bb.97). One that was already recorded (`reconciled`) wrote nothing.
+            if action=='handoff' and len(args)==2 and isinstance(result,dict) and result.get('reconciled') is False:runner.wrote=True
+            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False,indent=2)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             return run_guarded(request,journal_path(path),work_effect,
@@ -501,7 +508,7 @@ def execute(root,request,authority_config=None,require_authority=False):
         else:
             result=guidance.read(path,args,actor)
         answer={'returncode':0,'stdout':json.dumps(result,ensure_ascii=False,indent=2)+'\n','stderr':''}
-        return stamp_write(answer) if subcommand=='ack' else answer
+        return stamp_write(answer) if subcommand=='ack' and result.get('reconciled') is not True else answer
     if action=='anchors':
         # Read-only (kittrial-5bb.71): which rows are record anchors, by the predicate
         # every surface uses (reserved_comments.is_record_anchor), in ONE native read:
@@ -720,7 +727,7 @@ def execute(root,request,authority_config=None,require_authority=False):
             fcntl.flock(lock,fcntl.LOCK_EX)
             result=feedback_execute(path/'.feedback.jsonl',actor,args,request.get('attachments',{}))
         answer={'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''}
-        return answer if args[:1]==['list'] else stamp_write(answer)
+        return answer if args[:1]==['list'] or result.get('reconciled') is True else stamp_write(answer)
     if action=='view':
         target=request.get('path','CURRENT.md')
         viewroot=(path/'views').resolve();view=(viewroot/target).resolve()

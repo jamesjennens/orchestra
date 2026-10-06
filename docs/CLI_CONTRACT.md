@@ -39,13 +39,29 @@ Every request is one JSON object on stdin; every response is one JSON object on 
   were. Rules:
   - a refusal, a busy answer and an uncertain answer carry none (nothing was written at
     a known time), and neither does a read, including the reads of an action that can
-    also write (`work`, `review TASK`, `brief`, a `--dry-run`);
-  - the same request sent again with its operation identity is answered with the time
-    the write was carried out, not the time of the retry;
-  - the writes are: every bd write, `review --file`, `handoff`, `checkpoint`, the
-    lifecycle, coordinate and requirement actions, the keyed records (`ref`,
-    `capability`, `proposal`), `session register` and `session run start`,
+    also write (`work`, `review TASK`, `brief`, `handoff TASK`), a `--dry-run`, and the
+    help of a command (`create --help`);
+  - the writes are: every bd write (`create`, `update`, `close`, `reopen`, `comments
+    add`, `dep add`, `remove`, `relate` and `unrelate`, ...), `review --file`, `handoff`
+    with a payload (a request, an acceptance, a decline), `checkpoint`, the lifecycle,
+    coordinate and requirement actions, the keyed records (`ref`, `capability`,
+    `proposal`), `session register`, `session resume` and `session run start`,
     `heartbeat` and `end`, `guidance ack`, and `feedback` (add and correct);
+  - **a request that is already recorded carries none.** Where the kit recognises its
+    own record (the same `operation_id` in a lifecycle fact, a review record, a handoff,
+    a session registration, an acknowledgement, a feedback entry), the second answer
+    says so (`reconciled`, or the record it found) and writes nothing, so it has no
+    time of its own. The time of the first answer is the time of the write; keep it, or
+    read the record's own `created_at`;
+  - a request that is sent again with a transport operation identity (the HTTP
+    service's `Idempotency-Key`, which it hands to the endpoint) is answered from the
+    endpoint's journal with the stored answer, time included, and the field `replayed:
+    true`. An answer stored by a kit from before this field is replayed as it was
+    stored, without a time;
+  - the time is taken when the write has been carried out and is cut to the whole
+    second, while bd rounds its own times: a `created_at` or `updated_at` of the row
+    can read one second later than `server_time`. It is the host's wall clock, so it is
+    not monotonic across a step of that clock;
   - an older endpoint sends no such field and the client then prints nothing; an older
     client ignores the field.
 

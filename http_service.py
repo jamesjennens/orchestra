@@ -408,6 +408,8 @@ def written_at(service):
     WRITTEN.at = None
     if isinstance(at, str):
         return at
+    if at is False:
+        return None                                   # an endpoint's stored answer that has no time
     from http_authority import server_time
     return server_time(service._now())
 
@@ -1364,6 +1366,10 @@ class EndpointBackend:
             # The endpoint's time of the write it carried out, for the body of the answer of
             # the request this thread is serving (kittrial-5bb.97).
             WRITTEN.at = reply['server_time']
+        elif code == 0 and reply.get('replayed') is True:
+            # A stored answer from before the time was kept: no time is known, and the
+            # service's clock now would be the time of the retry.
+            WRITTEN.at = False
         stderr = (reply.get('stderr') or '') if isinstance(reply, dict) else ''
         stdout = (reply.get('stdout') or '') if isinstance(reply, dict) else ''
         if code == 126:
@@ -2908,7 +2914,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         # carried out (kittrial-5bb.97). An answer that is not an object carries none.
         at = written_at(self.service)
         for body in (public, stored):
-            if isinstance(body, dict) and 'server_time' not in body:
+            if at is not None and isinstance(body, dict) and 'server_time' not in body:
                 body['server_time'] = at
         # And in a header, whatever the shape of the body: a JSON list or an empty answer has
         # no field for it. An answer that already carries a time (a canonical retry answered

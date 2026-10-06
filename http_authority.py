@@ -692,7 +692,7 @@ class PreEffectFailure(Exception):
 #: allowlist: an unrecognized verb is treated as a write, so an unknown future
 #: mutation can never be mistaken for a read and released.
 READ_ONLY_BD_VERBS = frozenset({'export', 'list', 'show', 'ready', 'search',
-                                'count', 'dep', 'state', 'lint'})
+                                'count', 'state', 'lint'})
 
 #: Exceptions the canonical effect layer raises to refuse a request (bad attachment,
 #: task mismatch, malformed payload, unknown flag). They release the identity only
@@ -715,11 +715,40 @@ def _is_plain_dry_run(argv):
     return '--dry-run' in options
 
 
+def _asks_for_help(argv):
+    """Whether a bd invocation carries the help flag as a flag (not as the value of another flag)."""
+    try:
+        from reserved_comments import _bd_scan
+        flags, _, unknown = _bd_scan(list(argv), argv[0])
+    except Exception:  # noqa: BLE001 - a verb the scan does not know stays what it was
+        return False
+    return not unknown and any(name in ('--help', '-h') for name, _ in flags)
+
+
+def _writes_rows(argv):
+    """Whether the kit's table of writing commands says this invocation writes rows; unknown is a write."""
+    try:
+        from reserved_comments import write_targets
+        return write_targets(list(argv), {}) is not None
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def is_mutating_invocation(argv):
     """Whether one injected ``bin/bd`` argv can change canonical/native state."""
     if not isinstance(argv, (list, tuple)) or not argv or not isinstance(argv[0], str):
         return True
     verb = argv[0]
+    if _asks_for_help(argv):
+        # `bd VERB ... --help` prints the help of the verb and writes nothing (review of
+        # kittrial-5bb.97: `create --help` was taken for a write and its answer stamped).
+        return False
+    if verb == 'dep':
+        # `dep add`, `remove`, `relate`, `unrelate` and the form without a subcommand store or
+        # remove a dependency; `list`, `tree` and `cycles` read. The kit's own table of the
+        # rows a command writes decides (reserved_comments.write_targets): the whole verb was
+        # listed as read-only here, older than that table.
+        return _writes_rows(argv)
     if verb in READ_ONLY_BD_VERBS:
         return False
     if verb in ('create', 'update') and _is_plain_dry_run(argv):
@@ -744,12 +773,16 @@ class NativeRunner:
     it returns whatever the dispatch returns and raises whatever it raises.
     """
 
-    __slots__ = ('_dispatch', 'attempted_write', 'calls')
+    __slots__ = ('_dispatch', 'attempted_write', 'calls', 'wrote')
 
     def __init__(self, dispatch):
         self._dispatch = dispatch
         self.attempted_write = False
         self.calls = 0
+        #: Set by an effect that wrote something that is not a bd row (the kit's handoff
+        #: journal): the answer is then the answer of a write, with the server's time
+        #: (kittrial-5bb.97). It says nothing about refusals, which `attempted_write` decides.
+        self.wrote = False
 
     def __call__(self, argv):
         self.calls += 1
@@ -1925,7 +1958,11 @@ def run_guarded(request, journal_path, effect, authority_config=None,
                         return _envelope(124, stderr='Operation is committed but its response '
                                                      'exceeded the retention bound; reconcile '
                                                      'canonical state before retrying.\n')
-                    return entry.get('envelope')
+                    # The stored answer, marked as one: a caller that would otherwise put its
+                    # own clock on a write answer must not do so for an answer that was
+                    # stored without a time (by a kit from before the time was kept).
+                    stored = entry.get('envelope')
+                    return dict(stored, replayed=True) if isinstance(stored, dict) else stored
                 # The prior attempt reserved the identity and its outcome is unknown:
                 # preserve uncertainty rather than repeating a possibly committed effect.
                 return _envelope(124, stderr='Operation identity reserved; outcome unknown. '
@@ -1963,7 +2000,7 @@ def run_guarded(request, journal_path, effect, authority_config=None,
         # The time of the write, on the answer itself and so in what the journal keeps: the
         # same request sent again is answered with the time the write was carried out. A
         # guarded action that only read (its runner attempted no write) carries none.
-        if runner is None or runner.attempted_write:
+        if runner is None or runner.attempted_write or runner.wrote:
             stamp_write(envelope)
         if journal is not None and isinstance(envelope, dict):
             code = envelope.get('returncode')

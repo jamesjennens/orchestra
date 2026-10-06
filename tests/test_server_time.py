@@ -51,6 +51,44 @@ class ClockTests(unittest.TestCase):
             self.assertEqual(http_authority.stamp_write('not an envelope'), 'not an envelope')
 
 
+class WhichCallsWriteTests(unittest.TestCase):
+    """Review of the second delivery: `dep add` was listed as a read and `create --help` as a write."""
+
+    def test_dep_writes_and_reads(self):
+        writes = http_authority.is_mutating_invocation
+        for argv in (['dep', 'add', 'pp-1', 'pp-2'], ['dep', 'remove', 'pp-1', 'pp-2'], ['dep', 'relate', 'pp-1', 'pp-2'],
+                     ['dep', 'unrelate', 'pp-1', 'pp-2'], ['dep', 'pp-1', '--blocks', 'pp-2'],
+                     ['dep', 'add', 'pp-1', 'pp-2', '--type', 'blocks']):
+            with self.subTest(argv=argv):
+                self.assertTrue(writes(argv))
+        for argv in (['dep', 'list', 'pp-1'], ['dep', 'tree', 'pp-1'], ['dep', 'cycles'], ['dep', 'list', 'pp-1', '--json']):
+            with self.subTest(argv=argv):
+                self.assertFalse(writes(argv))
+
+    def test_help_writes_nothing_and_a_value_that_looks_like_the_flag_is_not_help(self):
+        writes = http_authority.is_mutating_invocation
+        for argv in (['create', '--help'], ['create', '-h'], ['update', 'pp-1', '--help'], ['close', 'pp-1', '-h'],
+                     ['comments', 'add', 'pp-1', 'text', '--help'], ['dep', 'add', 'pp-1', 'pp-2', '--help'],
+                     ['create', '--title', 'x', '--help']):
+            with self.subTest(argv=argv):
+                self.assertFalse(writes(argv))
+        for argv in (['create', '--title', '-h'], ['create', '--title', '--help'], ['create', '--title', 'x', '--', '--help'],
+                     ['comments', 'add', 'pp-1', '--', '-h']):
+            with self.subTest(argv=argv):
+                self.assertTrue(writes(argv))
+
+    def test_the_rest_is_what_it_was(self):
+        writes = http_authority.is_mutating_invocation
+        for argv, expected in ((['list', '--json'], False), (['show', 'pp-1'], False), (['export', '--all'], False),
+                               (['create', '--title', 'x'], True), (['create', '--title', 'x', '--dry-run'], False),
+                               (['create', '--title', 'x', '--dry-run=false'], True), (['update', 'pp-1', '--claim'], True),
+                               (['comments', 'add', 'pp-1', 'x'], True), (['comments', 'pp-1'], False),
+                               (['merge-slot', 'check'], False), (['merge-slot', 'acquire'], True), (['close', 'pp-1'], True),
+                               ([], True), ('create', True)):
+            with self.subTest(argv=argv):
+                self.assertEqual(writes(argv), expected)
+
+
 class GuardedWriteTests(unittest.TestCase):
     def guarded(self, effect, runner=None, operation_id=None, journal=None):
         request = {'project': 'p', 'actor': 'worker', 'action': 'bd', 'args': ['x']}
@@ -109,15 +147,45 @@ class GuardedWriteTests(unittest.TestCase):
             other = self.guarded(effect, operation_id='op-00000003')
         self.assertEqual(len(calls), 2)                               # the retry ran nothing
         self.assertEqual(first['server_time'], '2026-10-06T07:50:12+00:00')
-        self.assertEqual(again, first)
+        # The stored answer, whole, and marked as one.
+        self.assertEqual(again, dict(first, replayed=True))
+        self.assertNotIn('replayed', first)
         self.assertEqual(other['server_time'], '2026-10-06T09:00:00+00:00')
+
+    def test_a_stored_answer_without_a_time_is_replayed_without_one_and_marked(self):
+        """An answer the previous kit stored: this kit must not put a time on it, and says it is a stored answer."""
+        def effect():
+            return {'returncode': 0, 'stdout': '{"id": "p-1"}', 'stderr': ''}
+        with mock.patch.object(http_authority, 'stamp_write', lambda envelope: envelope):      # as the previous kit wrote it
+            first = self.guarded(effect, operation_id='op-00000004')
+        again = self.guarded(effect, operation_id='op-00000004')
+        self.assertNotIn('server_time', first)
+        self.assertEqual(again, dict(first, replayed=True))
+
+    def test_an_effect_that_wrote_outside_bd_is_stamped_and_its_refusals_are_what_they_were(self):
+        runner = http_authority.NativeRunner(lambda argv: {'returncode': 0, 'stdout': '[]', 'stderr': ''})
+        self.assertFalse(runner.wrote)
+
+        def journal_write():
+            runner(['show', 'p-1', '--json'])
+            runner.wrote = True
+            return {'returncode': 0, 'stdout': '{}', 'stderr': ''}
+        answer = self.guarded(journal_write, runner=runner)
+        self.assertRegex(answer['server_time'], SHAPE)
+        self.assertFalse(runner.attempted_write)                      # what decides a refusal is untouched
+        refusing = http_authority.NativeRunner(lambda argv: {'returncode': 0, 'stdout': '[]', 'stderr': ''})
+
+        def refuses():
+            raise ValueError('not allowed')
+        with self.assertRaises(ValueError):
+            self.guarded(refuses, runner=refusing, operation_id='op-00000005')
 
 
 @unittest.skipIf(endpoint is None, 'endpoint imports fcntl (POSIX-only)')
 class EndpointTests(unittest.TestCase):
     """The writes of the endpoint that are not guarded writes: the session registry, an acknowledgement, feedback."""
 
-    def run_action(self, action, args):
+    def run_action(self, action, args, reconciled=False):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / 'projects' / 'pp' / '.beads').mkdir(parents=True)
@@ -125,11 +193,11 @@ class EndpointTests(unittest.TestCase):
             import feedback
             import guidance
             import sessions
-            with mock.patch.object(sessions, 'execute', return_value={'ok': True}), \
-                    mock.patch.object(guidance, 'acknowledge', return_value={'acknowledged': 'v1'}), \
+            with mock.patch.object(sessions, 'execute', return_value={'ok': True, 'reconciled': reconciled}), \
+                    mock.patch.object(guidance, 'acknowledge', return_value={'acknowledged': 'v1', 'reconciled': reconciled}), \
                     mock.patch.object(guidance, 'read', return_value={'text': 'g'}), \
                     mock.patch.object(guidance, 'state', return_value={'version': 'v1'}), \
-                    mock.patch.object(feedback, 'execute', return_value={'ok': True}), \
+                    mock.patch.object(feedback, 'execute', return_value={'ok': True, 'reconciled': reconciled}), \
                     mock.patch.object(endpoint, 'report', return_value={}):
                 return endpoint.execute(root, {'project': 'pp', 'actor': 'worker', 'action': action, 'args': args})
 
@@ -142,7 +210,7 @@ class EndpointTests(unittest.TestCase):
                 ('session', ['run', 'end', '--run-id', 'r1', '--status', 'succeeded'], True),
                 ('session', ['run', 'status', '--run-id', 'r1'], False),
                 ('session', ['show', 'worker'], False),
-                ('session', ['resume', '--request-id', uuid], False),
+                ('session', ['resume', '--request-id', uuid], True),          # it records the resume
                 ('guidance', ['ack', '--version', 'v1'], True),
                 ('guidance', ['get'], False),
                 ('guidance', ['version'], False),
@@ -156,6 +224,42 @@ class EndpointTests(unittest.TestCase):
                     self.assertRegex(answer['server_time'], SHAPE)
                 else:
                     self.assertNotIn('server_time', answer)
+
+    def test_a_request_that_was_already_recorded_carries_none(self):
+        """The same registration, acknowledgement or entry again writes nothing: the kit says `reconciled`."""
+        uuid = '0b0f6f0c-1a55-4f0e-9d2b-5d7a3c1e9f10'
+        for action, args in (('session', ['register', '--name', 'n', '--request-id', uuid]),
+                             ('session', ['resume', '--request-id', uuid]),
+                             ('session', ['run', 'start', '--run-id', 'r1']),
+                             ('guidance', ['ack', '--version', 'v1']),
+                             ('feedback', ['add', '--file', '@a']), ('feedback', ['correct', '--file', '@a'])):
+            with self.subTest(action=action, args=args[:2]):
+                answer = self.run_action(action, args, reconciled=True)
+                self.assertEqual(answer['returncode'], 0)
+                self.assertNotIn('server_time', answer)
+
+    def handoff(self, result, action='handoff', args=('pp-1', '@attachment:a')):
+        import work
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'projects' / 'pp' / '.beads').mkdir(parents=True)
+            (root / 'projects' / 'pp' / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+            (root / 'deployment.private.json').write_text('{"password": "x", "operators": ["ops"]}', encoding='utf-8')
+            request = {'project': 'pp', 'actor': 'worker', 'action': action, 'args': list(args),
+                       'attachments': {'a': {'flag': '--file', 'text': '{"task": "pp-1"}'}}}
+            with mock.patch.object(work, 'execute', return_value=result):
+                return endpoint.execute(root, request)
+
+    def test_a_handoff_that_was_recorded_is_stamped_though_bd_was_not_written(self):
+        """Review of the second delivery: a request and a decline write the kit's handoff journal only."""
+        recorded = {'task': 'pp-1', 'operation_id': 'move-1', 'reconciled': False}
+        self.assertRegex(self.handoff(recorded)['server_time'], SHAPE)
+        # The same request again is already recorded; the read of a task's handoffs is a read.
+        self.assertNotIn('server_time', self.handoff(dict(recorded, reconciled=True)))
+        self.assertNotIn('server_time', self.handoff({'task': 'pp-1', 'handoffs': []}, args=('pp-1',)))
+        # A review read and the work read go the same way and are not writes.
+        self.assertNotIn('server_time', self.handoff({'task': 'pp-1', 'reconciled': False}, action='review', args=('pp-1',)))
+        self.assertNotIn('server_time', self.handoff({'next_actions': []}, action='work', args=('--json',)))
 
     def test_the_envelope_printed_by_main_carries_it(self):
         printed = io.StringIO()
@@ -369,6 +473,57 @@ class HeaderTests(test_http_agents.AgentHarness):
             again = self.request('PATCH', path, {'title': 'renamed', 'version': 1}, token=self.admin, key='change-key-0011')
         self.assertEqual((type(first.data), self.stamp(first), self.stamp(again)),
                          (list, '2026-10-06T07:49:59+00:00', '2026-10-06T07:49:59+00:00'))
+
+    def test_a_stored_answer_of_the_endpoint_that_has_no_time_gets_none_from_the_service(self):
+        """The upgrade window: a write made through the previous kit, sent again through this one with the
+        service's own stored answer gone. The endpoint replays what it stored, without a time; the service's
+        clock would be the time of the retry."""
+        reply = {'returncode': 0, 'stdout': '{"id": "pp-1"}\n', 'stderr': '', 'replayed': True}
+        self.assertEqual(http_service.EndpointBackend._checked(reply), {'id': 'pp-1'})
+        self.assertIsNone(http_service.written_at(self.service))
+        self.assertRegex(http_service.written_at(self.service), SHAPE)          # used once: the next write has the clock
+        # A replayed answer that has its time keeps it.
+        http_service.EndpointBackend._checked(dict(reply, server_time='2026-10-06T07:50:12+00:00'))
+        self.assertEqual(http_service.written_at(self.service), '2026-10-06T07:50:12+00:00')
+        real = self.backend.invoke
+
+        def replays(route, *args, **kwargs):
+            result = real(route, *args, **kwargs)
+            if route == 'tasks.create':
+                http_service.WRITTEN.at = False                               # what _checked leaves for such an answer
+            return result
+        path = '/v1/projects/%s/tasks' % self.project
+        with mock.patch.object(self.backend, 'invoke', replays):
+            first = self.request('POST', path, {'title': 'made by the previous kit'}, token=self.admin, key='old-key-0101')
+        again = self.request('POST', path, {'title': 'made by the previous kit'}, token=self.admin, key='old-key-0101')
+        for answer in (first, again):
+            self.assertEqual(answer.status, 201)
+            self.assertNotIn('server_time', answer.data)
+            self.assertIsNone(self.stamp(answer))
+
+    def test_an_answer_that_carries_its_own_time_keeps_it_in_the_body_and_the_header(self):
+        real = self.backend.invoke
+
+        def with_its_time(route, *args, **kwargs):
+            result = real(route, *args, **kwargs)
+            return dict(result, server_time='2026-10-06T07:49:59+00:00') if route == 'tasks.create' else result
+        with mock.patch.object(self.backend, 'invoke', with_its_time), mock.patch.object(self.store, 'now', return_value=1791273012.0):
+            made = self.request('POST', '/v1/projects/%s/tasks' % self.project, {'title': 'x'}, token=self.admin)
+        self.assertEqual((made.data['server_time'], self.stamp(made)), ('2026-10-06T07:49:59+00:00', '2026-10-06T07:49:59+00:00'))
+
+    def test_the_stored_answer_has_the_time_where_it_is_not_the_answer_that_was_sent(self):
+        """An agent is made: the answer carries its secret once, what is stored for a retry does not. Both have the time."""
+        body = {'name': 'Kestrel', 'working_directory': '/home/priya/work/kestrel'}
+        with mock.patch.object(self.store, 'now', return_value=1791273012.0):
+            first = self.request('POST', '/v1/agents', body, token=self.admin, key='agent-key-0001')
+        with mock.patch.object(self.store, 'now', return_value=1791273072.0):
+            again = self.request('POST', '/v1/agents', body, token=self.admin, key='agent-key-0001')
+        self.assertEqual((first.status, first.data['server_time'], self.stamp(first)),
+                         (201, '2026-10-06T07:50:12+00:00', '2026-10-06T07:50:12+00:00'))
+        self.assertIn(again.status, (200, 201))
+        self.assertNotEqual(again.data, first.data)                    # the secret is not delivered twice
+        self.assertEqual((again.data.get('server_time'), self.stamp(again)),
+                         ('2026-10-06T07:50:12+00:00', '2026-10-06T07:50:12+00:00'))
 
     def test_the_retry_of_an_object_answer_has_the_header_of_the_write(self):
         path = '/v1/projects/%s/tasks' % self.project
