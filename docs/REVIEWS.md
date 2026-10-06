@@ -404,7 +404,17 @@ Over HTTP a refused recommendation says which rule it hit: the 422 message is th
 * it was written after the contribution;
 * no `approve` or `request-changes` on that contribution was written after it.
 
-A new revision, a decision or a withdrawal makes it lapse. The newest recommendation by one actor replaces that actor's earlier one.
+A new revision, a decision or a withdrawal of the contribution makes it lapse.
+
+**One standing recommendation for a contribution from each reviewer (kittrial-5bb.154).** While a recommendation stands, a second one for the same contribution by the same reviewer is refused and nothing is stored: `NAME has already recommended this contribution, and that recommendation stands until the contribution is revised or decided. To ask for changes instead, request changes: the recommendation then stops counting. A recommendation cannot be withdrawn.` "The same reviewer" is the same actor by the name rule in the canonical action (over SSH), and the same PERSON in the web service: the reviewer, the person who owns the agent, or another agent of that person (409, with `detail.recommended_by`). An exact retry is still answered as recorded. A recommendation by another person is a second voice and is stored.
+
+How a reviewer changes their mind:
+
+* **From recommending to asking for changes: `request-changes`.** Any reviewer may, not only an owner. The recommendation stops counting at once, for every reader: the brief, the queue row, My work and the agents' actions. After the contributor has responded, the contribution awaits review again and the reviewer may recommend it again; the earlier one does not come back.
+* **A revised contribution is a new contribution.** Every recommendation of the earlier revision has lapsed, and the same reviewer may recommend the new one.
+* **From a mistaken recommendation to none: there is no such operation.** A recommendation cannot be withdrawn or voided; it lapses at the next decision or revision. A reviewer who recommended by mistake and does not want changes either tells the owner, who decides: a recommendation is advice to the owner, never a decision. **For the owner:** treat a recommendation that is followed by a comment from the same reviewer taking it back as taken back, although every reader still counts it; `request-changes` is the only record that stops a recommendation counting.
+
+Records written before this rule are read as before: where one actor has two standing ones, the newest replaces the earlier in every reading.
 
 **Where it shows.**
 

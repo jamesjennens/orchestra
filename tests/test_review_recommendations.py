@@ -61,6 +61,12 @@ class Harness(unittest.TestCase):
     def view(self):
         return work.workflow(self.issue)
 
+    def stored(self, contribution, actor='reviewer', **changes):
+        """A recommendation as a kit before kittrial-5bb.154 stored it: a second one by the same actor too."""
+        self.actor = actor
+        self.run_native(['comments', 'add', TASK,
+                         rec.PREFIX + rec.canonical_bytes(self.payload(contribution, **changes)).decode(), '--json'])
+
 
 class WriteRuleTests(Harness):
     def test_a_recommendation_is_recorded_beside_the_chain_and_changes_nothing_in_it(self):
@@ -216,18 +222,84 @@ class ReaderRuleTests(Harness):
         self.recommend(contribution, actor='second-reviewer')
         self.assertEqual([entry['author'] for entry in self.view()['recommendations']], ['second-reviewer'])
 
-    def test_the_newest_by_one_actor_replaces_their_earlier_one(self):
+    def test_two_stored_by_one_actor_read_as_the_newest(self):
+        """Records an earlier kit accepted: the reading is unchanged, the newest by an actor replaces the earlier."""
         contribution = self.contribute()
-        self.recommend(contribution, summary='First reading.')
-        self.recommend(contribution, actor='other', summary='Another reviewer.')
-        self.recommend(contribution, summary='Second reading, after running it.')
+        self.stored(contribution, summary='First reading.')
+        self.stored(contribution, actor='other', summary='Another reviewer.')
+        self.stored(contribution, summary='Second reading, after running it.')
         view = self.view()
         self.assertEqual([(entry['author']) for entry in view['recommendations']], ['reviewer', 'other'])
         self.assertEqual(view['recommendation']['summary'], 'Second reading, after running it.')
         self.assertEqual(len(rec._records(self.issue)[0]), 3)
         # `Reviewer/sub` is the same actor by the name rule and replaces it too.
-        self.recommend(contribution, actor='Reviewer/sub', summary='Third.')
+        self.stored(contribution, actor='Reviewer/sub', summary='Third.')
         self.assertEqual([entry['author'] for entry in self.view()['recommendations']], ['Reviewer/sub', 'other'])
+        with self.assertRaises(ValueError):
+            self.recommend(contribution, summary='A fourth is refused.')
+
+    def test_a_second_recommendation_by_the_same_actor_is_refused_and_nothing_is_written(self):
+        """kittrial-5bb.154: one standing recommendation for a contribution from each actor."""
+        contribution = self.contribute()
+        first = self.payload(contribution, summary='First reading.')
+        self.actor = 'reviewer'
+        rec.execute([self.issue], TASK, 'reviewer', first, self.run_native)
+        self.recommend(contribution, actor='other', summary='Another reviewer.')
+        before = len(self.issue['comments'])
+        for actor in ('reviewer', 'Reviewer/sub'):                      # the same actor by the name rule
+            with self.subTest(actor=actor), self.assertRaises(ValueError) as caught:
+                self.recommend(contribution, actor=actor, summary='Second reading, after running it.')
+            self.assertEqual(str(caught.exception),
+                             '%s has already recommended this contribution, and that recommendation stands until the '
+                             'contribution is revised or decided. To ask for changes instead, request changes: the '
+                             'recommendation then stops counting. A recommendation cannot be withdrawn.' % actor)
+        self.assertEqual(len(self.issue['comments']), before)
+        view = self.view()
+        self.assertEqual([entry['author'] for entry in view['recommendations']], ['other', 'reviewer'])
+        # An exact retry of the one that stands is still answered as recorded, and writes nothing.
+        self.actor = 'reviewer'
+        again = rec.execute([self.issue], TASK, 'reviewer', first, self.run_native)
+        self.assertTrue(again['reconciled'])
+        self.assertEqual(len(self.issue['comments']), before)
+
+    def test_changing_ones_mind_is_request_changes_and_the_recommendation_stops_counting(self):
+        """The reviewer who recommended asks for changes instead; after the response they may recommend again."""
+        contribution = self.contribute()
+        self.recommend(contribution)
+        request = self.chain('request-changes', 'reviewer', contribution=contribution, items=[dict(id='fix', text='Fix')])
+        view = self.view()
+        self.assertEqual((view['review_state'], view['recommended'], view['recommendation'], view['recommendations']),
+                         ('changes-requested', False, None, []))
+        self.chain('respond', 'worker', contribution=contribution,
+                   resolutions=[dict(request=request, item='fix', reason='Fixed', evidence='commit')])
+        view = self.view()
+        self.assertEqual((view['review_state'], view['recommended']), ('awaiting-review', False))
+        self.recommend(contribution, summary='After the fix.')          # the earlier one lapsed: not a second one
+        view = self.view()
+        self.assertEqual([entry['author'] for entry in view['recommendations']], ['reviewer'])
+        self.assertEqual(view['recommendation']['summary'], 'After the fix.')
+
+    def test_a_revised_contribution_is_a_new_one_and_the_same_actor_may_recommend_it(self):
+        first = self.contribute()
+        self.recommend(first)
+        second = self.contribute(commit='d' * 40)
+        self.recommend(second, commit='d' * 40, summary='The revision.')
+        view = self.view()
+        self.assertEqual([(entry['author'], entry['contribution']) for entry in view['recommendations']],
+                         [('reviewer', second)])
+        with self.assertRaises(ValueError) as caught:
+            self.recommend(second, commit='d' * 40)
+        self.assertIn('has already recommended this contribution', str(caught.exception))
+
+    def test_the_refusal_looks_at_every_standing_one_not_only_those_a_read_shows(self):
+        contribution = self.contribute()
+        self.recommend(contribution, actor='first')
+        for number in range(rec.READ_MAX):
+            self.recommend(contribution, actor='reviewer-%d' % number)
+        self.assertNotIn('first', [entry['author'] for entry in self.view()['recommendations']])
+        with self.assertRaises(ValueError) as caught:
+            self.recommend(contribution, actor='first')
+        self.assertIn('first has already recommended this contribution', str(caught.exception))
 
     def test_at_most_twenty_are_read(self):
         contribution = self.contribute()
