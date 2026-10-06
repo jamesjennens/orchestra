@@ -55,15 +55,23 @@ sudo install -d -m 0700 -o <SERVICE_USER> -g <SERVICE_USER> <RUNTIME_ROOT>/secre
 sudo -u <SERVICE_USER> git clone <KIT_REPO_URL> <RUNTIME_ROOT>/kit
 cd <RUNTIME_ROOT>/kit && git checkout <PINNED_COMMIT>
 
-# 3. one-time superuser bootstrap; there is no default or shared password
+# 3. one-time superuser bootstrap; there is no default or shared password.
+#    Run it while the service is stopped: it takes the runtime lock and refuses
+#    while a service holds that root. --root must name an existing runtime
+#    directory (a path that is not one is refused with one sentence).
 sudo -u <SERVICE_USER> python3 http_service.py \
-  --state <RUNTIME_ROOT>/http-state.json --bootstrap-user <ADMIN_USERNAME>
+  --state <RUNTIME_ROOT>/http-state.json --root <RUNTIME_ROOT> \
+  --bootstrap-user <ADMIN_USERNAME>
 # the operator types the password at the prompt; it is never echoed or logged
 ```
 
 Bootstrap refuses to run once any account exists, so it cannot silently reset a
 live deployment. Create ordinary accounts through the API and hand each user a
 single-use reset value; only redemption changes the verifier.
+
+The guard is only as good as `--root`: it locks the root you name, so naming a
+different root while a service holds the real one gets past the lock and the new
+account is lost as before.
 
 ## 4. Service unit
 
