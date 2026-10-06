@@ -465,10 +465,15 @@ class InProcessBackend:
             if authorize is not None:
                 authorize()
             if result_key is not None and self.service.has_result(result_key):
+                # A stored answer: the time kept with it, and none where none was kept. Never
+                # the clock now, which is the time of the retry (kittrial-5bb.97).
+                WRITTEN.at = self.service.result_written_at(result_key) or False
                 return self.service.result_get(result_key)
             result = self._dispatch(route, principal, project_id, payload)
+            from http_authority import server_time
+            WRITTEN.at = server_time(self.service._now())
             if result_key is not None:
-                self.service.result_put(result_key, result)
+                self.service.result_put(result_key, result, written_at=WRITTEN.at)
             self.service.store.save()
         if self.faults.get(route, 0) > 0:
             self.faults[route] -= 1
@@ -1458,6 +1463,10 @@ class EndpointBackend:
             if authorize is not None:
                 authorize()
             if result_key is not None and self.service.has_result(result_key):
+                # The endpoint is not asked: the time is the one kept with the stored result,
+                # and none where none was kept (a result stored before the time was kept).
+                # Never the service's clock, which is the time of the retry (kittrial-5bb.97).
+                WRITTEN.at = self.service.result_written_at(result_key) or False
                 return self.service.result_get(result_key)
         # The durable canonical operation identity is the same deterministic digest as
         # the local result key, so an exact retry after a lost response carries the
@@ -1495,7 +1504,8 @@ class EndpointBackend:
         # changed the authority the effect ran under.
         if result_key is not None:
             with self.service.store.lock:
-                self.service.result_put(result_key, result)
+                # With the endpoint's time of the write (``_checked`` left it for this thread).
+                self.service.result_put(result_key, result, written_at=getattr(WRITTEN, 'at', None))
                 self.service.store.save()
         if self.faults.get(route, 0) > 0:
             self.faults[route] -= 1

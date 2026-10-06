@@ -715,14 +715,78 @@ def _is_plain_dry_run(argv):
     return '--dry-run' in options
 
 
+def _help_flags(argv):
+    """The value of every help flag of a bd invocation, in order, or None when a flag cannot be resolved.
+
+    A bare ``--help`` or ``-h`` is True; ``--help=VALUE`` and ``-h=VALUE`` are the text of
+    VALUE. A token that is the value of another flag, or stands after ``--``, is not a
+    flag. The inventories are the kit's own tables of bd's flags; a flag none of them
+    knows makes the answer None, because its value could be what looks like the help flag.
+    """
+    import reserved_comments as rc
+    verb = argv[0]
+    value_long = set(rc.BD_GLOBAL_VALUE_FLAGS)
+    bool_long = set(rc.BD_GLOBAL_BOOL_FLAGS)
+    if verb == 'dep':
+        value_long |= rc.BD_DEP_VALUE_LONG_FLAGS
+        bool_long |= rc._DEP_BOOL_FLAGS
+        table = rc._short_flag_table('dep', rc._dep_subcommand(list(argv)))
+    elif verb == 'comments':
+        value_long |= rc.BD_COMMENT_ADD_VALUE_FLAGS
+        bool_long |= rc.BD_COMMENT_ADD_BOOL_FLAGS
+        table = rc._short_flag_table('comments', 'add')
+    else:
+        value_long |= rc.BD_LONG_VALUE_FLAGS.get(verb, set())
+        bool_long |= rc.BD_LONG_BOOL_FLAGS.get(verb, set())
+        table = rc._short_flag_table(verb)
+    found, index = [], 1
+    while index < len(argv):
+        token = argv[index]
+        index += 1
+        if not isinstance(token, str):
+            return None
+        if token == '--':
+            break
+        if len(token) > 1 and token.startswith('--'):
+            name, joined, value = token.partition('=')
+            if name == '--help':
+                found.append(value if joined else True)
+            elif name in value_long:
+                index += 0 if joined else 1
+            elif name not in bool_long:
+                return None
+        elif len(token) > 1 and token.startswith('-'):
+            letters, joined, value = token[1:].partition('=')
+            for position, letter in enumerate(letters):
+                kind = table.get(letter)
+                if kind is None:
+                    return None
+                if kind == 'value':
+                    if position == len(letters) - 1 and not joined:
+                        index += 1                       # its value is the next token
+                    break                                # else the rest of the token is its value
+                if letter == 'h':
+                    found.append(value if joined and position == len(letters) - 1 else True)
+    return found
+
+
 def _asks_for_help(argv):
-    """Whether a bd invocation carries the help flag as a flag (not as the value of another flag)."""
+    """Whether bd will print help for this invocation and carry nothing out.
+
+    bd prints help only when the flag is on. ``--help=false`` (also ``--help=0``,
+    ``-h=false``) is a flag bd accepts and then carries the command out (review of
+    kittrial-5bb.97, revision 2: every such spelling of a write was taken for a read, so it
+    was not stamped and a failure after it released the operation's identity). So: help only
+    when every help flag is on, bare or with a value bd reads as true. Anything else, and
+    anything that cannot be resolved, is judged as if no help had been asked: a help
+    request taken for a write is stamped needlessly; a write taken for help is the fault.
+    """
     try:
-        from reserved_comments import _bd_scan
-        flags, _, unknown = _bd_scan(list(argv), argv[0])
-    except Exception:  # noqa: BLE001 - a verb the scan does not know stays what it was
+        from reserved_comments import _parse_go_bool
+        found = _help_flags(argv)
+        return bool(found) and all(_parse_go_bool(value) is True for value in found)
+    except Exception:  # noqa: BLE001 - what cannot be scanned stays what it was
         return False
-    return not unknown and any(name in ('--help', '-h') for name, _ in flags)
 
 
 def _writes_rows(argv):

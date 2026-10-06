@@ -23,6 +23,7 @@ import client
 import http_authority
 import http_service
 import test_http_agents
+import test_http_review_fixes
 
 try:
     import endpoint
@@ -76,6 +77,76 @@ class WhichCallsWriteTests(unittest.TestCase):
                      ['comments', 'add', 'pp-1', '--', '-h']):
             with self.subTest(argv=argv):
                 self.assertTrue(writes(argv))
+
+    def test_a_help_flag_that_is_off_is_not_help(self):
+        """Review of revision 2: `--help=false` is a flag bd accepts and then carries the command out. Every
+        such spelling of a write was taken for a read: not stamped, and a failure after it released the identity."""
+        writes = http_authority.is_mutating_invocation
+        for argv in (['update', 'pp-1', '--description', 'X', '--help=false'], ['update', 'pp-1', '--description', 'X', '--help=0'],
+                     ['update', 'pp-1', '--description', 'X', '-h=false'], ['update', 'pp-1', '--claim', '--help=false'],
+                     ['comments', 'add', 'pp-1', 'text', '--help=false'], ['comments', 'add', 'pp-1', 'text', '-h=0'],
+                     ['close', 'pp-1', '--help=false'], ['close', 'pp-1', '-h=F'], ['reopen', 'pp-1', '--help=FALSE'],
+                     ['create', '--title', 'x', '--help=false'], ['create', '--title', 'x', '--help=f'],
+                     ['dep', 'add', 'pp-1', 'pp-2', '--help=false'], ['dep', 'pp-1', '--blocks', 'pp-2', '-h=false'],
+                     ['merge-slot', 'acquire', '--help=false'],
+                     # several: one that is off is enough; and a value bd cannot read is not "on"
+                     ['create', '--title', 'x', '--help', '--help=false'], ['create', '--title', 'x', '--help=false', '--help'],
+                     ['create', '--title', 'x', '-h', '-h=false'], ['create', '--title', 'x', '--help=maybe'],
+                     ['create', '--title', 'x', '--help='], ['update', 'pp-1', '-qh=false']):
+            with self.subTest(argv=argv):
+                self.assertTrue(writes(argv))
+        # On, in the spellings bd reads as true: help, and nothing is written.
+        for argv in (['create', '--title', 'x', '--help=true'], ['create', '--help=1'], ['update', 'pp-1', '-h=true'],
+                     ['close', 'pp-1', '--help=T'], ['update', 'pp-1', '-qh'], ['create', '--help', '-h', '--help=true']):
+            with self.subTest(argv=argv):
+                self.assertFalse(writes(argv))
+        # A read stays a read with the flag off.
+        for argv in (['list', '--help=false'], ['dep', 'list', 'pp-1', '--help=false'], ['show', 'pp-1', '-h=false']):
+            with self.subTest(argv=argv):
+                self.assertFalse(writes(argv))
+
+    def test_help_beside_the_flags_of_dep_and_of_comments_add_is_help(self):
+        """Smaller item of the same review: `dep add A B --type blocks --help` was still stamped."""
+        writes = http_authority.is_mutating_invocation
+        for argv in (['dep', 'add', 'pp-1', 'pp-2', '--type', 'blocks', '--help'], ['dep', 'add', 'pp-1', 'pp-2', '-t', 'blocks', '-h'],
+                     ['dep', 'pp-1', '--blocks', 'pp-2', '--help'], ['dep', 'pp-1', '-b', 'pp-2', '-h'],
+                     ['dep', 'remove', 'pp-1', 'pp-2', '--help'], ['dep', 'add', 'pp-1', '--depends-on=pp-2', '--help'],
+                     ['comments', 'add', 'pp-1', 'text', '--author', 'x', '--help'], ['comments', 'add', 'pp-1', '-f', 'notes.txt', '-h']):
+            with self.subTest(argv=argv):
+                self.assertFalse(writes(argv))
+        # The value of one of those flags is not the help flag.
+        for argv in (['dep', 'add', 'pp-1', 'pp-2', '--type', '--help'], ['dep', 'add', 'pp-1', 'pp-2', '-t', '-h'],
+                     ['dep', 'pp-1', '--blocks', '--help'], ['dep', 'pp-1', '-b', '-h'],
+                     ['comments', 'add', 'pp-1', 'text', '--author', '--help'], ['comments', 'add', 'pp-1', '-a', '-h'],
+                     ['dep', 'add', 'pp-1', 'pp-2', '--', '--help']):
+            with self.subTest(argv=argv):
+                self.assertTrue(writes(argv))
+
+    def test_what_cannot_be_resolved_is_not_help(self):
+        writes = http_authority.is_mutating_invocation
+        # A flag the tables do not know: its value could be what looks like the help flag.
+        for argv in (['create', '--bogus', '--help'], ['create', '--title', 'x', '-Z', '-h'], ['update', 'pp-1', '--bogus=1', '--help'],
+                     ['dep', 'add', 'pp-1', 'pp-2', '--bogus', '--help'], ['comments', 'add', 'pp-1', 'text', '--bogus', '-h'],
+                     ['create', '--help', 7]):
+            with self.subTest(argv=argv):
+                self.assertTrue(writes(argv))
+        # A scan that fails is not a help request either.
+        with mock.patch.object(http_authority, '_help_flags', side_effect=RuntimeError('broken')):
+            self.assertTrue(writes(['create', '--help']))
+            self.assertFalse(writes(['list', '--help']))
+        import reserved_comments
+        with mock.patch.object(reserved_comments, '_short_flag_table', side_effect=RuntimeError('broken')):
+            self.assertTrue(writes(['create', '--help']))
+
+    def test_dep_is_not_among_the_verbs_that_only_read(self):
+        """It was, older than the table of what a command writes; back there, a later change that asks the list
+        before the table would call `dep add` a read again."""
+        self.assertNotIn('dep', http_authority.READ_ONLY_BD_VERBS)
+        self.assertEqual(http_authority.READ_ONLY_BD_VERBS,
+                         frozenset({'export', 'list', 'show', 'ready', 'search', 'count', 'state', 'lint'}))
+        with mock.patch.object(http_authority, '_writes_rows', return_value=True) as asked:
+            self.assertTrue(http_authority.is_mutating_invocation(['dep', 'add', 'pp-1', 'pp-2']))
+        asked.assert_called_once()
 
     def test_the_rest_is_what_it_was(self):
         writes = http_authority.is_mutating_invocation
@@ -574,6 +645,129 @@ class HeaderTests(test_http_agents.AgentHarness):
         principal = self.service.authenticate(self.admin)
         self.assertIsNone(self.service.idempotency_written_at(principal, self.project, 'tasks.create x', None))
         self.assertIsNone(self.service.idempotency_written_at(principal, self.project, 'tasks.create x', 'no-such-key-0001'))
+        # A record that is not committed has no time to give, whatever is written in it.
+        digest = self.service._idempotency_key(principal, self.project, 'tasks.create x', 'held-key-0001')
+        for state in ('in_progress', 'unknown'):
+            self.store.records.put('idempotency', digest, {
+                'principal': principal.user_id, 'project_id': self.project, 'route': 'tasks.create x', 'request_hash': 'h',
+                'state': state, 'status': None, 'response': {'server_time': '2026-10-06T07:50:12+00:00'},
+                'written_at': '2026-10-06T07:50:12+00:00', 'expires_at': self.service._now() + 600})
+            self.assertIsNone(self.service.idempotency_written_at(principal, self.project, 'tasks.create x', 'held-key-0001'))
+        record = self.store.records.get('idempotency', digest)
+        record['state'] = 'committed'
+        self.store.records.put('idempotency', digest, record)
+        self.assertEqual(self.service.idempotency_written_at(principal, self.project, 'tasks.create x', 'held-key-0001'),
+                         '2026-10-06T07:50:12+00:00')
+
+
+class ResultRowTests(test_http_agents.AgentHarness):
+    """Review of revision 2: with the service's idempotency row gone or not committed and its result row there,
+    the retry is answered from the result row, the endpoint is not asked, and the time was the service's clock at
+    the retry (written 19:18:06, sent again 6 s later: 19:18:12)."""
+    WRITE, RETRY = 1791273012.0, 1791273072.0
+    AT = '2026-10-06T07:50:12+00:00'
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.admin_token()
+        self.project = self.create_project(self.admin, 'Alpha')
+        self.path = '/v1/projects/%s/tasks' % self.project
+
+    def stamp(self, answer):
+        return answer.headers.get('x-server-time')
+
+    def write_then_retry(self, key, lose, result_put=None):
+        """One keyed creation whose idempotency row is lost as ``lose`` says; then the same request a minute later."""
+        patches = [mock.patch.object(self.service, 'idempotency_commit', lose)]
+        if result_put is not None:
+            patches.append(mock.patch.object(self.service, 'result_put', result_put))
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            with mock.patch.object(self.store, 'now', return_value=self.WRITE):
+                first = self.request('POST', self.path, {'title': 'made once'}, token=self.admin, key=key)
+        dispatched = []
+        real = self.backend._dispatch
+        with mock.patch.object(self.backend, '_dispatch', side_effect=lambda *a, **k: dispatched.append(a) or real(*a, **k)), \
+                mock.patch.object(self.store, 'now', return_value=self.RETRY):
+            again = self.request('POST', self.path, {'title': 'made once'}, token=self.admin, key=key)
+        self.assertEqual((first.status, again.status), (201, 201))
+        self.assertEqual(again.data['id'], first.data['id'])
+        self.assertEqual(dispatched, [])                              # answered from the result row: nothing made twice
+        return first, again
+
+    def test_the_idempotency_row_gone_the_retry_has_the_time_of_the_write(self):
+        first, again = self.write_then_retry(
+            'lost-key-0001', lambda digest, status, response, written_at=None: self.service.idempotency_release(digest))
+        self.assertEqual((first.data['server_time'], self.stamp(first)), (self.AT, self.AT))
+        self.assertEqual((again.data['server_time'], self.stamp(again)), (self.AT, self.AT))
+        # And the row it now has keeps that time for the next retry.
+        with mock.patch.object(self.store, 'now', return_value=self.RETRY + 600):
+            third = self.request('POST', self.path, {'title': 'made once'}, token=self.admin, key='lost-key-0001')
+        self.assertEqual((third.data['server_time'], self.stamp(third)), (self.AT, self.AT))
+
+    def test_the_idempotency_row_left_in_progress_the_retry_has_the_time_of_the_write(self):
+        first, again = self.write_then_retry('held-key-0001', lambda digest, status, response, written_at=None: None)
+        self.assertEqual((again.data['server_time'], self.stamp(again)), (self.AT, self.AT))
+
+    def test_the_idempotency_row_marked_unknown_the_retry_has_the_time_of_the_write(self):
+        first, again = self.write_then_retry(
+            'held-key-0002', lambda digest, status, response, written_at=None: self.service.idempotency_unknown(digest))
+        self.assertEqual((again.data['server_time'], self.stamp(again)), (self.AT, self.AT))
+
+    def test_a_result_row_that_kept_no_time_gives_none_and_never_the_clock(self):
+        """The upgrade window: written through the kit before this one, sent again through this one."""
+        real = self.service.result_put
+        first, again = self.write_then_retry(
+            'old-key-0001', lambda digest, status, response, written_at=None: self.service.idempotency_release(digest),
+            result_put=lambda key, value, written_at=None: real(key, value))
+        self.assertNotIn('server_time', again.data)
+        self.assertIsNone(self.stamp(again))
+        self.assertEqual({k: v for k, v in first.data.items() if k != 'server_time'}, again.data)
+
+    def test_the_time_is_kept_with_the_result_row_and_read_from_nowhere_else(self):
+        self.assertIsNone(self.service.result_written_at('no-such-result'))
+        self.service.result_put('k1', {'id': 'pp-1'}, written_at=self.AT)
+        self.service.result_put('k2', {'id': 'pp-2'})
+        self.service.result_put('k3', {'id': 'pp-3', 'server_time': self.AT}, written_at=False)
+        self.service.result_put('k4', None, written_at=self.AT)
+        self.assertEqual([self.service.result_written_at(key) for key in ('k1', 'k2', 'k3', 'k4')], [self.AT, None, None, self.AT])
+        self.assertEqual(self.service.result_get('k1'), {'id': 'pp-1'})          # the result itself is what it was
+        self.assertEqual(self.store.records.get('result', 'k2'), {'result': {'id': 'pp-2'}})
+
+
+class EndpointResultRowTests(test_http_review_fixes.EndpointCase):
+    """The same on the endpoint backend: the time kept with the result row is the endpoint's."""
+    AT = '2026-10-06T07:49:59+00:00'
+
+    def write_then_retry(self, key, envelope_time):
+        alex, project = self.setup_project()
+        real_checked = http_service.EndpointBackend._checked.__func__
+
+        def checked(cls, reply, action=None):
+            if isinstance(reply, dict) and reply.get('returncode') == 0 and action == 'bd' and envelope_time:
+                reply = dict(reply, server_time=envelope_time)       # what the real endpoint's envelope carries for a write
+            return real_checked(cls, reply, action)
+        lose = lambda digest, status, response, written_at=None: self.service.idempotency_release(digest)
+        with mock.patch.object(http_service.EndpointBackend, '_checked', classmethod(checked)), \
+                mock.patch.object(self.service, 'idempotency_commit', lose):
+            first = self.create_task(alex, project, 'made once', key=key)
+        self.assertEqual(first.status, 201, first.data)
+        with mock.patch.object(self.backend, '_run', side_effect=AssertionError('the endpoint was asked')):
+            again = self.create_task(alex, project, 'made once', key=key)
+        self.assertEqual((again.status, again.data['id']), (201, first.data['id']))
+        self.assertEqual(len(self.canonical_rows()), 1)
+        return first, again
+
+    def test_the_retry_answered_from_the_result_row_has_the_endpoints_time_of_the_write(self):
+        first, again = self.write_then_retry('lost-key-0201', self.AT)
+        self.assertEqual((first.data.get('server_time'), first.headers.get('x-server-time')), (self.AT, self.AT))
+        self.assertEqual((again.data.get('server_time'), again.headers.get('x-server-time')), (self.AT, self.AT))
+
+    def test_a_result_row_of_a_write_that_had_no_time_gives_none(self):
+        first, again = self.write_then_retry('lost-key-0202', None)
+        self.assertNotIn('server_time', again.data)
+        self.assertIsNone(again.headers.get('x-server-time'))
 
 if __name__ == '__main__':
     unittest.main()

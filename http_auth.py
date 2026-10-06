@@ -2709,10 +2709,23 @@ class Service:
         """Whether the record store holds a result for ``key`` (a stored ``None`` counts)."""
         return self.store.records.get('result', key) is not None
 
-    def result_put(self, key, value):
-        """Record one committed canonical result with time-only retention."""
-        self.store.records.put('result', key, {'result': value},
-                              ttl=self.result_retention)
+    def result_put(self, key, value, written_at=None):
+        """Record one committed canonical result with time-only retention.
+
+        ``written_at`` is the server's time of the write, kept with the result: a retry
+        that is answered from this row (its idempotency row gone, or never committed) must
+        carry the time of the write and not the time of the retry (kittrial-5bb.97).
+        """
+        record = {'result': value}
+        if isinstance(written_at, str):
+            record['written_at'] = written_at
+        self.store.records.put('result', key, record, ttl=self.result_retention)
+
+    def result_written_at(self, key):
+        """The server's time kept with the result for ``key``; None when there is no row or it kept none."""
+        record = self.store.records.get('result', key)
+        kept = record.get('written_at') if isinstance(record, dict) else None
+        return kept if isinstance(kept, str) else None
 
     # -- HTTP-facing copies (never expose secrets) -----------------------------
     def export_state(self):
