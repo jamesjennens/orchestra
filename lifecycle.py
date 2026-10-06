@@ -54,13 +54,21 @@ RELEASE_TARGETS_MAX = 200
 RELEASE_OPERATION_MAX = 110
 # A release is sent as one request per group so the project lock is released
 # between groups and no single request can approach the client's 150 s timeout.
-# A smaller default group keeps one request well inside that timeout. A plain
-# deploy writes three facts per new target and keeps the historical default; a
-# `--live-verified` run that carries NEW targets writes four and uses the smaller
-# RELEASE_CHUNK_VERIFIED_DEFAULT, because a 25-target group of those was measured
-# at about the client timeout (kittrial-5bb.119 rev2, review item 3).
+# The default group is DERIVED from the native writes a group costs instead of a
+# fixed target count (kittrial-5bb.139 review item 1): one group may cost
+# RELEASE_GROUP_WRITE_BUDGET native `set-state` processes, which is the client
+# timeout at DRY_RUN_SECONDS_PER_WRITE (15 s + 1.5 s * 90 = 150 s). A first
+# deployment writes three processes per target, so its historical
+# RELEASE_CHUNK_DEFAULT group (75 writes) is kept; a release to a further
+# environment of already-labelled tasks costs five processes per target and a
+# `--live-verified` one six or seven, so the group shrinks instead of the run
+# telling the operator to lower a size the kit itself picked.
 RELEASE_CHUNK_DEFAULT = 25
-RELEASE_CHUNK_VERIFIED_DEFAULT = 15
+# The native `set-state` processes one request group may cost. 90 writes keep the
+# group estimate at exactly the 150 s client timeout
+# (DRY_RUN_FIXED_SECONDS + DRY_RUN_SECONDS_PER_WRITE * RELEASE_GROUP_WRITE_BUDGET),
+# so a default group the kit picks for itself never trips the timeout warning.
+RELEASE_GROUP_WRITE_BUDGET = 90
 # A single request must stay inside the client's 150 s timeout.
 RELEASE_CLIENT_TIMEOUT_SECONDS = 150.0
 # `release --dry-run` prints `expected_seconds`, a conservative ESTIMATE for the
@@ -1525,48 +1533,77 @@ def release_planned_writes(page,verify_only,live_verified):
                for item in page)
 
 
+def release_target_native_writes(task,verifying,live_verified,labels):
+    """The native ``set-state`` processes ONE target will cost.
+
+    ``_apply_fact`` pays one extra process for a fact whose target value the task
+    already carries (it rewrites the label through ``pending`` first), so a plain
+    first deployment is three processes for three facts, a verify-only target is
+    one (two when a ``live-verified`` fact already passed somewhere), and a
+    ``--live-verified`` target in a second environment of already-labelled tasks is
+    six or seven for four facts (kittrial-5bb.139 item 2). ``labels`` maps a task
+    id to its native labels read from the same export.
+    """
+    carrying=set(labels.get(task) or ())
+    if task in verifying:
+        return 1+(DRY_RUN_PENDING_REWRITE_EXTRA if 'live-verified:passed' in carrying else 0)
+    # scope is always written for a selected target whose scope differs; the
+    # other dimensions are each one process, plus one when the task already
+    # carries the target value.
+    total=1
+    total+=1+(DRY_RUN_PENDING_REWRITE_EXTRA if 'deployed:passed' in carrying else 0)
+    total+=1+(DRY_RUN_PENDING_REWRITE_EXTRA if 'live:live' in carrying else 0)
+    if live_verified:
+        total+=1+(DRY_RUN_PENDING_REWRITE_EXTRA if 'live-verified:passed' in carrying else 0)
+    return total
+
+
 def release_planned_native_writes(page,verify_only,live_verified,labels):
     """Native ``set-state`` processes the page will cost (kittrial-5bb.139 item 2).
 
     ``release_planned_writes`` counts the planned FACTS; this counts the processes
-    they become, which is what ``expected_seconds`` is priced in. ``_apply_fact``
-    pays one extra process for a fact whose target value the task already carries
-    (it rewrites the label through ``pending`` first), so a plain first deployment
-    stays at one process per fact, a verify-only target is one (two when a
-    ``live-verified`` fact already passed somewhere), and a ``--live-verified``
-    target in a second environment is six or seven for four facts. ``labels`` maps
-    a task id to its native labels read from the same export.
+    they become, which is what ``expected_seconds`` is priced in. It is an UPPER
+    count for a rollback or a ``--live-verified`` roll-forward: a re-lived target
+    may already be at the release scope and already live there, so the endpoint
+    writes fewer facts than a page-level estimate assumes (kittrial-5bb.139 review
+    item 3).
     """
     verifying=set(verify_only)
-    total=0
-    for item in page:
-        carrying=set(labels.get(item['task']) or ())
-        if item['task'] in verifying:
-            total+=1+(DRY_RUN_PENDING_REWRITE_EXTRA if 'live-verified:passed' in carrying else 0)
-            continue
-        # scope is always written for a selected target whose scope differs; the
-        # other dimensions are each one process, plus one when the task already
-        # carries the target value.
-        total+=1
-        total+=1+(DRY_RUN_PENDING_REWRITE_EXTRA if 'deployed:passed' in carrying else 0)
-        total+=1+(DRY_RUN_PENDING_REWRITE_EXTRA if 'live:live' in carrying else 0)
-        if live_verified:
-            total+=1+(DRY_RUN_PENDING_REWRITE_EXTRA if 'live-verified:passed' in carrying else 0)
-    return total
+    return sum(release_target_native_writes(item['task'],verifying,live_verified,labels)
+               for item in page)
 
 
-def release_default_chunk(page,verify_only,live_verified):
-    """The default group size: smaller when --live-verified carries new targets.
+def release_page_writes_per_target(page,verify_only,live_verified,labels):
+    """The most native processes any ONE target of this page will cost.
 
-    A first ``--live-verified`` deployment writes FOUR facts per target and the
-    measured 25-target group ran at about the client's 150 s timeout, so the
-    default group is smaller there (review item 3). A plain deploy keeps the
-    historical default.
+    The default group is sized from the WORST target on the page, so no group the
+    kit chooses for itself can exceed the per-group write budget. Zero for an
+    empty page.
     """
+    if not page:return 0
     verifying=set(verify_only)
-    if live_verified and any(item['task'] not in verifying for item in page):
-        return RELEASE_CHUNK_VERIFIED_DEFAULT
-    return RELEASE_CHUNK_DEFAULT
+    return max(release_target_native_writes(item['task'],verifying,live_verified,labels)
+               for item in page)
+
+
+def release_default_chunk(page,verify_only,live_verified,labels=None,reserved=0):
+    """The default group size, derived from the native writes the page costs.
+
+    One request group may cost RELEASE_GROUP_WRITE_BUDGET native ``set-state``
+    processes (90 writes is the client timeout at the policy per-write figure), so
+    the group size is derived from the native-write count of the page rather than a
+    fixed target count (kittrial-5bb.139 review item 1). A plain first deployment
+    writes three processes per target and keeps the historical
+    RELEASE_CHUNK_DEFAULT group (75 writes); a release to a further environment of
+    already-labelled tasks pays five per target and a ``--live-verified`` one six or
+    seven, so those use a smaller group instead of telling the operator to lower a
+    size the kit itself picked. ``reserved`` is the negative (supersede) write count
+    that rides the FIRST group, so it is paid out of the same budget.
+    """
+    if not page:return RELEASE_CHUNK_DEFAULT
+    per_target=release_page_writes_per_target(page,verify_only,live_verified,labels or {})
+    available=RELEASE_GROUP_WRITE_BUDGET-reserved
+    return max(1,min(RELEASE_CHUNK_DEFAULT,available//per_target))
 
 
 def release_group_estimate(writes):
@@ -1591,9 +1628,10 @@ def main():
     release.add_argument('--previous-release-commit')
     release.add_argument('--page',type=int,default=1)
     release.add_argument('--page-size',type=int)
-    # The group size. Unset means the command chooses one from the page: a
-    # `--live-verified` run that carries new targets writes four facts per target
-    # and uses a smaller default group (kittrial-5bb.119 review item 3).
+    # The group size. Unset means the command derives one from the page's native
+    # write count (a plain first deployment keeps the historical 25; a release to a
+    # further environment of already-labelled tasks uses a smaller group), so the
+    # kit never warns about a default it chose itself (kittrial-5bb.139 review item 1).
     release.add_argument('--chunk-size',type=int,default=None)
     # The project directory holding the host journal (.integration-reverts/). When
     # given, revert records are read with the SAME operator/journal rule as review;
@@ -1703,27 +1741,35 @@ def main():
                 start=(a.page-1)*a.page_size
                 page=targets[start:start+a.page_size]
             page_verify_only=sorted(set(verify_only)&{item['task'] for item in page})
-            explicit_chunk=a.chunk_size is not None
-            chunk_size=(a.chunk_size if explicit_chunk
-                        else release_default_chunk(page,page_verify_only,data['live_verified']))
-            chunk_size=max(1,min(int(chunk_size),RELEASE_TARGETS_MAX))
-            chunks=_chunks(page,chunk_size)
             # The negative facts (task-level supersede and per-scope supersede) ride
             # only the FIRST group of the FIRST page, so they are counted in that
-            # page's estimate and nowhere else.
+            # page's estimate and paid out of that page's write budget.
             negatives_here=bool(supersede or supersede_scopes) and (not a.page_size or a.page==1)
             negative_writes=(len(supersede)+len(supersede_scopes)) if negatives_here else 0
-            new_targets=[item for item in page if item['task'] not in set(page_verify_only)]
-            if data['live_verified'] and new_targets and not explicit_chunk:
-                warnings.append('--live-verified writes FOUR facts per new target (scope, deployed, live, '
-                                'live-verified), so this run uses a group of %d target(s), not the plain '
-                                'default of %d; pass --chunk-size to override (kittrial-5bb.119 review item 3)'
-                                %(chunk_size,RELEASE_CHUNK_DEFAULT))
             # The native label state from the same export: `_apply_fact` pays an
-            # extra process for a fact the task already carries, so the estimate
-            # counts processes, not planned facts (kittrial-5bb.139 item 2).
+            # extra process for a fact the task already carries, so the estimate and
+            # the derived group size count processes, not planned facts
+            # (kittrial-5bb.139 item 2).
             labels={row['id']:row.get('labels') or [] for row in rows
                     if row.get('issue_type')!='event' and isinstance(row.get('id'),str)}
+            explicit_chunk=a.chunk_size is not None
+            per_target=release_page_writes_per_target(page,page_verify_only,data['live_verified'],labels)
+            chunk_size=(a.chunk_size if explicit_chunk
+                        else release_default_chunk(page,page_verify_only,data['live_verified'],labels,
+                                                   reserved=negative_writes))
+            chunk_size=max(1,min(int(chunk_size),RELEASE_TARGETS_MAX))
+            chunks=_chunks(page,chunk_size)
+            # The kit derives its own default group from the native-write budget, so
+            # it no longer warns the operator to lower a size the kit picked; say why
+            # the group is smaller than the historical default when it is
+            # (kittrial-5bb.139 review item 1). An explicit --chunk-size is the
+            # caller's choice and may still warn below.
+            if not explicit_chunk and chunk_size<RELEASE_CHUNK_DEFAULT:
+                warnings.append('this page costs up to %d native bd process(es) per target (a fact the task '
+                                'already carries is rewritten through pending first), so the default group '
+                                "is %d target(s), not the plain %d, to keep one request inside the client's "
+                                '%s s limit; pass --chunk-size to override (kittrial-5bb.139 review item 1)'
+                                %(per_target,chunk_size,RELEASE_CHUNK_DEFAULT,RELEASE_CLIENT_TIMEOUT_SECONDS))
             group_estimates=[]
             for index,chunk in enumerate(chunks):
                 writes=(release_planned_native_writes(chunk,page_verify_only,data['live_verified'],labels)
@@ -1760,6 +1806,12 @@ def main():
                     'total_targets':len(targets),'page':a.page,'page_size':a.page_size,
                     'chunks':[len(chunk) for chunk in chunks],'total_chunks':len(chunks),
                     'chunk_size':chunk_size,
+                    # `planned_writes` and `planned_state_changes` are exact for a
+                    # plain release, but an UPPER count for a rollback or a
+                    # --live-verified roll-forward: a re-lived target may already be
+                    # at the release scope and already live there, so the endpoint
+                    # writes fewer facts than this page-level estimate assumes. The
+                    # error is on the safe side (kittrial-5bb.139 review item 3).
                     'planned_writes':release_planned_writes(page,page_verify_only,data['live_verified'])
                                      +negative_writes,
                     'planned_state_changes':
