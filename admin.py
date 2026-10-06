@@ -1977,7 +1977,8 @@ RETIRED_DIR='retired'
 RETIRE_JOURNAL='journal.jsonl'
 #: The receipt journals whose ``pending`` entries are reservations still in flight.
 RESERVATION_JOURNALS=('.coordination-requests','.requirement-requests','.handoff-requests',
-                      '.reference-requests','.proposal-requests','.capability-requests')
+                      '.reference-requests','.proposal-requests','.capability-requests',
+                      '.open-item-requests')
 
 def retired_entries(root):
     """``[(project name, entry directory name)]`` for every retired project, sorted.
@@ -2292,7 +2293,15 @@ def backup_lock(root,name):
 # `.capability-requests`. No writer exists in this kit, but a backup taken by a
 # later slice must restore here (a rollback target), so each is whitelisted,
 # backed up, and validated with its frozen receipt schema before any write.
-RECORD_JOURNALS=('.reference-requests','.proposal-requests','.capability-requests')
+# kittrial-5bb.126 (open items design, slice 0) adds `.open-item-requests`, which no
+# kit writes yet either. The host-issued `.owner-answers` journal is not a receipt
+# journal: see OWNER_ANSWERS_JOURNAL.
+RECORD_JOURNALS=('.reference-requests','.proposal-requests','.capability-requests','.open-item-requests')
+#: The host-issued owner answer and owner decision journal of the open items design
+#: (kittrial-5bb.126, slice 0). Nothing writes it yet. It is backed up when present and
+#: validated by its reader's own validator, open_items.validate_owner_entry, exactly
+#: like `.integration-reverts`.
+OWNER_ANSWERS_JOURNAL='.owner-answers'
 
 def validate_record_receipt(name,record):
     """Frozen slice-0 receipt schema for one record-journal entry.
@@ -2315,7 +2324,7 @@ def validate_coordination_files(files):
     if not isinstance(files,dict):raise ValueError('Invalid coordination files map')
     for name,record in files.items():
         quarantine = isinstance(name,str) and re.fullmatch(r'\.feedback\.jsonl\.(?:[a-f0-9]{16}|[a-f0-9]{64})\.incomplete',name)
-        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-backfills|\.integration-reverts|\.reference-requests|\.proposal-requests|\.capability-requests)/[a-f0-9]{64}\.json',name)
+        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-backfills|\.integration-reverts|\.reference-requests|\.proposal-requests|\.capability-requests|\.open-item-requests|\.owner-answers)/[a-f0-9]{64}\.json',name)
         if name not in ('.merge-context.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl') and not quarantine and not journal:raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
         if name=='.sessions.json':
@@ -2350,6 +2359,9 @@ def validate_coordination_files(files):
             from review_workflow import JOURNAL_DIR, validate_revert_journal_entry
             validate_revert_journal_entry(record,name.partition('/')[2])
             if not name.startswith(JOURNAL_DIR+'/'):raise ValueError('Invalid coordination backup path')
+        if name.startswith(OWNER_ANSWERS_JOURNAL+'/'):
+            from open_items import validate_owner_entry
+            validate_owner_entry(record,name.partition('/')[2])
         if name=='ONBOARDING.md' and (set(record)!={'text'} or not isinstance(record['text'],str) or not record['text'].strip() or len(record['text'].encode('utf-8'))>8000):raise ValueError('Invalid onboarding backup')
         if name=='GUIDANCE.md':
             from guidance import validate_text
@@ -2830,6 +2842,14 @@ def backup_project(root,name):
         for record in revert_journal.glob('*.json'):
             if record.is_symlink():raise ValueError('Integration revert journal entry must not be a symlink')
             files['.integration-reverts/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
+        # The owner answers journal (kittrial-5bb.126): written by no kit yet, collected
+        # only when present, so a backup of a runtime with open-item writes off is
+        # byte-for-byte what the previous kit takes.
+        owner_answers=path/OWNER_ANSWERS_JOURNAL
+        if owner_answers.is_symlink():raise ValueError('Owner answers journal must not be a symlink')
+        for record in owner_answers.glob('*.json'):
+            if record.is_symlink():raise ValueError('Owner answers journal entry must not be a symlink')
+            files[OWNER_ANSWERS_JOURNAL+'/'+record.name]=record_json.loads(record.read_text(encoding='utf-8'))
         # The record journals (kittrial-5bb.64). This kit writes none, but after a
         # rollback from a later slice they exist and must round-trip.
         for journal in RECORD_JOURNALS:
@@ -2942,6 +2962,51 @@ def utc_stamp():
 def utc_timestamp(value):
     """True for the exact second-precision UTC form this file writes."""
     return isinstance(value,str) and bool(re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z',value))
+
+def open_item_labelled(labels):
+    """The open items family or state labels among ``labels``: ``open-item`` and ``open-item:*``."""
+    return sorted(label for label in labels or [] if isinstance(label,str)
+                  and (label=='open-item' or label.startswith('open-item:')))
+
+def open_item_label_check(root,names=None):
+    """Read-only deploy-time check of the open items design (kittrial-5bb.126, slice 0).
+
+    The family label ``open-item`` is an exact label that a project may already use; a
+    later slice would read such a row as a record anchor once it also carries an
+    open-item record. ``open-item:`` became a reserved prefix in this slice, so a row
+    already carrying one can no longer have it changed by a contributor. This lists,
+    for every initialized project (or the ones named), the rows carrying either, so the
+    operator knows before open-item writes are turned on. No lock, no write: bd runs
+    only for a project whose metadata records the server coordinates
+    (``project_metadata_state`` is ``server``); any other project is reported unreadable.
+    Returns ``(report, clean)``; ``clean`` is false when a project uses a label or
+    could not be read.
+    """
+    report={}
+    for name in (names or initialized_projects(root)):
+        try:
+            state=project_metadata_state(root,name)
+        except (ValueError,OSError):state='absent'
+        if state=='absent':
+            report[name]={'error':'unknown or uninitialized project'};continue
+        if state!='server':
+            # bd would fall back to an embedded database here: it would CREATE
+            # .beads/embeddeddolt inside the project and list nothing, which would read
+            # as clean (kittrial-5bb.126 review). Nothing is run for such a project.
+            report[name]={'error':'.beads/metadata.json does not record the Dolt server coordinates, so bd '
+                                   'was not run (it would create an embedded database here and list nothing)'}
+            continue
+        try:
+            rows=json.loads(run_bd(root,name,['list','--all','--limit','0','--json']) or '[]')
+            if not isinstance(rows,list):raise ValueError('unexpected list output')
+        except (subprocess.CalledProcessError,subprocess.TimeoutExpired,OSError,ValueError,TypeError) as error:
+            report[name]={'error':'could not list the project: %s'%type(error).__name__};continue
+        found=[{'id':row.get('id'),'labels':open_item_labelled(row.get('labels'))} for row in rows
+               if isinstance(row,dict) and open_item_labelled(row.get('labels'))]
+        report[name]={'rows':found}
+    using=sorted(name for name,entry in report.items() if entry.get('rows'))
+    unreadable=sorted(name for name,entry in report.items() if 'error' in entry)
+    return {'projects':report,'using':using,'unreadable':unreadable},not using and not unreadable
 
 def initialized_projects(root):
     """Every initialized project name in this runtime, sorted.
@@ -3879,6 +3944,9 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
         elif name.startswith('.integration-reverts/'):
             from review_workflow import validate_revert_journal_entry
             validate_revert_journal_entry(record,name.partition('/')[2])
+        elif name.startswith(OWNER_ANSWERS_JOURNAL+'/'):
+            from open_items import validate_owner_entry
+            validate_owner_entry(record,name.partition('/')[2])
         elif name.startswith(tuple(journal+'/' for journal in RECORD_JOURNALS)):
             validate_record_receipt(name,record)
         elif name=='GUIDANCE.md':
@@ -4386,6 +4454,10 @@ def main():
     a=sub.add_parser('backup-authority',help='read only: the operators and verifiers a project backup records, '
                                              'against what this installation lists now')
     a.add_argument('project')
+    a=sub.add_parser('open-item-label-check',help='read only, at deploy time: list the projects whose rows already carry '
+                                                 'the label open-item or an open-item: label (exit 1 when any does, or '
+                                                 'cannot be read)')
+    a.add_argument('projects',nargs='*',metavar='project')
     a=sub.add_parser('backup-status')
     a.add_argument('--require-complete',action='store_true',dest='require_complete',
                    help='exit non-zero unless the last run covered every project (--all) and every initialized '
@@ -4933,6 +5005,10 @@ def main():
               %(args.project,result['destination'],args.project),file=sys.stderr)
     elif args.command=='backup-authority':
         print(json.dumps(backup_authority(root,args.project)))
+    elif args.command=='open-item-label-check':
+        report,clean=open_item_label_check(root,args.projects)
+        print(json.dumps(report,sort_keys=True))
+        if not clean:raise SystemExit(1)
     elif args.command=='backup-status':
         record=read_backup_status(root)
         # Retired projects are not part of the gate; they are listed so an operator can

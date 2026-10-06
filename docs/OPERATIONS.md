@@ -685,6 +685,24 @@ Restore compatibility, exactly:
 
 This kit is therefore the oldest one a deployment may roll back to once any of those records exist.
 
+**Open items, owner questions and decisions: slice 0 (kittrial-5bb.126).** This release adds the names of `docs/OPEN_ITEMS_DECISIONS_DESIGN.md` and nothing that writes them. It changes behaviour in exactly two ways:
+- **Raw record comments:** a raw `bd comments add` whose body starts `Kind: open-item-v`, `Kind: item-resolution-v`, `Kind: owner-answer-v` or `Kind: coordinator-decision-v` (any version) is refused, like every other record prefix. Such comments, if any exist, are hidden from the shared surfaces; an item anchor (a row labelled `open-item` that carries an item, resolution or answer record) is hidden; a decision issue stays visible and only its record comment is hidden.
+- **Labels:** every `open-item:` label is reserved: no contributor adds, removes or replaces one on any row. The exact label `open-item` stays an ordinary label.
+
+It also names two journals, `.open-item-requests/` (a receipt journal, validated and counted as a reservation like the three above) and `.owner-answers/` (the host-issued journal, validated by its own entry validator like `.integration-reverts/`, with the fixed entry shape of the design's §11.2.1). No kit writes either yet, and a backup collects each only when its directory exists, so a backup taken by this kit is restorable by the previous kit exactly as before.
+
+Rollback and restore, exactly:
+- **Older kits cannot restore such a backup at all.** Once a backup carries either journal, every kit before this one:
+  - refuses its `restore-new` with `ValueError: Invalid coordination backup path`, and leaves nothing behind;
+  - refuses `restore-new --without-coordination` of it too, so not even the native data can be restored with an older kit;
+  - takes its own backup of a project that has the journals without error and **silently leaves both journals out**, so that backup no longer carries them.
+
+  The way out is to restore with this kit or a newer one (`admin.py` from a checkout is enough). Nothing creates either journal until open-item writes are turned on in a later release, so with writes off none of this can arise.
+- **This kit:** a malformed `.owner-answers/` entry or `.open-item-requests/` receipt refuses the backup before the native sync and the restore before its first write.
+- **The four kinds are not void targets yet:** `void-record` refuses them as an unsupported target kind, as before, until the release with their reader.
+
+At deploy time, list the projects that already use an `open-item` label: `python3 admin.py --root RUNTIME open-item-label-check [PROJECT...]`. It reads each initialized project once (no lock, no write), prints JSON naming every row carrying `open-item` or an `open-item:` label, and exits 1 when any project uses one or could not be read. A project whose `.beads/metadata.json` does not record the Dolt server coordinates is reported unreadable and bd is not run for it: bd would otherwise create an embedded database inside the project and list nothing. A project that does must choose another label for its own use before open-item writes are turned on for it; the later release that adds the switch refuses it.
+
 **Requirement proposals: triage runs on the host.** A contributor submits a proposal through the client (`proposal submit`). Everything that rests on operator authority is a host command, because over SSH the actor is self-declared: `proposal-review`, `proposal-decide` and `proposal-settings` above. A stored settings record counts only when its native author is on the operator allowlist, and a stored disposition when its author is on the allowlist or is an HTTP account (the web service wrote it for a member with `reviews.approve`, see [HTTP deployment](HTTP_DEPLOYMENT.md#requirement-proposals)); removing an operator makes their dispositions inert (the proposal reads its earlier state) and re-adding them restores it.
 
 - **Session-start step: map the coordinator before its first disposition.** The no-self rules compare people, not actor strings, so an unmapped actor is refused with "map this actor first". A new coordinator session brings a new `session-<uuid>` actor: after it registers, run `admin.py proposal-settings PROJECT --actor OPERATOR --map-actor session-<uuid> --to person:<name>`. To map a person once for all their sessions, use `--namespace <name> --to person:<name>`: it matches every session registered under `<name>`, `<name>/...` or `<name>-...` (see the name with `session show ACTOR`). A host operator who has no session, such as `james`, is matched by a namespace equal to that actor name.

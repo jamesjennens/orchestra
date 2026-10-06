@@ -75,6 +75,15 @@ KEYED_KIND_PREFIXES = {'reference-entry': ('Kind: reference-entry-v1\n', 'Kind: 
 # drops voided comments the way AnchoredKind does. Until then a void naming one is
 # refused as an unsupported target kind, so no void is written that no reader honours.
 PROPOSAL_KIND_PREFIXES = {}
+# The four kinds of docs/OPEN_ITEMS_DECISIONS_DESIGN.md, registered by name in slice 0
+# (kittrial-5bb.126), with the prefixes reserved_comments reserves. By the rule above
+# they are NOT in KIND_PREFIXES yet: no kit reads them, so a void naming one is still
+# refused as an unsupported target kind. The slice whose reader drops a voided record
+# moves its kinds into KIND_PREFIXES; test_recovery pins both facts.
+OPEN_ITEM_KIND_PREFIXES = {'open-item': 'Kind: open-item-v1\n',
+                           'item-resolution': 'Kind: item-resolution-v1\n',
+                           'owner-answer': 'Kind: owner-answer-v1\n',
+                           'coordinator-decision': 'Kind: coordinator-decision-v1\n'}
 KIND_PREFIXES = dict(REVIEW_KIND_PREFIXES, **KEYED_KIND_PREFIXES, **PROPOSAL_KIND_PREFIXES)
 FIELDS = {'schema_version', 'operation', 'operation_id', 'task', 'target', 'target_kind',
           'target_sha256', 'original', 'reason', 'disposition', 'operator'}
