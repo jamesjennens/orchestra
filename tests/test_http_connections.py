@@ -260,10 +260,73 @@ class SilentConnectionTests(Case):
         time.sleep(self.httpd.REAP_EVERY * 4)
         self.assertEqual((self.httpd.open_connections(), self.httpd.turned_away), (1, 0))
         request.close.assert_not_called()
-        waiting.start()                                           # it ran and ended without serving: now it is given up
+        waiting.start()                                           # it ran and ended without serving...
         waiting.join()
+        time.sleep(self.httpd.REAP_EVERY * 4)
+        self.assertEqual((self.httpd.open_connections(), self.httpd.turned_away), (1, 0))
+        with self.httpd._guard:
+            self.httpd._begun.add(waiting)                        # ...and start() has returned for it: now it is given up
         self.settled()
         self.assertEqual(self.httpd.turned_away, 1)
+        self.assertEqual((self.httpd._serving, self.httpd._begun), ({}, set()))
+
+    def test_a_thread_that_is_only_starting_is_not_taken_for_one_that_died(self):
+        """kittrial-5bb.175, seen once in CI: an honest POST found its socket closed in set-up (WinError 10038;
+        on Linux it is EBADF). A thread has its ident a few steps before it is marked started, and is_alive()
+        is False until then; the reaper took "has an ident and is not alive" for a thread that had ended, closed
+        the connection and freed its place. Here those few steps are made to last four of the reaper's looks."""
+        self.serve(client_seconds=30)
+        held = []
+
+        class SlowToBeMarkedStarted(threading.Thread):
+            def _set_ident(self):
+                super()._set_ident()
+                held.append(self.is_alive())                      # False: this is what the reaper saw
+                time.sleep(self.server.REAP_EVERY * 4)
+        SlowToBeMarkedStarted.server = self.httpd
+        logged = io.StringIO()
+        with contextlib.redirect_stderr(logged), mock.patch.object(http_service.threading, 'Thread', SlowToBeMarkedStarted):
+            for _ in range(3):
+                status, _, _ = self.ask('GET', '/healthz')
+                self.assertEqual(status, 200)
+            status, body, _ = self.ask('POST', '/v1/sessions', {'username': ADMIN, 'password': PASSWORD})
+            self.assertEqual(status, 201, body)
+        self.assertEqual(held, [False] * 4)
+        self.settled()
+        self.assertEqual((self.httpd.turned_away, self.httpd.cut_off), (0, 0))
+        self.assertEqual(logged.getvalue(), '')
+        self.assertEqual((self.httpd._serving, self.httpd._begun), ({}, set()))
+
+    def test_no_thread_is_remembered_after_its_connection_is_served(self):
+        self.serve(client_seconds=30)
+        for _ in range(40):
+            self.assertEqual(self.ask('GET', '/healthz')[0], 200)
+        self.settled()
+        self.assertEqual((self.httpd._serving, self.httpd._begun, self.httpd.turned_away), ({}, set(), 0))
+
+    def test_set_up_on_a_socket_that_is_already_gone_is_quiet_and_frees_the_place(self):
+        """Whatever closed it: no traceback out of the connection's thread, and the service goes on."""
+        self.serve(client_seconds=30)
+        real = self.httpd.finish_request
+        closed = []
+
+        def gone_first(request, client_address):
+            closed.append(request)
+            request.close()
+            return real(request, client_address)
+        logged = io.StringIO()
+        with contextlib.redirect_stderr(logged):
+            with mock.patch.object(self.httpd, 'finish_request', gone_first):
+                for _ in range(3):
+                    connection = self.silent(b'GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n')
+                    self.closed_by_the_server(connection, 5)
+            self.assertEqual(len(closed), 3)
+            self.settled()
+            self.served()
+            self.settled()
+        self.assertEqual(logged.getvalue(), '')
+        self.assertEqual((self.httpd.turned_away, self.httpd.cut_off), (0, 0))
+        self.assertEqual((self.httpd._serving, self.httpd._begun), ({}, set()))
 
     def test_connections_beyond_the_limit_are_closed_at_once_and_the_limit_frees_itself(self):
         logged = io.StringIO()
@@ -410,6 +473,24 @@ class SilentTlsConnectionTests(Case):
         self.assertEqual(said.count('tls: '), 2, said)
         self.assertIn("tls: '127.0.0.1': 'TLS handshake not completed", said)
         self.assertIn('(and 19 more since the last such line)', said)
+
+    def test_set_up_on_a_socket_that_is_already_gone_is_quiet_with_tls_too(self):
+        self.serve(client_seconds=30)
+        real = self.httpd.finish_request
+
+        def gone_first(request, client_address):
+            request.close()
+            return real(request, client_address)
+        logged = io.StringIO()
+        with contextlib.redirect_stderr(logged):
+            with mock.patch.object(self.httpd, 'finish_request', gone_first):
+                connection = self.silent()
+                self.closed_by_the_server(connection, 5)
+            self.settled()
+            self.served()
+            self.settled()
+        self.assertEqual(logged.getvalue(), '')
+        self.assertEqual((self.httpd._serving, self.httpd._begun), ({}, set()))
 
     def test_a_handshake_that_fails_is_one_line_and_not_a_traceback(self):
         logged = io.StringIO()
