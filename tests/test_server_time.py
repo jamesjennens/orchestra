@@ -257,8 +257,10 @@ class EndpointTests(unittest.TestCase):
         # The same request again is already recorded; the read of a task's handoffs is a read.
         self.assertNotIn('server_time', self.handoff(dict(recorded, reconciled=True)))
         self.assertNotIn('server_time', self.handoff({'task': 'pp-1', 'handoffs': []}, args=('pp-1',)))
-        # A review read and the work read go the same way and are not writes.
+        self.assertNotIn('server_time', self.handoff(recorded, args=('pp-1',)))        # whatever a read answers
+        # A review and the work read go the same way; only what bd wrote makes them writes.
         self.assertNotIn('server_time', self.handoff({'task': 'pp-1', 'reconciled': False}, action='review', args=('pp-1',)))
+        self.assertNotIn('server_time', self.handoff(recorded, action='review'))
         self.assertNotIn('server_time', self.handoff({'next_actions': []}, action='work', args=('--json',)))
 
     def test_the_envelope_printed_by_main_carries_it(self):
