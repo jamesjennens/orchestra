@@ -187,7 +187,7 @@ class NoUnguardedParseTests(unittest.TestCase):
 
     ALLOWED = {
         'activity.py': (2, "the tracker export, and a cursor file on the caller's own machine"),
-        'admin.py': (27, 'bd output and files on the coordination host, in operator commands'),
+        'admin.py': (28, 'bd output and files on the coordination host, in operator commands'),
         'artifacts.py': (1, 'the artifact index the kit writes'),
         'bootstrap.py': (2, 'bd output on the host'),
         'briefing.py': (3, 'bd comment-write receipt and the snapshot files the kit writes; exports use the guard'),
@@ -247,8 +247,9 @@ class NoUnguardedParseTests(unittest.TestCase):
         self.assertEqual({name: count for name, count in uses.items() if count}, {
             # admin.py reads the review-writes audit history through the guard
             # (kittrial-5bb.110 item 3): a deeply nested audit file used to crash
-            # `review-writes status` with a RecursionError.
-            'admin.py': 1,
+            # `review-writes status` with a RecursionError. The second (kittrial-5bb.126) reads
+            # an `.owner-answers` entry for a backup: nothing in the kit writes one yet.
+            'admin.py': 2,
             'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 3, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
             'handoff.py': 1, 'http_service.py': 2, 'lifecycle.py': 1, 'recovery.py': 1, 'requirements.py': 1, 'reserved_comments.py': 1,
             'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
