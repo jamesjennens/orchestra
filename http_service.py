@@ -2755,15 +2755,18 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _read_parties(assignee, author):
-        """Whom a standing recommendation is compared with when it is READ.
+        """Whom a standing recommendation in a BRIEF is compared with when it is read.
 
         The contribution's author, and nobody else: the assignee rule is applied when a
-        recommendation is written, so a reassignment hides nothing. A row or brief that
-        does not say who delivered (an endpoint older than kittrial-5bb.115's second
-        delivery, in a staged upgrade or a rollback) is compared with the assignee, as
-        before, and never with nobody (review 01a10c80).
+        recommendation is written, so a reassignment hides nothing. A brief whose
+        contribution does not say who delivered is compared with the assignee (review
+        01a10c80). With neither, the list is empty, and the caller shows no
+        recommendation: "nobody to compare with" is never read as "independent of
+        everybody" (kittrial-5bb.137).
         """
-        return [author] if isinstance(author, str) and author else [assignee]
+        if isinstance(author, str) and author:
+            return [author]
+        return [assignee] if isinstance(assignee, str) and assignee else []
 
     def _independent_queue(self, read):
         """Drop from each row's ``recommended_by`` anyone who is the contribution author's person.
@@ -2773,12 +2776,22 @@ class ApiHandler(BaseHTTPRequestHandler):
         queue and My work as it is left out of the brief. The assignee is not compared
         on a read, here or in the canonical reader: that rule is applied when a
         recommendation is written, so a later reassignment hides nothing.
+
+        A row that does not say who delivered counts NO recommendation (kittrial-5bb.137).
+        Such a row comes from an endpoint older than this service, in a staged upgrade or a
+        rollback: the service cannot tell whose recommendation is independent, and it does
+        not guess from the assignee, who may have changed since the delivery. The queue
+        row, My work and the agent actions then show no recommendation until the endpoint
+        is updated; the brief, which names the author, still shows an independent one.
         """
         changed = False
         for item in read.get('items') or []:
             names = item.get('recommended_by') or []
-            kept = self._independent(names, self._read_parties(item.get('assignee'), item.get('contribution_author'))) \
-                if names else names
+            author = item.get('contribution_author')
+            if names:
+                kept = self._independent(names, [author]) if isinstance(author, str) and author else []
+            else:
+                kept = names
             if len(kept) != len(names):
                 item['recommended_by'], item['recommended'], changed = kept, bool(kept), True
         if changed:
@@ -4557,7 +4570,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         # (kittrial-5bb.115 review). Past those, one is still named and has no text here.
         parties = self._read_parties(brief['task'].get('assignee'), (contribution or {}).get('author'))
         standing = [entry for entry in review.get('recommendations') or [] if isinstance(entry, dict)]
-        kept = set(self._independent([entry.get('author') for entry in standing], parties))
+        kept = set(self._independent([entry.get('author') for entry in standing], parties)) if parties else set()
         shown = [entry for entry in standing if entry.get('author') in kept]
         newest = review.get('recommendation')
         if not (newest and newest.get('author') in kept):

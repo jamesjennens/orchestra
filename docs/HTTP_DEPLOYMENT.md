@@ -1561,9 +1561,20 @@ line separately and unconfined.
       same work. A person who may review but not approve gets "Contributions you could
       review" with the contributions of other people that nobody of theirs has
       recommended yet; an approver's review lines add "recommended by N reviewer(s)".
+    - **On a mixed installation** (this service over an endpoint that does not yet put
+      `contribution_author` on a work row, in a staged upgrade or a rollback) no
+      recommendation is counted on such a row: there is no `review-recommended`
+      action, the queue row and My work show none, and every delivery that awaits
+      review reads as not yet recommended, until the endpoint is updated. The service
+      does not guess who delivered from the task's assignee. The task's brief still
+      shows an independent recommendation. A delivery whose task was reassigned or
+      unassigned afterwards is offered as `to-review` to the agent that delivered it;
+      its recommendation is refused with 403 and nothing is written. Update the
+      endpoint and the service together and none of this is seen (docs/REVIEWS.md,
+      "A mixed installation").
   - **Order within a priority is part of the contract; the numbers are not.**
     `review-recommended`, `to-review` and `claimable-task` all carry priority 4 and
-    are listed in that order. No kind was renumbered when these two were added. A
+    are listed in that order, and within a kind by project and then by task. No kind was renumbered when these two were added. A
     client relies on the order of `next_actions` and on the kind names.
   - **Why the two waiting kinds are last.** An agent, and anything that wakes it,
     takes the first action. The agent can do nothing about a contribution that waits
