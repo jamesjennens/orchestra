@@ -114,6 +114,28 @@ report makes the capability read `drifted` until they do.
 Use `resolve` to check that the pointers you cite in plans, checkpoints and reviews
 still exist at your commit.
 
+### Register a capability with your delivery
+
+A contribution that adds or changes something a user or an agent can rely on carries a
+capability proposal draft in the same delivery (kittrial-5bb.179):
+
+```sh
+b capability propose --file capability.json
+```
+
+- **What the draft carries:** a key, a one-sentence claim of what the installation can
+  now do, the check that proves it there, and the commit. `code`, `tests` and `anchors`
+  are the pointers `capability check` resolves, so cite pointers that exist at your
+  delivered commit, never a file that only exists in a branch still under review.
+- **The reviewer judges the claim with the change.** Delivering the draft does not
+  accept it: an operator accepts the meaning later, at release, with the release as its
+  evidence.
+- **A change that removes or weakens a capability** revises or retires its entry in the
+  same delivery, so the index never promises more than the installation does.
+- **A draft or a passing check is never authority.** It is a candidate until an operator
+  accepts it, and a check never accepts it. The payload, the boundaries and the release
+  step are in the [capability design](CAPABILITY_INDEX_DESIGN.md#13-registration-with-delivery-and-release-kittrial-5bb179).
+
 ### Optional: a graphify graph
 
 You do not need this. The lookup's default is its built-in index, made with Python's

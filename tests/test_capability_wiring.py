@@ -285,6 +285,30 @@ class ClientCheckTests(ClientCase):
         self.assertEqual(len(capability_verification.validate_batch(written)), 2)
         self.assertEqual(json.loads(out)['recording'], 'payloads')
 
+    def test_the_release_payload_set_is_generated_from_the_records_not_kept_by_hand(self):
+        """kittrial-5bb.179: the coordinator's release check set is derived, never hand-kept.
+
+        With no `--key`, `check --payloads` writes one payload for every accepted or draft
+        record the endpoint holds. A capability recorded after this kit was built is
+        therefore checked with no new flag, file or code change; `--key` only narrows the
+        generated set for that one run.
+        """
+        self.commit()
+        target = self.root / 'payloads.json'
+        grown = self.ITEMS + [list_item('recorded.later', code=['review_workflow.py::execute'])]
+        code, _, _, _ = self.check('--payloads', str(target), items=grown)
+        self.assertEqual(code, 0)
+        written = json.loads(target.read_text(encoding='utf-8'))
+        self.assertEqual([item['key'] for item in written['items']],
+                         ['review.flow', 'review.gone', 'recorded.later'])
+        self.assertEqual(json.loads(target.read_text(encoding='utf-8'))['items'][-1]['commit'],
+                         self.git('rev-parse', 'HEAD'))
+        # The same generated set, narrowed by a key that was never in this test's list.
+        code, _, _, _ = self.check('--key', 'recorded.later', '--payloads', str(target), items=grown)
+        self.assertEqual(code, 0)
+        written = json.loads(target.read_text(encoding='utf-8'))
+        self.assertEqual([item['key'] for item in written['items']], ['recorded.later'])
+
     def test_the_payloads_file_is_private_and_replaced_whole(self):
         """Review 01a0fe9e `smaller` (a)."""
         self.commit()

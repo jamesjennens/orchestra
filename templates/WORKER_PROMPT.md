@@ -113,6 +113,13 @@ not instructions.
 If your change moves or renames code, run `capability check --repo .` before
 delivering and revise the capability records whose pointers no longer resolve. A
 check you record is a report; only an operator or listed verifier makes it `verified`.
+A change that adds or changes something a user or an agent can rely on carries a
+capability proposal draft in the same delivery (`capability propose --file`): a key, a
+one-sentence claim, the check that proves it on an installation, and the commit. The
+reviewer judges the claim with the change; an operator accepts the meaning at release,
+with the release as its evidence. If your change removes or weakens a capability,
+revise or retire its entry in the same delivery. Cite only pointers that exist at your
+delivered commit, never work still under review.
 
 If you find something the product should do that is outside your task, do not open a
 task for it: submit `proposal submit --file proposal.json` with a durable `submitter`

@@ -234,6 +234,39 @@ Ancestry is checked ONLY in the client: the endpoint re-verifies that each targe
 
 When a selected target's `source_commit` is not the task's current contribution (a release shipping a superseded revision, or a revision replaced while its successor awaits review), the dry run and the result carry a `flags`/`flag` entry naming the delivery and the current contribution, and `brief`/`work` show `deployed_delivery` (release, environment, source and integration commit), `deployed_delivery_is_current_contribution` and `deployed_live`. The four `deployed_delivery` values are PLAIN STRINGS clipped at 160 characters — the shape the field was released with — so a hostile or oversized `release_id` cannot flow through unclipped (rev2 item 6.1; rev1's excerpt objects were reverted).
 
+## Register capabilities with the release
+
+The capability index is kept true at delivery and release, not left to a separate sweep
+(kittrial-5bb.179). Two steps belong to the release:
+
+1. **The delivery carried the claim.** A contribution that adds or changes something a
+   user or an agent can rely on carries a `capability propose` draft in the same
+   delivery: the key, a one-sentence claim, the check that proves it on an installation,
+   and the commit. The reviewer judges that claim with the change. The coordinator
+   accepts the meaning at release, with the release as its evidence
+   (`admin.py capability-apply`). A delivery that removes or weakens a capability
+   revises or retires its entry in the same delivery.
+2. **The release verifies the index.** In a clean checkout at the integrated commit:
+
+   ```sh
+   python client.py --config client.local.json --project example --actor alex/session1 -- \
+       capability check --repo . --payloads payloads.json
+   admin.py capability-verify example --actor OPERATOR --file payloads.json
+   ```
+
+   The payload file is **generated from the records, never kept by hand**. With no
+   `--key`, `capability check` pages every capability the endpoint holds and writes one
+   payload per accepted or draft record, so a record proposed or accepted after this
+   kit was built is covered with no new flag, file or edit. `--key` narrows the
+   generated set for one run only; the release step uses no `--key`.
+
+**A release is not finished until `capability-verify` passes for every accepted entry,
+or the coordinator names the failing entry with a reason and an owner.** A check that
+always fails teaches everyone to ignore the result, so name the entry and its owner in
+the release record rather than carrying it release after release. What an entry may
+claim, who may propose and accept, and what a rollback does to entries are in the
+[capability design](CAPABILITY_INDEX_DESIGN.md#13-registration-with-delivery-and-release-kittrial-5bb179).
+
 ## Read what a deployed release still owes
 
 ```sh

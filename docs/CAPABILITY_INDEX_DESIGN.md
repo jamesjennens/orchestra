@@ -26,6 +26,20 @@ allowlisted operator or a listed verifier confirms one. Only the mechanism chang
 | "Integrated" is contributor-assertable | Lifecycle facts are recorded by contributors, so anyone can assert that a commit is integrated. On its own that changes nothing: it matters only together with a trusted pass at that same commit, which only an operator or listed verifier can record. A forged integration fact therefore cannot clear drift or make anything read `verified`. | §5.2 |
 | Scope of slice 1b | `work` and `brief` attention moved to a separate follow-up task. | §10 |
 
+## Revision 3 changes (kittrial-5bb.179): registration with delivery and release
+
+No record shape and no code change. Registration becomes part of delivery and release,
+and the boundaries a reader may rely on are written down.
+
+| Finding | Change | Where |
+| --- | --- | --- |
+| A feature was released with no entry | A delivery that adds or changes something a user or an agent can rely on carries a capability proposal draft in the same delivery; the reviewer judges the claim with the change; the coordinator accepts the meaning at release with the release as evidence; the release is unfinished until `capability-verify` passes for every accepted entry or the failing entry is named with a reason and an owner; a removal or weakening revises or retires the entry in the same delivery. | §13.1 |
+| Entries claimed too much | What an entry must NOT claim: nothing unverified on the installation, nothing about work in review, no authority it does not have, no private detail. | §13.2 |
+| Who may do what was spread out | One boundary table for propose/report/accept/retire/verify. | §13.3 |
+| Rollback effects were unstated | A rollback retires nothing; a verification at a reverted commit stops counting and the entry reads `drifted` again until a live trusted pass; a removed capability is revised or retired in the next delivery. | §13.4 |
+| The release payload was assumed hand-kept | It is generated from the records: run `capability check --payloads` with no `--key`, and a newly recorded key enters the file with no edit. A test pins it. | §13.5 |
+| Per-installation questions were open | One index per project, not per installation; records are not release-scoped, so an installation one release behind answers from its own checkout's check, not from the entry text. | §13.6 |
+
 ## Revision 2.1 changes (review 01a0f7a2)
 
 | Review item | Change | Where |
@@ -614,3 +628,94 @@ others.
    GitHub runners cannot reach the coordination host in this deployment, so a real CI
    verifier would itself be a host-side step. The list exists, with the operator-list
    rules of §5.2, for when one is named.
+
+## 13. Registration with delivery and release (kittrial-5bb.179)
+
+Revision 3 adds no record shape and changes no code: it makes the existing slices part of
+delivery and release and fixes the boundaries a reader may rely on.
+
+### 13.1 A delivery carries the claim
+
+A contribution that adds or changes something a user or an agent can rely on carries a
+`capability propose` draft **in the same delivery**: the key, a one-sentence claim of
+what the installation can now do, the check that proves it there (§5.1), and the commit.
+The reviewer judges the claim with the change. The coordinator accepts the meaning at
+release, with the release as its evidence (§4, `admin.py capability-apply`), and the
+release is not finished until `capability-verify` passes for every accepted entry or the
+coordinator names the failing entry with a reason and an owner. A delivery that removes
+or weakens a capability revises or retires its entry in the same delivery, so the index
+never promises more than the installation does. The worker and coordinator texts are in
+`docs/WORKER_GUIDE.md`, `docs/OPERATIONAL_WORKFLOW.md`, `templates/WORKER_PROMPT.md` and
+`templates/COORDINATOR_PROMPT.md`.
+
+### 13.2 What an entry must NOT claim
+
+- **Nothing unverified on the installation.** A claim is what the check in §5.1 proves
+  against a checkout at a named commit. A pointer that resolves nowhere, or a claim no
+  check can decide, is not an entry; revise the draft until the check is real.
+- **Nothing about work in review.** `code`, `tests` and `anchors` point at the delivered
+  commit only. A file that exists only on an un-integrated contribution branch is not a
+  pointer: the check runs against an installation and reads `drifted`. If the capability
+  needs that file, the entry waits for the commit that carries it.
+- **No authority it does not have.** A draft is not authoritative text (§5.3 shows drafts
+  as counts and keys only), a `reported` pass is never `verified` (§5.2), and `verified`
+  is not acceptance. An entry never claims that an installation runs a release it has not
+  deployed; that is a lifecycle fact, not a capability.
+- **No third-party or private detail.** The index is read by every contributor and by
+  agents, so keep project-private operational detail out, as `AGENTS.md` requires.
+
+### 13.3 Who may propose, report, accept and verify
+
+Unchanged from §4, repeated here as the boundary:
+
+| Action | Who |
+| --- | --- |
+| propose or revise a draft (including a delivery's draft) | any contributor, including agents |
+| report a check | any contributor (always `unverified` over the endpoint) |
+| accept, demote, retire, fold or reject an alias | allowlisted operator |
+| make a check count as `verified` | allowlisted operator or a listed verifier, through the host command |
+
+An agent never accepts and never verifies, and a passing check never accepts a draft.
+
+### 13.4 After a rollback
+
+A rollback is a lifecycle event (`docs/OPERATIONAL_WORKFLOW.md`), not a record operation.
+It does not retire, unaccept or delete an entry, and this design adds no rollback step of
+its own:
+
+- **Acceptance stands.** The meaning was accepted; removing it is a deliberate
+  `capability retire` or a revised entry, never a side effect of a rollback.
+- **A verification at a reverted commit stops counting.** §5.2 already treats a commit
+  named by an honoured integration revert as not integrated, so a pass that only cleared
+  drift at that commit no longer clears it and the entry reads `drifted` again until a
+  trusted pass at a live integrated commit. Nothing is deleted; re-integrating the commit
+  makes the pass count again.
+- **A capability the rollback removes** is revised or retired in the next delivery
+  (§13.1), so the index converges on what the installation really does.
+
+### 13.5 The release check payload is generated
+
+The coordinator's release payload is **derived from the records**, never kept by hand.
+`client.py::_capability_check` pages `capability list --state all --pointers` and, with no
+`--key`, selects every record whose state is `accepted` or `draft-only`; `--payloads FILE`
+writes one payload per selected record. The release step therefore uses no `--key` and
+needs no edit when a capability is proposed or accepted. A test pins that a newly recorded
+key enters the file with no flag, file or code change, and that `--key` only narrows the
+generated set for one run.
+
+### 13.6 One index per project; what each installation reads
+
+`capability-verify` is a host command run against a project's coordination store, and
+records are per **project**, not per installation. Every installation of a project reads
+the same index; a separate index is only right for a separate project (a different
+repository or product), because a capability's meaning is project-wide. What differs per
+installation is the checkout a check runs against, recorded as the verification `commit`.
+
+Records are not release-scoped, so the entry text is the same on an installation one
+release behind. Verification is what differs: reads report `verified`/`reported`/
+`drifted` for the revision, with `verified_at.commit` and whether that commit is
+integrated. A pass recorded at a newer release is not a statement about an older
+checkout, so "what can THIS installation do" is answered by running
+`capability check --repo .` against that installation's own checkout; the index alone is
+not installation-scoped. The release names the drift it cannot clear with the entry, its
+reason and its owner (§13.1).
