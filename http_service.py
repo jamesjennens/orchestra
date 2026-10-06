@@ -2292,19 +2292,142 @@ class EndpointBackend:
         return {'items': items, 'complete': complete, 'warnings': sorted(warnings)}
 
 
+#: What a row that cannot be read is called, in the words of the endpoint's readers
+#: (kittrial-5bb.141): the row is named, marked, and nothing of it is trusted.
+MALFORMED_ROW = 'Malformed issue row'
+#: Quotes with what they hold, and the brackets: all that matters for finding where one
+#: element of a JSON text ends. Each match consumes its characters, so a scan is one pass.
+_JSON_PIECE = re.compile(r'"(?:\\.|[^"\\])*"|[\[\]{}:,]', re.DOTALL)
+
+
+def unreadable_row(task_id):
+    """409 for a task whose row exists and cannot be read (kittrial-5bb.169)."""
+    return HttpError(409, 'unreadable_row',
+                     'Task %s exists, but its row cannot be read (it is malformed or nested too deeply). '
+                     'Ask an operator of the server to repair it.' % task_id,
+                     {'task': task_id, 'state': 'unreadable'})
+
+
+def _row_head(text):
+    """The id and title a row's text gives at its own top level, without parsing the row.
+
+    Only a string value of the keys ``id`` and ``title`` of the outermost object is read;
+    what is nested below is skipped by counting brackets. One pass, no recursion.
+    """
+    found, depth, key, expect_value = {}, 0, None, False
+    for match in _JSON_PIECE.finditer(text):
+        piece = match.group()
+        if piece in '[{':
+            depth += 1
+            key, expect_value = None, False
+        elif piece in ']}':
+            depth -= 1
+            if depth <= 0:
+                break
+        elif depth != 1:
+            continue
+        elif piece == ':':
+            expect_value = key is not None
+        elif piece == ',':
+            key, expect_value = None, False
+        elif piece[0] == '"':
+            if expect_value:
+                if key in ('id', 'title'):
+                    try:
+                        found.setdefault(key, json.loads(piece))
+                    except ValueError:
+                        pass
+                    if len(found) == 2:
+                        break
+                key, expect_value = None, False
+            else:
+                try:
+                    key = json.loads(piece)
+                except ValueError:
+                    key = None
+    return found
+
+
+def _marker(text):
+    """The row the service shows in place of one it cannot read."""
+    head = _row_head(text)
+    row = {'id': head.get('id') if isinstance(head.get('id'), str) else None, 'malformed': True, 'unreadable': True,
+           'error': MALFORMED_ROW, 'status': 'unknown'}
+    if isinstance(head.get('title'), str):
+        row['title'] = head['title'][:200]
+    return row
+
+
+def _elements(text):
+    """Where each element of a JSON array text begins and ends; None when the text is not a whole array.
+
+    One pass that counts brackets outside string literals, so a row nested thousands of
+    levels deep costs what its length costs and no recursion.
+    """
+    spans, depth, start = [], 0, None
+    for match in _JSON_PIECE.finditer(text):
+        piece = match.group()
+        if piece in '[{':
+            depth += 1
+            if depth == 2:
+                start = match.start()
+        elif piece in ']}':
+            depth -= 1
+            if depth == 1 and start is not None:
+                spans.append((start, match.end()))
+                start = None
+            if depth == 0:
+                return spans if not text[match.end():].strip() else None
+            if depth < 0:
+                return None
+    return None
+
+
+def _parse_native(text):
+    """Parse one JSON text of the tracker; a row that cannot be parsed becomes a marker row.
+
+    ``json.loads`` raises ``RecursionError`` for a text nested about a thousand levels deep
+    (one row with deep metadata is enough), which is not the ``ValueError`` a caller
+    expects: the task list, and the page of every such row, answered 500 (kittrial-5bb.169).
+    Then the text is taken apart element by element: each row is parsed on its own, and
+    one that still cannot be parsed is named and marked instead of failing the read.
+    Raises ``ValueError`` for a text that is not JSON at all, as before.
+    """
+    try:
+        return json.loads(text)
+    except RecursionError:
+        pass
+    if text.lstrip()[:1] == '{':
+        # One row printed alone: it must be a whole object to be called a row at all.
+        if _elements('[' + text + ']') is None:
+            raise ValueError('not a whole JSON object')
+        return _marker(text)
+    spans = _elements(text)
+    if spans is None:
+        raise ValueError('not a whole JSON array')
+    rows = []
+    for start, end in spans:
+        piece = text[start:end]
+        try:
+            rows.append(json.loads(piece))
+        except (RecursionError, ValueError):
+            rows.append(_marker(piece))
+    return rows
+
+
 def _canonical_payload(stdout):
     """Parse the JSON body a canonical command returned, tolerating NDJSON."""
     text = (stdout or '').strip()
     if not text:
         raise uncertain('Canonical command returned no data; outcome may be unknown')
     try:
-        return json.loads(text)
+        return _parse_native(text)
     except ValueError:
         for line in reversed(text.splitlines()):
             line = line.strip()
             if line[:1] in ('{', '['):
                 try:
-                    return json.loads(line)
+                    return _parse_native(line)
                 except ValueError:
                     continue
     raise uncertain('Canonical command returned unparsable data; outcome may be unknown')
@@ -4391,16 +4514,37 @@ class ApiHandler(BaseHTTPRequestHandler):
                                      lambda: self.backend.read_tasks(ctx.params['pid']),
                                      shared=True)
         rows = [dict(t) if isinstance(t, dict) else t for t in snapshot.get('items') or []]
+        # Rows the tracker returned and the service could not read (kittrial-5bb.169): the
+        # ones with an id stay in the list, marked; all are named beside it, whatever the
+        # page or the filter, so that one such row is seen and not a reason to show nothing.
+        unreadable = [t['id'] for t in rows if isinstance(t, dict) and t.get('malformed') and t.get('id')]
+        unparseable = sum(1 for t in rows if isinstance(t, dict) and t.get('malformed') and not t.get('id'))
+        rows = [t for t in rows if not (isinstance(t, dict) and t.get('malformed') and not t.get('id'))]
+        def review_states(of):
+            # The review states come from another read of the endpoint. While a row cannot be
+            # read that read may fail too (an endpoint from before it learned to name such a
+            # row): the list is then answered without review states, and says so, instead of
+            # failing with it. Without an unreadable row a failure is what it was.
+            try:
+                return self._with_review_states(ctx.params['pid'], of, shared=True)
+            except HttpError:
+                if not (unreadable or unparseable):
+                    raise
+                for row in of:
+                    if isinstance(row, dict):
+                        row.setdefault('review_state', None)
+                unavailable.append(True)
+                return False
+        unavailable = []
         if filters:
             rows = [t for t in rows if isinstance(t, dict)]
-            complete = self._with_review_states(ctx.params['pid'], rows, shared=True)
+            complete = review_states(rows)
             rows = [t for t in rows if task_matches(t, filters)]
             result = {'items': rows[state['o']:state['o'] + limit], 'total': len(rows)}
         else:
             result = {'items': rows[state['o']:state['o'] + limit],
-                      'total': snapshot.get('total', len(rows))}
-            complete = self._with_review_states(ctx.params['pid'], result['items'],
-                                                shared=True)
+                      'total': len(rows) if unparseable else snapshot.get('total', len(rows))}
+            complete = review_states(result['items'])
         result['items'] = self._task_views(result['items'])
         # False when some rows' review state is unknown (``review_state: null``): the
         # bounded canonical projection did not cover them, or they are closed tasks
@@ -4410,6 +4554,11 @@ class ApiHandler(BaseHTTPRequestHandler):
         result['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query,
                                              state['o'] + limit)
                                  if state['o'] + limit < result['total'] else None)
+        if unreadable or unparseable:
+            result['unreadable'] = unreadable
+            result['unparseable'] = unparseable
+            if unavailable:
+                result['review_states_unavailable'] = True
         return 200, result
 
     @staticmethod
@@ -4435,6 +4584,13 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._refuse_record_anchor(row)
         return 200, self._task_views([row])[0]
 
+    def _row_or_none(self, project_id, task_id):
+        """The task's row for deciding why another read of it failed; None when this read fails too."""
+        try:
+            return self.backend.get_task(project_id, task_id)
+        except HttpError:
+            return None
+
     @staticmethod
     def _refuse_record_anchor(row, write=False):
         """A record anchor is not a task: the task, brief and history routes answer
@@ -4444,6 +4600,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         The project's merge slot is not a task either (kittrial-5bb.113). The read
         routes answer 404 for it; a write route says what it is, so an agent that was
         once offered it learns why the claim is refused."""
+        if isinstance(row, dict) and row.get('malformed'):
+            # The row exists and cannot be read: say that, for a read and for a write
+            # (kittrial-5bb.169). Nothing of an unreadable row is shown or changed here.
+            raise unreadable_row(row.get('id'))
         if is_record_anchor(row):
             raise not_found('Task not found')
         if is_merge_slot(row):
@@ -4759,7 +4919,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         """
         self._project(ctx, CAP_READ)
         pid, tid = ctx.params['pid'], ctx.params['tid']
-        brief = self.backend.task_brief(pid, tid)
+        try:
+            brief = self.backend.task_brief(pid, tid)
+        except HttpError:
+            # The brief of a row that cannot be read fails in the endpoint; say what is the
+            # matter with the row instead of the endpoint's failure (kittrial-5bb.169). Only
+            # on this path is the row read again, so a healthy brief costs what it did.
+            self._refuse_record_anchor(self._row_or_none(pid, tid))
+            raise
         self._refuse_record_anchor(brief.get('task'))
         review = brief['review']
         checkpoint = brief.get('checkpoint')

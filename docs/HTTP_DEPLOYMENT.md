@@ -1475,6 +1475,31 @@ line separately and unconfined.
   a row past its bound, has `review_state: null` and no next action, and the list
   reports `review_states_complete: false`; it never guesses "claim" or "deliver" for
   work that may be under review.
+- **A row that cannot be read** (kittrial-5bb.169). A row whose JSON nests about a
+  thousand levels or more (deep metadata is enough) cannot be parsed. The service
+  takes such an answer of the tracker apart row by row, so one such row does not fail
+  the rest:
+  - `GET /v1/projects/{id}/tasks` answers 200 with every readable row. The other is in
+    `items` as `{"id", "title" (when it can be read), "status": "unknown",
+    "unreadable": true, "malformed": true, "error": "Malformed issue row"}`, and the
+    answer has `unreadable: [ids]` and `unparseable: N` (rows whose id could not be
+    read; they are counted, not listed). Both are named on every page and under every
+    filter. The fields are absent when every row is readable. The page marks the row
+    "Cannot be read" and says how many there are.
+  - The page, brief and history of that row, and a change or claim of it, answer 409
+    `unreadable_row`: "Task ID exists, but its row cannot be read (it is malformed or
+    nested too deeply). Ask an operator of the server to repair it." Nothing of the
+    row is shown or changed through the service.
+  - The review states come from a second read of the endpoint (`work`). An endpoint
+    that cannot read such a row itself fails that read; the list is then still
+    answered, with `review_states_unavailable: true`, `review_states_complete: false`
+    and no review states. With every row readable a failure of that read is an error,
+    as before.
+  - What still depends on the endpoint: the brief of a READABLE task, the queue and My
+    work ask the endpoint's `brief` and `work`, which must themselves cope with the
+    row (kittrial-5bb.141). Until the endpoint does, those answer 503 while such a row
+    exists; they never answered 500.
+  - Repair is on the host (for deep metadata: `bd update ID --unset-metadata KEY`).
 - **Reference catalog reads.** The routes are `GET /v1/projects/{id}/references` and
   `GET /v1/projects/{id}/references/{key}`, available to any project member
   (`CAP_READ`). They are the .41 slice 1, kittrial-5bb.66.
