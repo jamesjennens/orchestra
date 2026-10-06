@@ -187,7 +187,7 @@ class NoUnguardedParseTests(unittest.TestCase):
 
     ALLOWED = {
         'activity.py': (2, "the tracker export, and a cursor file on the caller's own machine"),
-        'admin.py': (28, 'bd output and files on the coordination host, in operator commands'),
+        'admin.py': (27, 'bd output and files on the coordination host, in operator commands'),
         'artifacts.py': (1, 'the artifact index the kit writes'),
         'bootstrap.py': (2, 'bd output on the host'),
         'briefing.py': (3, 'bd comment-write receipt and the snapshot files the kit writes; exports use the guard'),
