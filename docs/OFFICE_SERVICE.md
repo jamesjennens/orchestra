@@ -131,6 +131,14 @@ starts a systemd unit. The first `run` sets the fresh Dolt root password; if
 stopped between that change and the next check, the next `run` verifies the
 stored password and continues. Keep `deployment.private.json` private.
 
+**git must be on the service's PATH.** bd runs `git` when it initializes a
+project, so `admin.py add-project` needs it, and so does the account that
+starts `office_service.py run`. The host's packaged git is not required: any
+git on PATH will do (`export PATH=<DIR_WITH_GIT>:$PATH` in the shell or the
+scheduler's entry that starts the service and runs the admin commands). git
+2.21.0 is known to work: the coordinator's install rehearsal on AlmaLinux 8
+ran add-project, backup and health with it.
+
 ```sh
 <PYTHON> <KIT>/office_service.py prepare --root <RUNTIME_ROOT> --db-port <DB_PORT>
 ```
