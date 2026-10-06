@@ -5175,6 +5175,9 @@ def main(argv=None):
     parser.add_argument('--port', type=int, default=8443)
     parser.add_argument('--cert', help='TLS certificate (PEM)')
     parser.add_argument('--key', help='TLS private key (PEM)')
+    parser.add_argument('--allow-plaintext-on-network', action='store_true',
+                        help='serve plain HTTP on a host that is not loopback (no --cert): passwords and session '
+                             'cookies then cross the network unencrypted. Refused without this flag.')
     parser.add_argument('--trusted-proxy', action='append', default=[], metavar='ADDR',
                         help='honor forwarded headers only from this address/CIDR (repeatable)')
     parser.add_argument('--trust-proxy', action='store_true',
@@ -5240,7 +5243,11 @@ def main(argv=None):
     httpd = create_server(service, backend, host=args.host, port=args.port,
                           trusted_proxies=trusted, max_body=args.max_body,
                           certfile=args.cert, keyfile=args.key,
+                          allow_plaintext_non_loopback=args.allow_plaintext_on_network,
                           web_root=None if args.no_web else args.web_root)
+    if args.host not in LOOPBACK and not args.cert:
+        print('WARNING: serving plain HTTP on %s:%d. Passwords and session cookies cross the network unencrypted. '
+              'Use --cert and --key for HTTPS.' % (args.host, httpd.server_address[1]), file=sys.stderr, flush=True)
     print('orchestra-http listening on %s:%d (backend=%s, web=%s)'
           % (args.host, httpd.server_address[1], args.backend,
              'off' if args.no_web else args.web_root))

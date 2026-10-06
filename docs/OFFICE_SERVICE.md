@@ -141,8 +141,9 @@ Create an operator-owned mode-0600 JSON file outside source control:
 {"schema_version":1,"http_host":"127.0.0.1","http_state":"<RUNTIME_ROOT>/http-state.json","trusted_proxies":["127.0.0.1"],"public_url":"https://<APPROVED_HOST>"}
 ```
 
-The HTTP listener is loopback only. A separately approved reverse proxy
-terminates TLS. Bootstrap the first HTTP superuser through the documented
+By default the HTTP listener is loopback only, and a separately approved
+reverse proxy terminates TLS. The next section has the other two ways to serve
+it. Bootstrap the first HTTP superuser through the documented
 `http_service.py --bootstrap-user` prompt under the bundled interpreter;
 the password is entered interactively. The `endpoint` backend is selected by
 the supervisor and operates against this runtime's canonical project data.
@@ -152,6 +153,80 @@ has no initialized project to back up. `add-project` prints a worker client
 endpoint under that release's exact path. Regenerate each worker's client
 configuration after install or rollback if its endpoint still points to an
 older release.
+
+## How the web interface is reached: three shapes
+
+The private office JSON decides. Loopback is the default, and a file that sets
+none of the settings below behaves as it always did.
+
+| Shape | Private JSON | People open | Prefer it when |
+| --- | --- | --- | --- |
+| **HTTPS on an open port** | `"http_host": "<ADDRESS>", "cert": "<CERT.pem>", "key": "<KEY.pem>"` | `https://<ADDRESS>:<PORT>` | the host has a port open to the office network and no proxy. The first choice of the three for that case. |
+| **Loopback, behind a proxy or a tunnel** (the default) | `"http_host": "127.0.0.1"` or nothing | the proxy's address, or `http://localhost:<PORT>` through `ssh -L <PORT>:127.0.0.1:<PORT> <HOST>` | an approved reverse proxy terminates TLS, or only a few people use it and each can tunnel. |
+| **Plain HTTP on an open port** | `"http_host": "<ADDRESS>", "allow_plaintext_on_network": true` | `http://<ADDRESS>:<PORT>` | never for long: a stopgap on a network you trust, until a certificate is made. |
+
+- `http_host` is the address the service binds: an address of the host, or its
+  name. `0.0.0.0` (or `::`) binds every address; the service then cannot name
+  itself, so `public_url` must be set to the address people use. Otherwise
+  `public_url` defaults to `https://<ADDRESS>:<PORT>` (or `http://...` for
+  plain HTTP); it is what agent prompts and set-up texts carry, so it must be
+  an address the agents' machines can reach.
+- An address other than loopback without `cert` and `key` is refused, unless
+  the file says `"allow_plaintext_on_network": true`. The refusal names the
+  setting. With it the service starts and prints, at every start, on standard
+  error and in `http.log`: `WARNING: serving plain HTTP on <ADDRESS>:<PORT>.
+  Passwords and session cookies cross the network unencrypted. Use cert and
+  key for HTTPS.` The setting together with loopback, or together with a
+  certificate, is refused: it would do nothing there.
+- Which ports are open, and to whom, is the host's firewall and the network's
+  business. The service listens where it is told; it does not restrict who may
+  connect beyond its own log-in.
+
+**A self-signed certificate** is enough for the HTTPS shape. Make one on the
+host with its own openssl, naming the address (or the name) people will type,
+and keep the key readable by the service account only:
+
+```sh
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout <KEY.pem> -out <CERT.pem> -subj "/CN=orchestra-office" \
+  -addext "subjectAltName=IP:<ADDRESS>"        # or DNS:<HOST_NAME>
+chmod 600 <KEY.pem>
+```
+
+(`-addext` needs OpenSSL 1.1.1, which RHEL 8 has.) What people then see: the
+browser does not know who signed the certificate, so on the first visit it
+shows a warning page ("Your connection is not private" or "Warning: Potential
+Security Risk Ahead"); they choose to continue, once per browser, or the
+certificate is added to the machines' trusted certificates. After that the
+connection is encrypted like any HTTPS connection; what a self-signed
+certificate does not give is proof to a first-time visitor that this is the
+right server. A client such as `curl`, or an agent's tool, must be given the
+certificate file (`curl --cacert <CERT.pem>`) or it refuses the connection, as
+it should. Replace the certificate before it expires (`-days`), then restart.
+
+**What does not work over plain HTTP at a host name or address.** Browsers give
+some features only to a secure context (HTTPS, or `localhost`):
+
+- the button that saves an agent's set-up files straight into a folder is not
+  offered; the files are shown to copy instead;
+- copying to the clipboard falls back to the older method, which works in
+  current browsers but may be removed by them;
+- the session cookie is not marked `Secure`, and the password and that cookie
+  cross the network readable by anyone on the path.
+
+Log-in, the session cookie, the request-forgery check on every change, and
+issuing an agent's credential work the same in all three shapes. Through an SSH
+tunnel the page is opened as `http://localhost:<PORT>`, which the browser
+treats as a secure context, so nothing above is lost there.
+
+`health` and `tools/office_verify.py` ask the listener the file describes when
+they are given it (`--config <PRIVATE_OFFICE_JSON>`): the configured address,
+over HTTPS when a certificate is set. That probe does not verify the
+certificate: it is the service asking its own listener, on the host, whether it
+answers, and a self-signed certificate must not make it read as down. Without
+`--config` they ask `http://127.0.0.1:<PORT>`, which is right for the loopback
+shape only. The verification record's `listener` says which shape is in use
+(`loopback`, `https` or `plain-http-on-network`), the host and the public URL.
 
 ## External scheduler commands
 
@@ -183,7 +258,7 @@ Schedule these separate commands while the service is up:
 | Cadence | Command | Required result |
 | --- | --- | --- |
 | Daily, after startup | `<PYTHON> <KIT>/admin.py --root <RUNTIME_ROOT> backup --all` | Exit 0; durable long-sync backup and status file. |
-| Frequent | `<PYTHON> <KIT>/office_service.py health --root <RUNTIME_ROOT> --port <HTTP_LOOPBACK_PORT>` | Exit 0 and one line with version, DB, web and latest backup status/time. |
+| Frequent | `<PYTHON> <KIT>/office_service.py health --root <RUNTIME_ROOT> --port <HTTP_LOOPBACK_PORT> --config <PRIVATE_OFFICE_JSON>` | Exit 0 and one line with version, DB, web and latest backup status/time. |
 | After successful backup, optional | `<PYTHON> <KIT>/admin.py --root <RUNTIME_ROOT> backup-copy <OFF_MACHINE_STAGING>` | Exit 0 before the approved encrypted off-box transfer. |
 
 `health` exits nonzero if the database or web listener is down, if a backup
@@ -197,7 +272,7 @@ Collect a read-only, machine-readable UAT record after startup and backup:
 
 ```sh
 <PYTHON> <KIT>/tools/office_verify.py --install-root <INSTALL_ROOT> \
-  --root <RUNTIME_ROOT> --port <HTTP_LOOPBACK_PORT>
+  --root <RUNTIME_ROOT> --port <HTTP_LOOPBACK_PORT> --config <PRIVATE_OFFICE_JSON>
 ```
 
 It checks that the installed source provenance matches the release manifest,
