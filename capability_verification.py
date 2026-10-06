@@ -53,6 +53,7 @@ cannot stop anyone from raising drift. Trusted records are never capped. Report 
 import json
 import re
 
+import record_json
 import keyed_records as core
 from coordination import identifier
 from export_requirements import parse_json
@@ -268,7 +269,9 @@ class Integrated:
             for line in self.run(['export', '--all']).splitlines():
                 if not line.strip():
                     continue
-                row = json.loads(line)
+                row = record_json.loads_row(line)
+                if row.get('malformed'):
+                    raise ValueError('Unreadable lifecycle event row (%s): %s' % (row.get('id') or 'unknown', row.get('error') or 'malformed'))
                 if is_lifecycle_row(row):
                     rows.append(row)
         self.everything = integrated_commits(rows, self.operators, self.journal)
