@@ -2783,13 +2783,21 @@ class ApiHandler(BaseHTTPRequestHandler):
         not guess from the assignee, who may have changed since the delivery. The queue
         row, My work and the agent actions then show no recommendation until the endpoint
         is updated; the brief, which names the author, still shows an independent one.
+
+        The names that were not counted are kept on such a row as ``recommended_unchecked``
+        (kittrial-5bb.147). They say nothing about whether the delivery is recommended.
+        They answer one question the service CAN answer whoever delivered: has this
+        reviewer recommended it already. Without them a reviewer on a mixed installation
+        was offered the same delivery again on every read.
         """
         changed = False
         for item in read.get('items') or []:
             names = item.get('recommended_by') or []
             author = item.get('contribution_author')
-            if names:
-                kept = self._independent(names, [author]) if isinstance(author, str) and author else []
+            if names and not (isinstance(author, str) and author):
+                kept, item['recommended_unchecked'] = [], list(names)
+            elif names:
+                kept = self._independent(names, [author])
             else:
                 kept = names
             if len(kept) != len(names):
@@ -2797,6 +2805,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         if changed:
             read['items'].sort(key=queue_order)
         return read
+
+    @staticmethod
+    def _every_recommender(row):
+        """Everyone who recommended the row's delivery, whether or not the service counts them."""
+        return [name for name in (row.get('recommended_by') or []) + (row.get('recommended_unchecked') or [])
+                if isinstance(name, str)]
 
     def _review_queue(self, project_id, shared=False):
         """One review-queue read of a project per request (and, when ``shared`` and the
@@ -3862,12 +3876,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                 kind, count, who = 'review-recommended', 'review_recommended', 'owner'
                 reason = ('A reviewer recommends approving this contribution. Tell your owner it is ready to '
                           'approve; an agent cannot approve.')
-            elif actor not in recommended_by:
+            elif actor not in recommended_by and actor not in (row.get('recommended_unchecked') or []):
                 kind, count, who = 'to-review', 'to_review', 'agent'
                 reason = ('A contribution by someone else awaits review. Review it, then record a recommendation '
                           'or request changes.')
             else:
-                continue                      # this agent has recommended it, and its owner cannot approve
+                continue                      # this agent has recommended it already (see _independent_queue)
             counts[count] += 1
             contribution = row.get('contribution') if isinstance(row.get('contribution'), dict) else {}
             actions.append(self._agent_action(
@@ -4882,13 +4896,15 @@ class ApiHandler(BaseHTTPRequestHandler):
                      for item in read['items']]
             blocked |= {pid_tid[1] for pid_tid, detail in details.items()
                         if pid_tid[0] == project['id'] and detail.get('blocked')}
-            names = self.service.actor_names([i.get('assignee') for i in items])
+            names = self.service.actor_names([i.get('assignee') for i in items]
+                                             + [i.get('contribution_author') for i in items])
             # What this person could recommend: someone else's contribution, by person, that
-            # nobody of theirs has recommended yet (the rule of _agent_review_actions).
+            # nobody of theirs has recommended yet (the rule of _agent_review_actions). "Yet" is
+            # read from every name on the row, counted or not (kittrial-5bb.147).
             reviewable = {i.get('id') for i in items if CAP_REVIEWS in capabilities
                           and self._independent([actor], [i.get('assignee'), i.get('contribution_author')])
-                          and len(self._independent(i.get('recommended_by') or [], [actor]))
-                          == len(i.get('recommended_by') or [])}
+                          and len(self._independent(self._every_recommender(i), [actor]))
+                          == len(self._every_recommender(i))}
             classified.append(agent_prompts.classify(project, capabilities, items,
                                                      actor, blocked, now, names, reviewable))
             for item in items:

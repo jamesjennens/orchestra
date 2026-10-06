@@ -117,7 +117,8 @@ def classify(project, capabilities, items, actor, blocked, now, names=None, revi
             # The queues are filtered upstream (kittrial-5bb.64); a labelled row that
             # reaches here anyway is still never offered to an agent.
             continue
-        item = dict(item, assignee_name=names.get(item.get('assignee'), item.get('assignee')))
+        item = dict(item, assignee_name=names.get(item.get('assignee'), item.get('assignee')),
+                    author_name=names.get(item.get('contribution_author'), item.get('contribution_author')))
         state = item.get('review_state') or 'none'
         mine = item.get('assignee') == actor
         closed = item.get('status') == 'closed'
@@ -174,6 +175,18 @@ def _assignee(item):
     return '%s (%s)' % (label(item.get('assignee_name')), token(item.get('assignee')))
 
 
+def _deliverer(item):
+    """Who delivered the contribution: its author when the row says, else the task's assignee.
+
+    After a reassignment these differ, and the prompt named the new assignee as the one
+    who delivered (kittrial-5bb.147).
+    """
+    author = item.get('contribution_author')
+    if isinstance(author, str) and author:
+        return '%s (%s)' % (label(item.get('author_name') or author), token(author))
+    return _assignee(item)
+
+
 def _requests(item):
     ids = [token(i) for i in item.get('pending_request_ids') or []]
     if ids and item.get('pending_request_ids_complete') is False:
@@ -200,12 +213,12 @@ CLASSES = [
      lambda i: 'state %s; %s%s; delivered by %s%s' % (
          token(i.get('review_state')), 'RE-REVIEW of ' if int(
              (i.get('contribution') or {}).get('revision') or 1) > 1 else '', _revision(i),
-         _assignee(i), _recommended(i)),
+         _deliverer(i), _recommended(i)),
      'waiting_since'),
     ('recommend', 'Contributions you could review: read the work, then record a recommendation or request '
                   'changes (you cannot approve; an owner decides)',
      lambda i: 'state %s; %s; delivered by %s%s' % (
-         token(i.get('review_state')), _revision(i), _assignee(i), _recommended(i)),
+         token(i.get('review_state')), _revision(i), _deliverer(i), _recommended(i)),
      'waiting_since'),
     ('integrate', 'Approved, not yet integrated: integrate and record integration evidence',
      lambda i: 'state %s; %s' % (token(i.get('review_state')), _revision(i)), 'waiting_since'),

@@ -1569,9 +1569,17 @@ line separately and unconfined.
       does not guess who delivered from the task's assignee. The task's brief still
       shows an independent recommendation. A delivery whose task was reassigned or
       unassigned afterwards is offered as `to-review` to the agent that delivered it;
-      its recommendation is refused with 403 and nothing is written. Update the
-      endpoint and the service together and none of this is seen (docs/REVIEWS.md,
-      "A mixed installation").
+      its recommendation is refused with 403 and nothing is written. A reviewer that
+      has already recommended a delivery is not offered it again: the names that are
+      not counted are on the row as `recommended_unchecked` and are used for that one
+      question only. Update the endpoint and the service together and none of this is
+      seen (docs/REVIEWS.md, "A mixed installation").
+    - The prompt's "delivered by" names the contribution's author when the row gives
+      it, not the task's assignee, so a reassignment does not rename who delivered.
+    - After a reassignment the new assignee's agent lists the task as
+      `awaiting-review` ("Waiting for a human review decision."). That is meant: the
+      task is that agent's now, whoever delivered the contribution on it, and there is
+      nothing for it to do until the review is decided.
   - **Order within a priority is part of the contract; the numbers are not.**
     `review-recommended`, `to-review` and `claimable-task` all carry priority 4 and
     are listed in that order, and within a kind by project and then by task. No kind was renumbered when these two were added. A

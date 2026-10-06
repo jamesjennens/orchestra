@@ -188,6 +188,24 @@ class Shared:
         self.change(one[0], assignee=None)
         self.assertEqual(listed('carl'), [])
 
+    def test_the_prompt_names_who_delivered_not_who_is_assigned_now(self):
+        """kittrial-5bb.147: after a reassignment the copied prompt said the new assignee had delivered."""
+        (one, two), spare = self.scenario()
+        kestrel, osprey = self.agent_ids['Kestrel'], self.agent_ids['Osprey']
+
+        def line(name, task):
+            text = self.request('GET', '/v1/me/work', token=self.tokens[name]).data['agent_prompts'][0]['text']
+            return next(line for line in text.splitlines() if line.startswith('- task %s ' % task))
+        self.assertIn('delivered by "Kestrel (agent of carl)" (%s)' % kestrel, line('olive', one[0]))
+        self.change(one[0], assignee=osprey)
+        after = line('olive', one[0])
+        self.assertIn('delivered by "Kestrel (agent of carl)" (%s)' % kestrel, after)
+        self.assertNotIn(osprey, after)
+        # A third person's prompt, under "Contributions you could review", says the same.
+        self.add_agent('olive', 'Egret')
+        self.change(one[0], assignee=None)
+        self.assertIn('delivered by "Kestrel (agent of carl)" (%s)' % kestrel, line('rita', one[0]))
+
     def brief_without_the_author(self):
         """A brief whose contribution does not say who delivered it."""
         read = self.backend.task_brief
@@ -454,6 +472,42 @@ class EndpointTests(Shared, fixes.EndpointCase):
         self.assertEqual(heron['next_actions'][0]['recommended_by'], [])
         # The brief names the author itself, so it still shows the independent recommendation.
         self.assertEqual(self.shown_in_the_brief(one[0]), (osprey, [osprey]))
+
+    def full_row(self, task):
+        queue = self.request('GET', '/v1/projects/%s/queue' % self.project, token=self.tokens['olive']).data['items']
+        return next(row for row in queue if row['id'] == task)
+
+    def could_review(self, name):
+        heading = 'Contributions you could review:'
+        text = self.request('GET', '/v1/me/work', token=self.tokens[name]).data['agent_prompts'][0]['text']
+        found, lines = [], (text.split(heading)[1] if heading in text else '').splitlines()[1:]
+        for line in lines:                       # the list under the heading ends at the first other line
+            if not line.startswith('- task '):
+                break
+            found.append(line.split(' ')[2])
+        return sorted(found)
+
+    def test_a_reviewer_who_has_recommended_is_not_asked_again_on_a_mixed_installation(self):
+        """kittrial-5bb.147: the names that are not counted still say who has recommended already."""
+        (one, two), spare = self.scenario()
+        osprey = self.agent_ids['Osprey']
+        self.backend.READ_CACHE_SECONDS = 0
+        self.addCleanup(delattr, self.backend, 'READ_CACHE_SECONDS')
+        self.assertEqual(201, self.recommend(self.agents['Osprey'], *one).status)
+        self.assertNotIn('recommended_unchecked', self.full_row(one[0]))        # the row names the author
+        self.assertEqual((self.offered('Osprey'), self.could_review('rita')), ([two[0]], [two[0]]))
+        self.older_endpoint()
+        row = self.full_row(one[0])
+        self.assertEqual((row['recommended_by'], row['recommended'], row['recommended_unchecked']), ([], False, [osprey]))
+        self.assertNotIn('recommended_unchecked', self.full_row(two[0]))        # nobody recommended that one
+        # The reviewer that recommended it, and its person, are not asked again ...
+        self.assertEqual(self.offered('Osprey'), [two[0]])
+        self.assertEqual(self.next('Osprey')['attention']['counts']['to_review'], 1)
+        self.assertEqual(self.could_review('rita'), [two[0]])
+        # ... and for everybody else it still reads as not yet recommended, as kittrial-5bb.137 decided.
+        self.assertEqual(self.offered('Heron'), sorted([one[0], two[0]]))
+        self.assertEqual(self.next('Heron')['attention']['counts']['review_recommended'], 0)
+        self.assertNotIn('recommended by', self.owners_line(one[0]))
 
     def test_over_an_older_endpoint_nobody_is_offered_their_own_delivery_unless_it_was_reassigned(self):
         (one, two), spare = self.scenario()
