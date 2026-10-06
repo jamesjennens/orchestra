@@ -153,6 +153,50 @@ class Shared:
     def offered(self, name):
         return sorted(task for kind, task in kinds(self.next(name)) if kind in ('to-review', 'review-recommended'))
 
+    def could_review(self, name):
+        heading = 'Contributions you could review:'
+        text = self.request('GET', '/v1/me/work', token=self.tokens[name]).data['agent_prompts'][0]['text']
+        found, lines = [], (text.split(heading)[1] if heading in text else '').splitlines()[1:]
+        for line in lines:                       # the list under the heading ends at the first other line
+            if not line.startswith('- task '):
+                break
+            found.append(line.split(' ')[2])
+        return sorted(found)
+
+    def test_already_recommended_is_asked_by_person_of_agents_and_of_my_work(self):
+        """kittrial-5bb.154: an agent was asked "has THIS AGENT recommended", My work "has anyone of this PERSON"."""
+        (one, two), spare = self.scenario()
+        self.add_agent('rita', 'Plover')                       # Rita's second agent
+        admin = self.admin_token()
+        self.ids['dana'] = self.create_account(admin, 'dana', 'dana-password-1')
+        self.request('PUT', '/v1/projects/%s/members/%s' % (self.project, self.ids['dana']), {'role': 'contributor'},
+                     token=admin)
+        self.tokens['dana'] = self.login('dana', 'dana-password-1')[0]
+        self.add_agent('dana', 'Wren')                         # another person's agent
+        both = sorted([one[0], two[0]])
+        for name in ('Osprey', 'Plover', 'Wren'):
+            self.assertEqual(self.offered(name), both)
+        # Rita's first agent recommends one delivery: her second agent is not offered it, nor is she.
+        self.assertEqual(201, self.recommend(self.agents['Osprey'], *one).status)
+        for name in ('Osprey', 'Plover'):
+            with self.subTest(agent=name):
+                self.assertEqual(self.offered(name), [two[0]])
+                self.assertEqual(self.next(name)['attention']['counts']['to_review'], 1)
+        self.assertEqual(self.could_review('rita'), [two[0]])
+        # Another person, and her agent, are still offered both: theirs would be a second voice.
+        self.assertEqual(self.offered('Wren'), both)
+        self.assertEqual(self.could_review('dana'), both)
+        # The other way round: Rita herself recommends the other delivery; neither of her agents is offered it.
+        self.assertEqual(201, self.recommend(self.tokens['rita'], *two).status)
+        for name in ('Osprey', 'Plover'):
+            self.assertEqual(self.offered(name), [])
+        self.assertEqual(self.could_review('rita'), [])
+        self.assertEqual((self.offered('Wren'), self.could_review('dana')), (both, both))
+        # Her second agent's recommendation is refused, with the way on: nothing invites what would be refused.
+        refused = self.recommend(self.agents['Plover'], *one)
+        self.assertEqual(409, refused.status, refused.data)
+        self.assertIn('has already recommended this contribution', refused.data['error']['message'])
+
     def test_both_the_assignee_and_the_author_are_compared(self):
         """Each half of the independence check, alone (review 01a10c80)."""
         (one, two), spare = self.scenario()
@@ -468,6 +512,9 @@ class EndpointTests(Shared, fixes.EndpointCase):
         # is counted: not in the queue row, not in My work, not for the owner's agent.
         self.assertEqual(self.queue_row(one[0]), ([], False))
         self.assertNotIn('recommended by', self.owners_line(one[0]))
+        # Nor does the prompt name the assignee as the one who delivered (kittrial-5bb.154).
+        self.assertIn('; delivered by: not stated by this server (the task is assigned to "Kestrel (agent of carl)" (%s))'
+                      % self.agent_ids['Kestrel'], self.owners_line(one[0]))
         heron = self.next('Heron')
         self.assertEqual([action for action in kinds(heron) if action[0] != 'claimable-task'],
                          sorted([('to-review', one[0]), ('to-review', two[0])]))
@@ -480,16 +527,6 @@ class EndpointTests(Shared, fixes.EndpointCase):
     def full_row(self, task):
         queue = self.request('GET', '/v1/projects/%s/queue' % self.project, token=self.tokens['olive']).data['items']
         return next(row for row in queue if row['id'] == task)
-
-    def could_review(self, name):
-        heading = 'Contributions you could review:'
-        text = self.request('GET', '/v1/me/work', token=self.tokens[name]).data['agent_prompts'][0]['text']
-        found, lines = [], (text.split(heading)[1] if heading in text else '').splitlines()[1:]
-        for line in lines:                       # the list under the heading ends at the first other line
-            if not line.startswith('- task '):
-                break
-            found.append(line.split(' ')[2])
-        return sorted(found)
 
     def test_a_reviewer_who_has_recommended_is_not_asked_again_on_a_mixed_installation(self):
         """kittrial-5bb.147: the names that are not counted still say who has recommended already."""

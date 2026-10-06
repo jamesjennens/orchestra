@@ -176,15 +176,18 @@ def _assignee(item):
 
 
 def _deliverer(item):
-    """Who delivered the contribution: its author when the row says, else the task's assignee.
+    """What follows "delivered by": the contribution's author when the row says who that is.
 
-    After a reassignment these differ, and the prompt named the new assignee as the one
-    who delivered (kittrial-5bb.147).
+    Not the task's assignee: after a reassignment these differ, and the prompt named the
+    new assignee as the one who delivered (kittrial-5bb.147).
     """
     author = item.get('contribution_author')
     if isinstance(author, str) and author:
-        return '%s (%s)' % (label(item.get('author_name') or author), token(author))
-    return _assignee(item)
+        return ' %s (%s)' % (label(item.get('author_name') or author), token(author))
+    # The row does not say (an endpoint older than this service, kittrial-5bb.154). The
+    # assignee may have changed since the delivery, so nobody is named as the one who delivered.
+    return ': not stated by this server (the task is assigned to %s)' % _assignee(item) \
+        if item.get('assignee') else ': not stated by this server'
 
 
 def _requests(item):
@@ -210,14 +213,14 @@ CLASSES = [
     ('changes', 'Changes requested on your tasks: address every pending item, then deliver a new revision',
      lambda i: 'state changes-requested; %s; %s' % (_requests(i), _revision(i)), 'waiting_since'),
     ('review', 'Contributions awaiting your review: approve, or request changes with item ids',
-     lambda i: 'state %s; %s%s; delivered by %s%s' % (
+     lambda i: 'state %s; %s%s; delivered by%s%s' % (
          token(i.get('review_state')), 'RE-REVIEW of ' if int(
              (i.get('contribution') or {}).get('revision') or 1) > 1 else '', _revision(i),
          _deliverer(i), _recommended(i)),
      'waiting_since'),
     ('recommend', 'Contributions you could review: read the work, then record a recommendation or request '
                   'changes (you cannot approve; an owner decides)',
-     lambda i: 'state %s; %s; delivered by %s%s' % (
+     lambda i: 'state %s; %s; delivered by%s%s' % (
          token(i.get('review_state')), _revision(i), _deliverer(i), _recommended(i)),
      'waiting_since'),
     ('integrate', 'Approved, not yet integrated: integrate and record integration evidence',

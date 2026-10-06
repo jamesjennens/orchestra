@@ -104,6 +104,18 @@ Anything else is refused with zero native writes, in one sentence that names the
 1. **The exact prior commit is only as strong as who may record an integrated fact.** A follow-on based on exactly the prior revision's integration commit is accepted whoever recorded that integration, as it has been since `follows` exists. A contributor whose contribution was approved by somebody else can record `integrated=passed` for it herself, at a commit of her choosing, and base the follow-on there. The approval by a different person cannot be forged this way; the reviewer of the follow-on still checks its base.
 2. **Over SSH an actor name is a declared label.** "Recorded by a listed operator" means "recorded under an operator's name": a caller who reaches the endpoint and names itself as an operator passes. Over HTTP the actor is the authenticated account or agent, which a contributor cannot choose.
 
+What a coordinator needs to know about the operator list here (kittrial-5bb.158):
+
+* **The list is read when the follow-on is checked, not when the integration was recorded.** Listing a recorder makes everything already recorded under that name count as a later base from that moment; removing one makes all of it stop counting. Nothing is stamped on the fact itself.
+* **Names match exactly: the whole name, with case.** `Ops` is not `ops`; `ops-2` is not `ops`; an entry that is the beginning of a name (a truncated entry) matches nobody. A recorder that is refused is named in the sentence as it was recorded, so the entry to add can be copied from it.
+* **Being on the operator list grants the other operator powers too**: writing void and revert records, and whatever else `admin.py` checks the list for. Listing the coordinator so that its integrations count is a decision about those as well; the other way is to have a listed operator record the integrations.
+* **With no list configured, no later base counts.** A follow-on based on exactly the prior integration commit is still accepted.
+* **When a commit was recorded more than once**, a revert wins, then a listed operator's later recording, then an unlisted later one, then an earlier one. So a commit recorded before the prior integration and again later by somebody not listed is refused with the reason that names that recorder: the one that can be acted on.
+
+**Over HTTP the refusal arrives whole** (kittrial-5bb.158). The web service hands a canonical refusal on up to 200 characters; cut there, this sentence lost its reason, the recorder's name and what an operator does. For this sentence, and only when the line is nothing but the kit's own words around hexadecimal commit ids and a recorder name of the plain shape (`review_workflow.BASE_REFUSAL`), the limit is 1500, and the sentence is the `message` of the 422 as well as its `detail`. A recorder's name is constrained twice: the lifecycle action accepts only letters, digits and `_.@/-` for an actor, and the sentence repeats a name only if it is such a name of at most 80 characters (otherwise it says "an actor"). A scope may name any string as its integration commit; a refusal that would repeat such a string is not this sentence and is cut at 200 as before.
+
+**If `deployment.private.json` cannot be read**, the review action fails like every other action. Over SSH the endpoint's line names the file, as its busy line names the lock file it waited for; the caller there is somebody who was given the endpoint. Over the web service see docs/HTTP_DEPLOYMENT.md.
+
 What an installation should do meanwhile: put its coordinator on the operator list (`admin.py operators add NAME`) and have the coordinator record the integrations. Where integrations were recorded by somebody who is not listed, follow-ons based on exactly the prior integration commit keep working, and a later base is refused with the sentence above until an operator lists the recorder or records the integration.
 
 **What this rule cannot know.** The endpoint has no Git repository. It cannot tell that a recorded integration commit really descends from the prior one, only that the project recorded it, later, as an integration. Two release lines in one project, or a fact recorded with a wrong commit, would pass. A commit of main that no lifecycle fact names (a fix-up made directly on main) is never accepted: base the follow-on on the nearest recorded integration commit. The reviewer verifies the base, as for any contribution.
@@ -404,7 +416,17 @@ Over HTTP a refused recommendation says which rule it hit: the 422 message is th
 * it was written after the contribution;
 * no `approve` or `request-changes` on that contribution was written after it.
 
-A new revision, a decision or a withdrawal makes it lapse. The newest recommendation by one actor replaces that actor's earlier one.
+A new revision, a decision or a withdrawal of the contribution makes it lapse.
+
+**One standing recommendation for a contribution from each reviewer (kittrial-5bb.154).** While a recommendation stands, a second one for the same contribution by the same reviewer is refused and nothing is stored: `NAME has already recommended this contribution, and that recommendation stands until the contribution is revised or decided. To ask for changes instead, request changes: the recommendation then stops counting. A recommendation cannot be withdrawn.` "The same reviewer" is the same actor by the name rule in the canonical action (over SSH), and the same PERSON in the web service: the reviewer, the person who owns the agent, or another agent of that person (409, with `detail.recommended_by`). An exact retry is still answered as recorded. A recommendation by another person is a second voice and is stored.
+
+How a reviewer changes their mind:
+
+* **From recommending to asking for changes: `request-changes`.** Any reviewer may, not only an owner. The recommendation stops counting at once, for every reader: the brief, the queue row, My work and the agents' actions. After the contributor has responded, the contribution awaits review again and the reviewer may recommend it again; the earlier one does not come back.
+* **A revised contribution is a new contribution.** Every recommendation of the earlier revision has lapsed, and the same reviewer may recommend the new one.
+* **From a mistaken recommendation to none: there is no such operation.** A recommendation cannot be withdrawn or voided; it lapses at the next decision or revision. A reviewer who recommended by mistake and does not want changes either tells the owner, who decides: a recommendation is advice to the owner, never a decision. **For the owner:** treat a recommendation that is followed by a comment from the same reviewer taking it back as taken back, although every reader still counts it; `request-changes` is the only record that stops a recommendation counting.
+
+Records written before this rule are read as before: where one actor has two standing ones, the newest replaces the earlier in every reading.
 
 **Where it shows.**
 

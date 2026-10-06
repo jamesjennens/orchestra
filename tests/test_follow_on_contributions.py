@@ -1791,5 +1791,85 @@ class OperatorRecordedRevertTests(IntegrationRevertTests, LaterBaseTests):
         self.assertEqual((recorded[MERGE_2], newest), ('reverted', None))
 
 
+class OperatorNameMatchingTests(LaterBaseTests):
+    """kittrial-5bb.158: how a recorder is matched against the operator list, and which reason is given."""
+
+    def recorded_by(self, recorder, operators):
+        """A later base recorded by ``recorder``, read with ``operators`` listed: the reading of that commit."""
+        self.setUp()
+        self.integration_case()
+        self.other()
+        self.integrate('task-2', COMMIT_3, MERGE_2, '2026-09-17T08:30:00Z', actor=recorder)
+        from review_state import integration, scopes_for
+        prior = integration(w.project(self.issue)['contribution'], scopes_for(self.rows, 'task-1'))
+        recorded, newest = w.recorded_integrations(self.rows, 'task-1', prior, operators)
+        found = recorded[MERGE_2]
+        return (found[0] if isinstance(found, tuple) else found), newest
+
+    def test_a_recorder_is_matched_exactly_with_case(self):
+        self.assertEqual(self.recorded_by('ops', ['ops']), ('later', MERGE_2))
+        for recorder, listed in (('Ops', 'ops'), ('ops', 'Ops'), ('OPS', 'ops'), ('ops', 'OPS')):
+            with self.subTest(recorder=recorder, listed=listed):
+                self.assertEqual(self.recorded_by(recorder, [listed]), ('unlisted', None))
+
+    def test_a_name_that_only_begins_like_an_operators_does_not_count_either_way(self):
+        """A live operator list holds a truncated entry: neither it nor a longer name is the operator."""
+        for recorder, listed in (('ops-2', 'ops'), ('ops2', 'ops'), ('ops', 'op'), ('ops', 'ops-2'),
+                                 ('coordinator-1', 'coordinator'), ('coordinator', 'coordinator-1'),
+                                 ('ops', ' ops'), ('ops', 'ops '), ('team/ops', 'ops'), ('ops', 'team/ops')):
+            with self.subTest(recorder=recorder, listed=listed):
+                self.assertEqual(self.recorded_by(recorder, [listed]), ('unlisted', None))
+        # The whole name among others, and the list given as any iterable of names.
+        self.assertEqual(self.recorded_by('ops-2', ['ops', 'ops-2', 'op']), ('later', MERGE_2))
+        self.assertEqual(self.recorded_by('ops-2', ('ops', 'ops-2')), ('later', MERGE_2))
+
+    def test_recorded_before_the_prior_and_again_later_by_an_unlisted_actor_reads_unlisted(self):
+        """The reason given is the one the caller can act on, in either order of the rows."""
+        for order in ((('2026-09-15T00:00:00Z', OPERATOR), ('2026-09-18T00:00:00Z', 'old-coordinator')),
+                      (('2026-09-18T00:00:00Z', 'old-coordinator'), ('2026-09-15T00:00:00Z', OPERATOR))):
+            with self.subTest(first=order[0][1]):
+                self.setUp()
+                first = self.integration_case()
+                for number, (at, actor) in enumerate(order):
+                    self.other('task-%d' % (number + 2))
+                    self.integrate('task-%d' % (number + 2), '%d' % (number + 5) * 40, MERGE_2, at, actor=actor)
+                said = self.refusal(first, MERGE_2)
+                self.assertTrue(said.endswith(
+                    '%s is not accepted: it was recorded as an integration commit by "old-coordinator", who is not a '
+                    'listed operator of this installation. Integrations must be recorded by a listed operator for a later '
+                    'base to count: an operator adds the recorder (admin.py operators add) or records the integration'
+                    % MERGE_2), said)
+                self.assertIn('; none is recorded yet. ', said)
+
+    def test_every_refusal_of_the_base_is_the_sentence_the_pattern_describes(self):
+        """What the web service may hand on whole is exactly what the gate says, and nothing wider."""
+        first = self.integration_case()
+        said = [self.refusal(first, '9' * 40)]                                  # never recorded; none recorded yet
+        self.other()
+        self.integrate('task-2', COMMIT_3, MERGE_2, '2026-09-15T00:00:00Z')     # before the prior
+        said.append(self.refusal(first, MERGE_2))
+        self.other('task-3')
+        self.integrate('task-3', '7' * 40, '8' * 40, '2026-09-18T00:00:00Z', actor='old-coordinator')
+        said.append(self.refusal(first, '8' * 40))                              # unlisted, a plain name
+        self.other('task-4')
+        self.integrate('task-4', '5' * 40, '6' * 40, '2026-09-19T00:00:00Z', actor='n' * 100)
+        said.append(self.refusal(first, '6' * 40))                              # unlisted, a name too long to repeat
+        self.other('task-5')
+        self.integrate('task-5', '3' * 40, '4' * 40, '2026-09-20T00:00:00Z')    # an operator's: now there is a newest
+        said.append(self.refusal(first, ('9' * 40).upper()))
+        self.assertEqual(len(set(said)), 5)
+        for sentence in said:
+            with self.subTest(sentence=sentence[-70:]):
+                self.assertTrue(w.BASE_REFUSAL.fullmatch(sentence), sentence)
+        self.assertIn('; the newest such commit is %s. ' % ('4' * 40), said[-1])
+        self.assertIn('by an actor, who is not a listed operator', said[3])
+        # Not the sentence: more after it, other words before it, or something that is no commit id in a commit's place.
+        whole = said[2]
+        for other in (whole + '.', 'See: ' + whole, whole.replace(MERGE_1, 'main'), whole.replace('8' * 40, '<b>' * 10),
+                      whole.replace('"old-coordinator"', '"old coordinator"'), whole.replace('"old-coordinator"', 'old-coordinator'),
+                      whole.replace('listed operator of', 'listed operator  of'), whole + '\nmore'):
+            self.assertIsNone(w.BASE_REFUSAL.fullmatch(other), other)
+
+
 if __name__ == '__main__':
     unittest.main()
