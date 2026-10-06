@@ -12,8 +12,10 @@ import fcntl
 import io
 import json
 import os
+import re
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -34,18 +36,49 @@ def private_root(raw):
     return root
 
 
+#: The three ways the web interface is served (kittrial-5bb.163). ``loopback``: plain HTTP on
+#: this host only, reached through a proxy or a tunnel. ``https``: a certificate and key are
+#: given, on any address. ``plain-http-on-network``: no certificate, on an address other
+#: hosts can reach; only with the explicit setting below, and with a warning at every start.
+LOOPBACK_HOSTS = ('127.0.0.1', '::1', 'localhost')
+WILDCARD_HOSTS = ('0.0.0.0', '::')
+HOST = re.compile(r'[A-Za-z0-9:]([A-Za-z0-9.:-]{0,251}[A-Za-z0-9:])?')
+PLAINTEXT_SETTING = 'allow_plaintext_on_network'
+PLAINTEXT_WARNING = ('WARNING: serving plain HTTP on %s:%d. Passwords and session cookies cross the network '
+                     'unencrypted. Use cert and key for HTTPS.')
+
+
 def service_config(path):
     config = json.loads(Path(path).read_text(encoding='utf-8'))
     if config.get('schema_version') != 1:
         raise ValueError('Office service configuration must have schema_version 1')
     allowed = {'schema_version', 'http_host', 'http_state', 'cert', 'key',
-               'trusted_proxies', 'public_url', 'endpoint_timeout'}
+               'trusted_proxies', 'public_url', 'endpoint_timeout', PLAINTEXT_SETTING}
     if set(config) - allowed:
         raise ValueError('Unknown office service setting: ' + ', '.join(sorted(set(config)-allowed)))
-    if config.get('http_host', '127.0.0.1') != '127.0.0.1':
-        raise ValueError('Office service HTTP listener must use loopback; put TLS at the approved proxy')
     if bool(config.get('cert')) != bool(config.get('key')):
         raise ValueError('cert and key must be supplied together')
+    host = config.get('http_host', '127.0.0.1')
+    if not isinstance(host, str) or not HOST.fullmatch(host):
+        raise ValueError('http_host must be a host name or an address')
+    plain = config.get(PLAINTEXT_SETTING, False)
+    if not isinstance(plain, bool):
+        raise ValueError(PLAINTEXT_SETTING + ' must be true or false')
+    # Loopback stays the default. Off loopback the listener needs a certificate, or the
+    # operator's explicit word that plain HTTP on the network is meant.
+    if plain and host in LOOPBACK_HOSTS:
+        raise ValueError('%s is set but http_host is loopback: remove the setting, or name the address to serve on'
+                         % PLAINTEXT_SETTING)
+    if plain and config.get('cert'):
+        raise ValueError('%s is set together with cert and key: remove one of the two; with a certificate the '
+                         'service serves HTTPS' % PLAINTEXT_SETTING)
+    if host not in LOOPBACK_HOSTS and not config.get('cert') and not plain:
+        raise ValueError('http_host %s is not loopback and no cert and key are given. Give both for HTTPS, or set '
+                         '%s to true to serve plain HTTP on the network (passwords and session cookies then cross '
+                         'it unencrypted)' % (host, PLAINTEXT_SETTING))
+    if host in WILDCARD_HOSTS and not config.get('public_url'):
+        raise ValueError('http_host %s listens on every address, so the service cannot name itself: set public_url '
+                         'to the address people use' % host)
     if (not isinstance(config.get('trusted_proxies', []), list) or
             any(not isinstance(value, str) for value in config.get('trusted_proxies', []))):
         raise ValueError('trusted_proxies must be a list of addresses')
@@ -183,11 +216,41 @@ def prepare(root, db_port):
     admin.checked([root/'bin/bd', 'metrics', 'off'], env=env)
 
 
-def health(root, port):
+def listener(settings, port):
+    """How the web interface is served with ``settings`` (the private office JSON, or None): one of
+    the three shapes, the address it is bound to, the address to ask on this host, and its URL."""
+    settings = settings or {}
+    host = settings.get('http_host', '127.0.0.1')
+    secure = bool(settings.get('cert'))
+    shape = 'https' if secure else ('loopback' if host in LOOPBACK_HOSTS else 'plain-http-on-network')
+    # A wildcard is asked on loopback; any other address is asked as it is bound.
+    asked = {'0.0.0.0': '127.0.0.1', '::': '::1'}.get(host, host)
+    bracket = lambda name: '[%s]' % name if ':' in name else name
+    scheme = 'https' if secure else 'http'
+    return {'shape': shape, 'host': host, 'port': port,
+            'probe': '%s://%s:%d/healthz' % (scheme, bracket(asked), port),
+            # Named for the people who use it only off loopback: a loopback listener is reached
+            # through a proxy or a tunnel, whose address the service does not know.
+            'public_url': settings.get('public_url') or (
+                None if host in LOOPBACK_HOSTS else '%s://%s:%d' % (scheme, bracket(host), port))}
+
+
+def health(root, port, settings=None):
     version = report(Path(__file__).resolve().parent)['version']
     db = _database_ready(root)
+    served = listener(settings, port)
     try:
-        with urlopen('http://127.0.0.1:%d/healthz' % port, timeout=2) as response:
+        if served['probe'].startswith('https:'):
+            # The service asking its own listener whether it answers, on this host. The
+            # certificate is not verified here: a self-signed one must work, and this
+            # probe sends nothing and trusts nothing it reads beyond "200".
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            response = urlopen(served['probe'], timeout=2, context=context)
+        else:
+            response = urlopen(served['probe'], timeout=2)
+        with response:
             web = response.status == 200
     except (OSError, ValueError):
         web = False
@@ -203,6 +266,23 @@ def health(root, port):
     return ('version=%s db=%s web=%s backup=%s backup_at=%s' %
             (version, 'up' if db else 'down', 'up' if web else 'down',
              backup, backup_time)), 0 if ok else 1
+
+
+def web_command(settings, root, port, release_python, release_script):
+    """The command line of the web service for ``settings``: host, certificate, plain-HTTP word, URL."""
+    served = listener(settings, port)
+    command = [release_python, release_script.with_name('http_service.py'),
+               '--state', settings.get('http_state', str(root/'http-state.json')),
+               '--host', served['host'], '--port', port,
+               '--backend', 'endpoint', '--endpoint-python', release_python,
+               '--endpoint', release_script.with_name('endpoint.py'), '--root', root]
+    for arg, key in (('--cert','cert'), ('--key','key')):
+        if settings.get(key): command.extend([arg, settings[key]])
+    if served['public_url']:
+        command.extend(['--public-url', served['public_url']])
+    if served['shape'] == 'plain-http-on-network':
+        command.append('--allow-plaintext-on-network')
+    return command
 
 
 def run(root, logs, config, port, stop_seconds):
@@ -251,13 +331,9 @@ def run(root, logs, config, port, stop_seconds):
                 raise RuntimeError('Dolt did not become ready within 30 seconds')
             release_script = Path(__file__).resolve()
             release_python = os.path.realpath(sys.executable)
-            command = [release_python, release_script.with_name('http_service.py'),
-                       '--state', settings.get('http_state', str(root/'http-state.json')),
-                       '--host', '127.0.0.1', '--port', port,
-                       '--backend', 'endpoint', '--endpoint-python', release_python,
-                       '--endpoint', release_script.with_name('endpoint.py'), '--root', root]
-            for arg, key in (('--cert','cert'), ('--key','key'), ('--public-url','public_url')):
-                if settings.get(key): command.extend([arg, settings[key]])
+            command = web_command(settings, root, port, release_python, release_script)
+            if listener(settings, port)['shape'] == 'plain-http-on-network':
+                print(PLAINTEXT_WARNING % (settings['http_host'], port), file=sys.stderr, flush=True)
             for proxy in settings.get('trusted_proxies', []):
                 command.extend(['--trusted-proxy', proxy])
             if settings.get('endpoint_timeout'):
@@ -285,9 +361,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=('prepare','run','health'))
     parser.add_argument('--root', required=True)
-    parser.add_argument('--config', help='private office service JSON (run)')
+    parser.add_argument('--config', help='private office service JSON (run; health, to ask the listener it configures)')
     parser.add_argument('--logs', help='log directory (run)')
-    parser.add_argument('--port', type=int, default=10000, help='HTTP loopback port')
+    parser.add_argument('--port', type=int, default=10000, help='HTTP port (on loopback unless the configuration says otherwise)')
     parser.add_argument('--db-port', type=int, default=13307, help='Dolt loopback port (prepare)')
     parser.add_argument('--stop-seconds', type=int, default=5)
     args = parser.parse_args(argv)
@@ -297,7 +373,7 @@ def main(argv=None):
             prepare(root, args.db_port)
             print('Prepared private runtime %s' % root)
         elif args.action == 'health':
-            line, code = health(root, args.port)
+            line, code = health(root, args.port, service_config(args.config) if args.config else None)
             print(line)
             return code
         else:

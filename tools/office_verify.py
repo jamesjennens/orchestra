@@ -38,6 +38,8 @@ def main(argv=None):
     parser.add_argument('--install-root', required=True)
     parser.add_argument('--root', required=True)
     parser.add_argument('--port', type=int, required=True)
+    parser.add_argument('--config', help='the private office service JSON, to ask the listener it configures '
+                                         '(without it: plain HTTP on 127.0.0.1)')
     args = parser.parse_args(argv)
     current = Path(args.install_root).expanduser().resolve()/'current'
     release = current.resolve(strict=True)
@@ -47,13 +49,17 @@ def main(argv=None):
     if (provenance['source_commit'] != manifest.get('source_commit') or
             provenance['build_id'] != manifest.get('build_id')):
         raise SystemExit('Installed release provenance does not match the manifest')
-    line, code = office_service.health(office_service.private_root(args.root), args.port)
+    settings = office_service.service_config(args.config) if args.config else None
+    served = office_service.listener(settings, args.port)
+    line, code = office_service.health(office_service.private_root(args.root), args.port, settings)
     record = {'schema_version': 1, 'release': manifest['build_id'],
               'source_commit': manifest['source_commit'],
               'kit_version': provenance['version'],
               'python': platform.python_version(),
               'system': platform.system(), 'machine': platform.machine(),
               'libc': platform.libc_ver(), 'health': line, 'health_exit': code,
+              'listener': {'shape': served['shape'], 'host': served['host'], 'port': served['port'],
+                           'public_url': served['public_url']},
               'bd': bundled_bd(office_service.private_root(args.root), kit)}
     print(json.dumps(record, sort_keys=True))
     return code or (0 if record['bd']['starts'] else 1)
