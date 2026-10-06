@@ -698,6 +698,8 @@ class InProcessBackend:
         actor = payload.get('actor') or principal.actor
         if author_key(actor) in (author_key(contribution['actor']), author_key(task.get('assignee'))):
             raise forbidden('Nobody recommends their own contribution')
+        if author_key(actor) in {author_key(view['author']) for view in self._standing_recommendations(task, records)}:
+            raise conflict(rec.ALREADY_RECOMMENDED % actor)
         record = {'id': 'rec_' + secrets.token_hex(6), 'task_id': task['id'], 'kind': 'recommendation',
                   'contribution_id': contribution['id'], 'commit': contribution['commit'],
                   'verdict': payload['verdict'], 'summary': summary.strip(), 'items': items, 'actor': actor,
@@ -1308,6 +1310,29 @@ class EndpointBackend:
     #: every problem with the record (kittrial-5bb.113), so it gets room for all of them.
     DETAIL_LIMIT = 200
     DETAIL_LIMITS = {'checkpoint': 6000}
+    #: The follow-on base refusal is handed on whole (kittrial-5bb.158): cut at 200 it lost the
+    #: reason, the recorder's name and what an operator must do.
+    BASE_REFUSAL_LIMIT = 1500
+
+    @classmethod
+    def _detail_limit(cls, action, said):
+        """How much of a canonical refusal's last line is handed on.
+
+        The larger limit is for the kit's own sentence only, never for a caller's text echoed
+        back at length: the line must BE the follow-on base refusal, whole, as
+        ``review_workflow.BASE_REFUSAL`` describes it (the kit's words, hexadecimal commit
+        ids, a recorder name of a constrained shape). Anything else keeps the limit it had.
+        """
+        if action == 'review' and cls.base_refusal(said) is not None:
+            return cls.BASE_REFUSAL_LIMIT            # the longest form of the sentence is well below it
+        return cls.DETAIL_LIMITS.get(action, cls.DETAIL_LIMIT)
+
+    @staticmethod
+    def base_refusal(said):
+        """The follow-on base refusal in ``said`` (a canonical refusal line), or None when it is not one, whole."""
+        from review_workflow import BASE_REFUSAL
+        text = said[len('ValueError: '):] if isinstance(said, str) and said.startswith('ValueError: ') else None
+        return text if text is not None and BASE_REFUSAL.fullmatch(text) else None
 
     @classmethod
     def _checked(cls, reply, action=None):
@@ -1332,8 +1357,8 @@ class EndpointBackend:
             cls._log_busy(action, stderr)
             raise busy()
         if code:
-            limit = cls.DETAIL_LIMITS.get(action, cls.DETAIL_LIMIT)
-            detail = stderr.strip().splitlines()[-1][:limit] if stderr.strip() else None
+            said = stderr.strip().splitlines()[-1] if stderr.strip() else None
+            detail = said[:cls._detail_limit(action, said)] if said else None
             if code == 2:
                 raise invalid('Canonical command rejected the request', detail)
             raise uncertain('Canonical command failed; outcome may be unknown')
@@ -2962,6 +2987,17 @@ class ApiHandler(BaseHTTPRequestHandler):
         return [name for name in (row.get('recommended_by') or []) + (row.get('recommended_unchecked') or [])
                 if isinstance(name, str)]
 
+    def _own_party_recommended(self, row, actor):
+        """Whether ``actor``'s own PERSON has already recommended the row's delivery (kittrial-5bb.154).
+
+        The one answer to "already recommended?" for an agent's actions and for My work: the
+        actor itself, the person who owns it, or another agent of that person. Independence
+        is by person everywhere else in the review rules, and a second agent of the same
+        person adds no independent reading. Read from every name on the row, counted or not.
+        """
+        names = self._every_recommender(row)
+        return len(self._independent(names, [actor])) != len(names)
+
     def _review_queue(self, project_id, shared=False):
         """One review-queue read of a project per request (and, when ``shared`` and the
         backend allows it, reused for ``READ_CACHE_SECONDS`` by the same principal).
@@ -4031,12 +4067,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                 kind, count, who = 'review-recommended', 'review_recommended', 'owner'
                 reason = ('A reviewer recommends approving this contribution. Tell your owner it is ready to '
                           'approve; an agent cannot approve.')
-            elif actor not in recommended_by and actor not in (row.get('recommended_unchecked') or []):
+            elif not self._own_party_recommended(row, actor):
                 kind, count, who = 'to-review', 'to_review', 'agent'
                 reason = ('A contribution by someone else awaits review. Review it, then record a recommendation '
                           'or request changes.')
             else:
-                continue                      # this agent has recommended it already (see _independent_queue)
+                continue                      # this agent's person has recommended it already
             counts[count] += 1
             contribution = row.get('contribution') if isinstance(row.get('contribution'), dict) else {}
             actions.append(self._agent_action(
@@ -4938,6 +4974,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if not self._independent([actor], parties) or \
                         not self._independent([ctx.principal.user_id], parties):
                     raise forbidden(self.NOT_INDEPENDENT)
+                # One standing recommendation for a contribution from each PERSON
+                # (kittrial-5bb.154): a second one, by the same actor or by another agent of
+                # the same person, is refused and nothing is stored. Read from the brief, so
+                # it is every standing one, whether or not this service counts it.
+                standing = [entry.get('author') for entry in (current.get('review') or {}).get('recommendations') or []
+                            if isinstance(entry, dict) and isinstance(entry.get('author'), str)]
+                own = [name for name in standing if not self._independent([name], [actor, ctx.principal.user_id])]
+                if own:
+                    shown = self.service.actor_names(own[:1]).get(own[0]) or own[0]
+                    raise conflict(self.ALREADY_RECOMMENDED % shown, {'recommended_by': own[0]})
             if payload.get('operation') == 'respond':
                 # Only the task's assignee (the contributor of the current revision)
                 # may respond to requested changes. Both backends enforce it at the
@@ -4961,10 +5007,21 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if recommending and refusal.status == 422 and isinstance(refusal.detail, str) \
                         and refusal.detail.startswith('ValueError: '):
                     raise invalid(refusal.detail[len('ValueError: '):], refusal.detail) from None
+                # So does a refused follow-on base (kittrial-5bb.158): the sentence says which
+                # base is acceptable, why this one is not and what an operator does about it.
+                sentence = EndpointBackend.base_refusal(refusal.detail) if refusal.status == 422 else None
+                if sentence is not None:
+                    raise invalid(sentence, refusal.detail) from None
                 raise
             return result, result
         return self._mutate(ctx, 'reviews.add', ctx.params['pid'], add, status=201,
                             capability=capability, serialize=False, canonical=True)
+
+    #: Said to somebody whose own party (themselves, their owner, their owner's other agent)
+    #: has a standing recommendation for the contribution. It names the two ways on from there.
+    ALREADY_RECOMMENDED = ('%s has already recommended this contribution, and that recommendation stands until the '
+                           'contribution is revised or decided. To ask for changes instead, request changes: the '
+                           'recommendation then stops counting. A recommendation cannot be withdrawn.')
 
     #: Every field a recommendation may carry over HTTP (``task_id`` is set by the route).
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/history')
@@ -5058,8 +5115,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             # read from every name on the row, counted or not (kittrial-5bb.147).
             reviewable = {i.get('id') for i in items if CAP_REVIEWS in capabilities
                           and self._independent([actor], [i.get('assignee'), i.get('contribution_author')])
-                          and len(self._independent(self._every_recommender(i), [actor]))
-                          == len(self._every_recommender(i))}
+                          and not self._own_party_recommended(i, actor)}
             classified.append(agent_prompts.classify(project, capabilities, items,
                                                      actor, blocked, now, names, reviewable))
             for item in items:

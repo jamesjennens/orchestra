@@ -26,8 +26,11 @@ written after it. Anything else is ignored. So a raw comment posted on a kit tha
 reserve the prefix can never display as a recommendation unless it would have been
 accepted here.
 
-There is no operator void for a recommendation: a wrong one lapses at the next decision
-or revision, and the same reviewer can replace it (the newest by one actor wins).
+There is no operator void and no withdrawal for a recommendation: a wrong one lapses at
+the next decision or revision. While one stands, the same actor's second one for that
+contribution is refused (kittrial-5bb.154); a reviewer who wants changes instead requests
+changes, which makes it lapse. Two standing ones by one actor, stored by an earlier kit,
+are read as the newest.
 """
 import json
 import re
@@ -160,14 +163,27 @@ def _view(payload, comment):
             'summary': payload['summary'], 'items': [dict(item) for item in payload['items']]}
 
 
+#: Said to an actor who has a standing recommendation for the contribution and sends another.
+#: It names the two ways on from there; there is no third.
+ALREADY_RECOMMENDED = ('%s has already recommended this contribution, and that recommendation stands until the '
+                       'contribution is revised or decided. To ask for changes instead, request changes: the '
+                       'recommendation then stops counting. A recommendation cannot be withdrawn.')
+
+
 def standing(issue, state):
-    """The recommendations that stand for the task's current contribution, newest first.
+    """The recommendations a read shows for the task's current contribution: the newest READ_MAX."""
+    return [_view(payload, comment) for _, payload, comment in _standing(issue, state)[:READ_MAX]]
+
+
+def _standing(issue, state):
+    """Every recommendation that stands for the task's current contribution, newest first.
 
     ``state`` is the task's review projection (``review_workflow.project``). A
     recommendation stands when the task is open, its review reads awaiting-review, the
     record names the current contribution and its commit, it was written after that
     contribution by someone other than its author, and no decision on the contribution
-    was written after it. One per author (the newest), at most READ_MAX.
+    was written after it. One per author (the newest: since kittrial-5bb.154 a second one
+    by the same actor is refused when written, and records from before are read this way).
 
     The task's assignee is refused when the record is WRITTEN, not here: the reader
     sees only who is assigned now, and a task reassigned to someone who had already
@@ -210,8 +226,7 @@ def standing(issue, state):
         if key in excluded:
             continue
         newest[key] = (position, payload, comment)        # native order: a later one replaces an earlier one
-    ordered = sorted(newest.values(), key=lambda entry: entry[0], reverse=True)[:READ_MAX]
-    return [_view(payload, comment) for _, payload, comment in ordered]
+    return sorted(newest.values(), key=lambda entry: entry[0], reverse=True)
 
 
 def block(issue, state):
@@ -265,6 +280,11 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None):
             or key == review_workflow.author_key(issue.get('assignee')):
         raise ValueError('Nobody recommends their own contribution: %s is its author or the task\'s assignee'
                          % actor)
+    # One standing recommendation for a contribution from each actor (kittrial-5bb.154). A
+    # second one was stored and replaced the first in every reading, so the history said
+    # more than any reader did. Every standing one is looked at, not only those a read shows.
+    if key in {review_workflow.author_key(comment['author']) for _, _, comment in _standing(issue, state)}:
+        raise ValueError(ALREADY_RECOMMENDED % actor)
     result = json.loads(run(['comments', 'add', task, PREFIX + canonical_bytes(payload).decode(), '--json']))
     comment = {'id': result['id'], 'text': PREFIX + canonical_bytes(payload).decode(), 'author': actor,
                'created_at': result.get('created_at')}
