@@ -228,10 +228,102 @@ class RefusedAuthorityMergeTests(RuntimeCase):
                           'not_listed_here': ['verifier-recorded']}})
         self.assertEqual(self.marker.read_bytes(), before)                      # read only
         self.assertFalse((self.root / admin.REVIEW_WRITES_LOCK).exists())       # takes no lock
-        # A project with no complete sidecar records nothing.
-        stdout, _, code = self.run_admin('backup-authority', 'gamma')
-        self.assertEqual((code, json.loads(stdout)['sidecar'], json.loads(stdout)['operators']['recorded']),
-                         (0, None, []))
+
+    def cli(self, *argv):
+        """admin.py as the command line runs it (run_main): a refusal is rc 1 and one line."""
+        stdout, stderr = io.StringIO(), io.StringIO()
+        code = 0
+        with patch.object(sys, 'argv', ['admin.py', '--root', str(self.root), *argv]), \
+                patch.object(admin, 'root_path', return_value=self.root), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                admin.run_main()
+            except SystemExit as exit:
+                code = exit.code if isinstance(exit.code, int) else 1
+                if isinstance(exit.code, str):
+                    stderr.write(exit.code)
+        return stdout.getvalue(), stderr.getvalue(), code
+
+    def test_backup_authority_tells_no_backup_damage_and_legacy_apart(self):
+        # kittrial-5bb.145: these three all read `sidecar: null`, empty lists, rc 0.
+        bundle = self.root / 'backups' / 'alpha.coordination.json'
+        fallback = self.root / 'backups' / 'alpha.coordination.last-complete.json'
+        # 1. A name with no backup: refused, rc 1, nothing on stdout.
+        stdout, stderr, code = self.cli('backup-authority', 'gamma')
+        self.assertEqual((code, stdout), (1, ''), stderr)
+        self.assertIn('No such backup: backups/gamma does not exist', stderr)
+        # 2. Both copies damaged: refused, each copy named with why, and the lists untrusted.
+        record = bundle.read_text(encoding='utf-8')
+        bundle.write_text('{"schema_version": 1, "status": "complete", "files"', encoding='utf-8')
+        fallback.write_text(json.dumps({'schema_version': 1, 'status': 'pending', 'files': {}}), encoding='utf-8')
+        stdout, stderr, code = self.cli('backup-authority', 'alpha')
+        self.assertEqual((code, stdout), (1, ''), stderr)
+        self.assertIn('The coordination sidecar of backup alpha is damaged: '
+                      'backups/alpha.coordination.json: it is not valid JSON; '
+                      'backups/alpha.coordination.last-complete.json: its status is "pending", not complete. '
+                      'What this backup records cannot be read, so no operator or verifier list from it can '
+                      'be trusted.', stderr)
+        # Only one copy, damaged: the same refusal, naming that copy alone.
+        fallback.unlink()
+        bundle.write_text(json.dumps(['not', 'a', 'sidecar']), encoding='utf-8')
+        _, stderr, code = self.cli('backup-authority', 'alpha')
+        self.assertEqual(code, 1)
+        self.assertIn('damaged: backups/alpha.coordination.json: it is not a coordination sidecar of schema 1. ', stderr)
+        # A damaged canonical copy with a usable fallback: the fallback's lists, and the
+        # passed-over copy named.
+        fallback.write_text(record, encoding='utf-8')
+        stdout, stderr, code = self.cli('backup-authority', 'alpha')
+        self.assertEqual(code, 0, stderr)
+        result = json.loads(stdout)
+        self.assertEqual(result['sidecar'], 'backups/alpha.coordination.last-complete.json')
+        self.assertEqual(result['operators']['recorded'], ['ops-recorded', 'ops-second'])
+        self.assertEqual(result['unusable'], [{'copy': 'backups/alpha.coordination.json',
+                                               'problem': 'it is not a coordination sidecar of schema 1'}])
+        self.assertNotIn('note', result)
+        # 3. No sidecar at all: a legacy backup, rc 0, and said so.
+        bundle.unlink()
+        fallback.unlink()
+        stdout, stderr, code = self.cli('backup-authority', 'alpha')
+        self.assertEqual(code, 0, stderr)
+        result = json.loads(stdout)
+        self.assertEqual((result['sidecar'], result['operators']['recorded'], result['verifiers']['recorded']),
+                         (None, [], []))
+        self.assertIn('legacy backup', result['note'])
+        self.assertNotIn('unusable', result)
+
+    def test_backup_authority_checks_the_name_before_anything_else(self):
+        # An invalid name is refused as a name, not reported as a missing backup.
+        for name in ('Alpha', '../projects', 'a'):
+            with self.subTest(name=name):
+                _, stderr, code = self.cli('backup-authority', name)
+                self.assertEqual(code, 1)
+                self.assertIn('Project: 2-24 lowercase letters/digits', stderr)
+                self.assertNotIn('No such backup', stderr)
+
+    def test_merge_authority_refuses_an_invalid_name_with_nothing_changed(self):
+        before = self.marker.read_bytes()
+        for operators, verifiers, label in ((['ok-op', 'bad name'], [], 'Invalid operator identity'),
+                                            ([], ['ok-ver', 'bad;name'], 'Invalid verifier identity'),
+                                            (['-leading'], ['ok'], 'Invalid operator identity')):
+            with self.subTest(operators=operators, verifiers=verifiers):
+                with self.assertRaisesRegex(ValueError, label):
+                    admin.merge_authority(self.root, operators, verifiers)
+        self.assertEqual(self.marker.read_bytes(), before)
+
+    def test_restore_coordination_called_directly_prints_the_warning(self):
+        (self.root / 'projects' / 'beta').mkdir()
+        holder = self.hold_lock()
+        err = io.StringIO()
+        try:
+            with patch.object(admin, 'DEPLOYMENT_LOCK_WAIT_SECONDS', 0), contextlib.redirect_stderr(err), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertTrue(admin.restore_coordination(self.root, 'alpha', 'beta', restore_operators=True,
+                                                           restore_verifiers=True))
+        finally:
+            self.release(holder)
+        self.assertIn('WARNING: the restore is complete, but deployment authority the backup records was NOT '
+                      're-granted: operators (--restore-operators): ops-recorded, ops-second; verifiers '
+                      '(--restore-verifiers): verifier-recorded.', err.getvalue())
 
     def test_a_legacy_backup_does_not_run_the_authority_step(self):
         (self.root / 'backups' / 'alpha.coordination.json').unlink()

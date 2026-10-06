@@ -2547,13 +2547,25 @@ def complete_sidecar(path):
     return None: every caller treats "not proven complete" as unusable rather than
     guessing, so a half-written or still-``pending`` marker is never restored from.
     """
-    path=Path(path)
-    if path.is_symlink() or not path.is_file():return None
-    try:data=json.loads(path.read_text(encoding='utf-8'))
-    except (OSError,ValueError):return None
-    if not isinstance(data,dict) or data.get('schema_version')!=1 or data.get('status')!='complete':
-        return None
+    data,_=read_sidecar(path)
     return data
+
+def read_sidecar(path):
+    """``(record, None)`` for a complete coordination sidecar, else ``(None, problem)``.
+
+    ``problem`` is None when the copy is absent and otherwise says why it cannot be used,
+    for ``backup-authority`` (kittrial-5bb.145); ``complete_sidecar`` keeps only the record.
+    """
+    path=Path(path)
+    if path.is_symlink():return None,'it is a symlink'
+    if not path.exists():return None,None
+    if not path.is_file():return None,'it is not a regular file'
+    try:data=json.loads(path.read_text(encoding='utf-8'))
+    except OSError as error:return None,'it cannot be read (%s)'%error.__class__.__name__
+    except ValueError:return None,'it is not valid JSON'
+    if not isinstance(data,dict) or data.get('schema_version')!=1:return None,'it is not a coordination sidecar of schema 1'
+    if data.get('status')!='complete':return None,'its status is %s, not complete'%json.dumps(data.get('status'))
+    return data,None
 
 def native_backup_manifest(directory):
     """``(manifest, None)`` for a native backup directory, or ``(None, reason)``.
@@ -3922,16 +3934,37 @@ def backup_authority(root,source):
     last-complete copy). For each list: what the backup records, what this installation
     lists now, and the recorded entries it does not list, which ``--restore-operators`` /
     ``--restore-verifiers`` (or ``operators add`` / ``verifiers add``) would re-grant.
+
+    Three cases that once all read as empty lists are told apart (kittrial-5bb.145): a name
+    with no backup is refused; a backup whose sidecar copies exist but none is usable is
+    refused, naming each copy and why; a backup with no sidecar at all says so in ``note``.
+    A copy passed over for the fallback is listed in ``unusable``.
     """
     validate_name(source)
-    path,_=coordination_sidecar_source(root,source)
+    if not (root/'backups'/source).is_dir():
+        raise ValueError('No such backup: backups/%s does not exist. Check the project name '
+                         '(`backup-status` lists the backups this installation has).'%source)
+    copies=[root/'backups'/(source+'.coordination.json'),last_complete_sidecar_path(root,source)]
+    problems=[(copy,read_sidecar(copy)[1]) for copy in copies]
+    path,_=coordination_sidecar_source(root,source) if not any(problem=='it is a symlink' for _,problem in problems) else (None,None)
+    damaged=[(copy,problem) for copy,problem in problems if problem]
+    if path is None and damaged:
+        raise ValueError('The coordination sidecar of backup %s is damaged: %s. What this backup records '
+                         'cannot be read, so no operator or verifier list from it can be trusted.'
+                         %(source,'; '.join('%s: %s'%(copy.relative_to(root).as_posix(),problem) for copy,problem in damaged)))
     def compare(recorded,listed):
         return {'recorded':recorded,'listed_here':sorted(listed),
                 'not_listed_here':[item for item in recorded if item not in listed]}
-    return {'project':source,
-            'sidecar':None if path is None else str(path.relative_to(root)),
+    result={'project':source,
+            'sidecar':None if path is None else path.relative_to(root).as_posix(),
             'operators':compare(coordination_operators(root,source),operators(root)),
             'verifiers':compare(coordination_verifiers(root,source),verifiers(root))}
+    if damaged:
+        result['unusable']=[{'copy':copy.relative_to(root).as_posix(),'problem':problem} for copy,problem in damaged]
+    if path is None:
+        result['note']=('This backup has no coordination sidecar (a legacy backup): it records no operators '
+                        'or verifiers.')
+    return result
 
 def record_store_path(state):
     """The HTTP record store beside the service state document (``http_auth.Store``)."""
