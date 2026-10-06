@@ -118,6 +118,13 @@ class PortTakenTests(unittest.TestCase):
         for status in (None, 0, 1, 2, -9):
             self.assertEqual(office_service.child_exit_reason(status, {}, 8443), 'A supervised child exited; inspect service logs')
 
+    def test_the_supervisors_loop_uses_that_sentence(self):
+        """The loop itself runs only on a real host (smoke180.py on koopa); here, that it asks for the reason."""
+        source = (KIT / 'office_service.py').read_text(encoding='utf-8')
+        loop = source[source.index('def run(root, logs, config, port, stop_seconds):'):]
+        self.assertIn('raise RuntimeError(child_exit_reason(web.poll(), settings, port))', loop)
+        self.assertNotIn("raise RuntimeError('A supervised child exited", loop)
+
 
 if __name__ == '__main__':
     unittest.main()
