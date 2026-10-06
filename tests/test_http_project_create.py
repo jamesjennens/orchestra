@@ -981,7 +981,19 @@ class ScreenTests(Case):
         self.assertEqual((seen['yours']['links'], seen['yours']['nameError'], seen['yours']['went']), (['#/p/alpha'], '', []))
         # Each entry of the superuser's list is named in words, a file that is no record too (kittrial-5bb.156).
         (self.canonical_root / 'project-creations' / 'UPPER.json').write_text('{}', encoding='utf-8')
-        chips = {name: (state, text) for name, state, text in self.run_page(node, 'chips')['chips']}
+        # And alpha is retired on the host (review of kittrial-5bb.156): what retire-project leaves.
+        import shutil
+        (self.canonical_root / 'retired').mkdir(exist_ok=True)
+        shutil.move(str(self.canonical_root / 'projects' / 'alpha'),
+                    str(self.canonical_root / 'retired' / 'alpha-20261006T101500Z'))
+        self.assertEqual(200, self.grant('olive', limit=9).status)       # so that she is offered the form again
+        seen = self.run_page(node, 'chips')
+        self.assertFalse(seen['retired']['shown'])                       # no "You already have" notice
+        self.assertRegex(seen['retired']['nameError'], r'^You created project alpha on this server on \d{4}-\d\d-\d\d, and '
+                         r'it has since been retired there, so it is no longer served\. The name is not available: '
+                         r'choose another name\.$')
+        self.assertEqual((seen['retired']['links'], seen['retired']['went']), ([], []))
+        chips = {name: (state, text) for name, state, text in seen['chips']}
         self.assertEqual({name: state for name, (state, _) in chips.items()}, {'UPPER': 'not-a-record', 'beta': 'incomplete'})
         self.assertIn('Not a creation record', chips['UPPER'][1])
         self.assertNotIn('not-a-record', chips['UPPER'][1])
@@ -1712,6 +1724,7 @@ class HeldLockTests(Case):
         retired.parent.mkdir(exist_ok=True)
         shutil.move(str(self.canonical_root / 'projects' / 'alpha'), str(retired))
         self.assertTrue(self.backend.retired_on_host('alpha'))
+        self.assertFalse(self.backend.retired_on_host('gamma'))             # another name, never on the host
         sentence = ('You created project alpha on this server on %s, and it has since been retired there, so it is no '
                     'longer served. The name is not available: choose another name.' % day)
         again_in = self.login('olive', 'olive-password-1')[0]
@@ -1740,13 +1753,6 @@ class HeldLockTests(Case):
         import admin
         with patch.object(admin, 'retired_entries', side_effect=PermissionError(13, 'Permission denied')):
             self.assertFalse(self.backend.retired_on_host('beta'))
-
-    def test_the_page_shows_the_retired_sentence_on_the_name_and_links_nothing(self):
-        source = (KIT / 'web' / 'js' / 'views' / 'work.js').read_text(encoding='utf-8')
-        # The notice with its link is for the state "yours" alone; every other 409 goes to the name's field.
-        self.assertEqual(source.count("e.detail.state === 'yours'"), 1)
-        self.assertNotIn("'retired'", source)
-        self.assertIn("if (e.status === 422 || e.status === 409 || e.status === 403) { setFieldError(form, 'new_project_id', e.message); return true; }", source)
 
     def test_the_digest_of_the_creating_request_is_in_no_view(self):
         created = self.create(self.olive, 'alpha', key='create-alpha-1')

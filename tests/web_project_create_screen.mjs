@@ -96,6 +96,14 @@ if (phase === 'create') {
   // The superuser's list names what each entry is, in words.
   const list = await work.incompleteCreations(who.admin);
   out.chips = list.all((e) => e.attributes['data-creation']).map((e) => [e.attributes['data-creation'], e.attributes['data-state'], e.textContent.slice(0, 200)]);
+  // "alpha" has been retired on the host meanwhile: its creator is told so on the name, with no notice and no link.
+  const session = await who.olive.api.current();
+  const form = work.hostCreatePanel(who.olive, session.project_host_create).querySelector('form');
+  form.querySelector('#new_project_id').value = 'alpha';
+  await form.dispatch('submit');
+  const notice = form.querySelector('#host-create-yours');
+  out.retired = { shown: !notice.hidden, links: form.all((e) => e.tagName === 'A').map((a) => a.attributes.href),
+    nameError: fieldError(form, 'new_project_id'), went: who.olive.went.slice() };
 } else {
   // The server stops half way through creating "beta".
   const session = await who.olive.api.current();

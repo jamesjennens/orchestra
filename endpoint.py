@@ -372,9 +372,9 @@ def configuration_fault(root,error):
     gone while the service runs).
     """
     if isinstance(error,ConfigurationUnreadable):return True
-    if not isinstance(error,OSError) or isinstance(error,TimeoutError) or not error.filename:return False
+    if not isinstance(error,OSError) or isinstance(error,TimeoutError):return False
     try:return Path(os.fsdecode(error.filename))==Path(root)/'deployment.private.json'
-    except (TypeError,ValueError):return False       # a descriptor, not a name
+    except (TypeError,ValueError):return False       # it names no file, or a descriptor
 
 def execute(root,request,authority_config=None,require_authority=False):
     # Two actions exist only for the web service and name no existing project
