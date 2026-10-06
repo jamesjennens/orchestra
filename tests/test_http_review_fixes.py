@@ -4742,5 +4742,150 @@ class RecordStoreMissingPathCase(unittest.TestCase):
         self.assertTrue(after['suspect'])
 
 
+class FollowOnBaseRefusalOverHttpCase(EndpointCase):
+    """kittrial-5bb.158: the follow-on base refusal reaches an HTTP caller whole.
+
+    The service hands a canonical refusal on up to 200 characters. Cut there, this sentence
+    ended "...(a passed integrated fact on": the reason, the recorder's name and what an
+    operator must do never arrived.
+    """
+
+    MERGE_1, MERGE_2, OTHER = 'e1' * 20, 'e2' * 20, 'd' * 40
+
+    def reviews(self, project, task):
+        return '/v1/projects/%s/tasks/%s/reviews' % (project, task)
+
+    def delivered(self, alex, bea, project, title, commit, merge, recorder='old-coordinator'):
+        """A task delivered by alex's account, approved by bea, and integrated at ``merge`` by ``recorder``."""
+        task = self.create_task(alex, project, title).data['id']
+        self.assertEqual(200, self.request('POST', '/v1/projects/%s/tasks/%s/claim' % (project, task), {}, token=alex).status)
+        body = dict(CONTRIBUTION, commit=commit, operation='contribute', schema_version=1,
+                    operation_id='op-' + secrets.token_hex(6), previous=None)
+        made = self.request('POST', self.reviews(project, task), body, token=alex)
+        self.assertEqual(201, made.status, made.data)
+        contribution = made.data['comment_id']
+        approved = self.request('POST', self.reviews(project, task), {
+            'operation': 'approve', 'schema_version': 1, 'operation_id': 'op-' + secrets.token_hex(6),
+            'previous': contribution, 'contribution': contribution, 'summary': 'accepted'}, token=bea)
+        self.assertEqual(201, approved.status, approved.data)
+        self.integrate(task, commit, merge, recorder)
+        return task, contribution
+
+    def integrate(self, task, commit, merge, recorder):
+        """The lifecycle action's own writes (a scope, then integrated=passed), on the stub's store.
+
+        The strict stub has no ``set-state``; the kit's ``lifecycle.apply_native`` runs here
+        against the stub's rows, as tests/test_follow_on_contributions.py runs it in memory.
+        """
+        from lifecycle import apply_native
+        from requirements import content_hash
+        path = self.canonical_root / 'canonical.json'
+        state = json.loads(path.read_text(encoding='utf-8'))
+        rows = state['rows']
+        issue = next(row for row in rows if row['id'] == task)
+        stamp = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+        def run(args):
+            if args == ['export', '--all']:
+                return ''.join(json.dumps(row) + '\n' for row in rows)
+            assert args[0] == 'set-state', args
+            dimension, new = args[2].split('=', 1)
+            old = next((label.split(':', 1)[1] for label in issue.get('labels') or [] if label.startswith(dimension + ':')), None)
+            issue['labels'] = [label for label in issue.get('labels') or [] if not label.startswith(dimension + ':')]                 + [dimension + ':' + new]
+            event_id = '%s.%d' % (task, len(rows))
+            description = (('Set ' if old is None else 'Changed ') + dimension
+                           + (' to ' if old is None else ' from ' + old + ' to ') + new
+                           + '\n\nReason: ' + args[args.index('--reason') + 1])
+            rows.append(dict(_type='issue', id=event_id, issue_type='event', title='State change: ' + dimension + ' → ' + new,
+                             description=description, status='closed', created_by=recorder, created_at=stamp,
+                             dependencies=[dict(issue_id=event_id, depends_on_id=task, type='parent-child')]))
+            return json.dumps(dict(changed=True, dimension=dimension, event_id=event_id, new_value=new))
+        scope = {'source_commit': commit, 'integration_commit': merge, 'release_id': '', 'environment': ''}
+        fact = dict(schema_version=1, task=task, scope=scope, evidence=['commit:' + commit], provenance='performed',
+                    actor=recorder)
+        for dimension, value in (('lifecycle-scope', content_hash(scope)), ('integrated', 'passed')):
+            apply_native(dict(fact, operation_id='op-' + secrets.token_hex(6), dimension=dimension, value=value), recorder, run)
+        path.write_text(json.dumps(state), encoding='utf-8')
+
+    def scenario(self):
+        import time
+        admin = self.admin_token()
+        alex, project = self.setup_project()
+        bea_id = self.create_account(admin, 'bea', 'bea-password-1')
+        added = self.request('PUT', '/v1/projects/%s/members/%s' % (project, bea_id), {'role': 'owner'}, token=admin)
+        self.assertIn(added.status, (200, 201), added.data)
+        bea = self.login('bea', 'bea-password-1')[0]
+        first, contribution = self.delivered(alex, bea, project, 'first', COMMIT, self.MERGE_1)
+        time.sleep(1.1)                                    # the tracker stamps whole seconds
+        self.delivered(alex, bea, project, 'second', 'f' * 40, self.MERGE_2)
+        return alex, project, first, contribution
+
+    def follow(self, alex, project, task, contribution, base):
+        latest = self.request('GET', '/v1/projects/%s/tasks/%s/brief' % (project, task), token=alex).data['review']['latest_id']
+        body = dict(CONTRIBUTION, commit=self.OTHER, base_commit=base, operation='contribute', schema_version=1,
+                    operation_id='op-' + secrets.token_hex(6), previous=latest, supersedes=None, follows=contribution)
+        return self.request('POST', self.reviews(project, task), body, token=alex)
+
+    def test_an_accounts_follow_on_is_told_the_reason_the_recorder_and_both_remedies(self):
+        alex, project, task, contribution = self.scenario()
+        refused = self.follow(alex, project, task, contribution, self.MERGE_2)
+        self.assertEqual(422, refused.status, refused.data)
+        sentence = (
+            'Contribution base_commit must be the prior integration commit %s, or an integration commit this project '
+            'recorded after it (a passed integrated fact on any task, recorded by a listed operator, not reverted); none '
+            'is recorded yet. %s is not accepted: it was recorded as an integration commit by "old-coordinator", who is '
+            'not a listed operator of this installation. Integrations must be recorded by a listed operator for a later '
+            'base to count: an operator adds the recorder (admin.py operators add) or records the integration'
+            % (self.MERGE_1, self.MERGE_2))
+        self.assertGreater(len(sentence), 200)
+        error = refused.data['error']
+        # The sentence is the message, as for a refused recommendation, and the detail is the canonical line, whole.
+        self.assertEqual((error['message'], error['detail']), (sentence, 'ValueError: ' + sentence))
+        # The other reasons arrive whole too.
+        never = self.follow(alex, project, task, contribution, '9' * 40)
+        self.assertEqual(422, never.status, never.data)
+        self.assertTrue(never.data['error']['message'].endswith(
+            '%s is not accepted: this project has no passed integrated fact that names it as an integration commit'
+            % ('9' * 40)), never.data)
+        # And the exact prior commit is accepted, whoever recorded it.
+        self.assertEqual(201, self.follow(alex, project, task, contribution, self.MERGE_1).status)
+
+    def test_the_larger_limit_is_for_the_kits_own_sentence_only(self):
+        """Never for text a caller supplied, echoed back at length."""
+        import review_workflow
+        limit = EndpointBackend._detail_limit
+        whole = 'ValueError: ' + review_workflow.BASE_RULE % (
+            self.MERGE_1, review_workflow.BASE_NONE_YET, self.MERGE_2,
+            review_workflow.BASE_WHY_UNLISTED % '"old-coordinator"')
+        self.assertEqual(limit('review', whole), 1500)
+        for label, line in (
+                ('another refusal of the review action', 'ValueError: ' + 'x' * 900),
+                ('the sentence with more after it', whole + ' and then some'),
+                ('the sentence after other text', 'ValueError: see ' + whole[len('ValueError: '):]),
+                ('a commit that is not one', whole.replace(self.MERGE_2, 'not a commit <b>' + 'y' * 300)),
+                ('a recorder that is not a plain name', whole.replace('"old-coordinator"', '"x\x1b[31m y"')),
+                ('a recorder longer than a name may be', whole.replace('"old-coordinator"', '"%s"' % ('n' * 81))),
+                ('the sentence without the error name', whole[len('ValueError: '):]),
+                ('nothing', None)):
+            with self.subTest(line=label):
+                self.assertEqual(limit('review', line), 200)
+        self.assertEqual(limit('review', 'ValueError: ' + 'a' * 2000), 200)
+        # The longest form the sentence can take (the longest ids, a newest commit, the longest name) fits.
+        longest = 'ValueError: ' + review_workflow.BASE_RULE % (
+            'a' * 64, review_workflow.BASE_NEWEST % ('b' * 64), 'c' * 64,
+            review_workflow.BASE_WHY_UNLISTED % ('"%s"' % ('n' * 80)))
+        self.assertLess(len(longest), 1500)
+        self.assertEqual(limit('review', longest), 1500)
+        # The sentence from another action keeps that action's limit.
+        self.assertEqual((limit('bd', whole), limit('checkpoint', whole)), (200, 6000))
+        # What is handed on is cut at the limit that applies: a long line of another kind arrives at 200.
+        with self.assertRaises(HttpError) as cut:
+            EndpointBackend._checked({'returncode': 2, 'stdout': '', 'stderr': 'ValueError: ' + 'x' * 900 + '\n'}, 'review')
+        self.assertEqual(len(cut.exception.detail), 200)
+        with self.assertRaises(HttpError) as kept:
+            EndpointBackend._checked({'returncode': 2, 'stdout': '', 'stderr': whole + '\n'}, 'review')
+        self.assertEqual(kept.exception.detail, whole)
+
+
 if __name__ == '__main__':
     unittest.main()
