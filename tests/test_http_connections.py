@@ -351,24 +351,150 @@ class SilentConnectionTests(Case):
         self.assertEqual((self.httpd.turned_away, self.httpd.cut_off), (0, 0))
         self.assertEqual((self.httpd._serving, self.httpd._begun), ({}, set()))
 
+    def counted(self, connections, within=30):
+        """Wait until the server has counted that many connections; they are counted one by one, as accepted."""
+        until = time.monotonic() + within
+        while time.monotonic() < until and self.httpd.open_connections() != connections:
+            time.sleep(0.02)
+        self.assertEqual(self.httpd.open_connections(), connections)
+
     def test_connections_beyond_the_limit_are_closed_at_once_and_the_limit_frees_itself(self):
+        """No step of this test races a deadline (kittrial-5bb.175). It used to hold the five on a server that
+        cuts clients off after 2 s and gave the one accepting thread 3 s to have counted them all: on a starved
+        machine the first were cut off before the fifth was counted, and it failed in CI with "4 != 5"."""
         logged = io.StringIO()
         with contextlib.redirect_stderr(logged):
-            self.serve(client_seconds=2.0, connection_limit=5)
+            self.serve(client_seconds=30, connection_limit=5)     # nothing is cut off while the limit is looked at
             held = [self.silent() for _ in range(5)]
-            until = time.monotonic() + 3
-            while time.monotonic() < until and self.httpd.open_connections() < 5:
-                time.sleep(0.02)
-            self.assertEqual(self.httpd.open_connections(), 5)
+            self.counted(5)
             for _ in range(3):
                 extra = self.silent()
-                self.assertLess(self.closed_by_the_server(extra, 1.0), 1.0)      # at once, not after the deadline
-            self.assertEqual((self.httpd.turned_away, self.httpd.cut_off), (3, 0))
+                self.assertLess(self.closed_by_the_server(extra, 10.0), 10.0)    # at once, not after the 30 s deadline
+            self.assertEqual((self.httpd.turned_away, self.httpd.cut_off, self.httpd.open_connections()), (3, 0, 5))
+            # A place comes back when its client goes...
+            held.pop().close()
+            self.counted(4)
+            held.append(self.silent())
+            self.counted(5)
+            extra = self.silent()
+            self.assertLess(self.closed_by_the_server(extra, 10.0), 10.0)
             for connection in held:
-                self.closed_by_the_server(connection, 5)
-            self.settled()
-            self.served(within=1.5)
+                connection.close()
+            self.counted(0)
+            # ...and by itself when its client stays and says nothing: the service cuts it off.
+            self.httpd.client_seconds = 1.0
+            silent = [self.silent() for _ in range(5)]
+            for connection in silent:
+                self.closed_by_the_server(connection, 30)
+            self.counted(0)
+            self.assertEqual((self.httpd.turned_away, self.httpd.cut_off), (4, 5))
+            self.httpd.client_seconds = 30
+            self.served(within=10)
         self.assertEqual(logged.getvalue().count('connections: the limit of 5 open connections was reached'), 1)
+
+    def test_the_bound_holds_and_no_place_is_lost_while_threads_are_slow_to_start(self):
+        """A connection is counted when it is accepted, before its thread exists; the reaper never frees the
+        place of a thread that is starting. So with every thread slow to start: never more than the bound open,
+        every connection beyond it closed, and every place back when the clients have gone."""
+        self.serve(client_seconds=30, connection_limit=4)
+        at_start = []
+        server = self.httpd
+
+        class SlowToBeMarkedStarted(threading.Thread):
+            def _set_ident(self):
+                super()._set_ident()
+                at_start.append(server.open_connections())
+                time.sleep(server.REAP_EVERY * 2)
+        logged = io.StringIO()
+        with contextlib.redirect_stderr(logged):
+            with mock.patch.object(http_service.threading, 'Thread', SlowToBeMarkedStarted):
+                clients = [self.silent() for _ in range(12)]     # all connected at once: they wait in the backlog
+                peak, until = 0, time.monotonic() + 60
+                while time.monotonic() < until and self.httpd.turned_away < 8:
+                    peak = max(peak, self.httpd.open_connections())
+                    time.sleep(0.005)
+                self.assertEqual((self.httpd.turned_away, self.httpd.open_connections()), (8, 4))
+                self.assertEqual((peak, max(at_start), len(at_start)), (4, 4, 4))
+                closed = 0
+                for connection in clients:
+                    connection.settimeout(0.5)
+                    try:
+                        closed += connection.recv(1) == b''
+                    except socket.timeout:
+                        pass                                      # one of the four that are being served
+                    except OSError:
+                        closed += 1
+                self.assertEqual(closed, 8)
+                for connection in clients:
+                    connection.close()
+                self.counted(0)
+            self.assertEqual((self.httpd._serving, self.httpd._begun, self.httpd.cut_off), ({}, set(), 0))
+            # Every place is there again, and the bound is the bound.
+            again = [self.silent() for _ in range(4)]
+            self.counted(4)
+            extra = self.silent()
+            self.assertLess(self.closed_by_the_server(extra, 10.0), 10.0)
+            self.assertEqual((self.httpd.turned_away, self.httpd.open_connections()), (9, 4))
+        said = logged.getvalue()
+        self.assertNotIn('no thread could be started', said)
+        self.assertNotIn('Traceback', said)
+
+    def set_up_fails_with(self, error, connections=3):
+        """What the server says when giving a connection its timeout raises ``error``, for that many connections."""
+        logged = io.StringIO()
+        real = socket.socket.settimeout
+        failed = []
+
+        def settimeout(connection, seconds):
+            if seconds == self.httpd.client_seconds + self.httpd.TIMEOUT_MARGIN and len(failed) < connections:
+                failed.append(connection)
+                raise error
+            return real(connection, seconds)
+        with contextlib.redirect_stderr(logged):
+            with mock.patch.object(socket.socket, 'settimeout', settimeout):
+                for _ in range(connections):
+                    connection = self.silent(b'GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n')
+                    self.closed_by_the_server(connection, 10)
+                self.counted(0)
+            self.assertEqual(len(failed), connections)
+            self.served(within=10)
+            self.counted(0)
+        self.assertEqual((self.httpd._serving, self.httpd._begun, self.httpd.turned_away, self.httpd.cut_off), ({}, set(), 0, 0))
+        return logged.getvalue()
+
+    def test_set_up_on_a_socket_that_is_gone_is_quiet_whatever_it_raises(self):
+        import errno
+        self.serve(client_seconds=30)
+        for error in (OSError(errno.EBADF, 'Bad file descriptor'), OSError(errno.ENOTSOCK, 'not a socket'),
+                      OSError(errno.ENOTCONN, 'Transport endpoint is not connected'), ConnectionResetError(errno.ECONNRESET, 'reset'),
+                      OSError(errno.ECONNRESET, 'Connection reset by peer'), OSError(errno.ECONNABORTED, 'aborted'),
+                      BrokenPipeError(errno.EPIPE, 'Broken pipe')):
+            with self.subTest(error=repr(error)):
+                self.assertEqual(self.set_up_fails_with(error, connections=2), '')
+
+    def test_a_fault_of_the_server_in_set_up_is_one_line_and_not_a_traceback_each(self):
+        """kittrial-5bb.177: with every OSError taken for a socket that is gone, the server running out of
+        descriptors in a connection's set-up was silent (and before kittrial-5bb.175 a traceback for each)."""
+        import errno
+        self.serve(client_seconds=30)
+        said = self.set_up_fails_with(OSError(errno.EMFILE, 'Too many open files'), connections=5)
+        lines = said.strip().splitlines()
+        self.assertEqual(len(lines), 1, said)
+        self.assertRegex(lines[0], r"^setup: '127\.0\.0\.1': '\[Errno %d\] Too many open files'; the connection was closed$" % errno.EMFILE)
+        self.assertNotIn('Traceback', said)
+        # The next line, when its time has come, says how many were not shown.
+        self.httpd.TLS_LINE_EVERY = 0.0
+        again = self.set_up_fails_with(OSError(errno.ENOMEM, 'Cannot allocate memory'), connections=1)
+        self.assertRegex(again.strip(), r"^setup: '127\.0\.0\.1': '\[Errno %d\] Cannot allocate memory'; the connection was closed "
+                                        r"\(and 4 more since the last such line\)$" % errno.ENOMEM)
+
+    def test_an_error_in_set_up_that_is_not_the_sockets_is_reported_as_before(self):
+        """Only an OSError is the socket's or the system's. Anything else is a fault in the code and keeps its traceback."""
+        self.serve(client_seconds=30)
+        said = self.set_up_fails_with(RuntimeError('broken in set-up'), connections=1)
+        self.assertIn('Traceback', said)
+        self.assertIn('RuntimeError: broken in set-up', said)
+        self.assertNotIn('setup:', said)
 
     def test_a_process_that_cannot_start_a_thread_closes_the_connection_and_says_so_once(self):
         """Review of kittrial-5bb.163: under a memory cap "can't start new thread" was a traceback for every
@@ -514,6 +640,29 @@ class SilentTlsConnectionTests(Case):
             self.settled()
         self.assertEqual(logged.getvalue(), '')
         self.assertEqual((self.httpd._serving, self.httpd._begun), ({}, set()))
+
+    def test_a_fault_of_the_server_in_the_tls_wrap_is_one_line_and_what_the_wrap_refuses_is_a_handshake_line(self):
+        import errno
+        self.serve(client_seconds=30)
+        for error, begins in ((OSError(errno.EMFILE, 'Too many open files'), 'setup: '),
+                              (ssl.SSLError(1, 'closed before the handshake'), 'tls: ')):
+            self.httpd.TLS_LINE_EVERY = 5.0
+            self.httpd._tls_said = self.httpd._setup_said = None
+            logged = io.StringIO()
+            with contextlib.redirect_stderr(logged):
+                with mock.patch.object(ssl.SSLContext, 'wrap_socket', side_effect=error):
+                    for _ in range(4):
+                        connection = self.silent()
+                        self.closed_by_the_server(connection, 10)
+                    self.settled()
+                self.served(within=10)
+                self.settled()
+            said = logged.getvalue()
+            with self.subTest(error=repr(error)):
+                self.assertEqual(len(said.strip().splitlines()), 1, said)
+                self.assertTrue(said.startswith(begins), said)
+                self.assertNotIn('Traceback', said)
+                self.assertEqual((self.httpd._serving, self.httpd._begun), ({}, set()))
 
     def test_a_handshake_that_fails_is_one_line_and_not_a_traceback(self):
         logged = io.StringIO()

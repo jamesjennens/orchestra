@@ -18,6 +18,7 @@ and TLS termination at the service itself is supported with ``--cert``/``--key``
 import argparse
 import base64
 import binascii
+import errno
 import hashlib
 import ipaddress
 import json
@@ -2539,12 +2540,23 @@ class ApiHandler(BaseHTTPRequestHandler):
                 # longer than this, on every platform. A little longer than the deadline, so that
                 # it is the reaper that ends a wait wherever it can.
                 self.request.settimeout(server.client_seconds + server.TIMEOUT_MARGIN)
-        except OSError as gone:
-            # The socket is closed already (the client reset it, or the server gave the
-            # connection up): there is nobody to serve, and it is not an error of the service.
-            # Never a traceback out of the thread (kittrial-5bb.175).
-            raise ConnectionAbortedError('the connection was closed before it was served: %s'
-                                         % (str(gone)[:120] or type(gone).__name__)) from None
+        except ssl.SSLError as failed:
+            # The wrap looks at what the client has sent already; what it refuses there is a
+            # handshake that did not come about, and has the line of one.
+            raise ConnectionAbortedError('TLS handshake not completed: %s'
+                                         % (str(failed)[:120] or type(failed).__name__)) from None
+        except OSError as failed:
+            said = str(failed)[:120] or type(failed).__name__
+            if isinstance(failed, ConnectionError) or failed.errno in SOCKET_GONE:
+                # The socket is closed already (the client reset it, or the server gave the
+                # connection up): there is nobody to serve, and it is not an error of the
+                # service. Never a traceback out of the thread (kittrial-5bb.175).
+                raise ConnectionAbortedError('the connection was closed before it was served: %s' % said) from None
+            # Anything else is a fault of the server itself (no descriptor left for the TLS
+            # object, say): the connection cannot be served either, but the operator must be
+            # able to see why. One line, rate-limited in ``GuardedServer.handle_error``
+            # (kittrial-5bb.177: it was silent, and before kittrial-5bb.175 a traceback each).
+            raise ConnectionAbortedError('%s%s' % (SETUP_FAILED, said)) from None
         if context is not None:
             if self._guarded:
                 server.watch(self.request, server.client_seconds)
@@ -5417,6 +5429,13 @@ def build_handler(service, backend, *, trusted_proxies=(), max_body=MAX_BODY_BYT
     })
 
 
+#: What a socket that is already gone raises when it is wrapped or given its timeout: closed
+#: (EBADF; on Windows WSAENOTSOCK, which is ENOTSOCK there), not connected any more, reset,
+#: aborted, a broken pipe. Nobody is there to be served; nothing is said.
+SOCKET_GONE = frozenset({errno.EBADF, errno.ENOTSOCK, errno.ENOTCONN, errno.ECONNRESET, errno.ECONNABORTED, errno.EPIPE})
+#: How the error of a connection whose set-up failed for a reason of the server's own begins.
+SETUP_FAILED = 'connection set-up failed: '
+
 #: How long a client may take over each thing the service waits for from it: completing the
 #: TLS handshake, sending a request (its line and headers; then its body), and taking a
 #: response. Also how long an idle keep-alive connection is kept. Then the connection is closed.
@@ -5482,6 +5501,7 @@ class GuardedServer(ThreadingHTTPServer):
         self._serving = {}
         self._begun = set()              # of those threads, the ones start() has returned for
         self._tls_said, self._tls_unsaid = None, 0
+        self._setup_said, self._setup_unsaid = None, 0
         self._stopping = threading.Event()
         self._reaper = threading.Thread(target=self._reap, name='connection-reaper', daemon=True)
         self._reaper.start()
@@ -5606,6 +5626,22 @@ class GuardedServer(ThreadingHTTPServer):
                 if not quiet:
                     print('tls: %s: %s%s' % (ascii(str(client_address[0]))[:60], ascii(str(error))[:200],
                                              ' (and %d more since the last such line)' % unsaid if unsaid else ''),
+                          file=sys.stderr, flush=True)
+            elif str(error).startswith(SETUP_FAILED):
+                # A fault of the server itself in a connection's set-up: said, and like the
+                # line above at most once every TLS_LINE_EVERY seconds, because it comes with
+                # every connection while it lasts.
+                now = time.monotonic()
+                with self._guard:
+                    quiet = self._setup_said is not None and now - self._setup_said < self.TLS_LINE_EVERY
+                    if quiet:
+                        self._setup_unsaid += 1
+                    else:
+                        unsaid, self._setup_unsaid, self._setup_said = self._setup_unsaid, 0, now
+                if not quiet:
+                    print('setup: %s: %s; the connection was closed%s'
+                          % (ascii(str(client_address[0]))[:60], ascii(str(error)[len(SETUP_FAILED):])[:200],
+                             ' (and %d more since the last such line)' % unsaid if unsaid else ''),
                           file=sys.stderr, flush=True)
             return
         super().handle_error(request, client_address)
