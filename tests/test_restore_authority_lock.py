@@ -281,7 +281,7 @@ class RegrantCommandQuotingTests(unittest.TestCase):
     a quote today (recovery.identity, admin.root_path), so this pins the notice itself."""
 
     def test_an_actor_with_a_space_and_a_quote_round_trips_through_the_shell(self):
-        root = Path('/srv/run time')
+        root = '/srv/run time'            # a string: a Path would print with backslashes on Windows
         warning = admin.authority_not_regranted(root, 'alpha', ["o'brien x"], ['v "q"'])
         commands = [shlex.split(line.strip()) for line in warning.splitlines()
                     if line.strip().startswith('admin.py --root ')]
