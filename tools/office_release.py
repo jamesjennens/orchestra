@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
@@ -116,6 +117,219 @@ def safe_extract(data, destination):
                 raise ValueError('Extracted symlink escapes extraction root: ' + str(entry))
 
 
+# ---- what a bundled binary needs to start ------------------------------------------------
+#
+# The pinned bd 1.2.2 was built against glibc 2.34 and cannot start on RHEL 8 (glibc 2.28);
+# nothing noticed, because every installation ran on a newer host (kittrial-5bb.161). So a
+# release is checked twice: when it is built, against the glibc of the target it is built
+# for, and when it is installed, by starting every bundled binary on the target itself.
+# What a binary needs is read from the file, so the refusal can name it; no objdump or ldd
+# is needed on the host. Like the rest of this file, Python 3.6 standard library only.
+
+PT_LOAD, PT_DYNAMIC, PT_INTERP = 1, 2, 3
+DT_STRTAB, DT_VERNEED, DT_VERNEEDNUM = 5, 0x6ffffffe, 0x6fffffff
+GLIBC = re.compile(r'^GLIBC_(\d+(?:\.\d+)+)$')
+VERSION = re.compile(r'^\d+(?:\.\d+)+$')
+#: The vendored binaries, with the arguments that make each say its version and stop.
+BINARIES = (('bd', ['--version']), ('dolt', ['version']))
+UNREADABLE = 'Not a readable ELF file'
+
+
+def version_tuple(text):
+    return tuple(int(part) for part in text.split('.'))
+
+
+def elf_needs(data):
+    """What an ELF executable needs in order to start, or None when ``data`` is not ELF.
+
+    ``static``: no program interpreter is named, so no shared library is loaded.
+    ``interpreter``: the loader a dynamic executable asks for. ``versions``: the symbol
+    versions it requires of each shared library (``.gnu.version_r``, found through the
+    dynamic segment, so a file without section headers is read too). ``glibc``: the
+    highest ``GLIBC_x.y`` among them: the oldest glibc the file can start on.
+    """
+    if data[:4] != b'\x7fELF':
+        return None
+    try:
+        if data[4] not in (1, 2) or data[5] not in (1, 2):
+            raise ValueError(UNREADABLE)
+        wide, order = data[4] == 2, '<' if data[5] == 1 else '>'
+        if wide:
+            phoff, = struct.unpack_from(order + 'Q', data, 32)
+            phentsize, phnum = struct.unpack_from(order + 'HH', data, 54)
+        else:
+            phoff, = struct.unpack_from(order + 'I', data, 28)
+            phentsize, phnum = struct.unpack_from(order + 'HH', data, 42)
+        loads, interpreter, dynamic = [], None, None
+        for index in range(phnum):
+            at = phoff + index * phentsize
+            if wide:
+                kind, _, offset, address, _, size = struct.unpack_from(order + 'IIQQQQ', data, at)
+            else:
+                kind, offset, address, _, size = struct.unpack_from(order + 'IIIII', data, at)
+            if kind == PT_LOAD:
+                loads.append((address, offset, size))
+            elif kind == PT_INTERP:
+                interpreter = data[offset:offset + size].split(b'\0')[0].decode('ascii', 'replace')
+            elif kind == PT_DYNAMIC:
+                dynamic = (offset, size)
+
+        def located(address):
+            for start, offset, size in loads:
+                if start <= address < start + size:
+                    return offset + address - start
+            raise ValueError(UNREADABLE)
+
+        def text(at):
+            end = data.index(b'\0', at)
+            return data[at:end].decode('ascii', 'replace')
+        tags = {}
+        if dynamic is not None:
+            entry, form = (16, 'qQ') if wide else (8, 'iI')
+            for at in range(dynamic[0], dynamic[0] + dynamic[1] - entry + 1, entry):
+                tag, value = struct.unpack_from(order + form, data, at)
+                if tag == 0:
+                    break
+                tags.setdefault(tag, value)
+        versions = {}
+        if DT_VERNEED in tags and DT_STRTAB in tags:
+            strings, at = located(tags[DT_STRTAB]), located(tags[DT_VERNEED])
+            for _ in range(min(tags.get(DT_VERNEEDNUM, 0), 4096)):
+                _, count, name, aux, following = struct.unpack_from(order + 'HHIII', data, at)
+                wanted, entry = versions.setdefault(text(strings + name), []), at + aux
+                for _ in range(min(count, 4096)):
+                    _, _, _, symbol, onward = struct.unpack_from(order + 'IHHII', data, entry)
+                    wanted.append(text(strings + symbol))
+                    if not onward:
+                        break
+                    entry += onward
+                if not following:
+                    break
+                at += following
+    except (struct.error, IndexError, ValueError):
+        raise ValueError(UNREADABLE)
+    found = [GLIBC.match(symbol).group(1) for names in versions.values() for symbol in names if GLIBC.match(symbol)]
+    return {'static': interpreter is None, 'interpreter': interpreter,
+            'versions': {name: sorted(set(names)) for name, names in versions.items()},
+            'glibc': max(found, key=version_tuple) if found else None}
+
+
+def describe_needs(needs):
+    """One clause for a refusal or a note: what the file itself says it needs."""
+    if needs is None:
+        return 'it is not an ELF executable'
+    if needs['static']:
+        return 'it is statically linked and needs no glibc'
+    if needs['glibc']:
+        return 'it needs glibc %s or later' % needs['glibc']
+    return 'it is dynamically linked and names no glibc version'
+
+
+def host_glibc():
+    """This host's glibc version (``2.28``), or None where the C library does not say."""
+    try:
+        found = os.confstr('CS_GNU_LIBC_VERSION')
+    except (AttributeError, ValueError, OSError):
+        return None
+    match = re.match(r'^glibc (\d+(?:\.\d+)+)$', found or '')
+    return match.group(1) if match else None
+
+
+def archive_member(data, name):
+    """The bytes of the regular file ``name`` in a tar archive, following links inside the archive."""
+    wanted = str(_safe_path(name)).replace(os.sep, '/')
+    with tarfile.open(fileobj=io.BytesIO(data), mode='r:*') as archive:
+        members = {}
+        for item in archive:
+            try:
+                members[str(_safe_path(item.name)).replace(os.sep, '/')] = item
+            except ValueError:
+                continue
+        for _ in range(8):
+            item = members.get(wanted)
+            if item is None:
+                break
+            if item.isfile():
+                return archive.extractfile(item).read()
+            if item.issym():
+                wanted = str(_safe_path(os.path.dirname(wanted) + '/' + item.linkname
+                                        if os.path.dirname(wanted) else item.linkname)).replace(os.sep, '/')
+            elif item.islnk():
+                wanted = str(_safe_path(item.linkname)).replace(os.sep, '/')
+            else:
+                break
+    raise ValueError('Archive has no file ' + name)
+
+
+def pin_of(lock, name, data):
+    """Which pinned entry of versions.json the archive ``data`` is: ``name`` or ``name_static``.
+
+    A binary may be pinned twice (kittrial-5bb.161): ``bd`` is upstream's release, which needs
+    glibc 2.34; ``bd_static`` is the same version built without cgo, for hosts with an older
+    glibc. A release bundles whichever archive it was given, and it must be one of the two.
+    """
+    for key in (name, name + '_static'):
+        if isinstance(lock.get(key), dict) and lock[key].get('sha256') == digest(data):
+            return key
+    raise ValueError(name + ' archive differs from versions.json pin')
+
+
+def vendored(lock, name, data):
+    """The binary ``name`` out of its pinned archive (``member`` in versions.json, else the name itself)."""
+    return archive_member(data, lock[pin_of(lock, name, data)].get('member') or name)
+
+
+def starts(label, path, arguments, scratch):
+    """Start ``path`` with ``arguments``; return what it said, or raise saying why it cannot start here."""
+    path = os.path.abspath(str(path))             # it is started from the scratch directory
+    try:
+        done = subprocess.run([path] + list(arguments), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              stdin=subprocess.DEVNULL, timeout=60, cwd=str(scratch),
+                              env=dict(os.environ, HOME=str(scratch)))
+        code, said = done.returncode, done.stdout.decode('utf-8', 'replace')
+    except subprocess.TimeoutExpired:
+        code, said = None, 'it did not answer within 60 seconds'
+    except OSError as error:
+        code, said = None, error.strerror or str(error)
+    if code == 0:
+        return said.strip()
+    lines = [line.strip() for line in said.splitlines() if line.strip()]
+    # The loader's own sentence, when there is one: "version `GLIBC_2.34' not found (required by ...)".
+    reason = next((line for line in lines if 'not found' in line or 'No such file' in line), lines[-1] if lines else 'it said nothing')
+    try:
+        needs = describe_needs(elf_needs(Path(path).read_bytes()))
+    except (OSError, ValueError):
+        needs = 'it could not be read as an ELF file'
+    here = host_glibc()
+    raise ValueError('%s cannot start on this host%s: %s. The file says %s; this host has %s. '
+                     'A release must carry a build of it for this host (docs/OFFICE_SERVICE.md)'
+                     % (label, '' if code is None else ' (exit code %d)' % code, reason[:300], needs,
+                        'glibc ' + here if here else 'a C library that does not state a glibc version'))
+
+
+def start_vendored(kit, scratch):
+    """Start bd and dolt out of an unpacked kit's vendored archives. Returns what each said."""
+    kit, scratch = Path(kit), Path(scratch)
+    try:
+        lock = json.loads((kit/'versions.json').read_text(encoding='utf-8'))
+        archives = {name: (kit/'vendor'/(name + '.tar.gz')).read_bytes() for name, _ in BINARIES}
+    except (OSError, ValueError):
+        raise ValueError('Release lacks versions.json or a vendored bd or dolt archive')
+    scratch.mkdir(parents=True, exist_ok=True)
+    said = {}
+    try:
+        for name, arguments in BINARIES:
+            target = scratch/name
+            target.write_bytes(vendored(lock, name, archives[name]))
+            target.chmod(0o755)
+            pin = pin_of(lock, name, archives[name])
+            said[name] = '%s%s' % ('' if pin == name else '(%s) ' % pin,
+                                   starts(name, target, arguments, scratch))
+    finally:
+        shutil.rmtree(str(scratch), ignore_errors=True)
+    return said
+
+
 def _git(repo, *args):
     return subprocess.check_output(['git', '-C', str(repo), *args])
 
@@ -145,10 +359,41 @@ def build(args):
     if 'lock' not in locals():
         raise ValueError('Source archive lacks versions.json')
     vendors = {}
+    pins = {}
     for name, path in (('bd', args.bd_archive), ('dolt', args.dolt_archive)):
         vendors[name] = Path(path).read_bytes()
-        if digest(vendors[name]) != lock[name]['sha256']:
-            raise ValueError(name + ' archive differs from versions.json pin')
+        pins[name] = pin_of(lock, name, vendors[name])
+        print('office-release: %s archive is the pinned entry %s' % (name, pins[name]), file=sys.stderr)
+    # Every bundled binary: what it needs (recorded in the manifest), whether that fits the
+    # target's glibc when one is named, and whether bd and dolt start on this build host.
+    glibc = args.target_glibc
+    if glibc is not None and not VERSION.match(glibc):
+        raise ValueError('--target-glibc must be a glibc version such as 2.28')
+    payloads = [('python', archive_member(python_archive, args.python_executable))] + \
+        [(name, vendored(lock, name, vendors[name])) for name, _ in BINARIES]
+    binaries, too_new = {}, []
+    for name, payload in payloads:
+        needs = elf_needs(payload)
+        binaries[name] = None if needs is None else {'static': needs['static'], 'glibc': needs['glibc']}
+        print('office-release: %s: %s' % (name, describe_needs(needs)), file=sys.stderr)
+        if glibc is not None and needs is not None and needs['glibc'] \
+                and version_tuple(needs['glibc']) > version_tuple(glibc):
+            too_new.append('%s needs glibc %s' % (name, needs['glibc']))
+    if too_new:
+        raise ValueError('%s; the target has glibc %s. It could not start there. Bundle a build of it for the '
+                         'target: for bd, the archive versions.json pins as bd_static (docs/OFFICE_SERVICE.md)'
+                         % ('; '.join(too_new), glibc))
+    if not args.no_run_check:
+        with tempfile.TemporaryDirectory(prefix='office-release-check-') as scratch:
+            for (name, arguments), (_, payload) in zip(BINARIES, payloads[1:]):
+                candidate = Path(scratch)/name
+                candidate.write_bytes(payload)
+                candidate.chmod(0o755)
+                try:
+                    starts(name, candidate, arguments, scratch)
+                except ValueError as error:
+                    raise ValueError('%s. This was the build host; if it is older than the target and cannot run '
+                                     'the target\'s binaries, build with --no-run-check' % error)
     provenance = {'schema_version': 1, 'component': 'orchestra-kit',
                   'version': files['VERSION'].decode('utf-8').strip(),
                   'source_commit': commit, 'build_id': args.build_id,
@@ -168,7 +413,9 @@ def build(args):
     manifest = {'schema_version': 1, 'build_id': args.build_id, 'source_commit': commit,
                 'version': provenance['version'], 'source_sha256': digest(source_bytes.getvalue()),
                 'python_sha256': digest(python_archive),
-                'python_executable': args.python_executable}
+                'python_executable': args.python_executable,
+                # Additive: what each bundled binary needs, and the glibc the build was checked against.
+                'binaries': binaries, 'target_glibc': glibc, 'pins': pins}
     output = Path(args.output)
     if output.exists():
         raise ValueError('Refusing to replace existing artifact')
@@ -237,9 +484,11 @@ def install(args):
         executable = staged/'python-runtime'/_safe_path(manifest['python_executable'])
         if not executable.is_file():
             raise ValueError('Bundled Python executable missing')
-        result = subprocess.check_output([str(executable), '--version'], stderr=subprocess.STDOUT)
-        if not re.search(br'Python 3\.(1[0-9]|[2-9][0-9])\.', result):
+        result = starts('The bundled Python', executable, ['--version'], staged)
+        if not re.search(r'Python 3\.(1[0-9]|[2-9][0-9])\.', result):
             raise ValueError('Bundled interpreter must be Python 3.10 or newer')
+        # bd and dolt must start on THIS host before anything is switched (kittrial-5bb.161).
+        start_vendored(staged/'kit', staged/'.start-check')
         (staged/'manifest.json').write_bytes(contents['manifest.json'])
         os.rename(str(staged), str(final))
     except BaseException:
@@ -277,8 +526,12 @@ def verify(args):
     python = release/'python-runtime'/_safe_path(manifest['python_executable'])
     subprocess.check_call([str(python), '-c', 'import admin, office_service, http_service'],
                           cwd=str(release/'kit'))
+    with tempfile.TemporaryDirectory(prefix='office-release-verify-') as scratch:
+        said = start_vendored(release/'kit', Path(scratch)/'start-check')
     print('release=%s source=%s python=%s' % (manifest['build_id'],
                                              manifest['source_commit'], python))
+    for name, _ in BINARIES:
+        print('%s starts on this host: %s' % (name, (said[name].splitlines() or [''])[0][:120]))
 
 
 def main(argv=None):
@@ -294,6 +547,10 @@ def main(argv=None):
     a.add_argument('--bd-archive', required=True)
     a.add_argument('--dolt-archive', required=True)
     a.add_argument('--output', required=True)
+    a.add_argument('--target-glibc', help='the glibc version of the host the release is for (for example 2.28 '
+                                          'for RHEL 8); the build refuses a bundled binary that needs a newer one')
+    a.add_argument('--no-run-check', action='store_true',
+                   help='do not start bd and dolt on the build host (only for a build host that cannot run them)')
     a = sub.add_parser('install')
     a.add_argument('--archive', required=True)
     a.add_argument('--sha256', required=True)
