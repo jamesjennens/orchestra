@@ -5335,6 +5335,7 @@ class GuardedServer(ThreadingHTTPServer):
         self.cut_off = 0                 # connections closed for being too slow
         self.turned_away = 0             # connections closed for being over the limit
         self._said_no_thread = False
+        self._serving = {}
         self._tls_said, self._tls_unsaid = None, 0
         self._stopping = threading.Event()
         self._reaper = threading.Thread(target=self._reap, name='connection-reaper', daemon=True)
@@ -5364,6 +5365,13 @@ class GuardedServer(ThreadingHTTPServer):
                     socket.socket.shutdown(connection, socket.SHUT_RDWR)
                 except OSError:
                     pass
+            # A thread that was started and is no longer alive while its connection is still
+            # registered died before it served (out of memory in its first steps).
+            with self._guard:
+                dead = [(thread, request) for thread, request in self._serving.items()
+                        if thread.ident is not None and not thread.is_alive()]
+            for thread, request in dead:
+                self._gave_up(thread, request, 'the thread ended before it served')
 
     def open_connections(self):
         with self._guard:
@@ -5383,33 +5391,47 @@ class GuardedServer(ThreadingHTTPServer):
                       '(said once)' % self.connection_limit, file=sys.stderr, flush=True)
             self.shutdown_request(request)
             return
+        # The thread is started here and not by the base class, so that it is known: one that
+        # could not be started, or that died before it served (no memory for it), must not
+        # keep its connection open and its place taken for ever.
+        thread = threading.Thread(target=self.process_request_thread, args=(request, client_address), daemon=True)
+        with self._guard:
+            self._serving[thread] = request
         try:
-            super().process_request(request, client_address)
+            thread.start()
         except RuntimeError as failed:
             # "can't start new thread": the process is at a limit of its own (memory, threads)
             # below the connection limit. The connection is closed like one over the limit,
             # and it is said once, in one line: not a traceback for each (review of .163).
-            with self._guard:
-                self._open -= 1
-                self.turned_away += 1
-                first = not self._said_no_thread
-                self._said_no_thread = True
-            if first:
-                print('connections: no thread could be started for a connection with %d open (%s); such '
-                      'connections are closed at once (said once)' % (self.open_connections(), ascii(str(failed))[:80]),
-                      file=sys.stderr, flush=True)
-            self.shutdown_request(request)
+            self._gave_up(thread, request, ascii(str(failed))[:80])
         except BaseException:
             with self._guard:
+                self._serving.pop(thread, None)
                 self._open -= 1
             raise
+
+    def _gave_up(self, thread, request, why):
+        """No thread serves ``request``: close it, free its place, and say so the first time."""
+        with self._guard:
+            if self._serving.pop(thread, None) is None:
+                return
+            self._open -= 1
+            self.turned_away += 1
+            first = not self._said_no_thread
+            self._said_no_thread = True
+            open_now = self._open
+        if first:
+            print('connections: no thread could be started for a connection with %d open (%s); such '
+                  'connections are closed at once (said once)' % (open_now, why), file=sys.stderr, flush=True)
+        self.shutdown_request(request)
 
     def process_request_thread(self, request, client_address):
         try:
             super().process_request_thread(request, client_address)
         finally:
             with self._guard:
-                self._open -= 1
+                if self._serving.pop(threading.current_thread(), None) is not None:
+                    self._open -= 1
 
     def handle_error(self, request, client_address):
         """A client that went away or was cut off is not an error of the service: no traceback."""
@@ -5436,6 +5458,28 @@ class GuardedServer(ThreadingHTTPServer):
     def server_close(self):
         self._stopping.set()
         super().server_close()
+
+
+def quiet_memory_errors():
+    """Out of memory in a thread's first steps is one line, said once, not a traceback each time.
+
+    The interpreter reports it as an exception nobody can catch ("Exception ignored in thread
+    started by"), once per connection under a memory limit. The connection itself is closed by
+    the server's reaper. Everything else that cannot be raised is reported as before.
+    """
+    usual = sys.unraisablehook
+    said = []
+
+    def hook(unraisable):
+        if isinstance(unraisable.exc_value, MemoryError):
+            if not said:
+                said.append(True)
+                print('memory: the process ran out of memory while starting a thread; its limit is below what the '
+                      'connections it is asked to serve need (said once)', file=sys.stderr, flush=True)
+            return
+        usual(unraisable)
+    sys.unraisablehook = hook
+    return hook
 
 
 def create_server(service, backend, *, host='127.0.0.1', port=0, trusted_proxies=(),
@@ -5562,6 +5606,7 @@ def main(argv=None):
     print('orchestra-http listening on %s:%d (backend=%s, web=%s)'
           % (args.host, httpd.server_address[1], args.backend,
              'off' if args.no_web else args.web_root))
+    quiet_memory_errors()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

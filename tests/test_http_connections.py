@@ -272,8 +272,7 @@ class SilentConnectionTests(Case):
         refused = []
 
         def start(thread):
-            if thread.name != 'connection-reaper' and getattr(thread, '_target', None) is not None and \
-                    getattr(thread._target, '__name__', '') == 'process_request_thread':
+            if getattr(getattr(thread, '_target', None), '__name__', '') == 'process_request_thread':
                 refused.append(thread)
                 raise RuntimeError("can't start new thread")
             return real(thread)
@@ -289,6 +288,50 @@ class SilentConnectionTests(Case):
         self.assertNotIn('Traceback', said)
         self.assertEqual(said.count('connections: no thread could be started for a connection'), 1)
         self.assertEqual(len(said.strip().splitlines()), 1, said)
+
+    def test_a_thread_that_dies_before_it_serves_does_not_keep_its_connection_or_its_place(self):
+        """Seen on koopa under a tight memory cap: the thread starts and ends with MemoryError in its first
+        steps, so nothing served the connection, nothing closed it, and its place stayed taken."""
+        self.serve(client_seconds=30, connection_limit=4)
+        logged = io.StringIO()
+        real = self.httpd.process_request_thread
+        died = []
+
+        def dies(request, client_address):
+            died.append(request)                                  # the thread ends without having served
+        with contextlib.redirect_stderr(logged):
+            with mock.patch.object(self.httpd, 'process_request_thread', dies):
+                for _ in range(8):                                # twice the limit: no place stays taken
+                    extra = self.silent()
+                    self.assertLess(self.closed_by_the_server(extra, 3.0), 3.0)
+            self.assertEqual(len(died), 8)
+            self.settled()
+            self.assertEqual(self.httpd.turned_away, 8)
+            self.served(within=2.0)
+        said = logged.getvalue()
+        self.assertEqual(said.count('connections: no thread could be started for a connection'), 1)
+        self.assertIn('the thread ended before it served', said)
+        self.assertNotIn('the limit of 4', said)
+        self.assertEqual(len(said.strip().splitlines()), 1, said)
+
+    def test_out_of_memory_in_a_new_thread_is_one_line_and_other_reports_are_kept(self):
+        import types
+        usual = sys.unraisablehook
+        self.addCleanup(setattr, sys, 'unraisablehook', usual)
+        seen = []
+        sys.unraisablehook = seen.append
+        hook = http_service.quiet_memory_errors()
+        logged = io.StringIO()
+        with contextlib.redirect_stderr(logged):
+            for _ in range(5):
+                hook(types.SimpleNamespace(exc_value=MemoryError(), exc_type=MemoryError, exc_traceback=None,
+                                           err_msg=None, object=None))
+            other = types.SimpleNamespace(exc_value=ValueError('x'), exc_type=ValueError, exc_traceback=None,
+                                          err_msg=None, object=None)
+            hook(other)
+        self.assertEqual(logged.getvalue().count('memory: the process ran out of memory while starting a thread'), 1)
+        self.assertEqual(len(logged.getvalue().strip().splitlines()), 1)
+        self.assertEqual(seen, [other])
 
     def test_a_closed_client_frees_its_place_without_waiting_for_the_deadline(self):
         self.serve(client_seconds=30)
