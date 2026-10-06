@@ -1824,13 +1824,15 @@ class ReleaseCostEstimateTests(unittest.TestCase):
         self.assertGreaterEqual(lifecycle.release_group_estimate(3 * 201), 438.0)
         self.assertGreaterEqual(lifecycle.release_group_estimate(4 * 25), 139.0)
         self.assertGreaterEqual(lifecycle.release_group_estimate(4 * 50), 295.0)
-        # A plain default group and the smaller --live-verified default group each
-        # stay inside the client timeout.
+        # The per-group write budget must BE the client timeout at the policy
+        # per-write figure, and a plain first deployment at the historical default
+        # group stays inside it, so a group the kit picks for itself never trips the
+        # timeout warning (kittrial-5bb.139 review item 1).
+        self.assertEqual(lifecycle.release_group_estimate(lifecycle.RELEASE_GROUP_WRITE_BUDGET),
+                         lifecycle.RELEASE_CLIENT_TIMEOUT_SECONDS,
+                         '90 native writes must be the 150 s timeout at 1.5 s per write')
         self.assertLessEqual(lifecycle.release_group_estimate(3 * lifecycle.RELEASE_CHUNK_DEFAULT),
                              lifecycle.RELEASE_CLIENT_TIMEOUT_SECONDS)
-        self.assertLessEqual(
-            lifecycle.release_group_estimate(4 * lifecycle.RELEASE_CHUNK_VERIFIED_DEFAULT),
-            lifecycle.RELEASE_CLIENT_TIMEOUT_SECONDS)
 
     def test_the_estimate_follows_the_planned_writes(self):
         store = (NativeStore(tasks=('trial-a', 'trial-b', 'trial-c'))
@@ -1845,10 +1847,33 @@ class ReleaseCostEstimateTests(unittest.TestCase):
         self.assertEqual(report['planned_writes'], 3 * 3)
         self.assertEqual(report['expected_seconds'], lifecycle.release_group_estimate(9))
 
-    def test_a_first_live_verified_run_uses_a_smaller_group_and_warns(self):
-        # A default group of 25 first --live-verified targets is about the client
-        # timeout (measured 139 s), so the default group shrinks and the run says
-        # why (.119 item 3). 30 targets prove the smaller group really chunks.
+    def second_environment(self, tasks):
+        """``tasks`` seeded and already deployed (and labelled) in production.
+
+        A later release to staging then pays the pending rewrite for `deployed` and
+        `live`, which is the case that used to warn about the kit's own default
+        group (kittrial-5bb.139 review item 1).
+        """
+        store = NativeStore(tasks=tasks)
+        for task in tasks:
+            store.seed(task)
+        production = {'source_commit': '', 'integration_commit': RELEASE_COMMIT,
+                      'release_id': 'release-1', 'environment': 'production'}
+        store.record(release_payload([target(task) for task in tasks],
+                                     operation='deploy-production', release='release-1',
+                                     scope=production))
+        return store
+
+    def staging_argv(self, root, store, *extra):
+        data = release_payload([], operation='deploy-staging', release='release-2',
+                               environment='staging')
+        return ReleaseCommandTests.fixture_for(self, root, store, data) + list(extra)
+
+    def test_a_first_live_verified_run_derives_a_smaller_group_and_says_why(self):
+        # --live-verified writes FOUR native processes per new target, so the default
+        # group is derived from the 90-write budget (22 targets, not the plain 25)
+        # and the run says why (kittrial-5bb.139 review item 1). 30 targets prove the
+        # smaller group really chunks.
         tasks = tuple('trial-%02d' % index for index in range(30))
         store = NativeStore(tasks=tasks)
         for task in tasks:
@@ -1858,12 +1883,86 @@ class ReleaseCostEstimateTests(unittest.TestCase):
         with scratch() as root:
             argv = ReleaseCommandTests.fixture(self, root, store, live_verified=True) + ['--dry-run']
             report = json.loads(ReleaseCommandTests.run_cli(self, argv, client))
-        self.assertEqual(report['chunk_size'], lifecycle.RELEASE_CHUNK_VERIFIED_DEFAULT)
-        self.assertEqual(report['chunks'], [lifecycle.RELEASE_CHUNK_VERIFIED_DEFAULT] * 2)
+        derived = lifecycle.RELEASE_GROUP_WRITE_BUDGET // 4
+        self.assertEqual(report['chunk_size'], derived)
+        self.assertEqual(report['chunks'], [derived, len(tasks) - derived])
         self.assertEqual(report['planned_writes'], 4 * len(tasks))
         self.assertEqual(report['expected_seconds'], lifecycle.release_group_estimate(4 * len(tasks)))
-        self.assertTrue(any('FOUR facts per new target' in warning for warning in report['warnings']))
+        self.assertTrue(any('native bd process' in warning for warning in report['warnings']))
         self.assertFalse(any('client timeout' in warning for warning in report['warnings']))
+
+    def test_a_release_to_a_further_environment_derives_a_smaller_group(self):
+        # A plain release to a second environment of already-labelled tasks costs FIVE
+        # native processes per target for three planned facts, so a 25-target group
+        # would be 125 writes and 202.5 s. The kit derives 18 targets instead, rather
+        # than warning about a size it picked itself (kittrial-5bb.139 review item 1).
+        tasks = tuple('trial-%02d' % index for index in range(25))
+        store = self.second_environment(tasks)
+        client = types.ModuleType('client')
+        client.request = lambda *args, **kwargs: {'returncode': 0, 'stdout': '{}', 'stderr': ''}
+        with scratch() as root:
+            argv = self.staging_argv(root, store, '--dry-run')
+            report = json.loads(ReleaseCommandTests.run_cli(self, argv, client))
+        self.assertEqual(len(report['targets']), len(tasks))
+        self.assertEqual(report['chunk_size'], lifecycle.RELEASE_GROUP_WRITE_BUDGET // 5)
+        self.assertEqual(report['planned_writes'], 3 * len(tasks))
+        self.assertEqual(report['planned_state_changes'], 5 * len(tasks))
+        self.assertEqual(report['expected_seconds'], lifecycle.release_group_estimate(5 * len(tasks)))
+        self.assertLessEqual(report['chunk_size'] * 5, lifecycle.RELEASE_GROUP_WRITE_BUDGET)
+        self.assertTrue(any('native bd process' in warning for warning in report['warnings']))
+        self.assertFalse(any('client timeout' in warning for warning in report.get('warnings', [])))
+
+    def test_the_timeout_warning_is_priced_in_native_writes_not_planned_facts(self):
+        # kittrial-5bb.139 review item 2 (mutation P7 survived): the per-group timeout
+        # warning must be priced in NATIVE processes, not in the planned facts. At an
+        # explicit 25-target group a second-environment plain release is 125 processes
+        # (202.5 s) but only 75 planned facts (127.5 s), so a warning priced in facts
+        # would vanish. The derived default group is deliberately bypassed here, which
+        # is also the documented "an explicit --chunk-size may still warn".
+        tasks = tuple('trial-%02d' % index for index in range(25))
+        store = self.second_environment(tasks)
+        client = types.ModuleType('client')
+        client.request = lambda *args, **kwargs: {'returncode': 0, 'stdout': '{}', 'stderr': ''}
+        with scratch() as root:
+            argv = self.staging_argv(root, store, '--dry-run', '--chunk-size', '25')
+            report = json.loads(ReleaseCommandTests.run_cli(self, argv, client))
+        self.assertEqual(report['chunk_size'], 25)
+        self.assertEqual(report['planned_writes'], 3 * len(tasks))
+        self.assertEqual(report['planned_state_changes'], 5 * len(tasks))
+        self.assertEqual(report['expected_seconds'], lifecycle.release_group_estimate(5 * len(tasks)))
+        self.assertTrue(any('202.5 s' in warning and 'client timeout' in warning
+                            for warning in report['warnings']),
+                        'the timeout warning must be priced in native writes: %r'
+                        % (report.get('warnings'),))
+
+    def test_a_verify_only_target_already_verified_elsewhere_costs_two_processes(self):
+        # kittrial-5bb.139 review item 2 (mutation P4 survived): a verify-only target
+        # whose live-verified fact already passed elsewhere carries the
+        # live-verified:passed label, so `_apply_fact` rewrites it through `pending`
+        # first and the one planned fact costs TWO native processes. The estimate must
+        # count that extra process.
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        first = {'source_commit': '', 'integration_commit': RELEASE_COMMIT,
+                 'release_id': 'release-1', 'environment': 'production'}
+        store.record(release_payload([target('trial-a')], operation='deploy-r1',
+                                     release='release-1', scope=first, live_verified=True))
+        later = {'source_commit': '', 'integration_commit': RELEASE_COMMIT,
+                 'release_id': 'release-2', 'environment': 'production'}
+        store.record(release_payload([target('trial-a')], operation='deploy-r2',
+                                     release='release-2', scope=later))
+        labels = next(row['labels'] for row in store.rows if row['id'] == 'trial-a')
+        self.assertIn('live-verified:passed', labels,
+                      'the earlier verification leaves the native label on the task')
+        self.assertEqual(
+            lifecycle.release_planned_native_writes([{'task': 'trial-a'}], ['trial-a'], True,
+                                                    {'trial-a': labels}),
+            2, 'a verify-only fact the task already carries is rewritten through pending first')
+        before = len(store.calls)
+        store.record(release_payload([target('trial-a')], operation='verify-r2',
+                                     release='release-2', scope=later, live_verified=True))
+        writes = [call for call in store.calls[before:] if call[0] == 'set-state']
+        self.assertEqual(len(writes), 2, 'the endpoint really pays the extra pending process')
+        self.assertEqual(store.facts('trial-a')['facts']['live-verified']['value'], 'passed')
 
     def test_a_plain_run_keeps_the_default_group(self):
         tasks = tuple('trial-%02d' % index for index in range(30))
@@ -2385,3 +2484,40 @@ class RollbackCommandTests(ReleaseCommandTests):
                          'costs an extra pending rewrite')
         self.assertEqual(report['expected_seconds'],
                          lifecycle.release_group_estimate(report['planned_state_changes']))
+
+    def test_a_rollback_report_is_an_upper_count_of_the_re_lived_targets(self):
+        # kittrial-5bb.139 review item 3: the page-level estimate assumes three facts
+        # per re-lived target, but a rollback target may already be at the release
+        # scope and already live there, so the endpoint writes fewer. The report is
+        # documented as a conservative UPPER count for a rollback; this pins the
+        # direction on a rollback whose targets are already at the release scope.
+        store = (NativeStore(tasks=('trial-a', 'trial-b', 'trial-c'))
+                 .seed('trial-a')
+                 .seed('trial-b')
+                 .seed('trial-c', integration=MERGE_B, source=SOURCE_B))
+        store.record(release_payload([target('trial-a'), target('trial-b')],
+                                     operation='release-r1', release='r-1'))
+        store.record(release_payload([target('trial-c', integration=MERGE_B, source=SOURCE_B)],
+                                     operation='release-r3', release='r-3'))
+        client = types.ModuleType('client')
+        def fake_request(config, project, actor, args, action=None):
+            payload = json.loads(args[0])
+            if payload['dimension'] == RELEASE_QUERY:
+                return {'returncode': 0, 'stderr': '', 'stdout': json.dumps({'reverted': []})}
+            return {'returncode': 0, 'stderr': '',
+                    'stdout': json.dumps(apply_native(payload, ACTOR, store.run))}
+        client.request = fake_request
+        with scratch() as root:
+            argv = self.rollback_fixture(root, store) + ['--rollback', '--dry-run']
+            report = json.loads(self.run_cli(argv, client))
+        self.assertEqual([item['task'] for item in report['targets']], ['trial-a', 'trial-b'])
+        self.assertEqual(report['superseded'], ['trial-c'])
+        before = len(store.calls)
+        with scratch() as root:
+            argv = self.rollback_fixture(root, store) + ['--rollback']
+            self.run_cli(argv, client)
+        actual = len([call for call in store.calls[before:] if call[0] == 'set-state'])
+        self.assertGreater(
+            report['planned_state_changes'], actual,
+            'a re-lived target already at the release scope and already live there costs '
+            'fewer native processes than the page-level estimate assumes')
