@@ -2715,6 +2715,15 @@ def last_complete_guard(root,name):
     """
     bundle=root/'backups'/(name+'.coordination.json')
     last_complete=last_complete_sidecar_path(root,name)
+    # A directory where a sidecar copy belongs is not something this kit wrote, so it is
+    # neither replaced nor deleted: the run refuses before writing anything, naming it and
+    # what to do (kittrial-5bb.157). It used to end in a raw "Is a directory" error.
+    for copy in (bundle,last_complete):
+        if copy.is_dir() and not copy.is_symlink():
+            raise ValueError('%s is a directory where the coordination sidecar copy belongs, so this backup '
+                             'cannot keep its pair restorable; the pair was not touched. It is not a file this kit '
+                             'writes: look at what it holds, move it out of backups/, then run backup again.'
+                             %copy.relative_to(root).as_posix())
     state={'promoted':False}
     if complete_sidecar(bundle) is not None:
         _atomic_copy(bundle,last_complete)
@@ -5003,6 +5012,7 @@ def main():
                                  'used; this backup\'s can be, so restore it without the flag')
             else:
                 coordination_backup(root,args.project)
+            args.flag_had_nothing=args.without_coordination and outcome=='legacy'
             # Validate the journal snapshot BEFORE creating anything: a corrupt snapshot
             # must fail the restore with no destination project, Dolt restore or
             # coordination files left behind.
@@ -5059,6 +5069,9 @@ def main():
         if args.native_only is not None:
             # The last lines, so the operator cannot miss what this restore left out.
             print(native_only_note(root,args,args.native_only))
+        elif args.flag_had_nothing:
+            print('--without-coordination: this backup has no coordination sidecar at all, so there was nothing '
+                  'to leave out; it was restored as a legacy backup, exactly as without the flag.')
         if warning:
             # The last thing the restore says, after everything on stdout (kittrial-5bb.144),
             # and a distinct exit status, so `restore-new ... && next-step` does not proceed.
