@@ -132,17 +132,27 @@ Use the bundled interpreter, with `<PYTHON>` denoting
 denoting `<INSTALL_ROOT>/current/kit`. `prepare` copies the release's digest
 pinned Dolt and Beads archives into `<RUNTIME_ROOT>/bin`, creates a private
 database configuration and initializes nonsecret Dolt settings. It never
-starts a systemd unit. The first `run` sets the fresh Dolt root password; if
-stopped between that change and the next check, the next `run` verifies the
+starts a systemd unit. It runs the installed `bd --version` on both a fresh and
+an existing runtime, so a bundled bd that cannot start (for example one built
+against a newer glibc) fails `prepare` with the loader's sentence instead of
+being reported as prepared. The first `run` sets the fresh Dolt root password;
+if stopped between that change and the next check, the next `run` verifies the
 stored password and continues. Keep `deployment.private.json` private.
 
 **git must be on the service's PATH.** bd runs `git` when it initializes a
 project, so `admin.py add-project` needs it, and so does the account that
-starts `office_service.py run`. The host's packaged git is not required: any
-git on PATH will do (`export PATH=<DIR_WITH_GIT>:$PATH` in the shell or the
-scheduler's entry that starts the service and runs the admin commands). git
-2.21.0 is known to work: the coordinator's install rehearsal on AlmaLinux 8
-ran add-project, backup and health with it.
+starts `office_service.py run`. `add-project` (and the web project-creation
+action, which runs the same work) checks for git **before** creating anything
+and refuses with a plain sentence when it is missing, so a host without git
+gets that sentence instead of a half-made `projects/NAME`. Nothing is removed
+after that check: a creation that fails later leaves `projects/NAME` exactly
+as the failure left it, for an operator to finish or remove (the web creation
+path keeps its own record and names `finish-project` / `remove-creation`).
+The host's packaged git is not required: any git on PATH will do
+(`export PATH=<DIR_WITH_GIT>:$PATH` in the shell or the scheduler's entry
+that starts the service and runs the admin commands). git 2.21.0 is known to
+work: the coordinator's install rehearsal on AlmaLinux 8 ran add-project,
+backup and health with it.
 
 ```sh
 <PYTHON> <KIT>/office_service.py prepare --root <RUNTIME_ROOT> --db-port <DB_PORT>
@@ -156,9 +166,35 @@ Create an operator-owned mode-0600 JSON file outside source control:
 
 By default the HTTP listener is loopback only, and a separately approved
 reverse proxy terminates TLS. The next section has the other two ways to serve
-it. Bootstrap the first HTTP superuser through the documented
-`http_service.py --bootstrap-user` prompt under the bundled interpreter;
-the password is entered interactively. The `endpoint` backend is selected by
+it. With no proxy yet, the supported first-install shape is an SSH tunnel to
+that loopback listener:
+
+```sh
+ssh -N -L <LOCAL_PORT>:127.0.0.1:<HTTP_LOOPBACK_PORT> <HOST>
+```
+
+and open `http://localhost:<LOCAL_PORT>`. `localhost` is a browser secure
+context, so the interface works over plain HTTP there; set `public_url` to that
+`http://localhost:<LOCAL_PORT>` URL. What does not work is a secure-context-only
+feature reached over plain HTTP on a host name rather than `localhost`, such as
+the save-to-folder button; give those a real TLS endpoint.
+
+Bootstrap the first HTTP superuser while the service is **stopped**. A running
+service holds its state in memory and writes it back, so an account created
+underneath it is lost. The command needs `--root <RUNTIME_ROOT>`, takes the
+runtime lock and refuses while a service holds it:
+
+```sh
+<PYTHON> <KIT>/http_service.py --bootstrap-user <NAME> \
+  --state <RUNTIME_ROOT>/http-state.json --root <RUNTIME_ROOT>
+```
+
+`--root` must name an existing runtime directory; a path that is not one is
+refused with one sentence, not a traceback. The guard is only as good as
+`--root`: it locks the root you name, so naming a different root while a
+service holds the real one gets past the lock and the new account is lost as
+before. The password is entered interactively. The `endpoint` backend is
+selected by
 the supervisor and operates against this runtime's canonical project data.
 Start the service once, then run `<PYTHON> <KIT>/admin.py --root <RUNTIME_ROOT>
 add-project <PROJECT>` before scheduling `backup --all`. A new empty runtime
