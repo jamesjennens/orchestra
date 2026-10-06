@@ -989,10 +989,17 @@ time of the write, because the time is kept beside the stored answer; an answer 
 was stored by a kit from before this header has it on a retry only when its body is an
 object with `server_time`. The web pages do not show it.
 
+The service keeps the time in both of its records of a keyed write: with the answer as
+it was sent (the idempotency record) and with the endpoint's result (the result
+record). A retry that finds only the result record (the other gone, or never committed
+because the service stopped between the two) is answered from it without asking the
+endpoint, with the time of the write.
+
 Two edges. During an upgrade, a write that was made through the kit from before this
-field and is sent again through this one, when the service's own stored answer is gone
-and the endpoint replays what it stored: the answer has no `server_time` and no header
-(no time is known; the service does not put the time of the retry there). And the time
+field and is sent again through this one, when the service's own stored answer is gone:
+whether the endpoint replays what it stored or the service answers from a result record
+that kept no time, the answer has no `server_time` and no header (no time is known; the
+service never puts the time of the retry there). And the time
 is taken when the write has been carried out and cut to the whole second, while bd
 rounds: a task's `updated_at` can read one second later. It is the wall clock, not
 monotonic across a clock step.

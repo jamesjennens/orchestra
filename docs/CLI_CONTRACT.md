@@ -40,7 +40,10 @@ Every request is one JSON object on stdin; every response is one JSON object on 
   - a refusal, a busy answer and an uncertain answer carry none (nothing was written at
     a known time), and neither does a read, including the reads of an action that can
     also write (`work`, `review TASK`, `brief`, `handoff TASK`), a `--dry-run`, and the
-    help of a command (`create --help`);
+    help of a command (`create --help`). Help is a help flag that is ON: bare, or with a
+    value bd reads as true. `--help=false` (also `--help=0`, `-h=false`) is a flag bd
+    accepts and then carries the command out, so such a request is a write like any
+    other: stamped, and its outcome kept as unknown when it fails after bd was called;
   - the writes are: every bd write (`create`, `update`, `close`, `reopen`, `comments
     add`, `dep add`, `remove`, `relate` and `unrelate`, ...), `review --file`, `handoff`
     with a payload (a request, an acceptance, a decline), `checkpoint`, the lifecycle,
