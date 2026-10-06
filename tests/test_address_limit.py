@@ -392,6 +392,16 @@ class ProxyTests(AddressCase):
         self.assertEqual(status, 201, body)
 
     @needs_addresses
+    def test_every_method_is_under_the_limit(self):
+        self.serve(client_seconds=30, address_limit=1, trusted_proxies=(PROXY,))
+        self.assertTrue(self.httpd.request_begins(FAR))
+        for method in ('GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'):
+            status, _, response = self.forwarded(FAR, method=method, path='/v1/projects')
+            self.assertEqual((method, status, response.getheader('Retry-After')), (method, 503, '1'))
+            self.assertNotEqual(self.forwarded(OTHER, method=method, path='/v1/projects')[0], 503, method)
+        self.assertEqual(self.httpd.turned_away_for_address, 6)
+
+    @needs_addresses
     def test_a_forwarded_header_from_a_peer_that_is_not_the_proxy_changes_nothing(self):
         self.serve(client_seconds=30, address_limit=1, trusted_proxies=(PROXY,))
         self.assertTrue(self.httpd.request_begins(FAR))
