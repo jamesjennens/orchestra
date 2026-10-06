@@ -300,25 +300,61 @@ service bounds what such a connection costs, in all three shapes:
 
 **Log-in attempts need no credentials, so their cost is bounded.** A password
 check takes 16 MiB of memory for about a tenth of a second, and they are made
-one at a time. Two bounds keep a flood of attempts, with any user names, from
-costing more than that:
+one at a time. Three bounds keep a flood of attempts, with any user names, from
+taking the memory of the host or the log-in of everybody else:
 
 - Every check is computed in one thread of the web process, so the memory of
-  one check is what the process keeps, whatever the number of connections.
-  Measured on koopa with 50, 190 and 400 attempts at the same moment: the web
-  process went from 34 MB to a peak of 52 to 54 MB and stayed there. (Before,
-  190 attempts left 3 GB resident: each connection's thread kept its own
-  16 MiB. That was the C allocator, not the checks running at once.)
+  one check is what the checks keep, whatever the number of connections.
+  (Before, 190 attempts at the same moment left 3 GB resident: each
+  connection's thread kept its own 16 MiB. That was the C allocator, not the
+  checks running at once.)
 - At most **16 log-ins are in flight at once** (one being checked, the others
-  waiting their turn, 1.6 seconds at most). One more is answered at once with
-  503 `busy`, `Retry-After: 5`, "Too many people are logging in at this moment.
-  Try again in a few seconds.", whatever the user name: nothing is checked and
-  nothing is counted against the name. Somebody who is already logged in is
-  not affected.
+  waiting their turn). One more is answered at once with 503 `busy`,
+  `Retry-After: 5`, "Too many people are logging in at this moment. Try again
+  in a few seconds.", whatever the user name: nothing is checked, nothing is
+  counted against the name, and no count is cleared.
+- Of those 16 places **one client address holds at most 4** (an IPv6 address
+  with its /64; behind the approved proxy the forwarded address, as for the
+  connections above). One more from it is answered in the same way, with "Too
+  many log-ins from your address are being checked at this moment. Try again
+  in a few seconds." So whatever one address sends, twelve places are left to
+  everybody else, and somebody at another address waits behind a few checks.
 
-What this does not do: while attempts keep arriving faster than 10 a second,
-a person logging in may be told to try again; the lockout per user name and
-address is unchanged.
+Measured on koopa over HTTPS with the real service, made-up user names sent
+in a loop from ONE address by 20, 40 and 100 clients for 45 seconds each,
+while a person at another address logs in with the right password (told to
+try again, they wait the 5 seconds and do):
+
+| State document | Clients | The person gets in after | Web process, peak |
+|---|---|---|---|
+| new (no audit entries) | 20 / 40 / 100 | 0.7 s / 1.0 s / 0.7 s | 88 / 119 / 147 MB |
+| 2.8 MB (audit log full: 10,000 entries) | 20 / 40 / 100 | 5.5 s / 1.5 s / 3.0 s | 230 / 343 / 397 MB |
+
+(Before any of this, with the full audit log: 5.8 s, 11.5 s and not within a
+minute, and a peak of 2.5 GB.) The process starts at 38 MB (51 MB with the
+full audit log).
+
+What this does not do, measured in the same runs:
+
+- **A person at the flooding address itself is kept out** for as long as the
+  flood runs (12 tries in 60 seconds, all told to try again): its four places
+  are always taken. An office behind one router whose own machine floods the
+  service shuts its own people out of logging in, and nobody else.
+- **Four or more addresses acting together can still take all 16 places.**
+- **Somebody who is already logged in is slowed down.** Their read took a
+  median of 1.5 to 3.4 seconds during the flood with a new state document and
+  5 to 15 seconds with the full audit log (0.1 to 0.2 seconds without a
+  flood): the web process is busy with the flood's connections and TLS
+  handshakes, and every failed log-in that is checked is audited and rewrites
+  the whole state document under the state lock.
+- **Memory is not flat under a sustained flood.** The checks keep 16 MiB; the
+  rest of the peak above is the state document being written again for every
+  checked attempt, in the thread of each connection. It grows with the size
+  of the state document, and it stays resident afterwards (160 MB and 398 MB
+  after these runs).
+- How many checks a second the service makes depends on the state document:
+  7 to 11 with a new one and about 3 with the full audit log. The lockout
+  per user name and address is unchanged.
 
 ## External scheduler commands
 
