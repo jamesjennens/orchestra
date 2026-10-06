@@ -19,14 +19,6 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-try:
-    import fcntl
-except ImportError:
-    stub = types.ModuleType('fcntl')
-    stub.LOCK_EX = 1
-    stub.flock = lambda *a, **k: None
-    sys.modules['fcntl'] = stub
-
 KIT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(KIT))
 sys.path.insert(0, str(KIT / 'tests'))
