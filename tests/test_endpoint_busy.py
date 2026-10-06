@@ -164,6 +164,28 @@ class EndpointTests(unittest.TestCase):
                   ('a link to a directory', lambda marker: marker.symlink_to(marker.parent / 'projects')),
                   ('a FIFO', lambda marker: __import__('os').mkfifo(str(marker))))
 
+    def release_readers_of(self, fifo):
+        """Were a read to wait on the FIFO, this lets the test end, and fail on the time it took.
+
+        From 6 seconds on, the other end is opened and closed again and again until the
+        returned event is set, so that every reader that waits is released, not only the first.
+        """
+        import os
+        import threading
+        done = threading.Event()
+
+        def release():
+            if done.wait(6):
+                return
+            while not done.wait(0.1):
+                try:
+                    os.close(os.open(str(fifo), os.O_WRONLY | os.O_NONBLOCK))
+                except OSError:
+                    pass                                          # no reader is waiting just now
+        threading.Thread(target=release, daemon=True).start()
+        self.addCleanup(done.set)
+        return done
+
     def through_main(self, root, request):
         printed = io.StringIO()
         with mock.patch.object(sys, 'argv', ['endpoint.py', '--root', str(root)]), \
@@ -187,11 +209,7 @@ class EndpointTests(unittest.TestCase):
                 marker = root / 'deployment.private.json'
                 marker.unlink()
                 make(marker)
-                # Were the read to wait on the FIFO, this lets the test end (and fail on the time).
-                rescue = threading.Timer(8, lambda: os.close(os.open(str(marker), os.O_RDWR | os.O_NONBLOCK))
-                                         if state == 'a FIFO' else None)
-                rescue.start()
-                self.addCleanup(rescue.cancel)
+                rescue = self.release_readers_of(marker) if state == 'a FIFO' else threading.Event()
                 before = sorted(str(path) for path in root.rglob('*') if path.name != '.coordination.lock')
                 started = time.monotonic()
                 for action, args in (('bd', ['create', '--title', 'x', '--json']), ('work', ['start', 'pp-1']),
@@ -206,7 +224,7 @@ class EndpointTests(unittest.TestCase):
                     self.assertEqual((answer['returncode'], answer.get('fault')), (2, 'configuration'), (action, answer))
                     self.assertIn(str(marker), answer['stderr'])           # for the service's log
                 self.assertLess(time.monotonic() - started, 5)           # nothing waited, on a FIFO either
-                rescue.cancel()
+                rescue.set()
                 self.assertEqual(sorted(str(path) for path in root.rglob('*') if path.name != '.coordination.lock'), before)
                 # An action that needs nothing from the file is answered in every one of these states.
                 with self.assertRaises(ValueError) as missing:
@@ -223,6 +241,7 @@ class EndpointTests(unittest.TestCase):
                 marker = root / 'deployment.private.json'
                 marker.unlink()
                 make(marker)
+                rescue = self.release_readers_of(marker) if state == 'a FIFO' else None
                 started = time.monotonic()
                 for reader in (admin.config, admin.environment, lambda r: admin.deployment_document(r / 'deployment.private.json')):
                     with self.assertRaises((OSError, admin.ConfigurationUnreadable)) as refused:
@@ -232,6 +251,8 @@ class EndpointTests(unittest.TestCase):
                     else:
                         self.assertEqual(str(refused.exception), 'Deployment configuration %s is not a regular file' % marker)
                 self.assertLess(time.monotonic() - started, 3)
+                if rescue is not None:
+                    rescue.set()
         # A link to a regular file is read, as before.
         with tempfile.TemporaryDirectory() as tmp:
             root = self.project(tmp, '{}')
