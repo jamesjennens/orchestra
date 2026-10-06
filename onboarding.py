@@ -22,6 +22,22 @@ DOCUMENTS = {
     'decision-template': 'templates/DECISION.md',
 }
 PROJECT_LIMIT = 8000
+#: The start document is put in front of every worker by ``onboard``: it is kept short.
+START_LIMIT = 8000
+#: The bound for a document the KIT ships (every other name in ``DOCUMENTS``), in bytes.
+#:
+#: It is not a limit on how much the kit may say. Those documents are the kit's own files:
+#: nobody at an installation writes them, and nobody there can "shorten" one. The bound
+#: protects against a different thing: the file at that path being replaced by something
+#: that is not the document (a log, a dump, a device), which the endpoint would otherwise
+#: read and send without limit. One megabyte is eight times the longest document today
+#: (CLI_CONTRACT.md, 118 KB) and half of what one request or answer may carry on the wire
+#: (2 MB), so an answer always fits. tests/test_document_catalog.py fails when a catalogued
+#: document is missing, empty or over its bound, so a document cannot outgrow it unnoticed.
+#: The limit this replaces, 64,000 bytes, was one number for the kit's documents and for
+#: text people write; REVIEWS.md and CLI_CONTRACT.md outgrew it and were refused on every
+#: installation (kittrial-5bb.151).
+KIT_DOCUMENT_LIMIT = 1_000_000
 ENDPOINT_REFERENCE = re.compile(r'(?:[A-Za-z]:)?[\\/][A-Za-z0-9_.~\\/-]*\.py')
 ENDPOINT_REFUSAL = 'serves only'
 
@@ -166,7 +182,15 @@ def web_action(project_path, project, request, authority_config):
                        require_authority=True)
 
 
-def read_document(base, relative, limit=64000):
+def read_document(base, relative, limit, kit_document=None):
+    """The whole text of one document under ``base``, or a refusal; never a part of it.
+
+    ``limit`` is in bytes and has no default: the caller says which bound applies
+    (``PROJECT_LIMIT`` for text an owner or operator wrote, ``START_LIMIT``,
+    ``KIT_DOCUMENT_LIMIT``). ``kit_document`` is the catalogue name of a document the kit
+    ships: a refusal for one says what is wrong with the installation, not that somebody
+    should shorten it.
+    """
     base = Path(base).resolve()
     path = base / relative
     if any(p.is_symlink() for p in [path, *path.parents] if p != base and base in p.parents):
@@ -177,11 +201,21 @@ def read_document(base, relative, limit=64000):
         raise ValueError('Onboarding document missing; ask the operator to configure/update this installation')
     with path.open('rb') as f:
         data = f.read(limit + 1)
+    if len(data) > limit and kit_document is not None:
+        raise ValueError('The kit document "%s" is larger than a kit document can be (over %d bytes), so the file at '
+                         'that place in this installation is not the one the kit ships. Nothing was returned; ask the '
+                         'operator to reinstall the kit. The same text is in the repository (%s)'
+                         % (kit_document, limit, relative))
     if len(data) > limit:
         raise ValueError('Onboarding document exceeds size limit; operator must shorten it (no partial instructions returned)')
     result = data.decode('utf-8-sig')
     if not result.strip():raise ValueError('Onboarding document is empty')
     return result
+
+def read_kit_document(kit, name):
+    """A catalogued document the kit ships, whole (``docs NAME``)."""
+    return read_document(kit, DOCUMENTS[name], KIT_DOCUMENT_LIMIT, kit_document=name)
+
 
 def probe_endpoints(text, project, kit):
     """Warn about an onboarding document that names a project-restricted endpoint.
@@ -225,11 +259,11 @@ def execute(kit, project_path, project, actor, action, args, endpoint=None):
         if len(args) != 1 or args[0] not in {'project', *DOCUMENTS}:
             raise ValueError('Unknown document; run docs for the fixed catalog')
         if args[0] == 'project':return read_document(project_path, 'ONBOARDING.md', PROJECT_LIMIT)
-        return read_document(kit, DOCUMENTS[args[0]])
+        return read_kit_document(kit, args[0])
     if action != 'onboard' or args:raise ValueError('Use onboard without arguments')
     # Read both before constructing output: never return a plausible but incomplete start.
     entry = read_document(project_path, 'ONBOARDING.md', PROJECT_LIMIT)
-    start = read_document(kit, DOCUMENTS['start'], 8000)
+    start = read_document(kit, DOCUMENTS['start'], START_LIMIT)
     metadata = report(kit)
     in_use = Path(endpoint).resolve() if endpoint is not None else Path(kit).resolve()/'endpoint.py'
     return (f'# Orchestra onboarding\n\nProject: {project}\nSession actor: {actor}\n'

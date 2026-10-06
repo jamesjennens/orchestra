@@ -2,6 +2,21 @@
 
 Use your existing client prefix for the Beads commands below. This guide is available as `docs worker-guide`. Keep project-specific dependency commands in the repository or server project entry point.
 
+## Which document for what
+
+`docs` lists the documents this installation serves; `docs NAME` returns one, always whole. Read the short ones first and keep the long ones for looking things up:
+
+| Read | When | Size |
+|---|---|---|
+| `docs start`, `docs workflow`, this guide | once, before the first task | short (6 to 22 KB) |
+| `docs briefings` | before the first checkpoint | 22 KB |
+| `docs reviews` | when you deliver a contribution or answer a review; search it for the operation you are about to write | long (about 70 KB) |
+| `docs operations` | when a task involves lifecycle evidence, merge slots or releases | 44 KB |
+| `docs cli-contract` | as a reference for one command's exact output and limits; search for the command, do not read it through | very long (about 120 KB) |
+| the templates (`docs contribution-template` and the others) | when you write that payload | under 2 KB each |
+
+The same text is in the repository under `docs/` and `templates/`, where a clone lets you search it. A kit document is never returned in part: if `docs NAME` is refused, nothing was returned, and the refusal says what is wrong with the installation.
+
 ## Preflight before claiming implementation
 
 Read the prospective task first, then verify:
