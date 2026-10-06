@@ -489,7 +489,41 @@ the result after the last.
   "The project could not be created and nothing was made. Try again; if it fails again,
   ask an operator of the server." The same request can be sent again. The cause is not
   in the answer (it may name paths and commands of the host); the operator finds it in
-  `<root>/project-creations/last-failure.txt`.
+  `<root>/project-creations/last-failure.txt` (the newest failure, the step it happened
+  at, and the four before it under `earlier`).
+- **No answer to a person carries host text** (kittrial-5bb.143). A creation answers a
+  refusal with one of its own sentences and nothing else, whatever went wrong on the
+  host: a record that cannot be read, a directory that cannot be written, a journal
+  that is not a database. The sentence is chosen by what is on the host, not from the
+  error:
+  - a creation record of that name that cannot be read: "Project name NAME is not
+    available: choose another name". The name is held until an operator has set the
+    record aside (below). No request can adopt or resume such a record, whatever it
+    claims.
+  - the project was made and the last step failed (the operation journal
+    `project-creations/operations.sqlite3` could not be used): "Project NAME was made
+    on the server, but it could not be registered in the web interface. Ask an operator
+    of the server to look at it. When that is repaired, create it again with the same
+    name: nothing is made twice, it is only registered. Do not create it under another
+    name." It is listed for a superuser as made and not registered. After the repair
+    the same person sends the creation again and it is registered.
+  - The web service applies the same rule on its side: it puts the endpoint's line in
+    its 409 only when the line is, whole, one of those sentences. Anything else
+    becomes "The project could not be created, or was only partly made. Ask an
+    operator of the server to look before you try again.", and the line goes to the
+    service's log (`create-project NAME answered a line that is not a creation
+    sentence: ...`). This also covers an endpoint older than the rule.
+- **A creation record that cannot be read** (not JSON, the wrong shape, another
+  project's) reads `damaged` in both lists. It holds its name, and it counts toward the
+  server's limit of project databases, because it may stand for one. A creation of
+  another name is not held up by it. The operator looks at the file and then runs
+  `admin.py remove-creation NAME --actor OPERATOR --reason REASON`: for a damaged
+  record that command **only sets the record aside**, as
+  `project-creations/NAME.json.damaged-<UTC stamp>`, and touches nothing else, because
+  what the record stood for is not known. If nothing is under `projects/NAME` the name
+  is then free. If something is, it is then a project with no creation record: a
+  superuser registers it if it is complete, or the operator retires it
+  (`admin.py retire-project NAME`).
 - **Something was made** (the database exists; a later step stopped): the request
   answers 409 with a sentence that names the project and says an operator must finish
   or remove it. Nothing is registered in the web interface, so no member, list or agent

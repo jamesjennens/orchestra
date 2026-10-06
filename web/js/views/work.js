@@ -162,7 +162,7 @@ export async function incompleteCreations(ctx) {
           h('p', { class: 'small' }, 'Started by ', item.by_name || item.by || 'unknown', item.started_at ? [' ', time(item.started_at)] : null, item.stage && item.state !== 'running' ? `; stopped at the step “${item.stage}”.` : '.'),
           item.what ? h('p', { class: 'small muted' }, item.what) : null,
           item.finish ? [h('p', { class: 'small muted' }, 'To finish it:'), h('pre', { class: 'json' }, item.finish)] : null,
-          item.remove ? [h('p', { class: 'small muted' }, item.state === 'stalled' ? 'To remove it (nothing was made, so the name is free again):' : 'To remove it (the name stays retired):'), h('pre', { class: 'json' }, item.remove)] : null);
+          item.remove ? [h('p', { class: 'small muted' }, item.state === 'stalled' ? 'To remove it (nothing was made, so the name is free again):' : item.state === 'damaged' ? 'To set the damaged record aside (it is kept, and nothing else is touched):' : 'To remove it (the name stays retired):'), h('pre', { class: 'json' }, item.remove)] : null);
       })));
 }
 

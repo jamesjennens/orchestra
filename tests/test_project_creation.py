@@ -609,5 +609,108 @@ class BackupHintTests(Operators):
         self.assertEqual(admin.unfinished_creation_hint(self.root / 'nowhere', ['x']), '')
 
 
+class DamagedRecordTests(Operators):
+    """A creation record that cannot be read, and what holds a retired name (kittrial-5bb.143)."""
+
+    def damage(self, name='alpha', text='{not json'):
+        pc.records_dir(self.root).mkdir(exist_ok=True)
+        path = pc.records_dir(self.root) / (name + '.json')
+        path.write_text(text, encoding='utf-8')
+        return path
+
+    def test_it_is_listed_with_the_exact_command_and_holds_a_place_on_the_server(self):
+        self.damage()
+        listed = pc.attention(self.root)
+        self.assertEqual([(item['project'], item['state'], item['by']) for item in listed], [('alpha', 'damaged', None)])
+        self.assertIn('admin.py remove-creation alpha --actor OPERATOR --reason REASON', listed[0]['command'])
+        self.assertIn('alpha.json.damaged-STAMP', listed[0]['command'])
+        self.assertIn('admin.py retire-project alpha', listed[0]['command'])
+        self.assertEqual(sorted(pc.server_names(self.root)), ['alpha'])
+        self.assertEqual(pc.holds(self.root, ALICE), [])               # it names nobody, so it is nobody's
+
+    def test_no_request_can_adopt_or_resume_it(self):
+        for text in ('{not json', json.dumps({'project': 'alpha', 'by': ALICE, 'state': 'finished'}),
+                     json.dumps({'project': 'beta', 'by': ALICE, 'state': 'created'}), '[]'):
+            with self.subTest(record=text[:30]):
+                path = self.damage(text=text)
+                with self.assertRaises(ValueError) as caught:
+                    self.create()
+                self.assertNotIsInstance(caught.exception, pc.NothingMade)   # not a sentence for a person: see create_action
+                self.assertEqual(self.calls, [])
+                self.assertFalse((self.root / 'projects' / 'alpha').exists())
+                self.assertEqual(path.read_text(encoding='utf-8'), text)
+                self.assertIn('is damaged', pc.registrable(self.root, 'alpha'))
+
+    def test_remove_creation_sets_it_aside_and_touches_nothing_else(self):
+        path = self.damage()
+        result = pc.remove(self.root, 'alpha', 'ops', 'unreadable record', retire=self.retire)
+        self.assertEqual((result['removed'], result['name'], result['by']), ('damaged-record', 'free', None))
+        self.assertRegex(result['kept_as'], r'^alpha\.json\.damaged-[0-9]{8}T[0-9]{6}Z$')
+        self.assertFalse(path.exists())
+        self.assertEqual((pc.records_dir(self.root) / result['kept_as']).read_text(encoding='utf-8'), '{not json')
+        self.assertEqual((self.retired, pc.attention(self.root), sorted(pc.server_names(self.root))), ([], [], []))
+        # The name is free again: the next request creates it.
+        self.assertEqual(self.create()['status'], 'created')
+
+    def test_set_aside_twice_in_one_second_keeps_both(self):
+        first = pc.keep_damaged_record(self.root, self.damage().stem)
+        second = pc.keep_damaged_record(self.root, self.damage(text='[]').stem)
+        self.assertNotEqual(first.name, second.name)
+        self.assertEqual((first.read_text(encoding='utf-8'), second.read_text(encoding='utf-8')), ('{not json', '[]'))
+
+    def test_with_a_project_directory_it_leaves_a_project_with_no_creation_record(self):
+        self.create()                                                  # a finished project ...
+        self.damage()                                                  # ... whose record was then damaged
+        before = sorted(str(path.relative_to(self.root)) for path in (self.root / 'projects').rglob('*'))
+        result = pc.remove(self.root, 'alpha', 'ops', 'unreadable record', retire=self.retire)
+        self.assertEqual((result['removed'], result['name']), ('damaged-record', 'a project with no creation record'))
+        self.assertEqual(self.retired, [])                             # never retired on a guess
+        self.assertEqual(sorted(str(path.relative_to(self.root)) for path in (self.root / 'projects').rglob('*')), before)
+        self.assertIsNone(pc.registrable(self.root, 'alpha'))          # a superuser may register it
+        with self.assertRaises(pc.NothingMade):                        # and no web request can create over it
+            self.create(account=BOB)
+
+    def test_it_still_needs_a_listed_operator_and_a_reason(self):
+        path = self.damage()
+        with self.assertRaises(ValueError):
+            pc.remove(self.root, 'alpha', 'mallory', 'why', retire=self.retire)
+        with self.assertRaises(ValueError):
+            pc.remove(self.root, 'alpha', 'ops', ' ', retire=self.retire)
+        self.assertTrue(path.exists())
+
+    def test_a_retired_name_is_held_by_its_directory_not_by_the_journal(self):
+        """`retired/journal.jsonl` is an audit trail that nothing reads; `retired/NAME-STAMP` holds the name."""
+        retired = self.root / admin.RETIRED_DIR
+        (retired / 'alpha-20260101T000000Z').mkdir(parents=True)
+        journal = retired / admin.RETIRE_JOURNAL
+        for number, (label, prepare) in enumerate((('a broken line', lambda: journal.write_text('{"action": "retire"\nnot json\n', encoding='utf-8')),
+                               ('not text', lambda: journal.write_bytes(b'\xff\xfe\x00')),
+                               ('absent', journal.unlink))):
+            with self.subTest(journal=label):
+                prepare()
+                with self.assertRaises(pc.NothingMade) as caught:
+                    self.create()
+                self.assertEqual(str(caught.exception), pc.NOT_AVAILABLE % 'alpha')
+                self.assertEqual([call for call in self.calls if call[0] == 'alpha'], [])
+                self.assertEqual(self.create('beta%d' % number)['status'], 'created')   # other names are not held up
+        self.assertIn('alpha', pc.server_names(self.root))
+
+    def test_the_failure_note_keeps_the_newest_and_a_few_before_it(self):
+        for number in range(8):
+            pc.note_failure(self.root, 'p%d' % number, ALICE, RuntimeError('failure %d' % number), step='work')
+        noted = json.loads((pc.records_dir(self.root) / pc.FAILURE_FILE).read_text(encoding='utf-8'))
+        self.assertEqual((noted['project'], noted['step'], noted['error']), ('p7', 'work', 'RuntimeError: failure 7'))
+        self.assertEqual([entry['project'] for entry in noted['earlier']], ['p6', 'p5', 'p4', 'p3'])
+        self.assertNotIn('earlier', noted['earlier'][0])
+        # A note that cannot be written, or an old one that cannot be read, never stops the answer.
+        for unreadable in ('not json', '[' * 200000, '[]', '{"earlier": 7}'):
+            with self.subTest(old_note=unreadable[:12]):
+                (pc.records_dir(self.root) / pc.FAILURE_FILE).write_text(unreadable, encoding='utf-8')
+                pc.note_failure(self.root, 'p9', ALICE, RuntimeError('x'))
+                noted = json.loads((pc.records_dir(self.root) / pc.FAILURE_FILE).read_text(encoding='utf-8'))
+                self.assertEqual((noted['project'], [entry for entry in noted['earlier'] if 'project' in entry]), ('p9', []))
+        pc.note_failure(self.root / 'no' / 'such' / 'root', 'p9', ALICE, RuntimeError('x'))
+
+
 if __name__ == '__main__':
     unittest.main()
