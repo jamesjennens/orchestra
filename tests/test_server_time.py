@@ -272,12 +272,33 @@ class HttpTests(test_http_agents.AgentHarness):
                                                    'server_time': '2026-10-06T07:50:12+00:00'})
         with mock.patch.object(self.store, 'now', return_value=1791277200.0):
             self.assertEqual(http_service.written_at(self.service), '2026-10-06T09:00:00+00:00')
-        # A time an earlier request of this thread left behind is not given to the next write.
-        http_service.WRITTEN.at = '2026-01-01T00:00:00+00:00'
-        with mock.patch.object(self.store, 'now', return_value=1791273012.0):
-            made = self.request('POST', '/v1/accounts', {'username': 'amy'}, token=self.admin)
-        self.assertEqual(made.data['server_time'], '2026-10-06T07:50:12+00:00')
 
+    def test_a_time_an_earlier_request_left_behind_is_not_given_to_the_next_write(self):
+        """On one connection the same thread serves request after request. A write that took the endpoint's
+        time and then failed must not hand that time to the next write."""
+        import http.client
+        real = self.service.create_user
+        left = []
+
+        def fails_after_an_endpoint_write(*args, **kwargs):
+            if not left:
+                left.append(True)
+                http_service.WRITTEN.at = '2026-01-01T00:00:00+00:00'     # in the serving thread
+                raise http_service.conflict('refused after the endpoint had answered')
+            return real(*args, **kwargs)
+        connection = http.client.HTTPConnection('127.0.0.1', self.port, timeout=15)
+        self.addCleanup(connection.close)
+        headers = {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + self.admin}
+
+        def post(username):
+            connection.request('POST', '/v1/accounts', body=json.dumps({'username': username}), headers=headers)
+            response = connection.getresponse()
+            return response.status, json.loads(response.read())
+        with mock.patch.object(self.service, 'create_user', side_effect=fails_after_an_endpoint_write),                 mock.patch.object(self.store, 'now', return_value=1791273012.0):
+            self.assertEqual(post('amy')[0], 409)
+            status, made = post('amy')                            # the same connection, so the same thread
+        self.assertEqual(left, [True])
+        self.assertEqual((status, made['server_time']), (201, '2026-10-06T07:50:12+00:00'))
 
 if __name__ == '__main__':
     unittest.main()

@@ -868,8 +868,11 @@ write out itself (accounts, members, agents, credentials) it is the service's cl
 The same request sent again with its `Idempotency-Key` is answered with the stored
 body, so with the time of the write and not of the retry. Reads, refusals and uncertain
 answers carry none. A log-in and a log-out carry none either (they make or end a
-session and record nothing in a project), and an answer whose body is not a JSON object
-has no place for it. The web pages do not show it.
+session and record nothing in a project). An answer whose body is not a JSON object has
+no top level to put it at: on the endpoint backend a task change (`PATCH .../tasks/ID`)
+and a claim (`POST .../tasks/ID/claim`) answer with the list bd prints, and so carry
+none; read the task afterwards for its `updated_at`, or use the client over SSH, whose
+answer has the field for every write. The web pages do not show it.
 
 **Retry contract.** An exact retry sent no more than 29 days
 (`JOURNAL_RETRY_HORIZON_SECONDS`, the 30-day tombstone horizon minus the 24 h skew
