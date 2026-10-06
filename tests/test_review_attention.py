@@ -205,6 +205,10 @@ class Shared:
         self.add_agent('olive', 'Egret')
         self.change(one[0], assignee=None)
         self.assertIn('delivered by "Kestrel (agent of carl)" (%s)' % kestrel, line('rita', one[0]))
+        # The name is looked up for the author itself: here the author is no task's assignee any more.
+        self.change(two[0], assignee=osprey)
+        self.assertIn('delivered by "Kestrel (agent of carl)" (%s)' % kestrel, line('olive', one[0]))
+        self.assertIn('delivered by "Kestrel (agent of carl)" (%s)' % kestrel, line('olive', two[0]))
 
     def brief_without_the_author(self):
         """A brief whose contribution does not say who delivered it."""
