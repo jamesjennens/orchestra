@@ -856,6 +856,10 @@ DEPLOYMENT_LOCK_WAIT_SECONDS = 10
 DEPLOYMENT_LOCK_POLL_SECONDS = 0.05
 
 
+class DeploymentLockBusy(ValueError):
+    """``deployment_config_lock`` gave up on a lock another change still holds; nothing was changed."""
+
+
 @contextmanager
 def deployment_config_lock(root):
     """Serialise one read-modify-write of deployment.private.json with an exclusive flock.
@@ -870,7 +874,9 @@ def deployment_config_lock(root):
 
     A holder that does not finish within ``DEPLOYMENT_LOCK_WAIT_SECONDS`` makes the change
     refuse with nothing changed, rather than wait for good; reads never take the lock, and
-    a killed holder releases it with its process. POSIX-only, like every other
+    a killed holder releases it with its process. Once it is held, temporary copies an
+    interrupted write left beside the file are removed (``remove_private_write_leftovers``).
+    POSIX-only, like every other
     coordination lock in the kit: on a host without ``fcntl`` the atomic file writes still
     stand. The lock file holds no state and is never backed up.
     """
@@ -890,14 +896,44 @@ def deployment_config_lock(root):
                     break
                 except BlockingIOError:
                     if time.monotonic()>=deadline:
-                        raise ValueError('Nothing was changed: another change to deployment.private.json still holds '
+                        raise DeploymentLockBusy('Nothing was changed: another change to deployment.private.json still holds '
                                          'its lock (%s) after %d s. Run the command again; if this repeats, find '
                                          'the process holding it (for example `fuser %s`).'
                                          %(REVIEW_WRITES_LOCK,DEPLOYMENT_LOCK_WAIT_SECONDS,REVIEW_WRITES_LOCK)) from None
                     time.sleep(DEPLOYMENT_LOCK_POLL_SECONDS)
+        if fcntl is not None:
+            # Only while the lock is held: no writer of this kit is mid-write now, so a
+            # temporary copy beside the file is a leftover, never another writer's.
+            remove_private_write_leftovers(root)
         yield handle
     finally:
         handle.close()
+
+def remove_private_write_leftovers(root):
+    """Remove temporary copies of deployment.private.json left by an interrupted write.
+
+    ``atomic_private_write`` writes a sibling ``.deployment.private.json.XXXXXXXX`` (the
+    ``mkstemp`` name) and renames it over the file; a writer killed between the two
+    leaves that copy behind, and it holds the full configuration with the Dolt password
+    (kittrial-5bb.142). The next locked write removes it. Returns the names removed.
+    """
+    removed=[]
+    pattern=re.compile(r'\.deployment\.private\.json\.[A-Za-z0-9_]{8}')
+    try:
+        names=os.listdir(root)
+    except OSError:
+        return removed
+    for name in sorted(names):
+        if not pattern.fullmatch(name):continue
+        try:
+            os.unlink(os.path.join(str(root),name))
+        except OSError:
+            continue
+        removed.append(name)
+    if removed:
+        print('Removed %d temporary cop%s of deployment.private.json left by an interrupted write: %s'
+              %(len(removed),'y' if len(removed)==1 else 'ies',', '.join(removed)),file=sys.stderr)
+    return removed
 
 #: The name the switch code and kittrial-5bb.110's tests use.
 review_writes_lock=deployment_config_lock
@@ -3698,13 +3734,13 @@ def using_last_complete_sidecar(root,source):
     fallback=last_complete_sidecar_path(root,source)
     return complete_sidecar(bundle) is None and complete_sidecar(fallback) is not None
 
-def restore_coordination(root,source,destination,restore_operators=False,restore_verifiers=False):
+def restore_coordination(root,source,destination,restore_operators=False,restore_verifiers=False,authority=True):
     from coordination import atomic
     path=project_dir(root,destination)
     files=coordination_backup(root,source)
     if files is None:
         print('Legacy backup has no coordination journal. Reconcile outstanding child requests and merge ownership before accepting writes.')
-        return
+        return False
     if using_last_complete_sidecar(root,source):
         print('The canonical coordination sidecar backups/%s.coordination.json is not complete, so this restore '
               'uses the durable last-complete copy %s (the previous complete generation, restored with the '
@@ -3776,6 +3812,19 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
             from feedback import validate_quarantine_record
             _atomic_write_bytes(target,validate_quarantine_record(name,record))
         else:atomic(target,record)
+    if authority:restore_authority(root,source,restore_operators,restore_verifiers)
+    return True
+
+def restore_authority(root,source,restore_operators=False,restore_verifiers=False):
+    """Report, and with the explicit flags re-grant, the deployment authority a backup records.
+
+    ``restore-new`` runs this LAST, after the coordination files and the operation journal
+    are in place (kittrial-5bb.142): a merge refused because another change still holds the
+    deployment lock then leaves a completed restore with those entries not re-granted and
+    the exact commands to re-grant them, never a destination that is half-restored and that
+    a second ``restore-new`` refuses as existing. Each list is attempted on its own, so a
+    refused operator merge does not skip the verifiers.
+    """
     # The native and coordination records (original comment plus its void
     # disposition) are restored by the writes above. Operator AUTHORITY is not:
     # the deployment allowlist is authority for every project, so a stale backup
@@ -3790,9 +3839,13 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
               '`admin.py --root ROOT operators add ACTOR`, or re-run this restore with --restore-operators to '
               're-establish the whole recorded allowlist.')
     elif missing:
-        added=merge_operators(root,missing)
-        if added:
-            print('Re-granted operator allowlist entries from the backup (--restore-operators): ' + ', '.join(added))
+        try:
+            added=merge_operators(root,missing)
+        except DeploymentLockBusy:
+            print(authority_not_regranted(root,'operators',missing),file=sys.stderr)
+        else:
+            if added:
+                print('Re-granted operator allowlist entries from the backup (--restore-operators): ' + ', '.join(added))
     # The verifiers list is the second deployment-wide authority (.60 section 5.2) and
     # follows the same rule: never re-granted by a restore on its own.
     unlisted=missing_verifiers(root,source)
@@ -3803,9 +3856,25 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
               'deliberately with `admin.py --root ROOT verifiers add ACTOR`, or re-run this restore with '
               '--restore-verifiers to re-establish the whole recorded list.')
     elif unlisted:
-        added=merge_verifiers(root,unlisted)
-        if added:
-            print('Re-granted capability verifiers from the backup (--restore-verifiers): ' + ', '.join(added))
+        try:
+            added=merge_verifiers(root,unlisted)
+        except DeploymentLockBusy:
+            print(authority_not_regranted(root,'verifiers',unlisted),file=sys.stderr)
+        else:
+            if added:
+                print('Re-granted capability verifiers from the backup (--restore-verifiers): ' + ', '.join(added))
+
+def authority_not_regranted(root,kind,actors):
+    """The notice for a restore whose ``--restore-operators``/``--restore-verifiers`` merge was refused."""
+    import shlex
+    flag='--restore-operators' if kind=='operators' else '--restore-verifiers'
+    commands=['admin.py --root %s %s add %s'%(shlex.quote(str(root)),kind,shlex.quote(actor)) for actor in actors]
+    # Not the refusal's own text: it says to run the command again, and a second
+    # restore-new into this destination is refused because the destination now exists.
+    return ('WARNING: the restore is complete, but %s from the backup were NOT re-granted (%s): %s. Another '
+            'change to deployment.private.json held its lock (%s) for more than %d s. Do not repeat the restore; '
+            're-grant them with:\n  %s'%(kind,flag,', '.join(actors),REVIEW_WRITES_LOCK,
+                                           DEPLOYMENT_LOCK_WAIT_SECONDS,'\n  '.join(commands)))
 
 def record_store_path(state):
     """The HTTP record store beside the service state document (``http_auth.Store``)."""
@@ -4808,13 +4877,16 @@ def finish_restore(root,args,snapshot):
     # already-configured destination in place; validate_backup_target refuses any
     # clone that was not re-pointed this way.
     run_bd(root,args.destination,['backup','init',str(root/'backups'/args.destination)])
-    restore_coordination(root,args.project,args.destination,
-                         restore_operators=args.restore_operators,
-                         restore_verifiers=args.restore_verifiers)
+    # The deployment authority merges come last (kittrial-5bb.142): they are the only step
+    # that waits on the deployment lock, and a refusal there must leave a complete restore.
+    sidecar=restore_coordination(root,args.project,args.destination,authority=False)
     restored=restore_journal(snapshot,
                              project_dir(root,args.destination)/JOURNAL_STORE_NAME)
     if restored is None:
         print('Backup has no operation-journal snapshot; the restored project starts with an empty identity journal.')
+    if sidecar:
+        restore_authority(root,args.project,restore_operators=args.restore_operators,
+                          restore_verifiers=args.restore_verifiers)
 
 def kit_refusal(error):
     """Whether a ``ValueError`` is one of the kit's own refusals: exactly ``ValueError``
