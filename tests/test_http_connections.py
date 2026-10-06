@@ -343,17 +343,20 @@ class SilentConnectionTests(Case):
         def start_and_wait(thread):
             real(thread)
             if getattr(getattr(thread, '_target', None), '__name__', '') == 'process_request_thread':
-                thread.join(10)
+                thread.join(60)
                 waited.append(thread.is_alive())
         with mock.patch.object(threading.Thread, 'start', start_and_wait):
             for _ in range(5):
                 status, _, _ = self.ask('GET', '/healthz')
                 self.assertEqual(status, 200)
-            until = time.monotonic() + 10                         # the answer comes before the thread has ended
+            # The answer comes before the thread has ended, and the accepting thread waits for each end in turn:
+            # the fifth may be some way behind the fifth answer (in CI, on Windows with 3.13, more than the ten
+            # seconds this waited at first, and the test read four for five).
+            until = time.monotonic() + 300
             while time.monotonic() < until and len(waited) < 5:
                 time.sleep(0.02)
         self.assertEqual(waited, [False] * 5)
-        time.sleep(self.httpd.REAP_EVERY * 3)
+        self.counted(0)
         self.assertEqual((self.httpd._serving, self.httpd._begun), ({}, set()))
         self.assertEqual((self.httpd.open_connections(), self.httpd.turned_away), (0, 0))
 
