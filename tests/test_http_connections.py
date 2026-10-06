@@ -58,7 +58,7 @@ class Case(unittest.TestCase):
             self.context = ssl.create_default_context(cafile=cert)
         store = Store(Path(tmp)/'state.json')
         Service.bootstrap_superuser(store, ADMIN, PASSWORD)
-        service = Service(store)
+        service = self.service = Service(store)
         self.httpd = http_service.create_server(service, http_service.InProcessBackend(service), host=host, port=0,
                                                 web_root=web_root, client_seconds=client_seconds, **more)
         thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
@@ -177,6 +177,29 @@ class SilentConnectionTests(Case):
             self.settled()
         self.assertEqual(self.httpd.cut_off, 1)
         self.assertNotIn('Traceback', logged.getvalue())
+        self.served()
+
+    def test_a_body_shorter_than_it_said_is_not_carried_out_and_not_answered(self):
+        """A request is its whole body. A log-in that ends early is not a log-in, and not an internal error."""
+        self.serve()
+        body = json.dumps({'username': ADMIN, 'password': PASSWORD}).encode('utf-8')
+        logged = io.StringIO()
+        with contextlib.redirect_stderr(logged):
+            short = self.silent(b'POST /v1/sessions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n'
+                                b'Content-Length: %d\r\n\r\n' % (len(body) + 40) + body)
+            short.shutdown(socket.SHUT_WR)                        # the client has finished, forty bytes early
+            short.settimeout(5)
+            received = b''
+            while True:
+                piece = short.recv(4096)
+                if not piece:
+                    break
+                received += piece
+            self.settled()
+        self.assertEqual(received, b'')
+        self.assertEqual(len(self.service.state['sessions']), 0)
+        self.assertNotIn('Traceback', logged.getvalue())
+        self.assertEqual(self.httpd.cut_off, 0)                   # it went away by itself, at once
         self.served()
 
     def test_an_idle_keep_alive_connection_is_served_again_inside_the_bound_and_closed_after_it(self):
