@@ -202,7 +202,9 @@ class NoUnguardedParseTests(unittest.TestCase):
         'http_auth.py': (3, "the service's own store"),
         'http_authority.py': (3, "the service's own store and journal"),
         'http_client.py': (2, "the service's answer, and a body typed on the caller's own machine"),
-        'http_service.py': (5, "the endpoint's answer to the service, and host configuration"),
+        'http_service.py': (7, "the endpoint's answer to the service, and host configuration; since kittrial-5bb.169 the "
+                               "answer is parsed in _parse_native, which catches the RecursionError of a deep row and takes "
+                               "the text apart row by row (two calls), and _row_head parses single string literals (two calls)"),
         'keyed_entries.py': (4, 'bd output'),
         'keyed_records.py': (3, 'bd output'),
         'lifecycle.py': (6, "bd output, plus the endpoint's release-query and group answers on the caller's machine (kittrial-5bb.107 rev3)"),
