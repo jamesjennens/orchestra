@@ -36,6 +36,7 @@ import json
 import time
 from pathlib import Path
 
+import record_json
 from coordination import atomic, identifier
 from recovery import configured_operators
 from requirements import ACCEPTANCE_FIELDS, SHA256_TEXT, content_hash, load_json
@@ -225,7 +226,7 @@ def apply_controlled_labels(run, task, current, spec, desired):
 
 
 def read_rows(run):
-    return [json.loads(line) for line in run(['export', '--all']).splitlines() if line.strip()]
+    return record_json.loads_rows(run(['export', '--all']))
 
 
 def find(rows, task):
@@ -424,8 +425,6 @@ def apply_native(payload, actor, run, project, spec, operator=False, operators=N
     task = (prior.get('id') if prior and not reusable and prior.get('id') else None) or explicit
     if task is None:
         task = spec.resolve_task(rows, payload, operator)
-    # Key uniqueness is checked against the pre-write read so a duplicate key is
-    # refused with zero native writes.
     spec.check_key_unique(rows, payload, task)
     if task is None:
         request_label = 'request:' + identity

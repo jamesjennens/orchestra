@@ -53,6 +53,7 @@ import unicodedata
 from pathlib import Path
 
 import keyed_records as core
+import record_json
 from coordination import atomic, identifier
 from export_requirements import parse_json
 from keyed_entries import CATALOG_SHOW_MAX, AnchoredKind, read_labelled
@@ -1078,14 +1079,18 @@ def read_key_rows(run, key, operation_id=None):
     labels = [key_label(key)]
     if operation_id is not None:
         labels.append('request:' + content_hash({'operation_id': operation_id}))
-    listed = json.loads(run(['list', '--label', TYPE_LABEL, '--label-any', ','.join(labels), '--all', '--limit',
+    listed = record_json.loads_array_rows(run(['list', '--label', TYPE_LABEL, '--label-any', ','.join(labels), '--all', '--limit',
                              '0', '--json']) or '[]')
-    return AnchoredKind.shown(run, [row['id'] for row in listed or []
-                                    if isinstance(row, dict) and isinstance(row.get('id'), str)])
+    id_labels = {r['id']: r.get('labels', []) for r in listed or [] if isinstance(r, dict) and 'id' in r}
+    rows = AnchoredKind.shown(run, list(id_labels.keys()))
+    for r in rows:
+        if isinstance(r, dict) and r.get('id') in id_labels and not r.get('labels'):
+            r['labels'] = list(id_labels[r['id']])
+    return rows
 
 
 def _listed(run, *filters):
-    listed = json.loads(run(['list', *filters, '--all', '--limit', '0', '--json']) or '[]')
+    listed = record_json.loads_array_rows(run(['list', *filters, '--all', '--limit', '0', '--json']) or '[]')
     return [row['id'] for row in listed or [] if isinstance(row, dict) and isinstance(row.get('id'), str)]
 
 
@@ -1144,7 +1149,10 @@ def read_catalog(run):
     if len(ids) <= CATALOG_SHOW_MAX:
         return AnchoredKind.shown(run, ids)
     wanted = set(ids)
-    exported = (json.loads(line) for line in run(['export', '--all']).splitlines() if line.strip())
+    exported = record_json.loads_rows(run(['export', '--all']))
+    for r in exported:
+        if r.get('malformed') and (not wanted or r.get('id') in wanted):
+            raise ValueError('Unreadable proposal anchor (%s): %s' % (r.get('id') or 'unknown', r.get('error') or 'malformed'))
     return [row for row in exported if isinstance(row, dict) and row.get('id') in wanted]
 
 
@@ -1166,6 +1174,9 @@ def find_entry(rows, key, operators=None, resolve=None, verify_label=True):
     label = key_label(key)
     incomplete = None
     for row in rows:
+        if row.get('malformed') and (label in (row.get('labels') or []) or len(rows) == 1):
+            raise ValueError('Proposal key %s exists (anchor %s) but cannot be read'
+                             % (key, row.get('id') or 'unknown'))
         if TYPE_LABEL not in (row.get('labels') or []) or label not in (row.get('labels') or []):
             continue
         if not is_record_anchor(row):
@@ -1260,6 +1271,10 @@ def _spec(operators, context):
     def check_key_unique(rows, payload, task):
         if task is not None:
             return
+        for row in rows:
+            if row.get('malformed'):
+                raise ValueError('Cannot verify proposal key uniqueness: anchor %s could not be parsed'
+                                 % (row.get('id') or ''))
         request = 'request:' + content_hash({'operation_id': payload['operation_id']})
         label = key_label(key_for(payload['operation_id']))
         for row in rows:

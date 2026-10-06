@@ -14,9 +14,18 @@ import re
 import sys
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+try:
+    import fcntl
+except ImportError:
+    stub = types.ModuleType('fcntl')
+    stub.LOCK_EX = 1
+    stub.flock = lambda *a, **k: None
+    sys.modules['fcntl'] = stub
 
 KIT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(KIT))
@@ -187,41 +196,39 @@ class NoUnguardedParseTests(unittest.TestCase):
 
     ALLOWED = {
         'activity.py': (2, "the tracker export, and a cursor file on the caller's own machine"),
-        'admin.py': (27, 'bd output and files on the coordination host, in operator commands'),
+        'admin.py': (21, 'bd output and files on the coordination host, in operator commands'),
         'artifacts.py': (1, 'the artifact index the kit writes'),
         'bootstrap.py': (2, 'bd output on the host'),
         'briefing.py': (3, 'bd comment-write receipt and the snapshot files the kit writes; exports use the guard'),
         'capabilities.py': (1, "a graph.json in the caller's own checkout; it catches RecursionError itself"),
         'capability_misses.py': (1, 'the telemetry file the kit writes; any failure starts a new log'),
-        'capability_records.py': (2, 'bd output'),
-        'capability_verification.py': (4, 'bd output'),
+        'capability_verification.py': (3, 'bd output'),
         'client.py': (10, "the endpoint's own answer, on the caller's machine"),
-        'coordination.py': (8, 'bd output'),
-        'endpoint.py': (7, 'bd output'),
+        'coordination.py': (7, 'bd output'),
+        'endpoint.py': (4, 'bd output'),
         'handoff.py': (15, 'bd output and the request, receipt and recovery files the kit writes'),
         'http_auth.py': (3, "the service's own store"),
         'http_authority.py': (3, "the service's own store and journal"),
         'http_client.py': (2, "the service's answer, and a body typed on the caller's own machine"),
         'http_service.py': (5, "the endpoint's answer to the service, and host configuration"),
-        'keyed_entries.py': (4, 'bd output'),
-        'keyed_records.py': (3, 'bd output'),
-        'lifecycle.py': (6, "bd output, plus the endpoint's release-query and group answers on the caller's machine (kittrial-5bb.107 rev3)"),
+        'keyed_records.py': (2, 'bd output'),
+        'lifecycle.py': (3, "bd output, plus the endpoint's release-query and group answers on the caller's machine (kittrial-5bb.107 rev3)"),
         'native.py': (2, 'bd output'),
         'office_service.py': (1, 'host configuration'),
-        'proposal_records.py': (7, 'bd output, the host session file, and a copy of a structure the kit built'),
-        'record_json.py': (2, 'the guard itself and row-level parsing'),
+        'proposal_records.py': (4, 'bd output, the host session file, and a copy of a structure the kit built'),
+        'record_json.py': (3, 'the guard itself, row-level parsing, and iterative array decoding'),
         'reference_records.py': (2, 'bd output'),
         'project_creation.py': (2, 'the creation record and the failure note the kit writes on the coordination host; a note that cannot be parsed, however deep, is ignored'),
         'review_recommendations.py': (1, 'bd output (the answer of comments add)'),
         'review_workflow.py': (4, 'bd output and the revert journal the kit writes'),
-        'sessions.py': (2, 'bd output'),
+        'sessions.py': (1, 'the session registry file'),
         'version.py': (1, "the kit's own version file"),
-        'work.py': (4, 'bd output and the request files the kit writes'),
+        'work.py': (1, 'the request files the kit writes'),
         'worker.py': (2, "the endpoint's answer, on the caller's machine"),
         'worker_gate.py': (1, "the endpoint's answer, on the caller's machine"),
     }
     # Files that parse text somebody else wrote, and have no bare json.loads at all.
-    GUARDED_ONLY = ('export_requirements.py', 'feedback.py', 'guidance.py', 'recovery.py', 'reserved_comments.py')
+    GUARDED_ONLY = ('capability_records.py', 'export_requirements.py', 'feedback.py', 'guidance.py', 'keyed_entries.py', 'recovery.py', 'reserved_comments.py')
 
     def bare(self, path):
         return len(re.findall(r'(?<![A-Za-z_.])json\.loads\(', path.read_text(encoding='utf-8')))
@@ -245,13 +252,11 @@ class NoUnguardedParseTests(unittest.TestCase):
         # slot row as bd prints it, whose metadata a contributor could once write.
         # reserved_comments.py (revision 3): the lines of a `dep add --file` list of edges.
         self.assertEqual({name: count for name, count in uses.items() if count}, {
-            # admin.py reads the review-writes audit history through the guard
-            # (kittrial-5bb.110 item 3): a deeply nested audit file used to crash
-            # `review-writes status` with a RecursionError.
+            # admin.py reads the review-writes audit history through the guard (kittrial-5bb.110 item 3)
             'admin.py': 1,
             'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 3, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
-            'handoff.py': 1, 'http_service.py': 2, 'lifecycle.py': 1, 'recovery.py': 1, 'requirements.py': 1, 'reserved_comments.py': 1,
-            'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
+            'handoff.py': 1, 'http_service.py': 2, 'lifecycle.py': 1, 'recovery.py': 1, 'requirements.py': 1,
+            'reserved_comments.py': 1, 'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
 
     def test_the_parsers_that_do_not_call_it_directly_reach_it(self):
         # Review of 7c14f6a: the capability and proposal record parsers, and load_json.
@@ -597,6 +602,516 @@ class HttpBodyTests(ProposalHarness if ProposalHarness else unittest.TestCase):
         response = self.request('GET', self.base() + '?cursor=' + cursor, token=self.token('alex'))
         self.assertIn(response.status, (409, 422), response.data)
         self.assertNotEqual(response.status, 500)
+
+
+class BdRowTests(unittest.TestCase):
+    """Deeply nested bd issue rows, native output recovery and queue/render surfacing."""
+
+    def test_loads_row_depth_threshold_and_field_recovery(self):
+        # 65 levels and 500 levels parse normally under ROW_NESTING_MAX (750)
+        row_65 = '{"id": "t-65", "title": "65 deep", "status": "open", "nested": ' + deep(65, 'object') + '}'
+        loaded_65 = record_json.loads_row(row_65)
+        self.assertEqual(loaded_65['id'], 't-65')
+        self.assertFalse(loaded_65.get('malformed'))
+
+        row_500 = '{"id": "t-500", "title": "500 deep", "status": "open", "nested": ' + deep(500, 'object') + '}'
+        loaded_500 = record_json.loads_row(row_500)
+        self.assertEqual(loaded_500['id'], 't-500')
+        self.assertFalse(loaded_500.get('malformed'))
+
+        # Exactly 750 levels parses normally
+        row_750 = '{"id": "t-750", "title": "750 deep", "status": "open", "nested": ' + deep(749, 'object') + '}'
+        loaded_750 = record_json.loads_row(row_750)
+        self.assertEqual(loaded_750['id'], 't-750')
+        self.assertFalse(loaded_750.get('malformed'))
+
+        # Exceeding ROW_NESTING_MAX (751 levels) yields synthetic malformed record
+        row_deep = '{"id": "t-deep", "title": "Over depth", "issue_type": "task", "labels": ["guard", "test"], "data": ' + deep(750, 'object') + '}'
+        loaded_deep = record_json.loads_row(row_deep)
+        self.assertTrue(loaded_deep['malformed'])
+        self.assertEqual(loaded_deep['id'], 't-deep')
+        self.assertEqual(loaded_deep['title'], 'Over depth')
+        self.assertEqual(loaded_deep['issue_type'], 'task')
+        self.assertEqual(loaded_deep['labels'], [])
+        self.assertEqual(loaded_deep['status'], 'unknown')
+        self.assertIsNone(loaded_deep['assignee'])
+        self.assertIn('raw_length', loaded_deep)
+        self.assertIn('raw_sha256', loaded_deep)
+        self.assertIn('more than 750 levels', loaded_deep['error'])
+
+    def test_mutations_r1_r2_r7_status_unknown_assignee_none_on_malformed_row(self):
+        # Even if raw text specifies status: closed and assignee: mallory,
+        # an unparseable/over-deep row must have status: unknown and assignee: None.
+        line = '{"id": "t-spoofed", "title": "Spoofed", "status": "closed", "assignee": "mallory", "data": ' + deep(1500) + '}'
+        loaded = record_json.loads_row(line)
+        self.assertTrue(loaded['malformed'])
+        self.assertEqual(loaded['status'], 'unknown')
+        self.assertIsNone(loaded['assignee'])
+
+        # In work queue: surfaced as error, status unknown, owner None, visible in general queue
+        rows = [task('t-normal', 'Normal task'), loaded]
+        result_all = work.queue(rows, 'alice', [])
+        items = {it['task']: it for it in result_all['items']}
+        self.assertIn('t-spoofed', items)
+        self.assertEqual(items['t-spoofed']['status'], 'unknown')
+        self.assertIsNone(items['t-spoofed']['owner'])
+        self.assertEqual(items['t-spoofed']['review_state'], 'error')
+        self.assertIn('Malformed issue rows: t-spoofed', result_all['coverage'])
+
+        # In work queue with --mine: mallory does not own it (owner is None); it remains visible
+        # to all workers who could own it, not claimed by mallory.
+        result_mine = work.queue(rows, 'mallory', ['--mine'])
+        items_mine = {it['task']: it for it in result_mine['items']}
+        self.assertIn('t-spoofed', items_mine)
+        self.assertIsNone(items_mine['t-spoofed']['owner'])
+        self.assertEqual(items_mine['t-spoofed']['status'], 'unknown')
+
+    def test_loads_array_rows_iterative_decoding_without_recursion(self):
+        # An array with a normal item and a 3000-deep item decoded iteratively
+        normal = {"id": "t-ok", "title": "Healthy"}
+        arr_text = json.dumps([normal])[:-1] + ', {"id": "t-3000", "title": "Iterative", "data": ' + deep(3000) + '}]'
+        rows = record_json.loads_array_rows(arr_text)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]['id'], 't-ok')
+        self.assertFalse(rows[0].get('malformed'))
+        self.assertEqual(rows[1]['id'], 't-3000')
+        self.assertTrue(rows[1]['malformed'])
+        self.assertEqual(rows[1]['status'], 'unknown')
+
+        # Single object 3000 levels deep wrapped in braces
+        single_obj = '{"id": "single-3000", "title": "One", "data": ' + deep(3000) + '}'
+        single_res = record_json.loads_array_rows(single_obj)
+        self.assertEqual(len(single_res), 1)
+        self.assertEqual(single_res[0]['id'], 'single-3000')
+        self.assertTrue(single_res[0]['malformed'])
+
+    def test_loads_array_rows_damaged_output_raises_value_error(self):
+        # Truncated list: raises ValueError / JSONDecodeError
+        truncated = '[{"id": "t-1", "title": "One"}, {"id": "t-2", "title": "Two"'
+        with self.assertRaises(ValueError):
+            record_json.loads_array_rows(truncated)
+
+        # Plain non-JSON text: raises ValueError
+        with self.assertRaises(ValueError):
+            record_json.loads_array_rows('plain text not json')
+
+        # Truncated deep input: raises ValueError
+        deep_truncated = '[{"id": "t-deep", "data": ' + deep(1000)
+        with self.assertRaises(ValueError):
+            record_json.loads_array_rows(deep_truncated)
+
+    def test_native_split_recovers_deep_documents(self):
+        import native
+        doc = '{"id": "doc-deep", "deep": ' + deep(3000) + '}\n'
+        val, err = native.split(types.SimpleNamespace(stdout=doc, stderr='', returncode=0))
+        self.assertIn('"id": "doc-deep"', val)
+
+    def test_render_surfaces_malformed_and_unparseable_rows(self):
+        import render
+        with tempfile.TemporaryDirectory() as dest:
+            dest_path = Path(dest)
+            malformed = record_json.loads_row('{"id": "t-bad", "title": "Malformed item", "data": ' + deep(1500) + '}')
+            unparseable = record_json.loads_row('completely broken unparseable line ' + deep(1500))
+            healthy = task('t-good', 'Healthy task')
+            render.render([healthy, malformed, unparseable], dest_path, operators=[OPERATOR])
+
+            current = (dest_path / 'CURRENT.md').read_text(encoding='utf-8')
+            self.assertIn('## Malformed issue records', current)
+            self.assertIn('[t-bad](jobs/t-bad.md)', current)
+            self.assertIn('1 unparseable issue row(s) could not be read.', current)
+
+            index = (dest_path / 'INDEX.md').read_text(encoding='utf-8')
+            self.assertIn('[t-bad: Malformed item](jobs/t-bad.md)', index)
+            self.assertIn('1 unparseable issue row(s)', index)
+
+            job_path = dest_path / 'jobs' / 't-bad.md'
+            self.assertTrue(job_path.exists())
+            self.assertIn('## Error', job_path.read_text(encoding='utf-8'))
+
+    def test_mutation_l7_review_write_refused_on_malformed_task_succeeds_on_healthy(self):
+        healthy = task('p-good', 'Healthy task')
+        malformed = record_json.loads_row('{"id": "p-bad", "title": "Bad", "data": ' + deep(1500) + '}')
+        rows = [healthy, malformed]
+        contribute_payload = {
+            'schema_version': 1, 'operation': 'contribute', 'operation_id': 'op-c1',
+            'task': 'p-good', 'previous': None, 'repository': 'ssh://git.example/p',
+            'commit': 'a' * 40, 'base_commit': 'b' * 40,
+            'delivery': {'kind': 'bundle', 'path': 'koopa:/b.bundle', 'sha256': 'c' * 64},
+            'summary': 'Summary', 'supersedes': None
+        }
+        # Review write on p-good succeeds despite p-bad being present in rows
+        res = review_workflow.execute(rows, 'p-good', 'alice', contribute_payload, lambda cmd: '{"id": 1}')
+        self.assertIn('comment_id', res)
+
+        # Review write on p-bad is refused naming the malformed task
+        bad_payload = dict(contribute_payload, task='p-bad')
+        with self.assertRaisesRegex(ValueError, r'Task p-bad is malformed:'):
+            review_workflow.execute(rows, 'p-bad', 'alice', bad_payload, lambda cmd: '{"id": 1}')
+
+    def test_mutation_ob18_lifecycle_refuses_malformed_task(self):
+        healthy = task('p-good')
+        bad_line = '{"id": "p-bad", "title": "Bad", "data": ' + deep(1500) + '}'
+        export_text = json.dumps(healthy) + '\n' + bad_line + '\n'
+        run = lambda cmd: export_text if cmd == ['export', '--all'] else ''
+        p = lifecycle_payload(task='p-bad', actor='alice')
+        with self.assertRaisesRegex(ValueError, r'Task p-bad is malformed:'):
+            lifecycle.apply_native(p, 'alice', run, operators=[OPERATOR])
+
+    def test_coordination_merge_acquire_refuses_malformed_task(self):
+        import coordination
+        bad_task = '[{"id": "t-bad", "title": "Bad", "data": ' + deep(1000) + '}]'
+        run = lambda cmd: bad_task if cmd[:2] == ['show', 't-bad'] else '{"available": true}'
+        p = {'operation': 'merge-acquire', 'task': 't-bad', 'target': 'origin/main'}
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, r'Task t-bad is malformed:'):
+                coordination.apply_native(p, 'alice', run, Path(tmp))
+
+    def test_catalog_and_get_with_malformed_anchor(self):
+        bad_ref = {'id': 's2-9ju', 'title': 'Reference anchor: x.ref', 'status': 'closed',
+                   'labels': ['reference', 'reference-key:x-ref'], 'malformed': True, 'error': 'nested too deeply'}
+        rows = [bad_ref]
+        listed = rr.list_entries(rows, {'state': 'all'}, [OPERATOR])
+        self.assertEqual(listed['total'], 1)
+        self.assertEqual(listed['items'][0]['key'], 'x.ref')
+        self.assertEqual(listed['items'][0]['state'], 'malformed')
+        self.assertEqual(listed['items'][0]['native_id'], 's2-9ju')
+
+        with self.assertRaisesRegex(ValueError, r'Reference key x\.ref exists \(anchor s2-9ju\) but cannot be read'):
+            rr.get(rows, 'x.ref', [OPERATOR])
+
+        bad_cap = {'id': 's2-e44', 'title': 'Capability anchor: x.cap', 'status': 'closed',
+                   'labels': ['capability', 'capability-key:x-cap'], 'malformed': True, 'error': 'nested too deeply'}
+        cap_rows = [bad_cap]
+        cap_listed = cr.list_entries(cap_rows, {'state': 'all'}, [OPERATOR])
+        self.assertEqual(cap_listed['total'], 1)
+        self.assertEqual(cap_listed['items'][0]['key'], 'x.cap')
+        self.assertEqual(cap_listed['items'][0]['state'], 'malformed')
+        self.assertEqual(cap_listed['items'][0]['native_id'], 's2-e44')
+
+        with self.assertRaisesRegex(ValueError, r'Capability key x\.cap exists \(anchor s2-e44\) but cannot be read'):
+            cr.get(cap_rows, 'x.cap', [OPERATOR])
+
+    def test_p2_2_lifecycle_idempotency_refused_on_malformed_event_row(self):
+        healthy = task('p-good')
+        event_bad = '{"id": "p-good.1", "issue_type": "event", "data": ' + deep(1500) + '}'
+        export_text = json.dumps(healthy) + '\n' + event_bad + '\n'
+        run = lambda cmd: export_text if cmd == ['export', '--all'] else ''
+        p = lifecycle_payload(task='p-good', actor='alice')
+        with self.assertRaisesRegex(ValueError, r'Event row p-good\.1 cannot be parsed:'):
+            lifecycle.apply_native(p, 'alice', run, operators=[OPERATOR])
+
+    def test_mutation_l2_keyed_records_uniqueness_refusal_naming_malformed_anchor(self):
+        import keyed_records
+        spec = rr.KIND.write_spec([OPERATOR], lambda cmd: '[]')
+        spec.read_rows = lambda run, payload: [{'id': 'ref-corrupt', 'malformed': True, 'labels': ['reference-entry']}]
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, r'Cannot verify reference key uniqueness: anchor ref-corrupt could not be parsed'):
+                keyed_records.apply_native(reference_entry(), 'alice', lambda cmd: '[]', Path(tmp), spec)
+        with self.assertRaisesRegex(ValueError, r'Cannot verify reference key uniqueness: anchor ref-corrupt could not be parsed'):
+            rr.KIND.require_unique_key([{'id': 'ref-corrupt', 'malformed': True, 'labels': ['reference-entry']}], 'calendar.trading')
+
+    def test_mutation_l3_endpoint_native_anchor_rows_catches_recursion_error(self):
+        ep = wiring._endpoint_module(self)
+        with patch('subprocess.run') as mock_run, patch.object(ep, 'environment', return_value={}):
+            mock_run.return_value = types.SimpleNamespace(returncode=0, stdout='[{"id": "p-1"}]', stderr='')
+            with patch.object(ep.json, 'loads', side_effect=RecursionError('stack overflow')):
+                with self.assertRaisesRegex(ValueError, r'Could not parse the current rows of p-1 before the status write; refusing\.'):
+                    ep._native_anchor_rows(Path('.'), Path('.'), 'alice', ['p-1'])
+
+    def test_p2_4_coordination_create_child_refuses_malformed_child(self):
+        import coordination
+        from requirements import content_hash
+        payload = {'operation': 'create-child', 'request_id': 'req-child-1', 'parent': 'p-parent',
+                   'title': 'Child task', 'description': 'Description', 'type': 'task'}
+        identity = content_hash({'request_id': 'req-child-1'})
+        label = 'request:' + identity
+        child_line = '{"id": "p-parent.1", "labels": ["' + label + '"], "data": ' + deep(1500) + '}'
+        def run(argv):
+            if argv[:1] == ['list']:
+                return '[' + child_line + ']'
+            return '[]'
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, r'Cannot verify native request: child p-parent\.1 could not be parsed'):
+                coordination.apply_native(payload, 'alice', run, Path(tmp))
+
+    def test_p2_4_catalog_reads_handle_3000_deep_anchors_without_recursion_error(self):
+        import keyed_entries
+        bad_anchor = '{"id": "ref-3000", "labels": ["reference-entry"], "data": ' + deep(3000) + '}'
+        def run(argv):
+            if argv[0] == 'list':
+                return '[{"id": "ref-3000"}]'
+            if argv[0] == 'show':
+                return '[' + bad_anchor + ']'
+            return '[]'
+        shown = keyed_entries.AnchoredKind.shown(run, ['ref-3000'])
+        self.assertEqual(len(shown), 1)
+        self.assertTrue(shown[0]['malformed'])
+        view = rr.KIND.entry_view(shown[0], [OPERATOR])
+        self.assertEqual(view['state'], 'malformed')
+        self.assertEqual(view['warnings'][0]['code'], 'malformed')
+
+
+class ScanPathMutationsTests(unittest.TestCase):
+    def test_scan_path_unclosed_array(self):
+        text = '[{"a": ' + deep(752, 'object') + '}'
+        with self.assertRaisesRegex(ValueError, r'Truncated or invalid JSON array'):
+            record_json.loads_array_rows(text)
+
+    def test_scan_path_trailing_data(self):
+        text = '[{"a": ' + deep(752, 'object') + '}] trailing'
+        with self.assertRaisesRegex(ValueError, r'Trailing data after JSON array'):
+            record_json.loads_array_rows(text)
+
+    def test_scan_path_does_not_catch_arbitrary_parse_failures(self):
+        with self.assertRaises(json.JSONDecodeError):
+            record_json.loads_array_rows('[{not json}]')
+        with self.assertRaises(json.JSONDecodeError):
+            record_json.loads_array_rows('[{"id": "t1"}')
+
+
+class DupKeyRefusalTests(unittest.TestCase):
+    def test_requirement_write_refusal_naming_malformed_row(self):
+        import requirement_records as req_rec
+        bad_row = {'id': 'h1-086.1', 'title': 'Requirement G01', 'malformed': True, 'error': 'nested too deeply'}
+        payload = {'schema_version': 1, 'operation_id': 'op-req-1', 'operation': 'draft', 'kind': 'requirement',
+                   'key': 'G01', 'title': 'Requirement G01', 'description': 'desc', 'acceptance_state': 'draft',
+                   'parent': 'job-1'}
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, r'Cannot verify requirement key uniqueness: anchor h1-086\.1 could not be parsed'):
+                req_rec.apply_native(payload, 'alice', lambda cmd: json.dumps(bad_row) + '\n', Path(tmp), operator=False)
+
+    def test_requirement_check_key_unique_allows_different_key_and_ordinary_task(self):
+        import requirement_records as req_rec
+        bad_req = {'id': 'q1-1r2.1', 'title': 'G271: First', 'malformed': True, 'error': 'deep'}
+        bad_task = {'id': 'q1-5bc', 'title': 'Fix the login timeout', 'malformed': True, 'error': 'deep'}
+
+        # Same key is refused
+        with self.assertRaisesRegex(ValueError, r'Cannot verify requirement key uniqueness: anchor q1-1r2\.1 could not be parsed'):
+            req_rec.check_key_unique([bad_req, bad_task], {'kind': 'requirement', 'key': 'G271'}, None)
+
+        # Different key is accepted
+        req_rec.check_key_unique([bad_req, bad_task], {'kind': 'requirement', 'key': 'G272'}, None)
+
+        # Unreadable ordinary task alone is accepted for any requirement key
+        req_rec.check_key_unique([bad_task], {'kind': 'requirement', 'key': 'G271'}, None)
+
+    def test_reference_write_refusal_naming_malformed_anchor(self):
+        bad_ref = {'id': 'ref-bad', 'title': 'Reference anchor: x.ref', 'malformed': True, 'error': 'nested too deeply'}
+        payload = {'schema_version': 1, 'operation': 'propose', 'key': 'x.ref', 'statement': 'st', 'tags': ['tag'],
+                   'title': 'Title', 'authority': {'type': 'repo-path', 'path': 'docs/ref.md'}, 'owner': 'person:alice',
+                   'operation_id': 'op-ref-1'}
+        with tempfile.TemporaryDirectory() as tmp:
+            def run(cmd):
+                if cmd[:1] == ['list']:
+                    return '[{"id": "ref-bad"}]'
+                if cmd[:1] == ['show']:
+                    return json.dumps([bad_ref])
+                return '[]'
+            with self.assertRaisesRegex(ValueError, r'Cannot verify reference key uniqueness: anchor ref-bad could not be parsed'):
+                rr.apply_native(payload, 'alice', run, Path(tmp))
+
+    def test_capability_write_refusal_naming_malformed_anchor(self):
+        bad_cap = {'id': 'cap-bad', 'title': 'Capability anchor: x.cap', 'malformed': True, 'error': 'nested too deeply'}
+        payload = {'schema_version': 1, 'operation': 'propose', 'key': 'x.cap', 'name': 'Name', 'summary': 'Summary',
+                   'owner': 'person:alice', 'operation_id': 'op-cap-1'}
+        with tempfile.TemporaryDirectory() as tmp:
+            def run(cmd):
+                if cmd[:1] == ['list']:
+                    return '[{"id": "cap-bad"}]'
+                if cmd[:1] == ['show']:
+                    return json.dumps([bad_cap])
+                return '[]'
+            with self.assertRaisesRegex(ValueError, r'Cannot verify capability key uniqueness: anchor cap-bad could not be parsed'):
+                cr.apply_native(payload, 'alice', run, Path(tmp))
+
+    def test_proposal_write_refusal_naming_malformed_anchor(self):
+        bad_prop = {'id': 'prop-bad', 'title': 'Requirement proposal p-01', 'malformed': True, 'error': 'nested too deeply'}
+        payload = {'schema_version': 1, 'operation': 'submit', 'submitter': 'person:alice', 'text': 'text',
+                   'operation_id': 'op-prop-1'}
+        with tempfile.TemporaryDirectory() as tmp:
+            def run(cmd):
+                if cmd[:1] == ['list']:
+                    return json.dumps([bad_prop])
+                if cmd[:1] == ['show']:
+                    return json.dumps([bad_prop])
+                return '[]'
+            with self.assertRaisesRegex(ValueError, r'Cannot verify proposal key uniqueness: anchor prop-bad could not be parsed'):
+                pr.apply_native(payload, 'alice', run, Path(tmp))
+
+
+class AnchorAsWorkTests(unittest.TestCase):
+    def test_ordinary_tasks_with_anchor_titles_stay_in_work_and_slot_excluded(self):
+        slot = {'id': 'testproj-merge-slot', 'issue_type': 'task', 'status': 'open', 'malformed': True, 'title': 'Merge slot'}
+        readable_anchor = {'id': 's2-9ju', 'issue_type': 'task', 'status': 'closed',
+                           'labels': ['reference'], 'comments': [{'id': 'c1', 'text': 'Kind: reference-entry-v1\n{}'}]}
+        ord_tasks = [
+            {'id': 'q1-7bx', 'issue_type': 'task', 'status': 'unknown', 'malformed': True, 'title': 'Reference manual needs an update'},
+            {'id': 'q1-6f1', 'issue_type': 'task', 'status': 'unknown', 'malformed': True, 'title': 'Capability matrix for the autumn release'},
+            {'id': 'q1-a88', 'issue_type': 'task', 'status': 'unknown', 'malformed': True, 'title': 'Settings page loses the time zone'},
+            {'id': 'q1-2lk', 'issue_type': 'task', 'status': 'unknown', 'malformed': True, 'title': 'anchor: replace the mooring line'},
+            {'id': 'q1-t1a', 'issue_type': 'task', 'status': 'unknown', 'malformed': True, 'title': 'Requirement proposal template wording'},
+            {'id': 'q1-5g4', 'issue_type': 'task', 'status': 'unknown', 'malformed': True, 'title': 'Fix the login timeout'},
+        ]
+        rows = [slot, readable_anchor] + ord_tasks
+
+        # In work, all six ordinary tasks are listed; slot and readable anchor are excluded
+        page = work.queue(rows, 'alice', ['--json'], reference_attention=True)
+        task_ids = [item['task'] for item in page['items']]
+        expected_ids = sorted(['q1-7bx', 'q1-6f1', 'q1-a88', 'q1-2lk', 'q1-t1a', 'q1-5g4'])
+        self.assertEqual(sorted(task_ids), expected_ids)
+
+        # In work --mine, all six ordinary tasks stay listed; slot and readable anchor are excluded
+        mine_page = work.queue(rows, 'alice', ['--mine', '--json'], reference_attention=True)
+        self.assertEqual(sorted([item['task'] for item in mine_page['items']]), expected_ids)
+
+    def test_retitled_anchor_recognized_by_label(self):
+        # Anchor retitled by contributor but carrying reference label in bd list
+        bad_anchor = {'id': 'ref-retitled', 'issue_type': 'task', 'status': 'closed', 'title': 'Custom title',
+                      'malformed': True, 'error': 'deep'}
+        listed = [{'id': 'ref-retitled', 'labels': ['reference', 'reference-key:custom-ref']}]
+        def run(cmd):
+            if cmd[:1] == ['list']:
+                return json.dumps(listed)
+            if cmd[:1] == ['show']:
+                return json.dumps([bad_anchor])
+            return '[]'
+        rows = rr.KIND.read_key_rows(run, 'custom.ref')
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['id'], 'ref-retitled')
+        self.assertIn('reference-key:custom-ref', rows[0]['labels'])
+        with self.assertRaisesRegex(ValueError, r'Reference key custom\.ref exists \(anchor ref-retitled\) but cannot be read'):
+            rr.KIND.find_entry(rows, 'custom.ref', [OPERATOR])
+
+
+class SilentSkipsTests(unittest.TestCase):
+    def test_capability_verification_integrated_refuses_unreadable_lifecycle_event(self):
+        import capability_verification as cv
+        bad_line = '{"id": "ev-bad", "issue_type": "event", "malformed": true, "error": "nested too deeply"}'
+        run = lambda cmd: '{"id": "ev-good", "issue_type": "event", "labels": ["lifecycle-scope"]}\n' + bad_line + '\n'
+        integrated = cv.Integrated(run, operators=[OPERATOR])
+        with self.assertRaisesRegex(ValueError, r'Unreadable lifecycle event row \(ev-bad\)'):
+            _ = integrated._export()
+
+    def test_proposal_records_read_catalog_above_show_limit_refuses_unreadable_anchor(self):
+        bad_prop = '{"id": "p-deep", "issue_type": "task", "title": "Requirement proposal p-deep", "labels": [], "malformed": true, "error": "deep"}'
+        def run(cmd):
+            if cmd[:1] == ['list']:
+                return json.dumps([{'id': 'p-deep'}] + [{'id': 'p-%d' % i} for i in range(101)])
+            if cmd[:1] == ['export']:
+                return bad_prop + '\n' + '\n'.join(json.dumps({'id': 'p-%d' % i, 'title': 'Requirement proposal p-%d' % i}) for i in range(101))
+            return '[]'
+        with self.assertRaisesRegex(ValueError, r'Unreadable proposal anchor \(p-deep\)'):
+            pr.read_catalog(run)
+
+    def test_endpoint_anchors_action_answers_readable_and_reports_unreadable(self):
+        ep = wiring._endpoint_module(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'bin').mkdir()
+            (root / 'bin' / 'bd').write_text('', encoding='utf-8')
+            (root / 'deployment.private.json').write_text('{"password": "x"}', encoding='utf-8')
+            proj_dir = root / 'projects' / 'proj'
+            (proj_dir / '.beads').mkdir(parents=True)
+            (proj_dir / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+            bad_row = {'id': 'a-bad', 'malformed': True, 'error': 'corrupted JSON'}
+            good_anchor = {'id': 'a-good', 'issue_type': 'task', 'status': 'closed',
+                           'labels': ['reference'], 'comments': [{'id': 'c1', 'text': 'Kind: reference-entry-v1\n{}'}]}
+
+            # Show path naming a malformed row
+            with patch.object(ep.native, 'run', return_value=types.SimpleNamespace(returncode=0, stdout=json.dumps([bad_row]), stderr='')), \
+                 patch.object(ep.native, 'split', return_value=(json.dumps([bad_row]), '')):
+                req = {'project': 'proj', 'actor': 'alice', 'action': 'anchors', 'args': ['a-bad']}
+                resp = ep.execute(root, req)
+                self.assertEqual(resp['returncode'], 0)
+                out = json.loads(resp['stdout'])
+                self.assertEqual(out['anchors'], [])
+                self.assertIn('Unreadable issue row(s): a-bad (corrupted JSON)', resp['stderr'])
+
+            # Export path with a malformed row and a good anchor
+            exp_text = json.dumps(good_anchor) + '\n{"id": "a-bad", "data": ' + deep(1500) + '}\n'
+            with patch.object(ep.native, 'run', return_value=types.SimpleNamespace(returncode=0, stdout=exp_text, stderr='')), \
+                 patch.object(ep.native, 'split', return_value=(exp_text, '')):
+                req = {'project': 'proj', 'actor': 'alice', 'action': 'anchors', 'args': []}
+                resp = ep.execute(root, req)
+                self.assertEqual(resp['returncode'], 0)
+                out = json.loads(resp['stdout'])
+                self.assertEqual(out['anchors'], ['a-good'])
+                self.assertIn('Unreadable issue row(s): a-bad', resp['stderr'])
+
+
+class Revision3MutationKillTests(unittest.TestCase):
+    def test_mutation_r11_dotted_child_task_type_recovered_as_task(self):
+        line = '{"id": "q1-vi7.1", "title": "Child task", "issue_type": "task", "data": ' + deep(751) + '}'
+        row = record_json.loads_row(line)
+        self.assertEqual(row['id'], 'q1-vi7.1')
+        self.assertEqual(row['issue_type'], 'task')
+        self.assertTrue(row['malformed'])
+
+    def test_mutation_l2b_dotted_child_task_does_not_stop_lifecycle_writes(self):
+        child_task = {'id': 'q1-vi7.1', 'issue_type': 'task', 'malformed': True, 'error': 'deep'}
+        healthy_task = {'id': 'q1-healthy', 'issue_type': 'task', 'status': 'open'}
+        rows = [child_task, healthy_task]
+        # _operation_index does not raise on malformed child task
+        index = lifecycle._operation_index(rows)
+        self.assertEqual(index, {})
+
+        # Truly unreadable event DOES stop lifecycle writes naming the event
+        bad_event = {'id': 'ev-bad.1', 'issue_type': 'event', 'malformed': True, 'error': 'deep'}
+        with self.assertRaisesRegex(ValueError, r'Event row ev-bad\.1 cannot be parsed: deep; operator must reconcile or repair the event'):
+            lifecycle._operation_index([bad_event, healthy_task])
+
+    def test_mutation_k8_shown_single_id_returns_malformed_on_native_failure(self):
+        def fail_run(cmd):
+            raise ValueError('nested too deeply')
+        res = rr.KIND.shown(fail_run, ['single-id'])
+        self.assertEqual(res, [{'id': 'single-id', 'malformed': True, 'error': 'nested too deeply'}])
+
+    def test_proposal_find_entry_refuses_unreadable_anchor(self):
+        bad_prop = {'id': 'p-bad', 'issue_type': 'task', 'malformed': True,
+                    'labels': ['requirement-proposal', 'proposal-key:p-c69fd651ab85']}
+        with self.assertRaisesRegex(ValueError, r'Proposal key p-c69fd651ab85 exists \(anchor p-bad\) but cannot be read'):
+            pr.find_entry([bad_prop], 'p-c69fd651ab85')
+
+
+class AdditionalFileGuardTests(unittest.TestCase):
+    def test_activity_load_export_and_cursor_guard(self):
+        import activity
+        with tempfile.TemporaryDirectory() as tmp:
+            exp_path = Path(tmp) / 'export.jsonl'
+            exp_path.write_text('{"a": ' + deep(1500) + '}\n', encoding='utf-8')
+            with self.assertRaises(ValueError):
+                activity.load_export(exp_path)
+
+            cur_path = Path(tmp) / 'cursor.json'
+            cur_path.write_text(deep(MAX + 1, 'object'), encoding='utf-8')
+            with self.assertRaises(ValueError):
+                activity.load_cursor(cur_path, 'test-scope')
+
+    def test_artifacts_manifest_guard(self):
+        import artifacts
+        with tempfile.TemporaryDirectory() as tmp:
+            store = artifacts.ArtifactStore(Path(tmp))
+            store.manifest_path.write_text('{"a": ' + deep(1500) + '}\n', encoding='utf-8')
+            with self.assertRaises(artifacts.ArtifactError):
+                store.entries()
+
+    def test_handoff_task_guard(self):
+        import handoff
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            p_exec = {
+                'schema_version': 1,
+                'operation_id': 'op-handoff-1',
+                'task': 'p-bad',
+                'from_actor': 'alice',
+                'to_actor': 'bob',
+                'reason': 'Handoff reason',
+                'approval': 'Approval reason'
+            }
+            def fail_run(cmd):
+                raise RecursionError('deep nesting in show')
+            with self.assertRaisesRegex(ValueError, 'Task p-bad is malformed'):
+                handoff.execute(path, 'alice', p_exec, fail_run)
 
 
 if __name__ == '__main__':

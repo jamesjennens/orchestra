@@ -61,6 +61,7 @@ Payload schemas are closed. `schema_version` is the integer 1.
 """
 import argparse
 import json
+import re
 import time
 from pathlib import Path
 
@@ -381,8 +382,19 @@ def check_key_unique(rows, payload, task):
     for row in rows:
         if row.get('id') == task:
             continue
-        if 'requirement' not in (row.get('labels') or []):
+        could_be_requirement = ('requirement' in (row.get('labels') or [])
+                                or (row.get('title') or '').startswith(('Requirement ', 'Requirement:'))
+                                or bool(re.match(r'^[A-Za-z0-9_.-]+:', row.get('title') or '')))
+        if not could_be_requirement:
             continue
+        if row.get('malformed'):
+            title = row.get('title') or ''
+            key = payload['key']
+            m_title_key = re.match(r'^([A-Za-z0-9_.-]+):', title) or re.match(r'^Requirement\s+([A-Za-z0-9_.-]+)', title)
+            if m_title_key and m_title_key.group(1) != key:
+                continue
+            raise ValueError('Cannot verify requirement key uniqueness: anchor %s could not be parsed'
+                             % (row.get('id') or ''))
         record = latest_revision(existing_revisions(row))
         if record is not None and record.get('key') == payload['key']:
             raise ValueError('Requirement key %s is already used by record %s; requirement keys must be unique.'
