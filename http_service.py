@@ -1966,13 +1966,24 @@ class EndpointBackend:
             raise busy(said[-1][:300] if said else 'Another project is being created on this server. Try again in a minute.',
                        retry_after=60)
         if isinstance(reply, dict) and reply.get('returncode') == 2:
+            import project_creation
             said = (reply.get('stderr') or '').strip().splitlines()
-            sentence = said[-1][:400] if said else 'The project could not be created'
-            for prefix in ('ValueError: ', 'RuntimeError: '):
-                if sentence.startswith(prefix):
-                    sentence = sentence[len(prefix):]
+            sentence = project_creation.creation_sentence(said[-1]) if said else None
+            if sentence is None:
+                # Not one of the creation's own sentences: an exception's text or a host path
+                # (kittrial-5bb.143). The person is told only that it failed; the line is for
+                # the operator, in this service's log, bounded and with control characters shown.
+                print('create-project %s answered a line that is not a creation sentence: %s'
+                      % (name, ascii(said[-1][:400]) if said else '(nothing)'), file=sys.stderr, flush=True)
+                raise conflict(self.CREATION_FAILED)
             raise conflict(sentence)
         return self._checked(reply)
+
+    ONBOARDING_FAILED = 'The onboarding text could not be saved on the server. Ask an operator of the server to look.'
+    #: Said when the host's answer to a creation is not one of its own sentences. It does not
+    #: say that nothing was made, because the service cannot know.
+    CREATION_FAILED = ('The project could not be created, or was only partly made. Ask an operator of the server '
+                       'to look before you try again.')
 
     def set_onboarding(self, principal, project_id, text, key):
         """An owner sets (``text``) or clears (``None``) the project's onboarding text.
@@ -1990,8 +2001,15 @@ class EndpointBackend:
                                authority=authority, require_authority=True, route='projects.onboarding')
         if isinstance(reply, dict) and reply.get('returncode') == 2:
             said = (reply.get('stderr') or '').strip().splitlines()
-            sentence = said[-1][:400] if said else 'The onboarding text was refused'
-            raise invalid(sentence[len('ValueError: '):] if sentence.startswith('ValueError: ') else sentence)
+            sentence = said[-1][:400] if said else ''
+            if not sentence.startswith('ValueError: '):
+                # Not a refusal of the text by the kit's own rules but a failure on the host (a
+                # file that cannot be written, say): its line may name host paths, so it goes
+                # to this service's log and not to the person (kittrial-5bb.143).
+                print('set-onboarding %s answered a line that is not a refusal of the text: %s'
+                      % (project_id, ascii(sentence) if sentence else '(nothing)'), file=sys.stderr, flush=True)
+                raise conflict(self.ONBOARDING_FAILED)
+            raise invalid(sentence[len('ValueError: '):])
         return self._checked(reply)
 
     def read_onboarding(self, project_id):
@@ -2950,7 +2968,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 registered = self.service.state['projects']
                 held = {}
                 for item in found['items'] + found['created']:
-                    if isinstance(item.get('project'), str) and item['project'] not in registered                             and item.get('state') != 'damaged' and isinstance(item.get('by'), str):
+                    if (isinstance(item.get('project'), str) and item['project'] not in registered
+                            and item.get('state') != 'damaged' and isinstance(item.get('by'), str)):
                         held.setdefault(item['by'], []).append(item['project'])
                 for view in items:
                     view['projects_held'] = sorted(held.get(view['id'], []))
@@ -3174,7 +3193,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             remove = 'admin.py remove-creation %s --actor OPERATOR --reason REASON' % project
             items.append(view(item, what=item.get('command'),
                               finish='admin.py finish-project %s' % project if state == 'incomplete' else None,
-                              remove=remove if state in ('incomplete', 'stalled') else None))
+                              remove=remove if state in ('incomplete', 'stalled', 'damaged') else None))
         # Finished on the server and not registered here: the creator's grant was revoked, the
         # account was disabled or the server was over its limit when the work ended.
         unregistered = [view(item, state='created-unregistered', completed_at=item.get('completed_at'),

@@ -4232,7 +4232,14 @@ def main():
         import project_creation
         result=project_creation.remove(root,args.project,args.actor,args.reason)
         print(json.dumps(result,sort_keys=True))
-        if result['name']=='free':
+        if result['removed']=='damaged-record':
+            print('The creation record of %s could not be read. It is kept as project-creations/%s and nothing else '
+                  'was touched. %s'%(args.project,result['kept_as'],
+                  'Nothing is under projects/%s, so the name is free again.'%args.project if result['name']=='free' else
+                  'projects/%s exists and is now a project with no creation record: register it in the web interface '
+                  'if it is complete, or retire it (admin.py retire-project %s --actor OPERATOR --reason REASON).'
+                  %(args.project,args.project)),file=sys.stderr)
+        elif result['name']=='free':
             print('Removed the creation record of %s. Nothing had been made for it, so the name is free again.'
                   %args.project,file=sys.stderr)
         else:

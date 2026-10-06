@@ -270,7 +270,9 @@ def server_names(root):
     if projects.is_dir():
         names |= {path.name for path in projects.iterdir() if path.is_dir() and not path.is_symlink()}
     names |= {name for name, _ in admin.retired_entries(root)}
-    names |= {record['project'] for record in records(root) if record['effective'] in HOLDING}
+    # A record that cannot be read may stand for a database: it holds a place until an operator
+    # has set it aside (kittrial-5bb.143).
+    names |= {record['project'] for record in records(root) if record['effective'] in HOLDING + ('damaged',)}
     return names
 
 
@@ -394,8 +396,7 @@ def work(root, name, initialize=None):
             delete_record(root, name)
             if isinstance(error, Exception):
                 note_failure(root, name, record.get('by'), error)
-                raise NothingMade('The project could not be created and nothing was made. Try again; if it '
-                                  'fails again, ask an operator of the server.') from None
+                raise NothingMade(COULD_NOT) from None
             raise
         # The detail (which may name host paths and commands) stays in the record, for the operator.
         record.update(state='incomplete', stopped_at=_stamp(), error=_bounded(error))
@@ -514,7 +515,14 @@ def remove(root, name, actor, reason, retire=None):
         raise ValueError('Refusing to remove the creation of %s: a creation is running on this server (%s). '
                          'Wait for it to finish. Nothing was changed.' % (name, running_name(root) or 'unknown')) from None
     try:
-        record = read_record(root, name)
+        try:
+            record = read_record(root, name)
+        except ValueError:
+            # A record that cannot be read (kittrial-5bb.143): it is set aside, never deleted, and
+            # nothing else is touched, because what it stood for is not known.
+            kept = keep_damaged_record(root, name)
+            return {'project': name, 'removed': 'damaged-record', 'kept_as': kept.name, 'by': None,
+                    'name': 'free' if made(root, name) == 'nothing' else 'a project with no creation record'}
         if record is None:
             raise ValueError('There is no project creation record for %s, so there is nothing to remove here. '
                              'For a project, see admin.py retire-project. Nothing was changed.' % name)
@@ -541,6 +549,22 @@ def remove(root, name, actor, reason, retire=None):
         context.__exit__(None, None, None)
 
 
+def keep_damaged_record(root, name):
+    """Rename a creation record that cannot be read to ``NAME.json.damaged-<UTC stamp>`` beside it.
+
+    The kit's way with a damaged file (as for the review-writes audit): the bytes are kept
+    for whoever has to find out what happened, under a name no reader takes for a record.
+    """
+    path = record_path(root, name)
+    stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
+    aside, number = path.with_name('%s.damaged-%s' % (path.name, stamp)), 2
+    while aside.exists() or aside.is_symlink():
+        aside = path.with_name('%s.damaged-%s.%d' % (path.name, stamp, number))
+        number += 1
+    os.rename(path, aside)
+    return aside
+
+
 #: What the two lists say an operator can do about each reading.
 COMMANDS = {
     'incomplete': 'finish it (admin.py finish-project NAME) or remove it (admin.py remove-creation NAME --actor '
@@ -548,7 +572,11 @@ COMMANDS = {
     STALLED: 'the same web request resumes it; or remove the record (admin.py remove-creation NAME --actor OPERATOR '
              '--reason REASON), which frees the name',
     RUNNING: 'nothing: it is being created now',
-    'damaged': 'look at the record file',
+    'damaged': 'the record cannot be read, so the name is held and no web request can use it. Look at the file; then '
+               'set it aside (admin.py remove-creation NAME --actor OPERATOR --reason REASON): it is kept beside the '
+               'records as NAME.json.damaged-STAMP and nothing else is touched. What is under projects/NAME, if '
+               'anything, is then a project with no creation record: register it, or retire it (admin.py '
+               'retire-project NAME)',
 }
 
 
@@ -653,14 +681,95 @@ def _refused(sentence):
     return {'returncode': 2, 'stdout': '', 'stderr': 'ValueError: %s\n' % sentence}
 
 
-def note_failure(root, name, account, error):
-    """Keep why the last creation failed with nothing made, for the operator (0600, one entry)."""
+FAILURE_FILE = 'last-failure.txt'
+FAILURES_KEPT = 5
+
+
+def note_failure(root, name, account, error, step=None):
+    """Keep why a creation failed, for the operator: the newest, and the few before it (0600).
+
+    The detail may name host paths and exceptions, which is why it stays here and is not
+    in the answer to the person who asked. Never raises: a host that cannot write this
+    file must still answer the request.
+    """
     import admin
-    with contextlib.suppress(OSError, ValueError):
+    with contextlib.suppress(Exception):
         directory = records_dir(root)
         directory.mkdir(mode=0o700, exist_ok=True)
-        admin.atomic_private_write(directory / 'last-failure.txt', json.dumps(
-            {'project': name, 'by': account, 'at': _stamp(), 'error': _bounded(error)}, sort_keys=True) + '\n')
+        path = directory / FAILURE_FILE
+        earlier = []
+        with contextlib.suppress(Exception):
+            before = json.loads(path.read_text(encoding='utf-8'))
+            if isinstance(before, dict):
+                kept = before.pop('earlier', [])
+                earlier = [before] + [item for item in (kept if isinstance(kept, list) else []) if isinstance(item, dict)]
+        entry = {'project': name if isinstance(name, str) else None, 'by': account, 'at': _stamp(),
+                 'error': _bounded(error), 'earlier': earlier[:FAILURES_KEPT - 1]}
+        if step:
+            entry['step'] = step
+        admin.atomic_private_write(path, json.dumps(entry, sort_keys=True) + '\n')
+
+
+COULD_NOT = ('The project could not be created and nothing was made. Try again; if it fails again, ask an '
+             'operator of the server.')
+MADE_NOT_REGISTERED = ('Project %s was made on the server, but it could not be registered in the web interface. Ask '
+                       'an operator of the server to look at it. When that is repaired, create it again with the '
+                       'same name: nothing is made twice, it is only registered. Do not create it under another name.')
+NAME_RULE = 'Project: 2-24 lowercase letters/digits, beginning with a letter'
+_NAME = r'[a-z][a-z0-9]{1,23}'
+
+
+def _sentence_patterns():
+    import re
+    escaped = lambda text: re.escape(text).replace('%s', _NAME).replace('%d', r'[0-9]{1,6}')   # noqa: E731
+    incomplete = re.escape(incomplete_message('NAME')).replace('NAME', _NAME)
+    texts = [escaped(NOT_AVAILABLE), escaped('Project name %s is used by the database server itself: choose another name'),
+             escaped('The limit of %d project(s) for this account is reached (%d in use, counting creations that '
+                     'are not finished)'),
+             escaped(AT_SERVER_LIMIT), escaped(AT_SERVER_LIMIT + ' Project %s was made on the server and is not registered.'),
+             escaped(COULD_NOT), escaped(MADE_NOT_REGISTERED), escaped(NAME_RULE), incomplete]
+    return [re.compile(text) for text in texts]
+
+
+def creation_sentence(line):
+    """``line`` if it is, whole, one of the sentences a creation answers a person with; else None.
+
+    The web service puts the endpoint's line into its answer only when this recognises
+    it (kittrial-5bb.143). Anything else (an exception's text, a path on the host) is
+    for the operator, whichever kit the endpoint is.
+    """
+    if not isinstance(line, str):
+        return None
+    for prefix in ('ValueError: ', 'RuntimeError: '):
+        if line.startswith(prefix):
+            line = line[len(prefix):]
+    return line if any(pattern.fullmatch(line) for pattern in _sentence_patterns()) else None
+
+
+def _host_failure(root, name, account, error, progress):
+    """The sentence for a creation that failed in a way the kit did not foresee.
+
+    Chosen by what is on the host now, never from the error's text: a damaged record, a
+    directory that cannot be written and a journal that is not a database all name host
+    paths and exceptions (kittrial-5bb.143). The detail goes to :func:`note_failure`.
+    """
+    note_failure(root, name, account, error, step=progress.get('step'))
+    result = progress.get('result')
+    if isinstance(result, dict) and result.get('status') == 'created':
+        return MADE_NOT_REGISTERED % name
+    if progress.get('step') == 'reserve':
+        # Nothing was made by this request. A record of this name that cannot be read holds
+        # the name until an operator has looked at it: the same sentence as any taken name.
+        try:
+            read_record(root, name)
+        except Exception:                                        # noqa: BLE001
+            return NOT_AVAILABLE % name
+        return COULD_NOT
+    try:
+        state = made(root, name)
+    except Exception:                                            # noqa: BLE001
+        state = 'unknown'
+    return COULD_NOT if state == 'nothing' else incomplete_message(name)
 
 
 def create_action(root, request, authority_config, initialize=None):
@@ -670,17 +779,34 @@ def create_action(root, request, authority_config, initialize=None):
     reserved and again while it is confirmed, never while the project is initialized, so
     no other request waits for a creation (review 01a109cc). The creation lock is held
     for all three, without waiting: a second creation is answered busy at once.
+
+    Nothing but the kit's own creation sentences leaves this action as a refusal. A
+    failure it did not foresee is answered by :func:`_host_failure` and noted for the
+    operator; a wait for a lock that runs out still reads as busy.
     """
-    from http_authority import (AuthorityDenied, created_projects, decide, file_lock, project_grant, read_state,
-                                run_guarded)
+    import admin
     descriptor = service_descriptor(request, authority_config, 'create-project')
     name = request.get('project')
     if request.get('args', []) not in ([], None):
         raise ValueError('Use create-project without arguments')
     if not isinstance(request.get('operation_id'), str) or not request['operation_id']:
         raise ValueError('create-project needs an operation id')
+    if not isinstance(name, str):
+        raise ValueError(NAME_RULE)
+    admin.validate_name(name)
     account = descriptor['user_id']
     root = Path(root)
+    progress = {'step': 'reserve', 'result': None}
+    try:
+        return _create_steps(root, request, authority_config, initialize, descriptor, name, account, progress)
+    except TimeoutError:
+        raise                                  # a lock wait that ran out: the endpoint answers busy
+    except Exception as error:                 # noqa: BLE001
+        return _refused(_host_failure(root, name, account, error, progress))
+
+
+def _create_steps(root, request, authority_config, initialize, descriptor, name, account, progress):
+    from http_authority import (AuthorityDenied, created_projects, decide, file_lock, read_state, run_guarded)
 
     def standing():
         state = read_state(authority_config.store)
@@ -709,11 +835,13 @@ def create_action(root, request, authority_config, initialize=None):
             except NothingMade as refusal:
                 return _refused(refusal)
         # 2. Work, with the authority lock released: every other request is served meanwhile.
+        progress.update(step='work', result=result)
         if result is None:
             try:
                 result = work(root, name, initialize)
             except NothingMade as refusal:
                 return _refused(refusal)
+        progress.update(step='confirm', result=result)
 
         # 3. Confirm, under the authority lock again (run_guarded re-runs the authority check).
         def effect():

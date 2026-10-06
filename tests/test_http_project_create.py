@@ -714,6 +714,31 @@ class OnboardingTests(Case):
     def put(self, text, token=None):
         return self.request('PUT', self.url, {'text': text}, token=token or self.olive)
 
+    def test_a_failure_on_the_host_is_not_shown_as_a_refusal_of_the_text(self):
+        """kittrial-5bb.143: only the kit's own refusal of the text is passed on; a host failure names no path."""
+        import contextlib
+        import io
+        real = self.backend._endpoint
+
+        def answering(line):
+            def endpoint(action, *args, **kwargs):
+                if action != 'set-onboarding':
+                    return real(action, *args, **kwargs)
+                return {'returncode': 2, 'stdout': '', 'stderr': line}
+            return endpoint
+        for line in ('PermissionError: [Errno 13] Permission denied: %s/alpha/ONBOARDING.md\n' % self.canonical_root,
+                     'OSError: [Errno 28] No space left on device\n', ''):
+            with self.subTest(line=line[:30]), patch.object(self.backend, '_endpoint', answering(line)):
+                logged = io.StringIO()
+                with contextlib.redirect_stderr(logged):
+                    answer = self.put('Start with docs/README.md.')
+                self.assertEqual((409, self.backend.ONBOARDING_FAILED), (answer.status, answer.data['error']['message']))
+                self.assertNotIn(str(self.canonical_root), json.dumps(answer.data))
+                self.assertIn('set-onboarding alpha answered a line that is not a refusal of the text', logged.getvalue())
+        with patch.object(self.backend, '_endpoint', answering('ValueError: Project onboarding is limited to 8000 bytes\n')):
+            answer = self.put('x')
+        self.assertEqual((422, 'Project onboarding is limited to 8000 bytes'), (answer.status, answer.data['error']['message']))
+
     def test_an_owner_sets_reads_and_clears_it(self):
         import onboarding
         self.assertEqual(self.request('GET', self.url, token=self.olive).data,
@@ -988,6 +1013,189 @@ class GrantShapeTests(unittest.TestCase):
                                           'project': None, 'capability': http_authority.CAP_PROJECT_HOST_CREATE,
                                           'now': 1.0})
         self.assertEqual(caught.exception.status, 403)
+
+
+class HostFailureTests(Case):
+    """A runtime file that is damaged or cannot be written: no host text reaches the person (kittrial-5bb.143)."""
+
+    def setUp(self):
+        super().setUp()
+        self.grant(limit=5)
+        self.records = self.canonical_root / 'project-creations'
+        self.records.mkdir(parents=True, exist_ok=True)
+
+    def refused(self, answer, sentence):
+        self.assertEqual(409, answer.status, answer.data)
+        said = answer.data['error']['message']
+        self.assertEqual(said, sentence)
+        text = json.dumps(answer.data)
+        for leak in (str(self.canonical_root), str(self.tmp), 'project-creations', 'Error', 'Errno', 'Traceback', '.json',
+                     'sqlite', 'database'):
+            self.assertNotIn(leak, text)
+
+    def noted(self):
+        return json.loads((self.records / pc.FAILURE_FILE).read_text(encoding='utf-8'))
+
+    def raw(self):
+        """What the endpoint itself answers, before the service looks at it."""
+        return self.call(self.request_for('olive', self.olive))
+
+    call, descriptor, request_for = EndpointGuardTests.call, EndpointGuardTests.descriptor, EndpointGuardTests.request_for
+
+    def test_a_record_of_that_name_that_is_not_json_reads_as_a_taken_name(self):
+        path = self.records / 'alpha.json'
+        path.write_text('{not json', encoding='utf-8')
+        for attempt in range(2):                                   # the same request again changes nothing
+            self.refused(self.create(self.olive, 'alpha'), pc.NOT_AVAILABLE % 'alpha')
+        self.assertEqual(path.read_text(encoding='utf-8'), '{not json')
+        self.assertFalse(self.on_host('alpha'))
+        self.assertNotIn('alpha', self.service.state['projects'])
+        # The endpoint's own answer already carries the sentence and nothing else.
+        raw = self.raw()
+        self.assertEqual((raw['returncode'], raw['stderr']), (2, 'ValueError: %s\n' % (pc.NOT_AVAILABLE % 'alpha')))
+        # The detail is on the host, for the operator, with the step it happened at.
+        noted = self.noted()
+        self.assertEqual((noted['project'], noted['by'], noted['step']), ('alpha', self.ids['olive'], 'reserve'))
+        self.assertIn('JSONDecodeError', noted['error'])
+        self.assertEqual(len(noted['earlier']), 2)                  # the two requests before this one
+        # It is listed for the superuser as damaged, with the exact command.
+        listed = self.request('GET', '/v1/project-creations', token=self.admin).data['items']
+        self.assertEqual([(i['project'], i['state'], i['finish'], i['remove']) for i in listed],
+                         [('alpha', 'damaged', None, 'admin.py remove-creation alpha --actor OPERATOR --reason REASON')])
+        self.assertIn('kept beside the records as alpha.json.damaged-STAMP', listed[0]['what'])
+
+    def test_a_record_of_the_wrong_shape_cannot_be_adopted_or_resumed(self):
+        """Whatever it claims: a finished creation by this very account, or one that stalled."""
+        me = self.ids['olive']
+        for label, text in (('another project', '{"project": "other", "by": "%s", "state": "created"}' % me),
+                            ('no author', '{"project": "alpha", "state": "started"}'),
+                            ('an unknown state', '{"project": "alpha", "by": "%s", "state": "done"}' % me),
+                            ('a list', '[]'), ('not text', '\udcff')):
+            with self.subTest(record=label):
+                path = self.records / 'alpha.json'
+                path.write_bytes(text.encode('utf-8', 'surrogateescape'))
+                self.refused(self.create(self.olive, 'alpha'), pc.NOT_AVAILABLE % 'alpha')
+                self.assertFalse(self.on_host('alpha'))
+                self.assertNotIn('alpha', self.service.state['projects'])
+
+    def test_a_damaged_record_of_another_name_does_not_stop_a_creation_and_holds_a_place(self):
+        (self.records / 'beta.json').write_text('{not json', encoding='utf-8')
+        self.assertEqual(201, self.create(self.olive, 'alpha').status)
+        self.assertEqual(sorted(pc.server_names(self.canonical_root)), ['alpha', 'beta'])
+        self.assertEqual(pc.holds(self.canonical_root, self.ids['olive'], ['alpha']), [])   # nobody's: it names no author
+        (self.canonical_root / 'deployment.private.json').write_text(json.dumps({'project_database_limit': 2}),
+                                                                     encoding='utf-8')
+        self.refused(self.create(self.olive, 'gamma'), pc.AT_SERVER_LIMIT)
+
+    @unittest.skipIf(sys.platform == 'win32' or (hasattr(os, 'geteuid') and os.geteuid() == 0),
+                     'needs a directory the process cannot write (POSIX, not root)')
+    def test_a_records_directory_that_cannot_be_written_makes_nothing(self):
+        os.chmod(self.records, 0o500)
+        self.addCleanup(os.chmod, self.records, 0o700)
+        self.refused(self.create(self.olive, 'alpha'), pc.COULD_NOT)
+        self.assertFalse(self.on_host('alpha'))
+        self.assertEqual(sorted(path.name for path in self.records.iterdir()), [])
+        os.chmod(self.records, 0o700)
+        self.assertEqual(201, self.create(self.olive, 'alpha').status)       # repaired: the same name is created
+
+    def test_a_journal_that_is_not_a_database_says_the_project_was_made_and_can_be_registered_later(self):
+        journal = self.records / pc.CREATION_JOURNAL
+        journal.write_text('this is not a database, it is a text file of some length\n' * 4, encoding='utf-8')
+        answer = self.create(self.olive, 'alpha')
+        self.refused(answer, pc.MADE_NOT_REGISTERED % 'alpha')
+        # Made, complete, and not registered; the superuser sees it as such.
+        self.assertEqual(self.record('alpha')['state'], 'created')
+        self.assertNotIn('alpha', self.service.state['projects'])
+        listed = self.request('GET', '/v1/project-creations', token=self.admin).data
+        self.assertEqual([(i['project'], i['state']) for i in listed['unregistered']], [('alpha', 'created-unregistered')])
+        noted = self.noted()
+        self.assertEqual((noted['project'], noted['step']), ('alpha', 'confirm'))
+        self.assertIn('DatabaseError', noted['error'])
+        # Sent again while it is broken: the same answer, and nothing is made twice.
+        self.refused(self.create(self.olive, 'alpha'), pc.MADE_NOT_REGISTERED % 'alpha')
+        # The operator repairs the journal; the same name is then only registered.
+        journal.unlink()
+        again = self.create(self.olive, 'alpha')
+        self.assertEqual(201, again.status, again.data)
+        self.assertEqual(self.service.state['projects']['alpha']['host_created']['adopted'], True)
+        self.assertEqual(self.visible(self.olive), ['alpha'])
+
+    def test_a_failure_while_the_project_is_made_names_no_host_detail(self):
+        hooked = self.tmp / 'creation-hook.py'
+        hooked.write_text('raise OSError(13, "Permission denied", %r)\n' % str(self.canonical_root / 'backups' / 'alpha'),
+                          encoding='utf-8')
+        env = patch.dict(os.environ, {'STRICT_ENDPOINT_CREATE_HOOK': str(hooked)})
+        env.start()
+        self.addCleanup(env.stop)
+        answer = self.create(self.olive, 'alpha')
+        self.assertEqual(409, answer.status, answer.data)
+        self.assertEqual(answer.data['error']['message'], pc.incomplete_message('alpha'))
+        self.assertNotIn(str(self.canonical_root), json.dumps(answer.data))
+        self.assertIn('Permission denied', self.record('alpha')['error'])           # for the operator, in the record
+
+    @unittest.skipIf(sys.platform == 'win32' or (hasattr(os, 'geteuid') and os.geteuid() == 0),
+                     'needs a directory the process cannot write (POSIX, not root)')
+    def test_a_record_that_cannot_be_written_once_the_project_is_made_reads_as_unfinished(self):
+        """The failure is in the work step itself, after the reservation: something was made."""
+        hooked = self.tmp / 'creation-hook.py'
+        hooked.write_text('import os\nos.chmod(%r, 0o500)\n' % str(self.records), encoding='utf-8')
+        env = patch.dict(os.environ, {'STRICT_ENDPOINT_CREATE_HOOK': str(hooked)})
+        env.start()
+        self.addCleanup(env.stop)
+        self.addCleanup(os.chmod, self.records, 0o700)
+        self.refused(self.create(self.olive, 'alpha'), pc.incomplete_message('alpha'))
+        self.assertTrue(self.on_host('alpha'))
+        self.assertNotIn('alpha', self.service.state['projects'])
+        os.chmod(self.records, 0o700)
+        self.assertEqual([(i['project'], i['state']) for i in pc.attention(self.canonical_root)], [('alpha', 'incomplete')])
+
+    def test_the_service_passes_on_only_a_creation_sentence(self):
+        """The second layer, alone: whatever an endpoint of any kit answers with return code 2."""
+        import contextlib
+        import io
+        real = self.backend._endpoint
+
+        def answering(line):
+            def endpoint(action, *args, **kwargs):
+                if action != 'create-project':
+                    return real(action, *args, **kwargs)
+                return {'returncode': 2, 'stdout': '', 'stderr': line}
+            return endpoint
+        leaks = ('PermissionError: [Errno 13] Permission denied: %s/project-creations/alpha.json\n' % self.canonical_root,
+                 'JSONDecodeError: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)\n',
+                 'ValueError: The project creation record for alpha is damaged; an operator must look at /srv/x.json\n',
+                 'DatabaseError: file is not a database\n', 'ValueError: %s and then /etc/passwd\n' % (pc.NOT_AVAILABLE % 'alpha'),
+                 '', 'Traceback (most recent call last):\n  File "/srv/kit/endpoint.py"\n')
+        for line in leaks:
+            with self.subTest(line=line[:40]), patch.object(self.backend, '_endpoint', answering(line)):
+                logged = io.StringIO()
+                with contextlib.redirect_stderr(logged):
+                    self.refused(self.create(self.olive, 'alpha'), self.backend.CREATION_FAILED)
+                self.assertIn('create-project alpha answered a line that is not a creation sentence', logged.getvalue())
+        for sentence in (pc.NOT_AVAILABLE % 'alpha', pc.COULD_NOT, pc.AT_SERVER_LIMIT, pc.MADE_NOT_REGISTERED % 'alpha',
+                         pc.incomplete_message('alpha'),
+                         'The limit of 5 project(s) for this account is reached (5 in use, counting creations that are '
+                         'not finished)'):
+            with self.subTest(sentence=sentence[:40]), patch.object(self.backend, '_endpoint',
+                                                                    answering('ValueError: %s\n' % sentence)):
+                answer = self.create(self.olive, 'alpha')
+                self.assertEqual((409, sentence), (answer.status, answer.data['error']['message']))
+
+    def test_every_sentence_the_creation_refuses_with_is_one_the_service_knows(self):
+        for sentence in (pc.NOT_AVAILABLE % 'alpha', pc.COULD_NOT, pc.AT_SERVER_LIMIT, pc.MADE_NOT_REGISTERED % 'a1',
+                         pc.AT_SERVER_LIMIT + ' Project alpha was made on the server and is not registered.',
+                         pc.incomplete_message('beta'), pc.NAME_RULE,
+                         'Project name mysql is used by the database server itself: choose another name'):
+            self.assertEqual(pc.creation_sentence('ValueError: ' + sentence), sentence)
+            self.assertEqual(pc.creation_sentence(sentence), sentence)
+        for other in (pc.NOT_AVAILABLE % 'Alpha', pc.NOT_AVAILABLE % 'alpha' + '.', ' ' + pc.COULD_NOT,
+                      pc.incomplete_message('beta') + ' /srv', 'ValueError: ', '', None, 7,
+                      pc.MADE_NOT_REGISTERED % '../x'):
+            self.assertIsNone(pc.creation_sentence(other))
+        import admin
+        with self.assertRaises(ValueError) as caught:
+            admin.validate_name('Not A Name')
+        self.assertEqual(str(caught.exception), pc.NAME_RULE)        # the one sentence that is admin.py's own
 
 
 if __name__ == '__main__':
