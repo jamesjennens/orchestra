@@ -11,13 +11,14 @@ no HTTP principal at all.
 import argparse
 import fcntl
 import json
+import os
 import record_json
 import re
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from admin import environment,project_dir,root_path,operators as configured_operators,verifiers as configured_verifiers,review_workflow_writes as configured_review_writes
+from admin import ConfigurationUnreadable,deployment_document,deployment_password,environment,project_dir,root_path,operators as configured_operators,verifiers as configured_verifiers,review_workflow_writes as configured_review_writes
 import native
 from coordination import is_merge_slot, merge_slot_sentence
 from render import render
@@ -374,6 +375,38 @@ def _guard_named_rows(root,path,name,args,attachments,actor):
                              %(command,row['id'],merge_slot_sentence(row['id'])))
     return rows
 
+def guarded_write(root,request,journal,effect,**options):
+    """``run_guarded``, after the server's configuration has been read (kittrial-5bb.156).
+
+    Every write that reserves an operation identity needs ``deployment.private.json``: bd
+    takes its password from it. Read for the first time inside the guarded write, a file cut
+    short or closed to this user left the operation "outcome unknown" with nothing written,
+    and its idempotency key unusable until that expired (seen on real bd). Read here, it
+    refuses the write with nothing done and nothing reserved. The password is asked for as
+    well as the file: a file that parses and has none failed in the same place (seen on real
+    bd too). Only these writes read it ahead of time: an action that needs nothing from the
+    file is not stopped by its damage, and one that reads it on the way fails there, as it
+    always did.
+    """
+    # Whatever is at the name, or nothing: a file that is missing, a directory, a dangling
+    # link or a FIFO failed in the same place as a damaged one, after the reservation
+    # (review of revision 2). No write of this kind works without the file.
+    deployment_document(root/'deployment.private.json')
+    deployment_password(root)
+    return run_guarded(request,journal,effect,**options)
+
+def configuration_fault(root,error):
+    """Whether ``error`` is a failure to read the server's own configuration file.
+
+    The kit's class for a file that is not JSON, not text or not an object; and an
+    ``OSError`` that names that file (it cannot be opened: closed to this user, a directory,
+    gone while the service runs).
+    """
+    if isinstance(error,ConfigurationUnreadable):return True
+    if not isinstance(error,OSError) or isinstance(error,TimeoutError):return False
+    try:return Path(os.fsdecode(error.filename))==Path(root)/'deployment.private.json'
+    except (TypeError,ValueError):return False       # it names no file, or a descriptor
+
 def execute(root,request,authority_config=None,require_authority=False):
     # Two actions exist only for the web service and name no existing project
     # (kittrial-5bb.118 part 2); project_creation holds them, with what stops other callers.
@@ -453,7 +486,7 @@ def execute(root,request,authority_config=None,require_authority=False):
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False,indent=2)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            return run_guarded(request,journal_path(path),work_effect,
+            return guarded_write(root,request,journal_path(path),work_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
     if action=='set-onboarding':
@@ -585,7 +618,7 @@ def execute(root,request,authority_config=None,require_authority=False):
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            return run_guarded(request,journal_path(path),ref_effect,
+            return guarded_write(root,request,journal_path(path),ref_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
     if action=='capability':
@@ -633,7 +666,7 @@ def execute(root,request,authority_config=None,require_authority=False):
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            return run_guarded(request,journal_path(path),capability_effect,
+            return guarded_write(root,request,journal_path(path),capability_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
     if action=='proposal':
@@ -671,7 +704,7 @@ def execute(root,request,authority_config=None,require_authority=False):
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            return run_guarded(request,journal_path(path),proposal_effect,
+            return guarded_write(root,request,journal_path(path),proposal_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
     if action in ('brief','history','checkpoint'):
@@ -690,7 +723,7 @@ def execute(root,request,authority_config=None,require_authority=False):
                                                              verifiers=configured_verifiers(root)),'stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            return run_guarded(request,journal_path(path),briefing_effect,
+            return guarded_write(root,request,journal_path(path),briefing_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
     if action in ('lifecycle','coordinate','requirement'):
@@ -715,7 +748,7 @@ def execute(root,request,authority_config=None,require_authority=False):
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            return run_guarded(request,journal_path(path),lifecycle_effect,
+            return guarded_write(root,request,journal_path(path),lifecycle_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
     if action == 'feedback':
@@ -813,7 +846,7 @@ def execute(root,request,authority_config=None,require_authority=False):
                 return {'returncode':p.returncode,'stdout':p.stdout,'stderr':p.stderr}
             runner=NativeRunner(bd_dispatch)
             def bd_effect():return runner(final)
-            return run_guarded(request,journal_path(path),bd_effect,
+            return guarded_write(root,request,journal_path(path),bd_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
 
@@ -840,6 +873,12 @@ def main():
         answer={'returncode':75,'stdout':'','stderr':'Busy: %s. Nothing was done; try again shortly.\n'%waited}
     except Exception as e:
         answer={'returncode':2,'stdout':'','stderr':f'{type(e).__name__}: {e}\n'}
+        if configuration_fault(a.root,e):
+            # Not a fault of the request: the server's own configuration file cannot be read.
+            # The line names the file, as it does for the operator; `fault` lets the web service
+            # say it in its own words and keep the path to its log (kittrial-5bb.156).
+            if isinstance(e,ConfigurationUnreadable):answer['stderr']=f'ValueError: {e}\n'
+            answer['fault']='configuration'
     print(json.dumps(answer,ensure_ascii=False))
 
 if __name__=='__main__':main()

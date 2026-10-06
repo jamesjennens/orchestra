@@ -36,6 +36,7 @@ import os
 import re
 import secrets
 import sqlite3
+import sys
 import threading
 import time
 from pathlib import Path
@@ -681,6 +682,9 @@ class Store:
         self.path = Path(path)
         self.clock = clock
         self.lock = threading.RLock()
+        #: Since when the state in memory holds something the file does not, on this store's
+        #: clock: a save could not have the state lock. None when the file is current.
+        self.unsaved_since = None
         self.state = self._load()
         self.records = RecordStore(
             self.path.with_name(self.path.name + RECORD_STORE_SUFFIX),
@@ -731,7 +735,38 @@ class Store:
         if moved:
             self.save()
 
-    def save(self):
+    #: How long :meth:`save_soon` waits for the state lock the first time (kittrial-5bb.156).
+    SOON_WAIT = 5.0
+
+    def save_soon(self, what='a last-use stamp'):
+        """Save, without making the caller wait a minute for it. Returns whether it was saved.
+
+        For what a request's answer does not depend on: the last-use stamp every
+        authenticated request leaves, and the audit entry of a refusal. The first time the
+        state lock cannot be had within :attr:`SOON_WAIT` seconds the change stays in
+        memory, and until a save succeeds every further call tries once without waiting,
+        so requests sent together do not queue behind one another. The whole state is
+        written by every save, so the next save that succeeds writes what was left; a
+        write that goes to the endpoint saves first (``EndpointBackend._endpoint``),
+        because the endpoint reads a session's idle deadline from the file.
+
+        What follows from a stamp that is not saved, both ways: if the service stops
+        before the next save the last use is lost and the session reads as idle sooner
+        (the safe side); nothing lets a session live past its deadline.
+        """
+        with self.lock:
+            first = self.unsaved_since is None
+            try:
+                self.save(wait=self.SOON_WAIT if first else 0.0)
+                return True
+            except TimeoutError as waited:
+                if first:
+                    print('busy: %s was not saved, the state lock could not be had; it is kept in memory and '
+                          'written with the next save: %s' % (what, ascii(str(waited)[:400])),
+                          file=sys.stderr, flush=True)
+                return False
+
+    def save(self, wait=60.0):
         # One unique temporary per write, then an atomic replace. A fixed
         # ``<name>.tmp`` would let a second writer (or a stale process) clobber an
         # in-flight snapshot before it is renamed, so the name carries the pid and a
@@ -742,23 +777,37 @@ class Store:
         # same file around live-authority re-validation plus its effect, so an
         # authority change persisted here (revocation, membership, disable) is either
         # committed before the endpoint's check or serialized after the effect.
-        with self.lock, file_lock(str(self.path) + '.lock'):
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self.path.with_name(
-                '%s.%d.%s.tmp' % (self.path.name, os.getpid(), secrets.token_hex(4)))
-            text = json.dumps(self.state, ensure_ascii=False, indent=2) + '\n'
+        with self.lock:
             try:
-                with open(temporary, 'w', encoding='utf-8') as handle:
-                    handle.write(text)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temporary, self.path)
-            except BaseException:
-                try:
-                    os.unlink(temporary)
-                except OSError:
-                    pass
+                with file_lock(str(self.path) + '.lock', timeout=wait):
+                    self._write()
+            except TimeoutError:
+                # Whatever this save was to write is in memory only, until a save succeeds.
+                if self.unsaved_since is None:
+                    self.unsaved_since = self.clock()
                 raise
+
+    def _write(self):
+        """Write the whole state to the file. The caller holds both locks."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_name(
+            '%s.%d.%s.tmp' % (self.path.name, os.getpid(), secrets.token_hex(4)))
+        text = json.dumps(self.state, ensure_ascii=False, indent=2) + '\n'
+        try:
+            with open(temporary, 'w', encoding='utf-8') as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.path)
+            if self.unsaved_since is not None:
+                self.unsaved_since = None
+                print('The state is saved again; what was kept in memory is written.', file=sys.stderr, flush=True)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
 
 
 # --------------------------------------------------------------------------- service
@@ -1036,13 +1085,15 @@ class Service:
             return {'allowed': used < grant['limit'], 'limit': grant['limit'], 'used': used,
                     'reason': None if used < grant['limit'] else 'limit'}
 
-    def register_host_created(self, principal, project_id, name, creation):
+    def register_host_created(self, principal, project_id, name, creation, operation=None):
         """Write the web record of a project the host has just finished creating.
 
         The creator is the only member, as owner. ``registered_by`` is set so that this
         kit and the one before it serve the record (the earlier kit reads that mark as
         "a superuser stood behind this mapping"; here a superuser stood behind the
-        grant). ``host_created`` says how the record came to be.
+        grant). ``host_created`` says how the record came to be; its ``operation`` is the
+        digest of the request's identity, by which the creator's exact repeat of that
+        request is known again (kittrial-5bb.156).
         """
         with self.store.lock:
             self._refresh_authority(principal)
@@ -1059,7 +1110,7 @@ class Service:
                 'created_at': now_iso(self._now()), 'archived': False,
                 'registered_by': principal.user_id,
                 'host_created': {'by': principal.user_id, 'at': now_iso(self._now()),
-                                 'adopted': bool(creation.get('adopted')),
+                                 'adopted': bool(creation.get('adopted')), 'operation': operation,
                                  'grant_limit': None if user.get('superuser') else (grant or {}).get('limit'),
                                  'granted_by': None if user.get('superuser') else (grant or {}).get('granted_by')},
             }
@@ -1275,7 +1326,8 @@ class Service:
                 session['last_used'] = moment
                 session['last_used_raw'] = self._raw_now()
                 session['idle_expires'] = moment + self.session_idle
-                self.store.save()
+                # The answer of a request does not wait a minute for this stamp (kittrial-5bb.156).
+                self.store.save_soon()
                 return Principal(user['id'], user['display_name'], user['superuser'],
                                  'session', user['id'], csrf=session['csrf'],
                                  session_hash=digest)
@@ -1305,7 +1357,7 @@ class Service:
                     if not isinstance(agent, dict) or not agent.get('enabled'):
                         raise unauthenticated('Agent is disabled')
                     agent['last_seen_at'] = now_iso(self._now())
-                self.store.save()
+                self.store.save_soon()
                 # A credential carries ONLY the authority granted by its type, project
                 # and scopes. It never inherits the issuing account's global superuser
                 # authority: ``superuser`` is always False here, and scopes are the
@@ -1679,6 +1731,11 @@ class Service:
     def project_view(self, principal, project_id):
         project, role = self.require_project(principal, project_id)
         view = dict(project)
+        made = view.get('host_created')
+        if isinstance(made, dict) and 'operation' in made:
+            # The digest that recognises the creator's own repeat is the service's own: no other
+            # account or body can match it, and no reader needs it (kittrial-5bb.156 review).
+            view['host_created'] = {key: value for key, value in made.items() if key != 'operation'}
         # The repository as today's rule reads it (kittrial-5bb.123): a stored value that
         # no longer passes is withheld and flagged; a passing one carries the note that it
         # is information, wherever a member or an agent credential reads the project.

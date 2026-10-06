@@ -110,9 +110,11 @@ export function hostCreatePanel(ctx, creation) {
       h('div', { class: 'panel-body' }, h('p', { class: 'small muted' }, why)));
   }
   const status = h('div', { class: 'banner crit', role: 'alert', hidden: true });
+  // "You already have project X": a notice with the way to it, not an error on the name.
+  const yours = h('div', { class: 'banner', role: 'status', id: 'host-create-yours', hidden: true });
   const form = h('form', { class: 'form', novalidate: true },
     h('p', { class: 'small muted' }, 'This creates the project on the server and makes you its owner. It can take from a few seconds to a few minutes: the more projects the server holds, the longer. Keep this page open. You then set it up step by step.', numbers ? ' ' + numbers : ''),
-    status,
+    status, yours,
     field({ id: 'new_project_id', label: 'Project name', hint: '2–24 lowercase letters or digits, beginning with a letter. It becomes the start of every task id and cannot be changed.', required: true, maxlength: 24 }),
     field({ id: 'new_project_name', label: 'Display name (optional)', hint: 'Defaults to the project name.', maxlength: 64 }),
     h('div', null, h('button', { type: 'submit', class: 'primary' }, 'Create project')));
@@ -123,11 +125,18 @@ export function hostCreatePanel(ctx, creation) {
     if (!/^[a-z][a-z0-9]{1,23}$/.test(projectId)) return setFieldError(form, 'new_project_id', 'Enter 2–24 lowercase letters or digits, beginning with a letter.');
     setFieldError(form, 'new_project_id', '');
     status.hidden = true;
+    yours.hidden = true;
     const created = await act(form.querySelector('button'), () => ctx.api.createHostProject(projectId, values.new_project_name.trim()), {
       success: 'Project created',
       onError: (e) => {
         // A creation that stopped half way: the server's sentence names the project and says who must act.
         if (e.status === 409 && e.detail && e.detail.state === 'incomplete') { status.replaceChildren(e.message); status.hidden = false; return true; }
+        // The project is this account's own already (the server says so to its creator only).
+        if (e.status === 409 && e.detail && e.detail.state === 'yours' && e.detail.project === projectId) {
+          yours.replaceChildren(e.message, ' ', h('a', { href: ctx.href('/p/' + projectId) }, 'Open ' + projectId));
+          yours.hidden = false;
+          return true;
+        }
         // Another project is being created: nothing was done, and the same request can be sent again.
         if (e.status === 503 && e.code === 'busy') { status.replaceChildren(e.message); status.hidden = false; return true; }
         if (e.status === 422 || e.status === 409 || e.status === 403) { setFieldError(form, 'new_project_id', e.message); return true; }

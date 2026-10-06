@@ -320,6 +320,8 @@ history.
   has no clear record; the removed guidance record itself stays in the project's most
   recent coordination backup, if one was taken.
 
+**Every upgrade and rollback: restart the web service in the same step as the files (kittrial-5bb.156).** Where the web interface runs (`http_service.py --backend endpoint`), the service is a long-running process and the endpoint is started anew for each request. Replacing the kit's files therefore changes the endpoint at once and the service only when it is restarted, and a service of the other kit left running applies its own rules to the new endpoint's answers (seen: it registered a half-made project whose creation record is damaged, which the new service refuses). Replace the files and restart the service together; see docs/HTTP_DEPLOYMENT.md.
+
 **Upgrading to this kit, and rolling back from it (kittrial-5bb.105).** The plain-text
 rule is checked when guidance is read as well as when it is set, so a change of rule
 has an effect in both directions.

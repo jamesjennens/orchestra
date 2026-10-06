@@ -1060,7 +1060,10 @@ class EndpointReviewSwitchTests(unittest.TestCase):
     def _run(self, writes):
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / 'deployment.private.json').write_text(
-            json.dumps({'operators': ['coord'], 'review_workflow_writes': writes}), encoding='utf-8')
+            # A deployment file always has the database password; a guarded write asks for it
+            # before it reserves (kittrial-5bb.156).
+            json.dumps({'password': 'not-used', 'operators': ['coord'], 'review_workflow_writes': writes}),
+            encoding='utf-8')
         import endpoint
         import work
         from unittest.mock import patch
