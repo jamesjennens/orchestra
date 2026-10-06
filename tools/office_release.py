@@ -281,8 +281,9 @@ def vendored(lock, name, data):
 
 def starts(label, path, arguments, scratch):
     """Start ``path`` with ``arguments``; return what it said, or raise saying why it cannot start here."""
+    path = os.path.abspath(str(path))             # it is started from the scratch directory
     try:
-        done = subprocess.run([str(path)] + list(arguments), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        done = subprocess.run([path] + list(arguments), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               stdin=subprocess.DEVNULL, timeout=60, cwd=str(scratch),
                               env=dict(os.environ, HOME=str(scratch)))
         code, said = done.returncode, done.stdout.decode('utf-8', 'replace')

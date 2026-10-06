@@ -346,6 +346,20 @@ class InstallCheckTests(ReleaseFixture):
         self.assertIn('The file says it needs glibc 2.34 or later; this host has glibc ', refused.stderr)
         self.assertFalse((root/'current').exists())
 
+    def test_a_program_named_by_a_relative_path_is_still_started(self):
+        """It is started from a scratch directory; found on the real binaries inside the glibc 2.28 container."""
+        import os
+        with tempfile.TemporaryDirectory() as scratch, tempfile.TemporaryDirectory() as elsewhere:
+            program = Path(elsewhere)/'bd'
+            program.write_bytes(self.BD)
+            program.chmod(0o755)
+            before = os.getcwd()
+            os.chdir(elsewhere)
+            try:
+                self.assertEqual(tool.starts('bd', 'bd', ['--version'], scratch), 'bd version 1.2.2 (fixture)')
+            finally:
+                os.chdir(before)
+
     def test_the_scratch_copies_are_removed_and_the_installed_release_is_whole(self):
         root = self.base/'installation'
         self.assertEqual(self.install(self.build('clean'), root).returncode, 0)
