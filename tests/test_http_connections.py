@@ -228,21 +228,42 @@ class SilentConnectionTests(Case):
         self.assertEqual(self.httpd.cut_off, 0)
 
     def test_a_client_that_does_not_take_its_response_is_cut_off(self):
+        """The wait is in the WRITE: every request is already there, so the service never waits to read one."""
         web = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, web, ignore_errors=True)
-        (Path(web)/'index.html').write_text('<!doctype html><title>x</title>', encoding='utf-8')
-        (Path(web)/'big.js').write_bytes(b'/* */\n' * 6_000_000)       # more than the socket buffers of both ends hold
+        page = b'<!doctype html><title>x</title>' + b'<!-- -->\n' * 400_000
+        self.assertLess(len(page), http_service.STATIC_MAX_BYTES)
+        (Path(web)/'index.html').write_bytes(page)
         self.serve(web_root=web)
-        deaf = self.silent(b'GET /big.js HTTP/1.1\r\nHost: x\r\n\r\n')
+        # Sixty requests for a page of 3.6 MB, and nothing is read: far more than both ends' buffers hold.
+        deaf = self.silent()
         deaf.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
-        time.sleep(0.3)
-        self.assertEqual(self.httpd.open_connections(), 1)        # its thread is in the write
+        deaf.sendall(b'GET / HTTP/1.1\r\nHost: x\r\n\r\n' * 60)
+        time.sleep(0.5)
+        self.assertEqual(self.httpd.open_connections(), 1)        # its thread is in a write
         self.served()
-        until = time.monotonic() + CLIENT + 4
+        until = time.monotonic() + CLIENT + 1.5                   # before the socket's own timeout could end it
         while time.monotonic() < until and self.httpd.cut_off == 0:
             time.sleep(0.05)
         self.assertEqual(self.httpd.cut_off, 1)
         self.settled()
+        # It was a response that was being written: the client finds the beginning of one.
+        deaf.settimeout(2)
+        self.assertTrue(deaf.recv(4096).startswith(b'HTTP/1.1 200 '))
+
+    def test_a_thread_that_has_not_started_yet_is_not_taken_for_one_that_died(self):
+        self.serve()
+        waiting, request = threading.Thread(target=lambda: None), mock.Mock()
+        with self.httpd._guard:
+            self.httpd._serving[waiting] = request
+            self.httpd._open += 1
+        time.sleep(self.httpd.REAP_EVERY * 4)
+        self.assertEqual((self.httpd.open_connections(), self.httpd.turned_away), (1, 0))
+        request.close.assert_not_called()
+        waiting.start()                                           # it ran and ended without serving: now it is given up
+        waiting.join()
+        self.settled()
+        self.assertEqual(self.httpd.turned_away, 1)
 
     def test_connections_beyond_the_limit_are_closed_at_once_and_the_limit_frees_itself(self):
         logged = io.StringIO()
