@@ -12,6 +12,11 @@ whole project (``list --watch``, ``show ID --watch``, short ``-w``) is refused b
 and the existence check treats bd's ambiguous-prefix answer as "no row has exactly this id", so
 ``create --id p-ab`` with ``p-abc`` and ``p-abd`` present is allowed again while an exact id is
 still refused.
+
+kittrial-5bb.146 pins two .138 rules the revision 2 review left unpinned: a joined value belongs
+to the LAST letter of a short cluster (``-wq=false`` keeps ``--watch`` on and must be refused
+before bd starts), and the no-match object means absent only at bd's exact rc 1 (a non-zero rc
+other than 1, such as rc 2, fails closed).
 """
 import json
 import sys
@@ -262,6 +267,22 @@ class EndpointTests(unittest.TestCase):
                 self.assertEqual(self.bd.writes, [], args)
                 self.assertTrue(self.bd.reads, args)
 
+    def test_a_joined_value_belongs_to_the_last_letter_of_a_cluster(self):
+        # A joined value is the value of the cluster's LAST letter, so `-wq=false` is `-w` with
+        # `-q=false`: --watch is still on and the invocation must be refused before bd is started.
+        # The mutation that hands the joined value to EVERY letter reads the false as belonging to
+        # w and lets the read through, and bd then watches on the rows the cluster names
+        # (kittrial-5bb.146 item 1).
+        for args in (['list', '-wq=false'], ['list', '-wv=0'], ['list', '-wr=false'],
+                     ['show', OTHER, '-wq=false']):
+            with self.subTest(args=args):
+                self.bd.writes, self.bd.reads = [], []
+                said = self.refused(args)
+                self.assertIn('waits for changes', said)
+                self.assertIn('--watch', said)
+                self.assertEqual(self.bd.reads, [], args)
+                self.assertEqual(self.bd.writes, [], args)
+
     # 3. The id shape: a trailing dot or hyphen files the row under the row it looks like.
 
     def test_an_id_ending_in_a_dot_or_hyphen_is_refused(self):
@@ -334,6 +355,23 @@ class EndpointTests(unittest.TestCase):
         self.assertIn('could not check whether a task with that id exists', said)
         self.assertEqual(self.bd.writes, [])
         # With bd's real rc 1 the same answer is an absence and the create proceeds.
+        self.bd.no_match_rc = 1
+        self.assertEqual(self.run_bd(['create', 'new', '--id', 'pp-ab'])['returncode'], 0)
+        self.assertEqual(len(self.bd.writes), 1)
+
+    def test_a_no_match_object_at_another_non_zero_exit_code_is_not_an_absence(self):
+        # The object means absent only at bd 1.2.2's exact rc 1. The mutation that lets it count at
+        # ANY non-zero exit code reads rc 2 -- a failed read -- as "no row has exactly this id", and
+        # the create then replaces a row the read never saw (kittrial-5bb.146 item 2). rc 2 is a
+        # non-zero code other than the pinned one, so the read must fail closed.
+        self.bd.rows.append(dict(self.bd.rows[0], id='pp-abd'))
+        self.bd.no_match_rc = 2
+        self.bd.writes, self.bd.reads = [], []
+        said = self.refused(['create', 'new', '--id', 'pp-ab'])
+        self.assertIn('could not check whether a task with that id exists', said)
+        self.assertIn('ambiguous ID', said)
+        self.assertEqual(self.bd.writes, [])
+        # The very same object at bd's real rc 1 is still an absence: the exit code is what decides.
         self.bd.no_match_rc = 1
         self.assertEqual(self.run_bd(['create', 'new', '--id', 'pp-ab'])['returncode'], 0)
         self.assertEqual(len(self.bd.writes), 1)
