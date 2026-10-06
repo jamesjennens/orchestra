@@ -174,6 +174,12 @@ class BoundTests(test_http_agents.AgentHarness):
         self.assertEqual(self.service.login(ADMIN, PASSWORD)['user']['username'], ADMIN)
         self.assertEqual(self.service.logins_turned_away, 0)
 
+    def test_the_log_in_page_shows_the_servers_sentence_for_busy(self):
+        """Any other 5xx reads "could not confirm whether this was saved", which is not true of a log-in turned away."""
+        source = (KIT / 'web' / 'js' / 'views' / 'auth.js').read_text(encoding='utf-8')
+        self.assertIn("const busy = error.status === 503 && error.code === 'busy' && error.message;", source)
+        self.assertIn(": (busy || describe(error));", source)
+
     def test_the_bound_is_sixteen(self):
         self.assertEqual(http_auth.Service.LOGINS_AT_ONCE, 16)
 
