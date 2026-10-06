@@ -13,6 +13,7 @@ import secrets
 import signal
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -2560,8 +2561,24 @@ def read_sidecar(path):
     if path.is_symlink():return None,'it is a symlink'
     if not path.exists():return None,None
     if not path.is_file():return None,'it is not a regular file'
-    try:data=json.loads(path.read_text(encoding='utf-8'))
-    except OSError as error:return None,'it cannot be read (%s)'%error.__class__.__name__
+    # Opened without following a symlink and without blocking, then checked to be a regular
+    # file on the open descriptor: a FIFO or device put in place between the checks above
+    # and the open answers at once instead of hanging the read (kittrial-5bb.150).
+    flags=os.O_RDONLY|getattr(os,'O_NONBLOCK',0)|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_BINARY',0)
+    try:
+        fd=os.open(str(path),flags)
+    except OSError as error:
+        return None,'it cannot be read (%s)'%error.__class__.__name__
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):return None,'it is not a regular file'
+        with os.fdopen(fd,'rb') as handle:
+            fd=None
+            raw=handle.read()
+    except OSError as error:
+        return None,'it cannot be read (%s)'%error.__class__.__name__
+    finally:
+        if fd is not None:os.close(fd)
+    try:data=json.loads(raw.decode('utf-8'))
     except ValueError:return None,'it is not valid JSON'
     if not isinstance(data,dict) or data.get('schema_version')!=1:return None,'it is not a coordination sidecar of schema 1'
     if data.get('status')!='complete':return None,'its status is %s, not complete'%json.dumps(data.get('status'))
@@ -3945,9 +3962,14 @@ def backup_authority(root,source):
         raise ValueError('No such backup: backups/%s does not exist. Check the project name '
                          '(`backup-status` lists the backups this installation has).'%source)
     copies=[root/'backups'/(source+'.coordination.json'),last_complete_sidecar_path(root,source)]
-    problems=[(copy,read_sidecar(copy)[1]) for copy in copies]
-    path,_=coordination_sidecar_source(root,source) if not any(problem=='it is a symlink' for _,problem in problems) else (None,None)
-    damaged=[(copy,problem) for copy,problem in problems if problem]
+    damaged=[(copy,problem) for copy,problem in ((copy,read_sidecar(copy)[1]) for copy in copies) if problem]
+    # Exactly the copy restore-new would use (kittrial-5bb.150): the restore's own choice,
+    # and its symlink refusal read as "no usable copy". A symlinked copy the restore never
+    # reaches (the last-complete copy behind a good canonical one) is only listed as unusable.
+    try:
+        path,data=coordination_sidecar_source(root,source)
+    except ValueError:
+        path,data=None,None
     if path is None and damaged:
         raise ValueError('The coordination sidecar of backup %s is damaged: %s. What this backup records '
                          'cannot be read, so no operator or verifier list from it can be trusted.'
@@ -3957,8 +3979,10 @@ def backup_authority(root,source):
                 'not_listed_here':[item for item in recorded if item not in listed]}
     result={'project':source,
             'sidecar':None if path is None else path.relative_to(root).as_posix(),
-            'operators':compare(coordination_operators(root,source),operators(root)),
-            'verifiers':compare(coordination_verifiers(root,source),verifiers(root))}
+            'operators':compare([] if data is None else validate_coordination_operators(data.get('operators')),
+                                operators(root)),
+            'verifiers':compare([] if data is None else validate_coordination_operators(data.get('verifiers'),'verifiers'),
+                                verifiers(root))}
     if damaged:
         result['unusable']=[{'copy':copy.relative_to(root).as_posix(),'problem':problem} for copy,problem in damaged]
     if path is None:
