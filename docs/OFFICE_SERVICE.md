@@ -262,8 +262,19 @@ service bounds what such a connection costs, in all three shapes:
   per-address limit: where that matters, put it behind the approved proxy or
   a firewall rule and use the loopback shape.
 - A handshake that fails is one line in the http log (`tls: 'ADDRESS': 'TLS
-  handshake not completed: ...'`). A browser that has not accepted a
-  self-signed certificate shows there.
+  handshake not completed: ...'`), at most one such line every 5 seconds; the
+  next one says how many were not shown. A browser that has not accepted a
+  self-signed certificate shows there. A port scan does not fill the log.
+- Where the process cannot start a thread before the 200 are reached (a memory
+  or thread limit set on it), the connection is closed in the same way and the
+  log says so once (`connections: no thread could be started ...`).
+- A request is its whole body: one that ends before its `Content-Length` is
+  not carried out and gets no answer.
+- A legitimate request is not cut for taking long to ANSWER: the 30 seconds
+  run only while the service waits for the client. An endpoint action that
+  takes minutes is answered. What can be cut is a client so slow that sending
+  its request (at most 256 KiB) or taking a response takes more than 30
+  seconds.
 
 ## External scheduler commands
 

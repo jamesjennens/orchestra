@@ -5325,6 +5325,7 @@ class GuardedServer(ThreadingHTTPServer):
     connection_limit = CONNECTION_LIMIT
     REAP_EVERY = 0.25
     TIMEOUT_MARGIN = 2.0
+    TLS_LINE_EVERY = 5.0
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -5333,6 +5334,8 @@ class GuardedServer(ThreadingHTTPServer):
         self._open = 0
         self.cut_off = 0                 # connections closed for being too slow
         self.turned_away = 0             # connections closed for being over the limit
+        self._said_no_thread = False
+        self._tls_said, self._tls_unsaid = None, 0
         self._stopping = threading.Event()
         self._reaper = threading.Thread(target=self._reap, name='connection-reaper', daemon=True)
         self._reaper.start()
@@ -5382,6 +5385,20 @@ class GuardedServer(ThreadingHTTPServer):
             return
         try:
             super().process_request(request, client_address)
+        except RuntimeError as failed:
+            # "can't start new thread": the process is at a limit of its own (memory, threads)
+            # below the connection limit. The connection is closed like one over the limit,
+            # and it is said once, in one line: not a traceback for each (review of .163).
+            with self._guard:
+                self._open -= 1
+                self.turned_away += 1
+                first = not self._said_no_thread
+                self._said_no_thread = True
+            if first:
+                print('connections: no thread could be started for a connection with %d open (%s); such '
+                      'connections are closed at once (said once)' % (self.open_connections(), ascii(str(failed))[:80]),
+                      file=sys.stderr, flush=True)
+            self.shutdown_request(request)
         except BaseException:
             with self._guard:
                 self._open -= 1
@@ -5399,9 +5416,20 @@ class GuardedServer(ThreadingHTTPServer):
         error = sys.exc_info()[1]
         if isinstance(error, (ConnectionError, ssl.SSLError, TimeoutError)):
             if str(error).startswith('TLS handshake not completed'):
-                # One line for the operator (a certificate the client does not accept shows here).
-                print('tls: %s: %s' % (ascii(str(client_address[0]))[:60], ascii(str(error))[:200]),
-                      file=sys.stderr, flush=True)
+                # One line for the operator (a certificate the client does not accept shows
+                # here), and at most one every TLS_LINE_EVERY seconds: a port scan is not a
+                # line for each connection. The next line says how many were not shown.
+                now = time.monotonic()
+                with self._guard:
+                    quiet = self._tls_said is not None and now - self._tls_said < self.TLS_LINE_EVERY
+                    if quiet:
+                        self._tls_unsaid += 1
+                    else:
+                        unsaid, self._tls_unsaid, self._tls_said = self._tls_unsaid, 0, now
+                if not quiet:
+                    print('tls: %s: %s%s' % (ascii(str(client_address[0]))[:60], ascii(str(error))[:200],
+                                             ' (and %d more since the last such line)' % unsaid if unsaid else ''),
+                          file=sys.stderr, flush=True)
             return
         super().handle_error(request, client_address)
 

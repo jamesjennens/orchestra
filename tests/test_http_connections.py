@@ -263,6 +263,33 @@ class SilentConnectionTests(Case):
             self.served(within=1.5)
         self.assertEqual(logged.getvalue().count('connections: the limit of 5 open connections was reached'), 1)
 
+    def test_a_process_that_cannot_start_a_thread_closes_the_connection_and_says_so_once(self):
+        """Review of kittrial-5bb.163: under a memory cap "can't start new thread" was a traceback for every
+        connection, 21,000 lines of them. It is the connection limit met early: closed at once, said once."""
+        self.serve(client_seconds=30)
+        logged = io.StringIO()
+        real = threading.Thread.start
+        refused = []
+
+        def start(thread):
+            if thread.name != 'connection-reaper' and getattr(thread, '_target', None) is not None and \
+                    getattr(thread._target, '__name__', '') == 'process_request_thread':
+                refused.append(thread)
+                raise RuntimeError("can't start new thread")
+            return real(thread)
+        with contextlib.redirect_stderr(logged):
+            with mock.patch.object(threading.Thread, 'start', start):
+                for _ in range(6):
+                    extra = self.silent()
+                    self.assertLess(self.closed_by_the_server(extra, 2.0), 2.0)
+            self.assertEqual(len(refused), 6)
+            self.assertEqual((self.httpd.turned_away, self.httpd.open_connections()), (6, 0))
+            self.served(within=2.0)                                # and it serves again when it can
+        said = logged.getvalue()
+        self.assertNotIn('Traceback', said)
+        self.assertEqual(said.count('connections: no thread could be started for a connection'), 1)
+        self.assertEqual(len(said.strip().splitlines()), 1, said)
+
     def test_a_closed_client_frees_its_place_without_waiting_for_the_deadline(self):
         self.serve(client_seconds=30)
         for connection in [self.silent() for _ in range(10)]:
@@ -308,15 +335,23 @@ class SilentTlsConnectionTests(Case):
             self.assertEqual(self.httpd.cut_off, 20)
             self.settled()
             self.served()
+            # One more, after the quiet time of the log line: it says how many were not shown.
+            self.httpd.TLS_LINE_EVERY = 0.0
+            late = self.silent(b'GET / HTTP/1.1\r\n\r\n')
+            self.closed_by_the_server(late, 3)
+            self.settled()
         said = logged.getvalue()
         self.assertNotIn('Traceback', said)
-        self.assertEqual(said.count('tls: '), 20)                 # one line each for the operator
+        # Twenty at once are one line for the operator, not twenty: a port scan does not fill the log.
+        self.assertEqual(said.count('tls: '), 2, said)
         self.assertIn("tls: '127.0.0.1': 'TLS handshake not completed", said)
+        self.assertIn('(and 19 more since the last such line)', said)
 
     def test_a_handshake_that_fails_is_one_line_and_not_a_traceback(self):
         logged = io.StringIO()
         with contextlib.redirect_stderr(logged):
             self.serve()
+            self.httpd.TLS_LINE_EVERY = 0.0
             # A client that was not given the certificate refuses it; plain HTTP to the TLS port is not TLS.
             with self.assertRaises(ssl.SSLError):
                 http.client.HTTPSConnection('127.0.0.1', self.port, timeout=5,
@@ -328,6 +363,7 @@ class SilentTlsConnectionTests(Case):
         said = logged.getvalue()
         self.assertNotIn('Traceback', said)
         self.assertEqual(said.count('TLS handshake not completed'), 2)
+        self.assertNotIn('more since', said)
         self.assertEqual(self.httpd.cut_off, 0)
 
     def test_the_secure_channel_is_still_seen_as_one(self):
