@@ -39,9 +39,9 @@ from reserved_comments import (ANCHOR_READ_IDS_MAX, carries_record_label, hide_r
                                is_record_anchor)
 from http_auth import (AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CAP_APPROVE,
                        CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROPOSALS,
-                       CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_READ, CAP_REVIEWS,
+                       CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ, CAP_REVIEWS,
                        CAP_TASKS, RESULT_RETENTION_SECONDS, HttpError, Service, Store,
-                       authority_request, conflict, forbidden, invalid, not_found,
+                       authority_request, busy, conflict, forbidden, invalid, not_found,
                        not_implemented, now_iso, request_hash, unauthenticated,
                        uncertain, unsupported)
 
@@ -1162,13 +1162,16 @@ class EndpointBackend:
     PROPOSALS = True
 
     def __init__(self, python, endpoint, root, *, service, actor_namespace='http',
-                 timeout=150, runner=None):
+                 timeout=150, runner=None, create_timeout=900):
         self.python = python
         self.endpoint = endpoint
         self.root = root
         self.service = service
         self.actor_namespace = actor_namespace
         self.timeout = timeout
+        #: How long one project creation may take (kittrial-5bb.118 part 2): it grows with the
+        #: number of project databases on the server. See OPERATIONS, the cost of many projects.
+        self.create_timeout = max(int(create_timeout), int(timeout))
         self.runner = runner
         self.faults = {}
         # Server-side authority locations. The endpoint is launched with these paths;
@@ -1219,12 +1222,18 @@ class EndpointBackend:
                                ['list', '--limit', '1', '--json'], check_usable=False)
         if isinstance(reply, dict) and reply.get('returncode') == 2 \
                 and 'Unknown/uninitialized project' in (reply.get('stderr') or ''):
+            said = (reply.get('stderr') or '').strip().splitlines()[-1]
+            marker = 'Unknown/uninitialized project: '
+            if marker in said:
+                # It is on the host and is a creation that has not finished (or whose record is
+                # damaged): say that, not "no such project; run add-project" (review 01a109cc).
+                raise conflict(said.split(marker, 1)[1][:300])
             return False
         self._checked(reply)
         return True
 
     def _endpoint(self, action, project, actor, args, attachments=None, operation_id=None,
-                  authority=None, require_authority=False, route=None, check_usable=True):
+                  authority=None, require_authority=False, route=None, check_usable=True, timeout=None):
         if isinstance(project, str):
             # A record the backend will not serve is refused here, before any endpoint
             # process starts: a `proj_...` id (no canonical project can be behind it;
@@ -1263,7 +1272,7 @@ class EndpointBackend:
         try:
             completed = subprocess.run(argv,
                                        input=json.dumps(payload), text=True, encoding='utf-8',
-                                       capture_output=True, timeout=self.timeout)
+                                       capture_output=True, timeout=timeout or self.timeout)
         except subprocess.TimeoutExpired:
             raise uncertain('Canonical endpoint timed out; outcome may be unknown')
         if completed.returncode:
@@ -1300,6 +1309,11 @@ class EndpointBackend:
             raise forbidden(detail or 'Authority was revoked before the canonical write')
         if code == 124:
             raise uncertain('Canonical command timed out; outcome may be unknown')
+        if code == 75:
+            # The endpoint did nothing because it was occupied (a wait for a lock ran out, or
+            # another project is being created): the request may simply be sent again.
+            detail = stderr.strip().splitlines()[-1][:200] if stderr.strip() else None
+            raise busy(detail or 'The server is busy; nothing was done. Try again shortly.')
         if code:
             limit = cls.DETAIL_LIMITS.get(action, cls.DETAIL_LIMIT)
             detail = stderr.strip().splitlines()[-1][:limit] if stderr.strip() else None
@@ -1927,6 +1941,120 @@ class EndpointBackend:
     #: ``review_states`` is derived from ``review_queue`` (see the handler's reuse).
     REVIEW_STATES_FROM_QUEUE = True
 
+    def create_host_project(self, principal, name, key):
+        """Create project ``name`` on the host for ``principal`` (kittrial-5bb.118 part 2).
+
+        One ``create-project`` endpoint action. The endpoint re-checks the grant and the
+        limit against the live authority store under its lock, reserves the operation
+        identity before the first write and records the result with it, so the same
+        request sent again returns what happened instead of creating twice. Returns the
+        host's result (``status`` ``created`` or ``incomplete``). A refusal (name not
+        available, limit reached, nothing made) is a 409 with the host's sentence.
+        """
+        operation_id = self._result_key(principal, None, 'projects.host-create', key, name)
+        authority = authority_request(principal, None, CAP_PROJECT_HOST_CREATE,
+                                      now=self.service._expiry_now())
+        # A creation takes longer the more project databases the server holds, so it has its
+        # own, longer timeout (--create-timeout). No other request waits for it.
+        reply = self._endpoint('create-project', name, principal.user_id, [], operation_id=operation_id,
+                               authority=authority, require_authority=True, route='projects.host-create',
+                               check_usable=False, timeout=self.create_timeout)
+        if isinstance(reply, dict) and reply.get('returncode') == 75:
+            said = (reply.get('stderr') or '').strip().splitlines()
+            raise busy(said[-1][:300] if said else 'Another project is being created on this server. Try again in a minute.',
+                       retry_after=60)
+        if isinstance(reply, dict) and reply.get('returncode') == 2:
+            said = (reply.get('stderr') or '').strip().splitlines()
+            sentence = said[-1][:400] if said else 'The project could not be created'
+            for prefix in ('ValueError: ', 'RuntimeError: '):
+                if sentence.startswith(prefix):
+                    sentence = sentence[len(prefix):]
+            raise conflict(sentence)
+        return self._checked(reply)
+
+    def set_onboarding(self, principal, project_id, text, key):
+        """An owner sets (``text``) or clears (``None``) the project's onboarding text.
+
+        One service-only ``set-onboarding`` endpoint action. The endpoint re-checks the
+        project-administration capability under the authority lock and applies the same
+        size limit as ``admin.py set-onboarding`` plus the plain-text rule. The text
+        travels as an attachment, never on a command line.
+        """
+        operation_id = self._result_key(principal, project_id, 'projects.onboarding', key, None)
+        authority = authority_request(principal, project_id, CAP_PROJECT_ADMIN, now=self.service._expiry_now())
+        attachments = {} if text is None else {'text': {'flag': '--file', 'text': text}}
+        reply = self._endpoint('set-onboarding', project_id, principal.user_id,
+                               ['clear'] if text is None else ['set'], attachments, operation_id=operation_id,
+                               authority=authority, require_authority=True, route='projects.onboarding')
+        if isinstance(reply, dict) and reply.get('returncode') == 2:
+            said = (reply.get('stderr') or '').strip().splitlines()
+            sentence = said[-1][:400] if said else 'The onboarding text was refused'
+            raise invalid(sentence[len('ValueError: '):] if sentence.startswith('ValueError: ') else sentence)
+        return self._checked(reply)
+
+    def read_onboarding(self, project_id):
+        """The project's onboarding document as stored, or None when none is set."""
+        reply = self._endpoint('docs', project_id, self.actor_namespace + '/read', ['project'])
+        if isinstance(reply, dict) and reply.get('returncode') == 2 and \
+                'Onboarding document missing' in (reply.get('stderr') or ''):
+            return None
+        code = reply.get('returncode') if isinstance(reply, dict) else None
+        if code:
+            self._checked(reply)
+        return reply.get('stdout') if isinstance(reply, dict) else None
+
+    def host_creations(self, principal):
+        """What the host says about project creations (superusers; read-only).
+
+        ``{'items': the ones that run or need an operator, 'created': the finished ones,
+        'server': {'used', 'limit'}}``. An endpoint older than this revision answers
+        ``items`` only.
+        """
+        authority = authority_request(principal, None, CAP_ACCOUNTS_ADMIN, now=self.service._expiry_now())
+        reply = self._endpoint('project-creations', None, principal.user_id, [], authority=authority,
+                               require_authority=True)
+        result = self._checked(reply)
+        result = result if isinstance(result, dict) else {}
+        return {'items': [item for item in result.get('items') or [] if isinstance(item, dict)],
+                'created': [item for item in result.get('created') or [] if isinstance(item, dict)],
+                'server': result.get('server') if isinstance(result.get('server'), dict) else None}
+
+    #: An account's own standing on the host is asked for at most this often (seconds).
+    STANDING_CACHE_SECONDS = 20
+
+    def creation_standing(self, principal):
+        """The names ``principal`` holds on the host and whether the server is full, or None.
+
+        One read-only endpoint action, kept for a few seconds per account: the session
+        read asks on every page load. None when the host cannot say (an older endpoint,
+        a failure): the page then shows the web service's own count, as before.
+        """
+        cache = getattr(self, '_standing_cache', None)
+        if cache is None:
+            cache = self._standing_cache = {}
+        now = time.monotonic()
+        kept = cache.get(principal.user_id)
+        if kept and now - kept[0] < self.STANDING_CACHE_SECONDS:
+            return kept[1]
+        authority = authority_request(principal, None, CAP_PROJECT_HOST_CREATE, now=self.service._expiry_now())
+        try:
+            result = self._checked(self._endpoint('creation-standing', None, principal.user_id, [], authority=authority,
+                                                  require_authority=True))
+        except HttpError:
+            result = None
+        if not isinstance(result, dict) or not isinstance(result.get('held'), list):
+            result = None
+        else:
+            result = {'held': [name for name in result['held'] if isinstance(name, str)],
+                      'server_full': result.get('server_full') is True}
+        cache[principal.user_id] = (now, result)
+        if len(cache) > 500:
+            cache.pop(next(iter(cache)))
+        return result
+
+    def forget_standing(self, user_id):
+        getattr(self, '_standing_cache', {}).pop(user_id, None)
+
     def setup_status(self, project_id):
         """What the host knows about this project's setup (kittrial-5bb.118).
 
@@ -2273,6 +2401,13 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._send_json(status, response)
         except HttpError as error:
             self._note_denied(error, request_id)
+            self._retry_after = getattr(error, 'retry_after', None)
+            self._send_json(error.status, error.body(request_id))
+        except TimeoutError:
+            # A wait for the state lock ran out before anything was done (file_lock raises it
+            # while acquiring). The server is occupied; this is not an internal error.
+            error = busy()
+            self._retry_after = error.retry_after
             self._send_json(error.status, error.body(request_id))
         except Exception:
             # No traceback, no internal detail: a clean, generic JSON error.
@@ -2362,7 +2497,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                 raise invalid('Request body is not valid JSON')
             if not isinstance(payload, dict):
                 raise invalid('Request body must be a JSON object')
-        self._body_hash = request_hash(payload) if payload is not None else request_hash(None)
+        try:
+            self._body_hash = request_hash(payload) if payload is not None else request_hash(None)
+        except UnicodeEncodeError:
+            # Half of a surrogate pair is valid JSON text and not valid Unicode: it cannot be hashed,
+            # stored or sent on. It answered 500 on every route (kittrial-5bb.118 part 2 review).
+            raise invalid('The request holds text that is not valid Unicode (half of a surrogate pair)') from None
         self._principal = None
         self._set_cookie_token = None
         auth_source = None
@@ -2410,6 +2550,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         return self.service.authenticate(token, source=self._source()), source
 
     def _note_denied(self, error, request_id):
+        if getattr(self, '_audited_refusal', False):
+            self._audited_refusal = False
+            return
         if error.status not in (401, 403):
             return
         principal = getattr(self, '_principal', None)
@@ -2434,6 +2577,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('Referrer-Policy', 'no-referrer')
         self.send_header('X-Request-Id', getattr(self, '_current_request_id', '') or '')
+        if getattr(self, '_retry_after', None):
+            self.send_header('Retry-After', str(int(self._retry_after)))
+            self._retry_after = None
         if getattr(self, '_set_cookie_token', None):
             self._send_cookie(self._set_cookie_token)
         self.end_headers()
@@ -2488,7 +2634,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     # -- mutation helper -------------------------------------------------------
     def _mutate(self, ctx, route_name, project_id, fn, *, capability, allow_self_user=None,
                 status=200, idempotent=True, replay_status=None, serialize=True,
-                canonical=False, reason=None):
+                canonical=False, reason=None, refused_reason=None):
         """Run one authorized, idempotent mutation.
 
         ``capability`` names the authority the route needs. The idempotency key is
@@ -2536,9 +2682,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                             'idempotency key')
         except HttpError as error:
             self.service.idempotency_release(digest)
+            # ``refused_reason`` lets a route whose target is not a registered project (a
+            # creation) say what was refused; the error code stays first.
             self.service.audit(ctx.request_id, ctx.principal, route_name,
                                'denied' if error.status in (401, 403) else 'rejected',
-                               project_id=project_id, reason=error.code)
+                               project_id=project_id,
+                               reason=error.code if refused_reason is None else '%s: %s' % (error.code, refused_reason))
             self.service.store.save()
             raise
         except Exception:
@@ -2754,6 +2903,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                 'project_create': (
                     'create' if getattr(self.backend, 'PROJECT_CREATE', 'create') == 'create' else
                     'register' if principal.superuser and principal.via != 'credential' else 'operator-only')}
+        # Additive (kittrial-5bb.118 part 2): whether this account may create a project
+        # on the host from here, with its limit and how many it has. Only where the
+        # backend has a host.
+        if getattr(self.backend, 'PROJECT_CREATE', 'create') == 'register':
+            body['project_host_create'] = self._host_creation(principal)
         # A browser keeps its CSRF token in memory only, so a reload re-reads it here.
         # It is returned only to the cookie session it belongs to; a cross-origin page
         # cannot read this same-origin response.
@@ -2781,7 +2935,24 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('GET', r'/v1/accounts')
     def accounts_list(self, ctx):
         self.require(ctx, CAP_ACCOUNTS_ADMIN)
-        return 200, {'items': self.service.list_users(ctx.principal)}
+        items = self.service.list_users(ctx.principal)
+        # Additive (kittrial-5bb.118 part 2 revision): the names each account holds on the host
+        # that are not registered here count toward its limit too. One host read, for a
+        # superuser's session only; left out when the host cannot say.
+        if getattr(self.backend, 'PROJECT_CREATE', 'create') == 'register' and hasattr(self.backend, 'host_creations')                 and ctx.principal.superuser and ctx.principal.via != 'credential':
+            try:
+                found = self.backend.host_creations(ctx.principal)
+            except HttpError:
+                found = None
+            if found is not None:
+                registered = self.service.state['projects']
+                held = {}
+                for item in found['items'] + found['created']:
+                    if isinstance(item.get('project'), str) and item['project'] not in registered                             and item.get('state') != 'damaged' and isinstance(item.get('by'), str):
+                        held.setdefault(item['by'], []).append(item['project'])
+                for view in items:
+                    view['projects_held'] = sorted(held.get(view['id'], []))
+        return 200, {'items': items}
 
     @route('GET', r'/v1/accounts/lookup')
     def accounts_lookup(self, ctx):
@@ -2852,6 +3023,8 @@ class ApiHandler(BaseHTTPRequestHandler):
     def projects_create(self, ctx):
         payload = ctx.payload or {}
         if getattr(self.backend, 'PROJECT_CREATE', 'create') == 'register':
+            if payload.get('create') is True:
+                return self._project_host_create(ctx, payload)
             return self._project_register(ctx, payload)
 
         def create():
@@ -2863,6 +3036,171 @@ class ApiHandler(BaseHTTPRequestHandler):
         # (409) instead of creating a second project.
         return self._mutate(ctx, 'projects.create', None, create,
                             status=201, capability=CAP_PROJECT_CREATE)
+
+    #: Said to everyone who may not create or register, whatever the payload names.
+    NOT_ALLOWED_TO_CREATE = 'Only a superuser registers a project on this server. ' + REGISTER_HINT
+
+    def _host_creation(self, principal):
+        """``Service.host_creation`` with what the host holds for the account counted in.
+
+        A creation that is running, stopped or stalled holds a place the web service has
+        no record of; the endpoint counts it and refuses at the limit. Counted here too,
+        so ``allowed`` and ``used`` say what the endpoint will answer (review 01a109cc).
+        ``reason`` gains ``server-limit``: the server holds as many project databases as
+        its operator allows, whatever this account's own numbers are.
+        """
+        creation = self.service.host_creation(principal)
+        if creation['reason'] in ('credential', 'no-grant') or not hasattr(self.backend, 'creation_standing'):
+            return creation
+        standing = self.backend.creation_standing(principal)
+        if standing is None:
+            return dict(creation, held=None)          # the host could not say
+        registered = set(self.service.state['projects'])
+        held = [name for name in standing['held'] if name not in registered]
+        used = creation['used'] + len(held)
+        creation = dict(creation, used=used, held=held)
+        if creation['limit'] is not None and used >= creation['limit']:
+            creation.update(allowed=False, reason='limit')
+        elif standing['server_full']:
+            creation.update(allowed=False, reason='server-limit')
+        return creation
+
+    def _project_host_create(self, ctx, payload):
+        """`POST /v1/projects` with `"create": true`: create the project on the host and register it.
+
+        For a superuser, or an account a superuser granted "may create projects", within
+        the grant's limit (kittrial-5bb.118 part 2). Never a credential. Everyone else
+        gets the same 403 as the register route, before anything about the name is
+        looked at, so the answer cannot be used to find out which names exist.
+
+        The project is registered here only after the host reports it created, first
+        backup included. Until then nothing about it is visible in the web interface. A
+        creation that stopped half way answers 409 with the host's sentence, which names
+        the project and says an operator must finish or remove it.
+        """
+        principal = ctx.principal
+        creation = self.service.host_creation(principal)
+        asked = payload.get('project_id')
+        # What the audit says was asked for: the name when it is one, never caller text otherwise.
+        shown = asked if isinstance(asked, str) and CANONICAL_PROJECT.fullmatch(asked) else '(not a project name)'
+
+        def refuse(error):
+            """A refusal before the mutation starts is audited with the route and the name (review 01a109cc)."""
+            with self.service.store.lock:
+                self.service.audit(ctx.request_id, principal, 'projects.host-create',
+                                   'denied' if error.status in (401, 403) else 'rejected',
+                                   reason='%s: create %s' % (error.code, shown))
+                self.service.store.save()
+            # The generic authorization entry would only repeat it.
+            self._audited_refusal = True
+            raise error
+        if creation['reason'] in ('credential', 'no-grant'):
+            refuse(forbidden(self.NOT_ALLOWED_TO_CREATE))
+        if hasattr(self.backend, 'forget_standing'):
+            self.backend.forget_standing(principal.user_id)
+        if set(payload) - {'create', 'project_id', 'name'}:
+            refuse(invalid('Send project_id, name and create only'))
+        project_id = payload.get('project_id')
+        if not isinstance(project_id, str) or not CANONICAL_PROJECT.fullmatch(project_id):
+            refuse(invalid('project_id must be 2-24 lowercase letters or digits, beginning with a letter'))
+        name = payload.get('name') or project_id
+        try:
+            self.service._validate_project_name(name)
+        except HttpError as error:
+            refuse(error)
+        if self.service.state['projects'].get(project_id) is not None:
+            return self._refuse_unless_replay(ctx, 'projects.host-create',
+                                              conflict('Project name %s is not available: choose another name'
+                                                       % project_id), capability=CAP_PROJECT_HOST_CREATE)
+        key = ctx.idempotency_key or ctx.request_id
+
+        def create():
+            try:
+                result = self.backend.create_host_project(principal, project_id, key)
+            except HttpError as failure:
+                # Busy means nothing was done (another creation is running): it is answered as
+                # busy, to be sent again, and is not an outcome to reconcile.
+                if failure.status == 503 and failure.code != 'busy':
+                    raise UncertainOutcome() from None
+                raise
+            if not isinstance(result, dict) or result.get('status') not in ('created', 'incomplete'):
+                raise UncertainOutcome()
+            if result['status'] == 'incomplete':
+                raise conflict(result.get('message') or 'Project %s did not finish; an operator must finish or '
+                               'remove it' % project_id, {'project': project_id, 'state': 'incomplete',
+                                                          'stage': result.get('stage')})
+            view = self._usable(self.service.register_host_created(principal, project_id, name, result))
+            view['backup'] = result.get('backup')
+            return view, view
+        limit = 'none (superuser)' if creation['limit'] is None else str(creation['limit'])
+        reason = 'create %s account=%s limit=%s count=%d' % (project_id, principal.user_id, limit,
+                                                              creation['used'] + 1)
+        return self._mutate(ctx, 'projects.host-create', None, create, status=201,
+                            capability=CAP_PROJECT_HOST_CREATE, serialize=False, canonical=True, reason=reason,
+                            refused_reason='create %s account=%s' % (project_id, principal.user_id))
+
+    @route('GET', r'/v1/project-creations')
+    def project_creations(self, ctx):
+        """Superusers: creations that stopped half way, so that none is forgotten.
+
+        Each names the project, the account that started it, the stage it stopped at and
+        the two operator commands. Empty where the backend has no host.
+        """
+        principal = self._superuser_session(ctx, 'Only a superuser sees the project creations')
+        self.require(ctx, CAP_ACCOUNTS_ADMIN)
+        if getattr(self.backend, 'PROJECT_CREATE', 'create') != 'register' or \
+                not hasattr(self.backend, 'host_creations'):
+            return 200, {'items': [], 'host': 'not-applicable'}
+        found = self.backend.host_creations(principal)
+        registered = self.service.state['projects']
+        waiting = [item for item in found['created'] if isinstance(item.get('project'), str)
+                   and item['project'] not in registered]
+        names = self.service.actor_names([item.get('by') for item in found['items'] + waiting])
+
+        def view(item, **more):
+            project = item['project']
+            return dict({'project': project, 'state': item.get('state'), 'by': item.get('by'),
+                         'by_name': names.get(item.get('by'), item.get('by')), 'stage': item.get('stage'),
+                         'started_at': item.get('started_at'), 'stopped_at': item.get('stopped_at')}, **more)
+        items = []
+        for item in found['items']:
+            if not isinstance(item.get('project'), str):
+                continue
+            project, state = item['project'], item.get('state')
+            # The commands are tied to what the record reads as (review 01a109cc): a running
+            # creation has none, and no reading is given `retire-project --force`.
+            remove = 'admin.py remove-creation %s --actor OPERATOR --reason REASON' % project
+            items.append(view(item, what=item.get('command'),
+                              finish='admin.py finish-project %s' % project if state == 'incomplete' else None,
+                              remove=remove if state in ('incomplete', 'stalled') else None))
+        # Finished on the server and not registered here: the creator's grant was revoked, the
+        # account was disabled or the server was over its limit when the work ended.
+        unregistered = [view(item, state='created-unregistered', completed_at=item.get('completed_at'),
+                             what='It is complete on the server and not registered here. Register it as a superuser '
+                                  '(New project, with this name), or retire it on the server.',
+                             finish=None, remove=None) for item in waiting]
+        server = found['server']
+        if server is not None:
+            server = {'used': server.get('used'), 'limit': server.get('limit'),
+                      'note': 'Counts every project database on the server: archived and retired projects and '
+                              'unfinished creations too, because their databases stay on it. An operator changes '
+                              'the limit (admin.py project-creations --set-server-limit N --actor OPERATOR).'}
+        return 200, {'items': items, 'unregistered': unregistered, 'server': server, 'host': 'available'}
+
+    @route('PUT', r'/v1/accounts/(?P<uid>' + ID + r')/project-grant')
+    def account_project_grant(self, ctx):
+        """A superuser lets an account create projects: `{"limit": N}` (default 5)."""
+        payload = ctx.payload or {}
+        if set(payload) - {'limit'}:
+            raise invalid('Send limit only')
+        self.require(ctx, CAP_ACCOUNTS_ADMIN)
+        return 200, self.service.set_project_grant(ctx.principal, ctx.params['uid'], payload.get('limit'),
+                                                   request_id=ctx.request_id)
+
+    @route('DELETE', r'/v1/accounts/(?P<uid>' + ID + r')/project-grant')
+    def account_project_grant_clear(self, ctx):
+        self.require(ctx, CAP_ACCOUNTS_ADMIN)
+        return 200, self.service.clear_project_grant(ctx.principal, ctx.params['uid'], request_id=ctx.request_id)
 
     def _project_register(self, ctx, payload):
         """`POST /v1/projects` on the endpoint backend: register an existing canonical project.
@@ -2910,7 +3248,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         return self._mutate(ctx, 'projects.create', None, register, status=201, capability=CAP_ACCOUNTS_ADMIN,
                             reason='register ' + project_id)
 
-    def _refuse_unless_replay(self, ctx, route_name, error):
+    def _refuse_unless_replay(self, ctx, route_name, error, capability=CAP_ACCOUNTS_ADMIN):
         """Raise `error`, unless this request is an exact idempotent retry of one that
         already committed on this route: then its stored response is replayed.
 
@@ -2923,7 +3261,7 @@ class ApiHandler(BaseHTTPRequestHandler):
 
         def refuse():
             raise error
-        return self._mutate(ctx, route_name, None, refuse, capability=CAP_ACCOUNTS_ADMIN)
+        return self._mutate(ctx, route_name, None, refuse, capability=capability)
 
     def _superuser_session(self, ctx, message):
         principal = ctx.principal
@@ -3045,6 +3383,82 @@ class ApiHandler(BaseHTTPRequestHandler):
             return result, result
         return self._mutate(ctx, 'projects.update', ctx.params['pid'], update,
                             capability=CAP_PROJECT_ADMIN)
+
+    def _onboarding_owner(self, ctx):
+        # Project administration is refused for every credential by the authority rule itself
+        # (CREDENTIAL_FORBIDDEN_CAPABILITIES), so no second check for a credential stands here:
+        # one stood, could not be reached, and no test could pin it (review 01a109cc).
+        self._project(ctx, CAP_PROJECT_ADMIN)
+        if not hasattr(self.backend, 'set_onboarding'):
+            raise not_implemented('This server has no host project behind it, so there is no onboarding text to set')
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/onboarding')
+    def project_onboarding(self, ctx):
+        """The onboarding text, for an owner to edit (kittrial-5bb.118 part 2).
+
+        ``source`` says who set it: ``web`` (an owner, here) or ``operator`` (on the
+        server). Only owner-written text is returned for editing; the operator's own
+        document is reported as set, with its size, and is not returned here.
+        """
+        self._onboarding_owner(ctx)
+        from onboarding import PROJECT_LIMIT, WEB_HEADER, split_web
+        document = self.backend.read_onboarding(ctx.params['pid'])
+        if document is None:
+            return 200, {'state': 'not-set', 'source': None, 'text': None, 'limit': PROJECT_LIMIT}
+        by_owner, text = split_web(document)
+        return 200, {'state': 'set', 'source': 'web' if by_owner else 'operator',
+                     'text': text if by_owner else None, 'bytes': len(document.encode('utf-8')),
+                     'limit': PROJECT_LIMIT, 'header': WEB_HEADER if by_owner else None}
+
+    @route('PUT', r'/v1/projects/(?P<pid>' + ID + r')/onboarding')
+    def project_onboarding_set(self, ctx):
+        """An owner sets the project's onboarding text: `{"text": "..."}`.
+
+        Stored with a first line that says an owner wrote it in the web interface, so
+        every reader sees it as information from the project, not as an instruction from
+        the server's operator. Guidance is not settable here. Audited with the size,
+        never the text.
+        """
+        self._onboarding_owner(ctx)
+        payload = ctx.payload if isinstance(ctx.payload, dict) else {}
+        if set(payload) != {'text'} or not isinstance(payload['text'], str):
+            raise invalid('Send exactly: text')
+        try:
+            payload['text'].encode('utf-8')
+        except UnicodeEncodeError:
+            # Half of a surrogate pair cannot be stored as UTF-8; it used to answer 500 (review 01a109cc).
+            raise invalid('Project onboarding must be valid Unicode text (it holds half of a surrogate pair)') from None
+        return self._onboarding_write(ctx, payload['text'])
+
+    @route('DELETE', r'/v1/projects/(?P<pid>' + ID + r')/onboarding')
+    def project_onboarding_clear(self, ctx):
+        """Remove onboarding text an owner set here. The operator's own text is not removable here."""
+        self._onboarding_owner(ctx)
+        return self._onboarding_write(ctx, None)
+
+    def _onboarding_write(self, ctx, text):
+        key = ctx.idempotency_key or ctx.request_id
+
+        def write():
+            try:
+                result = self.backend.set_onboarding(ctx.principal, ctx.params['pid'], text, key)
+            except HttpError as failure:
+                if failure.status == 503:
+                    raise UncertainOutcome() from None
+                raise
+            kept = result.get('operator_text_kept_as') if isinstance(result, dict) else None
+            if kept:
+                # The owner's text replaced the operator's: say so in the audit, with where the copy is.
+                with self.service.store.lock:
+                    self.service.audit(ctx.request_id, ctx.principal, 'projects.onboarding', 'committed',
+                                       project_id=ctx.params['pid'],
+                                       reason='account=%s replaced the text an operator set; a copy is kept beside it as %s'
+                                              % (ctx.principal.user_id, str(kept)[:60]))
+                    self.service.store.save()
+            return result, result
+        size = 'cleared' if text is None else 'set %d bytes' % len(text.encode('utf-8'))
+        return self._mutate(ctx, 'projects.onboarding', ctx.params['pid'], write, capability=CAP_PROJECT_ADMIN,
+                            serialize=False, canonical=True, reason='account=%s %s' % (ctx.principal.user_id, size))
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/setup')
     def project_setup(self, ctx):
@@ -4643,7 +5057,7 @@ def build_backend(service, args):
     if args.backend == 'endpoint':
         return EndpointBackend(args.endpoint_python, args.endpoint, args.root,
                                service=service, actor_namespace=args.actor_namespace,
-                               timeout=args.endpoint_timeout)
+                               timeout=args.endpoint_timeout, create_timeout=getattr(args, 'create_timeout', 900))
     return InProcessBackend(service)
 
 
@@ -4667,6 +5081,9 @@ def main(argv=None):
     parser.add_argument('--actor-namespace', default='http',
                         help='actor namespace attributed to session principals')
     parser.add_argument('--endpoint-timeout', type=int, default=150)
+    parser.add_argument('--create-timeout', type=int, default=900,
+                        help='seconds one project creation may take (never less than --endpoint-timeout); a '
+                             'creation is slower the more project databases the server holds')
     parser.add_argument('--max-body', type=int, default=MAX_BODY_BYTES)
     parser.add_argument('--public-url',
                         help='canonical base URL of this service, used only to render '

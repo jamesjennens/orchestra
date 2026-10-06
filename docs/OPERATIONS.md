@@ -216,6 +216,10 @@ history](#malformed-structured-history) (`void-record`).
 | `capability-reconcile PROJECT --operation-id ID ...` | finish a capability operation whose write was uncertain (for a batch item, the id is `OPERATION_ID/KEY`). A transient native failure can leave a `pending` receipt with no native row behind it, and the same `operation_id` is then refused until it is cleared: run `capability-reconcile --disposition released`, then retry the original command | the deployment operator allowlist, checked before the receipt is read; then confirmation of the native record state |
 | `record-reconcile PROJECT --kind requirement\|reference\|capability\|proposal ...` | the same reconcile for any record kind | as above |
 | `reconcile-request PROJECT --request-id ID --actor OPERATOR --reason TEXT --disposition ...` | resolve a stuck coordination request receipt ([operational workflow](OPERATIONAL_WORKFLOW.md)) | the deployment operator allowlist, checked first; then its own actor-binding rules (`--any-actor`) |
+| `finish-project PROJECT` | complete a project creation that the web interface started and that stopped half way, when the project was initialized: settings, backup target, merge slot and a backup, each safe to repeat. It prints the creation record. See [HTTP deployment](HTTP_DEPLOYMENT.md#creating-a-project-from-the-web-interface) | whoever runs commands on the host |
+| `project-creations [--attention] [--usage]` | list the creation records in `project-creations/` as JSON; `--attention` lists only the ones that are running or that an operator must finish or remove, each with its command; `--usage` prints the number of project databases on the server and its limit | whoever runs commands on the host |
+| `project-creations --set-server-limit N --actor OPERATOR` | set the most project databases this server may hold (default 20); see [The cost of many projects on one server](#the-cost-of-many-projects-on-one-server) | a listed operator |
+| `remove-creation PROJECT --actor OPERATOR --reason TEXT` | remove a project creation from the web interface that did not finish. Refuses a finished project, a name with no creation record and a running creation. An incomplete one is retired (nothing deleted, the name stays retired); a stalled one, for which nothing was made, loses only its record and its name is free | a listed operator |
 | `retire-project PROJECT --actor OPERATOR --reason TEXT [--force]` | retire a partial or drill project: move `projects/PROJECT` to `retired/PROJECT-<UTC stamp>`. Nothing is deleted; see [Retiring a project](#retiring-a-project) | the deployment operator allowlist, checked first |
 | `reference-misses-clear PROJECT` | delete the project's [reference lookup-miss log](#the-reference-lookup-miss-log). Same behaviour and output as `capability-misses-clear`, on `.reference-misses.json`, `.reference-misses.json.tmp` and `.reference-misses.lock` | none beyond the service account: it deletes telemetry only |
 | `capability-misses-clear PROJECT` | delete the project's [capability lookup-miss log](#the-capability-lookup-miss-log). It prints what was removed (`finds`, `misses`, `phrases`), and in `repaired` any symlink, directory or unopenable lock file it removed from the three miss-log names (never following a link). It writes nothing to the tracker, takes no coordination lock and calls no `bd` | none beyond the service account: it deletes telemetry only, so there is no allowlist check and no `--actor` |
@@ -496,7 +500,8 @@ already on, or an `off` when it is already off, writes nothing and answers `chan
 false`, as `review-writes` does (kittrial-5bb.136; before, it appended an entry).
 
 **One lock for every change to `deployment.private.json`.** Both switches,
-`operators add|remove`, `verifiers add|remove` and the `--restore-operators` /
+`operators add|remove`, `verifiers add|remove`, `project-creations --set-server-limit`
+and the `--restore-operators` /
 `--restore-verifiers` merges of `restore-new` take the deployment lock
 (`.review-writes.lock`) across their whole read-modify-write and re-read the file under
 it, so two changes made at the same instant, from any two of these commands, never lose
@@ -735,9 +740,45 @@ python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime bac
 
 If restore is interrupted, the new destination may exist with only part of the restore completed. When the native step of `restore-new` fails, reaches its ceiling or is stopped (`SIGTERM`/Ctrl-C), the kit stops the restore client's process group, prints `restore-new did not complete: ...` naming the cause and the partial project, and exits non-zero without the re-point, the coordination sidecar, the journals or the operation journal: the destination then exists with an initialized but partial database (its `.beads/metadata.json` still holds its own fresh identity, so bd may refuse it). A `kill -9` of `admin.py` itself runs no cleanup, so the client may still be writing the destination's database for a while. Preserve it for inspection; retry recovery into another unused destination. Do not delete the source or force reuse of the partially restored target. While a destination left by a stopped or timed-out restore remains in the runtime, a `backup` of it fails (`backup 'default' not found`), so expect `backup --all`, `backup-status --require-complete` and `backup-copy` to report the runtime incomplete until it is dealt with; the source project's own backup pair is not touched. Retire such a project with `retire-project` ([Retiring a project](#retiring-a-project)); recovery drills are still better run in a separate runtime than in a live one. When the native step fails on a damaged backup or a refused password instead, the destination is an empty, working project rather than a partial one, and the notice says so; retiring it needs no flag. When the restore stops before `add-project` initialized the destination, the notice says the directory exists but is not a working project. A `SIGTERM` during the identity step that follows the native restore is reported like a stop during the restore itself. Every way the restore can stop after the destination starts to exist prints the notice, naming the step: a failure, `SIGTERM` or Ctrl-C in the `add-project` step, in the native restore, or in the re-point and coordination step. If the destination's directory has disappeared by then, the notice says that instead. Ctrl-C ends with exit status 130, and a refusal ends with one line (`ValueError: ...`), not a traceback. Only the kit's own refusals are shortened: any other error keeps its traceback. A `deployment.private.json` or `--file` payload that is not valid JSON is a refusal that names the file. Verify pending reservations, comments, lifecycle events, baselines and slot context before switching clients.
 
+### The cost of many projects on one server
+
+Every project is a database on the one Dolt server, and **every bd write on that server
+gets slower with each database it holds**, whichever project the write is for. Reads do
+not. Measured on one machine with the pinned bd 1.2.2 (kittrial-5bb.118 part 2 review):
+
+| Project databases on the server | `add-project` | one bd write (create, update, claim, comment, close, merge-slot, config) | one bd read (show, list, export) |
+|---|---|---|---|
+| 1 | 6 s | 0.2 to 0.4 s | 0.2 s |
+| 10 | 12 s | | |
+| 20 | 21 s | | |
+| 30 | 32 s | | |
+| 40 | 42 s | | |
+| 50 | 60 s | | |
+| 52 | 64 s | 1.9 to 2.4 s | 0.2 s |
+
+- The cause, as far as it was traced: bd checks its schema when it opens a database for
+  writing, with queries on `information_schema.columns`; Dolt answers such a query from
+  every database on the server (0.9 s at 52 databases, 0.07 s for an ordinary query),
+  and a write makes about two of them. bd's own SQL was not captured; the number of
+  queries is inferred from the timings.
+- **Archived and retired projects and unfinished creations cost the same as live ones**:
+  their databases stay on the server. The kit never drops a database.
+- **The limit.** `admin.py project-creations --usage` prints how many project databases
+  the server holds and its limit. The limit is 20 unless set:
+  `admin.py project-creations --set-server-limit N --actor OPERATOR` (a listed operator;
+  the change is recorded in `deployment.private.json` with who and when). At the limit
+  the web interface creates no project. `add-project` is the operator's own command and
+  is not stopped by the limit, but what it makes counts.
+- **Raising the limit** buys room at the price in the table: at 50 databases every task
+  write, claim, comment and merge-slot call takes about two seconds, and a creation
+  about a minute. A creation from the web interface may take up to `--create-timeout`
+  (900 seconds) of the web service.
+- The count is over everything under `projects/`, everything under `retired/`, and the
+  creations that hold a name. So twelve visible projects can reach a limit of 20.
+
 ### Retiring a project
 
-`admin.py retire-project PROJECT --actor OPERATOR --reason TEXT` takes a project out of the runtime without deleting anything. It is for a project a stopped `restore-new` left behind, or a drill project you no longer want backed up.
+`admin.py retire-project PROJECT --actor OPERATOR --reason TEXT` takes a project out of the runtime without deleting anything. It is for a project a stopped `restore-new` left behind, or a drill project you no longer want backed up. It is also how an operator removes a project creation that the web interface started and that stopped half way (with `--force` when the half-made project cannot be read): the creation record is then marked removed, the creator's place is free again, and the name stays retired.
 
 What it does:
 - It moves `projects/PROJECT` to `retired/PROJECT-<UTC stamp>` with one rename, under the project's backup lock and coordination lock.

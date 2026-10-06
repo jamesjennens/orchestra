@@ -27,9 +27,13 @@ def by_id(body):
 class RepositoryRuleTests(unittest.TestCase):
     def test_accepted_shapes(self):
         for value in ('https://git.example/team/project.git', 'ssh://git@git.example:2222/team/project.git',
-                      'git@git.example:team/project.git', '/srv/git/project.git', '\\\\server\\share\\project.git',
-                      'ssh://git.example/team/project.git', 'HTTPS://Git.Example:8443/team/project.git',
-                      'C:\\git\\project.git', 'C:/git/project.git', '/' + 'x' * 299):
+                      'git@git.example:team/project.git', '/srv/git/project.git',
+                      'ssh://git.example/team/project.git', 'https://Git.Example:8443/team/project.git',
+                      'https://git.example:1/p.git', 'https://git.example:65535/p.git',
+                      'ssh://' + 'u' * 32 + '@git.example/p.git', 'u' * 32 + '@git.example:p.git',
+                      # The kit does not judge where a host points.
+                      'https://localhost/p.git', 'https://10.0.0.7/p.git', 'ssh://git@169.254.1.1/p.git',
+                      '/' + 'x' * 299):
             with self.subTest(value=value[:40]):
                 self.assertEqual(http_auth.Service.validate_repository(value), value)
         self.assertIsNone(http_auth.Service.validate_repository(None))
@@ -79,6 +83,37 @@ class RepositoryRuleTests(unittest.TestCase):
             'an ssh host starting with a dash': 'ssh://-host.example/team/p.git',
             'an scp host starting with a dash': 'git@-host.example:team/p.git',
             'an https host starting with a dash': 'https://-host.example/team/p.git',
+            # kittrial-5bb.123. Letters that are not ASCII and that a case-insensitive match let through.
+            'the Kelvin sign as a host letter': 'https://git.exa\u212aple/p.git',
+            'the long s as a host letter': 'ssh://git@\u017ferver.example/p.git',
+            'the dotless i as a host letter': 'https://g\u0131t.example/p.git',
+            'an upper-case scheme': 'HTTPS://git.example/p.git',
+            'an upper-case ssh scheme': 'SSH://git@git.example/p.git',
+            # Only a path on the reader's own machine that begins with one slash.
+            'a UNC path': '\\\\server\\share\\project.git',
+            'a UNC path with slashes': '//server/share/project.git',
+            'a drive path': 'C:\\git\\project.git',
+            'a drive path with slashes': 'C:/git/project.git',
+            # A user name is a short account name.
+            'a user name of 33 characters': 'ssh://' + 'u' * 33 + '@git.example/p.git',
+            'an scp user name of 33 characters': 'u' * 33 + '@git.example:p.git',
+            'a user name of 300 characters': 'ssh://' + 'u' * 280 + '@h/p',
+            'a user name starting with a dash': 'ssh://-user@git.example/p.git',
+            'an scp user name starting with a dash': '-user@git.example:p.git',
+            'a user name starting with a dot': 'ssh://.user@git.example/p.git',
+            # Ports and hosts.
+            'port 0': 'https://git.example:0/p.git',
+            'port 65536': 'https://git.example:65536/p.git',
+            'port 99999': 'ssh://git@git.example:99999/p.git',
+            'a port that is not a number': 'https://git.example:8a/p.git',
+            'an empty port': 'https://git.example:/p.git',
+            'a host ending with a dot': 'https://git.example./p.git',
+            'a host with two dots together': 'https://git..example/p.git',
+            'a host label ending with a dash': 'https://git-.example/p.git',
+            'a host of 254 characters': 'https://' + '.'.join(['a' * 50] * 5)[:254] + '/p.git',
+            'two dots as a path segment': 'https://git.example/team/../other.git',
+            'two dots in an scp path': 'git@git.example:../other.git',
+            'two dots in an absolute path': '/srv/git/../../etc',
             'not text': 7,
             'a list': ['https://git.example/a.git'],
         }
@@ -95,7 +130,7 @@ class RepositoryRuleTests(unittest.TestCase):
         # mutation of one is caught only through the sentence; both are checked here.
         self.assertFalse(any(form.fullmatch('https://user@git.example/team/p.git')
                              for form in http_auth.Service._REPOSITORY_FORMS))
-        for value in ('https://TOKEN@github.com/t/b.git', 'user:hunter2@host:path'):
+        for value in ('https://TOKEN@github.com/t/b.git', 'user:hunter2@host:path', 'ssh://user:hunter2@host/team/b.git'):
             with self.assertRaises(http_auth.HttpError) as caught:
                 http_auth.Service.validate_repository(value)
             said = caught.exception.message + str(caught.exception.detail or '')
@@ -326,7 +361,9 @@ class HostStatusTests(unittest.TestCase):
 
     def test_a_bare_project(self):
         status = self.status()
-        self.assertEqual(sorted(status), ['backup', 'guidance', 'onboarding', 'project', 'schema_version'])
+        self.assertEqual(sorted(status), ['backup', 'guidance', 'onboarding', 'project', 'project_databases',
+                                          'schema_version'])
+        self.assertEqual(status['project_databases'], {'used': 1, 'limit': 20})
         self.assertEqual(status['guidance'], {'state': 'not-set', 'version': None, 'set_at': None})
         self.assertEqual(status['onboarding'], {'state': 'not-set', 'updated_at': None})
         self.assertEqual((status['backup']['scheduled'], status['backup']['last_run']), ('not-covered', None))
@@ -477,9 +514,11 @@ class EndpointSetupTests(fixes.EndpointCase):
         self.assertEqual(steps['onboarding']['command'], 'admin.py set-onboarding %s --file FILE' % self.project)
         self.assertIn(steps['backup']['state'], ('todo', 'done', 'unknown'))
         self.assertIn('backup --all', steps['backup']['command'] or 'backup --all')
-        for name in ('guidance', 'onboarding'):
-            self.assertEqual(steps[name]['who'], 'operator')
-            self.assertIn('cannot do this step', steps[name]['note'])
+        # Guidance is the operator's alone. Onboarding an owner may set on the page, or the operator on the server.
+        self.assertEqual((steps['guidance']['who'], steps['onboarding']['who']), ('operator', 'owner-or-operator'))
+        self.assertIn('cannot do this step', steps['guidance']['note'])
+        self.assertIn('It is not the standing guidance, which only an operator sets', steps['onboarding']['note'])
+        self.assertEqual(steps['onboarding']['link'], '/v1/projects/%s/onboarding' % self.project)
         guidance.write_guidance(self.path, 'A SECRET INSTRUCTION', 'operator-1')
         (self.path / 'ONBOARDING.md').write_text('Read the SECRET runbook first.\n', encoding='utf-8')
         body = self.setup()
@@ -572,6 +611,151 @@ class EndpointSetupTests(fixes.EndpointCase):
         self.assertEqual(self.setup()['host'], 'unknown')
 
 
+class FollowUpTests(test_http_agents.AgentHarness):
+    """kittrial-5bb.123: what the part 1 reviews asked for, on the in-process service."""
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.admin_token()
+        self.project = self.create_project(self.admin, 'Alpha')
+        self.olive_id = self.create_account(self.admin, 'olive', 'olive-password-1')
+        self.request('PUT', '/v1/projects/%s/members/%s' % (self.project, self.olive_id), {'role': 'owner'},
+                     token=self.admin)
+        self.olive = self.login('olive', 'olive-password-1')[0]
+        self.url = '/v1/projects/%s' % self.project
+
+    def patch_repository(self, value, token=None):
+        return self.request('PATCH', self.url, {'repository': value}, token=token or self.olive)
+
+    def test_the_note_travels_with_the_value_on_the_two_project_routes(self):
+        agent = self.request('POST', '/v1/agents', {'name': 'Kestrel', 'working_directory': '/home/olive/k',
+                                                    'projects': [self.project]}, token=self.olive)
+        secret = agent.data['credential']['secret']
+        for token in (self.olive, secret):
+            one = self.request('GET', self.url, token=token).data
+            self.assertEqual((one['repository'], one['repository_note']), (None, None))
+        self.assertEqual(200, self.patch_repository('git@git.example:team/alpha.git').status)
+        for label, token in (('a member', self.olive), ('an agent credential', secret)):
+            with self.subTest(reader=label):
+                one = self.request('GET', self.url, token=token).data
+                self.assertEqual(one['repository'], 'git@git.example:team/alpha.git')
+                self.assertIn('never run it as a command', one['repository_note'])
+                listed = [p for p in self.request('GET', '/v1/projects', token=token).data['items']
+                          if p['id'] == self.project][0]
+                self.assertEqual((listed['repository'], listed['repository_note']),
+                                 (one['repository'], one['repository_note']))
+
+    def test_a_value_stored_under_an_earlier_rule_is_withheld_and_flagged(self):
+        agent = self.request('POST', '/v1/agents', {'name': 'Kestrel', 'working_directory': '/home/olive/k',
+                                                    'projects': [self.project]}, token=self.olive)
+        secret = agent.data['credential']['secret']
+        task = self.request('POST', self.url + '/tasks', {'title': 'first'}, token=self.olive).data['id']
+        for stored in ('https://TOKEN-abc@git.example/team/alpha.git', 'C:/git/alpha.git', '../alpha'):
+            with self.subTest(stored=stored):
+                self.service.state['projects'][self.project]['repository'] = stored
+                one = self.request('GET', self.url, token=self.olive).data
+                self.assertEqual((one['repository'], one['repository_note'], one['repository_needs_attention']),
+                                 (None, None, True))
+                # Not delivered to an agent anywhere, and never echoed.
+                nxt = self.request('GET', '/v1/agents/me/next', token=secret).data
+                self.assertEqual((nxt['projects'][0]['repository'], nxt['repositories_note']), (None, None))
+                brief = self.request('GET', self.url + '/tasks/%s/brief' % task, token=secret).data
+                self.assertEqual((brief['project_repository'], brief['project_repository_note']), (None, None))
+                made = self.request('POST', '/v1/agents', {'name': 'Second ' + stored[:3].strip('./:'),
+                                                           'working_directory': '/home/olive/s',
+                                                           'projects': [self.project]}, token=self.olive)
+                self.assertEqual(made.data['setup']['repositories'], [])
+                step = by_id(self.request('GET', self.url + '/setup', token=self.olive).data)['repository']
+                self.assertEqual(step['state'], 'todo')
+                self.assertIn('no longer fits', step['detail'])
+                for answer in (one, nxt, brief, step):
+                    self.assertNotIn('TOKEN-abc', json.dumps(answer))
+        # The stored record is not rewritten by a read; an owner records it again.
+        self.assertEqual(self.service.state['projects'][self.project]['repository'], '../alpha')
+        self.assertEqual(200, self.patch_repository('git@git.example:team/alpha.git').status)
+        one = self.request('GET', self.url, token=self.olive).data
+        self.assertEqual((one['repository'], one['repository_needs_attention']),
+                         ('git@git.example:team/alpha.git', False))
+
+    def test_a_user_name_or_path_segment_that_begins_like_a_token_is_accepted_with_a_warning(self):
+        token = '0123456789abcdefghij'
+        for value in ('ssh://ghp_0123456789abcdef@git.example/team/alpha.git', 'glpat-%s@git.example:team/alpha.git' % token,
+                      'https://git.example/team/github_pat_%s/alpha.git' % token, '/srv/git/xoxb-%s/alpha.git' % token,
+                      # Review 01a109cc: upper case, a beginning inside a segment, forty hexadecimal digits.
+                      'https://git.example/team/GHP_%s/alpha.git' % token.upper(), 'https://git.example/x.ghp_%s.git' % token,
+                      'https://git.example/team/' + '0123456789abcdef0123456789abcdef01234567' + '/alpha.git'):
+            with self.subTest(value=value[:24]):
+                self.assertEqual(200, self.patch_repository(value).status)
+                one = self.request('GET', self.url, token=self.olive).data
+                self.assertIn('looks like an access token', one['repository_warning'])
+                self.assertNotIn(value, one['repository_warning'])
+                step = by_id(self.request('GET', self.url + '/setup', token=self.olive).data)['repository']
+                self.assertEqual((step['state'], step['warning']), ('done', one['repository_warning']))
+        # A name that only starts like a token is a name: no warning.
+        for value in ('git@git.example:team/alpha.git', 'ssh://sk-team@git.example/team/alpha.git',
+                      'https://git.example/sk-tools/alpha.git', 'https://git.example/team/' + 'a1' * 21 + '/x.git'):
+            with self.subTest(plain=value[:30]):
+                self.assertEqual(200, self.patch_repository(value).status)
+                one = self.request('GET', self.url, token=self.olive).data
+                self.assertIsNone(one['repository_warning'])
+        # Leftovers of the same review: these are refused, and their well-formed neighbours accepted.
+        for value in ('https://git.example:00080/team/a.git', '/', 'git@c:x.git', 'https://git.example/a/.../b.git'):
+            with self.subTest(refused=value):
+                self.assertEqual(422, self.patch_repository(value).status)
+        for value in ('https://git.example:8080/team/a.git', '/srv/git/a.git', 'git@gh:x.git', 'https://git.example/a/.b/c.git'):
+            with self.subTest(accepted=value):
+                self.assertEqual(200, self.patch_repository(value).status)
+        self.assertEqual(200, self.patch_repository('git@git.example:team/alpha.git').status)
+        one = self.request('GET', self.url, token=self.olive).data
+        self.assertIsNone(one['repository_warning'])
+        self.assertNotIn('warning', by_id(self.request('GET', self.url + '/setup', token=self.olive).data)['repository'])
+
+    def test_each_layer_of_the_repository_route_refuses_on_its_own(self):
+        """Three checks stand behind another check; each is exercised with the other one taken away."""
+        contributor = self.create_account(self.admin, 'carl', 'carl-password-1')
+        self.request('PUT', '/v1/projects/%s/members/%s' % (self.project, contributor), {'role': 'contributor'},
+                     token=self.admin)
+        carl = self.login('carl', 'carl-password-1')[0]
+        agent = self.request('POST', '/v1/agents', {'name': 'Kestrel', 'working_directory': '/home/olive/k',
+                                                    'projects': [self.project]}, token=self.olive)
+        secret = agent.data['credential']['secret']
+        value = 'git@git.example:team/alpha.git'
+        # (A4) The PATCH route's own capability check, with the service method's check taken away.
+        with patch.object(type(self.service), 'set_project_repository',
+                          lambda service, principal, project_id, repository, request_id=None:
+                          {'id': project_id, 'repository': repository}):
+            self.assertEqual(403, self.patch_repository(value, token=carl).status)
+            self.assertEqual(403, self.patch_repository(value, token=secret).status)
+            self.assertEqual(200, self.patch_repository(value).status)          # the stand-in itself answers an owner
+        # (A6) The service method's own refusal of a credential, called directly.
+        with self.assertRaises(http_auth.HttpError) as caught:
+            self.service.set_project_repository(self.service.authenticate(secret), self.project, value)
+        self.assertEqual((caught.exception.status, caught.exception.message),
+                         (403, 'Session authority required to change a project'))
+        # (A3) The setup route's refusal of a credential, with the capability check letting it through.
+        with patch.object(type(self.service), 'check_authority', lambda *args, **kwargs: {'role': 'owner'}):
+            answer = self.request('GET', self.url + '/setup', token=secret)
+        self.assertEqual((403, 'Session authority required'), (answer.status, answer.data['error']['message']))
+        self.assertNotIn('repository', self.service.state['projects'][self.project])
+
+
+class RemainingCountTests(fixes.EndpointCase):
+    """kittrial-5bb.123 item 7: a step the server could not check is counted, not hidden."""
+
+    def test_an_unknown_step_is_counted_as_could_not_be_checked(self):
+        admin = self.admin_token()
+        project = self.create_project(admin, 'Alpha')
+
+        def failing(project_id):
+            raise http_auth.HttpError(503, 'uncertain', 'Canonical command failed; outcome may be unknown')
+        self.backend.setup_status = failing
+        body = self.request('GET', '/v1/projects/%s/setup' % project, token=admin).data
+        states = [item['state'] for item in body['steps']]
+        self.assertEqual((body['unchecked'], states.count('unknown')), (3, 3))
+        self.assertEqual(body['remaining'], states.count('todo'))
+
+
+
 class SetupScreenTests(test_http_agents.AgentHarness):
     """web/js/views/setup.js run under Node, with a small DOM, against this real service."""
 
@@ -642,6 +826,14 @@ class SetupScreenTests(test_http_agents.AgentHarness):
         self.assertEqual(seen['routes'], {'members': '/p/p1/settings', 'task': '/p/p1/new', 'agent': '/agents',
                                           'guidance': None})
         self.assertEqual(seen['summary'], ['Nothing is left to do here.', '1 step is left.', '4 steps are left.'])
+        # kittrial-5bb.123: a step that could not be checked is said; a token-like value is warned about.
+        self.assertEqual(seen['unchecked'], ['1 step could not be checked.', '2 steps could not be checked.',
+                                             '2 steps are left. 1 step could not be checked.'])
+        self.assertEqual(seen['uncheckedHint'], '1 setup step could not be checked. See the setup steps')
+        self.assertIsNone(seen['noHintWhenAllDone'])
+        self.assertEqual(len(seen['warning']), 1)
+        self.assertIn('looks like an access token', seen['warning'][0])
+        self.assertEqual(seen['noWarning'], 0)
 
 
 if __name__ == '__main__':

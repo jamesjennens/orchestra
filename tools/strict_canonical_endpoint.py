@@ -310,6 +310,9 @@ def dispatch(canonical, request, tmp, run=None):
         items = {k: dict(v, path=str(Path(tmp) / k)) for k, v in attachments.items()}
         result = work_execute(canonical.path, actor, action, args, items, run)
         return envelope(0, json.dumps(result, ensure_ascii=False) + '\n')
+    if action == 'docs' and args == ['project']:
+        from onboarding import PROJECT_LIMIT, read_document
+        return envelope(0, read_document(canonical.path, 'ONBOARDING.md', PROJECT_LIMIT))
     if action == 'setup-status':
         # endpoint.py's read-only setup-status action (kittrial-5bb.118).
         try:
@@ -411,6 +414,46 @@ def dispatch(canonical, request, tmp, run=None):
     raise ValueError('Unknown action')
 
 
+def emulated_initialize(root, name, stage):
+    """What ``admin.initialize_project`` leaves, without bd. ``STRICT_ENDPOINT_CREATE_STOP``
+    names a stage to stop at (``init`` stops before anything is made)."""
+    import project_creation
+    stop = os.environ.get('STRICT_ENDPOINT_CREATE_STOP')
+    path = Path(root) / 'projects' / name
+    path.mkdir(parents=True, exist_ok=True)
+    for label in project_creation.STAGES:
+        stage(label)
+        if label == stop:
+            raise RuntimeError('emulated stop at %s' % label)
+        if label == 'init':
+            (path / '.beads').mkdir(exist_ok=True)
+            (path / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+            # A test may run code here, in the middle of the work (what holds which lock; a
+            # grant revoked meanwhile): ``STRICT_ENDPOINT_CREATE_HOOK`` names a Python file.
+            hook = os.environ.get('STRICT_ENDPOINT_CREATE_HOOK')
+            if hook:
+                exec(compile(Path(hook).read_text(encoding='utf-8'), hook, 'exec'), {'root': root, 'name': name})
+    print('Created project %s' % name)
+
+
+def service_action(root, request, arguments):
+    import admin
+    import project_creation
+    config = None
+    if arguments.authority_store and http_authority is not None:
+        config = http_authority.AuthorityConfig(arguments.authority_store, arguments.authority_lock)
+    try:
+        (root / 'projects').mkdir(parents=True, exist_ok=True)
+        if request.get('action') == 'create-project':
+            admin.project_dir(root, request.get('project'))
+            return project_creation.create_action(root, request, config, initialize=emulated_initialize)
+        if request.get('action') == 'creation-standing':
+            return project_creation.standing_action(root, request, config)
+        return project_creation.list_action(root, request, config)
+    except Exception as error:  # noqa: BLE001
+        return envelope(2, stderr='%s: %s\n' % (type(error).__name__, error))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--root', required=True)
@@ -424,6 +467,12 @@ def main():
         print(json.dumps(envelope(2, stderr='bad request: %s\n' % error)))
         return
     root = Path(arguments.root)
+    if request.get('action') in ('create-project', 'project-creations', 'creation-standing'):
+        # endpoint.py's two service-only actions (kittrial-5bb.118 part 2). The rules are
+        # the kit's own (project_creation); only the work of initializing a project is
+        # emulated: the directory and the marker add-project leaves, stage by stage.
+        print(json.dumps(service_action(root, request, arguments)))
+        return
     if os.environ.get('STRICT_ENDPOINT_PROJECTS') == '1':
         # endpoint.py's project rule (kittrial-5bb.80): admin.project_dir refuses a name
         # outside [a-z][a-z0-9]{1,23}, then an uninitialized project is refused, both
@@ -437,6 +486,12 @@ def main():
             return
         if not (root / 'projects' / name / '.beads' / 'metadata.json').is_file():
             print(json.dumps(envelope(2, stderr='ValueError: Unknown/uninitialized project\n')))
+            return
+        # endpoint.py serves nothing from a creation that has not finished (part 2 revision).
+        import project_creation
+        unfinished = project_creation.registrable(root, name)
+        if unfinished:
+            print(json.dumps(envelope(2, stderr='ValueError: Unknown/uninitialized project: %s\n' % unfinished)))
             return
     canonical = Canonical(root, request.get('project', 'project'), actor=request.get('actor'))
     canonical.authority_config = None
@@ -471,6 +526,12 @@ def main():
             if http_authority is not None and hasattr(http_authority, 'http_actor_denial') else None
         if denied is not None:
             print(json.dumps(denied))
+            return
+        if request.get('action') == 'set-onboarding':
+            # endpoint.py's service-only action (kittrial-5bb.118 part 2): the kit's own
+            # rules, which run their own guarded section.
+            from onboarding import web_action
+            print(json.dumps(web_action(canonical.path, request.get('project'), request, config)))
             return
         if http_authority is not None and hasattr(http_authority, 'run_guarded'):
             parameters = inspect.signature(http_authority.run_guarded).parameters

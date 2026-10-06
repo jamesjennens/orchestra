@@ -326,6 +326,13 @@ CAP_PROPOSALS = 'proposals.write'
 CAP_PROJECT_ADMIN = 'project.admin'
 CAP_PROJECT_CREATE = 'project.create'
 CAP_ACCOUNTS_ADMIN = 'accounts.admin'
+#: Creating a project ON THE HOST from the web interface (kittrial-5bb.118 part 2): a
+#: superuser, or an account a superuser granted it to, within the grant's limit.
+CAP_PROJECT_HOST_CREATE = 'project.host-create'
+#: The canonical project name (``admin.validate_name``); only such ids are host projects.
+CANONICAL_PROJECT_NAME = re.compile(r'[a-z][a-z0-9]{1,23}')
+GRANT_LIMIT_MAX = 100
+GRANT_LIMIT_DEFAULT = 5
 #: Personal agent management. It is deliberately NOT project-scoped: every
 #: authenticated session may manage the agents it owns, while no worker/agent
 #: credential ever holds it (an agent cannot create or widen another identity).
@@ -405,6 +412,35 @@ def credential_capabilities(state, credential, issuer, project_id):
     return frozenset(cap for cap in caps if cap in ROLE_CAPABILITIES.get(role, frozenset()))
 
 
+def project_grant(user):
+    """The account's "may create projects" grant as ``{'limit', 'granted_by', 'granted_at'}``, or None.
+
+    A grant that is not exactly that shape is no grant: the check fails closed.
+    """
+    grant = user.get('project_grant') if isinstance(user, dict) else None
+    if not isinstance(grant, dict) or type(grant.get('limit')) is not int or \
+            not 1 <= grant['limit'] <= GRANT_LIMIT_MAX or not isinstance(grant.get('granted_by'), str):
+        return None
+    return grant
+
+
+def created_projects(state, user_id):
+    """The registered host projects an account created that still count toward its limit.
+
+    Counted: a record this account created whose id is a canonical project name and which
+    is not archived. Handing the project to another owner does not free the place;
+    archiving it does (and an operator retires the host project separately).
+    """
+    return sorted(pid for pid, project in (state.get('projects') or {}).items()
+                  if isinstance(project, dict) and project.get('created_by') == user_id
+                  and not project.get('archived') and isinstance(pid, str)
+                  and CANONICAL_PROJECT_NAME.fullmatch(pid))
+
+
+#: Said to everyone who may not create a project, whatever name they sent.
+HOST_CREATE_REFUSED = 'This account may not create projects. A superuser grants that, or creates the project.'
+
+
 def decide(state, request, *, now=None, allow_self_user=None):
     """Authorize one capability from durable state, or raise :class:`AuthorityDenied`.
 
@@ -432,7 +468,7 @@ def decide(state, request, *, now=None, allow_self_user=None):
         issuer = state.get('users', {}).get(credential.get('user_id'))
         if not isinstance(issuer, dict) or issuer.get('disabled'):
             raise deny(401, 'unauthenticated', 'Authentication is no longer valid')
-        if capability in (CAP_ACCOUNTS_ADMIN, CAP_PROJECT_CREATE, CAP_AGENTS):
+        if capability in (CAP_ACCOUNTS_ADMIN, CAP_PROJECT_CREATE, CAP_AGENTS, CAP_PROJECT_HOST_CREATE):
             raise deny(403, 'forbidden',
                        'A worker credential cannot perform administrative operations')
         if credential.get('agent_id'):
@@ -473,6 +509,19 @@ def decide(state, request, *, now=None, allow_self_user=None):
         return {'role': 'superuser'}
     if capability == CAP_PROJECT_CREATE:
         return {'role': 'session'}
+    if capability == CAP_PROJECT_HOST_CREATE:
+        # Never an agent or worker credential (refused above), always the live record:
+        # a grant taken away, or a limit lowered, is seen by the next decision.
+        if user.get('superuser'):
+            return {'role': 'superuser', 'limit': None, 'used': len(created_projects(state, user_id))}
+        grant = project_grant(user)
+        if grant is None:
+            raise deny(403, 'forbidden', HOST_CREATE_REFUSED)
+        used = len(created_projects(state, user_id))
+        if used >= grant['limit']:
+            raise deny(403, 'forbidden', 'The limit of %d project(s) for this account is reached (%d in use)'
+                       % (grant['limit'], used))
+        return {'role': 'grant', 'limit': grant['limit'], 'used': used}
     if capability == CAP_AGENTS:
         # Personal identity management, not a project operation: every authenticated
         # session may manage the agents it owns, and the service checks ownership of

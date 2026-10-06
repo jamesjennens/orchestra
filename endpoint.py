@@ -29,7 +29,7 @@ from reserved_comments import (carries_record_label, check_raw_request, comment_
                                is_merge_slot_id, shown_token, write_targets, MERGE_SLOT_LABEL, MERGE_SLOT_SUFFIX,
                                reserved_label_in_args, refuse_http_actor, status_change_targets,
                                unresolved_bd_flags)
-from http_authority import AuthorityConfig, NativeRunner, http_actor_denial, journal_path, run_guarded
+from http_authority import AuthorityConfig, NativeRunner, CAP_PROJECT_ADMIN, http_actor_denial, journal_path, run_guarded
 
 ALLOWED={'list','show','ready','search','count','create','update','close','reopen','comments','dep','state','lint'}
 # Legacy name kept for operators reading this file; enforcement is the
@@ -318,8 +318,26 @@ def _guard_named_rows(root,path,name,args,attachments,actor):
                              %(command,row['id'],merge_slot_sentence(row['id'])))
 
 def execute(root,request,authority_config=None,require_authority=False):
+    # Two actions exist only for the web service and name no existing project
+    # (kittrial-5bb.118 part 2); project_creation holds them, with what stops other callers.
+    if request.get('action')=='create-project':
+        import project_creation
+        project_dir(root,request.get('project'))          # the name's shape, before anything else
+        return project_creation.create_action(root,request,authority_config)
+    if request.get('action')=='project-creations':
+        import project_creation
+        return project_creation.list_action(root,request,authority_config)
+    if request.get('action')=='creation-standing':
+        import project_creation
+        return project_creation.standing_action(root,request,authority_config)
     name=request['project'];path=project_dir(root,name)
     if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+    # A creation the web interface started and that has not finished is not a project yet
+    # (kittrial-5bb.118 part 2, review 01a109cc): it has no backup target, merge slot or first
+    # backup, so nothing is served from it and the web service cannot register it.
+    import project_creation
+    unfinished=project_creation.registrable(root,name)
+    if unfinished:raise ValueError('Unknown/uninitialized project: '+unfinished)
     actor=request.get('actor','')
     refuse_http_actor(actor,authority_config is not None)
     # Launched by the HTTP service, an HTTP-shaped actor still needs the verified
@@ -370,6 +388,13 @@ def execute(root,request,authority_config=None,require_authority=False):
             return run_guarded(request,journal_path(path),work_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
+    if action=='set-onboarding':
+        # An owner sets the project's onboarding text from the web interface
+        # (kittrial-5bb.118 part 2). Service-only; see onboarding.web_action.
+        from onboarding import web_action
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            return web_action(path,name,request,authority_config)
     if action in ('onboard','docs'):
         from onboarding import execute as onboard
         return {'returncode':0,'stdout':onboard(Path(__file__).resolve().parent,path,name,actor,action,request.get('args',[]),endpoint=Path(__file__).resolve()),'stderr':''}
@@ -738,6 +763,10 @@ def main():
                        require_authority=a.require_authority)
     except subprocess.TimeoutExpired:
         answer={'returncode':124,'stdout':'','stderr':'Command timed out; mutation outcome may be uncertain. Inspect state before retrying.\n'}
+    except TimeoutError as waited:
+        # A wait for a lock ran out before anything was done (file_lock raises it while acquiring):
+        # the server is busy, and the request may be sent again. Not a rejection of the request.
+        answer={'returncode':75,'stdout':'','stderr':'Busy: %s. Nothing was done; try again shortly.\n'%waited}
     except Exception as e:
         answer={'returncode':2,'stdout':'','stderr':f'{type(e).__name__}: {e}\n'}
     print(json.dumps(answer,ensure_ascii=False))
