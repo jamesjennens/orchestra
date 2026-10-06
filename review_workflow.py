@@ -1677,12 +1677,23 @@ def require_integrated_follow_on(payload, state, ordered, rows, task, assignee=N
     found = recorded.get(base)
     if found == 'later':
         return
+    if isinstance(found, tuple):
+        # Recorded as an integration, but not under a listed operator's name: say who recorded
+        # it and what to do, so a coordinator who is not on the operator list sees it at once.
+        found, recorder = found
+        unlisted = ('it was recorded as an integration commit by %s, who is not a listed operator of this '
+                    'installation. Integrations must be recorded by a listed operator for a later base to count: '
+                    'an operator adds the recorder (admin.py operators add) or records the integration' % recorder)
+    else:
+        unlisted = None
     why = {None: 'this project has no passed integrated fact that names it as an integration commit',
-           'earlier': 'this project recorded it as an integration commit before the prior integration, or at the '
-                      'same time, not after it',
+           'unlisted': unlisted,
+           'earlier': 'this project recorded it as an integration commit before the prior integration, or in the '
+                      'same second, not after it',
            'reverted': 'an operator revert names it'}[found]
     raise ValueError('Contribution base_commit must be the prior integration commit %s, or an integration commit '
-                     'this project recorded after it (a passed integrated fact on any task, not reverted)%s. '
+                     'this project recorded after it (a passed integrated fact on any task, recorded by a listed '
+                     'operator, not reverted)%s. '
                      '%s is not accepted: %s'
                      % (evidence['integration_commit'],
                         '; the newest such commit is %s' % newest if newest else '; none is recorded yet',
@@ -1694,6 +1705,10 @@ def _recorded_at(value):
     import datetime
     if not isinstance(value, str) or not value:
         return None
+    # Python 3.10 reads a fraction of exactly three or six digits only. The tracker stamps
+    # comments to the nanosecond; an event stamped that way must not read as "no time"
+    # (kittrial-5bb.155), so the fraction is brought to microseconds first.
+    value = re.sub(r'\.(\d+)', lambda found: '.' + (found.group(1) + '000000')[:6], value, count=1)
     try:
         stamp = datetime.datetime.fromisoformat(value[:-1] + '+00:00' if value.endswith('Z') else value)
     except ValueError:
@@ -1706,11 +1721,24 @@ def recorded_integrations(rows, task, prior, operators=None, journal=None):
 
     ``prior`` is the integration evidence of ``task``'s prior revision (``review_state.integration``).
     A commit reads ``later`` when a passed ``integrated`` fact on ANY task of the project
-    names it as its scope's ``integration_commit``, the event that recorded that fact was
-    created strictly after the event that recorded the prior revision's integration, and no
-    operator revert that the host journal confirms names the commit, on any task. Both
-    times are the tracker's own stamps on the event rows, never a caller's. A time that is
-    missing or cannot be read is not "after".
+    names it as its scope's ``integration_commit``, **that fact was recorded by a listed
+    operator**, the event that recorded it was created after the event that recorded the
+    prior revision's integration, and no operator revert that the host journal confirms
+    names the commit, on any task. Both times are the tracker's own stamps on the event
+    rows, never a caller's. The tracker stamps whole seconds, and two events stamped the
+    same second cannot be ordered (the export lists rows by id, not by time), so "the same
+    second" is not after: a later base recorded in the prior integration's own second is
+    refused, never an earlier one accepted. A time that is missing or cannot be read is
+    not "after".
+
+    **Only an operator's fact counts** (kittrial-5bb.155). Any actor can record an
+    ``integrated`` fact on a task of its own making, so a fact recorded by anybody else
+    names no base: a contributor could otherwise make any commit acceptable with a decoy
+    task. ``operators`` is the installation's allowlist; with none configured no later
+    base is accepted. This is the interim rule until kittrial-5bb.106 settles who may
+    write lifecycle facts. It does not stop a caller who reaches the endpoint over SSH and
+    names itself as an operator: there an actor name is a declared label. Over HTTP the
+    actor is the authenticated account.
 
     **What this cannot know.** The endpoint has no git repository, so it cannot tell that
     a recorded integration commit descends from the prior one. It knows only that the
@@ -1720,8 +1748,12 @@ def recorded_integrations(rows, task, prior, operators=None, journal=None):
     """
     from lifecycle import integration_evidence
     from review_state import reverts_by_task
+    # When each event was recorded: the tracker's stamp. Two events stamped the same second
+    # cannot be ordered: the export lists rows by id, not by time (measured on real bd,
+    # kittrial-5bb.155), so a position in it says nothing about which came first.
     created = {row.get('id'): _recorded_at(row.get('created_at')) for row in rows
                if isinstance(row, dict) and row.get('issue_type') == 'event'}
+    listed = {name for name in (operators or []) if isinstance(name, str) and name}
     reverted = set()
     for found in reverts_by_task(rows, operators, journal)[0].values():
         reverted |= {str(record.get('integration_commit') or '').lower() for record in found}
@@ -1731,7 +1763,7 @@ def recorded_integrations(rows, task, prior, operators=None, journal=None):
     for scope in next((entry['scopes'] for entry in evidence if entry['id'] == task), []):
         if scope.get('scope_token') == prior.get('scope_token'):
             prior_time = created.get((scope.get('integrated') or {}).get('event_id'))
-    recorded, newest, rank = {}, None, {'reverted': 2, 'later': 1, 'earlier': 0}
+    recorded, newest, rank = {}, None, {'reverted': 3, 'later': 2, 'unlisted': 1, 'earlier': 0}
     for entry in evidence:
         for scope in entry['scopes']:
             fact = scope.get('integrated') or {}
@@ -1741,12 +1773,22 @@ def recorded_integrations(rows, task, prior, operators=None, journal=None):
             stamp = created.get(fact.get('event_id'))
             if commit in reverted:
                 reading = 'reverted'
-            elif prior_time is not None and stamp is not None and stamp > prior_time:
+            elif prior_time is None or stamp is None or not stamp > prior_time:
+                reading = 'earlier'
+            elif fact.get('actor') in listed:
                 reading = 'later'
             else:
-                reading = 'earlier'
-            # A commit recorded more than once: a revert wins, then any later recording.
-            if commit not in recorded or rank[reading] > rank[recorded[commit]]:
+                # Later, and recorded by somebody who is not a listed operator: not a base. The
+                # name is shown only when it is a plain actor name; it is caller text.
+                actor = fact.get('actor')
+                shown = '"%s"' % actor if isinstance(actor, str) and re.fullmatch(r'[A-Za-z0-9_.:@/-]{1,80}', actor) \
+                    else 'an actor'
+                reading = ('unlisted', shown)
+            # A commit recorded more than once: a revert wins, then a later recording by a
+            # listed operator, then a later one by anybody else, then an earlier one.
+            key = reading[0] if isinstance(reading, tuple) else reading
+            had = recorded.get(commit)
+            if had is None or rank[key] > rank[had[0] if isinstance(had, tuple) else had]:
                 recorded[commit] = reading
             if reading == 'later' and (newest is None or stamp > newest[0]):
                 newest = (stamp, commit)

@@ -417,7 +417,7 @@ class FollowOnChainTests(unittest.TestCase):
             self.send(self.contribution(COMMIT_2, base=COMMIT_3, supersedes=None, follows=first))
         self.assertEqual(str(refused.exception),
                          'Contribution base_commit must be the prior integration commit %s, or an integration commit '
-                         'this project recorded after it (a passed integrated fact on any task, not reverted); none is '
+                         'this project recorded after it (a passed integrated fact on any task, recorded by a listed operator, not reverted); none is '
                          'recorded yet. %s is not accepted: this project has no passed integrated fact that names it '
                          'as an integration commit' % (MERGE_1, COMMIT_3))
         self.assertEqual(len(self.issue['comments']), before)
@@ -1408,7 +1408,12 @@ class LaterBaseTests(FollowOnChainTests):
         self.rows.append(issue)
         return issue
 
-    def integrate(self, task, source_commit, integration_commit, at, value='passed', actor='coordinator'):
+    def send(self, p, actor='worker'):
+        # The installation lists one operator; an integration recorded under that name counts.
+        self.actor = actor
+        return w.execute(self.rows, 'task-1', actor, p, self.run_native, operators=[OPERATOR])
+
+    def integrate(self, task, source_commit, integration_commit, at, value='passed', actor=OPERATOR):
         """Record a scope and an ``integrated`` fact on ``task``, the events created at ``at``."""
         issue = next(row for row in self.rows if row['id'] == task)
 
@@ -1476,7 +1481,7 @@ class LaterBaseTests(FollowOnChainTests):
         self.integrate('task-2', COMMIT_3, MERGE_2, '2026-09-17T08:30:00Z')
         self.assertEqual(self.refusal(first, COMMIT_3),
                          'Contribution base_commit must be the prior integration commit %s, or an integration commit '
-                         'this project recorded after it (a passed integrated fact on any task, not reverted); the '
+                         'this project recorded after it (a passed integrated fact on any task, recorded by a listed operator, not reverted); the '
                          'newest such commit is %s. %s is not accepted: this project has no passed integrated fact '
                          'that names it as an integration commit' % (MERGE_1, MERGE_2, COMMIT_3))
 
@@ -1495,7 +1500,7 @@ class LaterBaseTests(FollowOnChainTests):
         said = self.refusal(first, MERGE_2)
         self.assertIn('; none is recorded yet. ', said)
         self.assertTrue(said.endswith('%s is not accepted: this project recorded it as an integration commit before the '
-                                      'prior integration, or at the same time, not after it' % MERGE_2), said)
+                                      'prior integration, or in the same second, not after it' % MERGE_2), said)
 
     def test_after_means_after_the_prior_revisions_own_integration_not_another_scope_of_the_task(self):
         first = self.send(self.contribution(COMMIT_1))['comment_id']
@@ -1511,11 +1516,28 @@ class LaterBaseTests(FollowOnChainTests):
         self.integrate('task-3', '7' * 40, '8' * 40, '2026-09-17T00:00:00Z')
         self.follow(first, '8' * 40)
 
-    def test_the_same_instant_is_not_after(self):
+    def test_the_same_second_is_not_after_wherever_the_row_is_in_the_export(self):
+        """The export lists rows by id, not by time (measured on real bd), so a position decides nothing."""
         first = self.integration_case()
         self.other()
-        self.integrate('task-2', COMMIT_3, MERGE_2, self.PRIOR_AT)
-        self.assertIn('before the prior integration, or at the same time', self.refusal(first, MERGE_2))
+        self.integrate('task-2', COMMIT_3, MERGE_2, self.PRIOR_AT)        # the same second, a later row
+        self.assertIn('or in the same second, not after it', self.refusal(first, MERGE_2))
+
+    def test_the_same_second_in_an_earlier_row_is_not_after_either(self):
+        first = self.send(self.contribution(COMMIT_1))['comment_id']
+        self.send(self.payload('approve', contribution=first, summary='Reviewed'), 'reviewer')
+        self.other()
+        self.integrate('task-2', COMMIT_3, MERGE_2, self.PRIOR_AT)        # recorded first ...
+        self.record_lifecycle(COMMIT_1, MERGE_1)                          # ... then the prior, in the same second
+        self.assertIn('or in the same second, not after it', self.refusal(first, MERGE_2))
+
+    def test_the_time_decides_whatever_the_order_of_the_rows(self):
+        first = self.send(self.contribution(COMMIT_1))['comment_id']
+        self.send(self.payload('approve', contribution=first, summary='Reviewed'), 'reviewer')
+        self.other()
+        self.integrate('task-2', COMMIT_3, MERGE_2, '2026-09-17T00:00:00Z')   # an earlier row, a later time
+        self.record_lifecycle(COMMIT_1, MERGE_1)
+        self.follow(first, MERGE_2)
 
     def test_a_time_that_is_missing_or_cannot_be_read_is_not_after(self):
         for at in (None, '', 'yesterday', '2026-13-45T00:00:00Z', 20261001):
@@ -1582,7 +1604,7 @@ class LaterBaseTests(FollowOnChainTests):
         self.other('task-3')
         self.integrate('task-3', '7' * 40, MERGE_2, '2026-09-18T00:00:00Z')              # ... and again after
         prior = integration(w.project(self.issue)['contribution'], scopes_for(self.rows, 'task-1'))
-        recorded, newest = w.recorded_integrations(self.rows, 'task-1', prior)
+        recorded, newest = w.recorded_integrations(self.rows, 'task-1', prior, [OPERATOR])
         self.assertEqual((recorded, newest), ({MERGE_1: 'earlier', MERGE_2: 'later'}, MERGE_2))
 
 
@@ -1603,6 +1625,170 @@ class LaterBaseRevertTests(IntegrationRevertTests, LaterBaseTests):
         self.assertTrue(said.endswith('%s is not accepted: an operator revert names it' % MERGE_2), said)
         self.assertIn('; the newest such commit is %s. ' % ('8' * 40), said)          # never the reverted one
         self.follow(first, '8' * 40)
+
+
+class OperatorRecordedBaseTests(LaterBaseTests):
+    """Only an integration recorded under a listed operator's name makes a later base acceptable (kittrial-5bb.155)."""
+
+    def unlisted_sentence(self, recorder):
+        return ('%s is not accepted: it was recorded as an integration commit by %s, who is not a listed operator of this '
+                'installation. Integrations must be recorded by a listed operator for a later base to count: an operator '
+                'adds the recorder (admin.py operators add) or records the integration' % (MERGE_2, recorder))
+
+    def test_the_three_live_shapes(self):
+        """A listed operator recorded it; an unlisted actor recorded a later base; an unlisted actor recorded the prior."""
+        # 1. The exact prior commit, recorded by somebody who is NOT a listed operator: accepted, as
+        #    it has been since kittrial-5bb.25 (integration_case records it as 'worker').
+        first = self.integration_case()
+        self.other()
+        # 2. A later base recorded by an unlisted actor: refused, and the sentence says who and what to do.
+        self.integrate('task-2', COMMIT_3, MERGE_2, '2026-09-17T08:30:00Z', actor='old-coordinator')
+        said = self.refusal(first, MERGE_2)
+        self.assertTrue(said.endswith(self.unlisted_sentence('"old-coordinator"')), said)
+        self.assertIn('recorded by a listed operator, not reverted); none is recorded yet. ', said)
+        # 3. A later base recorded by a listed operator: accepted.
+        self.other('task-3')
+        self.integrate('task-3', '7' * 40, '8' * 40, '2026-09-18T08:30:00Z')
+        self.assertIn('; the newest such commit is %s. ' % ('8' * 40), self.refusal(first, MERGE_2))
+        self.follow(first, '8' * 40)
+
+    def test_the_exact_prior_commit_recorded_by_an_unlisted_actor_is_accepted_as_before(self):
+        first = self.integration_case()                            # recorded by 'worker', who is not listed
+        self.follow(first, MERGE_1)
+
+    def test_a_contributors_decoy_task_does_not_make_a_base(self):
+        """The review's case: a contributor makes a task and records an integration at a commit of her choosing."""
+        first = self.integration_case()
+        self.other('decoy')
+        self.integrate('decoy', COMMIT_3, MERGE_2, '2026-09-17T08:30:00Z', actor='worker')
+        self.assertTrue(self.refusal(first, MERGE_2).endswith(self.unlisted_sentence('"worker"')))
+        recorded, newest = w.recorded_integrations(self.rows, 'task-1', self.prior(), [OPERATOR])
+        self.assertEqual((recorded[MERGE_2], newest), (('unlisted', '"worker"'), None))
+
+    def prior(self):
+        from review_state import integration, scopes_for
+        return integration(w.project(self.issue)['contribution'], scopes_for(self.rows, 'task-1'))
+
+    def test_a_recorder_name_that_is_not_a_plain_name_is_not_repeated(self):
+        """The lifecycle action refuses such a name; the sentence does not rely on that."""
+        import copy
+        from unittest import mock
+        self.integration_case()
+        self.other()
+        self.integrate('task-2', COMMIT_3, MERGE_2, '2026-09-17T08:30:00Z', actor='old-coordinator')
+        evidence = copy.deepcopy(lifecycle.integration_evidence(self.rows))
+        for entry in evidence:
+            for scope in entry['scopes']:
+                if entry['id'] == 'task-2' and scope.get('integrated'):
+                    scope['integrated']['actor'] = 'x' + chr(27) + '[31m <b>ops</b> ' + 'y' * 90
+        with mock.patch.object(lifecycle, 'integration_evidence', return_value=evidence):
+            recorded, newest = w.recorded_integrations(self.rows, 'task-1', self.prior(), [OPERATOR])
+        self.assertEqual(recorded[MERGE_2], ('unlisted', 'an actor'))
+        for name in ('a' * 81, 'two words', '', None, 7):
+            for entry in evidence:
+                for scope in entry['scopes']:
+                    if entry['id'] == 'task-2' and scope.get('integrated'):
+                        scope['integrated']['actor'] = name
+            with mock.patch.object(lifecycle, 'integration_evidence', return_value=evidence):
+                self.assertEqual(w.recorded_integrations(self.rows, 'task-1', self.prior(), [OPERATOR])[0][MERGE_2],
+                                 ('unlisted', 'an actor'))
+
+    def test_with_no_operator_configured_no_later_base_counts(self):
+        first = self.integration_case()
+        self.other()
+        self.integrate('task-2', COMMIT_3, MERGE_2, '2026-09-17T08:30:00Z')
+        for operators in (None, [], [''], ['somebody-else']):
+            with self.subTest(operators=operators):
+                recorded, newest = w.recorded_integrations(self.rows, 'task-1', self.prior(), operators)
+                self.assertEqual((recorded[MERGE_2][0], newest), ('unlisted', None))
+        with self.assertRaisesRegex(ValueError, 'who is not a listed operator'):
+            w.execute(self.rows, 'task-1', 'worker', self.contribution(COMMIT_2, base=MERGE_2, supersedes=None, follows=first),
+                      self.run_native)
+
+    def test_an_operators_later_recording_wins_over_an_unlisted_one_in_either_order(self):
+        for order in (('old-coordinator', OPERATOR), (OPERATOR, 'old-coordinator')):
+            with self.subTest(order=order):
+                self.setUp()
+                first = self.integration_case()
+                for number, actor in enumerate(order):
+                    self.other('task-%d' % (number + 2))
+                    self.integrate('task-%d' % (number + 2), '%d' % (number + 5) * 40, MERGE_2,
+                                   '2026-09-1%dT00:00:00Z' % (number + 7), actor=actor)
+                self.follow(first, MERGE_2)
+
+    def test_a_revert_wins_then_a_later_recording_then_an_earlier_one(self):
+        """A commit recorded more than once, in both orders of the rows."""
+        for order in (('2026-09-15T00:00:00Z', '2026-09-18T00:00:00Z'), ('2026-09-18T00:00:00Z', '2026-09-15T00:00:00Z')):
+            with self.subTest(order=order):
+                self.setUp()
+                self.integration_case()
+                for number, at in enumerate(order):
+                    self.other('task-%d' % (number + 2))
+                    self.integrate('task-%d' % (number + 2), '%d' % (number + 5) * 40, MERGE_2, at)
+                recorded, newest = w.recorded_integrations(self.rows, 'task-1', self.prior(), [OPERATOR])
+                self.assertEqual((recorded[MERGE_2], newest), ('later', MERGE_2))
+
+    def test_stamps_with_any_number_of_fraction_digits_are_read(self):
+        """Python 3.10 reads three or six digits only; the tracker stamps comments to the nanosecond."""
+        for stamp, later in (('2026-09-16T00:00:00.123456789Z', True), ('2026-09-16T00:00:00.5Z', True),
+                             ('2026-09-16T00:00:00.12+00:00', True), ('2026-09-15T23:59:59.999999999Z', False),
+                             ('2026-09-16T02:00:00.000001999+02:00', True)):
+            with self.subTest(stamp=stamp):
+                self.setUp()
+                first = self.integration_case()
+                self.other()
+                self.integrate('task-2', COMMIT_3, MERGE_2, stamp)
+                self.assertIsNotNone(w._recorded_at(stamp))
+                if later:
+                    self.follow(first, MERGE_2)
+                else:
+                    self.assertIn('not after it', self.refusal(first, MERGE_2))
+
+    def test_a_later_stamp_with_no_zone_is_read_as_utc_and_accepted(self):
+        first = self.integration_case()
+        self.other()
+        self.integrate('task-2', COMMIT_3, MERGE_2, '2026-09-16T00:00:01')
+        self.follow(first, MERGE_2)
+
+    def test_when_the_prior_integrations_own_time_cannot_be_read_nothing_is_after_it(self):
+        first = self.integration_case()
+        for row in self.rows:
+            if row.get('issue_type') == 'event' and row['id'].startswith('task-1.'):
+                row['created_at'] = 'not a time'
+        self.other()
+        self.integrate('task-2', COMMIT_3, MERGE_2, '2026-09-17T08:30:00Z')
+        self.assertIn('or in the same second, not after it', self.refusal(first, MERGE_2))
+        self.follow(first, MERGE_1)                                 # the exact prior commit needs no time
+
+    def test_a_recorded_commit_is_compared_without_case(self):
+        first = self.integration_case()
+        self.other()
+        self.integrate('task-2', COMMIT_3, MERGE_2.upper(), '2026-09-17T08:30:00Z')
+        recorded, newest = w.recorded_integrations(self.rows, 'task-1', self.prior(), [OPERATOR])
+        self.assertEqual((recorded.get(MERGE_2), newest), ('later', MERGE_2))
+        self.follow(first, MERGE_2)
+
+
+class OperatorRecordedRevertTests(IntegrationRevertTests, LaterBaseTests):
+    def test_a_revert_that_names_the_commit_in_the_other_case_still_removes_it(self):
+        first = self.integration_case()
+        self.record_lifecycle(COMMIT_1, MERGE_2, scope_op='scope-2')
+        self.operator_revert(revert_payload(contribution=first, integration_commit=MERGE_2.upper()))
+        self.other()
+        self.integrate('task-2', COMMIT_3, MERGE_2, '2026-09-17T08:30:00Z')
+        self.assertTrue(self.refusal(first, MERGE_2).endswith('is not accepted: an operator revert names it'))
+
+    def test_a_revert_wins_over_a_later_recording_of_the_same_commit(self):
+        first = self.integration_case()
+        self.record_lifecycle(COMMIT_1, MERGE_2, scope_op='scope-2')
+        self.operator_revert(revert_payload(contribution=first, integration_commit=MERGE_2))
+        for number in (2, 3):                                        # recorded again, twice, later, by the operator
+            self.other('task-%d' % number)
+            self.integrate('task-%d' % number, '%d' % number * 40, MERGE_2, '2026-09-1%dT00:00:00Z' % (number + 5))
+        from review_state import integration, scopes_for
+        prior = integration(w.project(self.issue)['contribution'], scopes_for(self.rows, 'task-1'))
+        recorded, newest = w.recorded_integrations(self.rows, 'task-1', prior, [OPERATOR], self.journal)
+        self.assertEqual((recorded[MERGE_2], newest), ('reverted', None))
 
 
 if __name__ == '__main__':
