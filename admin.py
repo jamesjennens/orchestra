@@ -2565,6 +2565,16 @@ def read_sidecar(path):
     ``problem`` is None when the copy is absent and otherwise says why it cannot be used,
     for ``backup-authority`` (kittrial-5bb.145); ``complete_sidecar`` keeps only the record.
     """
+    data,problem=read_sidecar_json(path)
+    if problem is not None or data is None:return None,problem
+    if not isinstance(data,dict) or data.get('schema_version')!=1:return None,'it is not a coordination sidecar of schema 1'
+    if data.get('status')!='complete':return None,'its status is %s, not complete'%json.dumps(data.get('status'))
+    return data,None
+
+def read_sidecar_json(path):
+    """``(parsed JSON, None)`` for a sidecar copy, ``(None, None)`` when it is absent, else
+    ``(None, problem)``. The one place a sidecar is opened: never through a symlink, never
+    blocking on a FIFO or device, and only a regular file is read (kittrial-5bb.150/152)."""
     path=Path(path)
     if path.is_symlink():return None,'it is a symlink'
     if not path.exists():return None,None
@@ -2586,11 +2596,8 @@ def read_sidecar(path):
         return None,'it cannot be read (%s)'%error.__class__.__name__
     finally:
         if fd is not None:os.close(fd)
-    try:data=json.loads(raw.decode('utf-8'))
+    try:return json.loads(raw.decode('utf-8')),None
     except ValueError:return None,'it is not valid JSON'
-    if not isinstance(data,dict) or data.get('schema_version')!=1:return None,'it is not a coordination sidecar of schema 1'
-    if data.get('status')!='complete':return None,'its status is %s, not complete'%json.dumps(data.get('status'))
-    return data,None
 
 def native_backup_manifest(directory):
     """``(manifest, None)`` for a native backup directory, or ``(None, reason)``.
@@ -3098,10 +3105,13 @@ def backup_pair_state(root,name):
     native=root/'backups'/name
     sidecar=root/'backups'/(name+'.coordination.json')
     if not native.is_dir():return False,'native backup directory is missing'
-    if sidecar.is_symlink():return False,'coordination sidecar must not be a symlink'
-    try:data=json.loads(sidecar.read_text(encoding='utf-8'))
-    except FileNotFoundError:return False,'coordination sidecar is missing'
-    except (OSError,ValueError):return False,'coordination sidecar is not readable JSON'
+    # Through read_sidecar_json, never a plain open: a FIFO in place of the sidecar made
+    # `backup-status --require-complete` wait until it was killed (kittrial-5bb.152).
+    data,problem=read_sidecar_json(sidecar)
+    if problem=='it is a symlink':return False,'coordination sidecar must not be a symlink'
+    if problem=='it is not a regular file':return False,'coordination sidecar is not a regular file'
+    if problem is not None:return False,'coordination sidecar is not readable JSON'
+    if data is None:return False,'coordination sidecar is missing'
     if not isinstance(data,dict) or data.get('schema_version')!=1:
         return False,'coordination sidecar has an unexpected schema'
     if data.get('status')!='complete':
@@ -3656,6 +3666,35 @@ def coordination_sidecar_source(root,source):
     if data is not None:return fallback,data
     return None,None
 
+def sidecar_outcome(root,source):
+    """What a backup's coordination sidecar allows: ``(outcome, path, record, damaged)``.
+
+    ``outcome`` is ``'answer'`` (``path``/``record`` are the copy ``coordination_sidecar_source``
+    chooses), ``'refuse'`` (no copy is usable but at least one exists: ``damaged`` lists each
+    with why), or ``'legacy'`` (no copy at all). ``restore-new``, ``coordination_backup`` and
+    ``backup-authority`` all decide from this, so they cannot disagree (kittrial-5bb.152).
+    ``damaged`` also lists a damaged copy the answer passed over.
+    """
+    validate_name(source)
+    copies=[root/'backups'/(source+'.coordination.json'),last_complete_sidecar_path(root,source)]
+    damaged=[(copy,problem) for copy,problem in ((copy,read_sidecar(copy)[1]) for copy in copies) if problem]
+    try:
+        path,data=coordination_sidecar_source(root,source)
+    except ValueError:      # a symlink the restore reaches: no usable copy
+        path,data=None,None
+    if path is not None:return 'answer',path,data,damaged
+    return ('refuse' if damaged else 'legacy'),None,None,damaged
+
+def unusable_sidecar_message(root,source,damaged):
+    """The refusal for a backup whose sidecar copies exist but none can be used."""
+    named='; '.join('%s: %s'%(copy.relative_to(root).as_posix(),problem) for copy,problem in damaged)
+    symlink=' A coordination backup must not be a symlink.' if any(problem=='it is a symlink' for _,problem in damaged) else ''
+    return ('Incomplete coordination backup: no copy of the coordination sidecar of backup %s can be used (%s).%s '
+            'Recover or reconcile the source first, or restore the native tracker data alone with '
+            '`restore-new %s DEST --without-coordination`: its sessions, handoffs, requests, merge context and the '
+            'other coordination records, and the operators and verifiers it records, are then not restored.'
+            %(source,named,symlink,source))
+
 def resolved_coordination_sidecar(root,source):
     """The complete coordination sidecar for a project, or None when there is none.
 
@@ -3665,12 +3704,13 @@ def resolved_coordination_sidecar(root,source):
     return coordination_sidecar_source(root,source)[1]
 
 def coordination_backup(root,source):
-    data=resolved_coordination_sidecar(root,source)
-    if data is None:
-        bundle=root/'backups'/(source+'.coordination.json')
-        if not bundle.exists():
-            return None
-        raise ValueError('Incomplete coordination backup; recover/reconcile source first')
+    # None only for a truly legacy backup (no sidecar copy at all). A copy that exists but
+    # cannot be used refuses, the last-complete copy included: with the canonical copy
+    # absent and that copy damaged, the backup used to restore as legacy, silently without
+    # any coordination data (kittrial-5bb.152).
+    outcome,_,data,damaged=sidecar_outcome(root,source)
+    if outcome=='legacy':return None
+    if outcome=='refuse':raise ValueError(unusable_sidecar_message(root,source,damaged))
     validate_coordination_files(data.get('files'))
     validate_coordination_operators(data.get('operators'))
     validate_coordination_operators(data.get('verifiers'),'verifiers')
@@ -3969,16 +4009,11 @@ def backup_authority(root,source):
     if not (root/'backups'/source).is_dir():
         raise ValueError('No such backup: backups/%s does not exist. Check the project name '
                          '(`backup-status` lists the backups this installation has).'%source)
-    copies=[root/'backups'/(source+'.coordination.json'),last_complete_sidecar_path(root,source)]
-    damaged=[(copy,problem) for copy,problem in ((copy,read_sidecar(copy)[1]) for copy in copies) if problem]
-    # Exactly the copy restore-new would use (kittrial-5bb.150): the restore's own choice,
-    # and its symlink refusal read as "no usable copy". A symlinked copy the restore never
-    # reaches (the last-complete copy behind a good canonical one) is only listed as unusable.
-    try:
-        path,data=coordination_sidecar_source(root,source)
-    except ValueError:
-        path,data=None,None
-    if path is None and damaged:
+    # Exactly what restore-new decides (kittrial-5bb.150/152): the same outcome, from the
+    # same copy. A symlinked copy the restore never reaches (the last-complete copy behind a
+    # good canonical one) is only listed as unusable.
+    outcome,path,data,damaged=sidecar_outcome(root,source)
+    if outcome=='refuse':
         raise ValueError('The coordination sidecar of backup %s is damaged: %s. What this backup records '
                          'cannot be read, so no operator or verifier list from it can be trusted.'
                          %(source,'; '.join('%s: %s'%(copy.relative_to(root).as_posix(),problem) for copy,problem in damaged)))
@@ -4364,6 +4399,10 @@ def main():
     a.add_argument('--restore-verifiers',action='store_true',dest='restore_verifiers',
                    help='explicitly re-grant the capability verifiers the backup records that this host no '
                         'longer lists; off by default for the same reason as --restore-operators')
+    a.add_argument('--without-coordination',action='store_true',dest='without_coordination',
+                   help='restore only the native tracker data of a backup whose coordination sidecar exists but '
+                        'cannot be used (restore-new refuses such a backup without this flag); its sessions, '
+                        'handoffs, requests, merge context and recorded operators and verifiers are not restored')
     a.epilog=('Exit status: 0 restored; 3 restored, but --restore-operators/--restore-verifiers could not '
               're-grant (another change held the deployment lock): the last lines say what, with the commands '
               'to re-grant it; 1 failed. Compare a backup with this installation: backup-authority PROJECT.')
@@ -4947,7 +4986,23 @@ def main():
         if not backup.is_dir():raise ValueError('Source backup missing')
         if args.project==args.destination:raise ValueError('Restore requires a different destination')
         with backup_lock(root,args.project):
-            coordination_backup(root,args.project)
+            # The sidecar decides first, before anything is created (kittrial-5bb.152): a copy
+            # that exists but cannot be used refuses the restore unless --without-coordination
+            # asks for the native tracker data alone; a backup with no copy at all is legacy.
+            outcome,_,_,damaged=sidecar_outcome(root,args.project)
+            args.native_only=None
+            if outcome=='refuse':
+                if not args.without_coordination:
+                    raise ValueError(unusable_sidecar_message(root,args.project,damaged))
+                if args.restore_operators or args.restore_verifiers:
+                    raise ValueError('--restore-operators and --restore-verifiers re-grant what the coordination sidecar '
+                                     'records, and it cannot be read; they cannot be combined with --without-coordination')
+                args.native_only=damaged
+            elif args.without_coordination and outcome=='answer':
+                raise ValueError('--without-coordination is only for a backup whose coordination sidecar cannot be '
+                                 'used; this backup\'s can be, so restore it without the flag')
+            else:
+                coordination_backup(root,args.project)
             # Validate the journal snapshot BEFORE creating anything: a corrupt snapshot
             # must fail the restore with no destination project, Dolt restore or
             # coordination files left behind.
@@ -5001,6 +5056,9 @@ def main():
         # an unreadable one must not fail a restore that has already succeeded.
         noted=restore_degraded_note(root,args.project,args.destination)
         if noted:print(noted)
+        if args.native_only is not None:
+            # The last lines, so the operator cannot miss what this restore left out.
+            print(native_only_note(root,args,args.native_only))
         if warning:
             # The last thing the restore says, after everything on stdout (kittrial-5bb.144),
             # and a distinct exit status, so `restore-new ... && next-step` does not proceed.
@@ -5008,6 +5066,18 @@ def main():
             print(warning,file=sys.stderr)
             sys.stderr.flush()
             raise SystemExit(RESTORE_AUTHORITY_NOT_REGRANTED)
+
+def native_only_note(root,args,damaged):
+    """What a ``restore-new --without-coordination`` did NOT restore (its last lines)."""
+    journal=journal_snapshot_path(root,args.project)
+    return ('NOT restored (--without-coordination): the coordination sidecar of backup %s could not be used (%s). '
+            '%s has none of its coordination records: no sessions, handoffs, handoff or coordination requests, '
+            'merge context, guidance, onboarding, feedback or record journals; and the operators and verifiers that '
+            'backup records were neither compared nor re-granted.\nThe operation journal %s.'
+            %(args.project,'; '.join('%s: %s'%(copy.relative_to(root).as_posix(),problem) for copy,problem in damaged),
+              args.destination,
+              'was restored from %s'%journal.relative_to(root).as_posix() if getattr(args,'journal_restored',False)
+              else 'was not restored: the backup has no operation-journal snapshot'))
 
 def finish_restore(root,args,snapshot):
     """What ``restore-new`` does after the native restore: re-point, sidecar, journals."""
@@ -5023,11 +5093,16 @@ def finish_restore(root,args,snapshot):
     run_bd(root,args.destination,['backup','init',str(root/'backups'/args.destination)])
     # The deployment authority merges come last (kittrial-5bb.142): they are the only step
     # that waits on the deployment lock, and a refusal there must leave a complete restore.
-    sidecar=restore_coordination(root,args.project,args.destination,authority=False)
+    # --without-coordination (kittrial-5bb.152): no coordination files, no authority; the
+    # operation journal is restored as before when the backup has a snapshot.
+    sidecar=False if getattr(args,'native_only',None) is not None else restore_coordination(root,args.project,args.destination,authority=False)
     restored=restore_journal(snapshot,
                              project_dir(root,args.destination)/JOURNAL_STORE_NAME)
+    args.journal_restored=restored is not None
     if restored is None:
         print('Backup has no operation-journal snapshot; the restored project starts with an empty identity journal.')
+    if getattr(args,'native_only',None) is not None:
+        return None
     if not sidecar:
         # A legacy backup records no deployment authority: there is nothing to re-grant, and
         # the authority step does not run (it would read no sidecar).
