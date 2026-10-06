@@ -169,6 +169,67 @@ class Shared:
         self.assertIn(two[0], self.offered('Osprey'))
         self.assertNotIn(two[0], self.offered('Kestrel'))
 
+    def test_my_work_compares_both_the_assignee_and_the_author(self):
+        """The copied prompt's "you could review" list: each half of the check, alone (kittrial-5bb.137)."""
+        (one, two), spare = self.scenario()
+        heading = 'Contributions you could review:'
+
+        def listed(name):
+            text = self.request('GET', '/v1/me/work', token=self.tokens[name]).data['agent_prompts'][0]['text']
+            section = text.split(heading)[1] if heading in text else ''
+            return sorted(task for task in (one[0], two[0]) if '- task %s ' % task in section)
+        # Kestrel (Carl's) delivered both; `one` is then reassigned to Osprey (Rita's).
+        self.change(one[0], assignee=self.agent_ids['Osprey'])
+        # Carl delivered it: not his to review although he is no longer the assignee.
+        self.assertEqual(listed('carl'), [])
+        # Rita is the assignee's person: not hers to review although someone else delivered it.
+        self.assertEqual(listed('rita'), [two[0]])
+        # Unassigned, it is still not the author's person's to review.
+        self.change(one[0], assignee=None)
+        self.assertEqual(listed('carl'), [])
+
+    def brief_without_the_author(self):
+        """A brief whose contribution does not say who delivered it."""
+        read = self.backend.task_brief
+
+        def older(project_id, task_id):
+            brief = read(project_id, task_id)
+            contribution = (brief.get('review') or {}).get('contribution')
+            if isinstance(contribution, dict):
+                contribution.pop('author', None)
+            return brief
+        self.backend.task_brief = older
+        self.addCleanup(setattr, self.backend, 'task_brief', read)
+
+    def shown_in_the_brief(self, task):
+        review = self.request('GET', self.base(task) + '/brief', token=self.tokens['olive']).data['review']
+        return (review['recommendation'] or {}).get('author'), [entry['author'] for entry in review['recommendations']]
+
+    def test_the_brief_compares_with_the_assignee_when_it_does_not_say_who_delivered(self):
+        (one, two), spare = self.scenario()
+        osprey = self.agent_ids['Osprey']
+        self.assertEqual(201, self.recommend(self.agents['Osprey'], *one).status)
+        self.change(one[0], assignee=osprey)
+        # The author is known: a reassignment to the recommender hides nothing.
+        self.assertEqual(self.shown_in_the_brief(one[0]), (osprey, [osprey]))
+        # The author is not given: the assignee is compared, and it is the recommender's own person.
+        self.brief_without_the_author()
+        self.assertEqual(self.shown_in_the_brief(one[0]), (None, []))
+        # Another assignee: the recommendation is by a different person, and is shown.
+        self.change(one[0], assignee=self.agent_ids['Merlin'])
+        self.assertEqual(self.shown_in_the_brief(one[0]), (osprey, [osprey]))
+        # Neither an author nor an assignee: nobody to compare with is not "independent of everybody".
+        self.change(one[0], assignee=None)
+        self.assertEqual(self.shown_in_the_brief(one[0]), (None, []))
+
+    def test_the_parties_of_a_brief(self):
+        parties = self.httpd.RequestHandlerClass._read_parties
+        self.assertEqual(parties('assignee-1', 'author-1'), ['author-1'])
+        self.assertEqual(parties('assignee-1', None), ['assignee-1'])
+        self.assertEqual(parties('assignee-1', ''), ['assignee-1'])
+        for assignee, author in ((None, None), ('', ''), (None, ''), (7, {})):
+            self.assertEqual(parties(assignee, author), [])
+
     def test_a_closed_task_is_not_offered_for_review(self):
         (one, two), spare = self.scenario()
         self.change(one[0], status='closed')
@@ -247,10 +308,12 @@ class InProcessTests(Shared, test_http_agents.AgentHarness):
                                                    'projects': projects}, token=self.tokens['rita'])
         self.assertEqual((201, 201), (made.status, wide.status))
         kite, reviewer = made.data['credential']['secret'], wide.data['credential']['secret']
+        delivered = {project: [] for project in projects}
         for index, project in enumerate(projects):
             base = '/v1/projects/%s/tasks' % project
             for number in range(12):
                 task = self.request('POST', base, {'title': 'd %d' % number}, token=self.tokens['olive']).data['id']
+                delivered[project].append(task)
                 self.assertEqual(200, self.request('POST', '%s/%s/claim' % (base, task), token=kite).status)
                 sent = self.request('POST', '%s/%s/reviews' % (base, task), {
                     'operation': 'contribute', 'commit': '%040x' % (index * 100 + number + 1),
@@ -264,6 +327,12 @@ class InProcessTests(Shared, test_http_agents.AgentHarness):
         self.assertTrue(answer['attention']['truncated'])
         self.assertEqual(listed.count('claimable-task'), 3)
         self.assertEqual(listed[:20], ['to-review'] * 20)
+        # Which twenty, and in which order: by project, then by task (kittrial-5bb.137). The ids are
+        # random, so the order by task alone is another one.
+        expected = sorted((project, task) for project in projects for task in delivered[project])
+        self.assertEqual([(a['project'], a['task']) for a in answer['next_actions'][:20]], expected[:20])
+        self.assertNotEqual(sorted(expected, key=lambda pair: pair[1])[:20], expected[:20])
+
     def new_task(self, title):
         return self.request('POST', '/v1/projects/%s/tasks' % self.project, {'title': title},
                             token=self.tokens['olive']).data['id']
@@ -298,6 +367,21 @@ class InProcessTests(Shared, test_http_agents.AgentHarness):
         self.assertEqual(len([kind for kind, _ in kinds(heron) if kind in ('review-recommended', 'to-review')]), 20)
         self.assertEqual((heron['attention']['counts']['review_recommended'], heron['attention']['counts']['to_review']),
                          (1, 23))
+
+    def test_under_the_cap_the_recommended_ones_are_kept_whatever_their_ids(self):
+        """Recommended first is what the cap keeps, not only how the list is ordered (kittrial-5bb.137)."""
+        self.people()
+        made = dict(self.deliver('task %02d' % index, '%040x' % (index + 1)) for index in range(24))
+        # The three whose ids sort last would be cut by a cap that looked at project and task alone.
+        last = sorted(made)[-3:]
+        for task in last:
+            commit = self.request('GET', self.base(task) + '/brief', token=self.tokens['olive']).data['review']['contribution']['commit']
+            self.assertEqual(201, self.recommend(self.agents['Osprey'], task, made[task], commit).status)
+        heron = self.next('Heron')
+        review = [(kind, task) for kind, task in kinds(heron) if kind in ('review-recommended', 'to-review')]
+        self.assertEqual(len(review), 20)
+        self.assertEqual(review[:3], [('review-recommended', task) for task in last])
+        self.assertEqual([task for _, task in review[3:]], sorted(set(made) - set(last))[:17])
 
     def test_standing_is_per_project_and_follows_the_live_grant(self):
         self.people()
@@ -337,19 +421,53 @@ class EndpointTests(Shared, fixes.EndpointCase):
         self.backend._run = older
         self.addCleanup(setattr, self.backend, '_run', run)
 
-    def test_over_an_older_endpoint_nobody_is_offered_their_own_delivery(self):
+    def queue_row(self, task):
+        queue = self.request('GET', '/v1/projects/%s/queue' % self.project, token=self.tokens['olive']).data['items']
+        row = next(row for row in queue if row['id'] == task)
+        return row['recommended_by'], row['recommended']
+
+    def owners_line(self, task):
+        text = self.request('GET', '/v1/me/work', token=self.tokens['olive']).data['agent_prompts'][0]['text']
+        return next(line for line in text.splitlines() if line.startswith('- task %s ' % task))
+
+    def test_a_row_that_does_not_say_who_delivered_counts_no_recommendation(self):
+        """A newer service over an older endpoint (kittrial-5bb.137): it does not guess from the assignee."""
         (one, two), spare = self.scenario()
+        osprey = self.agent_ids['Osprey']
+        self.backend.READ_CACHE_SECONDS = 0          # My work is read before and after the endpoint changes
+        self.addCleanup(delattr, self.backend, 'READ_CACHE_SECONDS')
         self.assertEqual(201, self.recommend(self.agents['Osprey'], *one).status)
+        # The row names the author: the recommendation counts everywhere, as before.
+        self.assertEqual(self.queue_row(one[0]), ([osprey], True))
+        self.assertIn(('review-recommended', one[0]), kinds(self.next('Heron')))
+        self.assertIn('; recommended by 1 reviewer(s)', self.owners_line(one[0]))
+        self.older_endpoint()
+        # The row no longer says who delivered. Nothing was reassigned, and still no recommendation
+        # is counted: not in the queue row, not in My work, not for the owner's agent.
+        self.assertEqual(self.queue_row(one[0]), ([], False))
+        self.assertNotIn('recommended by', self.owners_line(one[0]))
+        heron = self.next('Heron')
+        self.assertEqual([action for action in kinds(heron) if action[0] != 'claimable-task'],
+                         sorted([('to-review', one[0]), ('to-review', two[0])]))
+        self.assertEqual((heron['attention']['counts']['review_recommended'], heron['attention']['counts']['to_review']),
+                         (0, 2))
+        self.assertEqual(heron['next_actions'][0]['recommended_by'], [])
+        # The brief names the author itself, so it still shows the independent recommendation.
+        self.assertEqual(self.shown_in_the_brief(one[0]), (osprey, [osprey]))
+
+    def test_over_an_older_endpoint_nobody_is_offered_their_own_delivery_unless_it_was_reassigned(self):
+        (one, two), spare = self.scenario()
         self.older_endpoint()
         for name in ('Kestrel', 'Merlin'):
             self.assertEqual(self.offered(name), [], name)
-        self.assertEqual(self.offered('Osprey'), [two[0]])
-        # The queue compares with the assignee when the row names no author: a recommendation by
-        # the delivering agent's own person is not shown.
-        self.change(one[0], assignee=self.agent_ids['Osprey'])
-        queue = self.request('GET', '/v1/projects/%s/queue' % self.project, token=self.tokens['olive']).data['items']
-        row = next(row for row in queue if row['id'] == one[0])
-        self.assertEqual((row['recommended_by'], row['recommended']), ([], False))
+        self.assertEqual(self.offered('Osprey'), sorted([one[0], two[0]]))
+        # The known limit: the task is reassigned, and the row names only the new assignee, so the
+        # delivering agent is offered its own delivery. Its recommendation is refused, and nothing is written.
+        self.change(two[0], assignee=self.agent_ids['Osprey'])
+        self.assertEqual(self.offered('Kestrel'), [two[0]])
+        refused = self.recommend(self.agents['Kestrel'], *two)
+        self.assertEqual(403, refused.status, refused.data)
+        self.assertEqual(self.shown_in_the_brief(two[0]), (None, []))
 
     def new_task(self, title):
         return self.create_task(self.tokens['olive'], self.project, title).data['id']
