@@ -241,6 +241,23 @@ class BuildCheckTests(ReleaseFixture):
                 self.assertEqual(refused.returncode, 1)
                 self.assertIn('--target-glibc must be a glibc version such as 2.28', refused.stderr)
 
+    def test_the_glibc_versions_are_compared_as_versions(self):
+        self.bundle('bd', make_elf())                                  # needs 2.34
+        refused, _ = self.try_build('older', '--target-glibc', '2.4', '--no-run-check')
+        self.assertIn('bd needs glibc 2.34; the target has glibc 2.4.', refused.stderr)      # 2.4 is older than 2.34
+        self.bundle('bd', make_elf((('libc.so.6', ('GLIBC_2.9',)),)))
+        accepted, _ = self.try_build('newer', '--target-glibc', '2.28', '--no-run-check')
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)       # 2.9 is older than 2.28
+
+    def test_the_bundled_python_is_checked_against_the_target_too(self):
+        self.python_archive.write_bytes(tar_bytes('bin/python3', make_elf((('libc.so.6', ('GLIBC_2.17', 'GLIBC_2.35')),)),
+                                                  mode=0o755))
+        refused, output = self.try_build('python-too-new', '--target-glibc', '2.28')
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn('office-release: python: it needs glibc 2.35 or later', refused.stderr)
+        self.assertIn('office-release: python needs glibc 2.35; the target has glibc 2.28.', refused.stderr)
+        self.assertFalse(output.exists())
+
     def test_a_binary_that_cannot_start_on_the_build_host_stops_the_build(self):
         self.bundle('bd', b'#!/bin/sh\necho "bd: /lib64/libc.so.6: version \\`GLIBC_2.34\' not found (required by bd)" >&2\nexit 1\n')
         refused, output = self.try_build('cannot-start')
