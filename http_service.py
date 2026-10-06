@@ -1308,6 +1308,29 @@ class EndpointBackend:
     #: every problem with the record (kittrial-5bb.113), so it gets room for all of them.
     DETAIL_LIMIT = 200
     DETAIL_LIMITS = {'checkpoint': 6000}
+    #: The follow-on base refusal is handed on whole (kittrial-5bb.158): cut at 200 it lost the
+    #: reason, the recorder's name and what an operator must do.
+    BASE_REFUSAL_LIMIT = 1500
+
+    @classmethod
+    def _detail_limit(cls, action, said):
+        """How much of a canonical refusal's last line is handed on.
+
+        The larger limit is for the kit's own sentence only, never for a caller's text echoed
+        back at length: the line must BE the follow-on base refusal, whole, as
+        ``review_workflow.BASE_REFUSAL`` describes it (the kit's words, hexadecimal commit
+        ids, a recorder name of a constrained shape). Anything else keeps the limit it had.
+        """
+        if action == 'review' and cls.base_refusal(said) is not None:
+            return cls.BASE_REFUSAL_LIMIT            # the longest form of the sentence is well below it
+        return cls.DETAIL_LIMITS.get(action, cls.DETAIL_LIMIT)
+
+    @staticmethod
+    def base_refusal(said):
+        """The follow-on base refusal in ``said`` (a canonical refusal line), or None when it is not one, whole."""
+        from review_workflow import BASE_REFUSAL
+        text = said[len('ValueError: '):] if isinstance(said, str) and said.startswith('ValueError: ') else None
+        return text if text is not None and BASE_REFUSAL.fullmatch(text) else None
 
     @classmethod
     def _checked(cls, reply, action=None):
@@ -1332,8 +1355,8 @@ class EndpointBackend:
             cls._log_busy(action, stderr)
             raise busy()
         if code:
-            limit = cls.DETAIL_LIMITS.get(action, cls.DETAIL_LIMIT)
-            detail = stderr.strip().splitlines()[-1][:limit] if stderr.strip() else None
+            said = stderr.strip().splitlines()[-1] if stderr.strip() else None
+            detail = said[:cls._detail_limit(action, said)] if said else None
             if code == 2:
                 raise invalid('Canonical command rejected the request', detail)
             raise uncertain('Canonical command failed; outcome may be unknown')
@@ -4882,6 +4905,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if recommending and refusal.status == 422 and isinstance(refusal.detail, str) \
                         and refusal.detail.startswith('ValueError: '):
                     raise invalid(refusal.detail[len('ValueError: '):], refusal.detail) from None
+                # So does a refused follow-on base (kittrial-5bb.158): the sentence says which
+                # base is acceptable, why this one is not and what an operator does about it.
+                sentence = EndpointBackend.base_refusal(refusal.detail) if refusal.status == 422 else None
+                if sentence is not None:
+                    raise invalid(sentence, refusal.detail) from None
                 raise
             return result, result
         return self._mutate(ctx, 'reviews.add', ctx.params['pid'], add, status=201,

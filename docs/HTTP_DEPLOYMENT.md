@@ -518,6 +518,21 @@ the result after the last.
     operator of the server to look before you try again.", and the line goes to the
     service's log (`create-project NAME answered a line that is not a creation
     sentence: ...`). This also covers an endpoint older than the rule.
+- **A refused follow-on base arrives whole** (kittrial-5bb.158). A canonical refusal's last
+  line is handed on up to 200 characters (6000 for a checkpoint, which lists every
+  problem). The follow-on base refusal of the review action is longer, and cut at 200 it
+  lost its reason, the recorder's name and what an operator must do. When the line is
+  exactly that sentence (`review_workflow.BASE_REFUSAL`: the kit's own words, hexadecimal
+  commit ids, a recorder name of a constrained shape) it is handed on whole, up to 1500
+  characters, and it is the `message` of the 422 as well as the `detail`. No other line
+  gets the larger limit, so a caller's own text is never echoed back at that length.
+- **What a caller without the web service reads** (kittrial-5bb.149, .158). Over SSH the
+  endpoint's own lines arrive as they are: its busy line names the lock file it waited
+  for, and its refusal when `deployment.private.json` cannot be read names that file.
+  That caller is somebody who was given the endpoint. The web service does not pass the
+  busy line on (below). A configuration file that cannot be read is answered 503 with no
+  path from the release that contains kittrial-5bb.156; before it, a member's request is
+  answered 422 with the endpoint's line.
 - **Busy, on every route** (kittrial-5bb.149). When the endpoint could not get a lock in
   time it answers return code 75 with a line that names the lock file. The service does
   not pass that line on. A read answers 503 `busy` with `Retry-After` and the service's
