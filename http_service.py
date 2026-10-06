@@ -327,12 +327,14 @@ UNCONFIRMED = ('This project was created before registering a project was limite
 #: will not serve it (kittrial-5bb.90 review item 2.1): the confirm route refuses an
 #: archived record and the record is already archived, so "confirm it or archive it" is
 #: two dead ends. Only removing the access being added works, and this says which call
-#: does it.
+#: does it, and who may make it (kittrial-5bb.140): the refusal goes to whoever tried to
+#: add access, usually the agent's owner, but the project-scoped DELETE needs the project
+#: role, so it is offered beside the PATCH that the owner can use.
 ARCHIVED_UNUSABLE = ('This project is archived and this server will not serve its record; an archived record '
                      'cannot be confirmed, so nothing that grants access is accepted on it. Remove the access '
                      'being added instead, which does work on an archived record: an agent grant (PATCH the '
-                     'agent with its projects without this one, or DELETE /v1/projects/ID/agents/AGENT), a '
-                     'membership, or a worker credential.')
+                     'agent with its projects without this one, or DELETE /v1/projects/ID/agents/AGENT, which a '
+                     'project owner or superuser may use), a membership, or a worker credential.')
 
 #: Canonical names that cannot be registered: the same segment is a literal route under
 #: ``/v1/projects/...`` (``GET /v1/projects/unconfirmed`` is the upgrade check), so a
