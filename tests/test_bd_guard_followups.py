@@ -6,6 +6,12 @@ The guard of .113 rev 3 refused every write that names the merge slot, but
 ``--id`` shape rule allowed a trailing dot or hyphen; and an empty answer from a read counted
 as "no such id". Each case is pinned here at the level it fails: the flag classification in
 ``tests/test_bd_write_flags.py``, the endpoint refusal here.
+
+kittrial-5bb.138 adds two follow-ups from the .135 review: a read flag that makes bd hold the
+whole project (``list --watch``, ``show ID --watch``, short ``-w``) is refused before bd starts,
+and the existence check treats bd's ambiguous-prefix answer as "no row has exactly this id", so
+``create --id p-ab`` with ``p-abc`` and ``p-abd`` present is allowed again while an exact id is
+still refused.
 """
 import json
 import sys
@@ -45,6 +51,13 @@ class FakeBd:
         self.rows, self.hidden = list(rows), list(hidden)
         self.reads, self.writes = [], []
         self.empty_answer = False
+        #: A structured error object other than the exact no-match answer, and the exit code
+        #: it arrives with (kittrial-5bb.138 item absence-pins).
+        self.error_answer = None
+        self.error_rc = 1
+        #: The exit code of the ambiguous-prefix no-match object; real bd 1.2.2 uses rc 1
+        #: (kittrial-5bb.138 item rc0).
+        self.no_match_rc = 1
 
     def all_rows(self):
         return self.rows + self.hidden
@@ -68,18 +81,40 @@ class FakeBd:
             self.reads.append(tokens)
             if self.empty_answer:
                 return _Proc(0, '')            # exit 0 and no output: not an answer at all
-            found, missing = [], []
+            if self.error_answer is not None:
+                # A structured error that is not the exact no-match answer (a locked database).
+                return _Proc(self.error_rc, json.dumps(self.error_answer), 'Error: database is locked')
+            found, missing, ambiguous = [], [], []
             for token in tokens:
                 rows = self.resolve(token)
-                if rows:
+                exact = [row for row in rows if row['id'] == token]
+                if exact:
+                    # bd prefers an exact id over the substring resolver (measured, bd 1.2.2).
+                    rows = exact
+                if len(rows) > 1:
+                    ambiguous.append((token, rows))
+                elif rows:
                     found += [row for row in rows if row not in found]
                 else:
                     missing.append('Error fetching %s: no issue found matching "%s"' % (token, token))
+            if ambiguous:
+                # bd 1.2.2 answers an id that is an ambiguous prefix of several rows with rc 1,
+                # this structured object on stdout, and "ambiguous ID ... Use more characters to
+                # disambiguate" on stderr (measured; kittrial-5bb.138 item 2).
+                token, rows = ambiguous[0]
+                said = ('Error fetching %s: ambiguous ID "%s" matches %d issues: [%s]\n'
+                        'Use more characters to disambiguate'
+                        % (token, token, len(rows), ' '.join(row['id'] for row in rows)))
+                return _Proc(self.no_match_rc, json.dumps({'error': 'no issues found matching the provided IDs',
+                                                           'schema_version': 1}, indent=2), said)
             return _Proc(0 if found else 1, json.dumps(found) if found else '', '\n'.join(missing))
         if 'list' in command and '--id' in command:
             # The hidden classes (`--all` shows closed rows, not ephemeral or gate rows).
             self.reads.append(['list --id', command[command.index('--id') + 1]])
             return _Proc(0, '[]')
+        if 'list' in command:
+            self.reads.append(command)
+            return _Proc(0, json.dumps([]))
         if command[:2] == ['ready', '--claim']:
             self.writes.append(command)
             return _Proc(0, json.dumps([{'id': OTHER, 'status': 'in_progress', 'assignee': 'mallory'}]))
@@ -166,6 +201,67 @@ class EndpointTests(unittest.TestCase):
                 self.assertEqual(self.run_bd(['create', 'new', '--id', value])['returncode'], 0, value)
                 self.assertEqual(len(self.bd.writes), 1, value)
 
+    def test_an_ambiguous_prefix_of_two_ids_is_not_an_existing_id(self):
+        # Real bd 1.2.2 (measured on koopa): with p-abc and p-abd present, `show p-ab` answers
+        # rc 1 with the structured no-match object and "ambiguous ID ... Use more characters to
+        # disambiguate". No row has exactly p-ab, so the create proceeds, exactly as the kit
+        # before kittrial-5bb.135 did (kittrial-5bb.138 item 2).
+        self.bd.rows.append(dict(self.bd.rows[0], id='pp-abd'))
+        self.bd.writes, self.bd.reads = [], []
+        self.assertEqual(self.run_bd(['create', 'new', '--id', 'pp-ab'])['returncode'], 0)
+        self.assertEqual(len(self.bd.writes), 1)
+        self.assertEqual(self.bd.reads, [['pp-ab']])
+        # The exact id the ambiguity is near is still refused.
+        self.bd.writes, self.bd.reads = [], []
+        said = self.refused(['create', 'new', '--id', 'pp-abc'])
+        self.assertIn('a task with that id exists', said)
+        self.assertEqual(self.bd.writes, [])
+
+    # 1b. A read flag that holds the project (`--watch`) is refused before bd starts.
+
+    def test_watch_is_refused_before_any_native_process(self):
+        for args in (['list', '--watch'], ['show', OTHER, '--watch'], ['list', '-w']):
+            with self.subTest(args=args):
+                self.bd.writes, self.bd.reads = [], []
+                said = self.refused(args)
+                self.assertIn('waits for changes', said)
+                self.assertTrue(said.startswith('Refusing '), said)
+                self.assertEqual(self.bd.reads, [])
+                self.assertEqual(self.bd.writes, [])
+
+    def test_a_watch_that_bd_parses_as_false_is_still_a_read(self):
+        for args in (['list', '--watch=false'], ['list', '-w=false'], ['show', OTHER, '--watch=0']):
+            with self.subTest(args=args):
+                self.bd.writes, self.bd.reads = [], []
+                self.assertEqual(self.run_bd(args)['returncode'], 0, args)
+                self.assertEqual(self.bd.writes, [], args)
+                self.assertTrue(self.bd.reads, args)
+
+    def test_a_watch_inside_a_short_cluster_is_refused_before_bd_starts(self):
+        # bd accepts its global booleans -q and -v in front of -w, so the guard must read every
+        # letter of a short cluster, not only token[:2] (kittrial-5bb.138 item cluster). As a
+        # contributor on the previous tip, `list -qw`, `list -vw` and `show ID -qw` each held the
+        # project until the endpoint's 120 s timeout because only the first letter was looked at.
+        for args in (['list', '-qw'], ['list', '-vw'], ['show', OTHER, '-qw'],
+                     ['show', OTHER, '-vw'], ['list', '-wq']):
+            with self.subTest(args=args):
+                self.bd.writes, self.bd.reads = [], []
+                said = self.refused(args)
+                self.assertIn('waits for changes', said)
+                self.assertTrue(said.startswith('Refusing '), said)
+                self.assertEqual(self.bd.reads, [], args)
+                self.assertEqual(self.bd.writes, [], args)
+
+    def test_a_value_taking_letter_ends_a_short_cluster(self):
+        # `-nw` is `-n w`: the rest of the token is the value, so w is not --watch. The scan
+        # stops at the first value-taking letter (kittrial-5bb.138 item cluster).
+        for args in (['list', '-nw'], ['list', '-n5'], ['list', '-aw'], ['list', '-qw=false']):
+            with self.subTest(args=args):
+                self.bd.writes, self.bd.reads = [], []
+                self.assertEqual(self.run_bd(args)['returncode'], 0, args)
+                self.assertEqual(self.bd.writes, [], args)
+                self.assertTrue(self.bd.reads, args)
+
     # 3. The id shape: a trailing dot or hyphen files the row under the row it looks like.
 
     def test_an_id_ending_in_a_dot_or_hyphen_is_refused(self):
@@ -201,6 +297,47 @@ class EndpointTests(unittest.TestCase):
         self.assertEqual(self.run_bd(['create', 'x', '--id', 'pp-new'])['returncode'], 0)
         self.assertEqual(len(self.bd.writes), 1)
 
+    # 5. The absence reading is the exact no-match object at rc 1, and only for the new-id
+    # check (kittrial-5bb.138 items absence-pins and rc0).
+
+    def test_a_structured_error_other_than_no_match_refuses_create_id(self):
+        # Treating any structured error as absence would let a `database is locked` object
+        # through: an existing id would be replaced and a new id created (absence-pins).
+        self.bd.error_answer = {'error': 'database is locked', 'schema_version': 1}
+        for value in (OTHER, 'pp-new'):
+            with self.subTest(id=value):
+                self.bd.writes, self.bd.reads = [], []
+                said = self.refused(['create', 'x', '--id', value])
+                self.assertIn('could not check whether a task with that id exists', said)
+                self.assertEqual(self.bd.writes, [], value)
+
+    def test_the_no_match_answer_is_an_absence_only_for_the_new_id_check(self):
+        # The no-match object at rc 1 is an absence only when the caller asks for it, as
+        # _guard_new_id does; every other guard read refuses it (absence-pins).
+        self.bd.rows.append(dict(self.bd.rows[0], id='pp-abd'))
+        path = self.root / 'projects' / 'pp'
+        with mock.patch.object(endpoint.subprocess, 'run', self.bd):
+            rows, said = endpoint._bd_read(self.root, path, 'mallory', ['show', 'pp-ab', '--json'])
+            self.assertIsNone(rows, 'a guard read that is not the new-id check must refuse the no-match answer')
+            self.assertIn('ambiguous ID', said)
+            rows, said = endpoint._bd_read(self.root, path, 'mallory', ['show', 'pp-ab', '--json'],
+                                           resolver_absence=True)
+            self.assertEqual(rows, [])
+
+    def test_a_no_match_object_at_exit_code_zero_refuses_the_create(self):
+        # The real bd 1.2.2 answers the no-match object with rc 1; rc 0 with an error object is
+        # a failed read, not an absence (kittrial-5bb.138 item rc0).
+        self.bd.rows.append(dict(self.bd.rows[0], id='pp-abd'))
+        self.bd.no_match_rc = 0
+        self.bd.writes, self.bd.reads = [], []
+        said = self.refused(['create', 'new', '--id', 'pp-ab'])
+        self.assertIn('could not check whether a task with that id exists', said)
+        self.assertEqual(self.bd.writes, [])
+        # With bd's real rc 1 the same answer is an absence and the create proceeds.
+        self.bd.no_match_rc = 1
+        self.assertEqual(self.run_bd(['create', 'new', '--id', 'pp-ab'])['returncode'], 0)
+        self.assertEqual(len(self.bd.writes), 1)
+
     # The unit-level classification the endpoint relies on.
 
     def test_ready_claim_is_classified_as_a_write_and_the_other_reads_are_not(self):
@@ -210,6 +347,16 @@ class EndpointTests(unittest.TestCase):
         for argv in (['ready'], ['ready', '--json'], ['ready', '--claim=false'], ['ready', '--claim=0'],
                      ['list', '--all'], ['show', OTHER], ['search', 'x'], ['count'], ['state'], ['lint'],
                      ['comments', OTHER], ['dep', 'list'], ['dep', 'tree'], ['dep', 'cycles']):
+            with self.subTest(argv=argv):
+                self.assertIsNone(rc.write_targets(argv), argv)
+
+    def test_watch_is_classified_as_a_hold(self):
+        for argv in (['list', '--watch'], ['show', OTHER, '--watch'], ['list', '-w'], ['list', '-wq'],
+                     ['list', '-qw'], ['list', '-vw'], ['show', OTHER, '-qw'], ['show', OTHER, '-vw']):
+            with self.subTest(argv=argv):
+                self.assertTrue(rc.write_targets(argv)['refusal'], argv)
+        for argv in (['list', '--watch=false'], ['show', OTHER, '--watch=false'], ['list', '-w=false'],
+                     ['list'], ['show', OTHER], ['list', '-nw'], ['list', '-qw=false']):
             with self.subTest(argv=argv):
                 self.assertIsNone(rc.write_targets(argv), argv)
 

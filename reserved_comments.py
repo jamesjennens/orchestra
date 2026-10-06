@@ -1392,12 +1392,18 @@ WRITE_FLAGS = {
 #: Every flag of every READING bd 1.2.2 command a contributor may run, and how it bears on rows:
 #:   'plain'   the invocation only reads
 #:   'write'   the flag makes bd move a row it chooses: refused before any native write
+#:   'hold'    the flag makes bd wait and hold the whole project: refused before any native write
 #: The reviewer of kittrial-5bb.113 revision 3 ran `bd ready --claim` as a contributor and
 #: bd answered "Claimed issue: PROJECT-merge-slot": `ready` was on the read side of the table
 #: above, so nothing looked at its flags, and bd claimed the priority-0 slot by itself. Every
 #: read is now here, and every flag of every read is named, so a flag that makes a read write
 #: is either refused (this table) or noticed when the pinned bd changes (the help comparison
 #: in tests/test_bd_write_flags.py, which covers reads as well as writes).
+#: kittrial-5bb.138 added `list --watch` and `show ID --watch`: they never return until the
+#: endpoint's 120 second timeout and hold the whole project meanwhile (a measured 117 second
+#: wait for another actor on the same project), so they are classed 'hold' and refused like
+#: `ready --claim`. bd prints the short `-w`, which reaches the same pump and is refused
+#: through READ_SHORT_FLAGS.
 #: `comments TASK` uses the `comments` inventory (bd's shorthand for `comments list`).
 READ_FLAGS = {
     'list': {
@@ -1414,12 +1420,12 @@ READ_FLAGS = {
         '--priority': 'plain', '--priority-max': 'plain', '--priority-min': 'plain', '--ready': 'plain',
         '--reverse': 'plain', '--skip-labels': 'plain', '--sort': 'plain', '--spec': 'plain', '--status': 'plain',
         '--title': 'plain', '--title-contains': 'plain', '--tree': 'plain', '--type': 'plain',
-        '--updated-after': 'plain', '--updated-before': 'plain', '--watch': 'plain', '--wisp-type': 'plain',
+        '--updated-after': 'plain', '--updated-before': 'plain', '--watch': 'hold', '--wisp-type': 'plain',
     },
     'show': {
         '--as-of': 'plain', '--children': 'plain', '--current': 'plain', '--id': 'plain',
         '--include-comments': 'plain', '--include-dependents': 'plain', '--local-time': 'plain', '--long': 'plain',
-        '--refs': 'plain', '--short': 'plain', '--thread': 'plain', '--watch': 'plain',
+        '--refs': 'plain', '--short': 'plain', '--thread': 'plain', '--watch': 'hold',
     },
     'ready': {
         '--assignee': 'plain', '--claim': 'write', '--exclude-label': 'plain', '--exclude-type': 'plain',
@@ -1499,6 +1505,16 @@ READ_VALUE_FLAGS = {
     'dep list': frozenset(['--direction', '--type']),
     'dep tree': frozenset(['--direction', '--format', '--max-depth', '--status']),
     'dep cycles': frozenset(),
+}
+#: The short spellings of READ_FLAGS entries whose class is not 'plain'. bd 1.2.2 prints
+#: `-w, --watch` for `list` and `show`; the short spelling reaches the same pump, so it is
+#: refused with the long one (kittrial-5bb.138). The guarded spelling may sit anywhere in a
+#: short cluster before the first value-taking letter (`-qw`, `-vw`), which `_read_writes`
+#: scans letter by letter. A short flag's value is not resolved, so this can only refuse
+#: more, never less.
+READ_SHORT_FLAGS = {
+    'list': {'-w': '--watch'},
+    'show': {'-w': '--watch'},
 }
 MERGE_SLOT_SUFFIX = '-merge-slot'
 #: A project name holds no hyphen (admin.validate_name), so the slot's id has this exact shape.
@@ -1643,19 +1659,50 @@ def read_invocation_label(args):
     return command if command in READ_FLAGS else None
 
 
-def _read_writes(args, label):
-    """The sentence refusing a READ invoked with a write-shaped flag, or None.
+def _read_flag_refusal(label, flag, value, joined):
+    """The sentence refusing a READ flag whose class is not 'plain', or None.
 
     ``bd ready --claim`` "atomically claim[s] the first ready issue" (bd 1.2.2 ``ready
     --help``) -- that is the row bd chooses, and on a real project the first ready issue
-    is the priority-0 merge slot the reviewer saw claimed (kittrial-5bb.113 review). The
-    flag is refused before any native write. The value of a value-taking read flag is
-    consumed, so ``ready -a --claim`` names the actor ``--claim`` and stays a read; a
-    short flag's value is not resolved, which can only refuse more, never less.
+    is the priority-0 merge slot the reviewer saw claimed (kittrial-5bb.113 review).
+    ``bd list --watch`` and ``bd show ID --watch`` "Watch for changes and auto-refresh
+    display": they never return until the endpoint's 120 second timeout and hold the whole
+    project meanwhile (a real measurement saw another actor's work wait 117 seconds;
+    kittrial-5bb.138). Both classes are refused before bd is started. A joined value bd
+    parses as false leaves the flag off, so it stays a read, exactly as for ``--claim``.
     """
-    fields = READ_FLAGS[label]
+    kind = READ_FLAGS[label].get(flag)
+    if kind not in ('write', 'hold'):
+        return None
+    parsed = _parse_go_bool(value) if joined else True
+    if parsed is not None and not parsed:
+        return None
+    if kind == 'write':
+        return ('%s lets bd choose the row it writes, which is not named in this request; '
+                'read the rows, then name the one you mean' % shown_token(flag))
+    return ('%s waits for changes and does not return until this endpoint times out, holding the '
+            'whole project while it waits; read the rows once instead' % shown_token(flag))
+
+
+def _read_writes(args, label):
+    """The sentence refusing a READ invoked with a write-shaped or holding flag, or None.
+
+    The value of a value-taking read flag is consumed, so ``ready -a --claim`` names the
+    actor ``--claim`` and stays a read; a short flag's value is not resolved, which can
+    only refuse more, never less.
+
+    A short *cluster* is scanned letter by letter: bd's global booleans ``-q``/``-v`` may
+    precede a guarded ``-w``, so ``list -qw`` and ``show ID -qw`` are ``--watch`` and must
+    be refused (kittrial-5bb.138). Every letter is looked up in this label's guarded short
+    flags, and the scan stops at the first letter whose shorthand takes a value, because the
+    rest of that token is that value and not flags (``list -nw`` limits by the value ``w``).
+    A joined value belongs to the last letter of the cluster, exactly as for a lone ``-w``.
+    """
     values = READ_VALUE_FLAGS[label]
-    index = len(label.split())
+    guarded = READ_SHORT_FLAGS.get(label, {})
+    parts = label.split()
+    short_table = _short_flag_table(parts[0], parts[1] if len(parts) > 1 else None) or {}
+    index = len(parts)
     while index < len(args):
         token = args[index]
         if not isinstance(token, str):
@@ -1664,13 +1711,27 @@ def _read_writes(args, label):
             return None
         if token.startswith('--'):
             name, joined, value = token.partition('=')
-            if fields.get(name) == 'write':
-                parsed = _parse_go_bool(value) if joined else True
-                if parsed is None or parsed:
-                    return ('%s lets bd choose the row it writes, which is not named in this request; '
-                            'read the rows, then name the one you mean' % shown_token(name))
+            refusal = _read_flag_refusal(label, name, value, joined)
+            if refusal is not None:
+                return refusal
             if name in values and not joined:
                 index += 1
+        elif len(token) > 1 and token.startswith('-'):
+            # A short spelling of a classified read flag (`-w` is --watch on list and show),
+            # alone or anywhere in a cluster before the first value-taking letter.
+            body = token[1:]
+            cut = body.find('=')
+            letters = body if cut == -1 else body[:cut]
+            value = '' if cut == -1 else body[cut + 1:]
+            for position, letter in enumerate(letters):
+                name = guarded.get('-'+letter)
+                if name is not None:
+                    joined = cut != -1 and position == len(letters) - 1
+                    refusal = _read_flag_refusal(label, name, value if joined else '', joined)
+                    if refusal is not None:
+                        return refusal
+                if short_table.get(letter) == 'value':
+                    break
         index += 1
     return None
 

@@ -25,9 +25,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import reserved_comments as rc
 
 KINDS = {'row', 'new', 'chosen', 'file', 'label', 'plain'}
-READ_KINDS = {'plain', 'write'}
+READ_KINDS = {'plain', 'write', 'hold'}
 #: The type words `bd COMMAND --help` prints after a flag that takes a value.
 VALUE_TYPES = {'string', 'strings', 'stringArray', 'int', 'int32', 'int64', 'uint', 'float', 'duration', 'bool', 'bytes'}
+#: The class of every read flag, pinned as a literal instead of read back from the table under
+#: test. Both the table and the old expectations came from ``rc.READ_FLAGS``, so changing a
+#: flag's class changed nothing that failed: the kittrial-5bb.135 reviewer marked
+#: ``show --watch`` as write and the suite stayed green with and without the real bd (mutation
+#: R10), because the bd-help comparison covers names and value types only. Every flag of every
+#: read is 'plain' unless it is named here, so a class moved in either direction fails this
+#: module (kittrial-5bb.138 item 3).
+READ_CLASS_PINS = {
+    'list': {'--watch': 'hold'},
+    'show': {'--watch': 'hold'},
+    'ready': {'--claim': 'write'},
+}
 
 
 def _bd_binary():
@@ -101,11 +113,11 @@ class TableTests(unittest.TestCase):
             for flag, kind in flags.items():
                 with self.subTest(command=command, flag=flag):
                     argv = command.split() + [flag]
-                    if kind == 'write':
+                    if kind == 'plain':
+                        self.assertIsNone(rc.write_targets(argv), argv)
+                    else:
                         self.assertTrue(rc.write_targets(argv)['refusal'], argv)
                         self.assertIsNone(rc.write_targets(command.split() + ['%s=false' % flag]), argv)
-                    else:
-                        self.assertIsNone(rc.write_targets(argv), argv)
 
     def test_ready_claim_is_a_write_and_a_value_that_spells_it_is_not(self):
         # The P2 of the kittrial-5bb.113 review: bd claims the first ready row (the slot).
@@ -123,6 +135,36 @@ class TableTests(unittest.TestCase):
                      ['state'], ['lint'], ['comments', 'pp-1'], ['comments', 'list', 'pp-1'],
                      ['dep'], ['dep', 'list'], ['dep', 'tree'], ['dep', 'cycles']):
             self.assertIsNone(rc.write_targets(argv), argv)
+
+    def test_the_class_of_every_read_flag_is_pinned(self):
+        # Checked against the literal READ_CLASS_PINS, not the table under test, so a flag moved
+        # between plain/write/hold fails here even though the table and any derived expectation
+        # would move together (kittrial-5bb.138 item 3; the .135 review's mutation R10).
+        for command, flags in rc.READ_FLAGS.items():
+            expected = {flag: 'plain' for flag in flags}
+            expected.update(READ_CLASS_PINS.get(command, {}))
+            self.assertEqual(flags, expected, command)
+
+    def test_the_watch_flag_is_refused_on_the_reads_that_have_it(self):
+        # bd 1.2.2: `list --watch` and `show ID --watch` never return until the endpoint's 120
+        # second timeout and hold the whole project meanwhile (kittrial-5bb.138 item 1). bd's
+        # global booleans -q/-v can precede -w, so a cluster must be scanned letter by letter
+        # (item cluster).
+        for argv in (['list', '--watch'], ['list', '--watch=true'], ['list', '--watch=1'],
+                     ['show', 'pp-1', '--watch'], ['show', 'pp-1', '--watch=yes'],
+                     ['list', '-w'], ['list', '-wq'], ['list', '-qw'], ['list', '-vw'],
+                     ['show', 'pp-1', '-w'], ['show', 'pp-1', '-qw'], ['show', 'pp-1', '-vw']):
+            with self.subTest(argv=argv):
+                request = rc.write_targets(argv)
+                self.assertTrue(request['refusal'], argv)
+                self.assertIn('waits for changes', request['refusal'])
+        # A value-taking letter ends the cluster, so a later w is that flag's value (`-nw` is
+        # `-n w`), and a joined false leaves the read alone (`-qw=false` is -w=false).
+        for argv in (['list'], ['list', '--watch=false'], ['list', '--watch=0'], ['list', '-w=false'],
+                     ['show', 'pp-1'], ['show', 'pp-1', '--watch=false'],
+                     ['list', '-nw'], ['list', '-qw=false']):
+            with self.subTest(argv=argv):
+                self.assertIsNone(rc.write_targets(argv), argv)
 
 
 @unittest.skipIf(BD is None, 'no real bd binary (set ORCHESTRA_BD_BIN or put bd on PATH)')
