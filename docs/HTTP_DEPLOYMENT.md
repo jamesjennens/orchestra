@@ -860,6 +860,17 @@ Mutating calls accept an `Idempotency-Key`. On an uncertain `503` the client
 raises `UncertainOutcome` carrying the key: retry the identical request with that
 key to reconcile. Never retry an uncertain mutation with a new key.
 
+**The server's time of a write.** The JSON body of a write that was carried out has
+`server_time` at its top level, for example `"server_time":
+"2026-10-06T07:50:12+00:00"` (UTC with its offset, whole seconds). On the endpoint
+backend it is the time the endpoint gave for the write; where the service carries the
+write out itself (accounts, members, agents, credentials) it is the service's clock.
+The same request sent again with its `Idempotency-Key` is answered with the stored
+body, so with the time of the write and not of the retry. Reads, refusals and uncertain
+answers carry none. A log-in and a log-out carry none either (they make or end a
+session and record nothing in a project), and an answer whose body is not a JSON object
+has no place for it. The web pages do not show it.
+
 **Retry contract.** An exact retry sent no more than 29 days
 (`JOURNAL_RETRY_HORIZON_SECONDS`, the 30-day tombstone horizon minus the 24 h skew
 allowance) after the original attempt replays the recorded result, reports

@@ -30,6 +30,24 @@ Every request is one JSON object on stdin; every response is one JSON object on 
 - On validation or transport failure, `returncode` is nonzero (`2` for endpoint
   validation), `stdout` is empty, and `stderr` starts with the error type
   (`ValueError: ...`). Automation should parse stdout only when the exit code is `0`.
+- **The server's time of a write** (additive). The answer of a write that was carried
+  out has one more field, `"server_time": "2026-10-06T07:50:12+00:00"`: the endpoint
+  host's clock, UTC with its offset, whole seconds. Cite it where a record says when
+  something happened, in place of your own clock. The client prints it as one line on
+  its standard error after the endpoint's own diagnostics, `server_time:
+  2026-10-06T07:50:12+00:00`; standard output and a `--out` file are exactly what they
+  were. Rules:
+  - a refusal, a busy answer and an uncertain answer carry none (nothing was written at
+    a known time), and neither does a read, including the reads of an action that can
+    also write (`work`, `review TASK`, `brief`, a `--dry-run`);
+  - the same request sent again with its operation identity is answered with the time
+    the write was carried out, not the time of the retry;
+  - the writes are: every bd write, `review --file`, `handoff`, `checkpoint`, the
+    lifecycle, coordinate and requirement actions, the keyed records (`ref`,
+    `capability`, `proposal`), `session register` and `session run start`,
+    `heartbeat` and `end`, `guidance ack`, and `feedback` (add and correct);
+  - an older endpoint sends no such field and the client then prints nothing; an older
+    client ignores the field.
 
 Native commands can succeed (exit `0`) while printing warnings. The endpoint forwards
 those warnings on `stderr` and keeps the success JSON clean; it does not silently drop

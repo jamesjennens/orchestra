@@ -390,6 +390,24 @@ def unusable_projects(service):
     return items
 
 
+#: The endpoint's ``server_time`` of the write the current thread's request carried out, if
+#: any (set by ``EndpointBackend._checked``, read and cleared by ``ApiHandler._mutate``).
+WRITTEN = threading.local()
+
+
+def written_at(service):
+    """The time for a write answer: the endpoint's when it carried the write out, else the service's clock.
+
+    UTC with its offset, whole seconds: the endpoint's format (``http_authority.server_time``).
+    """
+    at = getattr(WRITTEN, 'at', None)
+    WRITTEN.at = None
+    if isinstance(at, str):
+        return at
+    from http_authority import server_time
+    return server_time(service._now())
+
+
 class InProcessBackend:
     """Disposable canonical operations used for local validation.
 
@@ -1338,6 +1356,10 @@ class EndpointBackend:
     def _checked(cls, reply, action=None):
         """The payload of one canonical reply, or the HttpError its return code means."""
         code = reply.get('returncode') if isinstance(reply, dict) else None
+        if code == 0 and isinstance(reply.get('server_time'), str):
+            # The endpoint's time of the write it carried out, for the body of the answer of
+            # the request this thread is serving (kittrial-5bb.97).
+            WRITTEN.at = reply['server_time']
         stderr = (reply.get('stderr') or '') if isinstance(reply, dict) else ''
         stdout = (reply.get('stdout') or '') if isinstance(reply, dict) else ''
         if code == 126:
@@ -2842,6 +2864,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             digest = value
             # 'new' or 'reconcile': both proceed with the reserved digest; a canonical
             # reconcile re-invokes with the durable operation identity.
+        WRITTEN.at = None
         try:
             if serialize:
                 with self.service.store.lock:
@@ -2870,6 +2893,13 @@ class ApiHandler(BaseHTTPRequestHandler):
         except Exception:
             self.service.idempotency_release(digest)
             raise
+        # The server's time of the write, at the top level of the answer and of what is kept for
+        # a retry, so that the same request sent again is answered with the time the write was
+        # carried out (kittrial-5bb.97). An answer that is not an object carries none.
+        at = written_at(self.service)
+        for body in (public, stored):
+            if isinstance(body, dict) and 'server_time' not in body:
+                body['server_time'] = at
         self.service.idempotency_commit(digest, status, stored)
         self._forget_cached_reads(ctx.principal, project_id)
         self.service.audit(ctx.request_id, ctx.principal, route_name, 'committed',

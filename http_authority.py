@@ -1766,6 +1766,26 @@ def _envelope(code, stderr='', **extra):
     return payload
 
 
+def server_time(now=None):
+    """The server's clock for a write answer: UTC with its offset, whole seconds (kittrial-5bb.97)."""
+    import datetime
+    moment = datetime.datetime.now(datetime.timezone.utc) if now is None else \
+        datetime.datetime.fromtimestamp(now, datetime.timezone.utc)
+    return moment.replace(microsecond=0).isoformat()
+
+
+def stamp_write(envelope):
+    """Put ``server_time`` on the answer of a write that was carried out; the same answer is returned.
+
+    Only a successful answer (return code 0) that has none yet: a refusal, a busy and an
+    uncertain answer say nothing about when something was written, and an answer that is
+    stamped keeps its time (a replayed write returns the time it was carried out).
+    """
+    if isinstance(envelope, dict) and envelope.get('returncode') in (None, 0) and 'server_time' not in envelope:
+        envelope['server_time'] = server_time()
+    return envelope
+
+
 #: The ids the HTTP service allocates (http_auth: ``usr_``/``agent_`` + 16 hex). As a
 #: declared actor the shape is reserved for that service (``reserved_comments.HTTP_ACTOR``).
 HTTP_ACTOR_ID = re.compile(r'(?:usr|agent)_[0-9a-f]{16}')
@@ -1940,6 +1960,11 @@ def run_guarded(request, journal_path, effect, authority_config=None,
             return _envelope(124, stderr='Effect raised after the reservation (%s: %s); '
                                          'outcome unknown. Reconcile canonical state before '
                                          'retrying.\n' % (type(error).__name__, error))
+        # The time of the write, on the answer itself and so in what the journal keeps: the
+        # same request sent again is answered with the time the write was carried out. A
+        # guarded action that only read (its runner attempted no write) carries none.
+        if runner is None or runner.attempted_write:
+            stamp_write(envelope)
         if journal is not None and isinstance(envelope, dict):
             code = envelope.get('returncode')
             if code in (None, 0):

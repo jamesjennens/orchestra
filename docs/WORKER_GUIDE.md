@@ -284,7 +284,9 @@ remove them.
 A **record anchor** is a row that carries one of those labels **and** a v1 record
 comment of the same family. The record comment is what proves it is an anchor; the
 label alone is not enough, and neither are `request:` labels. An anchor's labels
-cannot be replaced or removed. It never appears in:
+cannot be replaced or removed, its status changes only through its record operations,
+and its title cannot be changed with `update --title` (the kit finds the record by that
+title; the endpoint refuses it and says so). It never appears in:
 - `work`;
 - the generated views, including `views/issues.jsonl`, and stale pages are pruned
   on refresh (`views/jobs/` and `views/journal/` are owned by refresh, so a

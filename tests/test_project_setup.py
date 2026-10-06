@@ -274,8 +274,12 @@ class InProcessSetupTests(test_http_agents.AgentHarness):
         # Set, read by every member, idempotent, audited once, and cleared.
         value = 'https://git.example/team/alpha.git'
         first = self.patch(olive, {'repository': value}, key='repo-key-1')
+        # The answer of a write carries the server's time at its top level (kittrial-5bb.97).
+        self.assertRegex(first.data.pop('server_time'), r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\+00:00$')
         self.assertEqual((200, {'id': self.project, 'repository': value}), (first.status, first.data))
-        self.assertEqual(self.patch(olive, {'repository': value}, key='repo-key-1').data, first.data)
+        again = self.patch(olive, {'repository': value}, key='repo-key-1').data
+        again.pop('server_time')
+        self.assertEqual(again, first.data)
         self.assertEqual(200, self.patch(olive, {'repository': value}).status)
         for name in ('vera', 'carl', 'olive'):
             self.assertEqual(self.request('GET', '/v1/projects/%s' % self.project,
