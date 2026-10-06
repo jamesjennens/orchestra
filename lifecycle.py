@@ -68,22 +68,29 @@ RELEASE_CLIENT_TIMEOUT_SECONDS = 150.0
 # computed per NATIVE WRITE, because one `bd set-state` process is what a release
 # really pays for. A new target costs THREE writes (scope, deployed, live) and a
 # `--live-verified` first deployment costs FOUR (the extra live-verified fact); a
-# verify-only target costs ONE. The per-write figure is a per PLANNED FACT
-# estimate, not a per-process one: `_apply_fact` rewrites a label through an
-# intermediate `pending` value when the task already carries the target value, so
-# a --live-verified deployment of already-labelled tasks issues one or more extra
-# processes per target (six, or seven once the task was also verified before) for
-# four recorded facts. A clean re-measurement of the delivered kit on real bd
-# 1.2.2 + Dolt (two runs) measured 0.43 to 0.57 s per `bd` process and up to
-# 0.92 s per planned fact in the slowest case
-# (DRY_RUN_MEASURED_SECONDS_PER_WRITE); the policy keeps 1.5 s, which also covers
-# the reviewer's measured 1.47 s per planned fact, and replaced the per-TARGET
-# figure taken under a concurrent suite (kittrial-5bb.119 review items 3 and 4).
+# verify-only target costs ONE. `_apply_fact` pays ONE EXTRA process for a fact
+# whose target value the task already carries, because it rewrites the label
+# through an intermediate `pending` value first; release_planned_native_writes
+# counts those, so a --live-verified release to a second environment of
+# already-labelled tasks is 1.5 native writes per planned fact (six processes for
+# four facts) and 1.75 once the task was verified before (seven), and the estimate
+# is not exceeded in the reviewer's 25-target 179 s worst case (kittrial-5bb.139
+# item 2). A clean re-measurement of the delivered kit on real bd 1.2.2 + Dolt (two
+# runs) measured 0.43 to 0.57 s per `bd` process and up to 0.92 s per planned fact
+# in the slowest case (DRY_RUN_MEASURED_SECONDS_PER_WRITE); the policy keeps 1.5 s
+# per native write, which also covers the reviewer's measured 1.47 s per planned
+# fact, and replaced the per-TARGET figure taken under a concurrent suite
+# (kittrial-5bb.119 review items 3 and 4; kittrial-5bb.139 items 2 and 3).
 DRY_RUN_SECONDS_PER_WRITE = 1.5
 DRY_RUN_FIXED_SECONDS = 15.0
 DRY_RUN_WRITES_PLAIN = 3
 DRY_RUN_WRITES_VERIFIED = 4
 DRY_RUN_WRITES_VERIFY_ONLY = 1
+# The extra `set-state` process `_apply_fact` pays for a fact the task already
+# carries (it rewrites the label through `pending` first). release_planned_native_
+# writes adds it per dimension so the estimate counts processes, not facts
+# (kittrial-5bb.139 item 2).
+DRY_RUN_PENDING_REWRITE_EXTRA = 1
 # The measured floors ReleaseCostEstimateTests hard-codes, so weakening the
 # constants the estimate rests on - or zeroing the fixed part - fails the suite
 # (kittrial-5bb.119 p3 item 3). DRY_RUN_MEASURED_SECONDS_PER_WRITE is this
@@ -1518,6 +1525,36 @@ def release_planned_writes(page,verify_only,live_verified):
                for item in page)
 
 
+def release_planned_native_writes(page,verify_only,live_verified,labels):
+    """Native ``set-state`` processes the page will cost (kittrial-5bb.139 item 2).
+
+    ``release_planned_writes`` counts the planned FACTS; this counts the processes
+    they become, which is what ``expected_seconds`` is priced in. ``_apply_fact``
+    pays one extra process for a fact whose target value the task already carries
+    (it rewrites the label through ``pending`` first), so a plain first deployment
+    stays at one process per fact, a verify-only target is one (two when a
+    ``live-verified`` fact already passed somewhere), and a ``--live-verified``
+    target in a second environment is six or seven for four facts. ``labels`` maps
+    a task id to its native labels read from the same export.
+    """
+    verifying=set(verify_only)
+    total=0
+    for item in page:
+        carrying=set(labels.get(item['task']) or ())
+        if item['task'] in verifying:
+            total+=1+(DRY_RUN_PENDING_REWRITE_EXTRA if 'live-verified:passed' in carrying else 0)
+            continue
+        # scope is always written for a selected target whose scope differs; the
+        # other dimensions are each one process, plus one when the task already
+        # carries the target value.
+        total+=1
+        total+=1+(DRY_RUN_PENDING_REWRITE_EXTRA if 'deployed:passed' in carrying else 0)
+        total+=1+(DRY_RUN_PENDING_REWRITE_EXTRA if 'live:live' in carrying else 0)
+        if live_verified:
+            total+=1+(DRY_RUN_PENDING_REWRITE_EXTRA if 'live-verified:passed' in carrying else 0)
+    return total
+
+
 def release_default_chunk(page,verify_only,live_verified):
     """The default group size: smaller when --live-verified carries new targets.
 
@@ -1682,9 +1719,14 @@ def main():
                                 'live-verified), so this run uses a group of %d target(s), not the plain '
                                 'default of %d; pass --chunk-size to override (kittrial-5bb.119 review item 3)'
                                 %(chunk_size,RELEASE_CHUNK_DEFAULT))
+            # The native label state from the same export: `_apply_fact` pays an
+            # extra process for a fact the task already carries, so the estimate
+            # counts processes, not planned facts (kittrial-5bb.139 item 2).
+            labels={row['id']:row.get('labels') or [] for row in rows
+                    if row.get('issue_type')!='event' and isinstance(row.get('id'),str)}
             group_estimates=[]
             for index,chunk in enumerate(chunks):
-                writes=(release_planned_writes(chunk,page_verify_only,data['live_verified'])
+                writes=(release_planned_native_writes(chunk,page_verify_only,data['live_verified'],labels)
                         +(negative_writes if index==0 else 0))
                 group_estimates.append(release_group_estimate(writes))
             if max(group_estimates or [0.0])>RELEASE_CLIENT_TIMEOUT_SECONDS:
@@ -1720,8 +1762,11 @@ def main():
                     'chunk_size':chunk_size,
                     'planned_writes':release_planned_writes(page,page_verify_only,data['live_verified'])
                                      +negative_writes,
+                    'planned_state_changes':
+                        release_planned_native_writes(page,page_verify_only,data['live_verified'],labels)
+                        +negative_writes,
                     'expected_seconds':release_group_estimate(
-                        release_planned_writes(page,page_verify_only,data['live_verified'])
+                        release_planned_native_writes(page,page_verify_only,data['live_verified'],labels)
                         +negative_writes),
                     'reader_note':SCOPE_ROLL_NOTE,'dry_run':bool(a.dry_run),
                     'rollback':bool(data['rollback'])}
