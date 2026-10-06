@@ -304,6 +304,26 @@ class SilentConnectionTests(Case):
         self.settled()
         self.assertEqual((self.httpd._serving, self.httpd._begun, self.httpd.turned_away), ({}, set(), 0))
 
+    def test_a_thread_that_served_before_start_returned_is_not_remembered(self):
+        """The other order: the connection is served and its thread gone before start() returns for it."""
+        self.serve(client_seconds=30)
+        real = threading.Thread.start
+        waited = []
+
+        def start_and_wait(thread):
+            real(thread)
+            if getattr(getattr(thread, '_target', None), '__name__', '') == 'process_request_thread':
+                thread.join(10)
+                waited.append(thread.is_alive())
+        with mock.patch.object(threading.Thread, 'start', start_and_wait):
+            for _ in range(5):
+                status, _, _ = self.ask('GET', '/healthz')
+                self.assertEqual(status, 200)
+        self.assertEqual(waited, [False] * 5)
+        time.sleep(self.httpd.REAP_EVERY * 3)
+        self.assertEqual((self.httpd._serving, self.httpd._begun), ({}, set()))
+        self.assertEqual((self.httpd.open_connections(), self.httpd.turned_away), (0, 0))
+
     def test_set_up_on_a_socket_that_is_already_gone_is_quiet_and_frees_the_place(self):
         """Whatever closed it: no traceback out of the connection's thread, and the service goes on."""
         self.serve(client_seconds=30)

@@ -2538,7 +2538,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 # longer than this, on every platform. A little longer than the deadline, so that
                 # it is the reaper that ends a wait wherever it can.
                 self.request.settimeout(server.client_seconds + server.TIMEOUT_MARGIN)
-        except (OSError, ValueError) as gone:
+        except OSError as gone:
             # The socket is closed already (the client reset it, or the server gave the
             # connection up): there is nobody to serve, and it is not an error of the service.
             # Never a traceback out of the thread (kittrial-5bb.175).
