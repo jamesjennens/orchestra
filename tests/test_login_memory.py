@@ -243,8 +243,47 @@ class ShareTests(Held):
         release, entered, threads, answers = self.held(places, source=self.ONE, count=per_address or places)
         return release, entered, threads, answers
 
-    def test_the_share_is_a_quarter_of_the_places(self):
-        self.assertEqual((http_auth.Service.LOGINS_PER_ADDRESS, http_auth.Service.LOGINS_AT_ONCE), (4, 16))
+    def test_the_share_is_half_of_the_places(self):
+        self.assertEqual((http_auth.Service.LOGINS_PER_ADDRESS, http_auth.Service.LOGINS_AT_ONCE), (8, 16))
+
+    def test_a_shared_source_has_no_share_and_the_places_in_all_still_bound_it(self):
+        """Everybody behind a trusted proxy that forwards no address (the SSH tunnel): not one client."""
+        self.service.LOGINS_PER_ADDRESS = 2
+        self.service.LOGINS_AT_ONCE = 5
+        release, entered = threading.Event(), []
+        real = http_auth._PASSWORD_WORKER.scrypt
+
+        def waiting(password, **parameters):
+            entered.append(password)
+            release.wait(30)
+            return real(password, **parameters)
+        patcher = mock.patch.object(http_auth._PASSWORD_WORKER, 'scrypt', waiting)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(release.set)
+        answers = []
+
+        def attempt(index):
+            try:
+                self.service.login('nobody-%d' % index, 'wrong password %d' % index, source='127.0.0.1', shared_source=True)
+            except HttpError as error:
+                answers.append(error.status)
+        threads = [threading.Thread(target=attempt, args=(index,)) for index in range(5)]
+        for thread in threads:
+            thread.start()
+        until = time.monotonic() + 10
+        while time.monotonic() < until and self.service._logins < 5:
+            time.sleep(0.01)
+        self.assertEqual((self.service._logins, self.service._logins_by_address), (5, {}))    # five, where the share is two
+        with self.assertRaises(HttpError) as refused:                 # the sixth meets the places in all
+            self.service.login(ADMIN, PASSWORD, source='127.0.0.1', shared_source=True)
+        self.assertEqual(refused.exception.message, self.service.LOGIN_BUSY)
+        self.assertEqual((self.service.logins_turned_away, self.service.logins_turned_away_for_address), (1, 0))
+        release.set()
+        for thread in threads:
+            thread.join(30)
+        self.assertEqual((answers, self.service._logins, self.service._logins_by_address), ([401] * 5, 0, {}))
+        self.assertEqual(self.service.login(ADMIN, PASSWORD, source='127.0.0.1', shared_source=True)['user']['username'], ADMIN)
 
     def test_one_address_cannot_take_every_place_and_another_address_gets_in(self):
         release, entered, threads, answers = self.share(6, 2)

@@ -133,8 +133,9 @@ class GroupTests(unittest.TestCase):
         self.assertEqual(group('::1'), '::/64')
         self.assertEqual(group('not an address'), 'not an address')
 
-    def test_the_limit_is_a_quarter_of_the_places(self):
-        self.assertEqual((http_service.ADDRESS_LIMIT, http_service.GuardedServer.address_limit), (50, 50))
+    def test_the_limit_is_half_of_the_places(self):
+        self.assertEqual((http_service.ADDRESS_LIMIT, http_service.GuardedServer.address_limit), (100, 100))
+        self.assertEqual(http_service.ADDRESS_LIMIT * 2, http_service.CONNECTION_LIMIT)
         self.assertLess(http_service.ADDRESS_LIMIT, http_service.CONNECTION_LIMIT)
         self.assertEqual(http_service.GuardedServer.trusted_proxies, ())
 
@@ -219,10 +220,10 @@ class AcceptTests(AddressCase):
 
     def test_the_default_applies_to_a_server_made_without_a_word_about_it(self):
         self.serve(client_seconds=30)
-        self.assertEqual((self.httpd.address_limit, self.httpd.connection_limit), (50, 200))
-        for _ in range(50):
+        self.assertEqual((self.httpd.address_limit, self.httpd.connection_limit), (100, 200))
+        for _ in range(100):
             self.silent()
-        self.open_from('127.0.0.1', 50, within=10)
+        self.open_from('127.0.0.1', 100, within=30)
         extra = self.silent()
         self.assertLess(self.closed_by_the_server(extra, 1.0), 1.0)
         self.assertEqual((self.httpd.turned_away, self.httpd.turned_away_for_address), (1, 1))
@@ -416,6 +417,35 @@ class ProxyTests(AddressCase):
             self.get(B, headers={'X-Forwarded-For': OTHER})
 
     @needs_addresses
+    def test_a_log_in_through_a_proxy_that_forwards_no_address_has_no_share_per_address(self):
+        """The first install: everybody comes through an SSH tunnel from 127.0.0.1, which is the trusted proxy and
+        sends no X-Forwarded-For. They are not one client; the sixteen places in all still bound them."""
+        self.serve(client_seconds=30, trusted_proxies=(PROXY,))
+        seen = []
+        real = self.service.login
+
+        def login(*args, **kwargs):
+            seen.append((kwargs.get('source'), kwargs.get('shared_source')))
+            return real(*args, **kwargs)
+        body = {'username': ADMIN, 'password': PASSWORD}
+        with mock.patch.object(self.service, 'login', login):
+            self.assertEqual(self.get(PROXY, method='POST', path='/v1/sessions', body=body)[0], 201)
+            self.assertEqual(self.forwarded(FAR, method='POST', path='/v1/sessions', body=body)[0], 201)
+            self.assertEqual(self.forwarded('not an address', method='POST', path='/v1/sessions', body=body)[0], 201)
+            self.assertEqual(self.get(B, method='POST', path='/v1/sessions', body=body)[0], 201)
+        self.assertEqual(seen, [(PROXY, True), (FAR, False), (PROXY, True), (B, False)])
+        # With the share at one and a log-in from the tunnel address held in flight, another from it still gets in.
+        self.service.LOGINS_PER_ADDRESS = 1
+        with self.service._logins_guard:
+            self.service._logins_by_address[PROXY] = 1                # as if one counted log-in of that address were in flight
+        self.assertEqual(self.get(PROXY, method='POST', path='/v1/sessions', body=body)[0], 201)
+        self.assertEqual(self.get(B, method='POST', path='/v1/sessions', body=body)[0], 201)
+        with self.service._logins_guard:
+            self.service._logins_by_address[B] = 1
+        status, answer, _ = self.get(B, method='POST', path='/v1/sessions', body=body)
+        self.assertEqual((status, answer['error']['message']), (503, self.service.LOGIN_BUSY_ADDRESS))
+
+    @needs_addresses
     def test_no_limit_per_forwarded_address_when_it_is_set_to_nought(self):
         self.serve(client_seconds=30, address_limit=0, trusted_proxies=(PROXY,))
         for _ in range(5):
@@ -476,15 +506,31 @@ class SettingTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         yield tmp
 
-    def test_the_command_line_takes_the_number_and_refuses_one_below_nought(self):
-        with self.folder() as tmp, contextlib.redirect_stderr(io.StringIO()) as said:
-            with self.assertRaises(SystemExit) as stopped:
-                http_service.main(['--state', str(Path(tmp)/'state.json'), '--backend', 'inprocess',
-                                   '--connections-per-address', '-1'])
-            self.assertEqual(stopped.exception.code, 2)
-            self.assertIn('--connections-per-address must be 0 (no limit per address) or more', said.getvalue())
-            self.assertFalse((Path(tmp)/'state.json').exists())
-        for words, expected in (([], 50), (['--connections-per-address', '7'], 7), (['--connections-per-address', '0'], 0)):
+    def test_the_command_line_takes_the_numbers_and_refuses_what_is_not_a_share_of_the_total(self):
+        for flag, total, sentence in (
+                ('--connections-per-address', 200, 'must be a whole number from 1 to 200 (the connections served in all)'),
+                ('--logins-per-address', 16, 'must be a whole number from 1 to 16 (the log-ins in flight in all)')):
+            for bad in ('-1', '0', str(total + 1)):
+                with self.subTest(flag=flag, value=bad), self.folder() as tmp, contextlib.redirect_stderr(io.StringIO()) as said:
+                    with self.assertRaises(SystemExit) as stopped:
+                        http_service.main(['--state', str(Path(tmp)/'state.json'), '--backend', 'inprocess', flag, bad])
+                    self.assertEqual(stopped.exception.code, 2)
+                    self.assertIn(flag + ' ' + sentence, said.getvalue())
+                    self.assertFalse((Path(tmp)/'state.json').exists())
+        for words, share in (([], 8), (['--logins-per-address', '3'], 3), (['--logins-per-address', '16'], 16)):
+            with self.subTest(words=words), self.folder() as tmp:
+                made = []
+
+                def create(service, *args, **kwargs):
+                    made.append(service)
+                    raise KeyboardInterrupt
+                with mock.patch.object(http_service, 'create_server', create), contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaises(KeyboardInterrupt):
+                        http_service.main(['--state', str(Path(tmp)/'state.json'), '--backend', 'inprocess', '--port', '0']
+                                          + words)
+                self.assertEqual(made[0].LOGINS_PER_ADDRESS, share)
+        self.assertEqual(http_service.Service.LOGINS_PER_ADDRESS, 8)              # the class is not changed by a setting
+        for words, expected in (([], 100), (['--connections-per-address', '7'], 7), (['--connections-per-address', '200'], 200)):
             with self.folder() as tmp:
                 made = []
 
@@ -501,7 +547,7 @@ class SettingTests(unittest.TestCase):
         with self.folder() as tmp:
             store = http_service.Store(Path(tmp)/'state.json')
             service = http_service.Service(store)
-            for more, expected in (({}, ((), 50)), ({'trusted_proxies': ['10.0.0.1', 'localhost'], 'address_limit': 4},
+            for more, expected in (({}, ((), 100)), ({'trusted_proxies': ['10.0.0.1', 'localhost'], 'address_limit': 4},
                                                     (('10.0.0.1', 'localhost'), 4)),
                                    ({'address_limit': 0}, ((), 0))):
                 httpd = http_service.create_server(service, http_service.InProcessBackend(service), port=0, **more)
@@ -523,20 +569,24 @@ class SettingTests(unittest.TestCase):
                 path.write_text(json.dumps(dict({'schema_version': 1}, **settings)), encoding='utf-8')
                 return office_service.service_config(path)
             self.assertNotIn('connections_per_address', config())
-            for good in (0, 1, 50, 400):
-                self.assertEqual(config(connections_per_address=good)['connections_per_address'], good)
-            for bad in (-1, 1.5, '50', True, None, [50]):
-                with self.assertRaises(ValueError) as refused:
-                    config(connections_per_address=bad)
-                self.assertIn('connections_per_address must be a whole number', str(refused.exception))
+            self.assertNotIn('logins_per_address', config())
+            for setting, total in (('connections_per_address', 200), ('logins_per_address', 16)):
+                for good in (1, total // 2, total):
+                    self.assertEqual(config(**{setting: good})[setting], good)
+                for bad in (-1, 0, total + 1, 1.5, '50', True, None, [50]):
+                    with self.subTest(setting=setting, value=bad), self.assertRaises(ValueError) as refused:
+                        config(**{setting: bad})
+                    self.assertIn('%s must be a whole number from 1 to %d' % (setting, total), str(refused.exception))
         script, root = Path('/release/kit/office_service.py'), Path('/runtime')
 
         def command(**settings):
             return [str(part) for part in office_service.web_command(settings, root, 10000, '/release/python', script)]
         self.assertNotIn('--connections-per-address', command())
-        for number in (0, 12):
-            found = command(connections_per_address=number)
+        self.assertNotIn('--logins-per-address', command())
+        for number in (1, 12):
+            found = command(connections_per_address=number, logins_per_address=number + 1)
             self.assertEqual(found[found.index('--connections-per-address') + 1], str(number))
+            self.assertEqual(found[found.index('--logins-per-address') + 1], str(number + 1))
 
 
 if __name__ == '__main__':

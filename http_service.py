@@ -3231,8 +3231,11 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('POST', r'/v1/sessions', anonymous=True, csrf=False)
     def sessions_create(self, ctx):
         payload = ctx.payload or {}
+        # Everybody behind a trusted proxy that forwards no address (the SSH tunnel) arrives from the
+        # proxy's own address: that is not one client, and has no share per address of the log-in places.
         result = self.service.login(payload.get('username'), payload.get('password'),
-                                    source=self._source(), request_id=ctx.request_id)
+                                    source=self._source(), request_id=ctx.request_id,
+                                    shared_source=self._peer_is_trusted_proxy() and self._forwarded_group() is None)
         self._set_cookie_token = result['session_token']
         self._current_request_id = ctx.request_id
         return 201, {'session': {'token': result['session_token'],
@@ -5468,8 +5471,11 @@ CLIENT_SECONDS = 30
 CONNECTION_LIMIT = 200
 #: Of those, how many one client address may have at once (kittrial-5bb.170 item 2): without
 #: it one address that keeps reopening silent connections holds every place for as long as it
-#: likes. A quarter of the places. 0: no limit per address.
-ADDRESS_LIMIT = 50
+#: likes. Half of the places: an office behind one address is the ordinary case (a browser
+#: uses up to six connections while a page loads), and one address still cannot take them
+#: all; two acting together can. 0: no limit per address (the settings do not offer it:
+#: they take 1 to CONNECTION_LIMIT).
+ADDRESS_LIMIT = 100
 #: Said to a request that came through a trusted proxy while its forwarded address already
 #: has that many requests being served.
 ADDRESS_BUSY = 'Too many requests from your address are being served at once. Send this one again in a moment.'
@@ -5867,8 +5873,12 @@ def main(argv=None):
     parser.add_argument('--max-body', type=int, default=MAX_BODY_BYTES)
     parser.add_argument('--connections-per-address', type=int, default=ADDRESS_LIMIT, metavar='N',
                         help='connections one client address may have open at once, of the %d the service '
-                             'serves (default %d; 0: no limit per address). Behind a --trusted-proxy: requests '
-                             'being served at once for one forwarded address.' % (CONNECTION_LIMIT, ADDRESS_LIMIT))
+                             'serves (default %d; 1 to %d). Behind a --trusted-proxy: requests being served at '
+                             'once for one forwarded address.' % (CONNECTION_LIMIT, ADDRESS_LIMIT, CONNECTION_LIMIT))
+    parser.add_argument('--logins-per-address', type=int, default=Service.LOGINS_PER_ADDRESS, metavar='N',
+                        help='log-ins one client address may have in flight at once, of the %d in all '
+                             '(default %d; 1 to %d)' % (Service.LOGINS_AT_ONCE, Service.LOGINS_PER_ADDRESS,
+                                                        Service.LOGINS_AT_ONCE))
     parser.add_argument('--public-url',
                         help='canonical base URL of this service, used only to render '
                              'copyable agent setup/resume snippets (e.g. https://host)')
@@ -5927,8 +5937,12 @@ def main(argv=None):
             os.close(lock_fd)
         print('Bootstrapped %s' % args.bootstrap_user)
         return 0
-    if args.connections_per_address < 0:
-        parser.error('--connections-per-address must be 0 (no limit per address) or more')
+    if not 1 <= args.connections_per_address <= CONNECTION_LIMIT:
+        parser.error('--connections-per-address must be a whole number from 1 to %d (the connections served in all)'
+                     % CONNECTION_LIMIT)
+    if not 1 <= args.logins_per_address <= Service.LOGINS_AT_ONCE:
+        parser.error('--logins-per-address must be a whole number from 1 to %d (the log-ins in flight in all)'
+                     % Service.LOGINS_AT_ONCE)
     store = Store(args.state)
     if args.backend == 'endpoint' and (not args.endpoint or not args.root):
         parser.error('--backend endpoint requires --endpoint and --root '
@@ -5937,6 +5951,7 @@ def main(argv=None):
     if args.trust_proxy and 'localhost' not in trusted:
         trusted.append('localhost')
     service = Service(store, public_url=args.public_url)
+    service.LOGINS_PER_ADDRESS = args.logins_per_address
     backend = build_backend(service, args)
     for line in operator_allowlist_warnings(args.root if args.backend == 'endpoint' else None):
         print(line, file=sys.stderr)
