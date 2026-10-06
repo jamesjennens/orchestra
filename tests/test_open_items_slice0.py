@@ -496,8 +496,10 @@ class LabelCheckTests(unittest.TestCase):
     def check(self, *projects):
         out = io.StringIO()
         argv = ['admin.py', '--root', str(self.root), 'open-item-label-check', *projects]
+        # root_path insists on a Linux runtime path; the check itself is what is under test,
+        # so it runs on the Windows jobs too.
         with patch.object(admin, 'run_bd', side_effect=self.run_bd), patch.object(sys, 'argv', argv), \
-                contextlib.redirect_stdout(out):
+                patch.object(admin, 'root_path', Path), contextlib.redirect_stdout(out):
             try:
                 admin.main()
                 code = 0
