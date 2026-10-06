@@ -211,6 +211,7 @@ class NoUnguardedParseTests(unittest.TestCase):
         'proposal_records.py': (7, 'bd output, the host session file, and a copy of a structure the kit built'),
         'record_json.py': (2, 'the guard itself and row-level parsing'),
         'reference_records.py': (2, 'bd output'),
+        'project_creation.py': (1, 'the creation record the kit writes on the coordination host'),
         'review_recommendations.py': (1, 'bd output (the answer of comments add)'),
         'review_workflow.py': (4, 'bd output and the revert journal the kit writes'),
         'sessions.py': (2, 'bd output'),

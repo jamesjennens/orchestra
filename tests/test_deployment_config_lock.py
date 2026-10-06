@@ -26,6 +26,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import admin
+import project_creation
 
 REPO = str(Path(__file__).resolve().parent.parent)
 PAUSE = 0.5
@@ -57,6 +58,7 @@ CHILD = textwrap.dedent('''
         'verifiers-remove': lambda: cli('verifiers', 'remove', 'gone-ver', '--confirm-revoke'),
         'merge-operators': lambda: admin.merge_operators(root, ['restored-op']),
         'merge-verifiers': lambda: admin.merge_verifiers(root, ['restored-ver']),
+        'server-limit': lambda: cli('project-creations', '--set-server-limit', '7', '--actor', 'ops'),
     }}
     if role == 'second':
         (root / 'second.started').touch()
@@ -76,6 +78,9 @@ EFFECTS = {
     'verifiers-remove': lambda cfg: 'gone-ver' not in cfg.get('verifiers', []),
     'merge-operators': lambda cfg: 'restored-op' in cfg.get('operators', []),
     'merge-verifiers': lambda cfg: 'restored-ver' in cfg.get('verifiers', []),
+    # The limit of project databases (kittrial-5bb.118 part 2): the setting and its audit entry.
+    'server-limit': lambda cfg: cfg.get('project_database_limit') == 7
+    and [(entry['actor'], entry['to']) for entry in cfg.get('project_database_limit_audit', [])] == [('ops', 7)],
 }
 
 #: Each writer against a switch flip, in both orders, and the two switches against the
@@ -83,6 +88,8 @@ EFFECTS = {
 PAIRS = [(writer, 'checkpoint-on') for writer in EFFECTS if writer not in ('checkpoint-on', 'review-on')]
 PAIRS += [(second, first) for first, second in PAIRS]
 PAIRS += [('review-on', 'operators-add'), ('operators-add', 'review-on'), ('review-on', 'checkpoint-on')]
+PAIRS += [('server-limit', 'operators-add'), ('operators-add', 'server-limit'),
+          ('server-limit', 'review-on'), ('review-on', 'server-limit')]
 
 
 @unittest.skipIf(sys.platform == 'win32', 'flock is POSIX-only')
@@ -182,7 +189,8 @@ class DeploymentLockWaitTests(unittest.TestCase):
             for change in (lambda: self.flip('on'),
                            lambda: admin.review_writes_command(self.root, 'ops', 'on'),
                            lambda: admin.merge_operators(self.root, ['another']),
-                           lambda: admin.merge_verifiers(self.root, ['another'])):
+                           lambda: admin.merge_verifiers(self.root, ['another']),
+                           lambda: project_creation.set_server_limit(self.root, 7, 'ops')):
                 _, error = self.bounded(change)
                 self.assertRegex(error or '', r'^Nothing was changed: another change to '
                                               r'deployment\.private\.json still holds its lock')
@@ -190,6 +198,26 @@ class DeploymentLockWaitTests(unittest.TestCase):
         self.assertFalse(self.flip('status')['checkpoint_provenance_writes'])   # reads take no lock
         result, _ = admin.review_writes_command(self.root, 'ops', 'status')
         self.assertFalse(result['review_workflow_writes'])
+
+    def test_the_command_that_sets_the_server_limit_exits_1_and_says_so(self):
+        # kittrial-5bb.118 part 2: admin.py project-creations --set-server-limit under a held lock.
+        self.hold()
+        before = self.marker.read_bytes()
+        done = subprocess.run([sys.executable, '-c', textwrap.dedent('''
+            import sys
+            sys.path.insert(0, sys.argv[1])
+            import admin
+            admin.DEPLOYMENT_LOCK_WAIT_SECONDS = 0
+            sys.argv = ['admin.py', '--root', sys.argv[2], 'project-creations', '--set-server-limit', '7', '--actor', 'ops']
+            admin.run_main()
+        '''), REPO, str(self.root)], capture_output=True, text=True, timeout=60,
+            env={key: value for key, value in os.environ.items() if key != 'ORCHESTRA_OPERATORS'})
+        self.assertEqual((done.returncode, done.stdout), (1, ''), done.stderr)
+        self.assertRegex(done.stderr.strip(), r'^ValueError: Nothing was changed: another change to '
+                                              r'deployment\.private\.json still holds its lock \(\.review-writes\.lock\) '
+                                              r'after 0 s\. Run the command again')
+        self.assertEqual(self.marker.read_bytes(), before)
+        self.assertEqual(project_creation.server_limit(self.root), project_creation.SERVER_LIMIT_DEFAULT)
 
     def test_a_lock_released_during_the_wait_is_taken(self):
         holder = self.hold()

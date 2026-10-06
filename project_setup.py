@@ -90,10 +90,15 @@ def steps(handler, principal, project_id):
         note='An owner adds contributors and viewers. Only a superuser can make someone an owner.'))
 
     repository = project.get('repository')
+    # A value stored under an earlier rule that no longer passes is withheld by the
+    # project view (kittrial-5bb.123): the step is to do again, and says why.
+    stale = bool(project.get('repository_needs_attention'))
     result.append(step(
         'repository', 'Record where the project\'s repository is',
         'done' if repository else 'todo',
         ('Recorded: %s' % repository) if repository else
+        ('A location was recorded before the rule for this field changed, and it no longer fits. It is not shown '
+         'and not given to agents. Record the location again.') if stale else
         'Not recorded. An agent needs a clone of the repository with a remote it can push to; this tells it '
         'which repository that is.',
         'owner', link=base,
@@ -144,6 +149,15 @@ def steps(handler, principal, project_id):
                        .get(block.get('state'), ('unknown', 'The server could not say whether onboarding is set.'))),
         'Set.', 'admin.py set-onboarding %s --file FILE' % name,
         'Not set. The onboarding entry point is what a new worker reads first about this project.'))
+    # An owner may set the onboarding text on this page (kittrial-5bb.118 part 2); an
+    # operator may still set it on the server. Guidance stays with the operator.
+    onboarding = result[-1]
+    if onboarding['state'] not in ('unavailable', 'not-applicable'):
+        onboarding.update(who='owner-or-operator',
+                          who_text='A project owner, on this page; or an operator, on the server.',
+                          link='/v1/projects/%s/onboarding' % project_id,
+                          note='Text an owner sets here is shown to workers as information written by a project '
+                               'owner. It is not the standing guidance, which only an operator sets.')
 
     def backup(block):
         last = block.get('last_run') if isinstance(block.get('last_run'), dict) else None
@@ -169,8 +183,17 @@ def steps(handler, principal, project_id):
     result.append(host_step('backup', 'Make sure a scheduled backup covers this project', status, reason, backup,
                             None, line or 'admin.py backup --all (on a schedule)', None))
 
+    if project.get('repository_warning'):
+        result[1]['warning'] = project['repository_warning']
     return {'project': {'id': project_id, 'name': project.get('name'), 'repository': repository},
             'steps': result,
             'remaining': sum(1 for item in result if item['state'] in REMAINING),
+            # Steps whose state the server could not read (kittrial-5bb.123): they are not
+            # "left to do" and they are not done, so the page says how many there are.
+            'unchecked': sum(1 for item in result if item['state'] == 'unknown'),
             'host': 'available' if status is not None else reason,
+            # How many project databases the server holds and its limit: for a superuser only,
+            # because it counts other people's projects (kittrial-5bb.118 part 2 revision).
+            'server': (status.get('project_databases') if isinstance(status, dict) and principal.superuser
+                       and isinstance(status.get('project_databases'), dict) else None),
             'generated_at': None}
