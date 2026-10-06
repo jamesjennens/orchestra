@@ -2547,13 +2547,25 @@ def complete_sidecar(path):
     return None: every caller treats "not proven complete" as unusable rather than
     guessing, so a half-written or still-``pending`` marker is never restored from.
     """
-    path=Path(path)
-    if path.is_symlink() or not path.is_file():return None
-    try:data=json.loads(path.read_text(encoding='utf-8'))
-    except (OSError,ValueError):return None
-    if not isinstance(data,dict) or data.get('schema_version')!=1 or data.get('status')!='complete':
-        return None
+    data,_=read_sidecar(path)
     return data
+
+def read_sidecar(path):
+    """``(record, None)`` for a complete coordination sidecar, else ``(None, problem)``.
+
+    ``problem`` is None when the copy is absent and otherwise says why it cannot be used,
+    for ``backup-authority`` (kittrial-5bb.145); ``complete_sidecar`` keeps only the record.
+    """
+    path=Path(path)
+    if path.is_symlink():return None,'it is a symlink'
+    if not path.exists():return None,None
+    if not path.is_file():return None,'it is not a regular file'
+    try:data=json.loads(path.read_text(encoding='utf-8'))
+    except OSError as error:return None,'it cannot be read (%s)'%error.__class__.__name__
+    except ValueError:return None,'it is not valid JSON'
+    if not isinstance(data,dict) or data.get('schema_version')!=1:return None,'it is not a coordination sidecar of schema 1'
+    if data.get('status')!='complete':return None,'its status is %s, not complete'%json.dumps(data.get('status'))
+    return data,None
 
 def native_backup_manifest(directory):
     """``(manifest, None)`` for a native backup directory, or ``(None, reason)``.
@@ -3915,20 +3927,6 @@ def authority_not_regranted(root,source,operators,verifiers):
             %('; '.join(named),REVIEW_WRITES_LOCK,DEPLOYMENT_LOCK_WAIT_SECONDS,'\n  '.join(commands),
               shlex.quote(str(root)),shlex.quote(source),RESTORE_AUTHORITY_NOT_REGRANTED))
 
-def sidecar_problem(path):
-    """Why a coordination sidecar copy that exists cannot be used, or None when it is absent
-    or usable. The same tests as ``complete_sidecar``, said out loud."""
-    path=Path(path)
-    if path.is_symlink():return 'it is a symlink'
-    if not path.exists():return None
-    if not path.is_file():return 'it is not a regular file'
-    try:data=json.loads(path.read_text(encoding='utf-8'))
-    except OSError as error:return 'it cannot be read (%s)'%error.__class__.__name__
-    except ValueError:return 'it is not valid JSON'
-    if not isinstance(data,dict) or data.get('schema_version')!=1:return 'it is not a coordination sidecar of schema 1'
-    if data.get('status')!='complete':return 'its status is %s, not complete'%json.dumps(data.get('status'))
-    return None
-
 def backup_authority(root,source):
     """Read only: the deployment authority a project backup records against this installation.
 
@@ -3947,7 +3945,7 @@ def backup_authority(root,source):
         raise ValueError('No such backup: backups/%s does not exist. Check the project name '
                          '(`backup-status` lists the backups this installation has).'%source)
     copies=[root/'backups'/(source+'.coordination.json'),last_complete_sidecar_path(root,source)]
-    problems=[(copy,sidecar_problem(copy)) for copy in copies]
+    problems=[(copy,read_sidecar(copy)[1]) for copy in copies]
     path,_=coordination_sidecar_source(root,source) if not any(problem=='it is a symlink' for _,problem in problems) else (None,None)
     damaged=[(copy,problem) for copy,problem in problems if problem]
     if path is None and damaged:
