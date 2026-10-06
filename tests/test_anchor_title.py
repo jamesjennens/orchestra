@@ -132,6 +132,32 @@ class GuardTests(unittest.TestCase):
             with self.subTest(argv=argv):
                 self.assertEqual(self.guard(argv, {}), [])
 
+    def test_with_the_rows_the_write_already_read_only_a_labelled_row_is_read_again(self):
+        """Every write reads its rows once (kittrial-5bb.113); a rename of ordinary rows must cost no second read."""
+        def guard(named, rows):
+            calls = []
+            with mock.patch.object(endpoint.subprocess, 'run', self.reads(rows, calls)):
+                endpoint._guard_record_anchor_title(self.root, self.path, ['update', *[r['id'] for r in named], '--title', 'x'],
+                                                    'worker', named)
+            return calls
+        plain = [{'id': 'pp-1', 'labels': []}, {'id': 'pp-2', 'labels': ['bug']}, {'id': 'pp-3'}]
+        self.assertEqual(guard(plain, {}), [])
+        # A row with a record label is read again, alone, with its comments: the label is not the proof.
+        labelled = plain + [{'id': 'pp-9', 'labels': ['reference']}]
+        calls = guard(labelled, {'pp-9': {'labels': ['reference'], 'comments': []}})
+        self.assertEqual(len(calls), 1)
+        self.assertIn('pp-9', calls[0])
+        self.assertIn('--include-comments', calls[0])
+        self.assertNotIn('pp-1', calls[0])
+        # And when it is an anchor, the write is refused.
+        with self.assertRaisesRegex(ValueError, 'Refusing to update the title of pp-9: it is a reference'):
+            guard(labelled, {'pp-9': self.anchor(*self.ANCHORS[0])})
+
+    def test_the_bd_action_hands_the_guard_the_rows_it_read(self):
+        source = (KIT / 'endpoint.py').read_text(encoding='utf-8')
+        self.assertIn("named=_guard_named_rows(root,path,name,args,request.get('attachments',{}),actor)", source)
+        self.assertIn('_guard_record_anchor_title(root,path,args,actor,named)', source)
+
     def test_a_title_change_that_names_no_row_is_refused(self):
         for argv in (['update', '--title', 'x'], ['update', 'pp-1', '--title', 'x', '--no-such-flag']):
             with self.subTest(argv=argv), self.assertRaisesRegex(ValueError, 'name exactly the issue'):
@@ -139,8 +165,8 @@ class GuardTests(unittest.TestCase):
 
     def test_the_guard_runs_before_the_write_of_the_bd_action(self):
         source = (KIT / 'endpoint.py').read_text(encoding='utf-8')
-        block = source[source.index('            _guard_named_rows(root,path,name,args'):source.index('            def bd_dispatch(argv):')]
-        self.assertIn('_guard_record_anchor_title(root,path,args,actor)', block)
+        block = source[source.index('            named=_guard_named_rows(root,path,name,args'):source.index('            def bd_dispatch(argv):')]
+        self.assertIn('_guard_record_anchor_title(root,path,args,actor,named)', block)
         self.assertLess(block.index('_guard_record_anchor_status'), block.index('_guard_record_anchor_title'))
 
 

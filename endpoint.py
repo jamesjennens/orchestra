@@ -197,23 +197,31 @@ def _guard_record_anchor_status(root,path,args,actor):
             raise ValueError('Refusing to %s %s: %s. Its holder changes only through `coordinate`.'
                              %(command,canonical,merge_slot_sentence(canonical)))
 
-def _guard_record_anchor_title(root,path,args,actor):
+def _guard_record_anchor_title(root,path,args,actor,rows=None):
     """Read-before-write guard: the title of a record anchor is not changed through bd (kittrial-5bb.97).
 
     The kit finds a reference, proposal, settings or capability record by its anchor's
     title, so a renamed anchor is a record nobody finds again. The same rows as
-    `_guard_record_anchor_status` protects, read the same way (one native read of every
-    named row, under the lock of the write). Requirement and brd-section records are worked
+    `_guard_record_anchor_status` protects. Requirement and brd-section records are worked
     as tasks and are renamed like tasks.
+
+    ``rows`` are the rows `_guard_named_rows` has just read for this write (without their
+    comments). An anchor carries a record type label, so only a row with such a label can
+    be one, and only those are read again, with their comments, in one native read: a
+    title change on ordinary rows costs no read beyond the one every write makes
+    (kittrial-5bb.113). Without ``rows`` every named row is read.
     """
     targets=title_change_targets(args)
     if targets is None:return
     if targets=='unnamed':
         raise ValueError('Refusing update --title: name exactly the issue(s) to change; bd would otherwise act on the '
                          'last touched issue, which cannot be checked for a record anchor.')
-    rows=_native_anchor_rows(root,path,actor,targets)
+    if rows is not None:
+        targets=[row['id'] for row in rows if carries_record_label(row)]
+        if not targets:return
+    read=_native_anchor_rows(root,path,actor,targets)
     for token in targets:
-        canonical,row=rows[token]
+        canonical,row=read[token]
         if is_record_anchor(row):
             raise ValueError('Refusing to update the title of %s: it is a reference/proposal/settings/capability record '
                              'anchor, and its title is how the kit finds it.'%canonical)
@@ -364,6 +372,7 @@ def _guard_named_rows(root,path,name,args,attachments,actor):
                                  %(command,row['id'],merge_slot_sentence(row['id'])))
             raise ValueError('Refusing %s on %s: %s. Nothing but `coordinate` writes it; its merge-create operation repairs a damaged slot.'
                              %(command,row['id'],merge_slot_sentence(row['id'])))
+    return rows
 
 def execute(root,request,authority_config=None,require_authority=False):
     # Two actions exist only for the web service and name no existing project
@@ -788,9 +797,9 @@ def execute(root,request,authority_config=None,require_authority=False):
             fcntl.flock(lock,fcntl.LOCK_EX)
             # First the rows the write names (an existing id given to create, a write that names
             # none, the merge slot); then the guards that read what those rows carry.
-            _guard_named_rows(root,path,name,args,request.get('attachments',{}),actor)
+            named=_guard_named_rows(root,path,name,args,request.get('attachments',{}),actor)
             _guard_record_anchor_status(root,path,args,actor)
-            _guard_record_anchor_title(root,path,args,actor)
+            _guard_record_anchor_title(root,path,args,actor,named)
             _guard_reserved_labels(root,path,args,actor)
             def bd_dispatch(argv):
                 p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*argv],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
