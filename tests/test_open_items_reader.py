@@ -250,6 +250,20 @@ class DerivationTests(unittest.TestCase):
         self.assertIn('two different records claim revision 1',
                       [w['detail'] for w in self.ledger.view(self, rid)['warnings']])
 
+    def test_a_closure_must_name_a_resolution_with_its_disposition(self):
+        rid = self.ledger.anchor()
+        self.ledger.post(rid, oi.OPEN_ITEM_PREFIX, fx.item_record(rid, submitted_by=fx.block(OPERATOR)))
+        rcid = self.ledger.post(rid, oi.ITEM_RESOLUTION_PREFIX,
+                                fx.resolution_record(rid, 1, disposition='superseded', evidence='item:kit-9',
+                                                     by=fx.block(OPERATOR), serial=1))
+        self.ledger.post(rid, oi.OPEN_ITEM_PREFIX, fx.item_record(rid, revision=2, state='resolved', resolved_by=rcid,
+                                                                  submitted_by=fx.block(OPERATOR)))
+        view = self.ledger.view(self, rid)
+        self.assertTrue(view['conflicted'])
+        self.assertIsNone(view['resolution'])
+        self.assertIn('state resolved has no matching item-resolution-v1 (resolved_by %s)' % rcid,
+                      [w['detail'] for w in view['warnings']])
+
     def test_trust_words_are_one_set(self):
         self.assertEqual(oi.TRUST_WORDS, ('attested', 'unattested'))
         host = fx.block(OPERATOR)
@@ -274,6 +288,9 @@ class DerivationTests(unittest.TestCase):
             self.ledger.sink.comment(rid, text, 'mallory')
         view = self.ledger.view(self, rid)
         self.assertEqual((view['state'], view['revision'], view['record_comment_id']), ('open', 1, '1'))
+        details = {w['comment_id']: w['detail'] for w in view['warnings']}
+        self.assertEqual(details['2'], 'starts like an open-item record but is not one; it is ignored')
+        self.assertEqual(details['3'], 'starts like an open-item record but is not one; it is ignored')
         codes = sorted(w['code'] for w in view['warnings'])
         self.assertEqual(codes, sorted(['not-a-record', 'not-a-record', 'malformed-record', 'unsupported-record',
                                         'misplaced-record', 'malformed-record']))
