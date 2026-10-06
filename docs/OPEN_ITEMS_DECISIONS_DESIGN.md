@@ -1,7 +1,11 @@
 # Coordinator open items, owner questions and decisions as first-class records
 
-Status: draft design note for owner acceptance (kittrial-5bb.96), **revision 3**. **Nothing in this
-document is built.** It adds no module, no client or endpoint operation, no reserved `Kind:` prefix,
+Status: draft design note for owner acceptance (kittrial-5bb.96), **revision 3**. **Slice 0 (§13) is
+built (kittrial-5bb.126): the names only - the reserved prefixes and label prefix, the hidden-surface
+tables, the void names, the two journal names, the `.owner-answers` entry validator and a
+deploy-time label listing. Nothing else in this document is built**, and the slice 0 review
+conditions corrected the note where it disagreed with them (marked "Corrected in slice 0"). Before
+slice 0 the note added no module, no client or endpoint operation, no reserved `Kind:` prefix,
 no label, no migration and no test. It proposes four new record kinds, three read commands, three
 write command groups, and a staged write switch, so that a coordinator's working state stops living
 as a JSON array rewritten inside a `task-checkpoint-v1` comment and starts living as addressable
@@ -34,8 +38,9 @@ undecided is §19.
    record found by its operation-derived id. The standalone decisions read is stated: decision
    records live on native decision issues, which the item-anchor read does not return. See §3.3,
    §7.3, §7.4, §8.3, §10.
-5. `slices-caps-overlap` - slice 0 adds the journals to `RESERVATION_JOURNALS` and a preflight check
-   that no project already uses an `open-item` label; the decision reader moves to the decisions
+5. `slices-caps-overlap` - slice 0 adds the journals to `RESERVATION_JOURNALS` and a deploy-time
+   listing of the projects that already use an `open-item` label (corrected in slice 0: a listing, not
+   a refusal; §13); the decision reader moves to the decisions
    slice; slice 2 splits into 2a (questions ask and answer, the trust rules and the journal - the
    owner's need) and 2b (revise, block, unblock, resolve); the 2,000-anchor cap is stated to count
    **every item anchor ever created**; a voided middle revision is not a skipped revision; and the
@@ -355,7 +360,8 @@ Kind: coordinator-decision-v1
 ```
 
 Written on the **native decision issue** named by `issue`, where `issue` must equal the host row id.
-Its closed field set is exactly these twelve fields:
+Its closed field set is exactly these eleven fields (corrected in slice 0: revision 3 said twelve,
+but the table has always listed eleven, and `open_items.DECISION_FIELDS` pins these eleven):
 
 | Field | Rule |
 | --- | --- |
@@ -369,7 +375,7 @@ Its closed field set is exactly these twelve fields:
 | `supersedes` | a prior `coordinator-decision-v1` comment id, or `null` |
 | `decided_by` | the one attribution block `{actor, route, identity, person}` |
 | `at` | server stamp |
-| `sha256` | `content_hash` of the other eleven fields |
+| `sha256` | `content_hash` of the other ten fields |
 
 **No copied body.** Revision 1 carried `statement`, `rationale`, `alternatives`, `consequences` and
 `prior_decisions` and rendered them into the issue. All five are cut: the native decision issue
@@ -443,8 +449,9 @@ extend, are:
   moved by a raw path. `decision:` is deliberately **not** added: no decision label exists any more
   (§3.2). The exact family label `open-item` is **not** value-reserved, for the reason
   `reserved_comments.py:714-721` gives for `proposal`; it is protected on a real anchor by
-  `is_record_anchor`, and slice 0's preflight check (§13) is what stops a project's already-existing
-  `open-item` label from being reclassified as a record anchor.
+  `is_record_anchor`, and slice 0's deploy-time listing, `admin.py open-item-label-check` (§13), is
+  what tells the operator which projects already carry an `open-item` label before a record anchor
+  can be written.
 * **hide**: add `RECORD_ANCHOR_FAMILIES['open-item'] = (OPEN_ITEM_PREFIX, ITEM_RESOLUTION_PREFIX,
   OWNER_ANSWER_PREFIX)` and extend `RECORD_COMMENT_FAMILIES` (`reserved_comments.py:835-846`) with
   `'Kind: open-item-'`, `'Kind: item-resolution-'`, `'Kind: owner-answer-'` and
@@ -453,11 +460,14 @@ extend, are:
   comment from every surface of the shared ten-surface list, with no per-surface change. There is
   **no** `RECORD_ANCHOR_FAMILIES` entry for `coordinator-decision`: the native decision issue is a
   real work item and must stay visible; only its machine comment is hidden.
-* **void**: add the four kinds to `recovery.KEYED_KIND_PREFIXES` (`recovery.py:65-71`) so
-  `admin.py void-record` can repair a malformed or foreign record. `recovery.py:72-77` states the rule
-  that a void is offered only for a kind whose reader honours voids, so the item and decision readers
-  must drop a voided target from the view and report it in `warnings`. That is a stated obligation on
-  the new readers, not a new mechanism.
+* **void**: corrected in slice 0. The four kinds are **named** in
+  `recovery.OPEN_ITEM_KIND_PREFIXES`, with the reserved prefixes, and are **not** added to
+  `recovery.KEYED_KIND_PREFIXES` or `KIND_PREFIXES`: the rule beside `PROPOSAL_KIND_PREFIXES` is that
+  a void is offered only for a kind whose reader honours voids, and in slice 0 no reader exists, so
+  `admin.py void-record` still refuses them as an unsupported target kind, exactly as before. The
+  slice that ships a reader moves its kinds into `KIND_PREFIXES` (the keyed kinds route to
+  `keyed_entries.AnchoredKind`, which these are not, so the routing is that slice's to state); its
+  reader must drop a voided target from the view and report it in `warnings`.
 
 A family label mapping to one prefix tuple is **not** a reason to reject an anchor that carries
 several kinds: `capability` already maps `capability` to four prefixes - `capability-entry-v1`,
@@ -1010,14 +1020,20 @@ reader itself validates, exactly like `.integration-reverts/`. The current kit s
 `validate_coordination_files` (`admin.py:1796-1803`) calls the reader's own
 `review_workflow.validate_revert_journal_entry(record, name)` for `.integration-reverts/`, which
 checks both the record shape and the `<sha256>.json` name/hash binding. Slice 0 adds
-`.owner-answers/` to the same path regex, and the answer/decision slices add the reader's own
-`validate_owner_entry(record, name)` under the same call. A backup therefore cannot carry an entry the
-reader would have to guess about, and the two journals keep two different validators on purpose.
+`.owner-answers/` to the same path regex **and** the validator itself,
+`open_items.validate_owner_entry(record, name)`, under the same call in both
+`validate_coordination_files` and the pre-write loop of `restore-new` (corrected in slice 0: revision
+3 said here that the answer/decision slices add the validator, while §13 put it in slice 0; the
+slice 0 condition puts it in slice 0, with the field set of §11.2.1 fixed). A backup therefore cannot
+carry an entry the reader would have to guess about, and the two journals keep two different
+validators on purpose. Both journals are collected by `backup` only when their directory exists, and
+no kit creates either until writes are on, so a backup taken with writes off names neither.
 
 The design states the consequence the integration-revert journal already documents: a kit built
 before these paths exist refuses a whole restore whose sidecar names them, with
 `ValueError: Invalid coordination backup path`, so the restore after a rollback must use the new
-kit's `admin.py restore-new`.
+kit's `admin.py restore-new`. Concretely, every kit before slice 0 refuses a backup carrying either
+`.open-item-requests/` or `.owner-answers/`; slice 0 itself writes neither.
 
 ### 11.2 The rollback limit, and the planted-record hole
 
@@ -1066,11 +1082,45 @@ The staged release this implies: ship the **tolerant reader** first (slice 1 rea
 writes them, `open_item_writes` absent), deploy it, then turn writing on only once the rollback target
 reads the kinds. That is two integration cycles, and this document does not pretend one is enough.
 
+### 11.2.1 The `.owner-answers` entry, fixed in slice 0
+
+Added in slice 0 (kittrial-5bb.126, condition 1); `open_items.ENTRY_FIELDS` and
+`open_items.validate_owner_entry` are the code. An entry is one of two kinds, each with an exact
+field set; any other key, a missing key or another kind is refused:
+
+| `kind` | Fields |
+| --- | --- |
+| `owner-answer` | `schema_version`, `kind`, `item`, `revision`, `owner`, `option`, `words`, `comment_id`, `payload`, `sha256` |
+| `coordinator-decision` | `schema_version`, `kind`, `issue`, `revision`, `decides`, `title`, `comment_id`, `payload`, `sha256` |
+
+These are exactly the bindings §11.2 lists - the kind, the item or issue, the revision, the owner,
+the option or `decides` list, the words or title, and the comment id - plus the version, the payload
+and the hash. The rules:
+
+* `schema_version` is the integer `1`; `comment_id` is a native id (`recovery.identity`).
+* `payload` is a complete record of the kind: the fourteen `owner-answer-v1` fields of §4.3 or the
+  eleven `coordinator-decision-v1` fields of §4.4, checked against those tables (ids, limits,
+  `options_offered`, `option` among them, `relayed_by` null exactly for `authority: owner`, `at` a
+  server stamp). An `owner-answer` entry is for `authority: owner` or `relayed`; a
+  `coordinator-decision` entry is only for `authority: owner`, the only decision the journal gates.
+* Every attribution block in the payload is exactly `{actor, route, identity, person}` with `route`
+  `host` or `web`, `identity: verified` and a durable `person`: an entry is host-issued, so an
+  endpoint-route block cannot appear in one.
+* Each bound field equals the payload's: `item`, `owner`, `option`, `words` and `revision` (the
+  payload's `question_revision`) for an answer; `issue`, `revision`, `decides` and `title` for a
+  decision.
+* `sha256` equals `content_hash(payload)` and the payload's own `sha256`; the file name is
+  `<sha256>.json`.
+
+The entry does not repeat `authority` or the actor: both are in the hashed payload. The writer and
+the reader that honours an entry against the native comment are the answer and decision slices'.
+
 ### 11.3 Void, supersede and rollback of a record
 
-* **A bad record is repaired with `admin.py void-record`**, not by editing history. Registering the
-  four kinds in `recovery.KEYED_KIND_PREFIXES` (`recovery.py:65-71`) puts them under the existing void
-  machinery, whose record is `Kind: record-void-v1` (`recovery.py:46`). A voided record is dropped
+* **A bad record is repaired with `admin.py void-record`**, not by editing history. Moving the four
+  kinds into `recovery.KIND_PREFIXES` with their readers (they are only named, in
+  `recovery.OPEN_ITEM_KIND_PREFIXES`, by slice 0; corrected in slice 0, §5) puts them under the
+  existing void machinery, whose record is `Kind: record-void-v1` (`recovery.py:46`). A voided record is dropped
   from the view and reported in `warnings`. There is **no** owner void (§17): only the operator
   allowlist may void, exactly as for every other record kind.
 * **A wrong relayed answer: the owner's four remedies.** Because a relayed answer closes the question
@@ -1209,16 +1259,24 @@ from "an item was dropped from a list" to "an item is still `open` and nobody lo
    (`RECORD_ANCHOR_FAMILIES['open-item']`, `RECORD_COMMENT_FAMILIES`), and the two backup journal
    names (`.open-item-requests`, `.owner-answers`) in the backup whitelist, the path regex, the
    receipt validator (`validate_record_receipt` for `.open-item-requests`; the reader's own
-   `validate_owner_entry` for `.owner-answers`) and `restore-new`, plus `.open-item-requests` in
-   `RESERVATION_JOURNALS` (§11.1). It also adds a **read-only preflight check that no project
-   already uses an `open-item` label**: the family label `open-item` is an exact label, not a
-   reserved value (`reserved_comments.py:714-721` says exactly this for `proposal`, which jjbp already
-   carries), so before the first anchor is written each project's rows are checked once with
-   `bd list --label open-item` and `bd list --label open-item:open`, and a project that already
-   carries one is refused (`'project %s already uses an open-item label; choose another family label
-   before reserving it'`) rather than silently reclassifying somebody's issue as a record anchor.
-   **Nothing else**: no reader, no writer, no command, no test of the ledger. This slice is what makes
-   a rollback safe, because the prefixes are reserved before any record can be written.
+   `validate_owner_entry` for `.owner-answers`, with the entry field set of §11.2.1) and
+   `restore-new`, plus `.open-item-requests` in `RESERVATION_JOURNALS` (§11.1), and the four kind
+   names in `recovery.OPEN_ITEM_KIND_PREFIXES`, not yet voidable (§5). It also adds a **read-only
+   deploy-time listing of the projects that already use an `open-item` label**. The family label
+   `open-item` is an exact label, not a reserved value (`reserved_comments.py` says exactly this for
+   `proposal` beside `RESERVED_LABEL_PREFIXES`; jjbp already carries `proposal`), so a later slice
+   could otherwise reclassify somebody's issue as a record anchor. Corrected in slice 0 (condition 7):
+   revision 3 refused a project here; slice 0 instead ships `admin.py open-item-label-check
+   [PROJECT...]`, run on the coordination host at deploy time, which reads each initialized project
+   once (`bd list --all --limit 0 --json`, no lock, no write), prints JSON naming every row that
+   carries `open-item` or any `open-item:` label, and exits 1 when any project uses one or cannot be
+   read. The hard refusal belongs to the later slice that adds `admin.py open-item-writes on`, which
+   must refuse to turn writes on for a project that uses either label.
+   **Nothing else**: no reader, no writer, no record command, no test of the ledger. In behaviour it
+   changes exactly two things - a raw comment with one of the four prefixes is refused, and an
+   `open-item:` label is reserved - plus the read-only listing command and the refusal of a malformed
+   `.owner-answers` entry in a backup that only a later slice can write. This slice is what makes a
+   rollback safe, because the prefixes are reserved before any record can be written.
 1. **Reader slice (tolerant reader), items and questions only.** The parsers and the `items` /
    `questions` reads, plus the `open-item` and `owner-question` `brief` attention kinds, exercised
    against records written by fixtures; `open_item_writes` **off**. The decision reader does **not**
