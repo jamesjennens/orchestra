@@ -65,7 +65,12 @@ without cgo: "only server mode is supported; embedded mode returns an error
 directing the user to server mode". This kit only ever runs bd against its own
 Dolt server (`bd init --server --external`) and uses neither `bd doctor` nor
 `bd federation`. The kit's real use of bd was run with both binaries and gave
-the same answers (kittrial-5bb.161).
+the same answers (kittrial-5bb.161). In one sentence: **the `bd_static` build
+has no embedded Dolt, and the kit only uses server mode.** The one place this
+shows is in the kit's own tests: `tests/test_bd_label_aliases.py` makes its
+tracker with a bare `bd init` (embedded mode), so its three tests are skipped
+when the suite is run with `ORCHESTRA_BD_BIN` set to the static bd; the same
+three tests pass with it against a tracker the kit made in server mode.
 
 `build` accepts either pinned bd archive for `--bd-archive`, says which entry it
 is, and records it in the manifest (`pins`). Name the target's glibc and the
