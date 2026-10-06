@@ -451,7 +451,14 @@ def service_action(root, request, arguments):
             return project_creation.standing_action(root, request, config)
         return project_creation.list_action(root, request, config)
     except Exception as error:  # noqa: BLE001
-        return envelope(2, stderr='%s: %s\n' % (type(error).__name__, error))
+        answer = envelope(2, stderr='%s: %s\n' % (type(error).__name__, error))
+        # As endpoint.main does: a failure to read the server's own configuration file is marked.
+        unreadable = getattr(admin, 'ConfigurationUnreadable', None)
+        if (unreadable is not None and isinstance(error, unreadable)) or (
+                isinstance(error, OSError) and not isinstance(error, TimeoutError)
+                and str(getattr(error, 'filename', '') or '') == str(root / 'deployment.private.json')):
+            answer['fault'] = 'configuration'
+        return answer
 
 
 def main():
