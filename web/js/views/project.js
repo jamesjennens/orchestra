@@ -67,10 +67,10 @@ export async function overview(ctx, { pid }) {
     const partial = page.review_states_complete === false
       ? h('p', { class: 'small muted', role: 'note' }, 'Review state is not known for some tasks shown here (closed tasks, or more tasks than one read covers); they show their status only.')
       : null;
-    const unread = (page.unreadable || []).length + (page.unparseable || 0);
+    const unread = (page.unreadable || []).length;
     const unreadable = unread
       ? h('p', { class: 'small', role: 'note' }, unread === 1 ? 'One task on the server cannot be read' : unread + ' tasks on the server cannot be read',
-          (page.unreadable || []).length ? ' (' + page.unreadable.join(', ') + ')' : '',
+          ' (' + (page.unreadable || []).join(', ') + ')',
           '. Everything else is shown. Ask an operator of the server to repair ', unread === 1 ? 'it.' : 'them.',
           page.review_states_unavailable ? ' Until then review states are not shown here.' : '')
       : null;

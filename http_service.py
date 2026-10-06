@@ -2372,6 +2372,10 @@ MALFORMED_ROW = 'Malformed issue row'
 #: Quotes with what they hold, and the brackets: all that matters for finding where one
 #: element of a JSON text ends. Each match consumes its characters, so a scan is one pass.
 _JSON_PIECE = re.compile(r'"(?:\\.|[^"\\])*"|[\[\]{}:,]', re.DOTALL)
+#: The only id a marker row may carry: the shape of a tracker id (the same bound as the
+#: endpoint's readers use), so that what is named in the list and put into a link is an id
+#: and not whatever text stood there.
+_ROW_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,160}\Z')
 
 
 def unreadable_row(task_id):
@@ -2382,13 +2386,13 @@ def unreadable_row(task_id):
                      {'task': task_id, 'state': 'unreadable'})
 
 
-def _row_head(text):
-    """The id and title a row's text gives at its own top level, without parsing the row.
+def _row_id(text):
+    """The id a row's text gives at its own top level, without parsing the row; None when it gives none.
 
-    Only a string value of the keys ``id`` and ``title`` of the outermost object is read;
-    what is nested below is skipped by counting brackets. One pass, no recursion.
+    Only a string value of the key ``id`` of the outermost object is read; what is nested
+    below is skipped by counting brackets. One pass, no recursion.
     """
-    found, depth, key, expect_value = {}, 0, None, False
+    depth, key, expect_value = 0, None, False
     for match in _JSON_PIECE.finditer(text):
         piece = match.group()
         if piece in '[{':
@@ -2405,88 +2409,115 @@ def _row_head(text):
         elif piece == ',':
             key, expect_value = None, False
         elif piece[0] == '"':
+            try:
+                value = json.loads(piece)
+            except ValueError:
+                value = None
             if expect_value:
-                if key in ('id', 'title'):
-                    try:
-                        found.setdefault(key, json.loads(piece))
-                    except ValueError:
-                        pass
-                    if len(found) == 2:
-                        break
+                if key == 'id':
+                    return value if isinstance(value, str) and _ROW_ID.match(value) else None
                 key, expect_value = None, False
             else:
-                try:
-                    key = json.loads(piece)
-                except ValueError:
-                    key = None
-    return found
+                key = value
+    return None
 
 
 def _marker(text):
-    """The row the service shows in place of one it cannot read."""
-    head = _row_head(text)
-    row = {'id': head.get('id') if isinstance(head.get('id'), str) else None, 'malformed': True, 'unreadable': True,
-           'error': MALFORMED_ROW, 'status': 'unknown'}
-    if isinstance(head.get('title'), str):
-        row['title'] = head['title'][:200]
-    return row
+    """The row the service shows in place of one it does not read: its id, and nothing else of it.
+
+    Not its title: the title is the stored text of a row nobody has read, control
+    characters and all, and the id is what names the row and what the operator needs.
+    A piece without an id of a tracker id's shape at its own top level is not a row at
+    all, and the answer it stands in is refused.
+    """
+    task_id = _row_id(text)
+    if task_id is None:
+        raise ValueError('an element nested too deeply to read is not a tracker row (it has no id)')
+    return {'id': task_id, 'malformed': True, 'unreadable': True, 'error': MALFORMED_ROW, 'status': 'unknown'}
 
 
 def _elements(text):
-    """Where each element of a JSON array text begins and ends; None when the text is not a whole array.
+    """Where each element of a JSON array of objects begins and ends; None when the text is not exactly that.
 
     One pass that counts brackets outside string literals, so a row nested thousands of
-    levels deep costs what its length costs and no recursion.
+    levels deep costs what its length costs and no recursion. Exactly that: ``[``, objects
+    separated by one comma each, ``]``, and white space. Anything else between the rows
+    or around the list (a number, a word, a second comma, text after the end) is what
+    ``json.loads`` refuses or is not a list of rows, and is refused here too.
     """
-    spans, depth, start = [], 0, None
-    for match in _JSON_PIECE.finditer(text):
+    stripped = text.strip()
+    if stripped[:1] != '[':
+        return None
+    offset = len(text) - len(text.lstrip())
+    spans, depth, start, last, closed = [], 0, None, offset + 1, None
+    for match in _JSON_PIECE.finditer(text, offset):
         piece = match.group()
         if piece in '[{':
             depth += 1
             if depth == 2:
+                if piece != '{':
+                    return None
+                gap = text[last:match.start()].strip()
+                if gap != (',' if spans else ''):
+                    return None
                 start = match.start()
         elif piece in ']}':
             depth -= 1
             if depth == 1 and start is not None:
                 spans.append((start, match.end()))
-                start = None
+                start, last = None, match.end()
             if depth == 0:
-                return spans if not text[match.end():].strip() else None
+                closed = match
+                break
             if depth < 0:
                 return None
-    return None
+    if closed is None or closed.group() != ']' or text[last:closed.start()].strip() or text[closed.end():].strip():
+        return None
+    return spans
+
+
+def _row(piece):
+    """One element of the tracker's list: the row, or its marker when it nests deeper than the kit reads."""
+    if record_json.nesting(piece, record_json.ROW_NESTING_MAX) > record_json.ROW_NESTING_MAX:
+        return _marker(piece)
+    try:
+        return json.loads(piece)
+    except RecursionError:
+        # An interpreter that gives up below the kit's own bound: the row is unreadable here.
+        return _marker(piece)
 
 
 def _parse_native(text):
-    """Parse one JSON text of the tracker; a row that cannot be parsed becomes a marker row.
+    """Parse one JSON text of the tracker; a row nested deeper than the kit reads becomes a marker row.
 
-    ``json.loads`` raises ``RecursionError`` for a text nested about a thousand levels deep
-    (one row with deep metadata is enough), which is not the ``ValueError`` a caller
-    expects: the task list, and the page of every such row, answered 500 (kittrial-5bb.169).
-    Then the text is taken apart element by element: each row is parsed on its own, and
-    one that still cannot be parsed is named and marked instead of failing the read.
-    Raises ``ValueError`` for a text that is not JSON at all, as before.
+    The rule is the kit's own, the one the endpoint's readers have (kittrial-5bb.141):
+    a row nested deeper than ``record_json.ROW_NESTING_MAX`` is not read. It is counted,
+    not tried: what ``json.loads`` can parse differs from one interpreter to the next
+    (3.10 gives up at about a thousand levels with ``RecursionError``, which is how one such
+    row made the task list answer 500; 3.13 parses 3,000 levels), and a rule that
+    depended on it marked a row on one host and read it on another (review of
+    kittrial-5bb.169).
+
+    A text whose deepest nesting is within the bound is parsed whole, as before. Otherwise
+    it is taken apart: each row is judged on its own, one that is too deep is named and
+    marked instead of failing the read, and every other row is parsed. Raises
+    ``ValueError`` for a text that is not JSON, and for a deep text that is not a single
+    row or a clean list of rows.
     """
-    try:
-        return json.loads(text)
-    except RecursionError:
-        pass
+    if record_json.nesting(text, record_json.ROW_NESTING_MAX) <= record_json.ROW_NESTING_MAX:
+        try:
+            return json.loads(text)
+        except RecursionError:
+            pass                                      # the interpreter gives up below the bound: row by row
     if text.lstrip()[:1] == '{':
-        # One row printed alone: it must be a whole object to be called a row at all.
+        # One row printed alone: it must be a whole object, and nothing else, to be called a row.
         if _elements('[' + text + ']') is None:
             raise ValueError('not a whole JSON object')
-        return _marker(text)
+        return _row(text)
     spans = _elements(text)
     if spans is None:
-        raise ValueError('not a whole JSON array')
-    rows = []
-    for start, end in spans:
-        piece = text[start:end]
-        try:
-            rows.append(json.loads(piece))
-        except (RecursionError, ValueError):
-            rows.append(_marker(piece))
-    return rows
+        raise ValueError('not a list of tracker rows')
+    return [_row(text[start:end]) for start, end in spans]
 
 
 def _canonical_payload(stdout):
@@ -4662,8 +4693,6 @@ class ApiHandler(BaseHTTPRequestHandler):
         # ones with an id stay in the list, marked; all are named beside it, whatever the
         # page or the filter, so that one such row is seen and not a reason to show nothing.
         unreadable = [t['id'] for t in rows if isinstance(t, dict) and t.get('malformed') and t.get('id')]
-        unparseable = sum(1 for t in rows if isinstance(t, dict) and t.get('malformed') and not t.get('id'))
-        rows = [t for t in rows if not (isinstance(t, dict) and t.get('malformed') and not t.get('id'))]
         def review_states(of):
             # The review states come from another read of the endpoint. While a row cannot be
             # read that read may fail too (an endpoint from before it learned to name such a
@@ -4672,7 +4701,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             try:
                 return self._with_review_states(ctx.params['pid'], of, shared=True)
             except HttpError:
-                if not (unreadable or unparseable):
+                if not unreadable:
                     raise
                 for row in of:
                     if isinstance(row, dict):
@@ -4686,8 +4715,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             rows = [t for t in rows if task_matches(t, filters)]
             result = {'items': rows[state['o']:state['o'] + limit], 'total': len(rows)}
         else:
-            result = {'items': rows[state['o']:state['o'] + limit],
-                      'total': len(rows) if unparseable else snapshot.get('total', len(rows))}
+            result = {'items': rows[state['o']:state['o'] + limit], 'total': snapshot.get('total', len(rows))}
             complete = review_states(result['items'])
         result['items'] = self._task_views(result['items'])
         # False when some rows' review state is unknown (``review_state: null``): the
@@ -4698,9 +4726,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         result['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query,
                                              state['o'] + limit)
                                  if state['o'] + limit < result['total'] else None)
-        if unreadable or unparseable:
+        if unreadable:
             result['unreadable'] = unreadable
-            result['unparseable'] = unparseable
             if unavailable:
                 result['review_states_unavailable'] = True
         return 200, result
