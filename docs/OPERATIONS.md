@@ -526,6 +526,12 @@ Two changes in behaviour come with this (kittrial-5bb.136, kittrial-5bb.142):
   can still be lost. Upgrade every kit that writes the file before relying on this, or
   make such changes from one kit at a time, and check `operators list` / `verifiers
   list` afterwards.
+- **An older writer can fail outright.** A writer from a kit before kittrial-5bb.136
+  (no lock) that is paused between writing its temporary copy and renaming it can have
+  that copy removed by a newer writer's cleanup (below). Its rename then fails with a
+  `FileNotFoundError` traceback and exit status 1. `deployment.private.json` stays valid
+  and keeps the newer change; the older command's change is not made, so run it again
+  (from the newer kit).
 
 **Temporary copies.** Every change writes the new file to a temporary copy beside it
 (`.deployment.private.json.XXXXXXXX`, created `0600`) and renames that copy over the
@@ -1383,7 +1389,24 @@ Or re-run the whole restore with `--restore-operators` when the entire allowlist
 python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime restore-new example examplerestore --restore-operators
 ```
 
-`--restore-operators` is additive only (it never removes an entry) and prints exactly which entries it re-granted. `--restore-operators` and `--restore-verifiers` are the last step of `restore-new`, after the coordination files and the operation-journal snapshot are restored (kittrial-5bb.142). They are the only step that takes the deployment lock, so when another change holds it past its 10-second wait the restore still completes and exits 0. It prints, on stderr, `WARNING: the restore is complete, but operators from the backup were NOT re-granted (--restore-operators): ...`, with one exact `admin.py --root ROOT operators add ACTOR` (or `verifiers add`) command per entry. Run those commands; do not repeat the restore, which is refused because the destination now exists. The operators and the verifiers are attempted separately, so a refusal of one does not skip the other. Before kittrial-5bb.142 such a refusal ended `restore-new` with exit status 1 and a half-restored destination: the operation journal and the other list were not restored either. It is an explicit authorization decision: after a revocation, do not pass it "to make the restore look complete" — a revoked operator stays revoked until an operator re-adds them by name. The native backup preserves the original comment and the void comment; the sidecar preserves the authority reads would need to apply it, so a restore still preserves both the original and its disposition, with the authority decision left where it belongs: with the deployment operator.
+`--restore-operators` is additive only (it never removes an entry) and prints exactly which entries it re-granted. `--restore-operators` and `--restore-verifiers` are the last step of `restore-new`, after the coordination files and the operation-journal snapshot are restored (kittrial-5bb.142). They are the only step that takes the deployment lock, and both lists are re-granted under one wait for it (kittrial-5bb.144). When another change holds the lock past its 10-second wait, the restore still completes, but nothing is re-granted:
+
+- **Exit status 3** means the restore is complete, but the authority asked for was not re-granted (kittrial-5bb.144; kittrial-5bb.142 exited 0). Status 0 means restored, including every re-grant asked for; 1 means failed. A script running `restore-new ... --restore-operators && next-step` therefore stops at status 3. `restore-new --help` states the codes.
+- **The warning is the last thing the restore prints**, on stderr, after `Restored only into the newly created project` and anything else on stdout. It names both lists (`WARNING: the restore is complete, but deployment authority the backup records was NOT re-granted: operators (--restore-operators): ...; verifiers (--restore-verifiers): ...`). It then gives one exact, shell-quoted `admin.py --root ROOT operators add ACTOR` (or `verifiers add`) command per entry and the `backup-authority` command below, and ends with `restore-new exits 3: ...`.
+
+Run the printed commands; do not repeat the restore, which is refused because the destination now exists. Before kittrial-5bb.142 such a refusal ended `restore-new` with exit status 1 and a half-restored destination: the operation journal and the other list were not restored either.
+
+A failure in the operation-journal step (after the destination exists) still ends `restore-new` with the failure notice and status 1, and re-grants nothing, because the authority step comes after it. A backup with no coordination sidecar records no operators or verifiers: with either flag, `restore-new` says so and re-grants nothing.
+
+**What a backup records, afterwards.** `operators list`, `verifiers list` and `backup-status` show only this installation. To compare a backup with it, at any time and without changing anything, run:
+
+```
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime backup-authority PROJECT
+```
+
+It prints JSON naming the sidecar it read: the canonical one, else the durable last-complete copy, the same one `restore-new` uses; `null` when there is none. For `operators` and for `verifiers` it gives `recorded` (what the backup records), `listed_here` (what this installation lists now) and `not_listed_here` (what `--restore-operators` / `--restore-verifiers`, or `operators add` / `verifiers add`, would re-grant). It takes no lock and writes nothing. PROJECT is the backup's project name, the SOURCE of `restore-new`.
+
+Passing `--restore-operators` is an explicit authorization decision: after a revocation, do not pass it "to make the restore look complete" — a revoked operator stays revoked until an operator re-adds them by name. The native backup preserves the original comment and the void comment; the sidecar preserves the authority reads would need to apply it, so a restore still preserves both the original and its disposition, with the authority decision left where it belongs: with the deployment operator.
 
 ### Optional scheduled backup
 

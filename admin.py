@@ -3664,6 +3664,32 @@ def coordination_verifiers(root,source):
     if data is None:return []
     return validate_coordination_operators(data.get('verifiers'),'verifiers')
 
+def merge_authority(root,operators=(),verifiers=()):
+    """Add missing operators and verifiers under ONE wait for the deployment lock.
+
+    Returns ``(added_operators, added_verifiers)``. Additive only; ``restore_authority``
+    calls it with exactly the lists the explicit restore flags asked for, so a busy lock
+    refuses both at once with nothing changed (kittrial-5bb.144).
+    """
+    marker=root/'deployment.private.json'
+    if not marker.is_file():raise ValueError('Deployment is not installed; run install first')
+    from recovery import identity
+    if isinstance(operators,str):operators=[operators]
+    if isinstance(verifiers,str):verifiers=[verifiers]
+    wanted_operators=[identity(item,'Invalid operator identity') for item in operators]
+    wanted_verifiers=[identity(item,'Invalid verifier identity') for item in verifiers]
+    with deployment_config_lock(root):
+        cfg=config(root)
+        current_operators=stored_operators(cfg)
+        current_verifiers=stored_verifiers(cfg)
+        added_operators=[item for item in wanted_operators if item not in current_operators]
+        added_verifiers=[item for item in wanted_verifiers if item not in current_verifiers]
+        if not added_operators and not added_verifiers:return [],[]
+        if added_operators:cfg['operators']=current_operators+added_operators
+        if added_verifiers:cfg['verifiers']=current_verifiers+added_verifiers
+        atomic_private_write(marker,json.dumps(cfg))
+    return added_operators,added_verifiers
+
 def merge_verifiers(root,actors):
     """Add missing verifiers to the deployment list; return the added names.
 
@@ -3812,18 +3838,25 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
             from feedback import validate_quarantine_record
             _atomic_write_bytes(target,validate_quarantine_record(name,record))
         else:atomic(target,record)
-    if authority:restore_authority(root,source,restore_operators,restore_verifiers)
+    if authority:
+        warning=restore_authority(root,source,restore_operators,restore_verifiers)
+        if warning:print(warning,file=sys.stderr)
     return True
+
+#: ``restore-new`` exit status when the restore is complete but ``--restore-operators`` or
+#: ``--restore-verifiers`` could not re-grant what the backup records (kittrial-5bb.144).
+RESTORE_AUTHORITY_NOT_REGRANTED=3
 
 def restore_authority(root,source,restore_operators=False,restore_verifiers=False):
     """Report, and with the explicit flags re-grant, the deployment authority a backup records.
 
     ``restore-new`` runs this LAST, after the coordination files and the operation journal
-    are in place (kittrial-5bb.142): a merge refused because another change still holds the
-    deployment lock then leaves a completed restore with those entries not re-granted and
-    the exact commands to re-grant them, never a destination that is half-restored and that
-    a second ``restore-new`` refuses as existing. Each list is attempted on its own, so a
-    refused operator merge does not skip the verifiers.
+    are in place (kittrial-5bb.142). Both requested lists are merged under ONE wait for the
+    deployment lock (kittrial-5bb.144), so a busy lock costs one wait, not one per list.
+    A merge refused because another change still holds the lock leaves a completed restore:
+    the warning naming what was not re-granted, with the exact commands to re-grant it, is
+    RETURNED (``None`` when there is nothing to say) so the caller prints it last and exits
+    ``RESTORE_AUTHORITY_NOT_REGRANTED``.
     """
     # The native and coordination records (original comment plus its void
     # disposition) are restored by the writes above. Operator AUTHORITY is not:
@@ -3838,14 +3871,6 @@ def restore_authority(root,source,restore_operators=False,restore_verifiers=Fals
               'so they stay revoked here and void records they authored stay inert. Re-grant one deliberately with '
               '`admin.py --root ROOT operators add ACTOR`, or re-run this restore with --restore-operators to '
               're-establish the whole recorded allowlist.')
-    elif missing:
-        try:
-            added=merge_operators(root,missing)
-        except DeploymentLockBusy:
-            print(authority_not_regranted(root,'operators',missing),file=sys.stderr)
-        else:
-            if added:
-                print('Re-granted operator allowlist entries from the backup (--restore-operators): ' + ', '.join(added))
     # The verifiers list is the second deployment-wide authority (.60 section 5.2) and
     # follows the same rule: never re-granted by a restore on its own.
     unlisted=missing_verifiers(root,source)
@@ -3855,26 +3880,58 @@ def restore_authority(root,source,restore_operators=False,restore_verifiers=Fals
               '`reported`, not `verified`, and drift only their passes had cleared reappears. Re-grant one '
               'deliberately with `admin.py --root ROOT verifiers add ACTOR`, or re-run this restore with '
               '--restore-verifiers to re-establish the whole recorded list.')
-    elif unlisted:
-        try:
-            added=merge_verifiers(root,unlisted)
-        except DeploymentLockBusy:
-            print(authority_not_regranted(root,'verifiers',unlisted),file=sys.stderr)
-        else:
-            if added:
-                print('Re-granted capability verifiers from the backup (--restore-verifiers): ' + ', '.join(added))
+    wanted_operators=missing if restore_operators else []
+    wanted_verifiers=unlisted if restore_verifiers else []
+    if not wanted_operators and not wanted_verifiers:return None
+    try:
+        added_operators,added_verifiers=merge_authority(root,wanted_operators,wanted_verifiers)
+    except DeploymentLockBusy:
+        return authority_not_regranted(root,source,wanted_operators,wanted_verifiers)
+    if added_operators:
+        print('Re-granted operator allowlist entries from the backup (--restore-operators): ' + ', '.join(added_operators))
+    if added_verifiers:
+        print('Re-granted capability verifiers from the backup (--restore-verifiers): ' + ', '.join(added_verifiers))
+    return None
 
-def authority_not_regranted(root,kind,actors):
-    """The notice for a restore whose ``--restore-operators``/``--restore-verifiers`` merge was refused."""
+def authority_not_regranted(root,source,operators,verifiers):
+    """The warning for a restore whose authority merge was refused by a busy lock.
+
+    One block for both lists, ending with the exit status, so it can be printed as the last
+    thing the restore says. Every command is shell-quoted as printed.
+    """
     import shlex
-    flag='--restore-operators' if kind=='operators' else '--restore-verifiers'
-    commands=['admin.py --root %s %s add %s'%(shlex.quote(str(root)),kind,shlex.quote(actor)) for actor in actors]
+    named=[]
+    if operators:named.append('operators (--restore-operators): '+', '.join(operators))
+    if verifiers:named.append('verifiers (--restore-verifiers): '+', '.join(verifiers))
+    commands=['admin.py --root %s %s add %s'%(shlex.quote(str(root)),kind,shlex.quote(actor))
+              for kind,actors in (('operators',operators),('verifiers',verifiers)) for actor in actors]
     # Not the refusal's own text: it says to run the command again, and a second
     # restore-new into this destination is refused because the destination now exists.
-    return ('WARNING: the restore is complete, but %s from the backup were NOT re-granted (%s): %s. Another '
-            'change to deployment.private.json held its lock (%s) for more than %d s. Do not repeat the restore; '
-            're-grant them with:\n  %s'%(kind,flag,', '.join(actors),REVIEW_WRITES_LOCK,
-                                           DEPLOYMENT_LOCK_WAIT_SECONDS,'\n  '.join(commands)))
+    return ('WARNING: the restore is complete, but deployment authority the backup records was NOT re-granted: '
+            '%s. Another change to deployment.private.json held its lock (%s) for more than %d s. Do not repeat '
+            'the restore; re-grant them with:\n  %s\nCompare what the backup records with this installation:\n'
+            '  admin.py --root %s backup-authority %s\nrestore-new exits %d: the restore is complete, but the authority '
+            'above was NOT re-granted.'
+            %('; '.join(named),REVIEW_WRITES_LOCK,DEPLOYMENT_LOCK_WAIT_SECONDS,'\n  '.join(commands),
+              shlex.quote(str(root)),shlex.quote(source),RESTORE_AUTHORITY_NOT_REGRANTED))
+
+def backup_authority(root,source):
+    """Read only: the deployment authority a project backup records against this installation.
+
+    The same complete sidecar ``restore-new`` would use (the canonical one, else the durable
+    last-complete copy). For each list: what the backup records, what this installation
+    lists now, and the recorded entries it does not list, which ``--restore-operators`` /
+    ``--restore-verifiers`` (or ``operators add`` / ``verifiers add``) would re-grant.
+    """
+    validate_name(source)
+    path,_=coordination_sidecar_source(root,source)
+    def compare(recorded,listed):
+        return {'recorded':recorded,'listed_here':sorted(listed),
+                'not_listed_here':[item for item in recorded if item not in listed]}
+    return {'project':source,
+            'sidecar':None if path is None else str(path.relative_to(root)),
+            'operators':compare(coordination_operators(root,source),operators(root)),
+            'verifiers':compare(coordination_verifiers(root,source),verifiers(root))}
 
 def record_store_path(state):
     """The HTTP record store beside the service state document (``http_auth.Store``)."""
@@ -4217,6 +4274,9 @@ def main():
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--reason',required=True)
     a.add_argument('--force',action='store_true',
                    help='retire it although it looks like a working tracker (or could not be checked), holds the merge slot or has pending reservations')
+    a=sub.add_parser('backup-authority',help='read only: the operators and verifiers a project backup records, '
+                                             'against what this installation lists now')
+    a.add_argument('project')
     a=sub.add_parser('backup-status')
     a.add_argument('--require-complete',action='store_true',dest='require_complete',
                    help='exit non-zero unless the last run covered every project (--all) and every initialized '
@@ -4239,6 +4299,9 @@ def main():
     a.add_argument('--restore-verifiers',action='store_true',dest='restore_verifiers',
                    help='explicitly re-grant the capability verifiers the backup records that this host no '
                         'longer lists; off by default for the same reason as --restore-operators')
+    a.epilog=('Exit status: 0 restored; 3 restored, but --restore-operators/--restore-verifiers could not '
+              're-grant (another change held the deployment lock): the last lines say what, with the commands '
+              'to re-grant it; 1 failed. Compare a backup with this installation: backup-authority PROJECT.')
     a=sub.add_parser('reconcile-request');a.add_argument('project');a.add_argument('--request-id',required=True)
     a.add_argument('--actor',required=True);a.add_argument('--reason',required=True)
     a.add_argument('--disposition',choices=['failed','released','complete'],default='released')
@@ -4748,6 +4811,8 @@ def main():
               'name stays reserved. If this project is registered in the web interface, archive it there: '
               'its task pages now answer "Unknown/uninitialized project".'
               %(args.project,result['destination'],args.project),file=sys.stderr)
+    elif args.command=='backup-authority':
+        print(json.dumps(backup_authority(root,args.project)))
     elif args.command=='backup-status':
         record=read_backup_status(root)
         # Retired projects are not part of the gate; they are listed so an operator can
@@ -4847,7 +4912,7 @@ def main():
                     step='native restore'
                     print(native_restore(root,args.project,args.destination))
                     step='re-point and coordination'
-                    finish_restore(root,args,snapshot)
+                    warning=finish_restore(root,args,snapshot)
             except BaseException as error:
                 # add-project's own refusals (a populated or retired destination) are raised
                 # before it creates anything: they need no notice about a leftover project.
@@ -4864,6 +4929,13 @@ def main():
         # an unreadable one must not fail a restore that has already succeeded.
         noted=restore_degraded_note(root,args.project,args.destination)
         if noted:print(noted)
+        if warning:
+            # The last thing the restore says, after everything on stdout (kittrial-5bb.144),
+            # and a distinct exit status, so `restore-new ... && next-step` does not proceed.
+            sys.stdout.flush()
+            print(warning,file=sys.stderr)
+            sys.stderr.flush()
+            raise SystemExit(RESTORE_AUTHORITY_NOT_REGRANTED)
 
 def finish_restore(root,args,snapshot):
     """What ``restore-new`` does after the native restore: re-point, sidecar, journals."""
@@ -4884,9 +4956,15 @@ def finish_restore(root,args,snapshot):
                              project_dir(root,args.destination)/JOURNAL_STORE_NAME)
     if restored is None:
         print('Backup has no operation-journal snapshot; the restored project starts with an empty identity journal.')
-    if sidecar:
-        restore_authority(root,args.project,restore_operators=args.restore_operators,
-                          restore_verifiers=args.restore_verifiers)
+    if not sidecar:
+        # A legacy backup records no deployment authority: there is nothing to re-grant, and
+        # the authority step does not run (it would read no sidecar).
+        if args.restore_operators or args.restore_verifiers:
+            print('This backup has no coordination sidecar, so it records no operators or verifiers: '
+                  '--restore-operators/--restore-verifiers re-granted nothing.')
+        return None
+    return restore_authority(root,args.project,restore_operators=args.restore_operators,
+                             restore_verifiers=args.restore_verifiers)
 
 def kit_refusal(error):
     """Whether a ``ValueError`` is one of the kit's own refusals: exactly ``ValueError``
