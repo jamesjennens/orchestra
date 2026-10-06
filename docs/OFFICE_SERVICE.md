@@ -241,6 +241,30 @@ answers, and a self-signed certificate must not make it read as down. Without
 shape only. The verification record's `listener` says which shape is in use
 (`loopback`, `https` or `plain-http-on-network`), the host and the public URL.
 
+**Connections that say nothing.** On an open port anybody who can reach it can
+open a connection and send nothing: a port scanner, a browser's spare
+connection, a laptop that left half way through a TLS handshake. The web
+service bounds what such a connection costs, in all three shapes:
+
+- Each connection has its own thread, and the TLS handshake is done there. A
+  connection that has not finished its handshake delays nobody else.
+- The service waits **30 seconds** for a client each time it needs something
+  from it: to finish the handshake, to send a whole request (the line and
+  headers; then the body), to take a response; an idle keep-alive connection
+  is kept as long. Then the connection is closed, whatever it had sent so far
+  (a client that sends a byte now and then is closed too). The time the
+  service itself takes over a request does not count.
+- At most **200** connections are served at once. One more is closed at once,
+  and the log says so the first time (`connections: the limit of 200 open
+  connections was reached ...`). So 200 silent connections stop the web
+  interface for up to 30 seconds, and `health` reads `web=down` meanwhile; a
+  client that keeps opening them keeps it stopped. The service has no
+  per-address limit: where that matters, put it behind the approved proxy or
+  a firewall rule and use the loopback shape.
+- A handshake that fails is one line in the http log (`tls: 'ADDRESS': 'TLS
+  handshake not completed: ...'`). A browser that has not accepted a
+  self-signed certificate shows there.
+
 ## External scheduler commands
 
 The scheduler should set a private working directory, pass the log and runtime

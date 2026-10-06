@@ -2422,12 +2422,75 @@ class ApiHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # never log query strings or headers
         pass
 
+    def setup(self):
+        """The TLS handshake, in this connection's own thread and under the client deadline.
+
+        The listening socket is plain (kittrial-5bb.163 review): wrapped itself, it did the
+        handshake inside ``accept``, in the one accepting thread and without a limit, so a
+        single client that connected and said nothing stopped every other client.
+        """
+        server = self.server
+        context = getattr(server, 'tls_context', None)
+        if context is not None:
+            self.request = context.wrap_socket(self.request, server_side=True, do_handshake_on_connect=False)
+        self._guarded = hasattr(server, 'watch')
+        if self._guarded:
+            # The second half of the bound (see GuardedServer): no single wait on the client is
+            # longer than this, on every platform. A little longer than the deadline, so that
+            # it is the reaper that ends a wait wherever it can.
+            self.request.settimeout(server.client_seconds + server.TIMEOUT_MARGIN)
+        if context is not None:
+            if self._guarded:
+                server.watch(self.request, server.client_seconds)
+            try:
+                self.request.do_handshake()
+            except Exception as failed:
+                self.request.close()
+                raise ConnectionAbortedError('TLS handshake not completed: %s'
+                                             % (type(failed).__name__ if not str(failed) else str(failed)[:120])) from None
+            finally:
+                if self._guarded:
+                    server.unwatch(self.request)
+        super().setup()
+        if self._guarded:
+            self.wfile = _WatchedWriter(self.wfile, server, self.connection)
+
+    def finish(self):
+        try:
+            super().finish()
+        finally:
+            if getattr(self.server, 'tls_context', None) is not None:
+                # The server closes the socket it accepted; the TLS socket made from it is this one.
+                try:
+                    self.request.close()
+                except OSError:
+                    pass
+
+    def handle_one_request(self):
+        """One request, with a bound on how long the client may take to send it.
+
+        The watch runs from here (waiting for the request line: a connection that has just
+        been made, or an idle keep-alive one) until the request has been read, and not while
+        the service works on it. ``_dispatch`` stops it; a body is read under its own.
+        """
+        if not getattr(self, '_guarded', False):
+            return super().handle_one_request()
+        self.server.watch(self.connection, self.server.client_seconds)
+        try:
+            return super().handle_one_request()
+        except ConnectionError:
+            self.close_connection = True          # the client went away, or was cut off for being too slow
+        finally:
+            self.server.unwatch(self.connection)
+
     #: Said for a write when the service's own lock could not be had in time: it may have been
     #: carried out already, so "not completed" would not always be true.
     BUSY_UNCERTAIN = ('The server was busy and cannot say whether this request was carried out. Look before you '
                       'repeat it, or send it again with the same idempotency key.')
 
     def _dispatch(self, method):
+        if getattr(self, '_guarded', False):
+            self.server.unwatch(self.connection)        # the request line and headers are here: the service's time now
         request_id = self._request_id()
         self._current_request_id = request_id
         # Per-request agent read cache. An HTTP/1.1 keep-alive connection reuses this
@@ -2482,6 +2545,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             else:
                 error = uncertain(self.BUSY_UNCERTAIN)
             self._send_json(error.status, error.body(request_id))
+        except ConnectionError:
+            raise                                   # the client is gone: nothing to answer, and not an internal error
         except Exception:
             # No traceback, no internal detail: a clean, generic JSON error.
             self._send_json(500, {'error': {'code': 'internal_error',
@@ -2603,7 +2668,21 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise HttpError(413, 'payload_too_large', 'Request body exceeds the configured limit')
         if length == 0:
             return b''
-        return self.rfile.read(length)
+        if not getattr(self, '_guarded', False):
+            return self.rfile.read(length)
+        self.server.watch(self.connection, self.server.client_seconds)
+        try:
+            body = self.rfile.read(length)
+        except OSError:
+            # The socket's own timeout. Not the TimeoutError of a lock wait, which _dispatch
+            # answers as "busy": this is the client, and there is nobody to answer.
+            body = b''
+        finally:
+            self.server.unwatch(self.connection)
+        if len(body) < length:
+            # Cut off for being too slow, or gone: there is nobody to answer.
+            raise ConnectionAbortedError('the request body did not arrive')
+        return body
 
     def _authenticate(self):
         header = self.headers.get('Authorization')
@@ -5138,24 +5217,172 @@ def build_handler(service, backend, *, trusted_proxies=(), max_body=MAX_BODY_BYT
     })
 
 
+#: How long a client may take over each thing the service waits for from it: completing the
+#: TLS handshake, sending a request (its line and headers; then its body), and taking a
+#: response. Also how long an idle keep-alive connection is kept. Then the connection is closed.
+CLIENT_SECONDS = 30
+#: Connections served at once, one thread each. A connection beyond it is closed at once.
+#: The bound is what keeps silent connections from using up the process's file descriptors
+#: (1024 by default on Linux), which the endpoint's own processes and files need too.
+CONNECTION_LIMIT = 200
+
+
+class _WatchedWriter:
+    """The handler's ``wfile``: every write is under the client deadline (a client that stops reading)."""
+
+    def __init__(self, inner, server, connection):
+        self._inner, self._server, self._connection = inner, server, connection
+
+    def write(self, data):
+        self._server.watch(self._connection, self._server.client_seconds)
+        try:
+            return self._inner.write(data)
+        except TimeoutError:
+            # The socket's own timeout: the client, not a lock wait (which is answered "busy").
+            raise ConnectionAbortedError('the client did not take the response') from None
+        finally:
+            self._server.unwatch(self._connection)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+class GuardedServer(ThreadingHTTPServer):
+    """One thread per connection, with what an open port needs (kittrial-5bb.163 review).
+
+    * The listening socket is never a TLS socket: ``accept`` returns at once and the
+      handshake is the connection's own business (``ApiHandler.setup``).
+    * ``watch``/``unwatch``: a connection the service is waiting on has a deadline. One
+      reaper thread shuts down a connection whose deadline has passed, which ends the wait
+      in its thread whatever it was (handshake, request line, headers, body, a write). A
+      shutdown, because a socket timeout bounds each read and not the whole wait: a client
+      that sends a byte now and then would stay. The socket has a timeout as well, a
+      little longer (``ApiHandler.setup``): on Windows a shutdown from another thread
+      reaches the client at once but does not end a read that is already waiting, and the
+      timeout does, at most one more such time later. On Linux the shutdown ends it.
+    * At most ``connection_limit`` connections at once; one more is closed at once.
+    """
+    daemon_threads = True
+    request_queue_size = 128
+    tls_context = None
+    client_seconds = CLIENT_SECONDS
+    connection_limit = CONNECTION_LIMIT
+    REAP_EVERY = 0.25
+    TIMEOUT_MARGIN = 2.0
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._guard = threading.Lock()
+        self._deadlines = {}
+        self._open = 0
+        self.cut_off = 0                 # connections closed for being too slow
+        self.turned_away = 0             # connections closed for being over the limit
+        self._stopping = threading.Event()
+        self._reaper = threading.Thread(target=self._reap, name='connection-reaper', daemon=True)
+        self._reaper.start()
+
+    def watch(self, connection, seconds):
+        with self._guard:
+            self._deadlines[connection] = time.monotonic() + seconds
+
+    def unwatch(self, connection):
+        with self._guard:
+            self._deadlines.pop(connection, None)
+
+    def _reap(self):
+        import socket
+        while not self._stopping.wait(self.REAP_EVERY):
+            now = time.monotonic()
+            with self._guard:
+                late = [connection for connection, deadline in self._deadlines.items() if deadline <= now]
+                for connection in late:
+                    del self._deadlines[connection]
+                self.cut_off += len(late)
+            for connection in late:
+                try:
+                    # The plain shutdown also for a TLS socket: it ends the other thread's wait
+                    # without touching the TLS state that thread is using.
+                    socket.socket.shutdown(connection, socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+    def open_connections(self):
+        with self._guard:
+            return self._open
+
+    def process_request(self, request, client_address):
+        with self._guard:
+            over = self._open >= self.connection_limit
+            if over:
+                self.turned_away += 1
+                first = self.turned_away == 1
+            else:
+                self._open += 1
+        if over:
+            if first:
+                print('connections: the limit of %d open connections was reached; further ones are closed at once '
+                      '(said once)' % self.connection_limit, file=sys.stderr, flush=True)
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            with self._guard:
+                self._open -= 1
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with self._guard:
+                self._open -= 1
+
+    def handle_error(self, request, client_address):
+        """A client that went away or was cut off is not an error of the service: no traceback."""
+        error = sys.exc_info()[1]
+        if isinstance(error, (ConnectionError, ssl.SSLError, TimeoutError)):
+            if str(error).startswith('TLS handshake not completed'):
+                # One line for the operator (a certificate the client does not accept shows here).
+                print('tls: %s: %s' % (ascii(str(client_address[0]))[:60], ascii(str(error))[:200]),
+                      file=sys.stderr, flush=True)
+            return
+        super().handle_error(request, client_address)
+
+    def server_close(self):
+        self._stopping.set()
+        super().server_close()
+
+
 def create_server(service, backend, *, host='127.0.0.1', port=0, trusted_proxies=(),
                   max_body=MAX_BODY_BYTES, certfile=None, keyfile=None,
-                  allow_plaintext_non_loopback=False, web_root=DEFAULT_WEB_ROOT):
+                  allow_plaintext_non_loopback=False, web_root=DEFAULT_WEB_ROOT,
+                  client_seconds=None, connection_limit=None):
     """Bind the service. Refuse a non-loopback plaintext listener unless explicitly allowed."""
     loopback = host in LOOPBACK
     if not loopback and certfile is None and not allow_plaintext_non_loopback:
         raise ValueError('Refusing plaintext on a non-loopback interface; supply TLS or '
                          'explicitly allow disposable plaintext')
-    httpd = ThreadingHTTPServer((host, port), build_handler(service, backend,
-                                                            trusted_proxies=trusted_proxies,
-                                                            max_body=max_body,
-                                                            web_root=web_root))
-    httpd.daemon_threads = True
+    context = None
     if certfile:
+        # Before anything is bound: a certificate or key that cannot be used stops the start.
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(certfile, keyfile)
-        httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+    if ':' in host:
+        server_class = type('GuardedServer6', (GuardedServer,), {'address_family': __import__('socket').AF_INET6})
+    else:
+        server_class = GuardedServer
+    httpd = server_class((host, port), build_handler(service, backend,
+                                                     trusted_proxies=trusted_proxies,
+                                                     max_body=max_body,
+                                                     web_root=web_root))
+    # The TLS context is the connection's (ApiHandler.setup): the listening socket stays plain.
+    httpd.tls_context = context
+    if client_seconds is not None:
+        httpd.client_seconds = client_seconds
+    if connection_limit is not None:
+        httpd.connection_limit = connection_limit
     return httpd
 
 
