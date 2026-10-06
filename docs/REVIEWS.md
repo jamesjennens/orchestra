@@ -405,7 +405,7 @@ How a reviewer changes their mind:
 
 * **From recommending to asking for changes: `request-changes`.** Any reviewer may, not only an owner. The recommendation stops counting at once, for every reader: the brief, the queue row, My work and the agents' actions. After the contributor has responded, the contribution awaits review again and the reviewer may recommend it again; the earlier one does not come back.
 * **A revised contribution is a new contribution.** Every recommendation of the earlier revision has lapsed, and the same reviewer may recommend the new one.
-* **From a mistaken recommendation to none: there is no such operation.** A recommendation cannot be withdrawn or voided; it lapses at the next decision or revision. A reviewer who recommended by mistake and does not want changes either tells the owner, who decides.
+* **From a mistaken recommendation to none: there is no such operation.** A recommendation cannot be withdrawn or voided; it lapses at the next decision or revision. A reviewer who recommended by mistake and does not want changes either tells the owner, who decides: a recommendation is advice to the owner, never a decision. **For the owner:** treat a recommendation that is followed by a comment from the same reviewer taking it back as taken back, although every reader still counts it; `request-changes` is the only record that stops a recommendation counting.
 
 Records written before this rule are read as before: where one actor has two standing ones, the newest replaces the earlier in every reading.
 
