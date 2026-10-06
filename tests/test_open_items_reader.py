@@ -409,7 +409,9 @@ class NativeReadTests(unittest.TestCase):
                     return '[' + '[' * 3000 + ']' * 3000 + ']'
                 return json.dumps([r for r in rows if r['id'] in ids])
             if argv[0] == 'export':
-                return '\n'.join('{"id": "%s", "x": %s}' % (r['id'], '[' * 3000 + ']' * 3000) if r['id'] in deep
+                # A row that is broken JSON on every interpreter (deep nesting is not: the
+                # bare parser of the export accepts more depth on some Python versions).
+                return '\n'.join('{"id": "%s", "x": [1, ' % r['id'] if r['id'] in deep
                                  else json.dumps(r) for r in rows)
             raise AssertionError(argv)
         return run
