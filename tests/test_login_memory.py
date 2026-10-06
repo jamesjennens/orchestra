@@ -82,14 +82,34 @@ class WorkerTests(unittest.TestCase):
             self.assertIsNot(worker._thread, first)
             self.assertEqual(worker._thread.name, 'password-worker')
 
+    def test_a_worker_whose_thread_has_died_is_replaced(self):
+        """The other half of "gone" (a mutant of the review): the same process, the thread no longer alive."""
+        worker = http_auth._PasswordWorker()
+        worker.scrypt(b'p', salt=b's' * 16, n=2 ** 10, r=8, p=1, dklen=32)
+        dead = threading.Thread(target=lambda: None, name='password-worker')
+        dead.start()
+        dead.join()
+        worker._thread = dead                                         # nobody reads the old queue any more
+        import queue
+        worker._jobs = queue.Queue()
+        results = []
+        caller = threading.Thread(target=lambda: results.append(
+            worker.scrypt(b'p', salt=b's' * 16, n=2 ** 10, r=8, p=1, dklen=32)), daemon=True)
+        caller.start()
+        caller.join(10)
+        self.assertFalse(caller.is_alive(), 'the computation was handed to a worker that is gone')
+        self.assertEqual(len(results[0]), 32)
+        self.assertIsNot(worker._thread, dead)
+        self.assertTrue(worker._thread.is_alive())
+
     def test_the_module_has_no_other_way_to_scrypt(self):
         source = (KIT / 'http_auth.py').read_text(encoding='utf-8')
         self.assertEqual(source.count('hashlib.scrypt('), 1)
         self.assertEqual(source.count('_PASSWORD_WORKER.scrypt('), 2)
 
 
-class BoundTests(test_http_agents.AgentHarness):
-    def held(self, limit):
+class Held(test_http_agents.AgentHarness):
+    def held(self, limit, source='local', count=None):
         """Log-ins that stay in flight: the worker does not answer until `release` is set."""
         release, entered = threading.Event(), []
         real = http_auth._PASSWORD_WORKER.scrypt
@@ -107,18 +127,21 @@ class BoundTests(test_http_agents.AgentHarness):
 
         def attempt(index):
             try:
-                self.service.login('nobody-%d' % index, 'wrong password %d' % index)
+                self.service.login('nobody-%d' % index, 'wrong password %d' % index, source=source)
             except HttpError as error:
                 answers.append(error.status)
-        threads = [threading.Thread(target=attempt, args=(index,)) for index in range(limit)]
+        count = limit if count is None else count
+        threads = [threading.Thread(target=attempt, args=(index,)) for index in range(count)]
         for thread in threads:
             thread.start()
         until = time.monotonic() + 10
-        while time.monotonic() < until and (self.service._logins < limit or not entered):
+        while time.monotonic() < until and (self.service._logins < count or not entered):
             time.sleep(0.01)
-        self.assertEqual(self.service._logins, limit)
+        self.assertEqual(self.service._logins, count)
         return release, entered, threads, answers
 
+
+class BoundTests(Held):
     def test_one_more_log_in_than_the_bound_is_answered_busy_before_anything_is_checked(self):
         release, entered, threads, answers = self.held(3)
         self.assertEqual(len(entered), 1)                             # one is being checked; two wait their turn
@@ -182,6 +205,138 @@ class BoundTests(test_http_agents.AgentHarness):
 
     def test_the_bound_is_sixteen(self):
         self.assertEqual(http_auth.Service.LOGINS_AT_ONCE, 16)
+
+    def test_a_log_in_that_is_turned_away_leaves_the_wrong_password_count_as_it_was(self):
+        """It neither counts against the name nor clears what was counted (a mutant of the review)."""
+        key = self.service._throttle_key(ADMIN, 'local')
+        for _ in range(2):
+            with self.assertRaises(HttpError):
+                self.service.login(ADMIN, 'a wrong password')
+        self.assertEqual(len(self.service._failures[key]), 2)
+        release, entered, threads, answers = self.held(2)
+        for password in (PASSWORD, 'a wrong password'):
+            with self.assertRaises(HttpError) as refused:
+                self.service.login(ADMIN, password)
+            self.assertEqual(refused.exception.status, 503)
+        self.assertEqual(len(self.service._failures[key]), 2)
+        release.set()
+        for thread in threads:
+            thread.join(30)
+        self.assertEqual(len(self.service._failures[key]), 2)
+        # The lock-out comes at the same attempt as without the turned-away ones.
+        for _ in range(self.service.login_max_attempts - 2):
+            with self.assertRaises(HttpError) as refused:
+                self.service.login(ADMIN, 'a wrong password')
+            self.assertEqual(refused.exception.status, 401)
+        with self.assertRaises(HttpError) as locked:
+            self.service.login(ADMIN, PASSWORD)
+        self.assertEqual(locked.exception.status, 429)
+
+
+class ShareTests(Held):
+    """Review of kittrial-5bb.170: about 20 looping connections from one address, with no credentials, held all
+    16 places and kept every log-in out. One address now has a share of the places."""
+    ONE, OTHER = '192.0.2.7', '192.0.2.8'
+
+    def share(self, places, per_address):
+        self.service.LOGINS_PER_ADDRESS = per_address
+        release, entered, threads, answers = self.held(places, source=self.ONE, count=per_address or places)
+        return release, entered, threads, answers
+
+    def test_the_share_is_a_quarter_of_the_places(self):
+        self.assertEqual((http_auth.Service.LOGINS_PER_ADDRESS, http_auth.Service.LOGINS_AT_ONCE), (4, 16))
+
+    def test_one_address_cannot_take_every_place_and_another_address_gets_in(self):
+        release, entered, threads, answers = self.share(6, 2)
+        failures = dict(self.service._failures)
+        audited = len(self.service.state.get('audit') or [])
+        for name, password in ((ADMIN, PASSWORD), ('nobody-at-all', 'x' * 12)):
+            with self.subTest(name=name), self.assertRaises(HttpError) as refused:
+                self.service.login(name, password, source=self.ONE)
+            error = refused.exception
+            self.assertEqual((error.status, error.code, error.message, error.retry_after),
+                             (503, 'busy', 'Too many log-ins from your address are being checked at this moment. '
+                                           'Try again in a few seconds.', 5))
+        self.assertEqual(len(entered), 1)                             # nothing was checked for them
+        self.assertEqual(self.service._failures, failures)
+        self.assertEqual(len(self.service.state.get('audit') or []), audited)
+        self.assertEqual((self.service.logins_turned_away, self.service.logins_turned_away_for_address), (2, 2))
+        # Somebody at another address has a place, and gets in when the checks before theirs are done.
+        got = []
+        person = threading.Thread(target=lambda: got.append(self.service.login(ADMIN, PASSWORD, source=self.OTHER)))
+        person.start()
+        until = time.monotonic() + 10
+        while time.monotonic() < until and self.service._logins < 3:
+            time.sleep(0.01)
+        self.assertEqual((self.service._logins, self.service._logins_by_address), (3, {self.ONE: 2, self.OTHER: 1}))
+        release.set()
+        person.join(30)
+        for thread in threads:
+            thread.join(30)
+        self.assertEqual(got[0]['user']['username'], ADMIN)
+        self.assertEqual(answers, [401, 401])
+        self.assertEqual((self.service._logins, self.service._logins_by_address), (0, {}))
+        self.assertEqual(self.service.login(ADMIN, PASSWORD, source=self.ONE)['user']['username'], ADMIN)
+        self.assertEqual(self.service._logins_by_address, {})
+
+    def test_when_every_place_is_taken_the_sentence_is_the_general_one(self):
+        self.service.LOGINS_PER_ADDRESS = 2
+        release, entered, threads, answers = self.held(2, source=self.ONE)
+        with self.assertRaises(HttpError) as refused:
+            self.service.login(ADMIN, PASSWORD, source=self.OTHER)
+        self.assertEqual(refused.exception.message, 'Too many people are logging in at this moment. Try again in a few seconds.')
+        self.assertEqual((self.service.logins_turned_away, self.service.logins_turned_away_for_address), (1, 0))
+        with self.assertRaises(HttpError) as refused:                 # at its share AND everything taken: its own share is said
+            self.service.login(ADMIN, PASSWORD, source=self.ONE)
+        self.assertIn('from your address', refused.exception.message)
+
+    def test_the_addresses_of_one_ipv6_64_are_one_address_and_a_mapped_one_is_its_ipv4(self):
+        self.service.LOGINS_PER_ADDRESS = 2
+        release, entered, threads, answers = self.held(8, source='2001:db8:1:2::1', count=2)
+        self.assertEqual(self.service._logins_by_address, {'2001:db8:1:2::/64': 2})
+        with self.assertRaises(HttpError) as refused:
+            self.service.login(ADMIN, PASSWORD, source='2001:db8:1:2:ffff::9')
+        self.assertIn('from your address', refused.exception.message)
+        release.set()
+        for thread in threads:
+            thread.join(30)
+        release, entered, threads, answers = self.held(8, source='::ffff:192.0.2.7', count=2)
+        self.assertEqual(self.service._logins_by_address, {'192.0.2.7': 2})
+        with self.assertRaises(HttpError) as refused:
+            self.service.login(ADMIN, PASSWORD, source='192.0.2.7')
+        self.assertIn('from your address', refused.exception.message)
+
+    def test_no_share_per_address_when_it_is_set_to_nought(self):
+        release, entered, threads, answers = self.share(5, 0)
+        self.assertEqual((self.service._logins, self.service._logins_by_address), (5, {self.ONE: 5}))
+        with self.assertRaises(HttpError) as refused:
+            self.service.login(ADMIN, PASSWORD, source=self.ONE)
+        self.assertEqual(refused.exception.message, self.service.LOGIN_BUSY)
+        self.assertEqual(self.service.logins_turned_away_for_address, 0)
+
+    def test_over_http_the_address_is_the_one_the_request_came_from(self):
+        self.service.LOGINS_PER_ADDRESS = 1
+        release, entered, threads, answers = self.held(4, source='127.0.0.1', count=1)
+        bodies = []
+        for name, password in ((ADMIN, PASSWORD), ('nobody-at-all', 'x' * 12)):
+            answer = self.request('POST', '/v1/sessions', {'username': name, 'password': password})
+            self.assertEqual((answer.status, answer.headers.get('retry-after')), (503, '5'))
+            bodies.append(dict(answer.data['error']))
+        self.assertEqual(bodies[0], bodies[1])
+        self.assertEqual(bodies[0], {'code': 'busy', 'message': self.service.LOGIN_BUSY_ADDRESS})
+        self.assertEqual(self.service.logins_turned_away_for_address, 2)
+
+    def test_a_log_in_that_ends_in_any_way_gives_the_address_its_place_back(self):
+        self.service.LOGINS_PER_ADDRESS = 1
+        for _ in range(3):
+            with self.assertRaises(HttpError) as refused:
+                self.service.login(ADMIN, 'a wrong password', source=self.ONE)
+            self.assertEqual(refused.exception.status, 401)
+        with mock.patch.object(self.service, '_login', side_effect=RuntimeError('broken')), self.assertRaises(RuntimeError):
+            self.service.login(ADMIN, PASSWORD, source=self.ONE)
+        self.assertEqual((self.service._logins, self.service._logins_by_address), (0, {}))
+        self.assertEqual(self.service.login(ADMIN, PASSWORD, source=self.ONE)['user']['username'], ADMIN)
+        self.assertEqual(self.service.logins_turned_away, 0)
 
 
 if __name__ == '__main__':

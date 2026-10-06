@@ -31,6 +31,7 @@ that.
 """
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -236,6 +237,25 @@ def request_hash(payload):
 
 def now_iso(timestamp):
     return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(timestamp))
+
+
+def address_group(address):
+    """What the limit per address counts as one client.
+
+    An IPv4 address is itself; an IPv6 address is its /64, because one line is given a whole
+    /64 and its holder can use any address in it; an IPv4 address written as IPv6
+    (``::ffff:a.b.c.d``) is that IPv4 address. Anything that is not an address is itself.
+    """
+    text = str(address)
+    try:
+        parsed = ipaddress.ip_address(text.split('%', 1)[0])
+    except ValueError:
+        return text
+    if parsed.version == 6:
+        if parsed.ipv4_mapped is not None:
+            return str(parsed.ipv4_mapped)
+        return str(ipaddress.ip_network((int(parsed) >> 64 << 64, 64)))
+    return str(parsed)
 
 
 # ------------------------------------------------------------------- password verifier
@@ -893,7 +913,9 @@ class Service:
         self._failures = {}
         self._logins_guard = threading.Lock()
         self._logins = 0
+        self._logins_by_address = {}     # address group -> its log-ins in flight
         self.logins_turned_away = 0
+        self.logins_turned_away_for_address = 0
         self.lookup_max = lookup_max
         self.lookup_window = lookup_window
         self._lookups = {}
@@ -1312,24 +1334,47 @@ class Service:
     #: memory nor a queue without end (kittrial-5bb.170).
     LOGINS_AT_ONCE = 16
     LOGIN_BUSY = 'Too many people are logging in at this moment. Try again in a few seconds.'
+    #: Of those places, how many one client address may hold (its ``address_group``; the
+    #: address is the forwarded one only when a trusted proxy sent it). Without it about 20
+    #: looping connections from one address, with no credentials, held all 16 places and
+    #: kept every log-in out for as long as they ran (review of kittrial-5bb.170). A quarter:
+    #: whatever one address sends, twelve places are left to the others, and somebody with
+    #: a place waits behind at most fifteen checks. 0: no share per address.
+    LOGINS_PER_ADDRESS = 4
+    LOGIN_BUSY_ADDRESS = ('Too many log-ins from your address are being checked at this moment. '
+                          'Try again in a few seconds.')
 
     def login(self, username, password, source='local', request_id=None):
         """Uniform failure response; never reveals whether the account exists."""
+        group = address_group(source or 'local')
         with self._logins_guard:
-            full = self._logins >= self.LOGINS_AT_ONCE
-            if not full:
-                self._logins += 1
+            mine = self._logins_by_address.get(group, 0)
+            if self.LOGINS_PER_ADDRESS and mine >= self.LOGINS_PER_ADDRESS:
+                refused = self.LOGIN_BUSY_ADDRESS
+                self.logins_turned_away_for_address += 1
+            elif self._logins >= self.LOGINS_AT_ONCE:
+                refused = self.LOGIN_BUSY
             else:
+                refused = None
+                self._logins += 1
+                self._logins_by_address[group] = mine + 1
+            if refused:
                 self.logins_turned_away += 1
-        if full:
-            # Nothing was checked and nothing is counted against the name or the address. Not
-            # audited per attempt either: a flood must not fill the audit log.
-            raise busy(self.LOGIN_BUSY, retry_after=5)
+        if refused:
+            # Nothing was checked and nothing is counted against the name or the address, and
+            # no count is cleared either. Not audited per attempt: a flood must not fill the
+            # audit log.
+            raise busy(refused, retry_after=5)
         try:
             return self._login(username, password, source, request_id)
         finally:
             with self._logins_guard:
                 self._logins -= 1
+                left = self._logins_by_address.get(group, 0) - 1
+                if left > 0:
+                    self._logins_by_address[group] = left
+                else:
+                    self._logins_by_address.pop(group, None)
 
     def _login(self, username, password, source, request_id):
         try:

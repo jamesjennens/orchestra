@@ -66,7 +66,7 @@ class AddressCase(Case):
         self.said = io.StringIO()
         quiet = contextlib.redirect_stderr(self.said)
         quiet.__enter__()
-        self.addCleanup(lambda: self.assertNotIn('Traceback', self.said.getvalue()))
+        self.addCleanup(lambda: self.assertFalse('Traceback' in self.said.getvalue(), self.said.getvalue()))
         self.addCleanup(quiet.__exit__, None, None, None)
 
     def held_open(self):
@@ -456,6 +456,10 @@ class TlsAddressTests(AddressCase):
         self.serve(client_seconds=30, address_limit=2)
         self.silent_from(A), self.silent_from(A)
         self.open_from(A, 2)
+        until = time.monotonic() + 5                              # both are in their handshake before the check begins
+        while time.monotonic() < until and len(self.httpd._deadlines) < 2:
+            time.sleep(0.02)
+        self.assertEqual(len(self.httpd._deadlines), 2)
         with mock.patch.object(ssl.SSLContext, 'wrap_socket', side_effect=AssertionError('a handshake was begun')), \
                 contextlib.redirect_stderr(io.StringIO()):
             self.turned_away_at_once(A)

@@ -41,7 +41,7 @@ from http_auth import (AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, 
                        CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROPOSALS,
                        CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ, CAP_REVIEWS,
                        CAP_TASKS, RESULT_RETENTION_SECONDS, HttpError, Service, Store,
-                       authority_request, busy, conflict, forbidden, invalid, not_found,
+                       address_group, authority_request, busy, conflict, forbidden, invalid, not_found,
                        not_implemented, now_iso, request_hash, unauthenticated,
                        uncertain, unsupported)
 
@@ -5465,25 +5465,6 @@ ADDRESS_LIMIT = 50
 #: Said to a request that came through a trusted proxy while its forwarded address already
 #: has that many requests being served.
 ADDRESS_BUSY = 'Too many requests from your address are being served at once. Send this one again in a moment.'
-
-
-def address_group(address):
-    """What the limit per address counts as one client.
-
-    An IPv4 address is itself; an IPv6 address is its /64, because one line is given a whole
-    /64 and its holder can use any address in it; an IPv4 address written as IPv6
-    (``::ffff:a.b.c.d``) is that IPv4 address. Anything that is not an address is itself.
-    """
-    text = str(address)
-    try:
-        parsed = ipaddress.ip_address(text.split('%', 1)[0])
-    except ValueError:
-        return text
-    if parsed.version == 6:
-        if parsed.ipv4_mapped is not None:
-            return str(parsed.ipv4_mapped)
-        return str(ipaddress.ip_network((int(parsed) >> 64 << 64, 64)))
-    return str(parsed)
 
 
 class _WatchedWriter:
