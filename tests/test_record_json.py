@@ -251,7 +251,10 @@ class NoUnguardedParseTests(unittest.TestCase):
             # an `.owner-answers` entry for a backup: nothing in the kit writes one yet.
             'admin.py': 2,
             'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 3, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
-            'handoff.py': 1, 'http_service.py': 2, 'lifecycle.py': 1, 'recovery.py': 1, 'requirements.py': 1, 'reserved_comments.py': 1,
+            'handoff.py': 1, 'http_service.py': 2, 'lifecycle.py': 1, 'recovery.py': 1,
+            # open_items.py (kittrial-5bb.127): record bodies, the anchor list and show, and a
+            # `.owner-answers` entry, every one written by somebody else.
+            'open_items.py': 4, 'requirements.py': 1, 'reserved_comments.py': 1,
             'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
 
     def test_the_parsers_that_do_not_call_it_directly_reach_it(self):

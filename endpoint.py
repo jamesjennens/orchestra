@@ -665,6 +665,20 @@ def execute(root,request,authority_config=None,require_authority=False):
             return guarded_write(root,request,journal_path(path),proposal_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
+    if action in ('items','questions'):
+        # Open items and owner questions, slice 1 (kittrial-5bb.127): read-only. One
+        # labelled bd list of the item anchors plus one bd show of their comments; no
+        # lock, not run_guarded, nothing is written. The writes arrive in a later slice.
+        import open_items
+        args=request.get('args',[])
+        if not isinstance(args,list) or any(not isinstance(x,str) or '\0' in x for x in args):raise ValueError('Expected argument list')
+        run_warnings=[]
+        def run(argv):
+            stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warnings:run_warnings.append(warnings)
+            return stdout
+        result=open_items.read(action,args,run,configured_operators(root),journal=path)
+        return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
     if action in ('brief','history','checkpoint'):
         from briefing import execute as briefing_execute
         args=request.get('args',[])

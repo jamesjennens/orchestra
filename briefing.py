@@ -694,6 +694,14 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     attention={'attention':attention['attention']+capabilities['attention'],
                'attention_total':attention['attention_total']+capabilities['attention_total'],
                'attention_more':((attention['attention_more'] or 0)+(capabilities['attention_more'] or 0)) or None}
+    # Open items and owner questions (design 7.4, kittrial-5bb.127): up to 3 `open-item` and
+    # 3 `owner-question` items, after every other kind; no bd read (the rows are the export
+    # brief already holds), and nothing at all when the project has no item anchor.
+    from open_items import brief_attention as open_item_attention
+    open_items=open_item_attention(rows,issue,operators,journal)
+    attention={'attention':attention['attention']+open_items['attention'],
+               'attention_total':attention['attention_total']+open_items['attention_total'],
+               'attention_more':((attention['attention_more'] or 0)+(open_items['attention_more'] or 0)) or None}
     newer=None;excluded_cursor=None;next_action=review_next.get(review['review_state'],p['next_action'] if p else 'Read the task description, acceptance criteria and any history, then publish a checkpoint.')
     # Outstanding directions persist independently of cursor freshness: an
     # acknowledged-but-unresolved direction stays visible on a current checkpoint,
@@ -1085,12 +1093,16 @@ def format_brief(result):
             lines.append('Proposal review [%s, %s]: %s (%s)'%(item['state'],item['trust'],item['text'],item['source']))
         elif item.get('kind')=='capability':
             lines.append('Capability [%s, %s]: %s (%s)'%(item['verification'],item['trust'],item['text'],item['source']))
+        elif item.get('kind')=='open-item':
+            lines.append('Open item [%s, %s]: %s (%s)'%(item['state'],item['trust'],item['text'],item['source']))
+        elif item.get('kind')=='owner-question':
+            lines.append('Owner question [%s, %s]: %s (%s)'%(item['due'],item['for'],item['text'],item['source']))
         elif item.get('kind')=='reference':
             lines.append('Reference [%s, %s]: %s (%s)'%(item['authority_kind'],item['trust'],item['text'],item['source']))
         else:
             lines.append('Reference review [%s, %s]: %s (%s)'%(item['due'],item['trust'],item['text'],item['source']))
     if result.get('attention_more'):
-        lines.append('More attention: %d (ref list --due expired; proposal list; capability list)'%result['attention_more'])
+        lines.append('More attention: %d (ref list --due expired; proposal list; capability list; items list; questions --for OWNER)'%result['attention_more'])
     if result.get('reference_drafts_matching'):
         from reference_records import DRAFTS_SHOWN_MAX
         count=result['reference_drafts_matching']
@@ -1134,7 +1146,9 @@ def help_notes(action):
                 'then at most 3 proposal-review items (proposals '
                 'that target this requirement record or one of the task\'s area labels, then, for an operator, '
                 'the oldest waiting ones), then at most 3 capability items (accepted capabilities tagged with '
-                'one of the task\'s labels, drifted first), each with trust; attention_total and '
+                'one of the task\'s labels, drifted first), then at most 3 open-item items (open or blocked '
+                'items whose task is this task, expired first) and at most 3 owner-question items (the '
+                'questions among them), each with trust or its addressee; attention_total and '
                 'attention_more count every kind. Reading changes nothing.']
     if action=='history':
         return ['Pages are snapshot-bound; pass next_cursor back to continue the same snapshot.']
