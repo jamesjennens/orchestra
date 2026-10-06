@@ -159,6 +159,7 @@ class Shared:
         made = self.request('POST', '/v1/agents', {'name': 'Plover', 'working_directory': '/home/rita/p',
                                                    'projects': [self.project]}, token=self.reviewer)
         self.assertEqual(201, made.status, made.data)
+        self.plover_id = made.data['agent']['id']
         return made.data['credential']['secret']
 
     def test_one_standing_recommendation_from_each_person(self):
@@ -179,6 +180,10 @@ class Shared:
                 self.assertTrue(message.endswith(self.ALREADY), message)
                 self.assertIn('Osprey', message[:-len(self.ALREADY)])
                 self.assertEqual(answer.data['error']['detail'], {'recommended_by': self.reviewer_actor})
+        # Under an attribution label the name is another one; the person signed in is the same.
+        labelled = self.recommend(plover, task, contribution, commit, actor=self.plover_id + '/second-reading')
+        self.assertEqual(409, labelled.status, labelled.data)
+        self.assertTrue(labelled.data['error']['message'].endswith(self.ALREADY))
         self.assertEqual(self.review(self.owner, task)['recommendations'], stored)           # nothing was stored
         # The owner of the project is another person: hers is a second voice, and is stored.
         self.assertEqual(201, self.recommend(self.owner, task, contribution, commit).status)
