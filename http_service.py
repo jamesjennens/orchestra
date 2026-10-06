@@ -1251,6 +1251,28 @@ class EndpointBackend:
 
     def _endpoint(self, action, project, actor, args, attachments=None, operation_id=None,
                   authority=None, require_authority=False, route=None, check_usable=True, timeout=None):
+        """One answer of the canonical endpoint; its mark of a configuration fault is raised here.
+
+        Here and not where a route reads the answer, so that no route can hand the
+        endpoint's line (the path of the file, the parser's or the system's words) to the
+        person: some routes read a return code of 2 their own way (kittrial-5bb.156 review).
+        """
+        reply = self._ask(action, project, actor, args, attachments, operation_id, authority,
+                          require_authority, route, check_usable, timeout)
+        if isinstance(reply, dict) and reply.get('returncode') == 2 and reply.get('fault') == 'configuration':
+            # The server's own configuration file cannot be read: the endpoint's line names the
+            # file and the parser's words. Those are for the operator, in this service's log;
+            # the person is told who to ask. Nothing was carried out.
+            said = (reply.get('stderr') or '').strip().splitlines()
+            print('configuration: the endpoint could not read the deployment configuration for %s: %s'
+                  % (action or 'a request', ascii(said[-1][:600]) if said else '(nothing)'), file=sys.stderr, flush=True)
+            refused = HttpError(503, 'server_configuration', self.CONFIGURATION_UNREADABLE)
+            refused.nothing_done = True
+            raise refused
+        return reply
+
+    def _ask(self, action, project, actor, args, attachments, operation_id, authority,
+             require_authority, route, check_usable, timeout):
         if isinstance(project, str):
             # A record the backend will not serve is refused here, before any endpoint
             # process starts: a `proj_...` id (no canonical project can be behind it;
@@ -1347,16 +1369,6 @@ class EndpointBackend:
             # sentence (kittrial-5bb.149).
             cls._log_busy(action, stderr)
             raise busy()
-        if code == 2 and reply.get('fault') == 'configuration':
-            # The server's own configuration file cannot be read: the endpoint's line names the
-            # file and the parser's words. Those are for the operator, in this service's log;
-            # the person is told who to ask (kittrial-5bb.156). Nothing was carried out.
-            said = stderr.strip().splitlines()
-            print('configuration: the endpoint could not read the deployment configuration for %s: %s'
-                  % (action or 'a request', ascii(said[-1][:600]) if said else '(nothing)'), file=sys.stderr, flush=True)
-            refused = HttpError(503, 'server_configuration', cls.CONFIGURATION_UNREADABLE)
-            refused.nothing_done = True
-            raise refused
         if code:
             limit = cls.DETAIL_LIMITS.get(action, cls.DETAIL_LIMIT)
             detail = stderr.strip().splitlines()[-1][:limit] if stderr.strip() else None
@@ -2009,6 +2021,22 @@ class EndpointBackend:
         """
         operation = self._result_key(principal, None, 'projects.host-create', key, name)
         return hashlib.sha256(('%s %s' % (operation, body_hash or '-')).encode('utf-8')).hexdigest()
+
+    def retired_on_host(self, project):
+        """Whether an operator retired ``project`` on the host, so that nothing is served under the name.
+
+        Read from the root itself: no endpoint process and no lock, so the answer to a
+        creator's repeat never waits for either (kittrial-5bb.156 review). What cannot be
+        read says nothing against the project.
+        """
+        try:
+            import admin
+            root = Path(self.root)
+            if (root / 'projects' / project / '.beads' / 'metadata.json').is_file():
+                return False
+            return any(name == project for name, _ in admin.retired_entries(root))
+        except (OSError, ValueError):
+            return False
 
     def create_host_project(self, principal, name, key):
         """Create project ``name`` on the host for ``principal`` (kittrial-5bb.118 part 2).
@@ -3230,6 +3258,9 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     #: Said to the account a project is registered to by its own creation, and to nobody else.
     ALREADY_YOURS = 'You already have project %s: you created it on this server%s. Nothing was made again.'
+    #: The same, when an operator has since retired the project on the host: the page links nothing.
+    RETIRED_YOURS = ('You created project %s on this server%s, and it has since been retired there, so it is no '
+                     'longer served. The name is not available: choose another name.')
 
     def _created_here_by(self, record, principal):
         """Whether ``record`` is a project this account created on the host and still belongs to."""
@@ -3296,8 +3327,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 made = existing.get('host_created') or {}
                 again = ctx.idempotency_key is not None and identity is not None and made.get('operation') == identity
                 day = str(existing.get('created_at') or '')[:10]
-                refusal = conflict(self.ALREADY_YOURS % (project_id, ' on ' + day if DAY.fullmatch(day) else ''),
-                                   {'project': project_id, 'state': 'yours'})
+                since = ' on ' + day if DAY.fullmatch(day) else ''
+                if hasattr(self.backend, 'retired_on_host') and self.backend.retired_on_host(project_id):
+                    # The web record outlives a retirement on the host. "You already have it", with
+                    # a link, would point at a project that answers "unknown" (review of .156).
+                    again = False
+                    refusal = conflict(self.RETIRED_YOURS % (project_id, since), {'project': project_id, 'state': 'retired'})
+                else:
+                    refusal = conflict(self.ALREADY_YOURS % (project_id, since), {'project': project_id, 'state': 'yours'})
             if not again:
                 return self._refuse_unless_replay(ctx, 'projects.host-create', refusal,
                                                   capability=CAP_PROJECT_HOST_CREATE)
@@ -3310,6 +3347,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                 # busy, to be sent again, and is not an outcome to reconcile.
                 if failure.status == 503 and failure.code != 'busy':
                     raise UncertainOutcome() from None
+                if again and failure.status == 409:
+                    # The same request for a project that is registered to this account, and the
+                    # endpoint will not answer it from its journal: sent from another session
+                    # (logged in again; the page keeps its key), the operation identity belongs
+                    # to the first one. Nothing was made, and the project is theirs: say that,
+                    # not "could not be created" (review of kittrial-5bb.156).
+                    raise refusal from None
                 raise
             if not isinstance(result, dict) or result.get('status') not in ('created', 'incomplete'):
                 raise UncertainOutcome()
@@ -3638,7 +3682,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             try:
                 result = self.backend.set_onboarding(ctx.principal, ctx.params['pid'], text, key)
             except HttpError as failure:
-                if failure.status == 503:
+                # Not when the answer says that nothing was carried out (the server's configuration
+                # could not be read; kittrial-5bb.156 review).
+                if failure.status == 503 and not getattr(failure, 'nothing_done', False):
                     raise UncertainOutcome() from None
                 raise
             kept = result.get('operator_text_kept_as') if isinstance(result, dict) else None

@@ -553,19 +553,32 @@ def read_json_file(path,what,encoding=None):
         raise ValueError('%s %s is not valid JSON: %s'%(what,path,error)) from None
 
 class ConfigurationUnreadable(ValueError):
-    """``deployment.private.json`` is not JSON or not text. The message names the file, for the operator.
+    """``deployment.private.json`` cannot be used as it is. The message names the file, for the operator.
 
-    A ``ValueError`` with the words it always had, so every host command says what it
-    said. Its own class so that the endpoint can mark the answer as a fault of the server
-    and the web service can keep the path from the people it serves (kittrial-5bb.156).
+    Not JSON, not text, not a JSON object, or a setting in it of the wrong kind. A
+    ``ValueError`` with the words it always had where it had any, so every host command
+    says what it said. Its own class so that the endpoint can mark the answer as a fault of
+    the server and the web service can keep the path from the people it serves
+    (kittrial-5bb.156). A file that cannot be OPENED keeps its ``OSError`` here (it names the
+    path already); the endpoint marks that one too (``endpoint.configuration_fault``).
     """
 
 def deployment_document(marker):
-    """The parsed ``deployment.private.json`` at ``marker``; not JSON or not text is :class:`ConfigurationUnreadable`."""
+    """The parsed ``deployment.private.json`` at ``marker``, a JSON object; anything else is :class:`ConfigurationUnreadable`."""
     try:
-        return read_json_file(marker,'Deployment configuration')
+        document=read_json_file(marker,'Deployment configuration')
     except ValueError as error:
         raise ConfigurationUnreadable(str(error)) from None
+    if not isinstance(document,dict):
+        raise ConfigurationUnreadable('Deployment configuration %s is not a JSON object'%marker)
+    return document
+
+def deployment_password(root):
+    """The database password in the deployment configuration; a file without one is :class:`ConfigurationUnreadable`."""
+    password=config(root).get('password')
+    if not isinstance(password,str):
+        raise ConfigurationUnreadable('Deployment configuration %s has no password'%(root/'deployment.private.json'))
+    return password
 
 def config(root):
     return deployment_document(root/'deployment.private.json')
@@ -593,7 +606,7 @@ def operators(root, strict=False):
         value=deployment_document(marker).get('operators')
         if isinstance(value,list):found.extend(value)
         elif isinstance(value,str):found.append(value)
-        elif value is not None:raise ValueError('deployment operators must be a list of actor identities')
+        elif value is not None:raise ConfigurationUnreadable('deployment operators must be a list of actor identities')
     from recovery import configured_operators
     allowed=configured_operators(found)
     if strict:
@@ -1056,7 +1069,7 @@ def verifiers(root, strict=False):
         value=deployment_document(marker).get('verifiers')
         if isinstance(value,list):found.extend(value)
         elif isinstance(value,str):found.append(value)
-        elif value is not None:raise ValueError('deployment verifiers must be a list of actor identities')
+        elif value is not None:raise ConfigurationUnreadable('deployment verifiers must be a list of actor identities')
     from recovery import configured_operators
     allowed=configured_operators(found)
     if strict:
@@ -1165,6 +1178,7 @@ def environment(root):
     prepared the old way metrics-off without touching anything outside ``root``.
     """
     env=os.environ.copy()
+    password=deployment_password(root)
     # The account's own home, recorded before HOME is scoped into the runtime below: the
     # scheduled-backup units are installed there, and the web service and the endpoint
     # it starts run under this environment and must still find them (kittrial-5bb.118).
@@ -1178,7 +1192,7 @@ def environment(root):
     env.update({'HOME':str(root/'home'),
                 'PATH':str(root/'bin')+os.pathsep+env.get('PATH',''),
                 'DOLT_ROOT_PATH':str(root/'dolt-home'),'XDG_CONFIG_HOME':str(root/'config'),
-                'BEADS_DOLT_PASSWORD':config(root)['password'],'DOLT_CLI_PASSWORD':config(root)['password'],
+                'BEADS_DOLT_PASSWORD':password,'DOLT_CLI_PASSWORD':password,
                 'BD_NON_INTERACTIVE':'1','BEADS_NO_DAEMON':'1','BD_DISABLE_METRICS':'1'})
     return env
 

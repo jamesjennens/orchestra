@@ -567,7 +567,18 @@ the result after the last.
   gets that sentence. Every other account gets "Project name NAME is not available:
   choose another name", with nothing about who has the name or since when. A record
   written by an earlier kit has no digest, so its creator's repeat with the old key is
-  answered with the 409 sentence, not 201.
+  answered with the 409 sentence, not 201. Three more cases:
+  - The same request from **another session** of the same account (logged in again; the
+    page keeps its key). The endpoint's operation identity belongs to the session that
+    made the project, so it will not answer from its journal; the service answers the
+    409 "You already have project NAME ..." (not "could not be created").
+  - A project an operator has since **retired on the host** (`admin.py retire-project`)
+    keeps its web record. Its creator is told 409 "You created project NAME on this
+    server on DATE, and it has since been retired there, so it is no longer served. The
+    name is not available: choose another name.", `detail` `{"project": NAME, "state":
+    "retired"}`, shown on the name like any other refusal, with no link. The service
+    reads that from the root itself (no endpoint process, no lock).
+  - The digest is the service's own. It is not part of the project view any reader gets.
 - **The last-use stamp of a request does not wait a minute** (kittrial-5bb.156). Every
   authenticated request stamps the session's (or credential's, and agent's) last use
   and saves the state, because the endpoint checks a session's idle deadline against
@@ -587,22 +598,33 @@ the result after the last.
     `busy: the state could not be saved before ACTION was sent to the endpoint, so it was
     not sent`). So the longest a stamp stays unsaved is until the next request after the
     lock is free, and never past a write that reaches the endpoint.
-  Reads that need the endpoint are answered busy by the endpoint's own wait, as before;
-  reads the service answers itself are answered.
-- **The server's configuration file cannot be read** (kittrial-5bb.156). When
-  `deployment.private.json` is not JSON (cut short, for example) the endpoint refuses
-  every request that needs it, and its line names the file and the parser's words. The
-  endpoint marks that answer (`"fault": "configuration"`), and the service answers 503
-  `server_configuration`, "The server's configuration cannot be read, so this request
-  was not carried out. Ask an operator of the server to look.", for reads and writes
-  alike; the line is in the service's log (`configuration: the endpoint could not read
-  the deployment configuration for ACTION: ...`). The endpoint reads the file before it
-  reserves anything, so a write is refused with nothing done and its idempotency key
-  stays usable: the same request works once the file is repaired. (Read for the first
-  time inside the guarded write, it left the operation "outcome unknown" with nothing
-  written, and the same key answered that until the reservation expired.) Any `admin.py`
-  command on the host names the file, as before. A caller who reaches the endpoint without the web service
-  still reads the endpoint's own line.
+  What this does NOT change, while the lock is held: only a read the service answers by
+  itself is answered at once. A read that needs the endpoint still waits for the
+  endpoint's own wait (up to 60 seconds) and is then answered 503 `busy`, as before.
+  And a request that arrives while a write or a log-in is itself waiting for the lock
+  queues behind it in the service (a read was seen to wait 54 seconds that way).
+- **The server's configuration file cannot be read** (kittrial-5bb.156). Every failure
+  to read `deployment.private.json` is one fault of the server: the file cannot be
+  opened (closed to the service's user, for example), is not text, is not JSON (cut
+  short), is not a JSON object, has no `password`, or has an `operators` or `verifiers`
+  that is not a list. The endpoint's line names the file with the parser's or the
+  system's words; the endpoint marks that answer (`"fault": "configuration"`), and the
+  service answers 503 `server_configuration`, "The server's configuration cannot be
+  read, so this request was not carried out. Ask an operator of the server to look.",
+  on every route, for reads and writes alike. The line is in the service's log only
+  (`configuration: the endpoint could not read the deployment configuration for
+  ACTION: ...`). What is and is not stopped:
+  - The file is read **only where it is used**. A request that needs nothing from it is
+    answered as if it were whole: reading, setting and clearing a project's onboarding
+    text, for example. Everything that starts bd needs it (the database password is in
+    it), so task reads and every write are refused while it is damaged.
+  - A write that reserves an operation identity reads the file before it reserves, so
+    it is refused with nothing done and its idempotency key stays usable: the same
+    request works once the file is repaired. (Read for the first time inside the guarded
+    write, it left the operation "outcome unknown" with nothing written, and the same
+    key answered that until the reservation expired.)
+  - Any `admin.py` command on the host names the file, as before. A caller who reaches
+    the endpoint without the web service still reads the endpoint's own line.
 - **Restart the web service in the same step as the files** (kittrial-5bb.156). The
   service is a long-running process and the endpoint is started anew for every request,
   so replacing the kit's files changes the endpoint at once and the service only when it

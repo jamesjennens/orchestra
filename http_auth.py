@@ -1731,6 +1731,11 @@ class Service:
     def project_view(self, principal, project_id):
         project, role = self.require_project(principal, project_id)
         view = dict(project)
+        made = view.get('host_created')
+        if isinstance(made, dict) and 'operation' in made:
+            # The digest that recognises the creator's own repeat is the service's own: no other
+            # account or body can match it, and no reader needs it (kittrial-5bb.156 review).
+            view['host_created'] = {key: value for key, value in made.items() if key != 'operation'}
         # The repository as today's rule reads it (kittrial-5bb.123): a stored value that
         # no longer passes is withheld and flagged; a passing one carries the note that it
         # is information, wherever a member or an agent credential reads the project.

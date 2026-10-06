@@ -1665,6 +1665,124 @@ class HeldLockTests(Case):
         again = self.create(self.olive, 'alpha', key='create-alpha-2')
         self.assertEqual(again.data['error']['detail'], {'project': 'alpha', 'state': 'yours'})
 
+    # ---- 1b. from the review of kittrial-5bb.156 ------------------------------------------------------------
+    def created_and_its_answer_forgotten(self, name, key):
+        """A creation whose stored answer has expired: the same request is then answered anew, not replayed."""
+        with patch.object(self.service, 'idempotency_ttl', -1):
+            self.assertEqual(201, self.create(self.olive, name, key=key).status)
+
+    def test_the_same_request_from_another_session_of_the_account_says_they_have_it(self):
+        """Logged in again, the page still holds its key; the endpoint's identity belongs to the first session."""
+        self.created_and_its_answer_forgotten('alpha', 'create-alpha-1')
+        day = self.service.state['projects']['alpha']['created_at'][:10]
+        sentence = 'You already have project alpha: you created it on this server on %s. Nothing was made again.' % day
+        seen = []
+
+        def another_principal(principal, name, key):
+            seen.append(name)
+            # What the backend makes of the endpoint's "Operation identity belongs to a different principal".
+            raise http_service.conflict(self.backend.CREATION_FAILED)
+        again_in = self.login('olive', 'olive-password-1')[0]
+        with patch.object(self.backend, 'create_host_project', another_principal):
+            again, _ = self.logged(lambda: self.create(again_in, 'alpha', key='create-alpha-1'))
+            self.assertEqual(seen, ['alpha'])                           # it is the same request: the endpoint was asked
+            self.assertEqual(self.said(again), (409, 'conflict', sentence))
+            self.assertEqual(again.data['error']['detail'], {'project': 'alpha', 'state': 'yours'})
+            self.assertNotIn('could not be created', json.dumps(again.data))
+        # Only for a project that is registered to them: a first creation the endpoint refuses is told so.
+        with patch.object(self.backend, 'create_host_project', another_principal):
+            fresh, _ = self.logged(lambda: self.create(self.olive, 'beta', key='create-beta-1'))
+        self.assertEqual(self.said(fresh), (409, 'conflict', self.backend.CREATION_FAILED))
+        # And an answer that may hide an outcome stays one.
+        def unknown(principal, name, key):
+            raise http_service.uncertain('Canonical endpoint timed out; outcome may be unknown')
+        third = self.login('olive', 'olive-password-1')[0]
+        with patch.object(self.backend, 'create_host_project', unknown):
+            lost, _ = self.logged(lambda: self.create(third, 'alpha', key='create-alpha-1'))
+        self.assertEqual((lost.status, lost.data['error']['code']), (503, 'uncertain'))
+
+    def test_a_project_retired_on_the_host_is_not_called_theirs_with_a_link(self):
+        import shutil
+        self.created_and_its_answer_forgotten('alpha', 'create-alpha-1')
+        self.assertEqual(200, self.grant('carl', limit=5).status)
+        day = self.service.state['projects']['alpha']['created_at'][:10]
+        self.assertFalse(self.backend.retired_on_host('alpha'))
+        # What retire-project leaves: nothing under projects/, an entry under retired/.
+        retired = self.canonical_root / 'retired' / 'alpha-20261006T101500Z'
+        retired.parent.mkdir(exist_ok=True)
+        shutil.move(str(self.canonical_root / 'projects' / 'alpha'), str(retired))
+        self.assertTrue(self.backend.retired_on_host('alpha'))
+        sentence = ('You created project alpha on this server on %s, and it has since been retired there, so it is no '
+                    'longer served. The name is not available: choose another name.' % day)
+        again_in = self.login('olive', 'olive-password-1')[0]
+        # The same request from a new session (its answer is no longer stored), another key, and none.
+        for token, key in ((again_in, 'create-alpha-1'), (self.olive, 'create-alpha-2'), (self.olive, None)):
+            with self.subTest(key=key), patch.object(self.backend, 'create_host_project',
+                                                     side_effect=AssertionError('asked the endpoint')):
+                mine = self.create(token, 'alpha', key=key)
+                self.assertEqual(self.said(mine), (409, 'conflict', sentence))
+                self.assertEqual(mine.data['error']['detail'], {'project': 'alpha', 'state': 'retired'})
+                self.assertNotIn('You already have', json.dumps(mine.data))
+        # Nobody else learns that, or anything.
+        other = self.create(self.carl, 'alpha', key='create-alpha-9')
+        self.assertEqual(self.said(other), (409, 'conflict', pc.NOT_AVAILABLE % 'alpha'))
+        self.assertNotIn('retired', json.dumps(other.data))
+        # A project that is merely absent (never retired) is not called retired; nor one that is served
+        # again under the name; nor when the root cannot be read.
+        shutil.move(str(retired), str(self.canonical_root / 'elsewhere'))
+        self.assertFalse(self.backend.retired_on_host('alpha'))
+        shutil.move(str(self.canonical_root / 'elsewhere'), str(retired))
+        (self.canonical_root / 'projects' / 'alpha' / '.beads').mkdir(parents=True)
+        (self.canonical_root / 'projects' / 'alpha' / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+        self.assertFalse(self.backend.retired_on_host('alpha'))
+        self.assertEqual(self.create(self.olive, 'alpha', key='create-alpha-3').data['error']['detail'],
+                         {'project': 'alpha', 'state': 'yours'})
+        import admin
+        with patch.object(admin, 'retired_entries', side_effect=PermissionError(13, 'Permission denied')):
+            self.assertFalse(self.backend.retired_on_host('beta'))
+
+    def test_the_page_shows_the_retired_sentence_on_the_name_and_links_nothing(self):
+        source = (KIT / 'web' / 'js' / 'views' / 'work.js').read_text(encoding='utf-8')
+        # The notice with its link is for the state "yours" alone; every other 409 goes to the name's field.
+        self.assertEqual(source.count("e.detail.state === 'yours'"), 1)
+        self.assertNotIn("'retired'", source)
+        self.assertIn("if (e.status === 422 || e.status === 409 || e.status === 403) { setFieldError(form, 'new_project_id', e.message); return true; }", source)
+
+    def test_the_digest_of_the_creating_request_is_in_no_view(self):
+        created = self.create(self.olive, 'alpha', key='create-alpha-1')
+        self.assertEqual(201, created.status)
+        digest = self.service.state['projects']['alpha']['host_created']['operation']
+        self.assertRegex(digest, r'^[0-9a-f]{64}$')
+        self.assertEqual(200, self.request('PUT', '/v1/projects/alpha/members/%s' % self.ids['carl'],
+                                           {'role': 'viewer'}, token=self.admin).status)
+        answers = [created,
+                   self.request('GET', '/v1/projects/alpha', token=self.olive),
+                   self.request('GET', '/v1/projects/alpha', token=self.carl),
+                   self.request('GET', '/v1/projects', token=self.olive),
+                   self.request('GET', '/v1/projects', token=self.carl),
+                   self.request('GET', '/v1/projects', token=self.admin),
+                   self.create(self.olive, 'alpha', key='create-alpha-1')]          # the stored answer, again
+        for answer in answers:
+            self.assertIn(answer.status, (200, 201), answer.data)
+            self.assertNotIn(digest, json.dumps(answer.data))
+            self.assertNotIn('"operation"', json.dumps(answer.data))
+        # The rest of how it came to be is still shown, and the record keeps the digest.
+        shown = self.request('GET', '/v1/projects/alpha', token=self.carl).data['host_created']
+        self.assertEqual((shown['by'], shown['adopted']), (self.ids['olive'], False))
+        self.assertEqual(self.service.state['projects']['alpha']['host_created']['operation'], digest)
+
+    def test_yours_is_never_said_to_a_credential_of_the_creator(self):
+        """The route refuses a credential before it looks at the name; the rule itself says so too."""
+        import types
+        self.assertEqual(201, self.create(self.olive, 'alpha', key='create-alpha-1').status)
+        record = self.service.state['projects']['alpha']
+        handler = types.SimpleNamespace(service=self.service)
+        mine = http_service.ApiHandler._created_here_by
+        session = types.SimpleNamespace(user_id=self.ids['olive'], via='session')
+        self.assertTrue(mine(handler, record, session))
+        self.assertFalse(mine(handler, record, types.SimpleNamespace(user_id=self.ids['olive'], via='credential')))
+        self.assertFalse(mine(handler, record, types.SimpleNamespace(user_id=self.ids['carl'], via='session')))
+
     # ---- 2. the sentence, by whether the request carried a key ---------------------------------------------
     def test_a_write_without_a_key_is_not_told_to_send_the_same_key(self):
         waited = TimeoutError('Timed out waiting for lock /srv/state.json.lock')
@@ -1842,31 +1960,50 @@ class HeldLockTests(Case):
 
     # ---- 6. the server's configuration file cannot be read --------------------------------------------------
     def test_a_configuration_fault_is_said_without_the_file(self):
+        """On every route that asks the endpoint, however that route reads a return code of 2.
+
+        Review of kittrial-5bb.156: the onboarding route passed the endpoint's line on as a refusal of the
+        text (422 with the path of the file), and a file that could not be opened kept its PermissionError.
+        """
         self.assertEqual(201, self.create(self.olive, 'alpha').status)
         self.backend.READ_CACHE_SECONDS = 0
         self.addCleanup(delattr, self.backend, 'READ_CACHE_SECONDS')
         path = self.canonical_root / 'deployment.private.json'
-        line = 'ValueError: Deployment configuration %s is not valid JSON: Expecting value: line 3 column 1 (char 40)\n' % path
-        reply = {'returncode': 2, 'stdout': '', 'stderr': line, 'fault': 'configuration'}
-        real = self.backend._endpoint
+        lines = ('ValueError: Deployment configuration %s is not valid JSON: Expecting value: line 3 column 1 (char 40)\n' % path,
+                 'ValueError: Deployment configuration %s is not a JSON object\n' % path,
+                 "PermissionError: [Errno 13] Permission denied: '%s'\n" % path)
+        reply = {'returncode': 2, 'stdout': '', 'fault': 'configuration'}
 
-        def endpoint(action, *args, **kwargs):
+        def ask(action, *args, **kwargs):
             return dict(reply)
         sentence = ("The server's configuration cannot be read, so this request was not carried out. Ask an operator of "
                     'the server to look.')
+        onboarding = '/v1/projects/alpha/onboarding'
         calls = (('a read', lambda: self.request('GET', '/v1/projects/alpha/tasks', token=self.olive)),
-                 ('a write', lambda: self.create_task(self.olive, 'alpha', 'a task')))
-        for label, call in calls:
-            with self.subTest(what=label), patch.object(self.backend, '_endpoint', endpoint):
-                answer, log = self.logged(call)
-                self.assertEqual(self.said(answer), (503, 'server_configuration', sentence))
-                for leak in (str(self.canonical_root), 'deployment.private.json', 'Expecting value', 'JSON', 'ValueError'):
-                    self.assertNotIn(leak, json.dumps(answer.data))
-                self.assertIn('configuration: the endpoint could not read the deployment configuration for', log)
-                self.assertIn('deployment.private.json is not valid JSON', log)
+                 ('a write', lambda: self.create_task(self.olive, 'alpha', 'a task')),
+                 ('the onboarding text read', lambda: self.request('GET', onboarding, token=self.olive)),
+                 ('the onboarding text set', lambda: self.request('PUT', onboarding, {'text': 'Read docs/README.md.'},
+                                                                  token=self.olive, key='onboarding-set-0001')),
+                 ('the onboarding text cleared', lambda: self.request('DELETE', onboarding, token=self.olive,
+                                                                      key='onboarding-clear-0001')),
+                 ('proposals', lambda: self.request('GET', '/v1/projects/alpha/proposals', token=self.olive)),
+                 ('reference records', lambda: self.request('GET', '/v1/projects/alpha/references', token=self.olive)))
+        for line in lines:
+            reply['stderr'] = line
+            for label, call in calls:
+                with self.subTest(what=label, line=line[:40]), patch.object(self.backend, '_ask', ask):
+                    answer, log = self.logged(call)
+                    self.assertEqual(self.said(answer), (503, 'server_configuration', sentence))
+                    for leak in (str(self.canonical_root), 'deployment.private.json', 'Expecting value', 'JSON',
+                                 'ValueError', 'PermissionError', 'Errno', 'Permission denied'):
+                        self.assertNotIn(leak, json.dumps(answer.data))
+                    self.assertIn('configuration: the endpoint could not read the deployment configuration for', log)
+                    self.assertIn('deployment.private.json', log)
+                    self.assertIn(line.split(': ')[0] + ': ', log)       # the endpoint's own words, for the operator
         # The same line without the mark is a refusal of the request, as before.
         reply.pop('fault')
-        with patch.object(self.backend, '_endpoint', endpoint):
+        reply['stderr'] = lines[0]
+        with patch.object(self.backend, '_ask', ask):
             self.assertEqual(422, self.request('GET', '/v1/projects/alpha/tasks', token=self.olive).status)
 
 
