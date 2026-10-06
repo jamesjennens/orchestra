@@ -90,6 +90,12 @@ class ConfigurationTests(unittest.TestCase):
             with self.assertRaises(admin.ConfigurationUnreadable) as caught:
                 admin.operators(root)
             self.assertIn('Deployment configuration %s is not ' % marker, str(caught.exception))
+            # A host command says it in one line, beginning as it always did.
+            line = 'Deployment configuration %s is not valid JSON: Expecting value' % marker
+            with mock.patch.object(admin, 'main', side_effect=admin.ConfigurationUnreadable(line)), \
+                    self.assertRaises(SystemExit) as stopped:
+                admin.run_main()
+            self.assertEqual(str(stopped.exception), 'ValueError: ' + line)
             # A whole file reads as before.
             marker.write_text('{"operators": ["ops"]}', encoding='utf-8')
             self.assertEqual(admin.config(root), {'operators': ['ops']})

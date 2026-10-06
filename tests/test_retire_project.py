@@ -543,7 +543,10 @@ class RestoreNoticeCase(unittest.TestCase):
             for read in (admin.config, admin.operators, admin.verifiers):
                 with self.subTest(read=read.__name__), self.assertRaises(ValueError) as refused:
                     read(root)
-                self.assertIs(type(refused.exception), ValueError)
+                # The kit's own refusal, so admin.py answers it in one line; since kittrial-5bb.156 it is
+                # the kit's own class for this file, and no longer exactly ValueError.
+                self.assertIs(type(refused.exception), admin.ConfigurationUnreadable)
+                self.assertTrue(admin.kit_refusal(refused.exception))
                 self.assertIn('Deployment configuration %s is not valid JSON: Expecting' % marker,
                               str(refused.exception))
             marker.write_text(json.dumps({'port': 13317, 'operators': [OPERATOR]}), encoding='utf-8')
