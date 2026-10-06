@@ -37,8 +37,14 @@ def symlink_member(name, linkname):
     return item
 
 
-@unittest.skipUnless(sys.platform.startswith('linux'), 'Linux release install only')
-class OfficeReleaseTests(unittest.TestCase):
+class ReleaseFixture(unittest.TestCase):
+    """A source repository and the three archives a release is built from; no tests of its own."""
+
+    #: Stand-ins that start and say a version, as the real binaries do (kittrial-5bb.161: the
+    #: release tool starts every bundled binary at build and at install time).
+    BD = b'#!/bin/sh\necho "bd version 1.2.2 (fixture)"\n'
+    DOLT = b'#!/bin/sh\necho "dolt version 2.2.0"\n'
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -53,11 +59,11 @@ class OfficeReleaseTests(unittest.TestCase):
             b'#!/bin/sh\necho Python 3.10.0\n', mode=0o755))
         self.bd_archive = self.base/'bd.tar.gz'
         self.dolt_archive = self.base/'dolt.tar.gz'
-        self.bd_archive.write_bytes(tar_bytes('bd', b'bd'))
-        self.dolt_archive.write_bytes(tar_bytes('dolt', b'dolt'))
-        (self.repo/'versions.json').write_text(json.dumps({
-            'bd': {'sha256': sha(self.bd_archive.read_bytes())},
-            'dolt': {'sha256': sha(self.dolt_archive.read_bytes())}}), encoding='utf-8')
+        self.bd_archive.write_bytes(tar_bytes('bd', self.BD, mode=0o755))
+        self.dolt_archive.write_bytes(tar_bytes('bin/dolt', self.DOLT, mode=0o755))
+        self.lock = {'bd': {'sha256': sha(self.bd_archive.read_bytes()), 'member': 'bd'},
+                     'dolt': {'sha256': sha(self.dolt_archive.read_bytes()), 'member': 'bin/dolt'}}
+        (self.repo/'versions.json').write_text(json.dumps(self.lock), encoding='utf-8')
         (self.repo/'VERSION').write_text('0.1.0\n', encoding='utf-8')
         (self.repo/'client.py').write_text('pass\n', encoding='utf-8')
         (self.repo/'version.py').write_text('pass\n', encoding='utf-8')
@@ -66,7 +72,8 @@ class OfficeReleaseTests(unittest.TestCase):
 
     def commit(self):
         subprocess.check_call(['git', '-C', str(self.repo), 'add', '.'])
-        subprocess.check_call(['git', '-C', str(self.repo), 'commit', '-qm', 'fixture'])
+        if subprocess.call(['git', '-C', str(self.repo), 'diff', '--cached', '--quiet']):     # something changed
+            subprocess.check_call(['git', '-C', str(self.repo), 'commit', '-qm', 'fixture'])
         return subprocess.check_output(['git', '-C', str(self.repo), 'rev-parse', 'HEAD'],
                                        text=True).strip()
 
@@ -74,16 +81,23 @@ class OfficeReleaseTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(SCRIPT), *map(str, args)],
                               capture_output=True, text=True)
 
-    def build(self, build_id):
+    def try_build(self, build_id, *more):
         output = self.base/(build_id+'.tar.gz')
         result = self.run_tool('build', '--repo', self.repo, '--commit', 'HEAD',
             '--build-id', build_id, '--python-archive', self.python_archive,
             '--python-sha256', sha(self.python_archive.read_bytes()),
             '--python-executable', 'bin/python3', '--bd-archive', self.bd_archive,
-            '--dolt-archive', self.dolt_archive, '--output', output)
+            '--dolt-archive', self.dolt_archive, '--output', output, *more)
+        return result, output
+
+    def build(self, build_id, *more):
+        result, output = self.try_build(build_id, *more)
         self.assertEqual(result.returncode, 0, result.stderr)
         return output
 
+
+@unittest.skipUnless(sys.platform.startswith('linux'), 'Linux release install only')
+class OfficeReleaseTests(ReleaseFixture):
     def test_install_upgrade_and_rollback(self):
         first = self.build('build-a')
         install_root = self.base/'installation'

@@ -108,7 +108,19 @@ class ClassificationCase(unittest.TestCase):
                                 reviewable={'t1'})])['text']
         self.assertIn('Contributions you could review: read the work, then record a recommendation or request '
                       'changes (you cannot approve; an owner decides):', text)
-        self.assertRegex(text, r'- task t1 .*state awaiting-review; .*delivered by ')
+        # This row does not say who delivered (an endpoint older than the service): nobody is named
+        # as the deliverer, and the assignee is given as the assignee (kittrial-5bb.154).
+        self.assertRegex(text, r'- task t1 .*state awaiting-review; .*; delivered by: not stated by this server '
+                               r'\(the task is assigned to .*\(usr_other\)\)')
+        named = dict(row('t1', 'awaiting-review', OTHER), contribution_author='agent_k', author_name='Kestrel')
+        text = prompt([classify(reviewer, [named], project=project, reviewable={'t1'})])['text']
+        self.assertRegex(text, r'- task t1 .*state awaiting-review; .*; delivered by "agent_k" \(agent_k\); ')
+        self.assertNotIn('not stated', text)
+        nobody = dict(row('t1', 'awaiting-review', None))
+        text = prompt([classify(reviewer, [nobody], project=project, reviewable={'t1'})])['text']
+        self.assertRegex(text, r'- task t1 .*; delivered by: not stated by this server(;|$)', )
+        text = prompt([classify(reviewer, [row('t1', 'awaiting-review', OTHER)], project=project,
+                                reviewable={'t1'})])['text']
         self.assertNotIn('recommended by', text)
         recommended = dict(row('t1', 'awaiting-review', OTHER), recommended_by=['agent_x', 'usr_y'])
         owner_text = prompt([classify(OWNER, [recommended])])['text']
@@ -148,8 +160,8 @@ class PromptCase(unittest.TestCase):
         self.assertEqual('action', result['kind'])
         self.assertEqual('Copy prompt for olive-coord', result['label'])
         self.assertIn('- task t1 "Task t1": state awaiting-review; RE-REVIEW of revision 2, '
-                      'commit %s, contribution id con_t1; delivered by "Carl Contributor" '
-                      '(usr_other); waiting 2 days' % ('a' * 40), text)
+                      'commit %s, contribution id con_t1; delivered by: not stated by this server (the task is '
+                      'assigned to "Carl Contributor" (usr_other)); waiting 2 days' % ('a' * 40), text)
         self.assertIn('Approved, not yet integrated', text)
         self.assertIn('Stale claims: claimed, no recorded activity for 72 hours or more', text)
         self.assertIn('- task t4 "Task t4": assignee "Carl Contributor" (usr_other); no delivery '

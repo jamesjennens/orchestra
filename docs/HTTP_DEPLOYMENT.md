@@ -518,6 +518,21 @@ the result after the last.
     operator of the server to look before you try again.", and the line goes to the
     service's log (`create-project NAME answered a line that is not a creation
     sentence: ...`). This also covers an endpoint older than the rule.
+- **A refused follow-on base arrives whole** (kittrial-5bb.158). A canonical refusal's last
+  line is handed on up to 200 characters (6000 for a checkpoint, which lists every
+  problem). The follow-on base refusal of the review action is longer, and cut at 200 it
+  lost its reason, the recorder's name and what an operator must do. When the line is
+  exactly that sentence (`review_workflow.BASE_REFUSAL`: the kit's own words, hexadecimal
+  commit ids, a recorder name of a constrained shape) it is handed on whole, up to 1500
+  characters, and it is the `message` of the 422 as well as the `detail`. No other line
+  gets the larger limit, so a caller's own text is never echoed back at that length.
+- **What a caller without the web service reads** (kittrial-5bb.149, .158). Over SSH the
+  endpoint's own lines arrive as they are: its busy line names the lock file it waited
+  for, and its refusal when `deployment.private.json` cannot be read names that file.
+  That caller is somebody who was given the endpoint. The web service does not pass the
+  busy line on (below). A configuration file that cannot be read is answered 503 with no
+  path from the release that contains kittrial-5bb.156; before it, a member's request is
+  answered 422 with the endpoint's line.
 - **Busy, on every route** (kittrial-5bb.149). When the endpoint could not get a lock in
   time it answers return code 75 with a line that names the lock file. The service does
   not pass that line on. A read answers 503 `busy` with `Retry-After` and the service's
@@ -1641,8 +1656,19 @@ line separately and unconfined.
       not counted are on the row as `recommended_unchecked` and are used for that one
       question only. Update the endpoint and the service together and none of this is
       seen (docs/REVIEWS.md, "A mixed installation").
+    - **"Already recommended?" is asked by person** (kittrial-5bb.154), of an agent's
+      actions and of My work alike: an agent is not offered a delivery that it, its
+      owner or another agent of its owner has recommended, and My work does not list
+      it under "Contributions you could review". (An agent used to be asked whether
+      THIS AGENT had recommended it, so a person's second agent was offered it.)
+      Another person's agent is still offered it. A second recommendation by the same
+      person is refused with 409 and the sentence in docs/REVIEWS.md, which names the
+      ways on: request changes, or wait for a revision or a decision.
     - The prompt's "delivered by" names the contribution's author when the row gives
       it, not the task's assignee, so a reassignment does not rename who delivered.
+      When the row does not give it (a mixed installation, above) the prompt reads
+      "delivered by: not stated by this server (the task is assigned to NAME)": the
+      assignee is named as the assignee, and nobody as the one who delivered.
     - After a reassignment the new assignee's agent lists the task as
       `awaiting-review` ("Waiting for a human review decision."). That is meant: the
       task is that agent's now, whoever delivered the contribution on it, and there is
