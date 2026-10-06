@@ -315,6 +315,8 @@ class UncertainOutcome(Exception):
 # The canonical Beads project name rule, as admin.validate_name enforces it on the host
 # and endpoint.py on every request: 2-24 lowercase letters/digits, beginning with a letter.
 CANONICAL_PROJECT = re.compile(r'[a-z][a-z0-9]{1,23}')
+#: A calendar day as the server's own records write it.
+DAY = re.compile(r'[0-9]{4}-[0-9]{2}-[0-9]{2}')
 REGISTER_HINT = ('A project is created on the coordination host by an operator (admin.py add-project NAME); '
                  'a superuser then registers it here with that name.')
 NO_CANONICAL = ('This project has no canonical Beads project behind it (it was created by an older kit), so its '
@@ -1251,6 +1253,28 @@ class EndpointBackend:
 
     def _endpoint(self, action, project, actor, args, attachments=None, operation_id=None,
                   authority=None, require_authority=False, route=None, check_usable=True, timeout=None):
+        """One answer of the canonical endpoint; its mark of a configuration fault is raised here.
+
+        Here and not where a route reads the answer, so that no route can hand the
+        endpoint's line (the path of the file, the parser's or the system's words) to the
+        person: some routes read a return code of 2 their own way (kittrial-5bb.156 review).
+        """
+        reply = self._ask(action, project, actor, args, attachments, operation_id, authority,
+                          require_authority, route, check_usable, timeout)
+        if isinstance(reply, dict) and reply.get('returncode') == 2 and reply.get('fault') == 'configuration':
+            # The server's own configuration file cannot be read: the endpoint's line names the
+            # file and the parser's words. Those are for the operator, in this service's log;
+            # the person is told who to ask. Nothing was carried out.
+            said = (reply.get('stderr') or '').strip().splitlines()
+            print('configuration: the endpoint could not read the deployment configuration for %s: %s'
+                  % (action or 'a request', ascii(said[-1][:600]) if said else '(nothing)'), file=sys.stderr, flush=True)
+            refused = HttpError(503, 'server_configuration', self.CONFIGURATION_UNREADABLE)
+            refused.nothing_done = True
+            raise refused
+        return reply
+
+    def _ask(self, action, project, actor, args, attachments, operation_id, authority,
+             require_authority, route, check_usable, timeout):
         if isinstance(project, str):
             # A record the backend will not serve is refused here, before any endpoint
             # process starts: a `proj_...` id (no canonical project can be behind it;
@@ -1261,6 +1285,20 @@ class EndpointBackend:
                 None if CANONICAL_PROJECT.fullmatch(project) else ('no-canonical', NO_CANONICAL))
             if verdict is not None:
                 raise conflict(verdict[1])
+        store = self.service.store
+        if authority and store.unsaved_since is not None:
+            # The endpoint reads the session's idle deadline from the state file. A last-use
+            # stamp that is only in memory (Store.save_soon) is written before the endpoint is
+            # asked, so a live session is never refused as idle for it; when the lock still
+            # cannot be had the request is answered busy, and nothing was sent.
+            try:
+                store.save()
+            except TimeoutError as waited:
+                print('busy: the state could not be saved before %s was sent to the endpoint, so it was not sent: %s'
+                      % (action, ascii(str(waited)[:400])), file=sys.stderr, flush=True)
+                not_sent = busy()
+                not_sent.nothing_done = True
+                raise not_sent from None
         if self.runner is not None:
             return self.runner(action=action, project=project, actor=actor, args=args,
                                attachments=attachments or {}, operation_id=operation_id,
@@ -1364,6 +1402,10 @@ class EndpointBackend:
             raise uncertain('Canonical command failed; outcome may be unknown')
         return _canonical_payload(stdout)
 
+    #: Said when the endpoint reports that the server's configuration file cannot be read.
+    CONFIGURATION_UNREADABLE = ("The server's configuration cannot be read, so this request was not carried out. "
+                                'Ask an operator of the server to look.')
+
     @staticmethod
     def _log_busy(action, stderr):
         """Which lock, and how long: the endpoint's own line, for the operator, in the service log."""
@@ -1409,7 +1451,10 @@ class EndpointBackend:
             # failure) for a mutation whose identity it still reserves. Preserve that
             # uncertainty in the HTTP receipt too, so an exact retry reconciles
             # through the durable operation identity instead of releasing the key.
-            if failure.status == 503:
+            # Not when the answer itself says that nothing was carried out (kittrial-5bb.156):
+            # the request was never sent to the endpoint, or the endpoint could not read the
+            # server's configuration and refused it.
+            if failure.status == 503 and not getattr(failure, 'nothing_done', False):
                 raise UncertainOutcome() from None
             raise
         # The endpoint's guarded section linearized live authority with the effect, so
@@ -1989,6 +2034,34 @@ class EndpointBackend:
     READ_CACHE_SECONDS = 20
     #: ``review_states`` is derived from ``review_queue`` (see the handler's reuse).
     REVIEW_STATES_FROM_QUEUE = True
+
+    def creation_identity(self, principal, name, key, body_hash):
+        """The digest kept with a host-created project for the request that registered it.
+
+        Of the request as it was authenticated: the operation identity the endpoint journals
+        the creation under (the account and its credential, the route, the project name and
+        the idempotency key) and the hash of the request body. So "the same request again"
+        is the same account sending the same body with the same key, and nothing else.
+        Only the digest is kept: the web record holds neither the key nor the body.
+        """
+        operation = self._result_key(principal, None, 'projects.host-create', key, name)
+        return hashlib.sha256(('%s %s' % (operation, body_hash or '-')).encode('utf-8')).hexdigest()
+
+    def retired_on_host(self, project):
+        """Whether an operator retired ``project`` on the host, so that nothing is served under the name.
+
+        Read from the root itself: no endpoint process and no lock, so the answer to a
+        creator's repeat never waits for either (kittrial-5bb.156 review). What cannot be
+        read says nothing against the project.
+        """
+        try:
+            import admin
+            root = Path(self.root)
+            if (root / 'projects' / project / '.beads' / 'metadata.json').is_file():
+                return False
+            return any(name == project for name, _ in admin.retired_entries(root))
+        except (OSError, ValueError):
+            return False
 
     def create_host_project(self, principal, name, key):
         """Create project ``name`` on the host for ``principal`` (kittrial-5bb.118 part 2).
@@ -2635,6 +2708,14 @@ class ApiHandler(BaseHTTPRequestHandler):
     #: carried out already, so "not completed" would not always be true.
     BUSY_UNCERTAIN = ('The server was busy and cannot say whether this request was carried out. Look before you '
                       'repeat it, or send it again with the same idempotency key.')
+    #: The same for a write that carried no idempotency key (kittrial-5bb.156): there is no key
+    #: to send again, and a repeat is a second request.
+    BUSY_UNCERTAIN_NO_KEY = ('The server was busy and cannot say whether this request was carried out. Look before '
+                             'you repeat it: sent again without an idempotency key, it may be carried out twice.')
+    #: `_mutate`'s own two, for an outcome the endpoint left unknown.
+    UNCERTAIN = 'The operation may have committed; reconcile with the same idempotency key'
+    UNCERTAIN_NO_KEY = ('The operation may have committed. Look before you repeat it: sent again without an '
+                        'idempotency key, it may be carried out twice.')
 
     def _dispatch(self, method):
         if getattr(self, '_guarded', False):
@@ -2645,6 +2726,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         # handler instance, so the cache is reset for every request and never outlives it.
         self._agent_task_cache = {}
         self._request_reads = {}
+        # What the answer to a lock wait that runs out depends on: whether the route had begun
+        # (before it, nothing can have been carried out), which route, and whether a key came.
+        begun = None
         try:
             parsed = urlsplit(self.path)
             path = parsed.path
@@ -2672,6 +2756,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             ctx = RouteContext(self._principal, payload, query, params, request_id,
                                self._idempotency_key(), self._body_hash, auth_source,
                                self._is_secure(), route_target)
+            begun = (name, ctx.idempotency_key is not None)
             status, response = getattr(self, name)(ctx)
             self._send_json(status, response)
         except HttpError as error:
@@ -2687,11 +2772,14 @@ class ApiHandler(BaseHTTPRequestHandler):
             # For a write the wait may have run out AFTER the effect: a creation was made and
             # registered, and the lock for the receipt could not be had (seen on real bd,
             # kittrial-5bb.149). The service does not know which, and says so.
-            if method in ('GET', 'HEAD'):
+            # Not every write: before the route began nothing was carried out, and a log-in that
+            # was made and not answered is a session nobody holds (kittrial-5bb.156). Otherwise
+            # the sentence names the idempotency key only when the request carried one.
+            if method in ('GET', 'HEAD') or begun is None or begun[0] == 'sessions_create':
                 error = busy()
                 self._retry_after = error.retry_after
             else:
-                error = uncertain(self.BUSY_UNCERTAIN)
+                error = uncertain(self.BUSY_UNCERTAIN if begun[1] else self.BUSY_UNCERTAIN_NO_KEY)
             self._send_json(error.status, error.body(request_id))
         except ConnectionError:
             raise                                   # the client is gone: nothing to answer, and not an internal error
@@ -2860,7 +2948,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             with self.service.store.lock:
                 self.service.audit(request_id, principal, 'authorization', 'denied',
                                    reason=error.code)
-                self.service.store.save()
+                self.service.store.save_soon('the audit entry of a refusal')
         except Exception:
             pass
 
@@ -2978,8 +3066,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             self.service.audit(ctx.request_id, ctx.principal, route_name, 'unknown',
                                project_id=project_id, reason=reason or 'uncertain')
             self.service.store.save()
-            raise uncertain('The operation may have committed; reconcile with the same '
-                            'idempotency key')
+            raise uncertain(self.UNCERTAIN if ctx.idempotency_key is not None else self.UNCERTAIN_NO_KEY)
         except HttpError as error:
             self.service.idempotency_release(digest)
             # ``refused_reason`` lets a route whose target is not a registered project (a
@@ -2988,7 +3075,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                                'denied' if error.status in (401, 403) else 'rejected',
                                project_id=project_id,
                                reason=error.code if refused_reason is None else '%s: %s' % (error.code, refused_reason))
-            self.service.store.save()
+            # The refusal is the answer whether or not its audit entry can be saved now
+            # (kittrial-5bb.156): nothing was carried out, so a lock wait that runs out here
+            # must not turn it into "cannot say". The entry is written with the next save.
+            self.service.store.save_soon('the audit entry of a refusal')
             raise
         except Exception:
             self.service.idempotency_release(digest)
@@ -3404,6 +3494,19 @@ class ApiHandler(BaseHTTPRequestHandler):
             creation.update(allowed=False, reason='server-limit')
         return creation
 
+    #: Said to the account a project is registered to by its own creation, and to nobody else.
+    ALREADY_YOURS = 'You already have project %s: you created it on this server%s. Nothing was made again.'
+    #: The same, when an operator has since retired the project on the host: the page links nothing.
+    RETIRED_YOURS = ('You created project %s on this server%s, and it has since been retired there, so it is no '
+                     'longer served. The name is not available: choose another name.')
+
+    def _created_here_by(self, record, principal):
+        """Whether ``record`` is a project this account created on the host and still belongs to."""
+        made = record.get('host_created')
+        return principal.via != 'credential' and isinstance(made, dict) and made.get('by') == principal.user_id \
+            and record.get('created_by') == principal.user_id \
+            and principal.user_id in (self.service.state['memberships'].get(record.get('id')) or {})
+
     def _project_host_create(self, ctx, payload):
         """`POST /v1/projects` with `"create": true`: create the project on the host and register it.
 
@@ -3429,7 +3532,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.service.audit(ctx.request_id, principal, 'projects.host-create',
                                    'denied' if error.status in (401, 403) else 'rejected',
                                    reason='%s: create %s' % (error.code, shown))
-                self.service.store.save()
+                self.service.store.save_soon('the audit entry of a refusal')
             # The generic authorization entry would only repeat it.
             self._audited_refusal = True
             raise error
@@ -3447,11 +3550,32 @@ class ApiHandler(BaseHTTPRequestHandler):
             self.service._validate_project_name(name)
         except HttpError as error:
             refuse(error)
-        if self.service.state['projects'].get(project_id) is not None:
-            return self._refuse_unless_replay(ctx, 'projects.host-create',
-                                              conflict('Project name %s is not available: choose another name'
-                                                       % project_id), capability=CAP_PROJECT_HOST_CREATE)
         key = ctx.idempotency_key or ctx.request_id
+        identity = self.backend.creation_identity(principal, project_id, key, ctx.body_hash) \
+            if hasattr(self.backend, 'creation_identity') else None
+        existing = self.service.state['projects'].get(project_id)
+        again = False
+        if existing is not None:
+            refusal = conflict('Project name %s is not available: choose another name' % project_id)
+            if self._created_here_by(existing, principal):
+                # The creator's own repeat (kittrial-5bb.156). The exact request that registered
+                # it, sent again with its idempotency key: the endpoint's journal answers what
+                # happened and the project is returned, 201. Anything else from the creator is
+                # told that they have it. Nobody else learns who has the name, or since when.
+                made = existing.get('host_created') or {}
+                again = ctx.idempotency_key is not None and identity is not None and made.get('operation') == identity
+                day = str(existing.get('created_at') or '')[:10]
+                since = ' on ' + day if DAY.fullmatch(day) else ''
+                if hasattr(self.backend, 'retired_on_host') and self.backend.retired_on_host(project_id):
+                    # The web record outlives a retirement on the host. "You already have it", with
+                    # a link, would point at a project that answers "unknown" (review of .156).
+                    again = False
+                    refusal = conflict(self.RETIRED_YOURS % (project_id, since), {'project': project_id, 'state': 'retired'})
+                else:
+                    refusal = conflict(self.ALREADY_YOURS % (project_id, since), {'project': project_id, 'state': 'yours'})
+            if not again:
+                return self._refuse_unless_replay(ctx, 'projects.host-create', refusal,
+                                                  capability=CAP_PROJECT_HOST_CREATE)
 
         def create():
             try:
@@ -3459,8 +3583,15 @@ class ApiHandler(BaseHTTPRequestHandler):
             except HttpError as failure:
                 # Busy means nothing was done (another creation is running): it is answered as
                 # busy, to be sent again, and is not an outcome to reconcile.
-                if failure.status == 503 and failure.code != 'busy':
+                if failure.status == 503 and failure.code != 'busy' and not getattr(failure, 'nothing_done', False):
                     raise UncertainOutcome() from None
+                if again and failure.status == 409:
+                    # The same request for a project that is registered to this account, and the
+                    # endpoint will not answer it from its journal: sent from another session
+                    # (logged in again; the page keeps its key), the operation identity belongs
+                    # to the first one. Nothing was made, and the project is theirs: say that,
+                    # not "could not be created" (review of kittrial-5bb.156).
+                    raise refusal from None
                 raise
             if not isinstance(result, dict) or result.get('status') not in ('created', 'incomplete'):
                 raise UncertainOutcome()
@@ -3468,12 +3599,15 @@ class ApiHandler(BaseHTTPRequestHandler):
                 raise conflict(result.get('message') or 'Project %s did not finish; an operator must finish or '
                                'remove it' % project_id, {'project': project_id, 'state': 'incomplete',
                                                           'stage': result.get('stage')})
-            view = self._usable(self.service.register_host_created(principal, project_id, name, result))
+            view = self._usable(self.service.register_host_created(principal, project_id, name, result,
+                                                                   operation=identity))
             view['backup'] = result.get('backup')
             return view, view
         limit = 'none (superuser)' if creation['limit'] is None else str(creation['limit'])
         reason = 'create %s account=%s limit=%s count=%d' % (project_id, principal.user_id, limit,
-                                                              creation['used'] + 1)
+                                                              creation['used'] + (0 if again else 1))
+        if again:
+            reason += ' (the same request again; it is registered already)'
         return self._mutate(ctx, 'projects.host-create', None, create, status=201,
                             capability=CAP_PROJECT_HOST_CREATE, serialize=False, canonical=True, reason=reason,
                             refused_reason='create %s account=%s' % (project_id, principal.user_id))
@@ -3786,7 +3920,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             try:
                 result = self.backend.set_onboarding(ctx.principal, ctx.params['pid'], text, key)
             except HttpError as failure:
-                if failure.status == 503:
+                # Not when the answer says that nothing was carried out (the server's configuration
+                # could not be read; kittrial-5bb.156 review).
+                if failure.status == 503 and not getattr(failure, 'nothing_done', False):
                     raise UncertainOutcome() from None
                 raise
             kept = result.get('operator_text_kept_as') if isinstance(result, dict) else None
