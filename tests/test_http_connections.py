@@ -319,6 +319,9 @@ class SilentConnectionTests(Case):
             for _ in range(5):
                 status, _, _ = self.ask('GET', '/healthz')
                 self.assertEqual(status, 200)
+            until = time.monotonic() + 10                         # the answer comes before the thread has ended
+            while time.monotonic() < until and len(waited) < 5:
+                time.sleep(0.02)
         self.assertEqual(waited, [False] * 5)
         time.sleep(self.httpd.REAP_EVERY * 3)
         self.assertEqual((self.httpd._serving, self.httpd._begun), ({}, set()))
