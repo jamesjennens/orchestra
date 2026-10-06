@@ -868,11 +868,18 @@ write out itself (accounts, members, agents, credentials) it is the service's cl
 The same request sent again with its `Idempotency-Key` is answered with the stored
 body, so with the time of the write and not of the retry. Reads, refusals and uncertain
 answers carry none. A log-in and a log-out carry none either (they make or end a
-session and record nothing in a project). An answer whose body is not a JSON object has
-no top level to put it at: on the endpoint backend a task change (`PATCH .../tasks/ID`)
-and a claim (`POST .../tasks/ID/claim`) answer with the list bd prints, and so carry
-none; read the task afterwards for its `updated_at`, or use the client over SSH, whose
-answer has the field for every write. The web pages do not show it.
+session and record nothing in a project).
+
+The same value is in the response header **`X-Server-Time`** of every write that was
+carried out, whatever the shape of its body: a caller has one place to look. That
+matters for the answers that have no top level for the field: on the endpoint backend
+a task change (`PATCH .../tasks/ID`) and a claim (`POST .../tasks/ID/claim`) answer
+with the list bd prints, and some writes answer 204 with no body. The header is absent
+exactly where the field is absent for an object body: reads, refusals, busy and
+uncertain answers, a log-in and a log-out. A retried request gets the header with the
+time of the write, because the time is kept beside the stored answer; an answer that
+was stored by a kit from before this header has it on a retry only when its body is an
+object with `server_time`. The web pages do not show it.
 
 **Retry contract.** An exact retry sent no more than 29 days
 (`JOURNAL_RETRY_HORIZON_SECONDS`, the 30-day tombstone horizon minus the 24 h skew

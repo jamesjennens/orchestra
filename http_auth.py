@@ -2588,14 +2588,42 @@ class Service:
             })
         return digest
 
-    def idempotency_commit(self, digest, status, response):
+    def idempotency_commit(self, digest, status, response, written_at=None):
+        """Keep the answer of a committed write for a retry; ``written_at`` is the server's time of the write.
+
+        The time is kept beside the answer and not only in it, because an answer that is a
+        JSON list or empty has no field for it and its retry must carry the same header
+        (kittrial-5bb.97).
+        """
         if digest is None:
             return
         with self.store.lock:
             record = self.store.records.get('idempotency', digest)
             if record is not None:
                 record.update(state='committed', status=status, response=response)
+                if written_at is not None:
+                    record['written_at'] = written_at
                 self.store.records.put('idempotency', digest, record)
+
+    def idempotency_written_at(self, principal, project_id, route, key):
+        """The server's time kept with the committed answer of this request, or None.
+
+        An answer stored before the time was kept beside it has it only in its body, when
+        that is an object with ``server_time``.
+        """
+        if key is None:
+            return None
+        digest = self._idempotency_key(principal, project_id, route, key)
+        with self.store.lock:
+            record = self.store.records.get('idempotency', digest)
+        if not isinstance(record, dict) or record.get('state') != 'committed':
+            return None
+        kept = record.get('written_at')
+        if isinstance(kept, str):
+            return kept
+        body = record.get('response')
+        inside = body.get('server_time') if isinstance(body, dict) else None
+        return inside if isinstance(inside, str) else None
 
     def idempotency_unknown(self, digest):
         if digest is None:

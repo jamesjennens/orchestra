@@ -390,6 +390,10 @@ def unusable_projects(service):
     return items
 
 
+#: The response header that carries the server's time of a write that was carried out, on
+#: every such answer whatever the shape of its body (kittrial-5bb.97).
+SERVER_TIME_HEADER = 'X-Server-Time'
+
 #: The endpoint's ``server_time`` of the write the current thread's request carried out, if
 #: any (set by ``EndpointBackend._checked``, read and cleared by ``ApiHandler._mutate``).
 WRITTEN = threading.local()
@@ -2538,6 +2542,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _dispatch(self, method):
         if getattr(self, '_guarded', False):
             self.server.unwatch(self.connection)        # the request line and headers are here: the service's time now
+        self._written_at = None                         # one connection serves request after request
         request_id = self._request_id()
         self._current_request_id = request_id
         # Per-request agent read cache. An HTTP/1.1 keep-alive connection reuses this
@@ -2776,6 +2781,11 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('Referrer-Policy', 'no-referrer')
         self.send_header('X-Request-Id', getattr(self, '_current_request_id', '') or '')
+        if getattr(self, '_written_at', None):
+            # Only an answer of a write that was carried out: a refusal after it has none.
+            if 200 <= status < 300:
+                self.send_header(SERVER_TIME_HEADER, self._written_at)
+            self._written_at = None
         if getattr(self, '_retry_after', None):
             self.send_header('Retry-After', str(int(self._retry_after)))
             self._retry_after = None
@@ -2860,6 +2870,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             if kind == 'replay':
                 # An exact retry must not re-deliver a one-time secret; the caller
                 # marks that with replay_status (200 metadata-only for issue routes).
+                # The header carries the time of the write, as kept with the stored answer.
+                self._written_at = self.service.idempotency_written_at(ctx.principal, project_id, idem_route, key)
                 return (replay_status or value), response
             digest = value
             # 'new' or 'reconcile': both proceed with the reserved digest; a canonical
@@ -2900,7 +2912,13 @@ class ApiHandler(BaseHTTPRequestHandler):
         for body in (public, stored):
             if isinstance(body, dict) and 'server_time' not in body:
                 body['server_time'] = at
-        self.service.idempotency_commit(digest, status, stored)
+        # And in a header, whatever the shape of the body: a JSON list or an empty answer has
+        # no field for it. An answer that already carries a time (a canonical retry answered
+        # from the endpoint's journal) keeps that one in both places.
+        if isinstance(public, dict) and isinstance(public.get('server_time'), str):
+            at = public['server_time']
+        self._written_at = at
+        self.service.idempotency_commit(digest, status, stored, written_at=at)
         self._forget_cached_reads(ctx.principal, project_id)
         self.service.audit(ctx.request_id, ctx.principal, route_name, 'committed',
                            project_id=project_id, reason=reason)

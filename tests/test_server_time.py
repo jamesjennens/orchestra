@@ -300,5 +300,106 @@ class HttpTests(test_http_agents.AgentHarness):
         self.assertEqual(left, [True])
         self.assertEqual((status, made['server_time']), (201, '2026-10-06T07:50:12+00:00'))
 
+class HeaderTests(test_http_agents.AgentHarness):
+    """`X-Server-Time`: the same value, on every carried-out write, whatever the shape of the body."""
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.admin_token()
+        self.project = self.create_project(self.admin, 'Alpha')
+        made = self.request('POST', '/v1/projects/%s/tasks' % self.project, {'title': 'a task'}, token=self.admin)
+        self.task = made.data['id']
+        self.made = made
+
+    def stamp(self, answer):
+        return answer.headers.get('x-server-time')
+
+    def test_an_object_answer_has_the_header_with_the_value_of_its_field(self):
+        self.assertEqual(self.made.status, 201)
+        self.assertRegex(self.stamp(self.made), '^%s$' % SHAPE.pattern)
+        self.assertEqual(self.stamp(self.made), self.made.data['server_time'])
+        self.assertEqual(http_service.SERVER_TIME_HEADER, 'X-Server-Time')
+
+    def test_reads_refusals_and_a_log_in_have_none(self):
+        for answer in (self.request('GET', '/v1/projects/%s/tasks' % self.project, token=self.admin),
+                       self.request('GET', '/v1/sessions/current', token=self.admin),
+                       self.request('POST', '/v1/projects/%s/tasks' % self.project, {'title': ''}, token=self.admin),
+                       self.request('POST', '/v1/projects/%s/tasks' % self.project, {'title': 'x'}),            # 401
+                       self.request('POST', '/v1/sessions', {'username': test_http_agents.ADMIN,
+                                                             'password': test_http_agents.ADMIN_PASSWORD}),
+                       self.request('GET', '/healthz')):
+            with self.subTest(status=answer.status):
+                self.assertIsNone(self.stamp(answer))
+
+    def list_answers(self):
+        """The endpoint backend answers a task change with the list bd prints: stand in for it."""
+        real = self.backend.invoke
+
+        def invoke(route, *args, **kwargs):
+            result = real(route, *args, **kwargs)
+            return [result] if route == 'tasks.update' else result
+        return mock.patch.object(self.backend, 'invoke', invoke)
+
+    def test_a_list_answer_has_the_header_and_its_retry_has_the_time_of_the_write(self):
+        path = '/v1/projects/%s/tasks/%s' % (self.project, self.task)
+        with self.list_answers():
+            with mock.patch.object(self.store, 'now', return_value=1791273012.0):
+                first = self.request('PATCH', path, {'title': 'renamed', 'version': 1}, token=self.admin, key='change-key-0001')
+            with mock.patch.object(self.store, 'now', return_value=1791273072.0):
+                again = self.request('PATCH', path, {'title': 'renamed', 'version': 1}, token=self.admin, key='change-key-0001')
+                other = self.request('PATCH', path, {'title': 'renamed twice', 'version': 2}, token=self.admin, key='change-key-0002')
+        self.assertEqual((first.status, type(first.data)), (200, list))
+        self.assertEqual(self.stamp(first), '2026-10-06T07:50:12+00:00')
+        self.assertEqual((again.status, again.data, self.stamp(again)), (200, first.data, '2026-10-06T07:50:12+00:00'))
+        self.assertEqual(self.stamp(other), '2026-10-06T07:51:12+00:00')
+
+    def test_the_retry_of_an_object_answer_has_the_header_of_the_write(self):
+        path = '/v1/projects/%s/tasks' % self.project
+        with mock.patch.object(self.store, 'now', return_value=1791273012.0):
+            first = self.request('POST', path, {'title': 'keyed'}, token=self.admin, key='task-key-0009')
+        with mock.patch.object(self.store, 'now', return_value=1791273072.0):
+            again = self.request('POST', path, {'title': 'keyed'}, token=self.admin, key='task-key-0009')
+        self.assertEqual(self.stamp(first), '2026-10-06T07:50:12+00:00')
+        self.assertEqual((again.data, self.stamp(again)), (first.data, '2026-10-06T07:50:12+00:00'))
+
+    def test_an_answer_stored_before_the_time_was_kept_beside_it(self):
+        """Its retry has the header from an object body's own field, and none where the body has no field."""
+        real = self.service.idempotency_commit
+
+        def as_before(digest, status, response, written_at=None):
+            return real(digest, status, response)
+        tasks = '/v1/projects/%s/tasks' % self.project
+        change = '%s/%s' % (tasks, self.task)
+        with mock.patch.object(self.service, 'idempotency_commit', as_before), self.list_answers():
+            first = self.request('POST', tasks, {'title': 'old kit'}, token=self.admin, key='old-key-0001')
+            listed = self.request('PATCH', change, {'title': 'old kit list', 'version': 1}, token=self.admin, key='old-key-0002')
+        with self.list_answers():
+            again = self.request('POST', tasks, {'title': 'old kit'}, token=self.admin, key='old-key-0001')
+            listed_again = self.request('PATCH', change, {'title': 'old kit list', 'version': 1}, token=self.admin, key='old-key-0002')
+        self.assertEqual(self.stamp(again), first.data['server_time'])
+        self.assertEqual((type(listed.data), listed_again.data), (list, listed.data))
+        self.assertIsNone(self.stamp(listed_again))
+
+    def test_a_header_does_not_stay_for_the_next_request_on_the_connection(self):
+        import http.client
+        connection = http.client.HTTPConnection('127.0.0.1', self.port, timeout=15)
+        self.addCleanup(connection.close)
+        headers = {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + self.admin}
+        seen = []
+        for method, path, body in (('POST', '/v1/projects/%s/tasks' % self.project, {'title': 'one'}),
+                                   ('GET', '/v1/projects/%s/tasks' % self.project, None),
+                                   ('POST', '/v1/projects/%s/tasks' % self.project, {'title': ''}),
+                                   ('POST', '/v1/projects/%s/tasks' % self.project, {'title': 'two'})):
+            connection.request(method, path, body=None if body is None else json.dumps(body), headers=headers)
+            response = connection.getresponse()
+            response.read()
+            seen.append((response.status, response.getheader('X-Server-Time') is not None))
+        self.assertEqual([present for _, present in seen], [True, False, False, True], seen)
+
+    def test_the_stored_time_is_read_only_for_a_committed_answer_of_that_request(self):
+        principal = self.service.authenticate(self.admin)
+        self.assertIsNone(self.service.idempotency_written_at(principal, self.project, 'tasks.create x', None))
+        self.assertIsNone(self.service.idempotency_written_at(principal, self.project, 'tasks.create x', 'no-such-key-0001'))
+
 if __name__ == '__main__':
     unittest.main()
