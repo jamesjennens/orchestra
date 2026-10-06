@@ -313,18 +313,55 @@ class FollowUpCase(RegisterHarness):
         self.assertTrue(self.service.state['projects']['legacy']['archived'])
 
     def test_the_host_check_lists_the_records_without_opening_the_store(self):
+        """The command reads the state document and nothing else; it is safe beside a running service.
+
+        The test used to compare the modification times of everything in the state folder
+        before and after. That folder also holds the record store of THIS harness's own
+        service, whose SQLite connections are closed whenever the collector gets to them,
+        and the last one to go folds the write-ahead log in and removes the -wal and -shm
+        files: now and then between the two looks (kittrial-5bb.172). So the three things
+        the comparison stood for are each shown on their own.
+        """
         import contextlib
         import io
+        import shutil
+        import sqlite3
+        import tempfile
+        from unittest import mock
         admin, alex = self.alex()
         self.legacy('legacy', self.user_id(alex))
         state = self.service.store.path
-        before = {path.name: path.stat().st_mtime_ns for path in state.parent.iterdir()}
-        with contextlib.redirect_stdout(io.StringIO()) as out:
-            self.assertEqual(0, http_service.main(['--state', str(state), '--list-unconfirmed-projects']))
-        listed = json.loads(out.getvalue())
-        self.assertEqual([(item['id'], item['kind'], item['created_by']['username']) for item in listed['items']],
-                         [('legacy', 'unconfirmed', 'alex')])
-        self.assertEqual(before, {path.name: path.stat().st_mtime_ns for path in state.parent.iterdir()})
+        expected = [('legacy', 'unconfirmed', 'alex')]
+
+        def listed(path):
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(0, http_service.main(['--state', str(path), '--list-unconfirmed-projects']))
+            return [(item['id'], item['kind'], item['created_by']['username']) for item in json.loads(out.getvalue())['items']]
+
+        # 1. It opens no store: neither the service's class nor a SQLite connection is asked for.
+        def opened(*args, **kwargs):
+            raise AssertionError('the host check opened the record store')
+        with mock.patch.object(http_service, 'Store', opened), mock.patch.object(sqlite3, 'connect', opened):
+            self.assertEqual(listed(state), expected)
+
+        # 2. In a folder no live service holds, with the state document alone: afterwards the
+        #    folder holds that one file, unchanged. No store was made and nothing was written.
+        alone = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, alone, ignore_errors=True)
+        copy = alone / 'state.json'
+        shutil.copy2(str(state), str(copy))
+        before = (copy.read_bytes(), copy.stat().st_mtime_ns)
+        self.assertEqual(listed(copy), expected)
+        self.assertEqual([path.name for path in alone.iterdir()], ['state.json'])
+        self.assertEqual((copy.read_bytes(), copy.stat().st_mtime_ns), before)
+
+        # 3. Beside the running service: the state document is not touched and no file appears.
+        #    The store's own side files are the harness's and are not compared.
+        names = {path.name for path in state.parent.iterdir()}
+        before = (state.read_bytes(), state.stat().st_mtime_ns)
+        self.assertEqual(listed(state), expected)
+        self.assertEqual((state.read_bytes(), state.stat().st_mtime_ns), before)
+        self.assertLessEqual({path.name for path in state.parent.iterdir()}, names)
         missing = state.parent / 'typo.json'
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             http_service.main(['--state', str(missing), '--list-unconfirmed-projects'])

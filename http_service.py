@@ -21,6 +21,7 @@ import binascii
 import hashlib
 import ipaddress
 import json
+import os
 import record_json
 import re
 import secrets
@@ -2529,14 +2530,21 @@ class ApiHandler(BaseHTTPRequestHandler):
         """
         server = self.server
         context = getattr(server, 'tls_context', None)
-        if context is not None:
-            self.request = context.wrap_socket(self.request, server_side=True, do_handshake_on_connect=False)
         self._guarded = hasattr(server, 'watch')
-        if self._guarded:
-            # The second half of the bound (see GuardedServer): no single wait on the client is
-            # longer than this, on every platform. A little longer than the deadline, so that
-            # it is the reaper that ends a wait wherever it can.
-            self.request.settimeout(server.client_seconds + server.TIMEOUT_MARGIN)
+        try:
+            if context is not None:
+                self.request = context.wrap_socket(self.request, server_side=True, do_handshake_on_connect=False)
+            if self._guarded:
+                # The second half of the bound (see GuardedServer): no single wait on the client is
+                # longer than this, on every platform. A little longer than the deadline, so that
+                # it is the reaper that ends a wait wherever it can.
+                self.request.settimeout(server.client_seconds + server.TIMEOUT_MARGIN)
+        except OSError as gone:
+            # The socket is closed already (the client reset it, or the server gave the
+            # connection up): there is nobody to serve, and it is not an error of the service.
+            # Never a traceback out of the thread (kittrial-5bb.175).
+            raise ConnectionAbortedError('the connection was closed before it was served: %s'
+                                         % (str(gone)[:120] or type(gone).__name__)) from None
         if context is not None:
             if self._guarded:
                 server.watch(self.request, server.client_seconds)
@@ -5472,6 +5480,7 @@ class GuardedServer(ThreadingHTTPServer):
         self.turned_away = 0             # connections closed for being over the limit
         self._said_no_thread = False
         self._serving = {}
+        self._begun = set()              # of those threads, the ones start() has returned for
         self._tls_said, self._tls_unsaid = None, 0
         self._stopping = threading.Event()
         self._reaper = threading.Thread(target=self._reap, name='connection-reaper', daemon=True)
@@ -5503,9 +5512,13 @@ class GuardedServer(ThreadingHTTPServer):
                     pass
             # A thread that was started and is no longer alive while its connection is still
             # registered died before it served (out of memory in its first steps).
+            # "Was started" is: start() has returned for it. Not "has an ident": a thread has
+            # its ident a few steps BEFORE it is marked started, and is_alive() is False until
+            # that mark, so a thread that was only starting looked dead, and an honest
+            # connection was closed under it (kittrial-5bb.175).
             with self._guard:
                 dead = [(thread, request) for thread, request in self._serving.items()
-                        if thread.ident is not None and not thread.is_alive()]
+                        if thread in self._begun and not thread.is_alive()]
             for thread, request in dead:
                 self._gave_up(thread, request, 'the thread ended before it served')
 
@@ -5545,10 +5558,15 @@ class GuardedServer(ThreadingHTTPServer):
                 self._serving.pop(thread, None)
                 self._open -= 1
             raise
+        else:
+            with self._guard:
+                if thread in self._serving:           # it may have served and gone already
+                    self._begun.add(thread)
 
     def _gave_up(self, thread, request, why):
         """No thread serves ``request``: close it, free its place, and say so the first time."""
         with self._guard:
+            self._begun.discard(thread)
             if self._serving.pop(thread, None) is None:
                 return
             self._open -= 1
@@ -5566,6 +5584,7 @@ class GuardedServer(ThreadingHTTPServer):
             super().process_request_thread(request, client_address)
         finally:
             with self._guard:
+                self._begun.discard(threading.current_thread())
                 if self._serving.pop(threading.current_thread(), None) is not None:
                     self._open -= 1
 
@@ -5650,6 +5669,34 @@ def create_server(service, backend, *, host='127.0.0.1', port=0, trusted_proxies
     return httpd
 
 
+def runtime_service_lock(root):
+    """Take the supervisor's runtime lock, or return None when a service holds it.
+
+    ``office_service.py run`` holds an exclusive flock on ``<root>/office-service.lock``
+    for its whole life. Taking the same lock here makes bootstrap and a running
+    service mutually exclusive: bootstrap is refused while a service runs (a running
+    service keeps the state in memory and writes it back, so an account added
+    underneath it is silently lost), and a service cannot start underneath a bootstrap
+    in progress. The caller holds the returned file descriptor until the bootstrap is
+    written, then releases it.
+
+    Raises ``ValueError`` on a platform without ``fcntl``, because the office service
+    is a POSIX deployment and silently skipping the guard would reintroduce the loss.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        raise ValueError('Bootstrapping needs the runtime lock, which requires a POSIX host') from None
+    path = Path(root)/'office-service.lock'
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
 def build_backend(service, args):
     """Select the canonical backend. ``endpoint`` is the documented Linux service."""
     if args.backend == 'endpoint':
@@ -5714,13 +5761,37 @@ def main(argv=None):
         items = unusable_projects(types.SimpleNamespace(state=document))
         print(json.dumps({'items': items, 'total': len(items)}, indent=2))
         return 0
-    store = Store(args.state)
     if args.bootstrap_user:
+        # Checked before the state store is opened, so a refusal neither reads nor
+        # writes the state a running service is about to save over.
+        if not args.root:
+            parser.error('--bootstrap-user needs --root: the runtime lock is what proves no service is running')
+        if not Path(args.root).is_dir():
+            # One plain sentence, checked before the lock is opened: os.open on a path
+            # under a missing root raises FileNotFoundError, and the review asked for a
+            # sentence instead of a traceback (kittrial-5bb.162 item bootstrap-docs-and-root).
+            print('Refusing to bootstrap %s: --root must name an existing runtime directory, and %s is not one.'
+                  % (args.bootstrap_user, args.root), file=sys.stderr)
+            return 1
+        lock_fd = runtime_service_lock(args.root)
+        if lock_fd is None:
+            print('Refusing to bootstrap %s: a service is running for runtime %s (it holds '
+                  'office-service.lock). Stop the service and bootstrap while it is stopped; a running '
+                  'service keeps its state in memory and writes it back, so the new account would be lost.'
+                  % (args.bootstrap_user, args.root), file=sys.stderr)
+            return 1
         import getpass
-        password = getpass.getpass('New superuser password: ')
-        Service.bootstrap_superuser(store, args.bootstrap_user, password)
+        try:
+            store = Store(args.state)
+            password = getpass.getpass('New superuser password: ')
+            Service.bootstrap_superuser(store, args.bootstrap_user, password)
+        finally:
+            import fcntl
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
         print('Bootstrapped %s' % args.bootstrap_user)
         return 0
+    store = Store(args.state)
     if args.backend == 'endpoint' and (not args.endpoint or not args.root):
         parser.error('--backend endpoint requires --endpoint and --root '
                      '(use --backend inprocess only for a disposable local check)')

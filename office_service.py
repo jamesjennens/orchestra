@@ -182,6 +182,40 @@ def _bootstrap_database(root):
         raise RuntimeError('Dolt root authentication did not become ready')
 
 
+def _install_binaries(root, assets):
+    """Install the pinned binaries, turning bootstrap's ``SystemExit`` into a failure.
+
+    ``bootstrap.install`` refuses a non-Linux host and a binary/receipt mismatch by
+    raising ``SystemExit``. That is not in ``main``'s handler, so prepare's own
+    contract ("a failed step fails prepare, with the reason") would depend on the
+    interpreter instead of the command. Raise an ordinary error carrying the same
+    sentence, which ``main`` prints and turns into exit code 1.
+    """
+    try:
+        admin.install_binaries(root, asset_dir=assets)
+    except SystemExit as error:
+        raise RuntimeError(str(error) or 'Installing the pinned binaries failed') from None
+
+
+def _verify_bd_starts(root):
+    """Run ``bd --version`` so a bundled bd that cannot start fails prepare here.
+
+    ``install_binaries`` verifies the archive and binary digests but never runs the
+    binary. A dynamically linked bd can be digest-correct and still be refused by the
+    loader on an older host (the rehearsal's pinned bd needs glibc 2.34), and the old
+    prepare only found out later, mid-command. Running it now reports the loader's own
+    sentence at prepare time. Only bd is checked here: it is the binary the rehearsal
+    showed can be digest-correct yet unstartable, and the pinned-binary start check at
+    build and install time is kittrial-5bb.161's separate change.
+    """
+    path = root/'bin/bd'
+    try:
+        admin.checked([path, '--version'], env=admin.environment(root))
+    except (OSError, subprocess.CalledProcessError) as error:
+        detail = (getattr(error, 'stderr', '') or str(error)).strip()
+        raise RuntimeError('%s cannot start: %s' % (path, detail or error)) from None
+
+
 def prepare(root, db_port):
     if not 1024 <= db_port <= 65535:
         raise ValueError('Database port must be unprivileged')
@@ -191,11 +225,12 @@ def prepare(root, db_port):
         cfg = admin.config(root)
         if cfg.get('port') != db_port or not (root/'server.json').is_file():
             raise ValueError('Existing deployment has different or incomplete settings')
-        admin.install_binaries(root, asset_dir=assets)
+        _install_binaries(root, assets)
+        _verify_bd_starts(root)
         return
     root.mkdir(parents=True, exist_ok=True)
     root.chmod(0o700)
-    admin.install_binaries(root, asset_dir=assets)
+    _install_binaries(root, assets)
     for name in ('data', 'projects', 'backups', 'config', 'dolt-home', 'home'):
         (root/name).mkdir(exist_ok=True)
     import secrets
@@ -209,6 +244,9 @@ def prepare(root, db_port):
               'metrics': {'port': -1}}
     admin.atomic_private_write(root/'server.json', json.dumps(server, indent=2)+'\n')
     admin.atomic_private_write(root/'deployment.private.json', json.dumps(cfg, indent=2)+'\n')
+    # After the private configuration exists: bd's runtime environment is scoped with
+    # HOME under the runtime, which reads the stored deployment password.
+    _verify_bd_starts(root)
     env = admin.environment(root)
     admin.checked([root/'bin/dolt', 'config', '--global', '--add', 'metrics.disabled', 'true'], env=env)
     admin.checked([root/'bin/dolt', 'config', '--global', '--add', 'user.name', 'Orchestra service'], env=env)
