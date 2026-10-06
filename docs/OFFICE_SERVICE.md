@@ -276,6 +276,28 @@ service bounds what such a connection costs, in all three shapes:
   its request (at most 256 KiB) or taking a response takes more than 30
   seconds.
 
+**Log-in attempts need no credentials, so their cost is bounded.** A password
+check takes 16 MiB of memory for about a tenth of a second, and they are made
+one at a time. Two bounds keep a flood of attempts, with any user names, from
+costing more than that:
+
+- Every check is computed in one thread of the web process, so the memory of
+  one check is what the process keeps, whatever the number of connections.
+  Measured on koopa with 50, 190 and 400 attempts at the same moment: the web
+  process went from 34 MB to a peak of 52 to 54 MB and stayed there. (Before,
+  190 attempts left 3 GB resident: each connection's thread kept its own
+  16 MiB. That was the C allocator, not the checks running at once.)
+- At most **16 log-ins are in flight at once** (one being checked, the others
+  waiting their turn, 1.6 seconds at most). One more is answered at once with
+  503 `busy`, `Retry-After: 5`, "Too many people are logging in at this moment.
+  Try again in a few seconds.", whatever the user name: nothing is checked and
+  nothing is counted against the name. Somebody who is already logged in is
+  not affected.
+
+What this does not do: while attempts keep arriving faster than 10 a second,
+a person logging in may be told to try again; the lockout per user name and
+address is unchanged.
+
 ## External scheduler commands
 
 The scheduler should set a private working directory, pass the log and runtime

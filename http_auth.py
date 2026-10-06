@@ -238,11 +238,64 @@ def now_iso(timestamp):
 
 
 # ------------------------------------------------------------------- password verifier
+class _PasswordWorker:
+    """Every scrypt computation of the process runs in this one long-lived thread (kittrial-5bb.170).
+
+    One computation takes 16 MiB. The web service serves each connection in a thread of
+    its own, and the C allocator keeps a freed block of that size in the arena of the
+    thread that asked for it: 190 log-in attempts on 190 connections left 3 GB resident
+    (measured; with one arena, 71 MB), although the checks ran one after another. With
+    one thread asking, one arena holds it: what stays is one computation's worth, however
+    many connections ask and whatever the allocator's settings are.
+
+    The caller waits for its own result; an error of the computation is raised in the
+    caller, as if it had computed there. A process that forks gets a new worker.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._jobs = None
+        self._thread = None
+        self._pid = None
+
+    def _start(self):
+        import queue
+        self._jobs = queue.Queue()
+        self._pid = os.getpid()
+        self._thread = threading.Thread(target=self._run, args=(self._jobs,), name='password-worker', daemon=True)
+        self._thread.start()
+
+    @staticmethod
+    def _run(jobs):
+        while True:
+            arguments, done = jobs.get()
+            try:
+                done['result'] = hashlib.scrypt(arguments[0], **arguments[1])
+            except BaseException as error:  # noqa: BLE001 - handed to the caller, which raises it
+                done['error'] = error
+            done['event'].set()
+
+    def scrypt(self, password, **parameters):
+        with self._lock:
+            if self._thread is None or self._pid != os.getpid() or not self._thread.is_alive():
+                self._start()
+            jobs = self._jobs
+        done = {'event': threading.Event()}
+        jobs.put(((password, parameters), done))
+        done['event'].wait()
+        if 'error' in done:
+            raise done['error']
+        return done['result']
+
+
+_PASSWORD_WORKER = _PasswordWorker()
+
+
 def hash_password(password, *, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P):
     _validate_password(password)
     salt = os.urandom(SCRYPT_SALT)
-    derived = hashlib.scrypt(password.encode('utf-8'), salt=salt, n=n, r=r, p=p,
-                             dklen=SCRYPT_DKLEN)
+    derived = _PASSWORD_WORKER.scrypt(password.encode('utf-8'), salt=salt, n=n, r=r, p=p,
+                                      dklen=SCRYPT_DKLEN)
     return 'scrypt$%d$%d$%d$%s$%s' % (n, r, p, salt.hex(), derived.hex())
 
 
@@ -254,8 +307,8 @@ def verify_password(verifier, password):
         if scheme != 'scrypt':
             return False
         salt_bytes, expected = bytes.fromhex(salt), bytes.fromhex(digest)
-        derived = hashlib.scrypt(password.encode('utf-8'), salt=salt_bytes, n=int(n),
-                                 r=int(r), p=int(p), dklen=len(expected))
+        derived = _PASSWORD_WORKER.scrypt(password.encode('utf-8'), salt=salt_bytes, n=int(n),
+                                          r=int(r), p=int(p), dklen=len(expected))
     except (ValueError, TypeError, MemoryError, OverflowError):
         return False
     return hmac.compare_digest(derived, expected)
@@ -789,6 +842,9 @@ class Service:
         #: setup/resume snippets. It is deployment configuration, never request data.
         self.public_url = (public_url or '').rstrip('/') or None
         self._failures = {}
+        self._logins_guard = threading.Lock()
+        self._logins = 0
+        self.logins_turned_away = 0
         self.lookup_max = lookup_max
         self.lookup_window = lookup_window
         self._lookups = {}
@@ -1199,8 +1255,32 @@ class Service:
         key = self._throttle_key(username, source)
         self._failures.setdefault(key, []).append(self._now())
 
+    #: Log-in attempts in flight at once: one being checked and the rest waiting their turn
+    #: (the check is made under the state lock, one at a time, about 0.1 s each). One more is
+    #: answered busy at once, before any check, so that a flood of attempts costs neither
+    #: memory nor a queue without end (kittrial-5bb.170).
+    LOGINS_AT_ONCE = 16
+    LOGIN_BUSY = 'Too many people are logging in at this moment. Try again in a few seconds.'
+
     def login(self, username, password, source='local', request_id=None):
         """Uniform failure response; never reveals whether the account exists."""
+        with self._logins_guard:
+            full = self._logins >= self.LOGINS_AT_ONCE
+            if not full:
+                self._logins += 1
+            else:
+                self.logins_turned_away += 1
+        if full:
+            # Nothing was checked and nothing is counted against the name or the address. Not
+            # audited per attempt either: a flood must not fill the audit log.
+            raise busy(self.LOGIN_BUSY, retry_after=5)
+        try:
+            return self._login(username, password, source, request_id)
+        finally:
+            with self._logins_guard:
+                self._logins -= 1
+
+    def _login(self, username, password, source, request_id):
         try:
             self._check_throttle(username, source)
         except HttpError:
