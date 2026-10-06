@@ -166,6 +166,22 @@ class TableTests(unittest.TestCase):
             with self.subTest(argv=argv):
                 self.assertIsNone(rc.write_targets(argv), argv)
 
+    def test_a_joined_value_belongs_to_the_last_letter_of_a_cluster(self):
+        # A joined value is the value of the cluster's LAST letter, so `-wq=false` is `-w` with
+        # `-q=false`: --watch is still on and must be refused. The mutation that hands the joined
+        # value to EVERY letter reads the false as belonging to w and lets the read through, and bd
+        # then watches there (kittrial-5bb.146 item 1; the surviving mutation of the .138 review).
+        for argv in (['list', '-wq=false'], ['list', '-wv=0'], ['list', '-wr=false'],
+                     ['show', 'pp-1', '-wq=false']):
+            with self.subTest(argv=argv):
+                request = rc.write_targets(argv)
+                self.assertTrue(request['refusal'], argv)
+                self.assertIn('waits for changes', request['refusal'])
+        # The same joined value on the last letter is that letter's value, so the read stays a read.
+        for argv in (['list', '-qw=false'], ['list', '-qw=0'], ['show', 'pp-1', '-qw=false']):
+            with self.subTest(argv=argv):
+                self.assertIsNone(rc.write_targets(argv), argv)
+
 
 @unittest.skipIf(BD is None, 'no real bd binary (set ORCHESTRA_BD_BIN or put bd on PATH)')
 class RealBdHelpTests(unittest.TestCase):
