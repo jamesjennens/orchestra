@@ -1616,7 +1616,9 @@ def require_integrated_follow_on(payload, state, ordered, rows, task, assignee=N
     * the shared per-scope integration evidence (kittrial-5bb.24,
       ``review_state.integration`` over ``review_state.scopes_for``) must record a
       passed ``integrated`` fact for the prior contribution's FULL commit, and the
-      follow-on ``base_commit`` must equal that scope's ``integration_commit``.
+      follow-on ``base_commit`` must be that scope's ``integration_commit`` or an
+      integration commit the project recorded after it (kittrial-5bb.148; see
+      ``recorded_integrations`` for what that can and cannot know).
       Any scope order is accepted, so recording a newer scope for other work does
       not make a genuinely integrated prior un-followable -- the older defect that
       read only the task's single current ``lifecycle`` scope.
@@ -1665,9 +1667,90 @@ def require_integrated_follow_on(payload, state, ordered, rows, task, assignee=N
                          'integrated lifecycle fact scoped to the prior contribution commit, read from '
                          'the shared review-state projection (an operator-reverted integration commit '
                          'does not count), before an additive follow-on can use it as its base')
-    if payload['base_commit'].lower() != evidence['integration_commit'].lower():
-        raise ValueError('Contribution base_commit must equal the prior integration commit '
-                         + evidence['integration_commit'])
+    base = payload['base_commit'].lower()
+    if base == evidence['integration_commit'].lower():
+        return
+    # Main usually moves before a follow-on is ready (kittrial-5bb.148). The base may also
+    # be an integration commit this project recorded AFTER the prior one. See
+    # recorded_integrations for what that can and cannot know.
+    recorded, newest = recorded_integrations(rows, task, evidence, operators, journal)
+    found = recorded.get(base)
+    if found == 'later':
+        return
+    why = {None: 'this project has no passed integrated fact that names it as an integration commit',
+           'earlier': 'this project recorded it as an integration commit before the prior integration, or at the '
+                      'same time, not after it',
+           'reverted': 'an operator revert names it'}[found]
+    raise ValueError('Contribution base_commit must be the prior integration commit %s, or an integration commit '
+                     'this project recorded after it (a passed integrated fact on any task, not reverted)%s. '
+                     '%s is not accepted: %s'
+                     % (evidence['integration_commit'],
+                        '; the newest such commit is %s' % newest if newest else '; none is recorded yet',
+                        payload['base_commit'], why))
+
+
+def _recorded_at(value):
+    """A tracker timestamp as an aware datetime, or None when it cannot be read."""
+    import datetime
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        stamp = datetime.datetime.fromisoformat(value[:-1] + '+00:00' if value.endswith('Z') else value)
+    except ValueError:
+        return None
+    return stamp if stamp.tzinfo is not None else stamp.replace(tzinfo=datetime.timezone.utc)
+
+
+def recorded_integrations(rows, task, prior, operators=None, journal=None):
+    """``({commit: 'later' | 'earlier' | 'reverted'}, newest later commit or None)`` for a follow-on's base.
+
+    ``prior`` is the integration evidence of ``task``'s prior revision (``review_state.integration``).
+    A commit reads ``later`` when a passed ``integrated`` fact on ANY task of the project
+    names it as its scope's ``integration_commit``, the event that recorded that fact was
+    created strictly after the event that recorded the prior revision's integration, and no
+    operator revert that the host journal confirms names the commit, on any task. Both
+    times are the tracker's own stamps on the event rows, never a caller's. A time that is
+    missing or cannot be read is not "after".
+
+    **What this cannot know.** The endpoint has no git repository, so it cannot tell that
+    a recorded integration commit descends from the prior one. It knows only that the
+    project recorded it, later, as an integration. Two release lines in one project, or a
+    fact recorded with the wrong commit, would pass; the reviewer checks the base as for
+    any contribution. A commit of main that no lifecycle fact names is never accepted.
+    """
+    from lifecycle import integration_evidence
+    from review_state import reverts_by_task
+    created = {row.get('id'): _recorded_at(row.get('created_at')) for row in rows
+               if isinstance(row, dict) and row.get('issue_type') == 'event'}
+    reverted = set()
+    for found in reverts_by_task(rows, operators, journal)[0].values():
+        reverted |= {str(record.get('integration_commit') or '').lower() for record in found}
+    evidence = integration_evidence(rows)
+    # When the prior revision's own integration was recorded: the event of its scope on this task.
+    prior_time = None
+    for scope in next((entry['scopes'] for entry in evidence if entry['id'] == task), []):
+        if scope.get('scope_token') == prior.get('scope_token'):
+            prior_time = created.get((scope.get('integrated') or {}).get('event_id'))
+    recorded, newest, rank = {}, None, {'reverted': 2, 'later': 1, 'earlier': 0}
+    for entry in evidence:
+        for scope in entry['scopes']:
+            fact = scope.get('integrated') or {}
+            commit = str((scope.get('scope') or {}).get('integration_commit') or '').lower()
+            if fact.get('value') != 'passed' or not commit:
+                continue
+            stamp = created.get(fact.get('event_id'))
+            if commit in reverted:
+                reading = 'reverted'
+            elif prior_time is not None and stamp is not None and stamp > prior_time:
+                reading = 'later'
+            else:
+                reading = 'earlier'
+            # A commit recorded more than once: a revert wins, then any later recording.
+            if commit not in recorded or rank[reading] > rank[recorded[commit]]:
+                recorded[commit] = reading
+            if reading == 'later' and (newest is None or stamp > newest[0]):
+                newest = (stamp, commit)
+    return recorded, (newest[1] if newest else None)
 
 
 def _retry_matches(stored, incoming):
