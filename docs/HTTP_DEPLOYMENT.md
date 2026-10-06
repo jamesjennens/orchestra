@@ -543,6 +543,114 @@ the result after the last.
   `uncertain` ("reconcile with the same idempotency key"), which names no path either.
   A creation passes on only its own two busy sentences (another creation is running;
   the project is made and registering it had to wait).
+- **A write the service cannot answer for: "cannot say"** (kittrial-5bb.149, .156). The
+  service saves its own state under a lock it shares with the endpoint. When a wait for
+  that lock runs out after a route began, a write is answered 503 `uncertain`, with no
+  `Retry-After`: the request may have been carried out (a creation was made and
+  registered, and only the save could not be done). Which sentence depends on the
+  request:
+  - with an `Idempotency-Key`: "The server was busy and cannot say whether this request
+    was carried out. Look before you repeat it, or send it again with the same
+    idempotency key." Sending it again with the same key is safe: it is answered with
+    what happened.
+  - without one: "... Look before you repeat it: sent again without an idempotency key,
+    it may be carried out twice." A task create repeated blindly is a second task. The
+    web interface always sends a key.
+  - the same rule for the other uncertain answer of a write ("The operation may have
+    committed; reconcile with the same idempotency key" or, without a key, "The
+    operation may have committed. Look before you repeat it: ...").
+  - a log-in (`POST /v1/sessions`) is answered 503 `busy` instead ("not completed. Send
+    it again in a moment."): a session that was made and not answered is one nobody
+    holds. So is any write whose wait ran out before its route began.
+- **A refusal is answered as it is while the lock is held** (kittrial-5bb.156). The audit
+  entry of a refused write is saved without a long wait (5 seconds the first time, then
+  no wait at all until a save succeeds). When it cannot be saved it stays in the
+  service's memory and is written with the next save, and the log says `busy: the audit
+  entry of a refusal was not saved ...`. So "Project NAME was made on the server;
+  registering it had to wait for a lock" reaches the creator also when the lock stays
+  held longer than the service's own wait.
+- **A creator who asks again for a project they already have** (kittrial-5bb.156). The
+  web record of a host-created project keeps a digest of the request that registered it
+  (`host_created.operation`). The same request sent again, with the same idempotency
+  key, is sent to the endpoint, whose journal answers what happened, and is answered 201
+  with the project: this is what follows a "cannot say". Any other creation request for
+  that name from its creator (a new key, or none) is answered 409 "You already have
+  project NAME: you created it on this server on DATE. Nothing was made again." with
+  `detail` `{"project": NAME, "state": "yours"}`; the page shows it as a notice with a
+  link, not as an error on the name. The date is the web record's own. Only the account
+  the project is registered to by its own creation, and that is still a member of it,
+  gets that sentence. Every other account gets "Project name NAME is not available:
+  choose another name", with nothing about who has the name or since when. A record
+  written by an earlier kit has no digest, so its creator's repeat with the old key is
+  answered with the 409 sentence, not 201. Three more cases:
+  - The same request from **another session** of the same account (logged in again; the
+    page keeps its key). The endpoint's operation identity belongs to the session that
+    made the project, so it will not answer from its journal; the service answers the
+    409 "You already have project NAME ..." (not "could not be created").
+  - A project an operator has since **retired on the host** (`admin.py retire-project`)
+    keeps its web record. Its creator is told 409 "You created project NAME on this
+    server on DATE, and it has since been retired there, so it is no longer served. The
+    name is not available: choose another name.", `detail` `{"project": NAME, "state":
+    "retired"}`, shown on the name like any other refusal, with no link. The service
+    reads that from the root itself (no endpoint process, no lock).
+  - The digest is the service's own. It is not part of the project view any reader gets.
+- **The last-use stamp of a request does not wait a minute** (kittrial-5bb.156). Every
+  authenticated request stamps the session's (or credential's, and agent's) last use
+  and saves the state, because the endpoint checks a session's idle deadline against
+  the file. That save waits 5 seconds for the lock the first time; when the lock cannot
+  be had the stamp stays in memory, the request goes on, and until a save succeeds every
+  further request tries once without waiting (log: `busy: a last-use stamp was not
+  saved ...`, once, then `The state is saved again ...`). What follows from a stamp that
+  is only in memory, both ways:
+  - If the service stops before the next save, the last use is lost and the session
+    reads as idle sooner after the restart. That is the safe side. Nothing lets a
+    session live past its deadline: the service decides from its own memory first, where
+    a deadline that has passed refuses the request whatever is unsaved.
+  - A live session is not refused as idle by the endpoint because of it. A read does not
+    carry the session to the endpoint. A write that does is not sent until the state is
+    saved: the service saves first (waiting up to the full minute) and, when the lock
+    still cannot be had, answers 503 `busy`, "not completed", having sent nothing (log:
+    `busy: the state could not be saved before ACTION was sent to the endpoint, so it was
+    not sent`). So the longest a stamp stays unsaved is until the next request after the
+    lock is free, and never past a write that reaches the endpoint.
+  What this does NOT change, while the lock is held: only a read the service answers by
+  itself is answered at once. A read that needs the endpoint still waits for the
+  endpoint's own wait (up to 60 seconds) and is then answered 503 `busy`, as before.
+  And a request that arrives while a write or a log-in is itself waiting for the lock
+  queues behind it in the service (a read was seen to wait 54 seconds that way).
+- **The server's configuration file cannot be read** (kittrial-5bb.156). Every failure
+  to read `deployment.private.json` is one fault of the server: the file is not there,
+  is not a regular file (a directory, a dangling link, a FIFO: refused at once, the
+  endpoint does not wait on a FIFO), cannot be opened (closed to the service's user,
+  for example), is not text, is not JSON (cut
+  short), is not a JSON object, has no `password`, or has an `operators` or `verifiers`
+  that is not a list. The endpoint's line names the file with the parser's or the
+  system's words; the endpoint marks that answer (`"fault": "configuration"`), and the
+  service answers 503 `server_configuration`, "The server's configuration cannot be
+  read, so this request was not carried out. Ask an operator of the server to look.",
+  on every route, for reads and writes alike. The line is in the service's log only
+  (`configuration: the endpoint could not read the deployment configuration for
+  ACTION: ...`). What is and is not stopped:
+  - The file is read **only where it is used**. A request that needs nothing from it is
+    answered as if it were whole: reading, setting and clearing a project's onboarding
+    text, for example. Everything that starts bd needs it (the database password is in
+    it), so task reads and every write are refused while it is damaged. Creating a
+    project is refused with the same answer (not "could not be created; try again":
+    trying again does not help).
+  - A write that reserves an operation identity reads the file before it reserves, so
+    it is refused with nothing done and its idempotency key stays usable: the same
+    request works once the file is repaired. (Read for the first time inside the guarded
+    write, it left the operation "outcome unknown" with nothing written, and the same
+    key answered that until the reservation expired.)
+  - Any `admin.py` command on the host names the file, as before. A caller who reaches
+    the endpoint without the web service still reads the endpoint's own line.
+- **Restart the web service in the same step as the files** (kittrial-5bb.156). The
+  service is a long-running process and the endpoint is started anew for every request,
+  so replacing the kit's files changes the endpoint at once and the service only when it
+  is restarted. A service of the previous kit left running over the new endpoint applies
+  the old rules to the new answers: it was seen to register, for a superuser, a
+  half-made project whose creation record is damaged (201), which the new service
+  refuses (409). Replace the files and restart the service together.
 - **A registered project does not depend on its creation record** (kittrial-5bb.149).
   The endpoint serves a project that is initialized and whose creation record is
   absent, finished or damaged; it refuses one whose record reads running, incomplete or

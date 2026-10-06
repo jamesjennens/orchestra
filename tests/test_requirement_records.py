@@ -993,6 +993,8 @@ class RequirementRecordTests(unittest.TestCase):
             project = root / 'projects' / 'p'
             (project / '.beads').mkdir(parents=True)
             (project / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+            # A server always has its configuration file; a guarded write reads it first (kittrial-5bb.156).
+            (root / 'deployment.private.json').write_text('{"password": "not-used"}', encoding='utf-8')
             payload = self.draft()
             with patch.object(endpoint, 'project_dir', return_value=project), \
                     patch.object(endpoint, 'environment', return_value={}), \

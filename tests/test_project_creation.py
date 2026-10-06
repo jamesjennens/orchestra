@@ -838,7 +838,21 @@ class UnopenableRecordTests(Operators):
         self.assertEqual((listed['done']['state'], listed['done']['served']), ('damaged', True))
         self.assertTrue(listed['done']['command'].startswith(
             'projects/done is initialized and is SERVED WITH A DAMAGED CREATION RECORD: the kit cannot tell whether its '
-            'creation finished. the record cannot be read'), listed['done']['command'])
+            'creation finished. The project itself is used as before; only its name is held. the record cannot be read, '
+            'so the name is held: no web request can create or register a project called done. Look at the file'),
+            listed['done']['command'])
+        # A directory that is only partly made is not served, and is not said to be (kittrial-5bb.156).
+        (self.root / 'projects' / 'part').mkdir(parents=True)
+        (self.root / 'projects' / 'part' / 'left-over').write_text('x', encoding='utf-8')
+        (pc.records_dir(self.root) / 'part.json').write_text('{not json', encoding='utf-8')
+        self.assertEqual(pc.made(self.root, 'part'), 'partial')
+        part = {item['project']: item for item in pc.attention(self.root)}['part']
+        self.assertEqual((part['state'], part['served']), ('damaged', False))
+        self.assertTrue(part['command'].startswith('the record cannot be read, so the name is held: no web request can '
+                                                    'create or register a project called part.'), part['command'])
+        (pc.records_dir(self.root) / 'part.json').unlink()
+        (self.root / 'projects' / 'part' / 'left-over').unlink()
+        (self.root / 'projects' / 'part').rmdir()
         self.assertIn('admin.py remove-creation done --actor OPERATOR --reason REASON', listed['done']['command'])
         self.assertEqual(sorted(pc.server_names(self.root)), ['done', 'half', 'stalled'])
 
