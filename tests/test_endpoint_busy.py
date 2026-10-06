@@ -48,13 +48,19 @@ class EndpointTests(unittest.TestCase):
 
 class BackendTests(unittest.TestCase):
     def test_the_busy_code_of_the_endpoint_is_503_busy_with_a_delay(self):
-        with self.assertRaises(http_service.HttpError) as caught:
-            http_service.EndpointBackend._checked({'returncode': 75, 'stdout': '',
-                                                   'stderr': 'Busy: Timed out waiting for lock x. Nothing was done; try again shortly.\n'})
+        import contextlib
+        line = 'Busy: Timed out waiting for lock /srv/runtime/state.json.lock. Nothing was done; try again shortly.'
+        logged = io.StringIO()
+        with self.assertRaises(http_service.HttpError) as caught, contextlib.redirect_stderr(logged):
+            http_service.EndpointBackend._checked({'returncode': 75, 'stdout': '', 'stderr': line + '\n'}, 'review')
         error = caught.exception
         self.assertEqual((error.status, error.code), (503, 'busy'))
-        self.assertIn('Nothing was done', error.message)
+        # The service's own sentence on every route (kittrial-5bb.149): no lock, no path, and
+        # no claim that nothing was done.
+        self.assertEqual(error.message, 'The server is busy and this request was not completed. Send it again in a moment.')
         self.assertEqual(error.retry_after, 30)
+        # Which lock, and for which action, still reaches the operator in the service's log.
+        self.assertEqual(logged.getvalue().strip(), 'busy: the endpoint answered return code 75 for review: %r' % line)
         with self.assertRaises(http_service.HttpError) as caught:
             http_service.EndpointBackend._checked({'returncode': 124, 'stdout': '', 'stderr': ''})
         self.assertEqual(caught.exception.code, 'uncertain')
@@ -67,7 +73,27 @@ class ServiceTests(test_http_agents.AgentHarness):
             answer = self.request('GET', '/v1/projects', token=admin)
         self.assertEqual(answer.status, 503, answer.data)
         self.assertEqual(answer.data['error']['code'], 'busy')
-        self.assertIn('nothing was done', answer.data['error']['message'])
+        self.assertEqual(answer.data['error']['message'],
+                         'The server is busy and this request was not completed. Send it again in a moment.')
+        self.assertEqual(answer.headers.get('retry-after'), '30')
+
+    def test_a_state_lock_wait_that_runs_out_during_a_write_does_not_say_it_was_not_completed(self):
+        """kittrial-5bb.149, seen on real bd: a creation was made and registered, and the lock for the
+        receipt could not be had. For a write the service cannot know, and says so."""
+        admin = self.admin_token()
+        import contextlib
+        logged = io.StringIO()
+        waited = TimeoutError('Timed out waiting for lock /srv/state.json.lock')
+        with mock.patch.object(self.service, 'create_user', side_effect=waited), contextlib.redirect_stderr(logged):
+            answer = self.request('POST', '/v1/accounts', {'username': 'zoe'}, token=admin)
+        # Which lock reaches the operator in the service's log, and nobody else.
+        self.assertIn("busy: a wait for a lock ran out in the service for POST: 'Timed out waiting for lock "
+                      "/srv/state.json.lock'", logged.getvalue())
+        self.assertEqual((answer.status, answer.data['error']['code']), (503, 'uncertain'), answer.data)
+        self.assertEqual(answer.data['error']['message'],
+                         'The server was busy and cannot say whether this request was carried out. Look before you '
+                         'repeat it, or send it again with the same idempotency key.')
+        self.assertNotIn('lock', json.dumps(answer.data))
         # Afterwards the service answers as usual.
         self.assertEqual(self.request('GET', '/v1/projects', token=admin).status, 200)
 

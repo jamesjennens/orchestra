@@ -1149,6 +1149,42 @@ class HostFailureTests(Case):
         os.chmod(self.records, 0o700)
         self.assertEqual([(i['project'], i['state']) for i in pc.attention(self.canonical_root)], [('alpha', 'incomplete')])
 
+    def test_a_lock_wait_that_runs_out_once_the_project_is_made_does_not_say_nothing_was_done(self):
+        """The action itself: busy, with a sentence that is true, and the same request then registers it."""
+        import http_authority
+        root = self.canonical_root
+
+        def initialize(root, name, stage):
+            (root / 'projects' / name / '.beads').mkdir(parents=True)
+            (root / 'projects' / name / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+        config = http_authority.AuthorityConfig(str(self.store.path))
+        request = self.request_for('olive', self.olive)
+        with patch.object(http_authority, 'run_guarded', side_effect=TimeoutError('Timed out waiting for lock')):
+            answer = pc.create_action(root, request, config, initialize=initialize)
+        self.assertEqual(answer, {'returncode': pc.BUSY_RETURNCODE, 'stdout': '', 'stderr': pc.MADE_WAITING % 'alpha' + '\n'})
+        self.assertEqual(self.record('alpha')['state'], 'created')
+        again = pc.create_action(root, request, config, initialize=initialize)
+        self.assertEqual(again['returncode'], 0, again)
+        self.assertTrue(json.loads(again['stdout'])['adopted'])
+        # A lock that cannot be had before anything is made is the plain busy answer, and nothing is made.
+        with patch.object(http_authority, 'file_lock', side_effect=TimeoutError('Timed out waiting for lock')):
+            early = pc.create_action(root, dict(request, project='beta', operation_id='op-guard-2'), config,
+                                     initialize=initialize)
+        self.assertEqual((early['returncode'], early['stderr']), (pc.BUSY_RETURNCODE, pc.BUSY + '\n'))
+        self.assertFalse(self.on_host('beta'))
+        self.assertIsNone(self.record('beta'))
+        # The service passes the sentence on as 503 busy.
+        real = self.backend._endpoint
+
+        def endpoint(action, *args, **kwargs):
+            if action != 'create-project':
+                return real(action, *args, **kwargs)
+            return {'returncode': 75, 'stdout': '', 'stderr': pc.MADE_WAITING % 'gamma' + '\n'}
+        with patch.object(self.backend, '_endpoint', endpoint):
+            waiting = self.create(self.olive, 'gamma')
+        self.assertEqual((waiting.status, waiting.data['error']['code'], waiting.data['error']['message']),
+                         (503, 'busy', pc.MADE_WAITING % 'gamma'))
+
     def test_the_service_passes_on_only_a_creation_sentence(self):
         """The second layer, alone: whatever an endpoint of any kit answers with return code 2."""
         import contextlib
@@ -1196,6 +1232,230 @@ class HostFailureTests(Case):
         with self.assertRaises(ValueError) as caught:
             admin.validate_name('Not A Name')
         self.assertEqual(str(caught.exception), pc.NAME_RULE)        # the one sentence that is admin.py's own
+
+
+class BusyAndUnreadableTests(Case):
+    """kittrial-5bb.149: busy on every route in the service's own words; records the host cannot read."""
+
+    BUSY = 'The server is busy and this request was not completed. Send it again in a moment.'
+    LOCK_LINE = 'Busy: Timed out waiting for lock %s. Nothing was done; try again shortly.\n'
+
+    def setUp(self):
+        super().setUp()
+        self.grant(limit=5)
+        self.records = self.canonical_root / 'project-creations'
+        self.records.mkdir(parents=True, exist_ok=True)
+
+    call, descriptor, request_for = EndpointGuardTests.call, EndpointGuardTests.descriptor, EndpointGuardTests.request_for
+
+    def clean(self, answer):
+        text = json.dumps(answer.data)
+        for leak in (str(self.canonical_root), str(self.tmp), 'project-creations', 'Error', 'Errno', 'Traceback', '.json',
+                     '.lock', 'state.json'):
+            self.assertNotIn(leak, text)
+
+    def answering(self, wanted, reply):
+        real = self.backend._endpoint
+
+        def endpoint(action, *args, **kwargs):
+            return dict(reply) if wanted in (None, action) else real(action, *args, **kwargs)
+        return patch.object(self.backend, '_endpoint', endpoint)
+
+    def logged(self, call):
+        import contextlib
+        import io
+        log = io.StringIO()
+        with contextlib.redirect_stderr(log):
+            answer = call()
+        return answer, log.getvalue()
+
+    def test_any_route_answers_busy_in_the_services_own_words(self):
+        self.assertEqual(201, self.create(self.olive, 'alpha').status)
+        line = self.LOCK_LINE % (str(self.store.path) + '.lock')
+        busy = {'returncode': 75, 'stdout': '', 'stderr': line}
+        self.backend.READ_CACHE_SECONDS = 0
+        self.addCleanup(delattr, self.backend, 'READ_CACHE_SECONDS')
+        reads = (('the task list', lambda: self.request('GET', '/v1/projects/alpha/tasks', token=self.olive)),
+                 ('the review queue', lambda: self.request('GET', '/v1/projects/alpha/queue', token=self.olive)),
+                 ('the setup page', lambda: self.request('GET', '/v1/projects/alpha/setup', token=self.olive)))
+        for label, call in reads:
+            with self.subTest(read=label), self.answering(None, busy):
+                answer, log = self.logged(call)
+                if label == 'the setup page':                 # it reads the host best-effort and still answers
+                    self.assertEqual(200, answer.status, answer.data)
+                else:
+                    self.assertEqual((answer.status, answer.data['error']['code'], answer.data['error']['message']),
+                                     (503, 'busy', self.BUSY))
+                    self.assertEqual(answer.headers.get('retry-after'), '30')
+                    # Which lock still reaches the operator, in the service's log.
+                    self.assertIn('busy: the endpoint answered return code 75', log)
+                    self.assertIn('.lock', log)
+                self.clean(answer)
+        # A write keeps its own, more careful answer: the service holds an operation identity for
+        # it, so it says to reconcile with the same key. No path there either.
+        with self.answering(None, busy):
+            answer, log = self.logged(lambda: self.create_task(self.olive, 'alpha', 'a task'))
+        self.assertEqual((answer.status, answer.data['error']['code']), (503, 'uncertain'))
+        self.clean(answer)
+
+    def test_a_creation_that_is_busy_passes_on_only_its_own_two_sentences(self):
+        line = self.LOCK_LINE % (str(self.store.path) + '.lock')
+        with self.answering('create-project', {'returncode': 75, 'stdout': '', 'stderr': line}):
+            answer, log = self.logged(lambda: self.create(self.olive, 'alpha'))
+        self.assertEqual((answer.status, answer.data['error']['code'], answer.data['error']['message']),
+                         (503, 'busy', self.BUSY))
+        self.assertEqual(answer.headers.get('retry-after'), '60')
+        self.clean(answer)
+        self.assertIn('busy: the endpoint answered return code 75 for create-project alpha', log)
+        for sentence in (pc.BUSY, pc.MADE_WAITING % 'alpha'):
+            with self.subTest(sentence=sentence[:30]), \
+                    self.answering('create-project', {'returncode': 75, 'stdout': '', 'stderr': sentence + '\n'}):
+                answer = self.create(self.olive, 'alpha')
+                self.assertEqual((answer.status, answer.data['error']['message'], answer.headers.get('retry-after')),
+                                 (503, sentence, '60'))
+        self.assertEqual(pc.BUSY, 'Another project is being created on this server. Try again in a minute.')
+        self.assertEqual(pc.MADE_WAITING % 'alpha',
+                         'Project alpha was made on the server; registering it had to wait for a lock. Send the same '
+                         'request again in a moment: nothing is made twice.')
+        self.assertIsNone(pc.busy_sentence(pc.MADE_WAITING % 'alpha' + ' /srv'))
+        self.assertIsNone(pc.busy_sentence(line.strip()))
+
+    def test_a_lock_wait_that_runs_out_before_anything_is_made_stays_busy_and_is_no_host_failure(self):
+        """The action itself: the endpoint answers busy for it; it is not turned into a refusal or noted as a failure."""
+        import http_authority
+        config = http_authority.AuthorityConfig(str(self.store.path))
+        real = http_authority.file_lock
+
+        def file_lock(path, *args, **kwargs):
+            if str(path) == config.lock:
+                raise TimeoutError('Timed out waiting for lock %s' % path)
+            return real(path, *args, **kwargs)
+        with patch.object(http_authority, 'file_lock', file_lock), self.assertRaises(TimeoutError):
+            pc.create_action(self.canonical_root, self.request_for('olive', self.olive), config)
+        self.assertFalse(self.on_host('alpha'))
+        self.assertIsNone(self.record('alpha'))
+        self.assertFalse((self.records / pc.FAILURE_FILE).exists())
+
+    def test_the_action_itself_refuses_a_name_that_is_not_a_project_name(self):
+        """The service validates the name first; the action does not rely on that."""
+        import http_authority
+        config = http_authority.AuthorityConfig(str(self.store.path))
+        for name in ('Not A Name', '../x', 'a', '', None, 7):
+            with self.subTest(name=name), self.assertRaises(ValueError) as caught:
+                pc.create_action(self.canonical_root, self.request_for('olive', self.olive, project=name), config)
+            self.assertEqual(str(caught.exception), pc.NAME_RULE)
+        self.assertEqual(sorted(path.name for path in self.records.iterdir()), [])
+        self.assertFalse((self.canonical_root / 'projects').exists() and any((self.canonical_root / 'projects').iterdir()))
+
+    def test_the_fixed_sentences_say_what_they_say(self):
+        self.assertEqual(self.backend.CREATION_FAILED,
+                         'The project could not be created, or was only partly made. Ask an operator of the server to look '
+                         'before you try again.')
+        self.assertEqual(pc.COULD_NOT, 'The project could not be created and nothing was made. Try again; if it fails '
+                                       'again, ask an operator of the server.')
+
+    def test_a_record_that_is_a_directory_holds_its_name_and_stops_nobody_else(self):
+        (self.records / 'alpha.json').mkdir()
+        refused = self.create(self.olive, 'alpha')
+        self.assertEqual((409, pc.NOT_AVAILABLE % 'alpha'), (refused.status, refused.data['error']['message']))
+        self.clean(refused)
+        self.assertEqual(201, self.create(self.olive, 'beta').status)
+        listed = self.request('GET', '/v1/project-creations', token=self.admin)
+        self.assertEqual(200, listed.status, listed.data)
+        self.assertEqual([(i['project'], i['state'], i['remove']) for i in listed.data['items']],
+                         [('alpha', 'damaged', 'admin.py remove-creation alpha --actor OPERATOR --reason REASON')])
+        self.assertEqual(listed.data['server']['used'], 2)
+
+    @unittest.skipIf(sys.platform == 'win32' or (hasattr(os, 'geteuid') and os.geteuid() == 0),
+                     'needs a file the process cannot open (POSIX, not root)')
+    def test_a_record_that_cannot_be_opened_holds_its_name_and_stops_nobody_else(self):
+        path = self.records / 'alpha.json'
+        path.write_text(json.dumps({'project': 'alpha', 'by': self.ids['olive'], 'state': 'created'}), encoding='utf-8')
+        os.chmod(path, 0)
+        self.addCleanup(lambda: path.exists() and os.chmod(path, 0o600))
+        refused = self.create(self.olive, 'alpha')
+        self.assertEqual((409, pc.NOT_AVAILABLE % 'alpha'), (refused.status, refused.data['error']['message']))
+        self.clean(refused)
+        self.assertEqual(201, self.create(self.olive, 'beta').status)        # every other creation goes ahead
+        self.assertEqual(201, self.create(self.carl if self.grant('carl').status == 200 else self.olive, 'gamma').status)
+        listed = self.request('GET', '/v1/project-creations', token=self.admin)
+        self.assertEqual(200, listed.status, listed.data)
+        for leak in (str(self.canonical_root), str(self.tmp), 'Error', 'Errno', 'Traceback', 'Permission denied'):
+            self.assertNotIn(leak, json.dumps(listed.data))            # the operator's commands are named; no path is
+        self.assertEqual([(i['project'], i['state']) for i in listed.data['items']], [('alpha', 'damaged')])
+
+    def test_a_file_that_is_no_record_is_listed_as_such_and_not_counted(self):
+        (self.records / 'UPPER.json').write_text('{}', encoding='utf-8')
+        self.assertEqual(201, self.create(self.olive, 'alpha').status)
+        listed = self.request('GET', '/v1/project-creations', token=self.admin).data
+        self.assertEqual([(i['project'], i['state'], i['finish'], i['remove']) for i in listed['items']],
+                         [('UPPER', 'not-a-record', None, None)])
+        self.assertIn('Move project-creations/UPPER.json out of that directory', listed['items'][0]['what'])
+        self.assertEqual(listed['server']['used'], 1)
+        http_service.EndpointBackend.STANDING_CACHE_SECONDS = 0
+        self.addCleanup(setattr, http_service.EndpointBackend, 'STANDING_CACHE_SECONDS', 20)
+        mine = self.request('GET', '/v1/sessions/current', token=self.olive).data['project_host_create']
+        self.assertEqual((mine['held'], mine['used']), ([], 1))
+
+    def test_a_server_configuration_that_cannot_be_read_shows_no_host_text(self):
+        self.assertEqual(201, self.create(self.olive, 'alpha').status)
+        (self.canonical_root / 'deployment.private.json').write_text('{not json', encoding='utf-8')
+        listed = self.request('GET', '/v1/project-creations', token=self.admin)
+        self.assertEqual(200, listed.status, listed.data)
+        self.clean(listed)
+        self.assertEqual((listed.data['server']['used'], listed.data['server']['limit']), (None, None))
+        self.assertIn('could not be read, so no project can be created', listed.data['server']['note'])
+        refused = self.create(self.olive, 'beta')
+        self.assertEqual((409, pc.COULD_NOT), (refused.status, refused.data['error']['message']))
+        self.clean(refused)
+        self.assertFalse(self.on_host('beta'))
+        self.assertEqual(200, self.request('GET', '/v1/sessions/current', token=self.olive).status)
+
+    def test_a_failure_of_the_list_itself_is_one_fixed_sentence(self):
+        line = 'PermissionError: [Errno 13] Permission denied: %s/project-creations/alpha.json\n' % self.canonical_root
+        with self.answering('project-creations', {'returncode': 2, 'stdout': '', 'stderr': line}):
+            answer, log = self.logged(lambda: self.request('GET', '/v1/project-creations', token=self.admin))
+        self.assertEqual((answer.status, answer.data['error']['message']),
+                         (409, 'The project creations on the server could not be read. Ask an operator of the server '
+                               'to look.'))
+        self.clean(answer)
+        self.assertIn('project-creations answered a failure', log)
+
+    def test_a_registered_project_does_not_depend_on_its_creation_record(self):
+        self.assertEqual(201, self.create(self.olive, 'alpha').status)
+        self.assertEqual(201, self.create_task(self.olive, 'alpha', 'before').status)
+        (self.records / 'alpha.json').write_text('{not json', encoding='utf-8')
+        # Its members go on working.
+        self.assertEqual(200, self.request('GET', '/v1/projects/alpha/tasks', token=self.olive).status)
+        self.assertEqual(201, self.create_task(self.olive, 'alpha', 'after').status)
+        # The operator and the superuser are told it is served with a damaged record, and how to set it aside.
+        item = self.request('GET', '/v1/project-creations', token=self.admin).data['items'][0]
+        self.assertEqual((item['project'], item['state'], item['remove']),
+                         ('alpha', 'damaged', 'admin.py remove-creation alpha --actor OPERATOR --reason REASON'))
+        self.assertTrue(item['what'].startswith('projects/alpha is initialized and is SERVED WITH A DAMAGED CREATION '
+                                                'RECORD'), item['what'])
+        # The record still holds the name against a creation.
+        again = self.create(self.carl if self.grant('carl').status == 200 else self.olive, 'alpha')
+        self.assertEqual(409, again.status, again.data)
+
+    def test_an_unregistered_project_with_a_damaged_record_cannot_be_registered(self):
+        stopped = self.stop_at('configure')                       # initialized, not finished
+        self.assertEqual(409, self.create(self.olive, 'beta').status)
+        stopped.stop()
+        self.assertEqual(pc.made(self.canonical_root, 'beta'), 'initialized')
+        (self.records / 'beta.json').write_text('{not json', encoding='utf-8')
+        refused = self.request('POST', '/v1/projects', {'project_id': 'beta', 'name': 'Beta'}, token=self.admin)
+        self.assertEqual((409, 'The creation record of project beta is damaged; an operator must look at it first'),
+                         (refused.status, refused.data['error']['message']))
+        self.assertNotIn('beta', self.service.state['projects'])
+        self.clean(refused)
+        # The operator sets the record aside: it is then a project with no creation record, and a
+        # superuser may register it, as any project an operator made.
+        (self.canonical_root / 'deployment.private.json').write_text(json.dumps({'operators': ['ops']}), encoding='utf-8')
+        result = pc.remove(self.canonical_root, 'beta', 'ops', 'unreadable')
+        self.assertEqual((result['removed'], result['name']), ('damaged-record', 'a project with no creation record'))
+        registered = self.request('POST', '/v1/projects', {'project_id': 'beta', 'name': 'Beta'}, token=self.admin)
+        self.assertEqual(201, registered.status, registered.data)
 
 
 if __name__ == '__main__':

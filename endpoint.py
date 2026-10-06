@@ -363,7 +363,7 @@ def execute(root,request,authority_config=None,require_authority=False):
     # (kittrial-5bb.118 part 2, review 01a109cc): it has no backup target, merge slot or first
     # backup, so nothing is served from it and the web service cannot register it.
     import project_creation
-    unfinished=project_creation.registrable(root,name)
+    unfinished=project_creation.unfinished(root,name)
     if unfinished:raise ValueError('Unknown/uninitialized project: '+unfinished)
     actor=request.get('actor','')
     refuse_http_actor(actor,authority_config is not None)

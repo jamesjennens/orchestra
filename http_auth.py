@@ -196,8 +196,14 @@ def uncertain(message='Outcome unknown'):
     return HttpError(503, 'uncertain', message)
 
 
-def busy(message='The server is busy; nothing was done. Try again shortly.', retry_after=30):
-    """503 for a request that did nothing because the server was occupied: safe to send again.
+#: Said on every route when the server was occupied (kittrial-5bb.149). It names no lock and no
+#: path, and it does not say that nothing was done: that is true for almost every route, and
+#: was exactly what was untrue for a creation whose project was already made.
+BUSY = 'The server is busy and this request was not completed. Send it again in a moment.'
+
+
+def busy(message=BUSY, retry_after=30):
+    """503 for a request that was not completed because the server was occupied: safe to send again.
 
     Unlike ``uncertain`` there is no outcome to reconcile. ``retry_after`` becomes the
     ``Retry-After`` header.

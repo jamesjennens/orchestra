@@ -142,7 +142,7 @@ export function hostCreatePanel(ctx, creation) {
 // Superuser only: project creations that run, stopped or finished without being registered,
 // so that none is forgotten; and how full the server is.
 const CREATION_CHIPS = { running: ['Being created', 'plain'], incomplete: ['Did not finish', 'warn'], stalled: ['Did not start', 'warn'],
-  damaged: ['Record damaged', 'warn'], 'created-unregistered': ['Made, not registered', 'warn'] };
+  damaged: ['Record damaged', 'warn'], 'not-a-record': ['Not a creation record', 'warn'], 'created-unregistered': ['Made, not registered', 'warn'] };
 export async function incompleteCreations(ctx) {
   if (!ctx.me.superuser) return null;
   const found = await ctx.api.projectCreations().catch(() => null);
@@ -153,7 +153,7 @@ export async function incompleteCreations(ctx) {
   return h('section', { class: 'panel', id: 'incomplete-creations' },
     h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Projects on the server ', needing ? h('span', { class: 'nav-count' }, needing) : null)),
     h('div', { class: 'panel-body stack' },
-      server ? h('p', { class: 'small', id: 'server-usage' }, `This server holds ${server.used} of the ${server.limit} project databases its operator allows. `, h('span', { class: 'muted' }, server.note || '')) : null,
+      server ? h('p', { class: 'small', id: 'server-usage' }, server.used == null ? '' : `This server holds ${server.used} of the ${server.limit} project databases its operator allows. `, h('span', { class: 'muted' }, server.note || '')) : null,
       items.length ? h('p', { class: 'small muted' }, 'Each of these was started from the web interface. Nothing is registered here for it and its name is held. An operator acts on the server; this page does not run anything.') : null,
       items.map((item) => {
         const [label, tone] = CREATION_CHIPS[item.state] || [item.state, 'warn'];
