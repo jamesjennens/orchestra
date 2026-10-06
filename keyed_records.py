@@ -425,6 +425,8 @@ def apply_native(payload, actor, run, project, spec, operator=False, operators=N
     task = (prior.get('id') if prior and not reusable and prior.get('id') else None) or explicit
     if task is None:
         task = spec.resolve_task(rows, payload, operator)
+    # Key uniqueness is checked against the pre-write read so a duplicate key is
+    # refused with zero native writes.
     spec.check_key_unique(rows, payload, task)
     if task is None:
         request_label = 'request:' + identity
@@ -470,6 +472,9 @@ def apply_native(payload, actor, run, project, spec, operator=False, operators=N
             raise ValueError('Recorded native %s record %s is not visible; outcome uncertain. '
                              'Operator must reconcile this operation ID.' % (spec.noun, task))
         raise ValueError('Unknown %s record: %s' % (spec.noun, task))
+    if row.get('malformed'):
+        raise ValueError('%s record %s exists but cannot be read; operator repair required'
+                         % (spec.noun.capitalize(), task))
     existing = spec.existing_revisions(row)
     if not created:
         spec.require_selectable(row, payload, operator, existing)

@@ -479,6 +479,7 @@ def execute(root,request,authority_config=None,require_authority=False):
         # recorded reads as an ordinary row, exactly like one whose writer crashed.
         from reserved_comments import ANCHOR_READ_IDS_MAX, record_anchor_ids
         ids=request.get('args') or []
+        raw_rows=[]
         if (not isinstance(ids,list) or len(ids)>ANCHOR_READ_IDS_MAX or len(set(ids))!=len(ids)
                 or any(not isinstance(x,str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,160}',x) for x in ids)):
             raise ValueError('anchors takes no arguments, or at most %d distinct task ids'%ANCHOR_READ_IDS_MAX)
@@ -488,7 +489,7 @@ def execute(root,request,authority_config=None,require_authority=False):
             except (ValueError,AttributeError):missing=False
             if missing:
                 # Every listed row was deleted after the list: none is an anchor.
-                rows,warnings=[],completed.stderr or ''
+                warnings=completed.stderr or ''
             else:
                 stdout,warnings=native.split(completed)
                 raw_rows=record_json.loads_array_rows(stdout or '[]')
@@ -497,7 +498,6 @@ def execute(root,request,authority_config=None,require_authority=False):
                     report='Unreadable issue row(s): %s' % ', '.join(
                         '%s (%s)' % (r.get('id') or 'unknown', r.get('error') or 'malformed') for r in unreadable)
                     warnings=(warnings + '\n' + report).strip() if warnings else report
-                rows=[r for r in raw_rows if isinstance(r,dict) and not r.get('malformed') and r.get('id') in ids]
         else:
             stdout,warnings=native.split(native.run(native.argv(root,path,actor,['export','--all']),environment(root)))
             raw_rows=record_json.loads_rows(stdout)
@@ -506,8 +506,15 @@ def execute(root,request,authority_config=None,require_authority=False):
                 report='Unreadable issue row(s): %s' % ', '.join(
                     '%s (%s)' % (r.get('id') or 'unknown', r.get('error') or 'malformed') for r in unreadable)
                 warnings=(warnings + '\n' + report).strip() if warnings else report
-            rows=[r for r in raw_rows if isinstance(r,dict) and not r.get('malformed')]
-        return {'returncode':0,'stdout':json.dumps({'schema_version':1,'anchors':record_anchor_ids(rows)})+'\n','stderr':warnings}
+        from reserved_comments import RECORD_ANCHOR_LABELS
+        def anchor_run(argv):
+            result,warning=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warning:anchor_warnings.append(warning)
+            return result
+        anchor_warnings=[]
+        classified=record_json.classify(raw_rows,anchor_run,sorted(RECORD_ANCHOR_LABELS)) if raw_rows else []
+        if anchor_warnings:warnings=(warnings+'\n'+'\n'.join(anchor_warnings)).strip()
+        return {'returncode':0,'stdout':json.dumps({'schema_version':1,'anchors':record_anchor_ids(classified)})+'\n','stderr':warnings}
     if action=='ref':
         # The reference catalog (.41 slice 1, kittrial-5bb.66). Reads (get, list, find, help)
         # read their own key, or the catalog in two native reads (reference_records), take no
@@ -707,7 +714,14 @@ def execute(root,request,authority_config=None,require_authority=False):
             p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','export','--all'],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
             if p.returncode:return {'returncode':p.returncode,'stdout':p.stdout,'stderr':p.stderr}
             rows=record_json.loads_rows(p.stdout)
-            return {'returncode':0,'stdout':json.dumps(render(rows,path/'views',configured_operators(root),configured_verifiers(root)))+'\n','stderr':p.stderr}
+            from reserved_comments import RECORD_ANCHOR_LABELS
+            def refresh_run(argv):
+                stdout,warning=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+                if warning:refresh_warnings.append(warning)
+                return stdout
+            refresh_warnings=[]
+            rows=record_json.classify(rows,refresh_run,sorted(RECORD_ANCHOR_LABELS)+['gt:slot'], ['event','gate'])
+            return {'returncode':0,'stdout':json.dumps(render(rows,path/'views',configured_operators(root),configured_verifiers(root)))+'\n','stderr':p.stderr+''.join(refresh_warnings)}
     if action!='bd':raise ValueError('Unknown action')
     args=request.get('args',[])
     if not isinstance(args,list) or not args or any(not isinstance(a,str) or '\0' in a for a in args):raise ValueError('Expected argument list')

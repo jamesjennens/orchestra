@@ -270,15 +270,17 @@ class Integrated:
                 if not line.strip():
                     continue
                 row = record_json.loads_row(line)
-                if row.get('malformed'):
-                    raise ValueError('Unreadable lifecycle event row (%s): %s' % (row.get('id') or 'unknown', row.get('error') or 'malformed'))
-                if is_lifecycle_row(row):
+                if row.get('malformed') or is_lifecycle_row(row):
                     rows.append(row)
+        rows=record_json.classify(rows,self.run,types=['event'])
+        rows=[row for row in rows if is_lifecycle_row(row)]
         self.everything = integrated_commits(rows, self.operators, self.journal)
         self.export_rows = None
 
     def _narrow(self, commit):
-        listed = json.loads(self.run(['list', '--all', '--desc-contains', commit, '--limit', '0', '--json']) or '[]')
+        listed = record_json.loads_array_rows(self.run(['list', '--all', '--desc-contains', commit, '--limit', '0', '--json']) or '[]')
+        listed = record_json.classify(listed,self.run,types=['event'])
+        if any(r.get('malformed') and r.get('issue_type')=='event' for r in listed):return None
         tasks = []
         for row in listed or []:
             if not isinstance(row, dict) or row.get('issue_type') != 'event':
@@ -295,9 +297,12 @@ class Integrated:
             return None
         rows = []
         for task in tasks:
-            children = json.loads(self.run(['list', '--all', '--parent', task, '--limit', '0', '--json']) or '[]')
+            children = record_json.loads_array_rows(self.run(['list', '--all', '--parent', task, '--limit', '0', '--json']) or '[]')
+            children = record_json.classify(children,self.run,types=['event'])
+            if any(r.get('malformed') and r.get('issue_type')=='event' for r in children):return None
             rows.extend(row for row in children or [] if isinstance(row, dict) and row.get('issue_type') == 'event')
-        shown = json.loads(self.run(['show', *tasks, '--json', '--include-comments']) or '[]')
+        shown = record_json.loads_array_rows(self.run(['show', *tasks, '--json', '--include-comments']) or '[]')
+        if any(r.get('malformed') for r in shown):return None
         if isinstance(shown, dict):
             shown = [shown]
         rows.extend(row for row in shown or [] if isinstance(row, dict) and row.get('id') in tasks)

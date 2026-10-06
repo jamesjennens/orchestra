@@ -42,6 +42,86 @@ ROW_NESTING_MAX = 750
 ROW_MESSAGE = 'Tracker row nested too deeply (more than %d levels)' % ROW_NESTING_MAX
 
 
+def native_ids(run, *filters):
+    """IDs selected by bd itself, even when a selected row cannot be decoded.
+
+    Selection is evidence; the unreadable row's title, type and embedded labels
+    are not. An incomplete answer cannot prove that an ID is absent.
+    """
+    rows = loads_array_rows(run(['list', *filters, '--all', '--limit', '0', '--json']) or '[]')
+    return set(ids_from_native(rows))
+
+
+def ids_from_native(rows):
+    """Keep native selection order, refusing an answer that loses a row's ID."""
+    ids = []
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get('id'), str) or not row['id']:
+            raise ValueError('Native membership read returned a row without an ID; cannot classify unreadable rows')
+        ids.append(row['id'])
+    return ids
+
+
+def mark_selected(rows, ids, labels, issue_type=None):
+    """Attach ONLY labels proven by a native filter to unreadable selected rows.
+
+    Healthy rows are untouched. The marker is a Python attribute, never a JSON
+    field that a contributor could supply or that a view would serialize.
+    """
+    result = []
+    for row in rows:
+        if isinstance(row, dict) and row.get('malformed') and row.get('id') in ids:
+            if not isinstance(row, SelectedRow):
+                row = SelectedRow(row)
+                row['labels'] = []
+                row['issue_type'] = 'unknown'
+            row.selected_labels.update(labels)
+            row['labels'] = sorted(row.selected_labels)
+            if issue_type is not None:
+                row.selected_types.add(issue_type)
+                row['issue_type'] = issue_type
+        result.append(row)
+    return result
+
+
+class SelectedRow(dict):
+    def __init__(self, row):
+        super().__init__(row)
+        self.selected_labels = set()
+        self.selected_types = set()
+
+
+def selected(row, labels=(), types=()):
+    return isinstance(row, SelectedRow) and bool(row.selected_labels.intersection(labels)
+                                               or row.selected_types.intersection(types))
+
+
+def classify(rows, run, labels=(), types=()):
+    """One native membership read per label, only if this read has unreadable rows."""
+    if not any(isinstance(r, dict) and r.get('malformed') for r in rows):
+        return rows
+    for label in labels:
+        rows = mark_selected(rows, native_ids(run, '--label', label), [label])
+    for issue_type in types:
+        rows = mark_selected(rows, native_ids(run, '--type', issue_type), [], issue_type=issue_type)
+    return rows
+
+
+def classify_key_rows(rows, listed, run, type_label, labels):
+    """The type AND (key OR request) selection proves type, not which OR arm.
+
+    A get has one arm and needs no extra read. A write with unreadable rows pays
+    separate filters so a request collision cannot be mistaken for another key.
+    """
+    ids = set(ids_from_native(listed))
+    rows = mark_selected(rows, ids, [type_label])
+    if any(isinstance(r, dict) and r.get('malformed') for r in rows):
+        for label in labels:
+            chosen = ids if len(labels) == 1 else native_ids(run, '--label', type_label, '--label', label)
+            rows = mark_selected(rows, chosen, [label])
+    return rows
+
+
 def nesting(text, max_depth=NESTING_MAX):
     """The deepest bracket nesting of a JSON text, counted outside string literals, or
     max_depth + 1 as soon as it is exceeded.
@@ -93,8 +173,6 @@ def loads(text, **options):
 def _make_malformed_row(line, error):
     m = re.search(r'"id"\s*:\s*"([A-Za-z0-9][A-Za-z0-9_.-]{0,160})"', line)
     task_id = m.group(1) if m else None
-    m_type = re.search(r'"issue_type"\s*:\s*"([A-Za-z0-9_.-]+)"', line)
-    issue_type = m_type.group(1) if m_type else 'task'
     m_title = re.search(r'"title"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', line)
     if m_title:
         title = re.sub(r'\\(["\\/bfnrt])', lambda m: {'"': '"', '\\': '\\', '/': '/', 'b': '\b', 'f': '\f', 'n': '\n', 'r': '\r', 't': '\t'}.get(m.group(1), m.group(1)), m_title.group(1))
@@ -105,7 +183,7 @@ def _make_malformed_row(line, error):
             'title': title,
             'status': 'unknown',
             'assignee': None,
-            'issue_type': issue_type,
+            'issue_type': 'unknown',
             'labels': [],
             'malformed': True,
             'error': str(error),
@@ -240,4 +318,3 @@ def loads_array_rows(text):
         raise ValueError('Truncated or invalid JSON array')
 
     return rows
-

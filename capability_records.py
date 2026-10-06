@@ -645,9 +645,9 @@ def read_catalog(run):
     without this split (kittrial-5bb.69 re-review, P3).
     """
     listed = record_json.loads_array_rows(run(['list', '--label', TYPE_LABEL, '--all', '--limit', '0', '--json']) or '[]')
-    ids = [row['id'] for row in listed or [] if isinstance(row, dict) and isinstance(row.get('id'), str)]
+    ids = record_json.ids_from_native(listed)
     if len(ids) <= keyed_entries.CATALOG_SHOW_MAX:
-        return KIND.shown(run, ids), None
+        return record_json.mark_selected(KIND.shown(run, ids), set(ids), [TYPE_LABEL]), None
     wanted = set(ids)
     rows, lifecycle = [], []
     for line in run(['export', '--all']).splitlines():
@@ -656,9 +656,10 @@ def read_catalog(run):
         row = record_json.loads_row(line)
         if isinstance(row, dict) and row.get('id') in wanted:
             rows.append(row)
-        if verification.is_lifecycle_row(row):
+        if row.get('malformed') or verification.is_lifecycle_row(row):
             lifecycle.append(row)
-    return rows, lifecycle
+    lifecycle=record_json.classify(lifecycle,run,types=['event'])
+    return record_json.mark_selected(rows, wanted, [TYPE_LABEL]), [r for r in lifecycle if verification.is_lifecycle_row(r)]
 
 
 class Trust:

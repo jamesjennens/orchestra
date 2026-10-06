@@ -1762,6 +1762,23 @@ request ID instead of creating a duplicate.
 
 ## Backward compatibility
 
+Unreadable native reference, capability and proposal rows are classified by their
+ID's membership in native label-filtered reads. Contributor-controlled titles and
+labels inside unreadable JSON are not classification evidence. Reference and
+capability catalogs name unreadable anchors as malformed (their exact key may be
+unknown); get reports that the selected key exists but cannot be read. These
+anchors stay out of work and remain in the anchors read. Healthy rows retain the
+existing label-plus-record rule and healthy reads need no extra membership reads.
+
+Unreadable lifecycle events use the complete native `list --type event --all
+--limit 0 --json` ID set, through the same helper. A failed event selection or an
+unreadable selected event refuses lifecycle writes with the operator repair
+sentence. Since its parent and dimension cannot be trusted, lifecycle reads of
+that snapshot report unknown instead of an older passed fact. The contributor
+endpoint currently permits creating an event and changing native type to/from
+event; a retyped ordinary row joins event membership, and a retyped event leaves
+it. Type membership alone never makes readable event content a trusted fact.
+
 Consumers should key on documented fields, tolerate additional fields, and treat any
 nonzero exit code as failure. The envelope, `work` top-level shape, `brief`
 excerpt-object fields, opaque cursors and the ID meanings above are stable for v1.

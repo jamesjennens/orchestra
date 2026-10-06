@@ -237,6 +237,9 @@ def scoped_event(events,task,dim,scope):
 
 def events_by_dimension(rows):
     """Every exported lifecycle-shaped state event, grouped by (task, dimension)."""
+    # An unreadable event has no trustworthy parent or dimension. An older
+    # readable fact cannot establish current truth for any task in this snapshot.
+    if unreadable_events(rows):return {}
     events={}
     for row in rows:
         event=native_event(row)
@@ -380,10 +383,7 @@ def scoped_evidence(rows,dimensions=('integrated',)):
     token is kept, so a recurring token cannot resurrect an older position.
     """
     dims=tuple(dimensions)
-    events={}
-    for row in rows:
-        event=native_event(row)
-        if event:events.setdefault((event['task'],event['dimension']),[]).append(event)
+    events=events_by_dimension(rows)
     result=[]
     for row in rows:
         if not isinstance(row, dict) or row.get('issue_type')=='event' or row.get('malformed') or not row.get('id'):continue
@@ -1033,13 +1033,28 @@ def _operation_index(rows):
     """``{operation_id: (payload, event_id)}`` from one pass over the export."""
     index={}
     for row in rows:
-        if isinstance(row, dict) and row.get('malformed') and row.get('issue_type') == 'event':
+        if record_json.selected(row, types=['event']) and row.get('malformed'):
             raise ValueError('Event row %s cannot be parsed: %s; operator must reconcile or repair the event'
                              % (row.get('id') or 'unknown', row.get('error') or 'malformed'))
         event=native_event(row)
         if event and event['payload'] and event['payload']['operation_id'] not in index:
             index[event['payload']['operation_id']]=(event['payload'],event['id'])
     return index
+
+
+def unreadable_events(rows):
+    return [r for r in rows if isinstance(r,dict) and r.get('malformed')
+            and record_json.selected(r,types=['event'])]
+
+
+def read_event_rows(run):
+    """One export; only an unreadable row needs a complete native event-ID read."""
+    rows=record_json.loads_rows(run(['export','--all']))
+    try:
+        return record_json.classify(rows,run,types=['event'])
+    except (ValueError,OSError,subprocess.SubprocessError) as error:
+        raise ValueError('Lifecycle event membership cannot be read: %s; operator must reconcile or repair the event index'
+                         % error) from None
 
 
 def _apply_fact(payload,actor,rows,run,current_scope,op_index,issues,recorded=None):
@@ -1356,7 +1371,7 @@ def apply_release(payload,actor,run,operators=None,journal=None):
                                            or payload.get('supersede_scopes')):
         raise ValueError('a release needs at least one integrated target')
     if payload['actor']!=actor:raise ValueError('payload actor must match request actor')
-    rows=record_json.loads_rows(run(['export','--all']))
+    rows=read_event_rows(run)
     if payload.get('rollback'):require_rollback_target_deployed(rows,payload['scope'])
     selected,plans,issues,evidence=_release_plan(rows,payload,operators,journal)
     superseded=_supersede_plan(rows,payload,issues,evidence)
@@ -1461,7 +1476,7 @@ def release_query(payload,actor,run,operators=None,journal=None):
     """
     validate_query_payload(payload)
     if payload['actor']!=actor:raise ValueError('payload actor must match request actor')
-    rows=record_json.loads_rows(run(['export','--all']))
+    rows=read_event_rows(run)
     environment=payload['scope']['environment']
     reverted=sorted(reverted_integrations(rows,operators,journal))
     live=[]
@@ -1490,7 +1505,7 @@ def apply_native(payload, actor, run, operators=None, journal=None):
         return apply_release(payload,actor,run,operators,journal)
     validate_payload(payload)
     if payload['actor']!=actor:raise ValueError('payload actor must match request actor')
-    rows=record_json.loads_rows(run(['export','--all']))
+    rows=read_event_rows(run)
     issues={row['id']:row for row in rows if row.get('issue_type')!='event' and not row.get('malformed')}
     state=next((r for r in project_facts(rows) if r['id']==payload['task']),None)
     current_scope=state['scope'] if state else None

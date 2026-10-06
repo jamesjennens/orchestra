@@ -95,6 +95,7 @@ def read_labelled(run, label):
     when there are at most CATALOG_SHOW_MAX rows, or one `bd export --all` above that.
     """
     listed = record_json.loads_array_rows(run(['list', '--label', label, '--all', '--limit', '0', '--json']) or '[]')
+    record_json.ids_from_native(listed)
     id_labels = {r['id']: r.get('labels', []) for r in listed or [] if isinstance(r, dict) and 'id' in r}
     ids = list(id_labels.keys())
     if len(ids) <= CATALOG_SHOW_MAX:
@@ -106,7 +107,7 @@ def read_labelled(run, label):
     for r in rows:
         if isinstance(r, dict) and r.get('id') in id_labels and not r.get('labels'):
             r['labels'] = list(id_labels[r['id']])
-    return rows
+    return record_json.mark_selected(rows, set(ids), [label])
 
 
 def all_missing(error):
@@ -293,7 +294,7 @@ class AnchoredKind:
         for r in rows:
             if isinstance(r, dict) and r.get('id') in id_labels and not r.get('labels'):
                 r['labels'] = list(id_labels[r['id']])
-        return rows
+        return record_json.classify_key_rows(rows, listed, run, self.type_label, labels)
 
     def unsupported_record(self, body, row=None):
         """Why this kit does not support one record comment of this kind's family, or None:
@@ -1467,12 +1468,6 @@ class AnchoredKind:
                 if self.type_label in (row.get('labels') or []):
                     entry = view(row, operators)
                     entry['state'] = 'malformed'
-                    key = None
-                    for l in self.key_labels(row):
-                        if l.startswith(self.key_prefix):
-                            key = l[len(self.key_prefix):].replace('-', '.')
-                    if key:
-                        entry['key'] = key
                     entries.append((entry, self.key_labels(row)))
                 continue
             if self.type_label not in (row.get('labels') or []):

@@ -1086,12 +1086,12 @@ def read_key_rows(run, key, operation_id=None):
     for r in rows:
         if isinstance(r, dict) and r.get('id') in id_labels and not r.get('labels'):
             r['labels'] = list(id_labels[r['id']])
-    return rows
+    return record_json.classify_key_rows(rows, listed, run, TYPE_LABEL, labels)
 
 
 def _listed(run, *filters):
     listed = record_json.loads_array_rows(run(['list', *filters, '--all', '--limit', '0', '--json']) or '[]')
-    return [row['id'] for row in listed or [] if isinstance(row, dict) and isinstance(row.get('id'), str)]
+    return record_json.ids_from_native(listed)
 
 
 def read_settings_rows(run):
@@ -1100,7 +1100,8 @@ def read_settings_rows(run):
 
 def read_key_and_settings(run, key):
     """One proposal's anchor and the settings anchor together: one `bd list`, one `bd show`."""
-    return AnchoredKind.shown(run, _listed(run, '--label-any', ','.join([key_label(key), SETTINGS_LABEL])))
+    rows = AnchoredKind.shown(run, _listed(run, '--label-any', ','.join([key_label(key), SETTINGS_LABEL])))
+    return record_json.classify(rows, run, [TYPE_LABEL, key_label(key), SETTINGS_LABEL])
 
 
 def read_superseders(run, key, known):
@@ -1147,7 +1148,7 @@ def read_catalog(run):
     up to CATALOG_SHOW_MAX rows or one `bd export --all` above."""
     ids = _listed(run, '--label-any', ','.join([TYPE_LABEL, SETTINGS_LABEL]))
     if len(ids) <= CATALOG_SHOW_MAX:
-        return AnchoredKind.shown(run, ids)
+        return record_json.classify(AnchoredKind.shown(run, ids), run, [TYPE_LABEL, SETTINGS_LABEL])
     wanted = set(ids)
     exported = record_json.loads_rows(run(['export', '--all']))
     for r in exported:
@@ -1174,7 +1175,7 @@ def find_entry(rows, key, operators=None, resolve=None, verify_label=True):
     label = key_label(key)
     incomplete = None
     for row in rows:
-        if row.get('malformed') and (label in (row.get('labels') or []) or len(rows) == 1):
+        if row.get('malformed') and label in (row.get('labels') or []):
             raise ValueError('Proposal key %s exists (anchor %s) but cannot be read'
                              % (key, row.get('id') or 'unknown'))
         if TYPE_LABEL not in (row.get('labels') or []) or label not in (row.get('labels') or []):

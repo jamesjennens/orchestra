@@ -313,7 +313,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
             else:
                 unparseable_count+=1
                 continue
-            if row.get('issue_type') in ('event','gate') or is_merge_slot(row):continue
+            if record_json.selected(row, ['gt:slot'], ['event','gate']):continue
             if is_record_anchor(row):continue
             if a.state and a.state!='error':continue
             items.append({'open_items':None,'checkpoint_at':None,'newer_activity':None,
@@ -532,13 +532,16 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
         args=[token for token in args if token!='--json']
     if action=='work':
         rows=record_json.loads_rows(run(['export','--all']))
+        from reserved_comments import RECORD_ANCHOR_LABELS
+        rows=record_json.classify(rows,run,sorted(RECORD_ANCHOR_LABELS)+['gt:slot'], ['event','gate'])
         return queue(rows,actor,args,path/'.handoff-requests', operators=operators, journal=path,
                      reference_attention=True, verifiers=verifiers)
     if len(args) not in (1,2):raise ValueError('Use review TASK [--file payload.json] or handoff TASK --file payload.json')
     task=args[0]
     if action=='review' and len(args)==1:
         from briefing import task_row
-        rows=record_json.loads_rows(run(['export','--all']))
+        from lifecycle import read_event_rows
+        rows=read_event_rows(run)
         issue=task_row(rows,task)
         from review_state import scopes_for
         return workflow(issue,scopes_for(rows,task),operators=operators,journal=path)
@@ -556,7 +559,8 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
             from handoff import disposition as handoff_disposition
             return handoff_disposition(path,actor,payload,run)
         return handoff(path,actor,payload,run)
-    rows=record_json.loads_rows(run(['export','--all']))
+    from lifecycle import read_event_rows
+    rows=read_event_rows(run)
     if payload.get('operation')=='recommend':
         # A reviewer's recommendation (kittrial-5bb.115) is a record beside the review
         # chain: it has its own writer and never passes through the chain's.
