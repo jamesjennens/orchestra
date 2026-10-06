@@ -59,6 +59,7 @@ CHILD = textwrap.dedent('''
         'merge-operators': lambda: admin.merge_operators(root, ['restored-op']),
         'merge-verifiers': lambda: admin.merge_verifiers(root, ['restored-ver']),
         'server-limit': lambda: cli('project-creations', '--set-server-limit', '7', '--actor', 'ops'),
+        'merge-authority': lambda: admin.merge_authority(root, ['both-op'], ['both-ver']),
     }}
     if role == 'second':
         (root / 'second.started').touch()
@@ -79,6 +80,8 @@ EFFECTS = {
     'merge-operators': lambda cfg: 'restored-op' in cfg.get('operators', []),
     'merge-verifiers': lambda cfg: 'restored-ver' in cfg.get('verifiers', []),
     # The limit of project databases (kittrial-5bb.118 part 2): the setting and its audit entry.
+    # The one-wait merge of both lists restore-new uses (kittrial-5bb.144).
+    'merge-authority': lambda cfg: 'both-op' in cfg.get('operators', []) and 'both-ver' in cfg.get('verifiers', []),
     'server-limit': lambda cfg: cfg.get('project_database_limit') == 7
     and [(entry['actor'], entry['to']) for entry in cfg.get('project_database_limit_audit', [])] == [('ops', 7)],
 }
@@ -90,6 +93,9 @@ PAIRS += [(second, first) for first, second in PAIRS]
 PAIRS += [('review-on', 'operators-add'), ('operators-add', 'review-on'), ('review-on', 'checkpoint-on')]
 PAIRS += [('server-limit', 'operators-add'), ('operators-add', 'server-limit'),
           ('server-limit', 'review-on'), ('review-on', 'server-limit')]
+# The project database limit against the restore merges (kittrial-5bb.144).
+PAIRS += [('server-limit', 'merge-authority'), ('merge-authority', 'server-limit'),
+          ('server-limit', 'merge-operators'), ('merge-verifiers', 'server-limit')]
 
 
 @unittest.skipIf(sys.platform == 'win32', 'flock is POSIX-only')
@@ -367,6 +373,46 @@ class PrivateWriteLeftoverTests(unittest.TestCase):
             result, _ = self.flip('on')
         self.assertTrue(result['checkpoint_provenance_writes'])
         self.assertTrue((self.root / '.deployment.private.json.abcd1234').exists())
+
+    def test_an_unlocked_older_kit_writer_loses_its_copy_and_fails_with_the_file_kept(self):
+        # kittrial-5bb.144 item 4: a writer from a kit before kittrial-5bb.136 takes no lock.
+        # Paused between its copy and its rename, its copy is removed by a newer writer's
+        # cleanup; its rename then fails (FileNotFoundError, rc 1), the file stays valid and
+        # the newer change is kept. The older change is lost, loudly.
+        older = subprocess.Popen([sys.executable, '-c', textwrap.dedent('''
+            import json, os, sys, time
+            sys.path.insert(0, sys.argv[2])
+            import admin
+            from pathlib import Path
+            root = Path(sys.argv[1])
+            real = os.replace
+            def paused(source, target):
+                (root / 'older.ready').touch()
+                deadline = time.monotonic() + 30
+                while not (root / 'newer.done').exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                return real(source, target)
+            admin.os.replace = paused
+            cfg = json.loads((root / 'deployment.private.json').read_text(encoding='utf-8'))
+            cfg['operators'] = cfg['operators'] + ['older-op']          # no lock, as before .136
+            admin.atomic_private_write(root / 'deployment.private.json', json.dumps(cfg))
+        '''), str(self.root), REPO], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(older.kill)
+        for _ in range(3000):
+            if (self.root / 'older.ready').exists() or older.poll() is not None:
+                break
+            time.sleep(0.01)
+        self.assertTrue((self.root / 'older.ready').exists(), older.stderr.read() if older.poll() is not None else '')
+        result, err = self.flip('on')                                    # the newer, locked writer
+        self.assertIn('Removed 1 temporary copy', err)
+        (self.root / 'newer.done').touch()
+        _, older_err = older.communicate(timeout=60)
+        self.assertEqual(older.returncode, 1)
+        self.assertIn('FileNotFoundError', older_err)
+        cfg = json.loads(self.marker.read_text(encoding='utf-8'))        # valid, newer change kept
+        self.assertTrue(cfg['checkpoint_provenance_writes'])
+        self.assertNotIn('older-op', cfg['operators'])
+        self.assertEqual(cfg['password'], 'test-only')
 
     def test_the_temporary_copy_is_created_0600(self):
         modes = []
