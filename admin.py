@@ -3915,6 +3915,20 @@ def authority_not_regranted(root,source,operators,verifiers):
             %('; '.join(named),REVIEW_WRITES_LOCK,DEPLOYMENT_LOCK_WAIT_SECONDS,'\n  '.join(commands),
               shlex.quote(str(root)),shlex.quote(source),RESTORE_AUTHORITY_NOT_REGRANTED))
 
+def sidecar_problem(path):
+    """Why a coordination sidecar copy that exists cannot be used, or None when it is absent
+    or usable. The same tests as ``complete_sidecar``, said out loud."""
+    path=Path(path)
+    if path.is_symlink():return 'it is a symlink'
+    if not path.exists():return None
+    if not path.is_file():return 'it is not a regular file'
+    try:data=json.loads(path.read_text(encoding='utf-8'))
+    except OSError as error:return 'it cannot be read (%s)'%error.__class__.__name__
+    except ValueError:return 'it is not valid JSON'
+    if not isinstance(data,dict) or data.get('schema_version')!=1:return 'it is not a coordination sidecar of schema 1'
+    if data.get('status')!='complete':return 'its status is %s, not complete'%json.dumps(data.get('status'))
+    return None
+
 def backup_authority(root,source):
     """Read only: the deployment authority a project backup records against this installation.
 
@@ -3922,16 +3936,37 @@ def backup_authority(root,source):
     last-complete copy). For each list: what the backup records, what this installation
     lists now, and the recorded entries it does not list, which ``--restore-operators`` /
     ``--restore-verifiers`` (or ``operators add`` / ``verifiers add``) would re-grant.
+
+    Three cases that once all read as empty lists are told apart (kittrial-5bb.145): a name
+    with no backup is refused; a backup whose sidecar copies exist but none is usable is
+    refused, naming each copy and why; a backup with no sidecar at all says so in ``note``.
+    A copy passed over for the fallback is listed in ``unusable``.
     """
     validate_name(source)
-    path,_=coordination_sidecar_source(root,source)
+    if not (root/'backups'/source).is_dir():
+        raise ValueError('No such backup: backups/%s does not exist. Check the project name '
+                         '(`backup-status` lists the backups this installation has).'%source)
+    copies=[root/'backups'/(source+'.coordination.json'),last_complete_sidecar_path(root,source)]
+    problems=[(copy,sidecar_problem(copy)) for copy in copies]
+    path,_=coordination_sidecar_source(root,source) if not any(problem=='it is a symlink' for _,problem in problems) else (None,None)
+    damaged=[(copy,problem) for copy,problem in problems if problem]
+    if path is None and damaged:
+        raise ValueError('The coordination sidecar of backup %s is damaged: %s. What this backup records '
+                         'cannot be read, so no operator or verifier list from it can be trusted.'
+                         %(source,'; '.join('%s: %s'%(copy.relative_to(root).as_posix(),problem) for copy,problem in damaged)))
     def compare(recorded,listed):
         return {'recorded':recorded,'listed_here':sorted(listed),
                 'not_listed_here':[item for item in recorded if item not in listed]}
-    return {'project':source,
-            'sidecar':None if path is None else str(path.relative_to(root)),
+    result={'project':source,
+            'sidecar':None if path is None else path.relative_to(root).as_posix(),
             'operators':compare(coordination_operators(root,source),operators(root)),
             'verifiers':compare(coordination_verifiers(root,source),verifiers(root))}
+    if damaged:
+        result['unusable']=[{'copy':copy.relative_to(root).as_posix(),'problem':problem} for copy,problem in damaged]
+    if path is None:
+        result['note']=('This backup has no coordination sidecar (a legacy backup): it records no operators '
+                        'or verifiers.')
+    return result
 
 def record_store_path(state):
     """The HTTP record store beside the service state document (``http_auth.Store``)."""

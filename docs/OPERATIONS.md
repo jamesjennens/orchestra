@@ -1406,6 +1406,12 @@ python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime bac
 
 It prints JSON naming the sidecar it read: the canonical one, else the durable last-complete copy, the same one `restore-new` uses; `null` when there is none. For `operators` and for `verifiers` it gives `recorded` (what the backup records), `listed_here` (what this installation lists now) and `not_listed_here` (what `--restore-operators` / `--restore-verifiers`, or `operators add` / `verifiers add`, would re-grant). It takes no lock and writes nothing. PROJECT is the backup's project name, the SOURCE of `restore-new`.
 
+It tells three cases apart (kittrial-5bb.145):
+
+- **No such backup.** When `backups/PROJECT` does not exist, it refuses with `No such backup: backups/PROJECT does not exist` and exit status 1. A mistyped name no longer reads as a backup that records nobody. An invalid project name is refused as a name first.
+- **Damaged sidecar.** When a sidecar copy exists but neither the canonical sidecar nor the last-complete copy is usable, it refuses with exit status 1. The message names each copy and why it cannot be used (not valid JSON, not a schema-1 sidecar, a status other than `complete`, a symlink, unreadable), and says the lists cannot be trusted. When the canonical copy is unusable but the last-complete copy is fine, it answers from the last-complete copy and lists the copy it passed over, and why, under `unusable`.
+- **No sidecar at all.** A legacy backup answers `sidecar: null`, empty lists and a `note` saying it records no operators or verifiers, with exit status 0.
+
 Passing `--restore-operators` is an explicit authorization decision: after a revocation, do not pass it "to make the restore look complete" — a revoked operator stays revoked until an operator re-adds them by name. The native backup preserves the original comment and the void comment; the sidecar preserves the authority reads would need to apply it, so a restore still preserves both the original and its disposition, with the authority decision left where it belongs: with the deployment operator.
 
 ### Optional scheduled backup
