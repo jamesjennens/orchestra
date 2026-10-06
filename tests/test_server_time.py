@@ -353,6 +353,23 @@ class HeaderTests(test_http_agents.AgentHarness):
         self.assertEqual((again.status, again.data, self.stamp(again)), (200, first.data, '2026-10-06T07:50:12+00:00'))
         self.assertEqual(self.stamp(other), '2026-10-06T07:51:12+00:00')
 
+    def test_the_header_of_a_list_answer_is_the_endpoints_time_when_an_endpoint_wrote(self):
+        """Not the service's clock: the endpoint's envelope said when the write was carried out."""
+        real = self.backend.invoke
+
+        def invoke(route, *args, **kwargs):
+            result = real(route, *args, **kwargs)
+            if route != 'tasks.update':
+                return result
+            http_service.WRITTEN.at = '2026-10-06T07:49:59+00:00'       # what EndpointBackend._checked takes from the envelope
+            return [result]
+        path = '/v1/projects/%s/tasks/%s' % (self.project, self.task)
+        with mock.patch.object(self.backend, 'invoke', invoke), mock.patch.object(self.store, 'now', return_value=1791273012.0):
+            first = self.request('PATCH', path, {'title': 'renamed', 'version': 1}, token=self.admin, key='change-key-0011')
+            again = self.request('PATCH', path, {'title': 'renamed', 'version': 1}, token=self.admin, key='change-key-0011')
+        self.assertEqual((type(first.data), self.stamp(first), self.stamp(again)),
+                         (list, '2026-10-06T07:49:59+00:00', '2026-10-06T07:49:59+00:00'))
+
     def test_the_retry_of_an_object_answer_has_the_header_of_the_write(self):
         path = '/v1/projects/%s/tasks' % self.project
         with mock.patch.object(self.store, 'now', return_value=1791273012.0):

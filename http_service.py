@@ -2782,10 +2782,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_header('Referrer-Policy', 'no-referrer')
         self.send_header('X-Request-Id', getattr(self, '_current_request_id', '') or '')
         if getattr(self, '_written_at', None):
-            # Only an answer of a write that was carried out: a refusal after it has none.
-            if 200 <= status < 300:
-                self.send_header(SERVER_TIME_HEADER, self._written_at)
-            self._written_at = None
+            # Set only for the answer of a write that was carried out; _dispatch clears it for the next request.
+            self.send_header(SERVER_TIME_HEADER, self._written_at)
         if getattr(self, '_retry_after', None):
             self.send_header('Retry-After', str(int(self._retry_after)))
             self._retry_after = None
