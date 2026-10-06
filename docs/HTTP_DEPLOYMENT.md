@@ -102,6 +102,17 @@ forwarded headers the service will believe. A reverse proxy on the same host is
 forwarded headers from any other peer are ignored, so a client cannot spoof the
 throttle key or claim `https`.
 
+`--connections-per-address N` (default 50; 0: no limit per address) is how many
+of the service's 200 connections one client address may have open at once; one
+more from it is closed at once. An IPv6 address is counted with its /64. A peer
+named by `--trusted-proxy` is not limited as an address, because every client
+behind it arrives from it: for the requests it forwards, N is how many requests
+of one forwarded address are served at once, and one more is answered
+`503 busy` with `Retry-After: 1` and `Connection: close` before its route
+begins. A forwarded header from any other peer does not change which address a
+connection is counted for. See docs/OFFICE_SERVICE.md ("Connections that say
+nothing") for what the limit stops and what it does not.
+
 That last point is what makes browser cookies safe under the documented TLS
 deployment. TLS terminates at the proxy, so the loopback connection to the
 service is plaintext and is **not** treated as secure by itself. The service marks
