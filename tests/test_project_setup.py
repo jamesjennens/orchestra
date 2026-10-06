@@ -361,13 +361,23 @@ class HostStatusTests(unittest.TestCase):
 
     def test_a_bare_project(self):
         status = self.status()
-        self.assertEqual(sorted(status), ['backup', 'guidance', 'onboarding', 'project', 'project_databases',
-                                          'schema_version'])
+        self.assertEqual(sorted(status), ['backup', 'creation_record', 'guidance', 'onboarding', 'project',
+                                          'project_databases', 'schema_version'])
         self.assertEqual(status['project_databases'], {'used': 1, 'limit': 20})
+        self.assertIsNone(status['creation_record'])                    # nothing against registering it
         self.assertEqual(status['guidance'], {'state': 'not-set', 'version': None, 'set_at': None})
         self.assertEqual(status['onboarding'], {'state': 'not-set', 'updated_at': None})
         self.assertEqual((status['backup']['scheduled'], status['backup']['last_run']), ('not-covered', None))
         self.assertEqual(status['backup']['line'], admin.scheduled_backup_execstart(self.root))
+
+    def test_a_damaged_creation_record_is_said_as_a_sentence_without_a_path(self):
+        """kittrial-5bb.149: the register route asks here, since the endpoint serves such a project."""
+        records = self.root / 'project-creations'
+        records.mkdir()
+        (records / 'alpha.json').write_text('{not json', encoding='utf-8')
+        said = self.status()['creation_record']
+        self.assertEqual(said, 'The creation record of project alpha is damaged; an operator must look at it first')
+        self.assertNotIn(str(self.root), said)
 
     def test_guidance_states_and_never_its_text(self):
         guidance.write_guidance(self.project, 'A SECRET INSTRUCTION', 'operator-1')

@@ -507,14 +507,47 @@ the result after the last.
     name: nothing is made twice, it is only registered. Do not create it under another
     name." It is listed for a superuser as made and not registered. After the repair
     the same person sends the creation again and it is registered.
+  - the project was made and the last step could not get its lock in time: 503 `busy`
+    with `Retry-After`, "Project NAME was made on the server; registering it had to
+    wait for a lock. Send the same request again in a moment: nothing is made twice."
+    (not the endpoint's general "Nothing was done", which would not be true here).
+    Sent again, the request registers it.
   - The web service applies the same rule on its side: it puts the endpoint's line in
     its 409 only when the line is, whole, one of those sentences. Anything else
     becomes "The project could not be created, or was only partly made. Ask an
     operator of the server to look before you try again.", and the line goes to the
     service's log (`create-project NAME answered a line that is not a creation
     sentence: ...`). This also covers an endpoint older than the rule.
+- **Busy, on every route** (kittrial-5bb.149). When the endpoint could not get a lock in
+  time it answers return code 75 with a line that names the lock file. The service does
+  not pass that line on. A read answers 503 `busy` with `Retry-After` and the service's
+  own sentence, "The server is busy and this request was not completed. Send it again in
+  a moment."; the endpoint's line, which says which lock, is in the service's log
+  (`busy: the endpoint answered return code 75 for ACTION: ...`). A write that the
+  service holds an operation identity for keeps its more careful answer, 503
+  `uncertain` ("reconcile with the same idempotency key"), which names no path either.
+  A creation passes on only its own two busy sentences (another creation is running;
+  the project is made and registering it had to wait).
+- **A registered project does not depend on its creation record** (kittrial-5bb.149).
+  The endpoint serves a project that is initialized and whose creation record is
+  absent, finished or damaged; it refuses one whose record reads running, incomplete or
+  stalled, and one that was never initialized whatever became of its record. So the
+  members of a working project keep it when that file is damaged. The damaged record
+  still holds the name against a creation, still counts toward the server's limit and
+  still blocks registration: the register route asks the host (`setup-status`,
+  `creation_record`) and answers 409 "The creation record of project NAME is damaged;
+  an operator must look at it first". Both lists flag such a project: "projects/NAME is
+  initialized and is SERVED WITH A DAMAGED CREATION RECORD", with the command to set the
+  record aside. The cost: an unfinished, unregistered creation whose record is then
+  damaged is reachable by a caller who reaches the endpoint without the web service,
+  as a project an operator made is.
+- **A file in `project-creations/` whose name no project can have** (`UPPER.json`,
+  `a.json`) is not a creation: it holds no name, is not counted, and both lists show it
+  as `not-a-record` with one instruction, to move it out of that directory.
+  `remove-creation` takes project names only.
 - **A creation record that cannot be read** (not JSON, the wrong shape, another
-  project's) reads `damaged` in both lists. It holds its name, and it counts toward the
+  project's, a directory, a symlink, or a file the service account cannot open, as
+  after a restore under another user) reads `damaged` in both lists. It holds its name, and it counts toward the
   server's limit of project databases, because it may stand for one. A creation of
   another name is not held up by it. The operator looks at the file and then runs
   `admin.py remove-creation NAME --actor OPERATOR --reason REASON`: for a damaged

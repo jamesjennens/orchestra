@@ -1232,6 +1232,19 @@ class EndpointBackend:
                 raise conflict(said.split(marker, 1)[1][:300])
             return False
         self._checked(reply)
+        # The endpoint serves a project whose creation record is damaged (a registered project
+        # does not depend on that record), so registration asks the host explicitly whether
+        # this name may be registered (kittrial-5bb.149). An endpoint without the action or
+        # without the answer says nothing against it, as before.
+        asked = self._endpoint('setup-status', project, self.actor_namespace + '/read', [], check_usable=False)
+        if isinstance(asked, dict) and asked.get('returncode') == 0:
+            try:
+                status = _canonical_payload(asked.get('stdout') or '')
+            except HttpError:
+                status = None
+            reason = status.get('creation_record') if isinstance(status, dict) else None
+            if isinstance(reason, str) and reason:
+                raise conflict(reason[:300])
         return True
 
     def _endpoint(self, action, project, actor, args, attachments=None, operation_id=None,
@@ -1312,10 +1325,12 @@ class EndpointBackend:
         if code == 124:
             raise uncertain('Canonical command timed out; outcome may be unknown')
         if code == 75:
-            # The endpoint did nothing because it was occupied (a wait for a lock ran out, or
-            # another project is being created): the request may simply be sent again.
-            detail = stderr.strip().splitlines()[-1][:200] if stderr.strip() else None
-            raise busy(detail or 'The server is busy; nothing was done. Try again shortly.')
+            # The endpoint was occupied (a wait for a lock ran out): the request may simply be
+            # sent again. Its line names the lock file it waited for, a path of the host, so it
+            # goes to this service's log for the operator and the person gets the service's own
+            # sentence (kittrial-5bb.149).
+            cls._log_busy(action, stderr)
+            raise busy()
         if code:
             limit = cls.DETAIL_LIMITS.get(action, cls.DETAIL_LIMIT)
             detail = stderr.strip().splitlines()[-1][:limit] if stderr.strip() else None
@@ -1323,6 +1338,13 @@ class EndpointBackend:
                 raise invalid('Canonical command rejected the request', detail)
             raise uncertain('Canonical command failed; outcome may be unknown')
         return _canonical_payload(stdout)
+
+    @staticmethod
+    def _log_busy(action, stderr):
+        """Which lock, and how long: the endpoint's own line, for the operator, in the service log."""
+        said = (stderr or '').strip().splitlines()
+        print('busy: the endpoint answered return code 75 for %s: %s'
+              % (action or 'a request', ascii(said[-1][:400]) if said else '(nothing)'), file=sys.stderr, flush=True)
 
     # -- mutations -------------------------------------------------------------
     def invoke(self, route, principal, project_id, payload, key, target=None, authorize=None,
@@ -1962,9 +1984,15 @@ class EndpointBackend:
                                authority=authority, require_authority=True, route='projects.host-create',
                                check_usable=False, timeout=self.create_timeout)
         if isinstance(reply, dict) and reply.get('returncode') == 75:
+            import project_creation
             said = (reply.get('stderr') or '').strip().splitlines()
-            raise busy(said[-1][:300] if said else 'Another project is being created on this server. Try again in a minute.',
-                       retry_after=60)
+            sentence = project_creation.busy_sentence(said[-1]) if said else None
+            if sentence is None:
+                # A wait for a lock ran out before the creation's own code answered: the
+                # endpoint's line names the lock file. The general sentence, and the log.
+                self._log_busy('create-project %s' % name, reply.get('stderr'))
+                raise busy(retry_after=60)
+            raise busy(sentence, retry_after=60)
         if isinstance(reply, dict) and reply.get('returncode') == 2:
             import project_creation
             said = (reply.get('stderr') or '').strip().splitlines()
@@ -2033,11 +2061,22 @@ class EndpointBackend:
         authority = authority_request(principal, None, CAP_ACCOUNTS_ADMIN, now=self.service._expiry_now())
         reply = self._endpoint('project-creations', None, principal.user_id, [], authority=authority,
                                require_authority=True)
-        result = self._checked(reply)
+        if isinstance(reply, dict) and reply.get('returncode') == 2:
+            # A failure on the host, not a refusal of the request: its line may name a host path
+            # and an exception, and this list is shown on a page (kittrial-5bb.149).
+            said = (reply.get('stderr') or '').strip().splitlines()
+            print('project-creations answered a failure: %s' % (ascii(said[-1][:400]) if said else '(nothing)'),
+                  file=sys.stderr, flush=True)
+            raise conflict(self.CREATIONS_UNREADABLE)
+        result = self._checked(reply, 'project-creations')
         result = result if isinstance(result, dict) else {}
         return {'items': [item for item in result.get('items') or [] if isinstance(item, dict)],
                 'created': [item for item in result.get('created') or [] if isinstance(item, dict)],
-                'server': result.get('server') if isinstance(result.get('server'), dict) else None}
+                'server': result.get('server') if isinstance(result.get('server'), dict) else None,
+                'server_readable': result.get('server_readable') is not False}
+
+    CREATIONS_UNREADABLE = ('The project creations on the server could not be read. Ask an operator of the server '
+                            'to look.')
 
     #: An account's own standing on the host is asked for at most this often (seconds).
     STANDING_CACHE_SECONDS = 20
@@ -2383,6 +2422,11 @@ class ApiHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # never log query strings or headers
         pass
 
+    #: Said for a write when the service's own lock could not be had in time: it may have been
+    #: carried out already, so "not completed" would not always be true.
+    BUSY_UNCERTAIN = ('The server was busy and cannot say whether this request was carried out. Look before you '
+                      'repeat it, or send it again with the same idempotency key.')
+
     def _dispatch(self, method):
         request_id = self._request_id()
         self._current_request_id = request_id
@@ -2423,11 +2467,20 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._note_denied(error, request_id)
             self._retry_after = getattr(error, 'retry_after', None)
             self._send_json(error.status, error.body(request_id))
-        except TimeoutError:
-            # A wait for the state lock ran out before anything was done (file_lock raises it
-            # while acquiring). The server is occupied; this is not an internal error.
-            error = busy()
-            self._retry_after = error.retry_after
+        except TimeoutError as waited:
+            # Which lock, for the operator: the message of the wait names the lock file.
+            print('busy: a wait for a lock ran out in the service for %s: %s' % (method, ascii(str(waited)[:400])),
+                  file=sys.stderr, flush=True)
+            # A wait for the state lock ran out (file_lock raises it while acquiring). The server
+            # is occupied; this is not an internal error. For a read nothing can have happened.
+            # For a write the wait may have run out AFTER the effect: a creation was made and
+            # registered, and the lock for the receipt could not be had (seen on real bd,
+            # kittrial-5bb.149). The service does not know which, and says so.
+            if method in ('GET', 'HEAD'):
+                error = busy()
+                self._retry_after = error.retry_after
+            else:
+                error = uncertain(self.BUSY_UNCERTAIN)
             self._send_json(error.status, error.body(request_id))
         except Exception:
             # No traceback, no internal detail: a clean, generic JSON error.
@@ -3228,7 +3281,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                                   '(New project, with this name), or retire it on the server.',
                              finish=None, remove=None) for item in waiting]
         server = found['server']
-        if server is not None:
+        if server is None and not found.get('server_readable', True):
+            server = {'used': None, 'limit': None,
+                      'note': 'The server\'s limit of project databases could not be read, so no project can be '
+                              'created from the web interface. An operator must look at the server\'s configuration.'}
+        elif server is not None:
             server = {'used': server.get('used'), 'limit': server.get('limit'),
                       'note': 'Counts every project database on the server: archived and retired projects and '
                               'unfinished creations too, because their databases stay on it. An operator changes '

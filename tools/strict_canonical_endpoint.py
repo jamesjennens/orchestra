@@ -489,7 +489,7 @@ def main():
             return
         # endpoint.py serves nothing from a creation that has not finished (part 2 revision).
         import project_creation
-        unfinished = project_creation.registrable(root, name)
+        unfinished = project_creation.unfinished(root, name)
         if unfinished:
             print(json.dumps(envelope(2, stderr='ValueError: Unknown/uninitialized project: %s\n' % unfinished)))
             return

@@ -1868,6 +1868,14 @@ def project_setup_status(root,name,path=None):
         result['project_databases']=project_creation.server_usage(root)
     except (ValueError,OSError):
         result['project_databases']=None
+    # Why the web service may NOT register this project, or None (kittrial-5bb.149). The
+    # endpoint serves a project whose creation record is damaged, so the register route no
+    # longer learns of one from a refused read: it asks here. A sentence, never a path.
+    try:
+        import project_creation
+        result['creation_record']=project_creation.registrable(root,name)
+    except (ValueError,OSError):
+        result['creation_record']='The creation record of project %s could not be checked; an operator must look at it first'%name
     return result
 
 def scheduled_backup_coverage(root,name):

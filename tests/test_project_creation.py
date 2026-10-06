@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 KIT = Path(__file__).resolve().parents[1]
@@ -710,6 +711,215 @@ class DamagedRecordTests(Operators):
                 noted = json.loads((pc.records_dir(self.root) / pc.FAILURE_FILE).read_text(encoding='utf-8'))
                 self.assertEqual((noted['project'], [entry for entry in noted['earlier'] if 'project' in entry]), ('p9', []))
         pc.note_failure(self.root / 'no' / 'such' / 'root', 'p9', ALICE, RuntimeError('x'))
+        # Whatever goes wrong while the note is written, of whatever kind (kittrial-5bb.149).
+        for failure in (RuntimeError('disk'), KeyError('x'), TypeError('y'), OSError(28, 'No space left on device')):
+            with self.subTest(failure=type(failure).__name__), \
+                    unittest.mock.patch.object(admin, 'atomic_private_write', side_effect=failure):
+                pc.note_failure(self.root, 'p9', ALICE, RuntimeError('x'))
+
+
+class UnopenableRecordTests(Operators):
+    """A record that cannot be opened, a record that is a directory, a file that is no record (kittrial-5bb.149)."""
+
+    def records_dir(self):
+        pc.records_dir(self.root).mkdir(exist_ok=True)
+        return pc.records_dir(self.root)
+
+    def unopenable(self, name='alpha'):
+        """A record whose every read fails, as a file owned by another user would."""
+        path = self.records_dir() / (name + '.json')
+        path.write_text(json.dumps({'project': name, 'by': ALICE, 'state': 'created'}), encoding='utf-8')
+        real = Path.read_text
+
+        def read_text(target, *args, **kwargs):
+            if Path(target) == path:
+                raise PermissionError(13, 'Permission denied', str(path))
+            return real(target, *args, **kwargs)
+        patcher = unittest.mock.patch.object(Path, 'read_text', read_text)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return path
+
+    def test_it_reads_as_damaged_everywhere_and_does_not_stop_other_names(self):
+        self.unopenable()
+        with self.assertRaises(ValueError) as caught:
+            pc.read_record(self.root, 'alpha')
+        self.assertIn('cannot be opened (PermissionError)', str(caught.exception))
+        self.assertEqual([(r['project'], r['effective']) for r in pc.records(self.root)], [('alpha', 'damaged')])
+        listed = pc.attention(self.root)
+        self.assertEqual([(i['project'], i['state'], i['served']) for i in listed], [('alpha', 'damaged', False)])
+        self.assertIn('admin.py remove-creation alpha --actor OPERATOR --reason REASON', listed[0]['command'])
+        self.assertEqual(sorted(pc.server_names(self.root)), ['alpha'])
+        self.assertIn('is damaged', pc.registrable(self.root, 'alpha'))
+        # Its own name is held ...
+        with self.assertRaises(ValueError):
+            self.create()
+        self.assertEqual(self.calls, [])
+        # ... and another name is created as usual.
+        self.assertEqual(self.create('beta')['status'], 'created')
+
+    def test_remove_creation_sets_it_aside_without_opening_it(self):
+        path = self.unopenable()
+        result = pc.remove(self.root, 'alpha', 'ops', 'cannot be opened', retire=self.retire)
+        self.assertEqual((result['removed'], result['name']), ('damaged-record', 'free'))
+        self.assertFalse(path.exists())
+        self.assertTrue((pc.records_dir(self.root) / result['kept_as']).is_file())
+        self.assertEqual((self.retired, pc.attention(self.root)), ([], []))
+
+    @unittest.skipIf(sys.platform == 'win32' or (hasattr(os, 'geteuid') and os.geteuid() == 0),
+                     'needs a file the process cannot open (POSIX, not root)')
+    def test_a_file_of_mode_000_for_real(self):
+        path = self.records_dir() / 'alpha.json'
+        path.write_text('{}', encoding='utf-8')
+        os.chmod(path, 0)
+        self.addCleanup(lambda: path.exists() and os.chmod(path, 0o600))
+        self.assertEqual([(r['project'], r['effective']) for r in pc.records(self.root)], [('alpha', 'damaged')])
+        self.assertEqual(self.create('beta')['status'], 'created')
+        result = pc.remove(self.root, 'alpha', 'ops', 'mode 000', retire=self.retire)
+        self.assertEqual(result['removed'], 'damaged-record')
+        self.assertEqual(pc.attention(self.root), [])
+
+    def test_a_record_that_is_a_directory_or_a_symlink_is_damaged_like_any_other(self):
+        (self.records_dir() / 'alpha.json').mkdir()
+        shapes = ['alpha']
+        if hasattr(os, 'symlink') and sys.platform != 'win32':
+            os.symlink(self.root / 'elsewhere.json', self.records_dir() / 'beta.json')
+            shapes.append('beta')
+        self.assertEqual([(r['project'], r['effective']) for r in pc.records(self.root)],
+                         [(name, 'damaged') for name in shapes])
+        self.assertEqual(sorted(pc.server_names(self.root)), shapes)
+        for name in shapes:
+            with self.subTest(record=name):
+                with self.assertRaises(ValueError):                    # the name is held: never "nothing was made, try again"
+                    self.create(name)
+                self.assertNotIn(name, [call[0] for call in self.calls])
+                result = pc.remove(self.root, name, 'ops', 'not a file', retire=self.retire)
+                self.assertEqual((result['removed'], result['name']), ('damaged-record', 'free'))
+        self.assertEqual(pc.attention(self.root), [])
+        self.assertEqual(self.create()['status'], 'created')
+
+    def test_a_file_whose_name_no_project_can_have_is_not_a_creation_and_is_not_counted(self):
+        for name in ('UPPER.json', 'a.json', 'has space.json', '.json', 'x' * 30 + '.json'):
+            (self.records_dir() / name).write_text('{}', encoding='utf-8')
+        found = pc.records(self.root)
+        self.assertEqual(sorted((r['project'], r['effective']) for r in found),
+                         sorted((Path(name).stem, 'not-a-record') for name in ('UPPER.json', 'a.json', 'has space.json', '.json',
+                                                                         'x' * 30 + '.json')))
+        self.assertEqual(pc.server_names(self.root), set())
+        self.assertEqual(pc.server_usage(self.root)['used'], 0)
+        self.assertEqual(pc.holds(self.root, ALICE), [])
+        listed = {item['project']: item for item in pc.attention(self.root)}
+        self.assertEqual(listed['UPPER']['state'], 'not-a-record')
+        self.assertEqual(listed['UPPER']['command'],
+                         'this file is not a creation record, because no project can have that name. It holds no name '
+                         'and is not counted. Move project-creations/UPPER.json out of that directory')
+        self.assertNotIn('remove-creation', listed['has space']['command'])
+        self.assertIn('Move project-creations/.json out of that directory', listed['.json']['command'])
+        with self.assertRaises(ValueError):                                # remove-creation takes project names only
+            pc.remove(self.root, 'UPPER', 'ops', 'junk', retire=self.retire)
+        self.assertTrue((self.records_dir() / 'UPPER.json').is_file())
+        self.assertEqual(self.create()['status'], 'created')              # and it stops nothing
+
+    def test_the_endpoint_rule_serves_a_damaged_record_and_refuses_an_unfinished_one(self):
+        self.create('done')
+        self.create('half', initialize=self.initialize(fail_at='merge-slot'))
+        pc.write_record(self.root, 'stalled', {'project': 'stalled', 'by': ALICE, 'operation_id': 'o', 'state': 'started',
+                                               'stage': None, 'started_at': 'x'})
+        self.assertIsNone(pc.unfinished(self.root, 'done'))
+        self.assertIsNone(pc.unfinished(self.root, 'never'))
+        self.assertIn('has not finished (incomplete)', pc.unfinished(self.root, 'half'))
+        self.assertIn('has not finished (stalled)', pc.unfinished(self.root, 'stalled'))
+        # The records are damaged: serving no longer depends on them, registration still does.
+        for name in ('done', 'half'):
+            (pc.records_dir(self.root) / (name + '.json')).write_text('{not json', encoding='utf-8')
+            self.assertIsNone(pc.unfinished(self.root, name))
+            self.assertIn('is damaged', pc.registrable(self.root, name))
+        listed = {item['project']: item for item in pc.attention(self.root)}
+        self.assertEqual((listed['done']['state'], listed['done']['served']), ('damaged', True))
+        self.assertTrue(listed['done']['command'].startswith(
+            'projects/done is initialized and is SERVED WITH A DAMAGED CREATION RECORD: the kit cannot tell whether its '
+            'creation finished. the record cannot be read'), listed['done']['command'])
+        self.assertIn('admin.py remove-creation done --actor OPERATOR --reason REASON', listed['done']['command'])
+        self.assertEqual(sorted(pc.server_names(self.root)), ['done', 'half', 'stalled'])
+
+    @unittest.skipIf(sys.platform == 'win32', 'endpoint imports fcntl (POSIX-only)')
+    def test_the_endpoint_serves_a_project_whose_record_is_damaged_but_not_one_that_was_never_initialized(self):
+        import endpoint
+        request = {'actor': 'alice', 'action': 'setup-status', 'args': []}
+        # Finished and then damaged: served (setup-status is a read that needs no bd).
+        self.create('done')
+        (pc.records_dir(self.root) / 'done.json').write_text('{not json', encoding='utf-8')
+        answer = endpoint.execute(self.root, dict(request, project='done'))
+        self.assertEqual(answer['returncode'], 0, answer)
+        self.assertEqual(json.loads(answer['stdout'])['creation_record'],
+                         'The creation record of project done is damaged; an operator must look at it first')
+        # Died inside bd init (a directory, no metadata), then its record was damaged: still refused,
+        # by the same test an operator-made project has to pass.
+        self.create('partial', initialize=lambda root, name, stage: (admin.project_dir(root, name) / 'x').mkdir(parents=True)
+                    or (_ for _ in ()).throw(RuntimeError('died in bd init')))
+        self.assertEqual(pc.made(self.root, 'partial'), 'partial')
+        (pc.records_dir(self.root) / 'partial.json').write_text('{not json', encoding='utf-8')
+        with self.assertRaises(ValueError) as caught:
+            endpoint.execute(self.root, dict(request, project='partial'))
+        self.assertEqual(str(caught.exception), 'Unknown/uninitialized project')
+        # Unfinished with a readable record: refused with its sentence, as before.
+        self.create('half', initialize=self.initialize(fail_at='merge-slot'))
+        with self.assertRaises(ValueError) as caught:
+            endpoint.execute(self.root, dict(request, project='half'))
+        self.assertIn('is a creation that has not finished (incomplete)', str(caught.exception))
+
+
+class RemoveCommandOutputTests(Operators):
+    """What `admin.py remove-creation` prints: each sentence is true of what was done (kittrial-5bb.149)."""
+
+    def run_admin(self, *argv):
+        import contextlib
+        import io
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(sys, 'argv', ['admin.py', '--root', str(self.root), *argv]), \
+                unittest.mock.patch.object(admin, 'root_path', return_value=self.root), \
+                unittest.mock.patch.dict(os.environ, {'ORCHESTRA_OPERATORS': ''}), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            admin.main()
+        return json.loads(out.getvalue()), err.getvalue().strip()
+
+    def damage(self, name):
+        pc.records_dir(self.root).mkdir(exist_ok=True)
+        (pc.records_dir(self.root) / (name + '.json')).write_text('{not json', encoding='utf-8')
+
+    def test_a_damaged_record_with_nothing_made_is_set_aside_and_the_name_is_free(self):
+        self.damage('alpha')
+        result, said = self.run_admin('remove-creation', 'alpha', '--actor', 'ops', '--reason', 'unreadable')
+        self.assertEqual(said, 'The creation record of alpha could not be read. It is kept as project-creations/%s and '
+                               'nothing else was touched. Nothing is under projects/alpha, so the name is free again.'
+                         % result['kept_as'])
+        self.assertNotIn('Removed the creation record', said)             # it was not removed: it was set aside
+
+    def test_a_damaged_record_over_a_project_directory_does_not_say_the_name_is_free(self):
+        self.create()
+        self.damage('alpha')
+        result, said = self.run_admin('remove-creation', 'alpha', '--actor', 'ops', '--reason', 'unreadable')
+        self.assertTrue(said.startswith('The creation record of alpha could not be read. It is kept as project-creations/%s '
+                                        'and nothing else was touched. projects/alpha exists and is now a project with no '
+                                        'creation record' % result['kept_as']), said)
+        self.assertNotIn('free again', said)
+        self.assertNotIn('Removed', said)
+
+    def test_a_stalled_creation_is_removed_and_the_name_is_free(self):
+        pc.write_record(self.root, 'alpha', {'project': 'alpha', 'by': ALICE, 'operation_id': 'o', 'state': 'started',
+                                             'stage': None, 'started_at': 'x'})
+        result, said = self.run_admin('remove-creation', 'alpha', '--actor', 'ops', '--reason', 'stalled')
+        self.assertEqual(said, 'Removed the creation record of alpha. Nothing had been made for it, so the name is free again.')
+
+    def test_the_listing_command_does_not_end_in_a_traceback_on_a_record_it_cannot_read(self):
+        self.damage('alpha')
+        (pc.records_dir(self.root) / 'beta.json').mkdir()
+        (pc.records_dir(self.root) / 'UPPER.json').write_text('{}', encoding='utf-8')
+        listed, said = self.run_admin('project-creations', '--attention')
+        self.assertEqual(sorted((item['project'], item['state']) for item in listed),
+                         [('UPPER', 'not-a-record'), ('alpha', 'damaged'), ('beta', 'damaged')])
+        everything, said = self.run_admin('project-creations')
+        self.assertEqual(len(everything), 3)
 
 
 if __name__ == '__main__':

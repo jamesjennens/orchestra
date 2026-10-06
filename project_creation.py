@@ -110,9 +110,21 @@ def read_record(root, name):
     path = record_path(root, name)
     if path.is_symlink():
         raise ValueError('A project creation record must not be a symlink')
-    if not path.is_file():
+    if not os.path.lexists(path):
         return None
-    record = json.loads(path.read_text(encoding='utf-8'))
+    if not path.is_file():
+        # A directory, a device, anything that is not a file (kittrial-5bb.149): damaged, like a
+        # file that cannot be parsed. It was read as "no record", and nothing listed it.
+        raise ValueError('The project creation record for %s is not a file; an operator must look at %s'
+                         % (name, path))
+    try:
+        text = path.read_text(encoding='utf-8')
+    except OSError as error:
+        # A file the service account cannot open (owned by another user after a restore, say) is
+        # a damaged record too, not a failure of whatever was being done (kittrial-5bb.149).
+        raise ValueError('The project creation record for %s cannot be opened (%s); an operator must look '
+                         'at %s' % (name, type(error).__name__, path)) from None
+    record = json.loads(text)
     if not isinstance(record, dict) or record.get('project') != name or record.get('state') not in STATES \
             or not isinstance(record.get('by'), str):
         raise ValueError('The project creation record for %s is damaged; an operator must look at %s'
@@ -185,12 +197,20 @@ def records(root):
         return []
     found = []
     running = running_name(root)
+    import admin
     for path in sorted(directory.glob('*.json')):
-        if path.is_symlink() or not path.is_file():
+        try:
+            admin.validate_name(path.stem)
+        except ValueError:
+            # No project can have this name, so this is no project's creation record: it holds
+            # no name and no place, and is listed only so that somebody moves it away.
+            found.append({'project': path.stem, 'state': NOT_A_RECORD, 'effective': NOT_A_RECORD, 'by': None,
+                          'file': path.name})
             continue
         try:
             record = read_record(root, path.stem)
         except ValueError:
+            # Not JSON, the wrong shape, a symlink, a directory, a file that cannot be opened.
             found.append({'project': path.stem, 'state': 'damaged', 'effective': 'damaged', 'by': None})
             continue
         if record is not None:
@@ -211,6 +231,8 @@ def holds(root, account, registered=()):
                   and record['project'] not in registered)
 
 
+#: A file in the records directory whose name no project can have.
+NOT_A_RECORD = 'not-a-record'
 #: The readings of a record that hold its name and a place.
 HOLDING = (RUNNING, STALLED, 'incomplete', 'created')
 
@@ -577,7 +599,12 @@ COMMANDS = {
                'records as NAME.json.damaged-STAMP and nothing else is touched. What is under projects/NAME, if '
                'anything, is then a project with no creation record: register it, or retire it (admin.py '
                'retire-project NAME)',
+    NOT_A_RECORD: 'this file is not a creation record, because no project can have that name. It holds no name and '
+                  'is not counted. Move project-creations/FILE out of that directory',
 }
+#: Put before the command of a damaged record whose project is initialized, and so is served.
+SERVED_DAMAGED = ('projects/NAME is initialized and is SERVED WITH A DAMAGED CREATION RECORD: the kit cannot tell '
+                  'whether its creation finished. ')
 
 
 def attention(root):
@@ -586,11 +613,26 @@ def attention(root):
     A running one is listed as running, never as incomplete (review 01a109cc): the
     remove command run on one in flight pulled its directory away.
     """
-    return [{'project': record['project'], 'state': record['effective'], 'by': record.get('by'),
-             'stage': record.get('stage'), 'started_at': record.get('started_at'),
-             'stopped_at': record.get('stopped_at'),
-             'command': COMMANDS[record['effective']].replace('NAME', record['project'])}
-            for record in records(root) if record['effective'] in COMMANDS]
+    found = []
+    for record in records(root):
+        if record['effective'] not in COMMANDS:
+            continue
+        command = COMMANDS[record['effective']]
+        served = record['effective'] == 'damaged' and _initialized(root, record['project'])
+        if served:
+            command = SERVED_DAMAGED + command
+        found.append({'project': record['project'], 'state': record['effective'], 'by': record.get('by'),
+                      'stage': record.get('stage'), 'started_at': record.get('started_at'),
+                      'stopped_at': record.get('stopped_at'), 'served': served,
+                      'command': command.replace('NAME', record['project']).replace('FILE', record.get('file') or '')})
+    return found
+
+
+def _initialized(root, name):
+    try:
+        return made(root, name) == 'initialized'
+    except (OSError, ValueError):
+        return False
 
 
 def unregistered(root):
@@ -598,6 +640,33 @@ def unregistered(root):
     return [{'project': record['project'], 'state': 'created', 'by': record.get('by'),
              'completed_at': record.get('completed_at')}
             for record in records(root) if record['effective'] == 'created']
+
+
+def unfinished(root, name):
+    """Why the endpoint serves nothing from ``name``, or None: its creation is running, stopped or stalled.
+
+    A registered project does not depend on its creation record (kittrial-5bb.149): a
+    record that is absent, finished or DAMAGED does not stop the endpoint, exactly as a
+    project an operator made, which has no record, is served. The caller has already
+    required the project to be initialized, so a creation that died inside ``bd init``
+    is refused whatever became of its record. The cost: an unfinished, unregistered
+    creation whose record is then damaged is reachable without the web service, as an
+    operator-made project is. A damaged record still holds the name, counts toward the
+    server limit and blocks registration (:func:`registrable`).
+    """
+    import admin
+    try:
+        admin.validate_name(name)
+        record = read_record(root, name)
+    except ValueError:
+        return None
+    if record is None or record['state'] == 'removed':
+        return None
+    effective = effective_state(root, record, running_name(root))
+    if effective == 'created':
+        return None
+    return ('Project %s is a creation that has not finished (%s). It cannot be registered until an operator '
+            'finishes it (admin.py finish-project %s).' % (name, effective, name))
 
 
 def registrable(root, name):
@@ -715,6 +784,8 @@ COULD_NOT = ('The project could not be created and nothing was made. Try again; 
 MADE_NOT_REGISTERED = ('Project %s was made on the server, but it could not be registered in the web interface. Ask '
                        'an operator of the server to look at it. When that is repaired, create it again with the '
                        'same name: nothing is made twice, it is only registered. Do not create it under another name.')
+MADE_WAITING = ('Project %s was made on the server; registering it had to wait for a lock. Send the same request '
+                'again in a moment: nothing is made twice.')
 NAME_RULE = 'Project: 2-24 lowercase letters/digits, beginning with a letter'
 _NAME = r'[a-z][a-z0-9]{1,23}'
 
@@ -744,6 +815,19 @@ def creation_sentence(line):
         if line.startswith(prefix):
             line = line[len(prefix):]
     return line if any(pattern.fullmatch(line) for pattern in _sentence_patterns()) else None
+
+
+def busy_sentence(line):
+    """``line`` if it is, whole, one of the two sentences a creation answers busy with; else None.
+
+    Anything else on return code 75 is the endpoint's own line for a lock wait that ran
+    out, which names the lock file (kittrial-5bb.149).
+    """
+    import re
+    if not isinstance(line, str):
+        return None
+    made = re.escape(MADE_WAITING).replace('%s', _NAME)
+    return line if line == BUSY or re.fullmatch(made, line) else None
 
 
 def _host_failure(root, name, account, error, progress):
@@ -800,7 +884,12 @@ def create_action(root, request, authority_config, initialize=None):
     try:
         return _create_steps(root, request, authority_config, initialize, descriptor, name, account, progress)
     except TimeoutError:
-        raise                                  # a lock wait that ran out: the endpoint answers busy
+        made_already = progress.get('result')
+        if progress.get('step') == 'confirm' and isinstance(made_already, dict) and made_already.get('status') == 'created':
+            # The wait ran out in the last step: the project IS made, so the endpoint's own
+            # busy sentence ("Nothing was done") would not be true here.
+            return {'returncode': BUSY_RETURNCODE, 'stdout': '', 'stderr': '%s\n' % (MADE_WAITING % name)}
+        raise                                  # nothing was made: the endpoint answers busy
     except Exception as error:                 # noqa: BLE001
         return _refused(_host_failure(root, name, account, error, progress))
 
@@ -895,6 +984,14 @@ def list_action(root, request, authority_config):
     except AuthorityDenied as denied:
         return {'returncode': 126, 'stdout': '', 'stderr': '%s\n' % denied.message,
                 'authority_status': denied.status}
+    # The limit comes from the deployment's configuration file. When that cannot be read the
+    # list still answers, without the numbers: its error names the file (kittrial-5bb.149).
+    try:
+        server = server_usage(root)
+    except (ValueError, OSError) as error:
+        note_failure(root, None, descriptor.get('user_id'), error, step='list')
+        server = None
     return {'returncode': 0, 'stdout': json.dumps({'schema_version': 1, 'items': attention(root),
-                                                   'created': unregistered(root), 'server': server_usage(root)}) + '\n',
+                                                   'created': unregistered(root), 'server': server,
+                                                   'server_readable': server is not None}) + '\n',
             'stderr': ''}
