@@ -155,6 +155,13 @@ class ParserTests(unittest.TestCase):
         with self.assertRaises(oi.Malformed):
             oi.parse_answer(fx.body(oi.OWNER_ANSWER_PREFIX, dict(answer, sha256='f' * 64)), 'kit-1')
 
+    def test_a_record_must_be_canonical_json(self):
+        item = fx.item_record('kit-1')
+        spaced = oi.OPEN_ITEM_PREFIX + json.dumps(item, sort_keys=True)
+        with self.assertRaisesRegex(oi.Malformed, 'not canonical JSON'):
+            oi.parse_item(spaced, 'kit-1')
+        self.assertEqual(oi.parse_item(fx.body(oi.OPEN_ITEM_PREFIX, item), 'kit-1'), item)
+
     def test_deep_json_is_malformed_not_a_crash(self):
         with self.assertRaisesRegex(oi.Malformed, 'nested too deeply'):
             oi.parse_item(oi.OPEN_ITEM_PREFIX + '[' * 3000 + ']' * 3000, 'kit-1')
