@@ -21,6 +21,7 @@ import binascii
 import hashlib
 import ipaddress
 import json
+import os
 import record_json
 import re
 import secrets
@@ -5650,6 +5651,34 @@ def create_server(service, backend, *, host='127.0.0.1', port=0, trusted_proxies
     return httpd
 
 
+def runtime_service_lock(root):
+    """Take the supervisor's runtime lock, or return None when a service holds it.
+
+    ``office_service.py run`` holds an exclusive flock on ``<root>/office-service.lock``
+    for its whole life. Taking the same lock here makes bootstrap and a running
+    service mutually exclusive: bootstrap is refused while a service runs (a running
+    service keeps the state in memory and writes it back, so an account added
+    underneath it is silently lost), and a service cannot start underneath a bootstrap
+    in progress. The caller holds the returned file descriptor until the bootstrap is
+    written, then releases it.
+
+    Raises ``ValueError`` on a platform without ``fcntl``, because the office service
+    is a POSIX deployment and silently skipping the guard would reintroduce the loss.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        raise ValueError('Bootstrapping needs the runtime lock, which requires a POSIX host') from None
+    path = Path(root)/'office-service.lock'
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
 def build_backend(service, args):
     """Select the canonical backend. ``endpoint`` is the documented Linux service."""
     if args.backend == 'endpoint':
@@ -5714,13 +5743,37 @@ def main(argv=None):
         items = unusable_projects(types.SimpleNamespace(state=document))
         print(json.dumps({'items': items, 'total': len(items)}, indent=2))
         return 0
-    store = Store(args.state)
     if args.bootstrap_user:
+        # Checked before the state store is opened, so a refusal neither reads nor
+        # writes the state a running service is about to save over.
+        if not args.root:
+            parser.error('--bootstrap-user needs --root: the runtime lock is what proves no service is running')
+        if not Path(args.root).is_dir():
+            # One plain sentence, checked before the lock is opened: os.open on a path
+            # under a missing root raises FileNotFoundError, and the review asked for a
+            # sentence instead of a traceback (kittrial-5bb.162 item bootstrap-docs-and-root).
+            print('Refusing to bootstrap %s: --root must name an existing runtime directory, and %s is not one.'
+                  % (args.bootstrap_user, args.root), file=sys.stderr)
+            return 1
+        lock_fd = runtime_service_lock(args.root)
+        if lock_fd is None:
+            print('Refusing to bootstrap %s: a service is running for runtime %s (it holds '
+                  'office-service.lock). Stop the service and bootstrap while it is stopped; a running '
+                  'service keeps its state in memory and writes it back, so the new account would be lost.'
+                  % (args.bootstrap_user, args.root), file=sys.stderr)
+            return 1
         import getpass
-        password = getpass.getpass('New superuser password: ')
-        Service.bootstrap_superuser(store, args.bootstrap_user, password)
+        try:
+            store = Store(args.state)
+            password = getpass.getpass('New superuser password: ')
+            Service.bootstrap_superuser(store, args.bootstrap_user, password)
+        finally:
+            import fcntl
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
         print('Bootstrapped %s' % args.bootstrap_user)
         return 0
+    store = Store(args.state)
     if args.backend == 'endpoint' and (not args.endpoint or not args.root):
         parser.error('--backend endpoint requires --endpoint and --root '
                      '(use --backend inprocess only for a disposable local check)')

@@ -2259,6 +2259,37 @@ def append_retire_journal(root,record):
 
 PROJECT_SETTINGS=[('no-git-ops','true'),('dolt.auto-push','false'),('dolt.auto-commit','on'),('backup.git-push','false')]
 
+#: What ``bd init`` runs while it makes a project. ``bd init`` creates the project's
+#: git repository, so a host without git fails part way through and used to leave a
+#: half-made ``projects/NAME`` that the next ``add-project`` reads as "already exists"
+#: and that ``backup --all`` cannot see. The list is deliberately small: each entry is
+#: a program the kit has watched a plain install need, and the check runs before
+#: anything is created.
+BD_INIT_TOOLS=('git',)
+
+def missing_bd_init_tools(root):
+    """The programs ``bd init`` needs that are not on the runtime's PATH, in order.
+
+    The PATH is composed as ``environment`` composes it - the runtime's own ``bin``
+    first, then the caller's PATH - without reading the runtime's private config, so
+    the check works before a runtime exists.
+    """
+    from shutil import which
+    path=str(Path(root)/'bin')+os.pathsep+os.environ.get('PATH','')
+    return [name for name in BD_INIT_TOOLS if which(name,path=path) is None]
+
+def require_bd_init_tools(root):
+    """Refuse, before anything is created, when a program ``bd init`` needs is missing.
+
+    The sentence names what is missing so an operator can install it; the caller has
+    not created the project directory yet, so a refusal leaves nothing behind.
+    """
+    missing=missing_bd_init_tools(root)
+    if missing:
+        names=' and '.join(missing)
+        raise ValueError('This host has no %s on PATH, which bd init needs to create a project. '
+                         'Install %s and run this command again; nothing was created.'%(names,names))
+
 def initialize_project(root,name,stage=None):
     """The work of ``add-project``: database, settings, backup target, merge slot, first backup.
 
@@ -2273,6 +2304,21 @@ def initialize_project(root,name,stage=None):
         raise ValueError('Project name %s is used by the database server itself: choose another name'%name)
     refuse_retired_name(root,name)
     if path.exists() and any(path.iterdir()): raise ValueError('Project already exists; use it rather than initializing again')
+    require_bd_init_tools(root)
+    # Deliberately NO clean-up of a failed creation here. An earlier revision removed
+    # ``projects/NAME`` whenever ``.beads/metadata.json`` was not there yet, so that a
+    # failed creation would "leave nothing". The review (kittrial-5bb.162 items
+    # cleanup-deletes-concurrent-creation and cleanup-hides-half-made-database) showed
+    # that was worse than main in two ways: it deleted a directory a concurrent
+    # ``add-project NAME`` was still filling (both calls then failed and the database
+    # stayed on the server), and when ``bd init`` was killed part way it hid a
+    # half-made database - the directory went while the database stayed, so the web
+    # route answered "nothing was made" and every retry then failed on the half-made
+    # database. A failure here now leaves the directory exactly as the failure left it,
+    # which is how main behaves and what docs/HTTP_DEPLOYMENT.md describes.
+    # ``project_creation.work`` is the web path's own, older clean-up and is unchanged:
+    # under the creation lock it ``rmdir``s only a genuinely empty directory (and
+    # tolerates failure), so it cannot remove another creation's work.
     path.mkdir(exist_ok=True)
     cfg=config(root)
     at('init')
