@@ -795,7 +795,9 @@ def a_deadline_is_as_long_as_it_was_asked_for(self):
         self.httpd.unwatch(marker)
         self.assertNotIn(marker, self.httpd._deadlines)
         self.assertGreater(left, seconds - 0.5)
-        self.assertLessEqual(left, seconds)
+        # A clock that has not ticked since the deadline was armed gives (t + s) - t, which floating point
+        # may round a hair above s (seen on Windows: 30.000000000000057): a millisecond of room, no more.
+        self.assertLessEqual(left, seconds + 0.001)
 
 
 def every_wait_for_a_client_is_armed_with_the_servers_bound(self):
@@ -817,7 +819,7 @@ def every_wait_for_a_client_is_armed_with_the_servers_bound(self):
         self.assertEqual(seconds, 30)
         if left is not None:
             self.assertGreater(left, 29.5)
-            self.assertLessEqual(left, 30)
+            self.assertLessEqual(left, 30 + 0.001)                 # as above: rounding, not a longer deadline
 
 
 def no_wait_for_a_client_is_left_armed_when_it_is_over(self):
