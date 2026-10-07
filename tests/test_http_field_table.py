@@ -98,6 +98,17 @@ class PriorityThroughTheRoute(task_fields.Project, fixes.EndpointCase):
                 self.assertIn('Task priority must be an integer 0-4', message(refused))
         self.assertEqual(before, len(self.canonical_rows()))
 
+    def test_a_null_priority_on_create_is_absent_on_this_backend_too(self):
+        """Both backends read ``priority: null`` as absent (review item 4, finding F4)."""
+        self.project()
+        made = self.request('POST', '/v1/projects/%s/tasks' % self.pid,
+                            {'title': 'null priority', 'priority': None}, token=self.alex)
+        self.assertEqual(201, made.status, made.data)
+        self.assertEqual(2, self.stored(made.data['id'])['priority'])
+        shown = self.request('GET', '/v1/projects/%s/tasks/%s' % (self.pid, made.data['id']),
+                             token=self.alex)
+        self.assertEqual(2, shown.data.get('priority'), shown.data)
+
 
 class UnknownFieldTableOnTheEndpointBackend(task_fields.Project, fixes.EndpointCase):
     """Task create, claim and checkpoint refuse a field they do not take (item 2)."""
@@ -160,6 +171,30 @@ class UnknownFieldTableOnTheEndpointBackend(task_fields.Project, fixes.EndpointC
         corrected = self.request('POST', self.path + '/checkpoints', body, token=self.alex,
                                  key='unknown-checkpoint-1')
         self.assertEqual(201, corrected.status, corrected.data)
+
+    def test_a_caller_with_no_right_keeps_the_404_on_every_task_route(self):
+        """A refusal must never come before the caller's right is checked (review item 4, O1).
+
+        ``drew`` is an account of the installation and not a member of this project. Every
+        one of these routes answers its unchanged 404 for a body it takes; the same body
+        with a field the route does not take must answer exactly the same, never the 422
+        field list that belongs to a caller who may write.
+        """
+        self.project()
+        drew = self.login('drew', 'drew-password-1')[0]
+        cases = (('task create', 'POST', '/v1/projects/%s/tasks' % self.pid,
+                  {'title': 'x'}, {'title': 'x', 'assignee': 'me'}),
+                 ('claim', 'POST', self.path + '/claim', {}, {'assignee': 'me'}),
+                 ('task change', 'PATCH', self.path, {'title': 'x'},
+                  {'title': 'x', 'assignee': 'me'}))
+        for where, method, path, taken, unknown in cases:
+            with self.subTest(route=where):
+                plain = self.request(method, path, taken, token=drew)
+                guessing = self.request(method, path, unknown, token=drew)
+                self.assertEqual(404, plain.status, plain.data)
+                self.assertEqual(plain.status, guessing.status, guessing.data)
+                self.assertEqual(message(plain), message(guessing))
+                self.assertNotIn('does not take', message(guessing))
 
 
 class UnknownFieldTableOnTheServiceRoutes(fixes.Harness):
@@ -231,6 +266,45 @@ class UnknownFieldTableOnTheServiceRoutes(fixes.Harness):
                                  token=self.alex, key='agent-change-unknown-1')
         self.assertEqual(200, corrected.status, corrected.data)
         self.assertEqual('/home/alex/k', corrected.data['working_directory'])
+
+    def test_agent_change_by_a_caller_with_no_right_keeps_the_404(self):
+        """The refusal is answered after the record's ownership is judged (review item 1)."""
+        admin = self.team()
+        made = self.request('POST', '/v1/agents', {'name': 'Kestrel'}, token=self.alex)
+        self.assertEqual(201, made.status, made.data)
+        path = '/v1/agents/%s' % made.data['agent']['id']
+        self.create_account(admin, 'casey', 'casey-password-1')
+        casey = self.login('casey', 'casey-password-1')[0]
+        plain = self.request('PATCH', path, {'notes': 'n'}, token=casey)
+        guessing = self.request('PATCH', path, {'notes': 'n', 'surprise': 1}, token=casey)
+        self.assertEqual(404, plain.status, plain.data)
+        self.assertEqual(plain.status, guessing.status, guessing.data)
+        self.assertEqual(message(plain), message(guessing))
+        self.assertNotIn('does not take', message(guessing))
+        # The owner still gets the field list for the same body.
+        owner = self.request('PATCH', path, {'notes': 'n', 'surprise': 1}, token=self.alex)
+        self.assertRefused(owner, 'An agent change', ['surprise'],
+                           http_service.ApiHandler.AGENT_UPDATE_FIELDS)
+
+    def test_agent_creation_for_a_project_the_caller_cannot_see_keeps_the_404(self):
+        """The grant is judged before the field list is answered (review item 1, case B)."""
+        admin = self.team()
+        self.create_account(admin, 'casey', 'casey-password-1')
+        casey = self.login('casey', 'casey-password-1')[0]
+        hidden = self.create_project(casey, 'Hidden')
+        body = {'name': 'Intruder', 'projects': [hidden]}
+        plain = self.request('POST', '/v1/agents', body, token=self.alex)
+        guessing = self.request('POST', '/v1/agents', dict(body, surprise=1), token=self.alex)
+        self.assertEqual(404, plain.status, plain.data)
+        self.assertEqual(plain.status, guessing.status, guessing.data)
+        self.assertEqual(message(plain), message(guessing))
+        self.assertNotIn('does not take', message(guessing))
+        # A project the caller can see, with the same unknown field, is the route's 422.
+        refused = self.request('POST', '/v1/agents',
+                               {'name': 'Kestrel', 'projects': [self.pid], 'surprise': 1},
+                               token=self.alex)
+        self.assertRefused(refused, 'An agent creation', ['surprise'],
+                           http_service.ApiHandler.AGENT_CREATE_FIELDS)
 
     def test_account_creation_refuses_a_field_it_does_not_take(self):
         admin = self.team()

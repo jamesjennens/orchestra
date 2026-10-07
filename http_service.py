@@ -531,7 +531,12 @@ class InProcessBackend:
         description = payload.get('description') or ''
         if not isinstance(description, str) or len(description) > 20000:
             raise invalid('Task description is too long')
-        priority = payload.get('priority', 2)
+        # A null priority is absent, not a value (kittrial-5bb.183 review item 4): the route
+        # guard and the endpoint backend already read it that way, and every released client
+        # sends null where it has no value, so bd's default 2 applies on both backends.
+        priority = payload.get('priority')
+        if priority is None:
+            priority = 2
         if type(priority) is not int or not 0 <= priority <= 4:
             raise invalid('Task priority must be an integer 0-4')
         task_id = 'task_' + secrets.token_hex(6)
@@ -4409,9 +4414,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         payload = dict(ctx.payload or {})
 
         def create():
-            # A field the route does not take is refused, not dropped (kittrial-5bb.183 item 2).
-            refuse_unknown_fields(payload, self.AGENT_CREATE_FIELDS, 'An agent creation')
+            # The caller's right over every named project is judged before the route's
+            # field list is answered (kittrial-5bb.183 review item 1): a project the
+            # caller cannot see keeps the service's own 404, exactly as the same body
+            # without the unknown field does. Only then is a field the route does not
+            # take refused, not dropped (kittrial-5bb.183 item 2).
             self._require_grantable(ctx.principal, payload.get('projects'), ())
+            self.service.check_agent_grant(ctx.principal, payload.get('projects'))
+            refuse_unknown_fields(payload, self.AGENT_CREATE_FIELDS, 'An agent creation')
             result = self.service.create_agent(
                 ctx.principal, name=payload.get('name'), tool=payload.get('tool'),
                 working_directory=payload.get('working_directory'),
@@ -4452,8 +4462,6 @@ class ApiHandler(BaseHTTPRequestHandler):
         payload = dict(ctx.payload or {})
 
         def update():
-            # A field the route does not take is refused, not dropped (kittrial-5bb.183 item 2).
-            refuse_unknown_fields(payload, self.AGENT_UPDATE_FIELDS, 'An agent change')
             record = self.service.state['agents'].get(ctx.params['aid'])
             if isinstance(record, dict):
                 # An id with no agent record is the service's own 404: judging a grant
@@ -4462,6 +4470,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._require_grantable(ctx.principal, payload.get('projects'),
                                         record.get('projects') or (),
                                         owner_id=record.get('owner'))
+            # The record's ownership is judged before the route's field list is answered
+            # (kittrial-5bb.183 review item 1): a caller who may not change the agent gets
+            # the service's own 404, exactly as the same body without the unknown field
+            # does. Only then is a field the route does not take refused, not dropped
+            # (kittrial-5bb.183 item 2). This is the same lookup update_agent() makes.
+            self.service.get_agent(ctx.principal, ctx.params['aid'])
+            refuse_unknown_fields(payload, self.AGENT_UPDATE_FIELDS, 'An agent change')
             result = self.service.update_agent(ctx.principal, ctx.params['aid'], payload)
             return result, result
         return self._mutate(ctx, 'agents.update', None, update, capability=CAP_AGENTS)

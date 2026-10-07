@@ -302,6 +302,31 @@ class InProcessCase(Project, fixes.Harness):
         self.assertEqual(200, changed.status, changed.data)
         self.assertEqual(('renamed', 2), (changed.data['title'], changed.data['version']))
 
+    def test_this_backend_takes_a_priority_on_a_change(self):
+        """The in-process backend applies the priority too (review item 4, mutant P7)."""
+        self.project()
+        for chosen in (0, 4, 2):
+            with self.subTest(priority=chosen):
+                current = self.request('GET', self.path, token=self.alex).data
+                changed = self.request('PATCH', self.path,
+                                       {'priority': chosen, 'version': current['version']},
+                                       token=self.alex)
+                self.assertEqual(200, changed.status, changed.data)
+                self.assertEqual(chosen, changed.data['priority'])
+                shown = self.request('GET', self.path, token=self.alex).data
+                self.assertEqual(chosen, shown['priority'])
+
+    def test_a_null_priority_on_create_is_absent_here_too(self):
+        """``priority: null`` is absent (bd's default 2) on both backends (review item 4)."""
+        self.project()
+        made = self.request('POST', '/v1/projects/%s/tasks' % self.pid,
+                            {'title': 'no priority', 'priority': None}, token=self.alex)
+        self.assertEqual(201, made.status, made.data)
+        self.assertEqual(2, made.data['priority'])
+        shown = self.request('GET', '/v1/projects/%s/tasks/%s' % (self.pid, made.data['id']),
+                             token=self.alex)
+        self.assertEqual(2, shown.data['priority'])
+
     def test_an_actor_in_the_body_is_bound_here_too(self):
         self.project()
         for route, method, body in (('/v1/projects/%s/tasks' % self.pid, 'POST', {'title': 'forged'}),
