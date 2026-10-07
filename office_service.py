@@ -323,6 +323,18 @@ def web_command(settings, root, port, release_python, release_script):
     return command
 
 
+#: The web service's exit status when its port is taken (``http_service.EXIT_PORT_TAKEN``).
+WEB_PORT_TAKEN = 4
+
+
+def child_exit_reason(web_status, settings, port):
+    """What the supervisor says when a child has exited; the port being taken is said as that."""
+    if web_status == WEB_PORT_TAKEN:
+        return ('The web service did not start: port %d on %s is taken (something else is listening on it). '
+                'Stop that, or run the service with another --port.' % (port, settings.get('http_host', '127.0.0.1')))
+    return 'A supervised child exited; inspect service logs'
+
+
 def run(root, logs, config, port, stop_seconds):
     if os.name != 'posix' or not sys.platform.startswith('linux'):
         raise ValueError('Foreground supervision requires Linux')
@@ -380,7 +392,7 @@ def run(root, logs, config, port, stop_seconds):
                 web = _spawn(command, root, logs/'http.log', env)
                 while not stop:
                     if db.poll() is not None or web.poll() is not None:
-                        raise RuntimeError('A supervised child exited; inspect service logs')
+                        raise RuntimeError(child_exit_reason(web.poll(), settings, port))
                     time.sleep(.2)
         finally:
             deadline = time.monotonic()+stop_seconds
