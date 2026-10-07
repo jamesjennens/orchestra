@@ -410,6 +410,7 @@ class ProxyTests(AddressCase):
         self.assertEqual(self.get(B, headers={'X-Forwarded-For': FAR})[0], 200)
         self.assertEqual(self.httpd._requests_by_address, {FAR: 1})
         # ...and it cannot use the header to pass as someone else: it is limited as B.
+        self.open_from(B, 0, within=30)              # the first connection's place is free again (see below)
         self.silent_from(B)
         self.open_from(B, 1)
         with contextlib.redirect_stderr(io.StringIO()), \
@@ -508,6 +509,10 @@ class ProxyTests(AddressCase):
         with mock.patch.object(self.httpd, 'request_begins', side_effect=AssertionError('counted')):
             status, _, _ = self.ask('GET', '/healthz')
             self.assertEqual(status, 200)
+            # The limit is one connection for this address too: the first one's place is free only
+            # when the server has seen it end, which a busy machine does a moment after the client
+            # (kittrial-5bb.181: seen once in a full run, the second connection closed at once).
+            self.open_from('127.0.0.1', 0, within=30)
             connection = self.client()
             connection.request('GET', '/healthz', headers={'X-Forwarded-For': FAR})
             self.assertEqual(connection.getresponse().status, 200)

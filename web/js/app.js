@@ -137,7 +137,7 @@ export async function start(root, options = {}) {
         if (error && error.status === 401) return ctx.sessionLost();
         if (!ctx.features.requirements && error && [404, 501].includes(error.status) && RECORD_ROUTES.has(match.name)) {
           mount(main, h('div', { class: 'panel' }, h('div', { class: 'empty', role: 'status' }, h('strong', null, 'Not available on this server'),
-            h('p', null, 'Requirements, decisions and records are not served by this Orchestra server yet. Tasks, reviews and feedback work as usual.'))));
+            h('p', null, 'Requirements, decisions and records are not served by this Orchestra server yet. Tasks and reviews work as usual.'))));
           document.title = 'Not available · Orchestra';
           return;
         }
