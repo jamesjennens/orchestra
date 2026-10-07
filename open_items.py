@@ -494,36 +494,18 @@ def _answer_view(answer, clip_words=LIST_TEXT_MAX):
 
 CONTENT_FIELDS = ('kind', 'text', 'source', 'owner', 'task', 'for', 'options', 'recommended', 'due_by')
 QUESTION_FIELDS = ('kind', 'text', 'for', 'options')
-# Depth rule for an export row (kittrial-5bb.127 review B3): a row nested deeper than this
-# is reported unreadable WITHOUT being parsed, so the result never depends on the
-# interpreter's recursion limit. 750 is the value kittrial-5bb.169 proposes for
-# record_json.ROW_NESTING_MAX; this module counts depth itself until that lands.
-ROW_NESTING_MAX = 750
-_DEPTH_TOKEN = re.compile(r'\\.|["\[\]{}]', re.DOTALL)
+# Depth rule for an export row (kittrial-5bb.127 review B3): a row nested deeper than
+# record_json.ROW_NESTING_MAX (750, kittrial-5bb.169) is reported unreadable WITHOUT being
+# parsed, so the result never depends on the interpreter's recursion limit.
+ROW_NESTING_MAX = record_json.ROW_NESTING_MAX
 _ROW_ID = re.compile(r'"id"\s*:\s*"([A-Za-z0-9][A-Za-z0-9_.-]{0,160})"')
 _ANCHOR_LABEL = '"%s"' % FAMILY_LABEL
 
 
 def nesting_exceeds(text, limit=ROW_NESTING_MAX):
-    """True when `text` nests brackets deeper than `limit` outside string literals.
-    One pass, no recursion: the same scan as record_json.nesting, with a bound."""
-    if text.count('[') + text.count('{') <= limit:
-        return False
-    depth = 0
-    in_string = False
-    for match in _DEPTH_TOKEN.finditer(text):
-        token = match.group()
-        if token == '"':
-            in_string = not in_string
-        elif in_string or token[0] == '\\':
-            continue
-        elif token in '[{':
-            depth += 1
-            if depth > limit:
-                return True
-        else:
-            depth -= 1
-    return False
+    """True when `text` nests brackets deeper than `limit` outside string literals:
+    record_json.nesting, the kit's one-pass count without recursion."""
+    return record_json.nesting(text, limit) > limit
 
 
 def _classify(comments):

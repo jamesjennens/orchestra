@@ -1353,8 +1353,8 @@ from "an item was dropped from a list" to "an item is still `open` and nobody lo
      closes nothing is shown only as `answer_that_closes_nothing`.
    * **Depth rule** (review B3). An export row nested deeper than `ROW_NESTING_MAX = 750` is reported
      unreadable without being parsed. The count is one pass without recursion, so no interpreter
-     limit decides the answer. This is the value kittrial-5bb.169 proposes for
-     `record_json.ROW_NESTING_MAX`; the module counts depth itself until that lands.
+     limit decides the answer. The rule and the count are kittrial-5bb.169's
+     `record_json.ROW_NESTING_MAX` and `record_json.nesting`, the kit's one depth rule for rows.
    * **Effective state.** A question whose stored state is `resolved` but whose closure does not rest
      on an answer that `closes` (§7.1) reads `state: open`, keeps `stored_state: resolved`, and is
      `conflicted` with a warning; so the three question counts always add up to `total`.
