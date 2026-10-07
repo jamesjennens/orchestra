@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -279,13 +280,62 @@ def vendored(lock, name, data):
     return archive_member(data, lock[pin_of(lock, name, data)].get('member') or name)
 
 
+#: How a scratch directory is removed when a bundled binary leaves a detached child behind.
+#: bd --version forks a child that writes the usage-metrics event kit just after bd exits, and
+#: dolt version re-executes itself as dolt send-metrics (kittrial-5bb.166), so the directory can
+#: fill again between the listing and the rmdir.
+#: Removal is retried, and each check happens a whole pause after the removal it judges:
+#: a writer that recreates the directory a moment later must not leave it in TMPDIR.
+SCRATCH_TRIES, SCRATCH_PAUSE, SCRATCH_QUIET = 200, 0.1, 2
+
+
+def remove_scratch(scratch):
+    """Remove a scratch directory, tolerating a binary's detached child still writing into it.
+
+    ``build``'s run check put HOME in a temporary directory and removed it at once, so about one
+    build in three died with ``[Errno 39] Directory not empty`` and the folder stayed in TMPDIR.
+    What refilled it outlives the command that was started: bd 1.2.2 writes
+    ``HOME/.config/bd/config.yaml`` and queues its usage-metrics event kit in
+    ``HOME/.beads/eventsData/`` from a detached child, ``dolt version`` re-executes itself as
+    a detached ``dolt send-metrics`` and writes its global config, a version-check file and an
+    event lock under ``HOME/.dolt/``. ``starts`` passes each program's own switch
+    (``BD_DISABLE_METRICS=1``, the same guard the runtime sets in ``admin.environment``, and
+    ``DOLT_DISABLE_EVENT_FLUSH=1``), which stops both children; removal is the guard that does
+    not depend on either program behaving, so a late writer cannot fail a release check or
+    leave its scratch in TMPDIR. Returns whether the directory is gone.
+    """
+    scratch = Path(scratch)
+    quiet = 0
+    for attempt in range(SCRATCH_TRIES):
+        try:
+            shutil.rmtree(str(scratch), ignore_errors=True)
+        except OSError:
+            pass
+        time.sleep(SCRATCH_PAUSE)
+        if scratch.exists():                      # a detached writer put it back
+            quiet = 0
+        else:
+            quiet += 1
+            if quiet >= SCRATCH_QUIET:            # gone for a whole quiet pause: it stays gone
+                return True
+    return not scratch.exists()
+
+
 def starts(label, path, arguments, scratch):
-    """Start ``path`` with ``arguments``; return what it said, or raise saying why it cannot start here."""
+    """Start ``path`` with ``arguments``; return what it said, or raise saying why it cannot start here.
+
+    Both bundled binaries leave a detached child behind unless they are told not to: bd queues its
+    usage-metrics event kit, and dolt re-executes itself as ``dolt send-metrics`` after the command
+    returns. The guard each one documents is passed here (kittrial-5bb.166): ``BD_DISABLE_METRICS=1``
+    for bd and ``DOLT_DISABLE_EVENT_FLUSH=1`` for dolt. Both were measured, not assumed; dolt's
+    ``metrics.disabled`` global setting does NOT stop the child.
+    """
     path = os.path.abspath(str(path))             # it is started from the scratch directory
     try:
         done = subprocess.run([path] + list(arguments), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               stdin=subprocess.DEVNULL, timeout=60, cwd=str(scratch),
-                              env=dict(os.environ, HOME=str(scratch)))
+                              env=dict(os.environ, HOME=str(scratch), BD_DISABLE_METRICS='1',
+                                       DOLT_DISABLE_EVENT_FLUSH='1'))
         code, said = done.returncode, done.stdout.decode('utf-8', 'replace')
     except subprocess.TimeoutExpired:
         code, said = None, 'it did not answer within 60 seconds'
@@ -326,7 +376,7 @@ def start_vendored(kit, scratch):
             said[name] = '%s%s' % ('' if pin == name else '(%s) ' % pin,
                                    starts(name, target, arguments, scratch))
     finally:
-        shutil.rmtree(str(scratch), ignore_errors=True)
+        remove_scratch(scratch)
     return said
 
 
@@ -361,6 +411,8 @@ def build(args):
     vendors = {}
     pins = {}
     for name, path in (('bd', args.bd_archive), ('dolt', args.dolt_archive)):
+        if not Path(path).is_file():
+            raise ValueError('The --%s-archive file does not exist: %s' % (name, path))
         vendors[name] = Path(path).read_bytes()
         pins[name] = pin_of(lock, name, vendors[name])
         print('office-release: %s archive is the pinned entry %s' % (name, pins[name]), file=sys.stderr)
@@ -384,9 +436,10 @@ def build(args):
                          'target: for bd, the archive versions.json pins as bd_static (docs/OFFICE_SERVICE.md)'
                          % ('; '.join(too_new), glibc))
     if not args.no_run_check:
-        with tempfile.TemporaryDirectory(prefix='office-release-check-') as scratch:
+        scratch = Path(tempfile.mkdtemp(prefix='office-release-check-'))
+        try:
             for (name, arguments), (_, payload) in zip(BINARIES, payloads[1:]):
-                candidate = Path(scratch)/name
+                candidate = scratch/name
                 candidate.write_bytes(payload)
                 candidate.chmod(0o755)
                 try:
@@ -394,6 +447,10 @@ def build(args):
                 except ValueError as error:
                     raise ValueError('%s. This was the build host; if it is older than the target and cannot run '
                                      'the target\'s binaries, build with --no-run-check' % error)
+        finally:
+            if not remove_scratch(scratch):
+                print('office-release: could not remove the run-check scratch directory %s' % scratch,
+                      file=sys.stderr)
     provenance = {'schema_version': 1, 'component': 'orchestra-kit',
                   'version': files['VERSION'].decode('utf-8').strip(),
                   'source_commit': commit, 'build_id': args.build_id,
@@ -526,8 +583,11 @@ def verify(args):
     python = release/'python-runtime'/_safe_path(manifest['python_executable'])
     subprocess.check_call([str(python), '-c', 'import admin, office_service, http_service'],
                           cwd=str(release/'kit'))
-    with tempfile.TemporaryDirectory(prefix='office-release-verify-') as scratch:
-        said = start_vendored(release/'kit', Path(scratch)/'start-check')
+    scratch = Path(tempfile.mkdtemp(prefix='office-release-verify-'))
+    try:
+        said = start_vendored(release/'kit', scratch/'start-check')
+    finally:
+        remove_scratch(scratch)
     print('release=%s source=%s python=%s' % (manifest['build_id'],
                                              manifest['source_commit'], python))
     for name, _ in BINARIES:
