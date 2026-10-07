@@ -1155,8 +1155,7 @@ audit entry of outcome `unknown` each time. Now:
   entry is written;
 - a refusal is recognised by its form AND its sentence together (`bd_refusals.py`):
   "no issue found matching", "validation failed for issue", "... cannot be empty",
-  "invalid priority" and "invalid status", a title that "looks like a flag", "must be
-  N characters or less". A failure that merely has the form of a refusal (a JSON
+  "invalid priority" and "invalid status", a title that "looks like a flag". A failure that merely has the form of a refusal (a JSON
   error with another sentence, the database's own sentence) is **still an outcome
   nobody knows**, as before: that is the side to err on. A bd that changes its
   sentences falls back to that, and `tests/test_bd_refusals.py` notices it when it

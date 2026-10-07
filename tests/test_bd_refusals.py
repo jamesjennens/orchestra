@@ -110,6 +110,7 @@ class RecogniserTests(unittest.TestCase):
                 (1, json.dumps({'error': {'text': said}, 'schema_version': 1}), ''),
                 (1, json.dumps([{'error': said, 'schema_version': 1}]), ''),
                 (1, '{"id": "pp-1"}\n', 'Error: %s\n' % said),                 # something on standard output beside it
+                (1, 'Created issue pp-1\n', 'Error: %s\n' % said),             # words there too: it may have written
                 (1, '', 'Error: %s\nError: and another\n' % said),             # two errors
                 (1, '', said + '\n'),                                          # no "Error: " before it
                 (1, '', '  Error: %s\n' % said),
@@ -122,6 +123,11 @@ class RecogniserTests(unittest.TestCase):
         self.assertIsNone(bd_refusals.refusal(1, '', 'Error: commit failed after invalid status was set\n'))
         self.assertIsNone(bd_refusals.refusal(1, json_error('wrote the row; its note cannot be empty, retrying'), ''))
         self.assertIsNone(bd_refusals.refusal(1, '[' * 3000, ''))                   # and never a RecursionError
+
+    def test_other_lines_of_standard_error_do_not_hide_the_one_error(self):
+        """bd prints a warning before it and hints after it; a hint may itself speak of errors."""
+        said = WARNING + 'Error: title cannot be empty\n  See the list of Error codes with bd help errors\n  hint: Errors are final\n'
+        self.assertEqual(bd_refusals.refusal(1, '', said), (INVALID, 'title cannot be empty'))
 
     def test_a_sentence_that_carries_the_callers_long_text_is_cut(self):
         title = '-' + 'x' * 450

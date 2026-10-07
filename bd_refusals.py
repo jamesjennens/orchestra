@@ -27,7 +27,6 @@ SENTENCES = (
     (INVALID, re.compile(r'\bcannot be empty$')),
     (INVALID, re.compile(r'^invalid (?:priority|status) ')),
     (INVALID, re.compile(r'^title "[^\n]*" looks like a flag\b')),
-    (INVALID, re.compile(r'\bmust be \d+ characters or less\b')),
 )
 #: How much of bd's sentence is handed on. It can carry the caller's own text (a title).
 SHOWN = 240
