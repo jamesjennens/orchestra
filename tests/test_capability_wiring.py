@@ -613,9 +613,9 @@ class ProposalFolderTests(unittest.TestCase):
     FOLDER = KIT / 'capability-proposals'
 
     def files(self):
-        found = sorted(self.FOLDER.glob('*.json'))
-        self.assertTrue(found, 'capability-proposals/ carries no payload file')
-        return found
+        # An empty or absent folder is the normal state once every waiting payload has been
+        # accepted and its file deleted (the folder README's rule), so it must pass.
+        return sorted(self.FOLDER.glob('*.json')) if self.FOLDER.is_dir() else []
 
     def test_every_file_is_named_for_its_key_and_passes_the_payload_validator(self):
         for path in self.files():
@@ -641,7 +641,8 @@ class ProposalFolderTests(unittest.TestCase):
                     self.assertIs(resolved['resolved'], True,
                                   '%s: %s -> %s' % (path.name, pointer, resolved['reason']))
                     checked += 1
-        self.assertGreater(checked, 0)
+        if self.files():
+            self.assertGreater(checked, 0)
 
 
 if __name__ == '__main__':
