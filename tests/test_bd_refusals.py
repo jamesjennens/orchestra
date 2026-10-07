@@ -399,32 +399,80 @@ class ReadInsideAWriteCase(Project, fixes.EndpointCase):
 class SmallOnesCase(Project, fixes.EndpointCase):
     """From the review of kittrial-5bb.181."""
 
-    def test_the_sentence_of_a_task_change_lists_the_three_fields_and_ends_there(self):
+    def test_the_sentence_of_a_task_change_lists_what_a_change_may_change_and_ends_there(self):
+        """Priority is one of them since kittrial-5bb.183; version and actor are carried, not changed."""
         self.project()
-        takes = 'A task change takes: title, description, status'
-        for body in ({'priority': 1}, {}, {'title': None}, {'version': 1}, {'priority': 1, 'title': 'x'}):
+        takes = 'A task change takes: title, description, status, priority'
+        for body in ({'assignee': 'x'}, {}, {'title': None}, {'version': 1}, {'assignee': 'x', 'title': 'x'}):
             with self.subTest(body=body):
                 refused = self.request('PATCH', self.path, body, token=self.alex)
                 self.assertEqual(422, refused.status, refused.data)
                 self.assertTrue(message(refused).endswith(takes), message(refused))
-                self.assertEqual(['title', 'description', 'status'], refused.data['error']['detail']['takes'])
+                self.assertEqual(['title', 'description', 'status', 'priority'], refused.data['error']['detail']['takes'])
                 self.assertNotIn('version', message(refused))
                 self.assertNotIn('actor', message(refused))
 
     def test_a_long_or_odd_field_name_is_not_handed_back_in_the_detail_either(self):
         self.project()
         long, odd = 'k' * 300, '<script>alert(1)</script>'
-        refused = self.request('PATCH', self.path, {long: 1, odd: 2, 'priority': 3, 'title': 'x'}, token=self.alex)
+        refused = self.request('PATCH', self.path, {long: 1, odd: 2, 'assignee': 3, 'title': 'x'}, token=self.alex)
         self.assertEqual(422, refused.status, refused.data)
         whole = json.dumps(refused.data)
         self.assertNotIn(long, whole)
         self.assertNotIn('alert', whole)
         self.assertEqual(sorted(refused.data['error']['detail']['unsupported']),
-                         ['<non-identifier name>', '<non-identifier name>', 'priority'])
+                         ['<non-identifier name>', '<non-identifier name>', 'assignee'])
         many = {'field_%02d' % n: n for n in range(40)}
         refused = self.request('PATCH', self.path, many, token=self.alex)
         self.assertEqual(http_service.UNSUPPORTED_FIELDS_SHOWN, len(refused.data['error']['detail']['unsupported']))
 
+    def test_the_same_on_every_route_that_refuses_a_field_it_does_not_take(self):
+        """The refusal is one function for nine routes (kittrial-5bb.183): none of them hands a name back whole."""
+        self.project()
+        long, odd = 'k' * 300, '<script>alert(1)</script>'
+        user = self.request('GET', '/v1/sessions/current', token=self.alex).data['user']['id']
+        for what, method, where, body in (
+                ('task create', 'POST', self.tasks, {'title': 'x'}),
+                ('claim', 'POST', self.path + '/claim', {}),
+                ('member', 'PUT', '/v1/projects/%s/members/%s' % (self.pid, user), {'role': 'owner'}),
+                ('worker credential', 'POST', '/v1/projects/%s/worker-credentials' % self.pid, {'label': 'w'}),
+                ('agent', 'POST', '/v1/agents', {'name': 'Kestrel'}),
+                ('account', 'POST', '/v1/accounts', {'username': 'somebody'})):
+            with self.subTest(route=what):
+                token = self.admin_token() if what == 'account' else self.alex
+                refused = self.request(method, where, dict(body, **{long: 1, odd: 2, 'colour': 3}), token=token)
+                self.assertEqual(422, refused.status, refused.data)
+                whole = json.dumps(refused.data)
+                self.assertNotIn(long, whole)
+                self.assertNotIn('alert', whole)
+                self.assertEqual(sorted(refused.data['error']['detail']['unsupported']),
+                                 ['<non-identifier name>', '<non-identifier name>', 'colour'])
+                self.assertIn('colour', message(refused))
+
+
+class AgentGrantCase(fixes.Harness):
+    """From the review of kittrial-5bb.183 (P3): on an agent CHANGE too, the grant is judged before the field list."""
+
+    def test_a_grant_the_owner_cannot_make_keeps_the_404_whatever_else_the_body_carries(self):
+        admin = self.admin_token()
+        for name in ('alex', 'casey'):
+            self.create_account(admin, name, name + '-password-1')
+        alex, casey = (self.login(name, name + '-password-1')[0] for name in ('alex', 'casey'))
+        hidden = self.create_project(casey, 'Hidden')
+        made = self.request('POST', '/v1/agents', {'name': 'Kestrel'}, token=alex)
+        self.assertEqual(201, made.status, made.data)
+        path = '/v1/agents/%s' % made.data['agent']['id']
+        plain = self.request('PATCH', path, {'projects': [hidden]}, token=alex)
+        guessing = self.request('PATCH', path, {'projects': [hidden], 'surprise': 1}, token=alex)
+        self.assertEqual(404, plain.status, plain.data)
+        self.assertEqual((plain.status, message(plain)), (guessing.status, message(guessing)), guessing.data)
+        self.assertNotIn('does not take', message(guessing))
+        # A grant the owner may make, with a field the route does not take: the field list, as before.
+        own = self.create_project(alex, 'Own')
+        refused = self.request('PATCH', path, {'projects': [own], 'surprise': 1}, token=alex)
+        self.assertEqual(422, refused.status, refused.data)
+        self.assertIn('An agent change does not take: surprise', message(refused))
+        self.assertEqual([], self.request('GET', path, token=alex).data.get('projects') or [])
 
 if __name__ == '__main__':
     unittest.main()

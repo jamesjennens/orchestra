@@ -2338,6 +2338,18 @@ class Service:
                 raise not_found('Project not found')
         return granted
 
+    def check_agent_grant(self, principal, projects, owner_id=None):
+        """Judge an agent grant without writing anything (kittrial-5bb.183 review item 1).
+
+        ``create_agent`` calls :meth:`_agent_projects` on the way in; the route calls this
+        first so that a caller with no right over a named project keeps the service's own
+        404 (a project the owner cannot see, or one that does not exist) instead of being
+        answered the route's unknown-field refusal and its field list.
+        """
+        with self.store.lock:
+            self._refresh_authority(principal)
+            return self._agent_projects(principal, projects, owner_id=owner_id)
+
     def _agent(self, agent_id):
         agent = self.state['agents'].get(agent_id)
         if not isinstance(agent, dict):
