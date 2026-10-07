@@ -494,7 +494,9 @@ class SilentConnectionTests(Case):
         for error in (OSError(errno.EBADF, 'Bad file descriptor'), OSError(errno.ENOTSOCK, 'not a socket'),
                       OSError(errno.ENOTCONN, 'Transport endpoint is not connected'), ConnectionResetError(errno.ECONNRESET, 'reset'),
                       OSError(errno.ECONNRESET, 'Connection reset by peer'), OSError(errno.ECONNABORTED, 'aborted'),
-                      BrokenPipeError(errno.EPIPE, 'Broken pipe')):
+                      BrokenPipeError(errno.EPIPE, 'Broken pipe'),
+                      # a connection error is the client's whatever number it carries, or none
+                      ConnectionResetError('reset by the peer'), ConnectionAbortedError()):
             with self.subTest(error=repr(error)):
                 self.assertEqual(self.set_up_fails_with(error, connections=2), '')
 
@@ -521,6 +523,9 @@ class SilentConnectionTests(Case):
         self.assertIn('Traceback', said)
         self.assertIn('RuntimeError: broken in set-up', said)
         self.assertNotIn('setup:', said)
+        # ...and it is that error which is reported, not one made by taking it for an OSError.
+        self.assertNotIn('AttributeError', said)
+        self.assertEqual(said.count('Traceback'), 1)
 
     def test_a_process_that_cannot_start_a_thread_closes_the_connection_and_says_so_once(self):
         """Review of kittrial-5bb.163: under a memory cap "can't start new thread" was a traceback for every
