@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "operation_id": "caprev-3d9726cdc046a76df1db284a6db5f553",
+  "revision": 2,
+  "expected_sha256": "42c29d81d9ae09c9bba4e3d85a183b825f322cdcb1216ed3b880c924487724f1",
+  "key": "review.follow-on-base-refusal-whole",
+  "name": "The follow-on base rule and its whole refusal over HTTP",
+  "aliases": [],
+  "summary": "A follow-on contribution may be based on the prior integration commit, or on any integration the project recorded later that was recorded by a listed operator and not reverted (kittrial-5bb.155). A base that does not meet the rule is refused, and the whole refusal sentence reaches an HTTP caller instead of a generic error.",
+  "requirements": [],
+  "anchors": [],
+  "code": [
+    "review_workflow.py::require_integrated_follow_on",
+    "http_service.py::EndpointBackend.base_refusal"
+  ],
+  "tests": [
+    "tests/test_follow_on_contributions.py",
+    "tests/test_http_review_fixes.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "review",
+    "contributions",
+    "http"
+  ]
+}

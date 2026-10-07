@@ -1,0 +1,841 @@
+"""The server's time in the answer of every write (kittrial-5bb.97, item 3).
+
+A record that cites when something happened should cite the server's clock, not the
+worker's. A write that was carried out answers with ``server_time`` (UTC with its offset,
+whole seconds), once, at the top level: of the endpoint's envelope, which the client prints
+as one line on standard error, and of the HTTP body. A replayed write returns the time it
+was carried out. A refusal, a busy or uncertain answer, and a read carry none.
+"""
+import contextlib
+import io
+import json
+import re
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+KIT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(KIT))
+sys.path.insert(0, str(KIT / 'tests'))
+import client
+import http_authority
+import http_service
+import test_http_agents
+import test_http_review_fixes
+
+try:
+    import endpoint
+except ImportError:  # endpoint needs fcntl (POSIX)
+    endpoint = None
+
+SHAPE = re.compile(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\+00:00')
+
+
+class ClockTests(unittest.TestCase):
+    def test_the_time_is_utc_with_its_offset_in_whole_seconds(self):
+        self.assertEqual(http_authority.server_time(1791273012.987), '2026-10-06T07:50:12+00:00')
+        self.assertRegex(http_authority.server_time(), '^%s$' % SHAPE.pattern)
+
+    def test_only_a_successful_answer_is_stamped_and_a_stamp_is_kept(self):
+        with mock.patch.object(http_authority, 'server_time', return_value='2026-10-06T07:50:12+00:00'):
+            for code in (0, None):
+                answer = {'returncode': code, 'stdout': 'x', 'stderr': ''} if code is not None else {'stdout': 'x'}
+                self.assertIs(http_authority.stamp_write(answer), answer)
+                self.assertEqual(answer['server_time'], '2026-10-06T07:50:12+00:00')
+            for code in (2, 75, 124, 126, 1):
+                answer = {'returncode': code, 'stdout': '', 'stderr': 'no'}
+                self.assertNotIn('server_time', http_authority.stamp_write(answer))
+            kept = {'returncode': 0, 'stdout': '', 'stderr': '', 'server_time': '2026-01-01T00:00:00+00:00'}
+            self.assertEqual(http_authority.stamp_write(kept)['server_time'], '2026-01-01T00:00:00+00:00')
+            self.assertEqual(http_authority.stamp_write('not an envelope'), 'not an envelope')
+
+
+class WhichCallsWriteTests(unittest.TestCase):
+    """Review of the second delivery: `dep add` was listed as a read and `create --help` as a write."""
+
+    def test_dep_writes_and_reads(self):
+        writes = http_authority.is_mutating_invocation
+        for argv in (['dep', 'add', 'pp-1', 'pp-2'], ['dep', 'remove', 'pp-1', 'pp-2'], ['dep', 'relate', 'pp-1', 'pp-2'],
+                     ['dep', 'unrelate', 'pp-1', 'pp-2'], ['dep', 'pp-1', '--blocks', 'pp-2'],
+                     ['dep', 'add', 'pp-1', 'pp-2', '--type', 'blocks']):
+            with self.subTest(argv=argv):
+                self.assertTrue(writes(argv))
+        for argv in (['dep', 'list', 'pp-1'], ['dep', 'tree', 'pp-1'], ['dep', 'cycles'], ['dep', 'list', 'pp-1', '--json']):
+            with self.subTest(argv=argv):
+                self.assertFalse(writes(argv))
+
+    def test_help_writes_nothing_and_a_value_that_looks_like_the_flag_is_not_help(self):
+        writes = http_authority.is_mutating_invocation
+        for argv in (['create', '--help'], ['create', '-h'], ['update', 'pp-1', '--help'], ['close', 'pp-1', '-h'],
+                     ['comments', 'add', 'pp-1', 'text', '--help'], ['dep', 'add', 'pp-1', 'pp-2', '--help'],
+                     ['create', '--title', 'x', '--help']):
+            with self.subTest(argv=argv):
+                self.assertFalse(writes(argv))
+        for argv in (['create', '--title', '-h'], ['create', '--title', '--help'], ['create', '--title', 'x', '--', '--help'],
+                     ['comments', 'add', 'pp-1', '--', '-h']):
+            with self.subTest(argv=argv):
+                self.assertTrue(writes(argv))
+
+    def test_a_help_flag_that_is_off_is_not_help(self):
+        """Review of revision 2: `--help=false` is a flag bd accepts and then carries the command out. Every
+        such spelling of a write was taken for a read: not stamped, and a failure after it released the identity."""
+        writes = http_authority.is_mutating_invocation
+        for argv in (['update', 'pp-1', '--description', 'X', '--help=false'], ['update', 'pp-1', '--description', 'X', '--help=0'],
+                     ['update', 'pp-1', '--description', 'X', '-h=false'], ['update', 'pp-1', '--claim', '--help=false'],
+                     ['comments', 'add', 'pp-1', 'text', '--help=false'], ['comments', 'add', 'pp-1', 'text', '-h=0'],
+                     ['close', 'pp-1', '--help=false'], ['close', 'pp-1', '-h=F'], ['reopen', 'pp-1', '--help=FALSE'],
+                     ['create', '--title', 'x', '--help=false'], ['create', '--title', 'x', '--help=f'],
+                     ['dep', 'add', 'pp-1', 'pp-2', '--help=false'], ['dep', 'pp-1', '--blocks', 'pp-2', '-h=false'],
+                     ['merge-slot', 'acquire', '--help=false'],
+                     # several: the last one decides, as in bd; and a value bd cannot read is not "on"
+                     ['create', '--title', 'x', '--help', '--help=false'], ['create', '--title', 'x', '--help=true', '-h=0'],
+                     ['create', '--title', 'x', '-h', '-h=false'], ['create', '--title', 'x', '--help=maybe'],
+                     ['create', '--title', 'x', '--help', '--help=maybe'],
+                     ['create', '--title', 'x', '--help='], ['update', 'pp-1', '-qh=false']):
+            with self.subTest(argv=argv):
+                self.assertTrue(writes(argv))
+        # On, in the spellings bd reads as true: help, and nothing is written.
+        for argv in (['create', '--title', 'x', '--help=true'], ['create', '--help=1'], ['update', 'pp-1', '-h=true'],
+                     ['close', 'pp-1', '--help=T'], ['update', 'pp-1', '-qh'], ['create', '--help', '-h', '--help=true'],
+                     # given more than once with the LAST one on: bd prints help and writes nothing (64 of 64 in the review)
+                     ['create', '--title', 'x', '--help=false', '--help'], ['update', 'pp-1', '-h=false', '-h'],
+                     ['close', 'pp-1', '--help=0', '--help=1'], ['comments', 'add', 'pp-1', 'text', '--help=false', '--help=true']):
+            with self.subTest(argv=argv):
+                self.assertFalse(writes(argv))
+        # A read stays a read with the flag off.
+        for argv in (['list', '--help=false'], ['dep', 'list', 'pp-1', '--help=false'], ['show', 'pp-1', '-h=false']):
+            with self.subTest(argv=argv):
+                self.assertFalse(writes(argv))
+
+    def test_help_beside_the_flags_of_dep_and_of_comments_add_is_help(self):
+        """Smaller item of the same review: `dep add A B --type blocks --help` was still stamped."""
+        writes = http_authority.is_mutating_invocation
+        for argv in (['dep', 'add', 'pp-1', 'pp-2', '--type', 'blocks', '--help'], ['dep', 'add', 'pp-1', 'pp-2', '-t', 'blocks', '-h'],
+                     ['dep', 'pp-1', '--blocks', 'pp-2', '--help'], ['dep', 'pp-1', '-b', 'pp-2', '-h'],
+                     ['dep', 'remove', 'pp-1', 'pp-2', '--help'], ['dep', 'add', 'pp-1', '--depends-on=pp-2', '--help'],
+                     ['comments', 'add', 'pp-1', 'text', '--author', 'x', '--help'], ['comments', 'add', 'pp-1', '-f', 'notes.txt', '-h']):
+            with self.subTest(argv=argv):
+                self.assertFalse(writes(argv))
+        # The value of one of those flags is not the help flag.
+        for argv in (['dep', 'add', 'pp-1', 'pp-2', '--type', '--help'], ['dep', 'add', 'pp-1', 'pp-2', '-t', '-h'],
+                     ['dep', 'pp-1', '--blocks', '--help'], ['dep', 'pp-1', '-b', '-h'],
+                     ['comments', 'add', 'pp-1', 'text', '--author', '--help'], ['comments', 'add', 'pp-1', '-a', '-h'],
+                     ['dep', 'add', 'pp-1', 'pp-2', '--', '--help']):
+            with self.subTest(argv=argv):
+                self.assertTrue(writes(argv))
+
+    def test_a_flag_between_comments_and_add_does_not_hide_the_write(self):
+        """Review of revision 3 (and the same on main): the test was whether the token right after `comments`
+        is `add`. bd accepts flags there and writes the comment; a failure after it released the operation's
+        identity, and the same request ran again: the comment twice."""
+        writes = http_authority.is_mutating_invocation
+        for argv in (['comments', '--help=false', 'add', 'pp-1', 'text'], ['comments', '--help=0', 'add', 'pp-1', 'text'],
+                     ['comments', '-h=false', 'add', 'pp-1', 'text'], ['comments', '--help', '--help=false', 'add', 'pp-1', 'text'],
+                     ['comments', '--json', 'add', 'pp-1', 'text'], ['comments', '-q', 'add', 'pp-1', 'text'],
+                     ['comments', '--quiet', 'add', 'pp-1', 'text'], ['comments', '--json=false', 'add', 'pp-1', 'text'],
+                     ['comments', '--verbose', 'add', 'pp-1', 'text'], ['comments', '--json', '-q', 'add', 'pp-1', 'text'],
+                     ['comments', 'add', 'pp-1', 'text'], ['comments', 'add', '--json', 'pp-1', 'text'],
+                     # what cannot be resolved could hide the subcommand: a write
+                     ['comments', '--bogus', 'add', 'pp-1', 'text'], ['comments', '--bogus', 'pp-1']):
+            with self.subTest(argv=argv):
+                self.assertTrue(writes(argv))
+        # The reads stay reads, flags or not: the shorthand for the list, and a task that is named `add` nowhere.
+        for argv in (['comments', 'pp-1'], ['comments', 'pp-1', '--json'], ['comments', '--json', 'pp-1'], ['comments', '-q', 'pp-1'],
+                     ['comments', 'list', 'pp-1'], ['comments', '--json', 'list', 'pp-1'], ['comments'],
+                     ['comments', 'pp-1', 'add'],                       # the subcommand is the FIRST operand
+                     ['comments', '--help', 'add', 'pp-1', 'text'], ['comments', '--help=false', '--help', 'add', 'pp-1', 'text']):
+            with self.subTest(argv=argv):
+                self.assertFalse(writes(argv))
+        import reserved_comments
+        with mock.patch.object(reserved_comments, '_comments_parts', side_effect=RuntimeError('broken')):
+            self.assertTrue(writes(['comments', 'pp-1']))              # a reader that fails never makes a read of it
+
+    def test_the_runner_records_such_a_comment_as_an_attempted_write(self):
+        """What keeps the operation's identity when a failure follows the write: without it the same request,
+        sent again with the same identity, was carried out again and the task had the comment twice."""
+        for argv, attempted in ((['comments', '--json', 'add', 'pp-1', 'text'], True), (['comments', '--help=false', 'add', 'pp-1', 'text'], True),
+                                (['comments', '-q', 'add', 'pp-1', 'text'], True), (['comments', '--json', 'pp-1'], False),
+                                (['comments', '--help', 'add', 'pp-1', 'text'], False)):
+            with self.subTest(argv=argv):
+                runner = http_authority.NativeRunner(lambda sent: 'answer')
+                self.assertEqual(runner(argv), 'answer')
+                self.assertEqual(runner.attempted_write, attempted)
+
+    def test_the_other_verbs_with_subcommands_resolve_the_first_operand_too(self):
+        """`dep` is the only other one a caller may run; it is resolved by the kit's table of writing commands."""
+        writes = http_authority.is_mutating_invocation
+        for argv in (['dep', '--json', 'add', 'pp-1', 'pp-2'], ['dep', '-q', 'remove', 'pp-1', 'pp-2'],
+                     ['dep', '--help=false', 'add', 'pp-1', 'pp-2'], ['dep', '--type', 'blocks', 'add', 'pp-1', 'pp-2']):
+            with self.subTest(argv=argv):
+                self.assertTrue(writes(argv))
+        for argv in (['dep', '--json', 'list', 'pp-1'], ['dep', '-q', 'tree', 'pp-1'], ['dep', '--json', 'cycles']):
+            with self.subTest(argv=argv):
+                self.assertFalse(writes(argv))
+        # The verbs a caller may run, read from the endpoint's source (it does not import on Windows): a new
+        # verb with subcommands must be looked at here.
+        import ast
+        allowed = re.search(r'^ALLOWED=(\{[^}]*\})', (KIT / 'endpoint.py').read_text(encoding='utf-8'), re.M)
+        self.assertEqual(ast.literal_eval(allowed.group(1)), {'list', 'show', 'ready', 'search', 'count', 'create', 'update', 'close',
+                                                              'reopen', 'comments', 'dep', 'state', 'lint'})
+
+    def test_the_letters_after_a_short_value_flag_are_its_value(self):
+        """`-dh` is `-d` with the value `h`, not `-d` and help (a mutant of the review)."""
+        writes = http_authority.is_mutating_invocation
+        for argv in (['create', '--title', 'x', '-dh'], ['update', 'pp-1', '-dh'], ['create', '--title', 'x', '-d=h'],
+                     ['comments', 'add', 'pp-1', '-ah'], ['dep', 'add', 'pp-1', 'pp-2', '-th']):
+            with self.subTest(argv=argv):
+                self.assertTrue(writes(argv))
+        self.assertEqual(http_authority._help_flags(['create', '--title', 'x', '-dh']), [])
+        self.assertEqual(http_authority._help_flags(['update', 'pp-1', '-qh']), [True])        # after a bool flag it IS the flag
+
+    def test_what_cannot_be_resolved_is_not_help(self):
+        writes = http_authority.is_mutating_invocation
+        # A flag the tables do not know: its value could be what looks like the help flag.
+        for argv in (['create', '--bogus', '--help'], ['create', '--title', 'x', '-Z', '-h'], ['update', 'pp-1', '--bogus=1', '--help'],
+                     ['dep', 'add', 'pp-1', 'pp-2', '--bogus', '--help'], ['comments', 'add', 'pp-1', 'text', '--bogus', '-h'],
+                     ['create', '--help', 7]):
+            with self.subTest(argv=argv):
+                self.assertTrue(writes(argv))
+        # A scan that fails is not a help request either.
+        with mock.patch.object(http_authority, '_help_flags', side_effect=RuntimeError('broken')):
+            self.assertTrue(writes(['create', '--help']))
+            self.assertFalse(writes(['list', '--help']))
+        import reserved_comments
+        with mock.patch.object(reserved_comments, '_short_flag_table', side_effect=RuntimeError('broken')):
+            self.assertTrue(writes(['create', '--help']))
+
+    def test_dep_is_not_among_the_verbs_that_only_read(self):
+        """It was, older than the table of what a command writes; back there, a later change that asks the list
+        before the table would call `dep add` a read again."""
+        self.assertNotIn('dep', http_authority.READ_ONLY_BD_VERBS)
+        self.assertEqual(http_authority.READ_ONLY_BD_VERBS,
+                         frozenset({'export', 'list', 'show', 'ready', 'search', 'count', 'state', 'lint'}))
+        with mock.patch.object(http_authority, '_writes_rows', return_value=True) as asked:
+            self.assertTrue(http_authority.is_mutating_invocation(['dep', 'add', 'pp-1', 'pp-2']))
+        asked.assert_called_once()
+
+    def test_the_rest_is_what_it_was(self):
+        writes = http_authority.is_mutating_invocation
+        for argv, expected in ((['list', '--json'], False), (['show', 'pp-1'], False), (['export', '--all'], False),
+                               (['create', '--title', 'x'], True), (['create', '--title', 'x', '--dry-run'], False),
+                               (['create', '--title', 'x', '--dry-run=false'], True), (['update', 'pp-1', '--claim'], True),
+                               (['comments', 'add', 'pp-1', 'x'], True), (['comments', 'pp-1'], False),
+                               (['merge-slot', 'check'], False), (['merge-slot', 'acquire'], True), (['close', 'pp-1'], True),
+                               ([], True), ('create', True)):
+            with self.subTest(argv=argv):
+                self.assertEqual(writes(argv), expected)
+
+
+class GuardedWriteTests(unittest.TestCase):
+    def guarded(self, effect, runner=None, operation_id=None, journal=None):
+        request = {'project': 'p', 'actor': 'worker', 'action': 'bd', 'args': ['x']}
+        if operation_id:
+            request['operation_id'] = operation_id
+        return http_authority.run_guarded(request, journal or Path(self.tmp) / 'journal.sqlite3', effect, runner=runner)
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.tmp = directory.name
+
+    def test_a_write_is_stamped_and_a_guarded_read_is_not(self):
+        def answer():
+            return {'returncode': 0, 'stdout': '{}', 'stderr': ''}
+        self.assertRegex(self.guarded(answer)['server_time'], SHAPE)                 # no runner: a write action
+        wrote = http_authority.NativeRunner(lambda argv: {'returncode': 0, 'stdout': '', 'stderr': ''})
+
+        def writes():
+            wrote(['create', '--title', 'x'])
+            return answer()
+        self.assertRegex(self.guarded(writes, runner=wrote)['server_time'], SHAPE)
+        read = http_authority.NativeRunner(lambda argv: {'returncode': 0, 'stdout': '[]', 'stderr': ''})
+
+        def reads():
+            read(['list', '--json'])
+            return answer()
+        self.assertNotIn('server_time', self.guarded(reads, runner=read))
+        dry = http_authority.NativeRunner(lambda argv: {'returncode': 0, 'stdout': '', 'stderr': ''})
+
+        def preflight():
+            dry(['create', '--title', 'x', '--dry-run'])
+            return answer()
+        self.assertNotIn('server_time', self.guarded(preflight, runner=dry))
+
+    def test_a_refusal_and_an_uncertain_answer_carry_none(self):
+        self.assertNotIn('server_time', self.guarded(lambda: {'returncode': 2, 'stdout': '', 'stderr': 'no\n'}))
+        self.assertNotIn('server_time', self.guarded(lambda: {'returncode': 124, 'stdout': '', 'stderr': '?\n'}))
+
+        def breaks():
+            raise OSError('disk')
+        broken = self.guarded(breaks, operation_id='op-00000001')
+        self.assertEqual(broken['returncode'], 124)
+        self.assertNotIn('server_time', broken)
+
+    def test_the_same_request_sent_again_is_answered_with_the_time_of_the_write(self):
+        calls = []
+
+        def effect():
+            calls.append(1)
+            return {'returncode': 0, 'stdout': '{"id": "p-1"}', 'stderr': ''}
+        with mock.patch.object(http_authority, 'server_time', return_value='2026-10-06T07:50:12+00:00'):
+            first = self.guarded(effect, operation_id='op-00000002')
+        with mock.patch.object(http_authority, 'server_time', return_value='2026-10-06T09:00:00+00:00'):
+            again = self.guarded(effect, operation_id='op-00000002')
+            other = self.guarded(effect, operation_id='op-00000003')
+        self.assertEqual(len(calls), 2)                               # the retry ran nothing
+        self.assertEqual(first['server_time'], '2026-10-06T07:50:12+00:00')
+        # The stored answer, whole, and marked as one.
+        self.assertEqual(again, dict(first, replayed=True))
+        self.assertNotIn('replayed', first)
+        self.assertEqual(other['server_time'], '2026-10-06T09:00:00+00:00')
+
+    def test_a_stored_answer_without_a_time_is_replayed_without_one_and_marked(self):
+        """An answer the previous kit stored: this kit must not put a time on it, and says it is a stored answer."""
+        def effect():
+            return {'returncode': 0, 'stdout': '{"id": "p-1"}', 'stderr': ''}
+        with mock.patch.object(http_authority, 'stamp_write', lambda envelope: envelope):      # as the previous kit wrote it
+            first = self.guarded(effect, operation_id='op-00000004')
+        again = self.guarded(effect, operation_id='op-00000004')
+        self.assertNotIn('server_time', first)
+        self.assertEqual(again, dict(first, replayed=True))
+
+    def test_an_effect_that_wrote_outside_bd_is_stamped_and_its_refusals_are_what_they_were(self):
+        runner = http_authority.NativeRunner(lambda argv: {'returncode': 0, 'stdout': '[]', 'stderr': ''})
+        self.assertFalse(runner.wrote)
+
+        def journal_write():
+            runner(['show', 'p-1', '--json'])
+            runner.wrote = True
+            return {'returncode': 0, 'stdout': '{}', 'stderr': ''}
+        answer = self.guarded(journal_write, runner=runner)
+        self.assertRegex(answer['server_time'], SHAPE)
+        self.assertFalse(runner.attempted_write)                      # what decides a refusal is untouched
+        refusing = http_authority.NativeRunner(lambda argv: {'returncode': 0, 'stdout': '[]', 'stderr': ''})
+
+        def refuses():
+            raise ValueError('not allowed')
+        with self.assertRaises(ValueError):
+            self.guarded(refuses, runner=refusing, operation_id='op-00000005')
+
+
+@unittest.skipIf(endpoint is None, 'endpoint imports fcntl (POSIX-only)')
+class EndpointTests(unittest.TestCase):
+    """The writes of the endpoint that are not guarded writes: the session registry, an acknowledgement, feedback."""
+
+    def run_action(self, action, args, reconciled=False):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'projects' / 'pp' / '.beads').mkdir(parents=True)
+            (root / 'projects' / 'pp' / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+            import feedback
+            import guidance
+            import sessions
+            with mock.patch.object(sessions, 'execute', return_value={'ok': True, 'reconciled': reconciled}), \
+                    mock.patch.object(guidance, 'acknowledge', return_value={'acknowledged': 'v1', 'reconciled': reconciled}), \
+                    mock.patch.object(guidance, 'read', return_value={'text': 'g'}), \
+                    mock.patch.object(guidance, 'state', return_value={'version': 'v1'}), \
+                    mock.patch.object(feedback, 'execute', return_value={'ok': True, 'reconciled': reconciled}), \
+                    mock.patch.object(endpoint, 'report', return_value={}):
+                return endpoint.execute(root, {'project': 'pp', 'actor': 'worker', 'action': action, 'args': args})
+
+    def test_which_of_them_are_stamped(self):
+        uuid = '0b0f6f0c-1a55-4f0e-9d2b-5d7a3c1e9f10'
+        for action, args, written in (
+                ('session', ['register', '--name', 'n', '--request-id', uuid], True),
+                ('session', ['run', 'start', '--run-id', 'r1'], True),
+                ('session', ['run', 'heartbeat', '--run-id', 'r1'], True),
+                ('session', ['run', 'end', '--run-id', 'r1', '--status', 'succeeded'], True),
+                ('session', ['run', 'status', '--run-id', 'r1'], False),
+                ('session', ['show', 'worker'], False),
+                ('session', ['resume', '--request-id', uuid], True),          # it records the resume
+                ('guidance', ['ack', '--version', 'v1'], True),
+                ('guidance', ['get'], False),
+                ('guidance', ['version'], False),
+                ('feedback', ['add', '--file', '@a'], True),
+                ('feedback', ['correct', '--file', '@a'], True),
+                ('feedback', ['list'], False)):
+            with self.subTest(action=action, args=args[:2]):
+                answer = self.run_action(action, args)
+                self.assertEqual(answer['returncode'], 0)
+                if written:
+                    self.assertRegex(answer['server_time'], SHAPE)
+                else:
+                    self.assertNotIn('server_time', answer)
+
+    def test_a_request_that_was_already_recorded_carries_none(self):
+        """The same registration, acknowledgement or entry again writes nothing: the kit says `reconciled`."""
+        uuid = '0b0f6f0c-1a55-4f0e-9d2b-5d7a3c1e9f10'
+        for action, args in (('session', ['register', '--name', 'n', '--request-id', uuid]),
+                             ('session', ['resume', '--request-id', uuid]),
+                             ('session', ['run', 'start', '--run-id', 'r1']),
+                             ('guidance', ['ack', '--version', 'v1']),
+                             ('feedback', ['add', '--file', '@a']), ('feedback', ['correct', '--file', '@a'])):
+            with self.subTest(action=action, args=args[:2]):
+                answer = self.run_action(action, args, reconciled=True)
+                self.assertEqual(answer['returncode'], 0)
+                self.assertNotIn('server_time', answer)
+
+    def handoff(self, result, action='handoff', args=('pp-1', '@attachment:a')):
+        import work
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'projects' / 'pp' / '.beads').mkdir(parents=True)
+            (root / 'projects' / 'pp' / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+            (root / 'deployment.private.json').write_text('{"password": "x", "operators": ["ops"]}', encoding='utf-8')
+            request = {'project': 'pp', 'actor': 'worker', 'action': action, 'args': list(args),
+                       'attachments': {'a': {'flag': '--file', 'text': '{"task": "pp-1"}'}}}
+            with mock.patch.object(work, 'execute', return_value=result):
+                return endpoint.execute(root, request)
+
+    def test_a_handoff_that_was_recorded_is_stamped_though_bd_was_not_written(self):
+        """Review of the second delivery: a request and a decline write the kit's handoff journal only."""
+        recorded = {'task': 'pp-1', 'operation_id': 'move-1', 'reconciled': False}
+        self.assertRegex(self.handoff(recorded)['server_time'], SHAPE)
+        # The same request again is already recorded; the read of a task's handoffs is a read.
+        self.assertNotIn('server_time', self.handoff(dict(recorded, reconciled=True)))
+        self.assertNotIn('server_time', self.handoff({'task': 'pp-1', 'handoffs': []}, args=('pp-1',)))
+        self.assertNotIn('server_time', self.handoff(recorded, args=('pp-1',)))        # whatever a read answers
+        # A review and the work read go the same way; only what bd wrote makes them writes.
+        self.assertNotIn('server_time', self.handoff({'task': 'pp-1', 'reconciled': False}, action='review', args=('pp-1',)))
+        self.assertNotIn('server_time', self.handoff(recorded, action='review'))
+        self.assertNotIn('server_time', self.handoff({'next_actions': []}, action='work', args=('--json',)))
+
+    def test_the_envelope_printed_by_main_carries_it(self):
+        printed = io.StringIO()
+        stamped = {'returncode': 0, 'stdout': '{}\n', 'stderr': '', 'server_time': '2026-10-06T07:50:12+00:00'}
+        with mock.patch.object(endpoint, 'execute', return_value=stamped), \
+                mock.patch.object(sys, 'argv', ['endpoint.py', '--root', '/srv/rt']), \
+                mock.patch.object(sys, 'stdin', io.StringIO('{"project": "pp", "action": "bd", "args": []}')), \
+                mock.patch.object(sys, 'stdout', printed):
+            endpoint.main()
+        self.assertEqual(json.loads(printed.getvalue()), stamped)
+
+
+class ClientTests(unittest.TestCase):
+    def run_client(self, result, *arguments):
+        out, err = io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / 'client.json'
+            config.write_text('{}', encoding='utf-8')
+            argv = ['client.py', '--config', str(config), '--project', 'pp', '--actor', 'worker', '--', *arguments]
+            with mock.patch.object(client, 'request', return_value=dict(result)), mock.patch.object(sys, 'argv', argv), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = client.main()
+        return code, out.getvalue(), err.getvalue()
+
+    def test_a_write_prints_one_line_on_standard_error_and_standard_output_is_what_it_was(self):
+        receipt = '{"id": "pp-1"}\n'
+        plain = self.run_client({'returncode': 0, 'stdout': receipt, 'stderr': ''}, 'create', '--title', 'x', '--json')
+        stamped = self.run_client({'returncode': 0, 'stdout': receipt, 'stderr': '', 'server_time': '2026-10-06T07:50:12+00:00'},
+                                  'create', '--title', 'x', '--json')
+        self.assertEqual(plain, (0, receipt, ''))                     # an older endpoint: nothing is printed
+        self.assertEqual(stamped, (0, receipt, 'server_time: 2026-10-06T07:50:12+00:00\n'))
+        # After the endpoint's own warnings, which stay as they were.
+        warned = self.run_client({'returncode': 0, 'stdout': receipt, 'stderr': 'warning: x\n',
+                                  'server_time': '2026-10-06T07:50:12+00:00'}, 'create', '--title', 'x')
+        self.assertEqual(warned[2], 'warning: x\nserver_time: 2026-10-06T07:50:12+00:00\n')
+
+    def test_nothing_is_printed_for_a_refusal_or_for_a_value_that_is_not_a_time(self):
+        for result in ({'returncode': 2, 'stdout': '', 'stderr': 'no\n', 'server_time': '2026-10-06T07:50:12+00:00'},
+                       {'returncode': 0, 'stdout': 'x\n', 'stderr': '', 'server_time': 'rm -rf /\x1b[2J'},
+                       {'returncode': 0, 'stdout': 'x\n', 'stderr': '', 'server_time': 17},
+                       {'returncode': 0, 'stdout': 'x\n', 'stderr': '', 'server_time': None}):
+            with self.subTest(result=result):
+                code, out, err = self.run_client(result, 'create', '--title', 'x')
+                self.assertNotIn('server_time', err)
+                self.assertEqual(out, result['stdout'])
+
+    def test_a_capture_file_holds_the_output_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / 'out.json'
+            config = Path(tmp) / 'client.json'
+            config.write_text('{}', encoding='utf-8')
+            err = io.StringIO()
+            argv = ['client.py', '--config', str(config), '--project', 'pp', '--actor', 'worker', '--out', str(target),
+                    '--', 'create', '--title', 'x', '--json']
+            answer = {'returncode': 0, 'stdout': '{"id": "pp-1"}\n', 'stderr': '', 'server_time': '2026-10-06T07:50:12+00:00'}
+            with mock.patch.object(client, 'request', return_value=answer), mock.patch.object(sys, 'argv', argv), \
+                    contextlib.redirect_stderr(err):
+                self.assertEqual(client.main(), 0)
+            self.assertEqual(target.read_text(encoding='utf-8'), '{"id": "pp-1"}\n')
+            self.assertEqual(err.getvalue(), 'server_time: 2026-10-06T07:50:12+00:00\n')
+
+
+class HttpTests(test_http_agents.AgentHarness):
+    """Over HTTP: at the top level of the body of a write that was carried out."""
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.admin_token()
+        self.project = self.create_project(self.admin, 'Alpha')
+
+    def test_a_write_carries_it_and_a_read_and_a_refusal_do_not(self):
+        made = self.request('POST', '/v1/projects/%s/tasks' % self.project, {'title': 'a task'}, token=self.admin,
+                            key='task-key-0001')
+        self.assertEqual(201, made.status, made.data)
+        self.assertRegex(made.data['server_time'], '^%s$' % SHAPE.pattern)
+        self.assertEqual(list(made.data).count('server_time'), 1)
+        for path in ('/v1/projects/%s/tasks' % self.project, '/v1/projects/%s' % self.project, '/v1/projects',
+                     '/v1/sessions/current'):
+            read = self.request('GET', path, token=self.admin)
+            self.assertEqual(200, read.status)
+            self.assertNotIn('server_time', json.dumps(read.data))
+        refused = self.request('POST', '/v1/projects/%s/tasks' % self.project, {'title': ''}, token=self.admin)
+        self.assertGreaterEqual(refused.status, 400)
+        self.assertNotIn('server_time', json.dumps(refused.data))
+
+    def test_the_time_is_the_services_clock_where_no_endpoint_stands_behind_it(self):
+        with mock.patch.object(self.store, 'now', return_value=1791273012.4):
+            made = self.request('POST', '/v1/accounts', {'username': 'zoe'}, token=self.admin, key='account-key-0001')
+        self.assertEqual((made.status, made.data['server_time']), (201, '2026-10-06T07:50:12+00:00'))
+
+    def test_the_same_request_sent_again_is_answered_with_the_time_of_the_write(self):
+        path = '/v1/projects/%s/tasks' % self.project
+        with mock.patch.object(self.store, 'now', return_value=1791273012.0):
+            first = self.request('POST', path, {'title': 'a task'}, token=self.admin, key='task-key-0002')
+        with mock.patch.object(self.store, 'now', return_value=1791273072.0):
+            again = self.request('POST', path, {'title': 'a task'}, token=self.admin, key='task-key-0002')
+            other = self.request('POST', path, {'title': 'another'}, token=self.admin, key='task-key-0003')
+        self.assertEqual((first.status, again.status), (201, 201))
+        self.assertEqual(first.data['server_time'], '2026-10-06T07:50:12+00:00')
+        self.assertEqual(again.data, first.data)
+        self.assertEqual(other.data['server_time'], '2026-10-06T07:51:12+00:00')
+
+    def test_the_endpoints_time_is_passed_through_and_used_once(self):
+        """On the endpoint backend the time is the endpoint's: its envelope's, not the service's clock."""
+        reply = {'returncode': 0, 'stdout': '{"id": "pp-1"}\n', 'stderr': '', 'server_time': '2026-10-06T07:50:12+00:00'}
+        self.assertEqual(http_service.EndpointBackend._checked(reply), {'id': 'pp-1'})
+        self.assertEqual(http_service.written_at(self.service), '2026-10-06T07:50:12+00:00')
+        with mock.patch.object(self.store, 'now', return_value=1791277200.0):
+            self.assertEqual(http_service.written_at(self.service), '2026-10-06T09:00:00+00:00')   # used once
+        # A read's envelope has none, and a refusal's is not taken.
+        http_service.EndpointBackend._checked({'returncode': 0, 'stdout': '[]\n', 'stderr': ''})
+        with self.assertRaises(http_service.HttpError):
+            http_service.EndpointBackend._checked({'returncode': 2, 'stdout': '', 'stderr': 'ValueError: no\n',
+                                                   'server_time': '2026-10-06T07:50:12+00:00'})
+        with mock.patch.object(self.store, 'now', return_value=1791277200.0):
+            self.assertEqual(http_service.written_at(self.service), '2026-10-06T09:00:00+00:00')
+
+    def test_a_time_an_earlier_request_left_behind_is_not_given_to_the_next_write(self):
+        """On one connection the same thread serves request after request. A write that took the endpoint's
+        time and then failed must not hand that time to the next write."""
+        import http.client
+        real = self.service.create_user
+        left = []
+
+        def fails_after_an_endpoint_write(*args, **kwargs):
+            if not left:
+                left.append(True)
+                http_service.WRITTEN.at = '2026-01-01T00:00:00+00:00'     # in the serving thread
+                raise http_service.conflict('refused after the endpoint had answered')
+            return real(*args, **kwargs)
+        connection = http.client.HTTPConnection('127.0.0.1', self.port, timeout=15)
+        self.addCleanup(connection.close)
+        headers = {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + self.admin}
+
+        def post(username):
+            connection.request('POST', '/v1/accounts', body=json.dumps({'username': username}), headers=headers)
+            response = connection.getresponse()
+            return response.status, json.loads(response.read())
+        with mock.patch.object(self.service, 'create_user', side_effect=fails_after_an_endpoint_write),                 mock.patch.object(self.store, 'now', return_value=1791273012.0):
+            self.assertEqual(post('amy')[0], 409)
+            status, made = post('amy')                            # the same connection, so the same thread
+        self.assertEqual(left, [True])
+        self.assertEqual((status, made['server_time']), (201, '2026-10-06T07:50:12+00:00'))
+
+class HeaderTests(test_http_agents.AgentHarness):
+    """`X-Server-Time`: the same value, on every carried-out write, whatever the shape of the body."""
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.admin_token()
+        self.project = self.create_project(self.admin, 'Alpha')
+        made = self.request('POST', '/v1/projects/%s/tasks' % self.project, {'title': 'a task'}, token=self.admin)
+        self.task = made.data['id']
+        self.made = made
+
+    def stamp(self, answer):
+        return answer.headers.get('x-server-time')
+
+    def test_an_object_answer_has_the_header_with_the_value_of_its_field(self):
+        self.assertEqual(self.made.status, 201)
+        self.assertRegex(self.stamp(self.made), '^%s$' % SHAPE.pattern)
+        self.assertEqual(self.stamp(self.made), self.made.data['server_time'])
+        self.assertEqual(http_service.SERVER_TIME_HEADER, 'X-Server-Time')
+
+    def test_reads_refusals_and_a_log_in_have_none(self):
+        for answer in (self.request('GET', '/v1/projects/%s/tasks' % self.project, token=self.admin),
+                       self.request('GET', '/v1/sessions/current', token=self.admin),
+                       self.request('POST', '/v1/projects/%s/tasks' % self.project, {'title': ''}, token=self.admin),
+                       self.request('POST', '/v1/projects/%s/tasks' % self.project, {'title': 'x'}),            # 401
+                       self.request('POST', '/v1/sessions', {'username': test_http_agents.ADMIN,
+                                                             'password': test_http_agents.ADMIN_PASSWORD}),
+                       self.request('GET', '/healthz')):
+            with self.subTest(status=answer.status):
+                self.assertIsNone(self.stamp(answer))
+
+    def list_answers(self):
+        """The endpoint backend answers a task change with the list bd prints: stand in for it."""
+        real = self.backend.invoke
+
+        def invoke(route, *args, **kwargs):
+            result = real(route, *args, **kwargs)
+            return [result] if route == 'tasks.update' else result
+        return mock.patch.object(self.backend, 'invoke', invoke)
+
+    def test_a_list_answer_has_the_header_and_its_retry_has_the_time_of_the_write(self):
+        path = '/v1/projects/%s/tasks/%s' % (self.project, self.task)
+        with self.list_answers():
+            with mock.patch.object(self.store, 'now', return_value=1791273012.0):
+                first = self.request('PATCH', path, {'title': 'renamed', 'version': 1}, token=self.admin, key='change-key-0001')
+            with mock.patch.object(self.store, 'now', return_value=1791273072.0):
+                again = self.request('PATCH', path, {'title': 'renamed', 'version': 1}, token=self.admin, key='change-key-0001')
+                other = self.request('PATCH', path, {'title': 'renamed twice', 'version': 2}, token=self.admin, key='change-key-0002')
+        self.assertEqual((first.status, type(first.data)), (200, list))
+        self.assertEqual(self.stamp(first), '2026-10-06T07:50:12+00:00')
+        self.assertEqual((again.status, again.data, self.stamp(again)), (200, first.data, '2026-10-06T07:50:12+00:00'))
+        self.assertEqual(self.stamp(other), '2026-10-06T07:51:12+00:00')
+
+    def test_the_header_of_a_list_answer_is_the_endpoints_time_when_an_endpoint_wrote(self):
+        """Not the service's clock: the endpoint's envelope said when the write was carried out."""
+        real = self.backend.invoke
+
+        def invoke(route, *args, **kwargs):
+            result = real(route, *args, **kwargs)
+            if route != 'tasks.update':
+                return result
+            http_service.WRITTEN.at = '2026-10-06T07:49:59+00:00'       # what EndpointBackend._checked takes from the envelope
+            return [result]
+        path = '/v1/projects/%s/tasks/%s' % (self.project, self.task)
+        with mock.patch.object(self.backend, 'invoke', invoke), mock.patch.object(self.store, 'now', return_value=1791273012.0):
+            first = self.request('PATCH', path, {'title': 'renamed', 'version': 1}, token=self.admin, key='change-key-0011')
+            again = self.request('PATCH', path, {'title': 'renamed', 'version': 1}, token=self.admin, key='change-key-0011')
+        self.assertEqual((type(first.data), self.stamp(first), self.stamp(again)),
+                         (list, '2026-10-06T07:49:59+00:00', '2026-10-06T07:49:59+00:00'))
+
+    def test_a_stored_answer_of_the_endpoint_that_has_no_time_gets_none_from_the_service(self):
+        """The upgrade window: a write made through the previous kit, sent again through this one with the
+        service's own stored answer gone. The endpoint replays what it stored, without a time; the service's
+        clock would be the time of the retry."""
+        reply = {'returncode': 0, 'stdout': '{"id": "pp-1"}\n', 'stderr': '', 'replayed': True}
+        self.assertEqual(http_service.EndpointBackend._checked(reply), {'id': 'pp-1'})
+        self.assertIsNone(http_service.written_at(self.service))
+        self.assertRegex(http_service.written_at(self.service), SHAPE)          # used once: the next write has the clock
+        # A replayed answer that has its time keeps it.
+        http_service.EndpointBackend._checked(dict(reply, server_time='2026-10-06T07:50:12+00:00'))
+        self.assertEqual(http_service.written_at(self.service), '2026-10-06T07:50:12+00:00')
+        real = self.backend.invoke
+
+        def replays(route, *args, **kwargs):
+            result = real(route, *args, **kwargs)
+            if route == 'tasks.create':
+                http_service.WRITTEN.at = False                               # what _checked leaves for such an answer
+            return result
+        path = '/v1/projects/%s/tasks' % self.project
+        with mock.patch.object(self.backend, 'invoke', replays):
+            first = self.request('POST', path, {'title': 'made by the previous kit'}, token=self.admin, key='old-key-0101')
+        again = self.request('POST', path, {'title': 'made by the previous kit'}, token=self.admin, key='old-key-0101')
+        for answer in (first, again):
+            self.assertEqual(answer.status, 201)
+            self.assertNotIn('server_time', answer.data)
+            self.assertIsNone(self.stamp(answer))
+
+    def test_an_answer_that_carries_its_own_time_keeps_it_in_the_body_and_the_header(self):
+        real = self.backend.invoke
+
+        def with_its_time(route, *args, **kwargs):
+            result = real(route, *args, **kwargs)
+            return dict(result, server_time='2026-10-06T07:49:59+00:00') if route == 'tasks.create' else result
+        with mock.patch.object(self.backend, 'invoke', with_its_time), mock.patch.object(self.store, 'now', return_value=1791273012.0):
+            made = self.request('POST', '/v1/projects/%s/tasks' % self.project, {'title': 'x'}, token=self.admin)
+        self.assertEqual((made.data['server_time'], self.stamp(made)), ('2026-10-06T07:49:59+00:00', '2026-10-06T07:49:59+00:00'))
+
+    def test_the_stored_answer_has_the_time_where_it_is_not_the_answer_that_was_sent(self):
+        """An agent is made: the answer carries its secret once, what is stored for a retry does not. Both have the time."""
+        body = {'name': 'Kestrel', 'working_directory': '/home/priya/work/kestrel'}
+        with mock.patch.object(self.store, 'now', return_value=1791273012.0):
+            first = self.request('POST', '/v1/agents', body, token=self.admin, key='agent-key-0001')
+        with mock.patch.object(self.store, 'now', return_value=1791273072.0):
+            again = self.request('POST', '/v1/agents', body, token=self.admin, key='agent-key-0001')
+        self.assertEqual((first.status, first.data['server_time'], self.stamp(first)),
+                         (201, '2026-10-06T07:50:12+00:00', '2026-10-06T07:50:12+00:00'))
+        self.assertIn(again.status, (200, 201))
+        self.assertNotEqual(again.data, first.data)                    # the secret is not delivered twice
+        self.assertEqual((again.data.get('server_time'), self.stamp(again)),
+                         ('2026-10-06T07:50:12+00:00', '2026-10-06T07:50:12+00:00'))
+
+    def test_the_retry_of_an_object_answer_has_the_header_of_the_write(self):
+        path = '/v1/projects/%s/tasks' % self.project
+        with mock.patch.object(self.store, 'now', return_value=1791273012.0):
+            first = self.request('POST', path, {'title': 'keyed'}, token=self.admin, key='task-key-0009')
+        with mock.patch.object(self.store, 'now', return_value=1791273072.0):
+            again = self.request('POST', path, {'title': 'keyed'}, token=self.admin, key='task-key-0009')
+        self.assertEqual(self.stamp(first), '2026-10-06T07:50:12+00:00')
+        self.assertEqual((again.data, self.stamp(again)), (first.data, '2026-10-06T07:50:12+00:00'))
+
+    def test_an_answer_stored_before_the_time_was_kept_beside_it(self):
+        """Its retry has the header from an object body's own field, and none where the body has no field."""
+        real = self.service.idempotency_commit
+
+        def as_before(digest, status, response, written_at=None):
+            return real(digest, status, response)
+        tasks = '/v1/projects/%s/tasks' % self.project
+        change = '%s/%s' % (tasks, self.task)
+        with mock.patch.object(self.service, 'idempotency_commit', as_before), self.list_answers():
+            first = self.request('POST', tasks, {'title': 'old kit'}, token=self.admin, key='old-key-0001')
+            listed = self.request('PATCH', change, {'title': 'old kit list', 'version': 1}, token=self.admin, key='old-key-0002')
+        with self.list_answers():
+            again = self.request('POST', tasks, {'title': 'old kit'}, token=self.admin, key='old-key-0001')
+            listed_again = self.request('PATCH', change, {'title': 'old kit list', 'version': 1}, token=self.admin, key='old-key-0002')
+        self.assertEqual(self.stamp(again), first.data['server_time'])
+        self.assertEqual((type(listed.data), listed_again.data), (list, listed.data))
+        self.assertIsNone(self.stamp(listed_again))
+
+    def test_a_header_does_not_stay_for_the_next_request_on_the_connection(self):
+        import http.client
+        connection = http.client.HTTPConnection('127.0.0.1', self.port, timeout=15)
+        self.addCleanup(connection.close)
+        headers = {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + self.admin}
+        seen = []
+        for method, path, body in (('POST', '/v1/projects/%s/tasks' % self.project, {'title': 'one'}),
+                                   ('GET', '/v1/projects/%s/tasks' % self.project, None),
+                                   ('POST', '/v1/projects/%s/tasks' % self.project, {'title': ''}),
+                                   ('POST', '/v1/projects/%s/tasks' % self.project, {'title': 'two'})):
+            connection.request(method, path, body=None if body is None else json.dumps(body), headers=headers)
+            response = connection.getresponse()
+            response.read()
+            seen.append((response.status, response.getheader('X-Server-Time') is not None))
+        self.assertEqual([present for _, present in seen], [True, False, False, True], seen)
+
+    def test_the_stored_time_is_read_only_for_a_committed_answer_of_that_request(self):
+        principal = self.service.authenticate(self.admin)
+        self.assertIsNone(self.service.idempotency_written_at(principal, self.project, 'tasks.create x', None))
+        self.assertIsNone(self.service.idempotency_written_at(principal, self.project, 'tasks.create x', 'no-such-key-0001'))
+        # A record that is not committed has no time to give, whatever is written in it.
+        digest = self.service._idempotency_key(principal, self.project, 'tasks.create x', 'held-key-0001')
+        for state in ('in_progress', 'unknown'):
+            self.store.records.put('idempotency', digest, {
+                'principal': principal.user_id, 'project_id': self.project, 'route': 'tasks.create x', 'request_hash': 'h',
+                'state': state, 'status': None, 'response': {'server_time': '2026-10-06T07:50:12+00:00'},
+                'written_at': '2026-10-06T07:50:12+00:00', 'expires_at': self.service._now() + 600})
+            self.assertIsNone(self.service.idempotency_written_at(principal, self.project, 'tasks.create x', 'held-key-0001'))
+        record = self.store.records.get('idempotency', digest)
+        record['state'] = 'committed'
+        self.store.records.put('idempotency', digest, record)
+        self.assertEqual(self.service.idempotency_written_at(principal, self.project, 'tasks.create x', 'held-key-0001'),
+                         '2026-10-06T07:50:12+00:00')
+
+
+class ResultRowTests(test_http_agents.AgentHarness):
+    """Review of revision 2: with the service's idempotency row gone or not committed and its result row there,
+    the retry is answered from the result row, the endpoint is not asked, and the time was the service's clock at
+    the retry (written 19:18:06, sent again 6 s later: 19:18:12)."""
+    WRITE, RETRY = 1791273012.0, 1791273072.0
+    AT = '2026-10-06T07:50:12+00:00'
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.admin_token()
+        self.project = self.create_project(self.admin, 'Alpha')
+        self.path = '/v1/projects/%s/tasks' % self.project
+
+    def stamp(self, answer):
+        return answer.headers.get('x-server-time')
+
+    def write_then_retry(self, key, lose, result_put=None):
+        """One keyed creation whose idempotency row is lost as ``lose`` says; then the same request a minute later."""
+        patches = [mock.patch.object(self.service, 'idempotency_commit', lose)]
+        if result_put is not None:
+            patches.append(mock.patch.object(self.service, 'result_put', result_put))
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            with mock.patch.object(self.store, 'now', return_value=self.WRITE):
+                first = self.request('POST', self.path, {'title': 'made once'}, token=self.admin, key=key)
+        dispatched = []
+        real = self.backend._dispatch
+        with mock.patch.object(self.backend, '_dispatch', side_effect=lambda *a, **k: dispatched.append(a) or real(*a, **k)), \
+                mock.patch.object(self.store, 'now', return_value=self.RETRY):
+            again = self.request('POST', self.path, {'title': 'made once'}, token=self.admin, key=key)
+        self.assertEqual((first.status, again.status), (201, 201))
+        self.assertEqual(again.data['id'], first.data['id'])
+        self.assertEqual(dispatched, [])                              # answered from the result row: nothing made twice
+        return first, again
+
+    def test_the_idempotency_row_gone_the_retry_has_the_time_of_the_write(self):
+        first, again = self.write_then_retry(
+            'lost-key-0001', lambda digest, status, response, written_at=None: self.service.idempotency_release(digest))
+        self.assertEqual((first.data['server_time'], self.stamp(first)), (self.AT, self.AT))
+        self.assertEqual((again.data['server_time'], self.stamp(again)), (self.AT, self.AT))
+        # And the row it now has keeps that time for the next retry.
+        with mock.patch.object(self.store, 'now', return_value=self.RETRY + 600):
+            third = self.request('POST', self.path, {'title': 'made once'}, token=self.admin, key='lost-key-0001')
+        self.assertEqual((third.data['server_time'], self.stamp(third)), (self.AT, self.AT))
+
+    def test_the_idempotency_row_left_in_progress_the_retry_has_the_time_of_the_write(self):
+        first, again = self.write_then_retry('held-key-0001', lambda digest, status, response, written_at=None: None)
+        self.assertEqual((again.data['server_time'], self.stamp(again)), (self.AT, self.AT))
+
+    def test_the_idempotency_row_marked_unknown_the_retry_has_the_time_of_the_write(self):
+        first, again = self.write_then_retry(
+            'held-key-0002', lambda digest, status, response, written_at=None: self.service.idempotency_unknown(digest))
+        self.assertEqual((again.data['server_time'], self.stamp(again)), (self.AT, self.AT))
+
+    def test_a_result_row_that_kept_no_time_gives_none_and_never_the_clock(self):
+        """The upgrade window: written through the kit before this one, sent again through this one."""
+        real = self.service.result_put
+        first, again = self.write_then_retry(
+            'old-key-0001', lambda digest, status, response, written_at=None: self.service.idempotency_release(digest),
+            result_put=lambda key, value, written_at=None: real(key, value))
+        self.assertNotIn('server_time', again.data)
+        self.assertIsNone(self.stamp(again))
+        self.assertEqual({k: v for k, v in first.data.items() if k != 'server_time'}, again.data)
+
+    def test_the_time_is_kept_with_the_result_row_and_read_from_nowhere_else(self):
+        self.assertIsNone(self.service.result_written_at('no-such-result'))
+        self.service.result_put('k1', {'id': 'pp-1'}, written_at=self.AT)
+        self.service.result_put('k2', {'id': 'pp-2'})
+        self.service.result_put('k3', {'id': 'pp-3', 'server_time': self.AT}, written_at=False)
+        self.service.result_put('k4', None, written_at=self.AT)
+        self.assertEqual([self.service.result_written_at(key) for key in ('k1', 'k2', 'k3', 'k4')], [self.AT, None, None, self.AT])
+        self.assertEqual(self.service.result_get('k1'), {'id': 'pp-1'})          # the result itself is what it was
+        self.assertEqual(self.store.records.get('result', 'k2'), {'result': {'id': 'pp-2'}})
+
+
+class EndpointResultRowTests(test_http_review_fixes.EndpointCase):
+    """The same on the endpoint backend: the time kept with the result row is the endpoint's."""
+    AT = '2026-10-06T07:49:59+00:00'
+
+    def write_then_retry(self, key, envelope_time):
+        alex, project = self.setup_project()
+        real_checked = http_service.EndpointBackend._checked.__func__
+
+        def checked(cls, reply, action=None):
+            if isinstance(reply, dict) and reply.get('returncode') == 0 and action == 'bd' and envelope_time:
+                reply = dict(reply, server_time=envelope_time)       # what the real endpoint's envelope carries for a write
+            return real_checked(cls, reply, action)
+        lose = lambda digest, status, response, written_at=None: self.service.idempotency_release(digest)
+        with mock.patch.object(http_service.EndpointBackend, '_checked', classmethod(checked)), \
+                mock.patch.object(self.service, 'idempotency_commit', lose):
+            first = self.create_task(alex, project, 'made once', key=key)
+        self.assertEqual(first.status, 201, first.data)
+        with mock.patch.object(self.backend, '_run', side_effect=AssertionError('the endpoint was asked')):
+            again = self.create_task(alex, project, 'made once', key=key)
+        self.assertEqual((again.status, again.data['id']), (201, first.data['id']))
+        self.assertEqual(len(self.canonical_rows()), 1)
+        return first, again
+
+    def test_the_retry_answered_from_the_result_row_has_the_endpoints_time_of_the_write(self):
+        first, again = self.write_then_retry('lost-key-0201', self.AT)
+        self.assertEqual((first.data.get('server_time'), first.headers.get('x-server-time')), (self.AT, self.AT))
+        self.assertEqual((again.data.get('server_time'), again.headers.get('x-server-time')), (self.AT, self.AT))
+
+    def test_a_result_row_of_a_write_that_had_no_time_gives_none(self):
+        first, again = self.write_then_retry('lost-key-0202', None)
+        self.assertNotIn('server_time', again.data)
+        self.assertIsNone(again.headers.get('x-server-time'))
+
+if __name__ == '__main__':
+    unittest.main()

@@ -394,6 +394,30 @@ def unusable_projects(service):
     return items
 
 
+#: The response header that carries the server's time of a write that was carried out, on
+#: every such answer whatever the shape of its body (kittrial-5bb.97).
+SERVER_TIME_HEADER = 'X-Server-Time'
+
+#: The endpoint's ``server_time`` of the write the current thread's request carried out, if
+#: any (set by ``EndpointBackend._checked``, read and cleared by ``ApiHandler._mutate``).
+WRITTEN = threading.local()
+
+
+def written_at(service):
+    """The time for a write answer: the endpoint's when it carried the write out, else the service's clock.
+
+    UTC with its offset, whole seconds: the endpoint's format (``http_authority.server_time``).
+    """
+    at = getattr(WRITTEN, 'at', None)
+    WRITTEN.at = None
+    if isinstance(at, str):
+        return at
+    if at is False:
+        return None                                   # an endpoint's stored answer that has no time
+    from http_authority import server_time
+    return server_time(service._now())
+
+
 class InProcessBackend:
     """Disposable canonical operations used for local validation.
 
@@ -443,10 +467,15 @@ class InProcessBackend:
             if authorize is not None:
                 authorize()
             if result_key is not None and self.service.has_result(result_key):
+                # A stored answer: the time kept with it, and none where none was kept. Never
+                # the clock now, which is the time of the retry (kittrial-5bb.97).
+                WRITTEN.at = self.service.result_written_at(result_key) or False
                 return self.service.result_get(result_key)
             result = self._dispatch(route, principal, project_id, payload)
+            from http_authority import server_time
+            WRITTEN.at = server_time(self.service._now())
             if result_key is not None:
-                self.service.result_put(result_key, result)
+                self.service.result_put(result_key, result, written_at=WRITTEN.at)
             self.service.store.save()
         if self.faults.get(route, 0) > 0:
             self.faults[route] -= 1
@@ -1378,6 +1407,14 @@ class EndpointBackend:
     def _checked(cls, reply, action=None):
         """The payload of one canonical reply, or the HttpError its return code means."""
         code = reply.get('returncode') if isinstance(reply, dict) else None
+        if code == 0 and isinstance(reply.get('server_time'), str):
+            # The endpoint's time of the write it carried out, for the body of the answer of
+            # the request this thread is serving (kittrial-5bb.97).
+            WRITTEN.at = reply['server_time']
+        elif code == 0 and reply.get('replayed') is True:
+            # A stored answer from before the time was kept: no time is known, and the
+            # service's clock now would be the time of the retry.
+            WRITTEN.at = False
         stderr = (reply.get('stderr') or '') if isinstance(reply, dict) else ''
         stdout = (reply.get('stdout') or '') if isinstance(reply, dict) else ''
         if code == 126:
@@ -1428,6 +1465,10 @@ class EndpointBackend:
             if authorize is not None:
                 authorize()
             if result_key is not None and self.service.has_result(result_key):
+                # The endpoint is not asked: the time is the one kept with the stored result,
+                # and none where none was kept (a result stored before the time was kept).
+                # Never the service's clock, which is the time of the retry (kittrial-5bb.97).
+                WRITTEN.at = self.service.result_written_at(result_key) or False
                 return self.service.result_get(result_key)
         # The durable canonical operation identity is the same deterministic digest as
         # the local result key, so an exact retry after a lost response carries the
@@ -1465,7 +1506,8 @@ class EndpointBackend:
         # changed the authority the effect ran under.
         if result_key is not None:
             with self.service.store.lock:
-                self.service.result_put(result_key, result)
+                # With the endpoint's time of the write (``_checked`` left it for this thread).
+                self.service.result_put(result_key, result, written_at=getattr(WRITTEN, 'at', None))
                 self.service.store.save()
         if self.faults.get(route, 0) > 0:
             self.faults[route] -= 1
@@ -2771,6 +2813,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _dispatch(self, method):
         if getattr(self, '_guarded', False):
             self.server.unwatch(self.connection)        # the request line and headers are here: the service's time now
+        self._written_at = None                         # one connection serves request after request
         request_id = self._request_id()
         self._current_request_id = request_id
         # Per-request agent read cache. An HTTP/1.1 keep-alive connection reuses this
@@ -3016,6 +3059,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('Referrer-Policy', 'no-referrer')
         self.send_header('X-Request-Id', getattr(self, '_current_request_id', '') or '')
+        if getattr(self, '_written_at', None):
+            # Set only for the answer of a write that was carried out; _dispatch clears it for the next request.
+            self.send_header(SERVER_TIME_HEADER, self._written_at)
         if getattr(self, '_retry_after', None):
             self.send_header('Retry-After', str(int(self._retry_after)))
             self._retry_after = None
@@ -3100,10 +3146,13 @@ class ApiHandler(BaseHTTPRequestHandler):
             if kind == 'replay':
                 # An exact retry must not re-deliver a one-time secret; the caller
                 # marks that with replay_status (200 metadata-only for issue routes).
+                # The header carries the time of the write, as kept with the stored answer.
+                self._written_at = self.service.idempotency_written_at(ctx.principal, project_id, idem_route, key)
                 return (replay_status or value), response
             digest = value
             # 'new' or 'reconcile': both proceed with the reserved digest; a canonical
             # reconcile re-invokes with the durable operation identity.
+        WRITTEN.at = None
         try:
             if serialize:
                 with self.service.store.lock:
@@ -3134,7 +3183,20 @@ class ApiHandler(BaseHTTPRequestHandler):
         except Exception:
             self.service.idempotency_release(digest)
             raise
-        self.service.idempotency_commit(digest, status, stored)
+        # The server's time of the write, at the top level of the answer and of what is kept for
+        # a retry, so that the same request sent again is answered with the time the write was
+        # carried out (kittrial-5bb.97). An answer that is not an object carries none.
+        at = written_at(self.service)
+        for body in (public, stored):
+            if at is not None and isinstance(body, dict) and 'server_time' not in body:
+                body['server_time'] = at
+        # And in a header, whatever the shape of the body: a JSON list or an empty answer has
+        # no field for it. An answer that already carries a time (a canonical retry answered
+        # from the endpoint's journal) keeps that one in both places.
+        if isinstance(public, dict) and isinstance(public.get('server_time'), str):
+            at = public['server_time']
+        self._written_at = at
+        self.service.idempotency_commit(digest, status, stored, written_at=at)
         self._forget_cached_reads(ctx.principal, project_id)
         self.service.audit(ctx.request_id, ctx.principal, route_name, 'committed',
                            project_id=project_id, reason=reason)

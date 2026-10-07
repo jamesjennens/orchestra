@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "operation_id": "caprev-ade93f85b7d4fd00374efc8e75ec3387",
+  "revision": 2,
+  "expected_sha256": "792e64cfa3a61983f7a28e1fb80d10c286b75f9a362bb1558b1b095f8fd5fbf1",
+  "key": "http.answers-under-held-lock",
+  "name": "True answers under a held coordination lock",
+  "aliases": [],
+  "summary": "A web write that meets a held project lock answers busy or repeats the creator's earlier answer, so keyless writes, refusals and reads answer truly under the lock instead of a false success or a different fault.",
+  "requirements": [],
+  "anchors": [],
+  "code": [
+    "http_auth.py::busy",
+    "project_creation.py::standing_action",
+    "http_service.py::EndpointBackend._ask"
+  ],
+  "tests": [
+    "tests/test_endpoint_busy.py",
+    "tests/test_http_project_create.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "http",
+    "service",
+    "lock"
+  ]
+}

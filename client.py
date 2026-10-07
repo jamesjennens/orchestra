@@ -480,6 +480,11 @@ def main():
     elif args[:1] in (['brief'],['history'],['checkpoint'],['onboard'],['docs'],['session'],['handoff'],['review'],['work'],['feedback'],['requirement'],['ref'],['capability'],['proposal'],['guidance']):action=args.pop(0)
     result=request(json.loads(Path(a.config).read_text()),a.project,a.actor,args,action,path)
     output = result['stdout']
+    # The server's time of a write that was carried out (kittrial-5bb.97): one line on standard
+    # error, so that standard output is exactly what it was. An older endpoint sends none.
+    written = result.get('server_time')
+    if result['returncode'] == 0 and isinstance(written, str) and re.fullmatch(r'[0-9T:+.Z-]{20,40}', written):
+        result['stderr'] = (result.get('stderr') or '') + 'server_time: %s\n' % written
     if action == 'session' and args[:1] == ['resume'] and result['returncode'] == 0:
         client = report(Path(__file__).resolve().parent, "client")
         try:

@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "operation_id": "caprev-e1fe2e7234a64fb8ba95e2e5b84fa492",
+  "revision": 2,
+  "expected_sha256": "9b83c740e16606b90718c9b25141376a57f6aa2b33f2e8a944e2843ab2b57536",
+  "key": "review.one-recommendation-per-person",
+  "name": "One recommendation per person",
+  "aliases": [],
+  "summary": "A reviewer recommends once per contribution per person: a second recommendation by the same person is refused, while a different person may still recommend, so the owner sees one standing recommendation from each reviewer.",
+  "requirements": [],
+  "anchors": [],
+  "code": [
+    "review_recommendations.py::standing",
+    "review_recommendations.py::execute"
+  ],
+  "tests": [
+    "tests/test_review_recommendations.py",
+    "tests/test_http_recommendations.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "review",
+    "recommendations"
+  ]
+}
