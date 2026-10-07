@@ -1856,7 +1856,9 @@ class OperationIdentityCase(unittest.TestCase):
         retry = run_guarded(self.request('a', 'usr_a', 'sess_a'), self.journal, effect,
                             authority_config=self.config)
         self.assertEqual(0, first['returncode'], first)
-        self.assertEqual(first, retry)
+        # The committed envelope, whole, and marked as a stored answer (kittrial-5bb.97).
+        self.assertEqual(dict(first, replayed=True), retry)
+        self.assertNotIn('replayed', first)
         self.assertEqual(1, len(records))
 
     def test_replayed_identity_is_bound_to_the_route_body(self):

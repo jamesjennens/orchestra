@@ -30,6 +30,46 @@ Every request is one JSON object on stdin; every response is one JSON object on 
 - On validation or transport failure, `returncode` is nonzero (`2` for endpoint
   validation), `stdout` is empty, and `stderr` starts with the error type
   (`ValueError: ...`). Automation should parse stdout only when the exit code is `0`.
+- **The server's time of a write** (additive). The answer of a write that was carried
+  out has one more field, `"server_time": "2026-10-06T07:50:12+00:00"`: the endpoint
+  host's clock, UTC with its offset, whole seconds. Cite it where a record says when
+  something happened, in place of your own clock. The client prints it as one line on
+  its standard error after the endpoint's own diagnostics, `server_time:
+  2026-10-06T07:50:12+00:00`; standard output and a `--out` file are exactly what they
+  were. Rules:
+  - a refusal, a busy answer and an uncertain answer carry none (nothing was written at
+    a known time), and neither does a read, including the reads of an action that can
+    also write (`work`, `review TASK`, `brief`, `handoff TASK`), a `--dry-run`, and the
+    help of a command (`create --help`). Help is a help flag that is ON: bare, or with a
+    value bd reads as true; given more than once, the last one decides, as in bd.
+    `--help=false` (also `--help=0`, `-h=false`) is a flag bd accepts and then carries
+    the command out, so such a request is a write like any other: stamped, and its
+    outcome kept as unknown when it fails after bd was called. A flag between a verb and
+    its subcommand changes nothing: `comments --json add ID TEXT` is the write that
+    `comments add ID TEXT --json` is;
+  - the writes are: every bd write (`create`, `update`, `close`, `reopen`, `comments
+    add`, `dep add`, `remove`, `relate` and `unrelate`, ...), `review --file`, `handoff`
+    with a payload (a request, an acceptance, a decline), `checkpoint`, the lifecycle,
+    coordinate and requirement actions, the keyed records (`ref`, `capability`,
+    `proposal`), `session register`, `session resume` and `session run start`,
+    `heartbeat` and `end`, `guidance ack`, and `feedback` (add and correct);
+  - **a request that is already recorded carries none.** Where the kit recognises its
+    own record (the same `operation_id` in a lifecycle fact, a review record, a handoff,
+    a session registration, an acknowledgement, a feedback entry), the second answer
+    says so (`reconciled`, or the record it found) and writes nothing, so it has no
+    time of its own. The time of the first answer is the time of the write; keep it, or
+    read the record's own `created_at`;
+  - a request that is sent again with a transport operation identity (the HTTP
+    service's `Idempotency-Key`, which it hands to the endpoint) is answered from the
+    endpoint's journal with the stored answer, time included, and the field `replayed:
+    true`. An answer stored by a kit from before this field is replayed as it was
+    stored, without a time;
+  - the time is taken when the write has been carried out and is cut to the whole
+    second, while bd rounds its own times: a `created_at` or `updated_at` of the row
+    can read one second later than `server_time`. It is the host's wall clock, so it is
+    not monotonic across a step of that clock;
+  - an older endpoint sends no such field and the client then prints nothing; an older
+    client ignores the field.
 
 Native commands can succeed (exit `0`) while printing warnings. The endpoint forwards
 those warnings on `stderr` and keeps the success JSON clean; it does not silently drop

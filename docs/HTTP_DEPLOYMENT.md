@@ -976,6 +976,42 @@ Mutating calls accept an `Idempotency-Key`. On an uncertain `503` the client
 raises `UncertainOutcome` carrying the key: retry the identical request with that
 key to reconcile. Never retry an uncertain mutation with a new key.
 
+**The server's time of a write.** The JSON body of a write that was carried out has
+`server_time` at its top level, for example `"server_time":
+"2026-10-06T07:50:12+00:00"` (UTC with its offset, whole seconds). On the endpoint
+backend it is the time the endpoint gave for the write; where the service carries the
+write out itself (accounts, members, agents, credentials) it is the service's clock.
+The same request sent again with its `Idempotency-Key` is answered with the stored
+body, so with the time of the write and not of the retry. Reads, refusals and uncertain
+answers carry none. A log-in and a log-out carry none either (they make or end a
+session and record nothing in a project).
+
+The same value is in the response header **`X-Server-Time`** of every write that was
+carried out, whatever the shape of its body: a caller has one place to look. That
+matters for the answers that have no top level for the field: on the endpoint backend
+a task change (`PATCH .../tasks/ID`) and a claim (`POST .../tasks/ID/claim`) answer
+with the list bd prints, and some writes answer 204 with no body. The header is absent
+exactly where the field is absent for an object body: reads, refusals, busy and
+uncertain answers, a log-in and a log-out. A retried request gets the header with the
+time of the write, because the time is kept beside the stored answer; an answer that
+was stored by a kit from before this header has it on a retry only when its body is an
+object with `server_time`. The web pages do not show it.
+
+The service keeps the time in both of its records of a keyed write: with the answer as
+it was sent (the idempotency record) and with the endpoint's result (the result
+record). A retry that finds only the result record (the other gone, or never committed
+because the service stopped between the two) is answered from it without asking the
+endpoint, with the time of the write.
+
+Two edges. During an upgrade, a write that was made through the kit from before this
+field and is sent again through this one, when the service's own stored answer is gone:
+whether the endpoint replays what it stored or the service answers from a result record
+that kept no time, the answer has no `server_time` and no header (no time is known; the
+service never puts the time of the retry there). And the time
+is taken when the write has been carried out and cut to the whole second, while bd
+rounds: a task's `updated_at` can read one second later. It is the wall clock, not
+monotonic across a clock step.
+
 **Retry contract.** An exact retry sent no more than 29 days
 (`JOURNAL_RETRY_HORIZON_SECONDS`, the 30-day tombstone horizon minus the 24 h skew
 allowance) after the original attempt replays the recorded result, reports

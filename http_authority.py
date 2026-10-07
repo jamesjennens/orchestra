@@ -692,7 +692,7 @@ class PreEffectFailure(Exception):
 #: allowlist: an unrecognized verb is treated as a write, so an unknown future
 #: mutation can never be mistaken for a read and released.
 READ_ONLY_BD_VERBS = frozenset({'export', 'list', 'show', 'ready', 'search',
-                                'count', 'dep', 'state', 'lint'})
+                                'count', 'state', 'lint'})
 
 #: Exceptions the canonical effect layer raises to refuse a request (bad attachment,
 #: task mismatch, malformed payload, unknown flag). They release the identity only
@@ -715,11 +715,125 @@ def _is_plain_dry_run(argv):
     return '--dry-run' in options
 
 
+def _help_flags(argv):
+    """The value of every help flag of a bd invocation, in order, or None when a flag cannot be resolved.
+
+    A bare ``--help`` or ``-h`` is True; ``--help=VALUE`` and ``-h=VALUE`` are the text of
+    VALUE. A token that is the value of another flag, or stands after ``--``, is not a
+    flag. The inventories are the kit's own tables of bd's flags; a flag none of them
+    knows makes the answer None, because its value could be what looks like the help flag.
+    """
+    import reserved_comments as rc
+    verb = argv[0]
+    value_long = set(rc.BD_GLOBAL_VALUE_FLAGS)
+    bool_long = set(rc.BD_GLOBAL_BOOL_FLAGS)
+    if verb == 'dep':
+        value_long |= rc.BD_DEP_VALUE_LONG_FLAGS
+        bool_long |= rc._DEP_BOOL_FLAGS
+        table = rc._short_flag_table('dep', rc._dep_subcommand(list(argv)))
+    elif verb == 'comments':
+        value_long |= rc.BD_COMMENT_ADD_VALUE_FLAGS
+        bool_long |= rc.BD_COMMENT_ADD_BOOL_FLAGS
+        table = rc._short_flag_table('comments', 'add')
+    else:
+        value_long |= rc.BD_LONG_VALUE_FLAGS.get(verb, set())
+        bool_long |= rc.BD_LONG_BOOL_FLAGS.get(verb, set())
+        table = rc._short_flag_table(verb)
+    found, index = [], 1
+    while index < len(argv):
+        token = argv[index]
+        index += 1
+        if not isinstance(token, str):
+            return None
+        if token == '--':
+            break
+        if len(token) > 1 and token.startswith('--'):
+            name, joined, value = token.partition('=')
+            if name == '--help':
+                found.append(value if joined else True)
+            elif name in value_long:
+                index += 0 if joined else 1
+            elif name not in bool_long:
+                return None
+        elif len(token) > 1 and token.startswith('-'):
+            letters, joined, value = token[1:].partition('=')
+            for position, letter in enumerate(letters):
+                kind = table.get(letter)
+                if kind is None:
+                    return None
+                if kind == 'value':
+                    if position == len(letters) - 1 and not joined:
+                        index += 1                       # its value is the next token
+                    break                                # else the rest of the token is its value
+                if letter == 'h':
+                    found.append(value if joined and position == len(letters) - 1 else True)
+    return found
+
+
+def _asks_for_help(argv):
+    """Whether bd will print help for this invocation and carry nothing out.
+
+    bd prints help only when the flag is on. ``--help=false`` (also ``--help=0``,
+    ``-h=false``) is a flag bd accepts and then carries the command out (review of
+    kittrial-5bb.97, revision 2: every such spelling of a write was taken for a read, so it
+    was not stamped and a failure after it released the operation's identity). So: help only
+    when the help flag is on, bare or with a value bd reads as true; given more than once,
+    the last one decides, as in bd (``--help=false --help`` prints help, ``--help
+    --help=false`` carries the command out). Anything else, and anything that cannot be
+    resolved, is judged as if no help had been asked: a help request taken for a write is
+    stamped needlessly; a write taken for help is the fault.
+    """
+    try:
+        from reserved_comments import _parse_go_bool
+        found = _help_flags(argv)
+        # bd takes the last one where the flag is given more than once.
+        return bool(found) and _parse_go_bool(found[-1]) is True
+    except Exception:  # noqa: BLE001 - what cannot be scanned stays what it was
+        return False
+
+
+def _writes_rows(argv):
+    """Whether the kit's table of writing commands says this invocation writes rows; unknown is a write."""
+    try:
+        from reserved_comments import write_targets
+        return write_targets(list(argv), {}) is not None
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _comments_writes(argv):
+    """Whether a ``bd comments`` invocation adds a comment: its subcommand is ``add``.
+
+    The subcommand is the first operand, not the second token: bd accepts flags between
+    the two (``comments --json add ID text``, ``comments --help=false add ID text``), and
+    a test of the token right after ``comments`` took each of those writes for a read
+    (review of kittrial-5bb.97, revision 3; the same on main). The kit's own reader of a
+    ``comments`` invocation resolves it, as ``dep`` is resolved; what it cannot resolve
+    (a flag it does not know, which could hide the subcommand) is a write.
+    """
+    try:
+        from reserved_comments import _comments_parts
+        parts = _comments_parts(list(argv))
+    except Exception:  # noqa: BLE001 - ambiguous: never mistaken for a read
+        return True
+    return parts is None or parts[0] == 'add'
+
+
 def is_mutating_invocation(argv):
     """Whether one injected ``bin/bd`` argv can change canonical/native state."""
     if not isinstance(argv, (list, tuple)) or not argv or not isinstance(argv[0], str):
         return True
     verb = argv[0]
+    if _asks_for_help(argv):
+        # `bd VERB ... --help` prints the help of the verb and writes nothing (review of
+        # kittrial-5bb.97: `create --help` was taken for a write and its answer stamped).
+        return False
+    if verb == 'dep':
+        # `dep add`, `remove`, `relate`, `unrelate` and the form without a subcommand store or
+        # remove a dependency; `list`, `tree` and `cycles` read. The kit's own table of the
+        # rows a command writes decides (reserved_comments.write_targets): the whole verb was
+        # listed as read-only here, older than that table.
+        return _writes_rows(argv)
     if verb in READ_ONLY_BD_VERBS:
         return False
     if verb in ('create', 'update') and _is_plain_dry_run(argv):
@@ -727,7 +841,7 @@ def is_mutating_invocation(argv):
         # from it is a clean pre-effect failure, not an uncertain write.
         return False
     if verb == 'comments':
-        return len(argv) > 1 and argv[1] == 'add'
+        return _comments_writes(argv)
     if verb == 'merge-slot':
         return not (len(argv) > 1 and argv[1] == 'check')
     return True
@@ -744,12 +858,16 @@ class NativeRunner:
     it returns whatever the dispatch returns and raises whatever it raises.
     """
 
-    __slots__ = ('_dispatch', 'attempted_write', 'calls')
+    __slots__ = ('_dispatch', 'attempted_write', 'calls', 'wrote')
 
     def __init__(self, dispatch):
         self._dispatch = dispatch
         self.attempted_write = False
         self.calls = 0
+        #: Set by an effect that wrote something that is not a bd row (the kit's handoff
+        #: journal): the answer is then the answer of a write, with the server's time
+        #: (kittrial-5bb.97). It says nothing about refusals, which `attempted_write` decides.
+        self.wrote = False
 
     def __call__(self, argv):
         self.calls += 1
@@ -1766,6 +1884,26 @@ def _envelope(code, stderr='', **extra):
     return payload
 
 
+def server_time(now=None):
+    """The server's clock for a write answer: UTC with its offset, whole seconds (kittrial-5bb.97)."""
+    import datetime
+    moment = datetime.datetime.now(datetime.timezone.utc) if now is None else \
+        datetime.datetime.fromtimestamp(now, datetime.timezone.utc)
+    return moment.replace(microsecond=0).isoformat()
+
+
+def stamp_write(envelope):
+    """Put ``server_time`` on the answer of a write that was carried out; the same answer is returned.
+
+    Only a successful answer (return code 0) that has none yet: a refusal, a busy and an
+    uncertain answer say nothing about when something was written, and an answer that is
+    stamped keeps its time (a replayed write returns the time it was carried out).
+    """
+    if isinstance(envelope, dict) and envelope.get('returncode') in (None, 0) and 'server_time' not in envelope:
+        envelope['server_time'] = server_time()
+    return envelope
+
+
 #: The ids the HTTP service allocates (http_auth: ``usr_``/``agent_`` + 16 hex). As a
 #: declared actor the shape is reserved for that service (``reserved_comments.HTTP_ACTOR``).
 HTTP_ACTOR_ID = re.compile(r'(?:usr|agent)_[0-9a-f]{16}')
@@ -1905,7 +2043,11 @@ def run_guarded(request, journal_path, effect, authority_config=None,
                         return _envelope(124, stderr='Operation is committed but its response '
                                                      'exceeded the retention bound; reconcile '
                                                      'canonical state before retrying.\n')
-                    return entry.get('envelope')
+                    # The stored answer, marked as one: a caller that would otherwise put its
+                    # own clock on a write answer must not do so for an answer that was
+                    # stored without a time (by a kit from before the time was kept).
+                    stored = entry.get('envelope')
+                    return dict(stored, replayed=True) if isinstance(stored, dict) else stored
                 # The prior attempt reserved the identity and its outcome is unknown:
                 # preserve uncertainty rather than repeating a possibly committed effect.
                 return _envelope(124, stderr='Operation identity reserved; outcome unknown. '
@@ -1940,6 +2082,11 @@ def run_guarded(request, journal_path, effect, authority_config=None,
             return _envelope(124, stderr='Effect raised after the reservation (%s: %s); '
                                          'outcome unknown. Reconcile canonical state before '
                                          'retrying.\n' % (type(error).__name__, error))
+        # The time of the write, on the answer itself and so in what the journal keeps: the
+        # same request sent again is answered with the time the write was carried out. A
+        # guarded action that only read (its runner attempted no write) carries none.
+        if runner is None or runner.attempted_write or runner.wrote:
+            stamp_write(envelope)
         if journal is not None and isinstance(envelope, dict):
             code = envelope.get('returncode')
             if code in (None, 0):

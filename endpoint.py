@@ -28,9 +28,9 @@ from reserved_comments import (carries_record_label, check_raw_request, comment_
                                first_reserved_label, is_record_anchor, label_guard_request,
                                operator_only_in_args, raw_file_flag_in_args,
                                is_merge_slot_id, shown_token, write_targets, MERGE_SLOT_LABEL, MERGE_SLOT_SUFFIX,
-                               reserved_label_in_args, refuse_http_actor, status_change_targets,
+                               reserved_label_in_args, refuse_http_actor, status_change_targets, title_change_targets,
                                unresolved_bd_flags)
-from http_authority import AuthorityConfig, NativeRunner, CAP_PROJECT_ADMIN, http_actor_denial, journal_path, run_guarded
+from http_authority import AuthorityConfig, NativeRunner, CAP_PROJECT_ADMIN, http_actor_denial, journal_path, run_guarded, stamp_write
 
 ALLOWED={'list','show','ready','search','count','create','update','close','reopen','comments','dep','state','lint'}
 # Legacy name kept for operators reading this file; enforcement is the
@@ -198,6 +198,35 @@ def _guard_record_anchor_status(root,path,args,actor):
             raise ValueError('Refusing to %s %s: %s. Its holder changes only through `coordinate`.'
                              %(command,canonical,merge_slot_sentence(canonical)))
 
+def _guard_record_anchor_title(root,path,args,actor,rows=None):
+    """Read-before-write guard: the title of a record anchor is not changed through bd (kittrial-5bb.97).
+
+    The kit finds a reference, proposal, settings or capability record by its anchor's
+    title, so a renamed anchor is a record nobody finds again. The same rows as
+    `_guard_record_anchor_status` protects. Requirement and brd-section records are worked
+    as tasks and are renamed like tasks.
+
+    ``rows`` are the rows `_guard_named_rows` has just read for this write (without their
+    comments). An anchor carries a record type label, so only a row with such a label can
+    be one, and only those are read again, with their comments, in one native read: a
+    title change on ordinary rows costs no read beyond the one every write makes
+    (kittrial-5bb.113). Without ``rows`` every named row is read.
+    """
+    targets=title_change_targets(args)
+    if targets is None:return
+    if targets=='unnamed':
+        raise ValueError('Refusing update --title: name exactly the issue(s) to change; bd would otherwise act on the '
+                         'last touched issue, which cannot be checked for a record anchor.')
+    if rows is not None:
+        targets=[row['id'] for row in rows if carries_record_label(row)]
+        if not targets:return
+    read=_native_anchor_rows(root,path,actor,targets)
+    for token in targets:
+        canonical,row=read[token]
+        if is_record_anchor(row):
+            raise ValueError('Refusing to update the title of %s: it is a reference/proposal/settings/capability record '
+                             'anchor, and its title is how the kit finds it.'%canonical)
+
 #: bd 1.2.2's structured answer when `show ID` resolved to no single row. bd prints it both
 #: for an id that does not exist and for an id that is an ambiguous prefix of several; only
 #: the stderr differs ("no issue found" against "ambiguous ID ... Use more characters to
@@ -344,6 +373,7 @@ def _guard_named_rows(root,path,name,args,attachments,actor):
                                  %(command,row['id'],merge_slot_sentence(row['id'])))
             raise ValueError('Refusing %s on %s: %s. Nothing but `coordinate` writes it; its merge-create operation repairs a damaged slot.'
                              %(command,row['id'],merge_slot_sentence(row['id'])))
+    return rows
 
 def guarded_write(root,request,journal,effect,**options):
     """``run_guarded``, after the server's configuration has been read (kittrial-5bb.156).
@@ -418,7 +448,13 @@ def execute(root,request,authority_config=None,require_authority=False):
             fcntl.flock(lock,fcntl.LOCK_EX)
             result=session_execute(path,name,args,export,actor=actor)
         result['provenance'] = {'kit': report(Path(__file__).resolve().parent, 'kit')}
-        return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(session_warnings)}
+        answer={'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(session_warnings)}
+        # The session writes are not guarded writes; they carry the server's time all the same
+        # (kittrial-5bb.97). show and run status only read.
+        # A request that is already recorded writes nothing (`reconciled`) and carries none.
+        writes=args[:1] in (['register'],['resume']) or (args[:1]==['run'] and args[1:2] in (['start'],['heartbeat'],['end']))
+        if writes and result.get('reconciled') is not True:stamp_write(answer)
+        return answer
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}',actor):raise ValueError('Supply a short contributor/session actor')
     action=request.get('action','bd')
     if action in ('handoff','review','work'):
@@ -439,10 +475,15 @@ def execute(root,request,authority_config=None,require_authority=False):
         review_writes=configured_review_writes(root,warnings=switch_warnings)
         run_warnings.extend(switch_warnings)
         def work_effect():
-            return {'returncode':0,'stdout':json.dumps(work_execute(path,actor,action,args,request.get('attachments',{}),runner,
-                                                                    operators=configured_operators(root),
-                                                                    verifiers=configured_verifiers(root),
-                                                                    review_writes=review_writes),ensure_ascii=False,indent=2)+'\n','stderr':''.join(run_warnings)}
+            result=work_execute(path,actor,action,args,request.get('attachments',{}),runner,
+                                operators=configured_operators(root),
+                                verifiers=configured_verifiers(root),
+                                review_writes=review_writes)
+            # A handoff request and a decline are recorded in the kit's handoff journal and move
+            # nothing in bd, so the runner saw no write; they are writes all the same (review
+            # of kittrial-5bb.97). One that was already recorded (`reconciled`) wrote nothing.
+            if action=='handoff' and len(args)==2 and isinstance(result,dict) and result.get('reconciled') is False:runner.wrote=True
+            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False,indent=2)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             return guarded_write(root,request,journal_path(path),work_effect,
@@ -499,7 +540,8 @@ def execute(root,request,authority_config=None,require_authority=False):
             result=guidance.state(path,actor)
         else:
             result=guidance.read(path,args,actor)
-        return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False,indent=2)+'\n','stderr':''}
+        answer={'returncode':0,'stdout':json.dumps(result,ensure_ascii=False,indent=2)+'\n','stderr':''}
+        return stamp_write(answer) if subcommand=='ack' and result.get('reconciled') is not True else answer
     if action=='anchors':
         # Read-only (kittrial-5bb.71): which rows are record anchors, by the predicate
         # every surface uses (reserved_comments.is_record_anchor), in ONE native read:
@@ -717,7 +759,8 @@ def execute(root,request,authority_config=None,require_authority=False):
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             result=feedback_execute(path/'.feedback.jsonl',actor,args,request.get('attachments',{}))
-        return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''}
+        answer={'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''}
+        return answer if args[:1]==['list'] or result.get('reconciled') is True else stamp_write(answer)
     if action=='view':
         target=request.get('path','CURRENT.md')
         viewroot=(path/'views').resolve();view=(viewroot/target).resolve()
@@ -794,8 +837,9 @@ def execute(root,request,authority_config=None,require_authority=False):
             fcntl.flock(lock,fcntl.LOCK_EX)
             # First the rows the write names (an existing id given to create, a write that names
             # none, the merge slot); then the guards that read what those rows carry.
-            _guard_named_rows(root,path,name,args,request.get('attachments',{}),actor)
+            named=_guard_named_rows(root,path,name,args,request.get('attachments',{}),actor)
             _guard_record_anchor_status(root,path,args,actor)
+            _guard_record_anchor_title(root,path,args,actor,named)
             _guard_reserved_labels(root,path,args,actor)
             def bd_dispatch(argv):
                 p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*argv],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
