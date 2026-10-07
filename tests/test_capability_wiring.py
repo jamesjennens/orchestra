@@ -25,6 +25,7 @@ KIT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(KIT))
 sys.path.insert(0, str(KIT / 'tests'))
 import admin
+import capabilities
 import capability_records as cr
 import client
 from test_capability_records import CapabilityNative, entry
@@ -285,6 +286,43 @@ class ClientCheckTests(ClientCase):
         self.assertEqual(len(capability_verification.validate_batch(written)), 2)
         self.assertEqual(json.loads(out)['recording'], 'payloads')
 
+    def test_the_release_payload_rule_is_the_documented_one(self):
+        """kittrial-5bb.179: the release check set is derived, and the rule is the written one.
+
+        `docs/CAPABILITY_INDEX_DESIGN.md` section 13.5 promises the coordinator's release
+        payload is generated from the records: with no `--key`, `check --payloads` writes one
+        payload for every accepted or draft record **whose check the checkout can decide**, and
+        a record whose pointers are all `unknown` gets none and reads `not-recordable`. This
+        test reads that document and then pins the same behaviour, so the section and the
+        client cannot drift apart.
+        """
+        prose = ' '.join((KIT / 'docs' / 'CAPABILITY_INDEX_DESIGN.md').read_text(encoding='utf-8').split())
+        self.assertIn('writes one payload per selected record **whose check the checkout can decide**', prose)
+        self.assertIn('gets none and reads `not-recordable`', prose)
+        self.commit()
+        target = self.root / 'payloads.json'
+        grown = self.ITEMS + [list_item('recorded.later', code=['review_workflow.py::execute'])]
+        code, out, _, _ = self.check('--payloads', str(target), items=grown)
+        self.assertEqual(code, 0)
+        written = json.loads(target.read_text(encoding='utf-8'))
+        # The documented set: accepted and draft-only, covered with no flag and no new file.
+        self.assertEqual([item['key'] for item in written['items']],
+                         ['review.flow', 'review.gone', 'recorded.later'])
+        # Every payload names the commit the check ran at; the document says the payload has
+        # no commit field of its own, so the check supplies it.
+        self.assertEqual({item['commit'] for item in written['items']}, {self.git('rev-parse', 'HEAD')})
+        # The documented exclusion: a record whose check the checkout cannot decide gets no
+        # payload, and the run says so instead of writing a payload full of unknowns.
+        rows = {row['key']: row for row in json.loads(out)['capabilities']}
+        self.assertIsNone(rows['other.lang']['passed'])
+        self.assertEqual(rows['other.lang']['recorded'], 'not-recordable')
+        self.assertNotIn('other.lang', [item['key'] for item in written['items']])
+        # `--key` only narrows the generated set for that one run.
+        code, _, _, _ = self.check('--key', 'recorded.later', '--payloads', str(target), items=grown)
+        self.assertEqual(code, 0)
+        self.assertEqual([item['key'] for item in json.loads(target.read_text(encoding='utf-8'))['items']],
+                         ['recorded.later'])
+
     def test_the_payloads_file_is_private_and_replaced_whole(self):
         """Review 01a0fe9e `smaller` (a)."""
         self.commit()
@@ -521,6 +559,89 @@ class OperatorCommandTests(unittest.TestCase):
                 patch.object(admin, 'run_bd', side_effect=self.run_native):
             with self.assertRaisesRegex(ValueError, 'No capability operation receipt'):
                 admin.main()
+
+
+class ProposalHintTests(unittest.TestCase):
+    """kittrial-5bb.179 review 01a113eb item `hint-still-says-propose`.
+
+    The hint is text the kit itself prints on every `capability find` (and on every
+    `capability lookup` that misses with `--config`), so it is the one place a lane worker
+    reads the process. It must send the worker to a payload file carried in the delivery,
+    not to a live `capability propose`.
+    """
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.project = Path(temp.name)
+        self.native = CapabilityNative()
+
+    def find(self, phrase):
+        return cr.read(['find', phrase], self.native, [OPERATOR])
+
+    def test_the_miss_hint_names_a_payload_file_and_never_a_live_propose(self):
+        miss = self.find('nothing like it at all')
+        self.assertFalse(miss['found'])
+        hint = miss['hint']
+        self.assertIn('write the payload file', hint)
+        self.assertIn('capability-proposals/<key>.json', hint)
+        self.assertIn('carry it in your delivery', hint)
+        self.assertIn('do not run capability propose', hint)
+        # The alias branch stays: that route is still a live contributor write.
+        self.assertIn('capability propose-alias', hint)
+        # The old sentence sent the worker to the index.
+        self.assertNotIn('capability propose a draft', hint)
+        self.assertNotIn('draft with the pointers you found', hint)
+
+    def test_an_exact_hit_carries_no_hint_at_all(self):
+        cr.apply_native(entry(), 'alice', self.native, self.project)
+        exact = self.find('review.structured-contribution')
+        self.assertTrue(exact['found'])
+        self.assertIsNone(exact['hint'])
+
+
+class ProposalFolderTests(unittest.TestCase):
+    """kittrial-5bb.179 review 01a113eb item `the-folder` (b).
+
+    Every file in `capability-proposals/` is a carrier for a capability record: the test
+    holds the folder to the kit's own rules, so a renamed file, a malformed payload or a
+    pointer that no longer resolves at the delivered commit fails here rather than at the
+    coordinator's write. The pointer check resolves against this checkout, which on the
+    verification clone is the delivered commit.
+    """
+
+    FOLDER = KIT / 'capability-proposals'
+
+    def files(self):
+        found = sorted(self.FOLDER.glob('*.json'))
+        self.assertTrue(found, 'capability-proposals/ carries no payload file')
+        return found
+
+    def test_every_file_is_named_for_its_key_and_passes_the_payload_validator(self):
+        for path in self.files():
+            text = path.read_text(encoding='utf-8')
+            payload = json.loads(text)
+            self.assertEqual(path.name, payload['key'] + '.json', path.name)
+            # Exactly the command's path: the file must not set `operation`, the command
+            # injects it, and then the kit's validator decides the payload.
+            operation = 'revise' if 'expected_sha256' in payload else 'propose'
+            wire = cr.write_payload([operation, '@attachment:0'],
+                                    {'0': {'flag': '--file', 'text': text}})
+            self.assertEqual(wire['operation'], operation)
+            cr.KIND.validate_payload(wire)
+
+    def test_every_pointer_in_the_folder_resolves_at_head(self):
+        repo = capabilities.open_repo(str(KIT))
+        checked = 0
+        for path in self.files():
+            payload = json.loads(path.read_text(encoding='utf-8'))
+            for field in ('anchors', 'code', 'tests'):
+                for pointer in payload.get(field) or []:
+                    resolved = capabilities.resolve_pointer(repo, pointer)
+                    self.assertIs(resolved['resolved'], True,
+                                  '%s: %s -> %s' % (path.name, pointer, resolved['reason']))
+                    checked += 1
+        self.assertGreater(checked, 0)
 
 
 if __name__ == '__main__':

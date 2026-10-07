@@ -234,6 +234,54 @@ Ancestry is checked ONLY in the client: the endpoint re-verifies that each targe
 
 When a selected target's `source_commit` is not the task's current contribution (a release shipping a superseded revision, or a revision replaced while its successor awaits review), the dry run and the result carry a `flags`/`flag` entry naming the delivery and the current contribution, and `brief`/`work` show `deployed_delivery` (release, environment, source and integration commit), `deployed_delivery_is_current_contribution` and `deployed_live`. The four `deployed_delivery` values are PLAIN STRINGS clipped at 160 characters — the shape the field was released with — so a hostile or oversized `release_id` cannot flow through unclipped (rev2 item 6.1; rev1's excerpt objects were reverted).
 
+## Register capabilities with the release
+
+The capability index is kept true at delivery and release, not left to a separate sweep
+(kittrial-5bb.179). Three steps:
+
+1. **The delivery carries the payload file, and the worker does not write the index.** A
+   contribution that adds or changes something a user or an agent can rely on carries its
+   capability proposal payload as a file in the delivery — conventionally
+   `capability-proposals/<key>.json`, one file per record — named in the contribution
+   summary. The payload is the closed record set of the design: a key, a name, aliases, a
+   one-sentence `summary`, requirements, anchors, `code`, `tests`, an owner and tags. There
+   is no "check" field and no commit field in it; the check records the commit it was run
+   at. The reviewer judges that claim with the change. A delivery that removes or weakens a
+   capability states in the same delivery that its entry must be revised or retired, and
+   carries either the revised payload file or the successor key: retiring is
+   `admin.py capability-retire`, operator-only, and it needs a successor key. This kit has
+   no demotion.
+2. **The coordinator writes the payload and accepts the meaning at release, after
+   integration.** Once the delivery is integrated the coordinator runs `capability propose`
+   or `capability revise` for the payload file, then accepts the meaning at release
+   (`admin.py capability-apply`), with the release as its evidence. Writing the record only
+   after integration is the point: a record written from a lane is in the release check set
+   while its work is still in review, so a release cut before that work lands checks the
+   draft against main, its pointers are missing, and it reads `drifted`.
+3. **The release verifies the index.** In a clean checkout at the integrated commit:
+
+   ```sh
+   python client.py --config client.local.json --project example --actor alex/session1 -- \
+       capability check --repo . --payloads payloads.json
+   admin.py capability-verify example --actor OPERATOR --file payloads.json
+   ```
+
+   The payload file is **generated from the records, never kept by hand**. With no
+   `--key`, `capability check` pages every capability the endpoint holds and writes one
+   payload per accepted or draft record **whose check the checkout can decide**: a record
+   whose pointers are all `unknown` gets none and reads `not-recordable`, so a record
+   proposed or accepted after this kit was built is covered with no new flag, file or edit.
+   `--key` narrows the generated set for one run only; the release step uses no `--key`.
+
+**A release is not finished until `capability-verify` passes for every accepted entry.** A
+failing **draft** does not fail the release — nobody has accepted its meaning and it is not
+in the index the release speaks for — but it is listed in the release record with its key,
+the pointers that did not resolve and an owner, and left to that owner. A check that always fails
+teaches everyone to ignore the result, so list the entry and its owner in the release record
+rather than carrying it release after release. What an entry may claim, who may propose and
+accept, and what a rollback does to entries are in the
+[capability design](CAPABILITY_INDEX_DESIGN.md#13-registration-with-delivery-and-release-kittrial-5bb179).
+
 ## Read what a deployed release still owes
 
 ```sh

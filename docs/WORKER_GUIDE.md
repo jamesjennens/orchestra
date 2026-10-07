@@ -77,12 +77,15 @@ When you had to find something by hand, feed it back to the index:
 
 ```sh
 b capability propose-alias merge.slot "single integrator" --evidence coordination.py::merge_acquire
-b capability propose --file capability.json
 ```
 
 - **A capability already exists:** propose the phrase that missed as an alias. It
   lifts that capability among the candidates until an operator folds it in.
-- **None exists:** propose a draft with the pointers you found.
+- **None exists:** write the entry as a proposal payload file and carry it in your delivery
+  (see [Register a capability with your delivery](#register-a-capability-with-your-delivery)).
+  Do not run `capability propose`: the worker does not write the index, and a record written
+  from a lane is in every release's check set while its work is still in review. With no
+  delivery in flight, hand the payload to the coordinator.
 - Your alias is recorded as `unverified`, and unverified proposers share a small pool
   (1 pending per capability, 10 per project). If it is full, say so in your report
   and carry on.
@@ -105,14 +108,59 @@ checkout:
 b capability check --repo .
 ```
 
-It lists every recorded pointer that no longer resolves, and writes nothing. If a
-pointer moved, `capability revise` the record. `capability check --repo . --record`
-files your result as a report (from a clean, committed checkout). A report is never
-`verified`: only an operator or listed verifier confirms a check, and a failing
-report makes the capability read `drifted` until they do.
+It lists every recorded pointer that no longer resolves, and writes nothing. A pointer that
+moved is a change to the index's promise: state it in your delivery with the revised payload
+file (below), whether the entry is a draft or accepted. The endpoint accepts `capability
+revise` from a contributor, but the process does not use a live write from a lane: the reviewer
+judges the payload with the change, and the coordinator revises the entry at release.
+`capability check --repo . --record` files your result as a report
+(from a clean, committed checkout). A report is never `verified`: only an operator or listed
+verifier confirms a check, and a failing report makes the capability read `drifted` until
+they do.
 
 Use `resolve` to check that the pointers you cite in plans, checkpoints and reviews
 still exist at your commit.
+
+### Register a capability with your delivery
+
+A contribution that adds or changes something a user or an agent can rely on carries a
+capability proposal **payload file** in the same delivery (kittrial-5bb.179). Write the file
+and name it in your contribution summary; **do not run `capability propose`**. The worker
+does not write the index: a record written from a lane is in every release's check set while
+its work is still in review, so it is checked against main, its pointers are missing, and it
+reads `drifted` at every release cut before its work lands.
+
+- **Where it goes.** One JSON file per record, conventionally
+  `capability-proposals/<key>.json`, so the reviewer can read it beside the diff.
+- **What it carries.** Exactly the record fields — `key`, `name`, `aliases`, `summary`,
+  `requirements`, `anchors`, `code`, `tests`, `owner`, `tags` — plus `schema_version`,
+  `operation_id`, and `revision`/`expected_sha256` when it revises an existing record. Do not
+  set `operation` (the command supplies it), and do not invent a field: any other field is
+  refused. There is no field for "the check that proves it" and none for the commit — the
+  check records the commit it was run at.
+- **The check proves location, not meaning.** `code`, `tests` and `anchors` are the pointers
+  `capability check` resolves, so cite pointers that exist at your delivered commit — never a
+  file that only exists in a branch still under review — and make `tests` include a test that
+  fails when the capability breaks. A regression then fails that test; the check still passes,
+  because the check proves only that the pointers resolve.
+- **The reviewer judges the claim with the change.** The reviewer decides whether the
+  sentence says what the change does and whether the pointers and their test are the right
+  ones. The coordinator writes the payload into the index after integration and accepts the
+  meaning at release, with the release as its evidence.
+- **A change that removes or weakens a capability** is not yours to retire. State it in the
+  delivery and give the coordinator either the revised payload file or the successor key for
+  `admin.py capability-retire` (operator-only, and it needs a successor key). This kit has no
+  demotion.
+- **A draft or a passing check is never authority.** It is a candidate until an operator
+  accepts it, and a check never accepts it. The boundaries and the release step are in the
+  [capability design](CAPABILITY_INDEX_DESIGN.md#13-registration-with-delivery-and-release-kittrial-5bb179).
+
+**Refresh a client that predates capability support.** The capability commands go through
+the kit's `client.py`. A lane whose `orchestra-client.py` predates capability support routes
+`capability` to the raw tracker action, and the endpoint refuses it ("Command is outside the
+contributor interface"), so refresh that client from the kit before you read or write
+capability records. A client that predates `capability list --pointers` fails `capability
+check` as well, which refuses rather than reporting a check it could not make.
 
 ### Optional: a graphify graph
 

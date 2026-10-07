@@ -729,15 +729,24 @@ If the endpoint cannot answer, the local result is still returned, with
    with `trust: accepted` and pointers that are `live: resolved` is the answer.
 2. **On a miss** (`records_found: false`, or only candidates), use the code
    `candidates` the same lookup returned, then search the checkout by hand.
-3. **Update the index with what you found:**
+3. **Feed what you found back — as a file, never as a live write:**
    - it exists under another name: `capability propose-alias KEY "<phrase that missed>"
-     --evidence POINTER`;
-   - it is not indexed at all: `capability propose --file capability.json`, a draft
-     with the pointers you found.
-4. **A pending alias or a draft is never authoritative.** Until an operator accepts
-   it, it only lifts a candidate (`match: candidate`, `trust: draft`,
-   `alias_state: proposed`). Do not cite one as the accepted meaning of a capability,
-   and check its pointers yourself before relying on them.
+     --evidence POINTER` (that route is still a live contributor write);
+   - it is not indexed at all: write the payload file and carry it in your delivery —
+     one JSON file per record, conventionally `capability-proposals/<key>.json`, named
+     in your contribution summary. **Do not run `capability propose` or
+     `capability revise`:** the endpoint accepts either payload, but the process does
+     not use a live write from a lane, so the worker carries the payload as a file, the
+     reviewer judges it with the change, and the coordinator writes it into the index
+     after integration and accepts the meaning at release. With no delivery in flight,
+     hand the payload to the coordinator.
+4. **The payload is judged, not yet authoritative.** The check proves **location, not
+   meaning**: `code`, `tests` and `anchors` must resolve at the commit the check runs
+   at, which for a carried payload is the integrated commit, after the coordinator
+   writes it. Until an operator accepts the meaning, cite neither the payload nor a
+   pending alias as the accepted meaning of a capability — a pending alias only lifts a
+   candidate (`match: candidate`, `alias_state: proposed`) — and check the pointers
+   yourself before relying on them.
 
 **Writing.**
 - **`propose` and `revise`** take a closed JSON payload:
@@ -782,8 +791,10 @@ If the endpoint cannot answer, the local result is still returned, with
   - `submitted_by_agent` is `false` until then.
 
 Acceptance, retirement, alias rejection and a verified alias proposal are operator
-commands ([operations](OPERATIONS.md#operator-commands)). There is no demotion in slice 1a: the
-design's "demote" (section 4) is covered by retiring the key for now.
+commands ([operations](OPERATIONS.md#operator-commands)). There is no demotion: an accepted
+revision of a key is never weakened or withdrawn in place. The operator supersedes the key
+with a named successor (`admin.py capability-retire`) or accepts a later revision of it
+(design section 4).
 
 **Batch acceptance results** (`admin.py capability-apply`). Each item names the newest
 revision the operator reviewed, by `revision` and `record_sha256`, and gets one result:
