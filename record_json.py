@@ -37,17 +37,21 @@ class NestingError(ValueError):
     """JSON text nested deeper than NESTING_MAX."""
 
 
-def nesting(text):
-    """The deepest bracket nesting of a JSON text, counted outside string literals, or
-    NESTING_MAX + 1 as soon as it is exceeded.
+ROW_NESTING_MAX = 750
+ROW_MESSAGE = 'Tracker row nested too deeply (more than %d levels)' % ROW_NESTING_MAX
 
-    One pass, no recursion, linear in the text. A text with at most NESTING_MAX opening
+
+def nesting(text, max_depth=NESTING_MAX):
+    """The deepest bracket nesting of a JSON text, counted outside string literals, or
+    max_depth + 1 as soon as it is exceeded.
+
+    One pass, no recursion, linear in the text. A text with at most max_depth opening
     brackets cannot nest deeper than that, so it is answered without a scan. Inside a
     string literal brackets are text; a literal that is never closed makes the rest of
     the text a string, which the parser then refuses as malformed. The scan stops at the
     first bracket past the bound, so deep nesting is refused without reading the rest.
     """
-    if text.count('[') + text.count('{') <= NESTING_MAX:
+    if text.count('[') + text.count('{') <= max_depth:
         return 0
     depth = deepest = 0
     in_string = False
@@ -61,7 +65,7 @@ def nesting(text):
             depth += 1
             if depth > deepest:
                 deepest = depth
-                if deepest > NESTING_MAX:
+                if deepest > max_depth:
                     return deepest
         elif depth:
             depth -= 1

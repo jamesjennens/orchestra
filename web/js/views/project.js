@@ -67,13 +67,22 @@ export async function overview(ctx, { pid }) {
     const partial = page.review_states_complete === false
       ? h('p', { class: 'small muted', role: 'note' }, 'Review state is not known for some tasks shown here (closed tasks, or more tasks than one read covers); they show their status only.')
       : null;
+    const unread = (page.unreadable || []).length;
+    const unreadable = unread
+      ? h('p', { class: 'small', role: 'note' }, unread === 1 ? 'One task on the server cannot be read' : unread + ' tasks on the server cannot be read',
+          ' (' + (page.unreadable || []).join(', ') + ')',
+          '. Everything else is shown. Ask an operator of the server to repair ', unread === 1 ? 'it.' : 'them.',
+          page.review_states_unavailable ? ' Until then review states are not shown here.' : '')
+      : null;
     tableHost.replaceChildren(
+      ...(unreadable ? [unreadable] : []),
       rows.length ? h('div', { class: 'table-wrap' }, h('table', null,
         h('caption', { class: 'visually-hidden' }, 'Tasks in ' + project.name),
         h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Task'), h('th', { scope: 'col' }, 'State'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Assignee'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Next action'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Updated'))),
         h('tbody', null, rows.map((t) => h('tr', { class: 'row-link', onclick: (e) => { if (e.target.tagName !== 'A') ctx.go(`/p/${pid}/t/${t.id}`); } },
-          h('td', null, h('a', { class: 'title', href: ctx.href(`/p/${pid}/t/${t.id}`) }, t.title), h('div', { class: 'sub' }, t.priority != null ? [priority(t.priority), ' · '] : null, h('span', { class: 'mono' }, t.id))),
-          h('td', null, t.review_state && t.review_state !== 'none' ? reviewChip(t.review_state) : statusChip(t.status)),
+          h('td', null, h('a', { class: 'title', href: ctx.href(`/p/${pid}/t/${t.id}`) }, t.title || t.id), h('div', { class: 'sub' }, t.priority != null ? [priority(t.priority), ' · '] : null, h('span', { class: 'mono' }, t.id))),
+          // A row the server could not read is listed, and says so (kittrial-5bb.169).
+          h('td', null, t.unreadable ? h('span', { class: 'chip crit' }, 'Cannot be read') : t.review_state && t.review_state !== 'none' ? reviewChip(t.review_state) : statusChip(t.status)),
           h('td', { class: 'hide-narrow' }, t.assignee_name || h('span', { class: 'muted' }, 'Unclaimed')),
           h('td', { class: 'hide-narrow' }, t.next_action ? t.next_action.text : h('span', { class: 'muted' }, '—')),
           h('td', { class: 'hide-narrow muted' }, t.updated_at ? time(t.updated_at) : '')))))) :
