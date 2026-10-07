@@ -171,6 +171,21 @@ class Canonical:
             return 0, text, ''
         if command == 'update':
             task = rest[0] if rest else ''
+            if '--claim' in rest:
+                # bd's own claim, as bd 1.2.2 answers it (measured, kittrial-5bb.187): for the
+                # actor of the command; refused when the row is somebody else's or is not open.
+                held = next((r for r in self.rows() if r['id'] == task), None)
+                if held is not None:
+                    if held.get('assignee') and held['assignee'] != self.actor:
+                        return 1, '', 'Error claiming %s: issue already claimed by %s\n' % (task, held['assignee'])
+                    if held.get('status') not in ('open', 'in_progress'):
+                        return 1, '', 'Error claiming %s: issue not claimable: status %s\n' % (task, held.get('status'))
+
+                    def claimed(state):
+                        row = self._row(state, task)
+                        row['assignee'], row['status'] = self.actor, 'in_progress'
+                        return row
+                    return 0, json.dumps([self._mutate(claimed)]), ''
             if '--title' in rest and rest.index('--title') + 1 < len(rest):
                 # As bd 1.2.2 (measured, kittrial-5bb.185): an empty title is refused in bd's JSON
                 # form; one over 500 characters is refused by the DATABASE, a bare sentence.

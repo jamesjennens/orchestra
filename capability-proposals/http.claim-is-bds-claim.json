@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-1b0546948c0240f493719da837424af3",
+  "key": "http.claim-is-bds-claim",
+  "name": "The web claim is bd's own atomic claim",
+  "aliases": [
+    "claim a held task",
+    "already claimed by",
+    "claim reopens closed task",
+    "take over a task",
+    "claim race",
+    "issue not claimable"
+  ],
+  "summary": "EndpointBackend._command sends `bd update ID --claim` for tasks.claim under the caller's bound actor; bd checks and writes in one step, so a task somebody else holds or one that is not open is refused and of several claims at once exactly one is carried out. bd_refusals reads bd's two sentences (CLAIMED with the holder, NOT_CLAIMABLE with the status), EndpointBackend._checked turns them into 409, and ApiHandler.tasks_claim names the holder as people know them. Nobody takes a task over through a claim, an owner included.",
+  "requirements": [],
+  "anchors": [
+    "docs/HTTP_DEPLOYMENT.md#claiming-a-task"
+  ],
+  "code": [
+    "http_service.py::EndpointBackend._command",
+    "http_service.py::ApiHandler.tasks_claim",
+    "bd_refusals.py::holder",
+    "bd_refusals.py::status"
+  ],
+  "tests": [
+    "tests/test_claim_held.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "http",
+    "tasks",
+    "claim",
+    "security"
+  ]
+}

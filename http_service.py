@@ -35,6 +35,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import agent_prompts
+import bd_refusals
 import project_setup
 from coordination import MERGE_SLOT_SUFFIX, is_merge_slot, merge_slot_sentence
 from reserved_comments import (ANCHOR_READ_IDS_MAX, carries_record_label, hide_records,
@@ -1449,6 +1450,17 @@ class EndpointBackend:
                 if reply.get('refused') == 'not-found':
                     # bd found no row of that name (bd_refusals): the thing asked about is not there.
                     raise not_found('Task not found')
+                if reply.get('refused') == bd_refusals.CLAIMED:
+                    # bd's claim found the task in somebody else's hands. The route names the
+                    # holder as people know them; here it is the label the tracker has.
+                    held_by = bd_refusals.holder(detail)
+                    refusal = conflict('Task is already claimed', {'held_by': held_by})
+                    refusal.held_by = held_by
+                    raise refusal
+                if reply.get('refused') == bd_refusals.NOT_CLAIMABLE:
+                    state = bd_refusals.status(detail)
+                    raise conflict('Task is not open%s' % (' (it is %s)' % state.replace('_', ' ') if state else ''),
+                                   {'status': state})
                 raise invalid('Canonical command rejected the request', detail)
             if reading:
                 raise cls._unread()
@@ -1630,10 +1642,12 @@ class EndpointBackend:
                 raise invalid('Nothing to change. A task change takes: title, description, status')
             return 'bd', project_id, args, attachments
         if route == 'tasks.claim':
-            actor = payload.get('actor') or self._actor(principal)
-            return ('bd', project_id,
-                    ['update', str(task_id), '--status', 'in_progress', '--assignee',
-                     str(actor), '--json'], {})
+            # bd's own claim, for the actor the request runs under (kittrial-5bb.187). It checks
+            # and writes in one step: a row that is somebody else's or is not open is refused,
+            # and of several claims of one free row exactly one is carried out. The plain update
+            # of status and assignee this sent before took the task from whoever held it and
+            # reopened a closed one.
+            return 'bd', project_id, ['update', str(task_id), '--claim', '--json'], {}
         if route == 'checkpoints.add':
             # A field left out is sent as left out: the canonical validator names it with
             # every other problem of the record, where refusing it here hid the rest
@@ -5442,10 +5456,19 @@ class ApiHandler(BaseHTTPRequestHandler):
         payload['actor'] = actor
 
         def claim():
-            result = self.backend.invoke('tasks.claim', ctx.principal, ctx.params['pid'],
-                                         payload, ctx.idempotency_key,
-                                         target=ctx.route_target, authorize=ctx.authorize,
-                                         capability=CAP_TASKS)
+            try:
+                result = self.backend.invoke('tasks.claim', ctx.principal, ctx.params['pid'],
+                                             payload, ctx.idempotency_key,
+                                             target=ctx.route_target, authorize=ctx.authorize,
+                                             capability=CAP_TASKS)
+            except HttpError as refusal:
+                held_by = getattr(refusal, 'held_by', None)
+                if held_by is None:
+                    raise
+                # Somebody else has it. Nobody takes a task over through a claim, an owner
+                # included (kittrial-5bb.187); said with the holder's name as people know it.
+                shown = self.service.actor_names([held_by]).get(held_by) or held_by
+                raise conflict('Task is already claimed by %s' % shown, {'held_by': held_by}) from None
             return result, result
         return self._mutate(ctx, 'tasks.claim', ctx.params['pid'], claim,
                             capability=CAP_TASKS, serialize=False, canonical=True)

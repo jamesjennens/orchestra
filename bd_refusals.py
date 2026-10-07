@@ -20,9 +20,17 @@ import json
 import re
 
 NOT_FOUND, INVALID = 'not-found', 'invalid'
+#: bd's own claim (`update ID --claim`) refused: the row is somebody else's, or it is not open
+#: (kittrial-5bb.187). bd checks and writes a claim in one step, so of several claims of one
+#: free row exactly one is carried out and the others are told who has it.
+CLAIMED, NOT_CLAIMABLE = 'claimed', 'not-claimable'
+HOLDER = re.compile(r'^issue already claimed by (?P<holder>[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95})$')
+STATUS = re.compile(r'^issue not claimable: status (?P<status>[a-z_]{1,40})$')
 #: bd's own sentences for a refusal it makes before writing, as bd 1.2.2 prints them.
 SENTENCES = (
     (NOT_FOUND, re.compile(r'\bno issues? found matching\b')),
+    (CLAIMED, HOLDER),
+    (NOT_CLAIMABLE, STATUS),
     (INVALID, re.compile(r'^validation failed for issue\b')),
     (INVALID, re.compile(r'\bcannot be empty$')),
     (INVALID, re.compile(r'^invalid (?:priority|status) ')),
@@ -30,7 +38,7 @@ SENTENCES = (
 )
 #: How much of bd's sentence is handed on. It can carry the caller's own text (a title).
 SHOWN = 240
-ERROR_LINE = re.compile(r'Error(?: (?:resolving|fetching) [^:\n]{1,200})?: (.+)\Z')
+ERROR_LINE = re.compile(r'Error(?: (?:resolving|fetching|claiming) [^:\n]{1,200})?: (.+)\Z')
 
 
 def said(returncode, stdout, stderr):
@@ -73,6 +81,18 @@ def refusal(returncode, stdout, stderr):
         if pattern.search(sentence):
             return kind, sentence[:SHOWN]
     return None
+
+
+def holder(detail):
+    """Who has the row, from the last line of a ``CLAIMED`` refusal as the endpoint hands it on, or None."""
+    found = HOLDER.match(str(detail or '').rpartition('bd refused: ')[2].strip())
+    return found.group('holder') if found else None
+
+
+def status(detail):
+    """The row's status, from the last line of a ``NOT_CLAIMABLE`` refusal, or None."""
+    found = STATUS.match(str(detail or '').rpartition('bd refused: ')[2].strip())
+    return found.group('status') if found else None
 
 
 def envelope(kind, sentence):

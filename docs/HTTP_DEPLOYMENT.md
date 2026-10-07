@@ -1057,6 +1057,42 @@ idempotency record's (`IDEMPOTENCY_TTL_SECONDS`, 24 h). That record expires on t
 confirmed timeline (see the record store in section 8), so a clock jump never shortens
 it; a retry after the window is treated as a new request.
 
+### Claiming a task
+
+`POST /v1/projects/{id}/tasks/{task}/claim` takes a free, open task for the caller: it
+becomes `in_progress` and the caller its assignee. It is bd's own claim (`bd update
+ID --claim`), which checks and writes in one step, so:
+
+- a task that **somebody else holds** is refused: **409 "Task is already claimed by
+  NAME"**, with the holder's id in `error.detail.held_by`. That is so for every caller,
+  **the project's owner included: nobody takes a task over through a claim**;
+- a task that **is not open** (closed, blocked, deferred) is refused: **409 "Task is
+  not open (it is closed)"**, with the status in `error.detail.status`. A claim does
+  not reopen anything;
+- the caller's **own** claimed task, claimed again, answers 200 and changes nothing;
+- of **several claims of one free task at the same moment exactly one is carried
+  out**; the others are answered 409 naming the winner. There is no check followed by
+  a write for another claim to get between: bd does both in one transaction, and every
+  write through the endpoint holds the project's lock besides.
+
+A refusal keeps nothing: the idempotency key is free and no audit entry of outcome
+`unknown` is written.
+
+**Taking a task over** is a separate, explicit act and has no web route today. An
+owner who needs a task moved asks the project's coordinator, who reassigns it on the
+host route (`update TASK --assignee ACTOR --status in_progress`); that plain update
+is not a claim and is not refused.
+
+Before kittrial-5bb.187 this route sent bd that plain update of status and assignee,
+and bd carried it out whatever the row was: a second member's claim took the task
+from the first, with no word to either, and a claim of a closed task reopened it.
+Whoever claimed last then passed every rule that asks "is the caller the assignee"
+(contribute, respond, the checkpoint's directions). The host client's own claim
+(`update TASK --claim`) was bd's claim all along and never had the fault. The
+in-process backend (the tests' and the local preview's) refused both cases already;
+it also refuses a second claim by the SAME member with 409, where a real installation
+answers 200.
+
 ### What an agent needs to write a checkpoint
 
 `GET /v1/projects/{id}/tasks/{task}/brief` carries everything a checkpoint needs, so an
