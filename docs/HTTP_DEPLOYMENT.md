@@ -1066,7 +1066,7 @@ ID --claim`), which checks and writes in one step, so:
 - a task that **somebody else holds** is refused: **409 "Task is already claimed by
   NAME"**, with the holder's id in `error.detail.held_by`. That is so for every caller,
   **the project's owner included: nobody takes a task over through a claim**;
-- a task that **is not open** (closed, blocked, deferred) is refused: **409 "Task is
+- a task that **is not open** (closed, blocked) is refused: **409 "Task is
   not open (it is closed)"**, with the status in `error.detail.status`. A claim does
   not reopen anything;
 - the caller's **own** claimed task, claimed again, answers 200 and changes nothing;
