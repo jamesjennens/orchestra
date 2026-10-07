@@ -19,6 +19,7 @@ import sys
 import tempfile
 from pathlib import Path
 from admin import ConfigurationUnreadable,deployment_document,deployment_password,environment,project_dir,root_path,operators as configured_operators,verifiers as configured_verifiers,review_workflow_writes as configured_review_writes
+import bd_refusals
 import native
 from coordination import is_merge_slot, merge_slot_sentence
 from render import render
@@ -843,6 +844,11 @@ def execute(root,request,authority_config=None,require_authority=False):
             _guard_reserved_labels(root,path,args,actor)
             def bd_dispatch(argv):
                 p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*argv],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
+                # When bd itself says no, before it writes, that is a refusal and not an outcome
+                # nobody knows (kittrial-5bb.185): the identity is released and the caller is told
+                # bd's sentence. Only what bd_refusals recognises; anything else is handed on as it came.
+                refused=bd_refusals.refusal(p.returncode,p.stdout,p.stderr)
+                if refused is not None:return bd_refusals.envelope(*refused)
                 return {'returncode':p.returncode,'stdout':p.stdout,'stderr':p.stderr}
             runner=NativeRunner(bd_dispatch)
             def bd_effect():return runner(final)
