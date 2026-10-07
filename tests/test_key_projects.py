@@ -125,7 +125,8 @@ class BoundEndpointTests(unittest.TestCase):
                 self.refused(request)
 
     def test_the_web_only_actions_are_refused_before_their_name_is_looked_at(self):
-        for action in endpoint.SERVICE_ONLY_ACTIONS:
+        self.assertEqual(sorted(endpoint.SERVICE_ONLY_ACTIONS), ['create-project', 'creation-standing', 'project-creations'])
+        for action in ('create-project', 'project-creations', 'creation-standing'):
             for project in ('alpha', 'beta', 'Not A Name', None):
                 with self.subTest(action=action, project=project):
                     self.refused({'project': project, 'actor': 'a', 'action': action},
@@ -452,6 +453,9 @@ class ListingTests(unittest.TestCase):
         mixed = self.one(self.line(projects=['alpha']).replace('--endpoint %s' % self.kit.as_posix(),
                                                                '--endpoint %s' % self.old.as_posix()))
         self.assertTrue(mixed['other_kit'])                                     # this wrapper, the other kit's endpoint
+        mixed = self.one(self.line(projects=['alpha']).replace('%s/ssh_forced_command.py' % self.kit.as_posix(),
+                                                               '%s/ssh_forced_command.py' % self.old.as_posix()))
+        self.assertTrue(mixed['other_kit'])                                     # the other kit's wrapper, this endpoint
         gone = self.one(self.line(kit=self.base/'removed', projects=['alpha']))
         self.assertEqual((gone['other_kit'], gone['missing']), (True, True))
 
