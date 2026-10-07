@@ -3441,7 +3441,9 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def _task_title(self, title):
         """A task's title is text, not blank, and no longer than bd takes; else the refusal."""
-        if not isinstance(title, str) or not title.strip():
+        # Not blank: at least one character that can be seen. A title of spaces, or of one control
+        # character (review of kittrial-5bb.185: bd stores it), is no title.
+        if not isinstance(title, str) or not any(ch.isprintable() and not ch.isspace() for ch in title):
             raise invalid('Task title must be text and not empty')
         if len(title) > self.TASK_TITLE_MAX:
             raise invalid('Task title must be %d characters or less (it has %d)' % (self.TASK_TITLE_MAX, len(title)))

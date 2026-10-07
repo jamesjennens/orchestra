@@ -22,7 +22,10 @@ import re
 NOT_FOUND, INVALID = 'not-found', 'invalid'
 #: bd's own sentences for a refusal it makes before writing, as bd 1.2.2 prints them.
 SENTENCES = (
-    (NOT_FOUND, re.compile(r'\bno issues? found matching\b')),
+    # The whole sentence, as bd says it in its three places (review of kittrial-5bb.185): the words
+    # somewhere in another sentence ("failed to commit: no issue found matching ...") are not this.
+    (NOT_FOUND, re.compile(r'^(?:resolving (?:ID )?[^\s:]{1,200}: )?no issues? found matching '
+                           r'(?:"[^"\n]{0,200}"|the provided IDs)$')),
     (INVALID, re.compile(r'^validation failed for issue\b')),
     (INVALID, re.compile(r'\bcannot be empty$')),
     (INVALID, re.compile(r'^invalid (?:priority|status) ')),
