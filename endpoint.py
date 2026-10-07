@@ -665,6 +665,25 @@ def execute(root,request,authority_config=None,require_authority=False):
             return guarded_write(root,request,journal_path(path),proposal_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
+    if action in ('items','questions'):
+        # Open items and owner questions, slice 1 (kittrial-5bb.127): read-only. One
+        # bd export --all; no lock, not run_guarded, nothing is written. The writes
+        # arrive in a later slice.
+        import open_items
+        args=request.get('args',[])
+        if not isinstance(args,list) or any(not isinstance(x,str) or '\0' in x for x in args):raise ValueError('Expected argument list')
+        run_warnings=[]
+        def run(argv):
+            # Raw stdout, not native.split: its JSON policy decodes every row with the
+            # interpreter's parser, so one deeply nested row raised RecursionError for the
+            # whole project on Python 3.10/3.11 (review B3). open_items.parse_export reads
+            # the export line by line under a fixed depth rule instead.
+            completed=native.run(native.argv(root,path,actor,argv),environment(root))
+            if completed.returncode:raise ValueError(native.failure(completed))
+            if completed.stderr:run_warnings.append(completed.stderr)
+            return completed.stdout or ''
+        result=open_items.read(action,args,run,configured_operators(root),journal=path)
+        return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
     if action in ('brief','history','checkpoint'):
         from briefing import execute as briefing_execute
         args=request.get('args',[])

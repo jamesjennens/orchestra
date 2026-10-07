@@ -3,8 +3,10 @@
 Status: draft design note for owner acceptance (kittrial-5bb.96), **revision 3**. **Slice 0 (§13) is
 built (kittrial-5bb.126): the names only - the reserved prefixes and label prefix, the hidden-surface
 tables, the void names, the two journal names, the `.owner-answers` entry validator and a
-deploy-time label listing. Nothing else in this document is built**, and the slice 0 review
-conditions corrected the note where it disagreed with them (marked "Corrected in slice 0"). Before
+deploy-time label listing. Slice 1 is built (kittrial-5bb.127): the read-only item and question
+reader (`items list|get`, `questions --for|get`) and the `open-item` and `owner-question` brief kinds.
+Nothing else in this document is built**, and the slice 0 and slice 1 review conditions corrected the
+note where it disagreed with them (marked "Corrected in slice 0" or "Corrected in slice 1"). Before
 slice 0 the note added no module, no client or endpoint operation, no reserved `Kind:` prefix,
 no label, no migration and no test. It proposes four new record kinds, three read commands, three
 write command groups, and a staged write switch, so that a coordinator's working state stops living
@@ -464,10 +466,12 @@ extend, are:
   `recovery.OPEN_ITEM_KIND_PREFIXES`, with the reserved prefixes, and are **not** added to
   `recovery.KEYED_KIND_PREFIXES` or `KIND_PREFIXES`: the rule beside `PROPOSAL_KIND_PREFIXES` is that
   a void is offered only for a kind whose reader honours voids, and in slice 0 no reader exists, so
-  `admin.py void-record` still refuses them as an unsupported target kind, exactly as before. The
-  slice that ships a reader moves its kinds into `KIND_PREFIXES` (the keyed kinds route to
-  `keyed_entries.AnchoredKind`, which these are not, so the routing is that slice's to state); its
-  reader must drop a voided target from the view and report it in `warnings`.
+  `admin.py void-record` still refuses them as an unsupported target kind, exactly as before.
+  Corrected in slice 1: the reader slice does **not** make them voidable either. Slice 1 writes
+  nothing, so there is no record to void, and `void-record` routes every non-keyed kind to
+  `review_workflow.apply_void`, which does not know these kinds; moving them into `KIND_PREFIXES` is
+  the writer slice's (2a), together with the void routing and the reader rule that drops a voided
+  target from the view and reports it in `warnings`. Until then `items list --state` has no `void`.
 
 A family label mapping to one prefix tuple is **not** a reason to reject an anchor that carries
 several kinds: `capability` already maps `capability` to four prefixes - `capability-entry-v1`,
@@ -539,7 +543,7 @@ nothing. Every read is one labelled read of the project's rows plus their commen
 ### 7.1 `items list` and `items get`
 
 ```
-items list [--owner IDENTITY] [--task TASK] [--kind KIND]... [--state open|blocked|resolved|superseded|void|all]
+items list [--owner IDENTITY] [--task TASK] [--kind KIND]... [--state open|blocked|resolved|superseded|all]
            [--closed-by owner|relayed] [--due expired|due-soon|unset] [--limit N] [--offset N]
 items get ITEM
 ```
@@ -548,13 +552,18 @@ items get ITEM
 `{id, revision, kind, state, state_note, owner, task, due_by, due, for, options, recommended, answer,
 answers, closed_by, reopened_by, resolved_by, trust, text:{text,omitted_chars}, source:{...},
 record_comment_id, warnings, provenance}`.
-`trust` is `attested` or `unattested` by the rule in §9.1; `closed_by` is `owner`, `relayed` or `null`
+`trust` is `attested` or `unattested` by the rule in §9.2 - **these two words are the whole set**
+(corrected in slice 1: revision 3 also used `untrusted` in §9.2, §11.2 and §16; a record that fails the
+journal gate reads `unattested` like any other record that fails a trust check, and an answer
+additionally carries `journal` (its `.owner-answers` entry matches) and `closes` (it is attested,
+journaled, for the question's addressee, and an `authority: owner` answer was written by the
+addressee)); `closed_by` is `owner`, `relayed` or `null`
 (§4.5) and `--closed-by` filters on it, so "what did the owner answer himself?" and "what was relayed
 in his name?" are two different reads; `warnings` names a malformed record, an orphan resolution, a
 voided revision, an unresolvable `task`, and a cap being reached.
 
 Refusals follow the existing filter wording: `'items list: --state must be open, blocked, resolved,
-superseded, void or all'`, `'items list: --closed-by must be owner or relayed'`,
+superseded or all'`, `'items list: --closed-by must be owner or relayed'`,
 `'items list: --due must be expired, due-soon or unset'`, `'items list: --limit must be 1..100'`,
 `'items list: --offset must be >= 0'`.
 
@@ -646,7 +655,28 @@ CPU-only and lands on the reader: no extra `bd` read, and no write at all on the
 
 **Read cost, stated exactly.** The item anchors and the decision issues are already in the row set
 `brief` and `work` fetch, so **`brief` and `work` add no `bd` read but parse up to 2,000 records per
-anchor on every call** (`RECORDS_PER_ANCHOR_MAX = 2000`, §6). A standalone `items list` /
+anchor on every call** (`RECORDS_PER_ANCHOR_MAX = 2000`, §6). Measured in slice 1 (kittrial-5bb.127,
+mock rows, one CPU, best of 5): `work` adds nothing, because it is not extended. `brief` first keeps
+only the item anchors whose record text holds the canonical `"task":"TASK"` (records are canonical
+JSON, so the test is exact) and parses only those. A brief of a task no item names costs 7 ms with
+400 item anchors and 40 ms with 2,000. A brief of a task that every anchor names - the worst case
+short of the per-anchor cap - costs 74 ms with 400 anchors (760 record comments) and 378 ms with
+2,000 (3,680). One anchor at the 2,000-record cap parses in 118 ms, so the theoretical bound is
+2,000 such anchors, about 4 minutes, which no writer can reach without first hitting the item cap
+of §11.4 with every anchor at its record cap. `items list` and `questions --for` parse every anchor:
+65 ms for 400 and 321 ms for 2,000.
+
+**Corrected in slice 1 review (kittrial-5bb.127): a standalone read is one `bd export --all`, not a
+labelled `bd list` plus a `bd show`.** Measured on real bd 1.2.2 by the reviewer, at 400 / 2,000 item
+anchors: `bd list --label` 0.25 / 0.43 s; `bd show --include-comments` of every anchor 13.7 to 15.2 /
+70.9 s (815 kB / 4.1 MB out), which is near the kit's 120 s `bd` timeout; `bd export --all` 0.55 /
+1.8 s, the same rows with labels and comments, closed anchors included. So `items list|get` and
+`questions --for|get` each make exactly one `bd export --all` call (the read `brief` already makes),
+and `items get ONE` costs the same as a list. The endpoint passes the export's raw stdout to the
+reader, which parses it line by line under a fixed depth rule (§13, slice 1). The reader's CPU after
+that call, on mock exports holding only the anchors (best of 5, Python 3.11): 39 ms for `items list`,
+38 ms for `items get` and 48 ms for `questions --for` at 400 anchors (594 kB); 250, 238 and 248 ms
+at 2,000 (2.9 MB). A real project's export also carries its other rows. A standalone `items list` /
 `questions --for` costs one labelled `bd list` of the item anchors plus one `bd show` of their
 comments. A standalone `decisions list` is a **different** read: it costs one full
 `bd list --all --limit 0` of the project's rows, filtered to the decision issues by the predicate in
@@ -817,7 +847,8 @@ admin.py open-items-import PROJECT --source-task TASK --owner IDENTITY --actor O
           [--kind question] [--file checkpoint.json] [--due-by YYYY-MM-DD]
 ```
 
-`questions-answer` is the only route that can write an answer, and `open-item-reopen` the only host
+`questions-answer` is the only **host** route that can write an answer (corrected in slice 1: revision 3
+said "the only route", against §9.3, where the web route writes answers too), and `open-item-reopen` the only host
 route that can reopen a question the owner closed; both require a configured operator from the
 allowlist, exactly as the other host writes do. `open-items-import --kind question` is the overlap
 release's question-only import; without `--kind` it imports every remaining item (§12).
@@ -888,8 +919,9 @@ on the host or web route is `attested` as the relayer's host-issued record - the
 route and, on the web, the authenticated principal are all real - but its `authority` is `relayed`,
 so it closes the item and is *never* read as `authority: owner`. An answer or an `authority: owner`
 decision record is additionally gated by the host journal (§11.2), so a raw-written record claiming
-`route: host, identity: verified` without a journal entry reads `trust: "untrusted"`, is named in
-`warnings`, and is inert.
+`route: host, identity: verified` without a journal entry closes nothing: it reads with `journal: false`
+and `closes: false`, is named in `warnings`, and is inert (corrected in slice 1: revision 3 gave it a
+third trust word, `untrusted`; the trust words are only `attested` and `unattested`).
 
 ### 9.3 The route -> authority -> what-closes table
 
@@ -1070,8 +1102,8 @@ Three honest limits, in the order a reviewer should check them:
   native comment, by the host CLI route or by the web service on the coordination host, so only the
   host can produce one. A raw-written comment from a pre-reserve kit has no entry; the reader is
   fail-closed about the journal (a missing, unreadable, symlinked or malformed `.owner-answers/` means
-  no answer and no owner decision is trusted), the planted record is displayed with
-  `trust: "untrusted"` and named in `warnings`, it **does not close the question**, and it is not shown
+  no answer and no owner decision is trusted), the planted record is displayed with `journal: false`,
+  `closes: false` and named in `warnings`, it **does not close the question**, and it is not shown
   as an owner decision. A crash between the two writes leaves the native comment inert; re-running the
   same operation id persists the missing entry and reconciles instead of writing a second comment.
 * **Restore.** The safe direction: take the backup with the new kit, or keep the pre-rollback backup,
@@ -1114,7 +1146,9 @@ and the hash. The rules:
 * `sha256` equals `content_hash(payload)` and the payload's own `sha256`; the file name is
   `<sha256>.json`.
 
-The entry does not repeat `authority` or the actor: both are in the hashed payload. The writer and
+The entry does not repeat `authority` or the actor: both are in the hashed payload. Corrected in
+slice 1: on the host route an attribution `person` may also be `operator:<actor>` for that block's own
+actor (§9.1, an operator with no actor-map entry); slice 0's validator refused that form. The writer and
 the reader that honours an entry against the native comment are the answer and decision slices'.
 
 ### 11.3 Void, supersede and rollback of a record
@@ -1284,6 +1318,63 @@ from "an item was dropped from a list" to "an item is still `open` and nobody lo
    against records written by fixtures; `open_item_writes` **off**. The decision reader does **not**
    live here: it moves to slice 3 with the records it reads. This is the rollback target slice 0
    protects.
+
+   **Built in kittrial-5bb.127**, in `open_items.py`, with these choices stated (the slice 1 review
+   added the first five):
+   * **A closure counts only when every link is sound** (review B1). For a question whose newest
+     revision says `resolved`, all of these must hold, or the question reads `open`, `conflicted`,
+     with the broken link named in `warnings`:
+     * the resolution that revision names is an attested `resolved` `item-resolution-v1`;
+     * it names an answer that `closes` (§7.1);
+     * that answer's `question_sha256` and `options_offered` match revision N, the revision its
+       `question_revision` names;
+     * the resolution's `revision` is N;
+     * the closing revision is attested, is revision N+1, and repeats revision N's kind, text,
+       options and addressee;
+     * no `reopened` resolution comes after the closing resolution.
+   * **Which revisions an item is made of.**
+     * The first readable revision fixes the kind: a revision of another kind is refused
+       (`kind-change`), never adopted.
+     * Once an attested revision exists, an unattested revision that changes any content field
+       (`kind`, `text`, `source`, `owner`, `task`, `for`, `options`, `recommended`, `due_by`) is
+       refused (`unattested-change`). An unattested state move with the same content (block,
+       unblock) is adopted.
+     * `submitted_by` on each revision names the writer of that revision; corrected here, as §4.1
+       left it open.
+   * **An item anchor** is a row with the exact `open-item` label **and** an exact v1 record comment
+     (`reserved_comments.is_record_anchor`, the rule that hides it). A row a contributor labels
+     `open-item` without a record is an ordinary row: it is not read, not reported and not counted
+     against `ITEM_ANCHORS_MAX` (review P2 a). The exact label is not reserved: slice 0 chose not to,
+     because projects may already use it, and counting only real anchors removes the harm.
+   * **Caps keep the newest.** Above `RECORDS_PER_ANCHOR_MAX` the newest 2,000 record comments are
+     read, and `coverage.cut` is set on the item, the list (`records_cut` names the anchors) and the
+     brief (`open_items_cut`, plus a line in the text brief).
+   * **Answers shown.** `answer` is only the answer a sound closure rests on; the newest answer that
+     closes nothing is shown only as `answer_that_closes_nothing`.
+   * **Depth rule** (review B3). An export row nested deeper than `ROW_NESTING_MAX = 750` is reported
+     unreadable without being parsed. The count is one pass without recursion, so no interpreter
+     limit decides the answer. The rule and the count are kittrial-5bb.169's
+     `record_json.ROW_NESTING_MAX` and `record_json.nesting`, the kit's one depth rule for rows.
+   * **Effective state.** A question whose stored state is `resolved` but whose closure does not rest
+     on an answer that `closes` (§7.1) reads `state: open`, keeps `stored_state: resolved`, and is
+     `conflicted` with a warning; so the three question counts always add up to `total`.
+   * **Canonical JSON.** A record whose body is not exactly the prefix plus its canonical bytes is
+     malformed; the brief pre-filter of §7.4 relies on it.
+   * **Due.** `due` is `expired`, `due-soon` (within `DUE_SOON_DAYS = 7`), `ok` or `unset`.
+   * **Comments that only look like records.** A comment that starts like one of the four kinds but is
+     not a record - no newline after the version, a version such as `-vx` - is hidden by slice 0 and
+     never parsed; the reader names it in `warnings` as `not-a-record` with its comment id. A newer
+     version reads `unsupported-record`, a malformed body (including JSON nested past
+     `record_json.NESTING_MAX`) `malformed-record`, and a decision comment on an item anchor
+     `misplaced-record`.
+   * **Unreadable rows.** An anchor with no readable revision is listed under `unreadable` with its
+     warnings. An export row that cannot be parsed (too deep, or not JSON) is listed under
+     `unreadable` when its text names the `open-item` label, the only rows that can be anchors.
+   * **Coverage.** Every list and get says how many anchors and records were read and whether a cap
+     cut the read.
+   * **Fixtures.** No writer exists, so every test record is hand-built from the tables of §4 by
+     `tools/open_items_fixture.py`, which also writes a scratch runtime through raw `bd` for a
+     read-cost run on real bd.
 2. **Item and question writes - the owner's need arrives here, in two parts.**
    * **2a - questions ask and answer.** `items add` (the shared write path) and `questions ask` on the
      contributor endpoint; `questions answer` on the host and web routes only, with the §9.3 trust
@@ -1427,8 +1518,8 @@ no field. `b brief example-task` shows
 `Decision [owner, attested]: Ship the change in the next minor release (decisions get d-...)` because
 the read projected the record onto the task, and `b decisions list --task example-task` shows the
 same record. Because this record claims `authority: owner`, the writer also persisted its
-`.owner-answers/<sha256>.json` entry in the same lock; without that entry the record would read
-`untrusted` and would not show as an owner decision (§11.2).
+`.owner-answers/<sha256>.json` entry in the same lock; without that entry the record would not show as
+an owner decision (§11.2).
 
 ## 16. Test strategy and acceptance criteria
 
@@ -1462,7 +1553,7 @@ contributor must be able to prove every one of these with disposable fixtures:
 7. **Options fidelity.** An answer whose `options_offered` differs from the item's `options` is
    refused; an answer whose `question_sha256` is stale is refused.
 8. **The journal gate.** An answer of either authority with no `.owner-answers` entry reads
-   `untrusted` and does not close the item; the same record with its host entry closes it.
+   `closes: false` and does not close the item; the same record with its host entry closes it.
    An `authority: owner` decision record with no entry is not shown as an owner decision.
    `.owner-answers` is validated by the reader's own validator with the `<sha256>.json` path/hash
    binding, **not** by `validate_record_receipt`, and a backup carrying an entry the validator
