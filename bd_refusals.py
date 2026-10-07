@@ -20,8 +20,21 @@ import json
 import re
 
 NOT_FOUND, INVALID = 'not-found', 'invalid'
+#: bd's own claim (`update ID --claim`) refused: the row is somebody else's, or it is not open
+#: (kittrial-5bb.187). bd checks and writes a claim in one step, so of several claims of one
+#: free row exactly one is carried out and the others are told who has it.
+CLAIMED, NOT_CLAIMABLE = 'claimed', 'not-claimable'
+#: The holder is whatever the row's assignee is, and on the host route that is free text: a task
+#: assigned to "Alex Smith" is held all the same (review of kittrial-5bb.187: with only an actor
+#: label allowed here, a claim of such a task read as an outcome nobody knows, 503, key kept).
+HOLDER = re.compile(r'^issue already claimed by (?P<holder>\S[^\n]{0,199})$')
+#: A holder is NAMED to a caller only when it is an actor label; anything else is somebody's text.
+LABEL = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}\Z')
+STATUS = re.compile(r'^issue not claimable: status (?P<status>[a-z_]{1,40})$')
 #: bd's own sentences for a refusal it makes before writing, as bd 1.2.2 prints them.
 SENTENCES = (
+    (CLAIMED, HOLDER),
+    (NOT_CLAIMABLE, STATUS),
     # The whole sentence, as bd says it in its three places (review of kittrial-5bb.185): the words
     # somewhere in another sentence ("failed to commit: no issue found matching ...") are not this.
     (NOT_FOUND, re.compile(r'^(?:resolving (?:ID )?[^\s:]{1,200}: )?no issues? found matching '
@@ -33,7 +46,7 @@ SENTENCES = (
 )
 #: How much of bd's sentence is handed on. It can carry the caller's own text (a title).
 SHOWN = 240
-ERROR_LINE = re.compile(r'Error(?: (?:resolving|fetching) [^:\n]{1,200})?: (.+)\Z')
+ERROR_LINE = re.compile(r'Error(?: (?:resolving|fetching|claiming) [^:\n]{1,200})?: (.+)\Z')
 
 
 def said(returncode, stdout, stderr):
@@ -76,6 +89,22 @@ def refusal(returncode, stdout, stderr):
         if pattern.search(sentence):
             return kind, sentence[:SHOWN]
     return None
+
+
+def holder(detail):
+    """Who has the row, from the last line of a ``CLAIMED`` refusal as the endpoint hands it on.
+
+    None when the line is not such a refusal, and None when the holder is not an actor label
+    (free text put there on the host route): the task is held, and nobody is named.
+    """
+    found = HOLDER.match(str(detail or '').rpartition('bd refused: ')[2].strip())
+    return found.group('holder') if found and LABEL.match(found.group('holder')) else None
+
+
+def status(detail):
+    """The row's status, from the last line of a ``NOT_CLAIMABLE`` refusal, or None."""
+    found = STATUS.match(str(detail or '').rpartition('bd refused: ')[2].strip())
+    return found.group('status') if found else None
 
 
 def envelope(kind, sentence):
