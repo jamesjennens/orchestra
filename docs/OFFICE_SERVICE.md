@@ -438,6 +438,10 @@ taking the memory of the host or the log-in of everybody else:
   at this moment. Try again in a few seconds." At most 12 log-ins of one
   address wait like that at once (one more is refused at once), so an address
   parks at most 12 of the service's threads however many connections it has.
+  Parked log-ins have no bound of their own beyond those 12 per address: many
+  addresses can each park 12, and what bounds them in all is the 200
+  connections. A log-in that wakes when every one of the 16 places is taken is
+  answered like anybody else ("Too many people are logging in at this moment").
   `"logins_per_address": N` in the service configuration changes the share
   (1 to 16); the 2 seconds and the 12 are fixed.
 

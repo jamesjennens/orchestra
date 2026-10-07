@@ -180,7 +180,8 @@ class SilentConnectionTests(Case):
 
     def test_a_client_that_sends_a_byte_now_and_then_is_cut_off_all_the_same(self):
         """The bound is on the whole wait, not on each read: a timeout per read would let this one stay."""
-        self.serve(margin=8)
+        self.serve(client_seconds=30, margin=8)
+        self.httpd.client_seconds = CLIENT                        # the short deadline is for the one that is cut off
         slow = self.silent()
         request = b'GET /healthz HTTP/1.1\r\nHost: x\r\nX-A: ' + b'a' * 400      # forty seconds of it, a byte at a time
         sent = 0
@@ -196,21 +197,23 @@ class SilentConnectionTests(Case):
         self.assertGreater(sent, 3)
         self.assertLess(sent, len(request))                       # it was not let finish
         self.settled()
+        self.httpd.client_seconds = 30                            # an honest request is not raced against 1.5 s
         self.served()
 
     def test_a_body_that_does_not_arrive_is_cut_off_and_is_not_an_internal_error(self):
-        self.serve(margin=8)
+        self.serve(client_seconds=30, margin=8)
         logged = io.StringIO()
         with contextlib.redirect_stderr(logged):
+            self.httpd.client_seconds = CLIENT                    # the short deadline is for the one that is cut off
             half = self.silent(b'POST /v1/sessions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n'
                                b'Content-Length: 80\r\n\r\n{"username": "root')
-            self.served()
             self.closed_by_the_server(half, 60)
             self.cut(1)
             self.settled()
         self.assertEqual(self.httpd.cut_off, 1)
         self.assertNotIn('Traceback', logged.getvalue())
-        self.served()
+        self.httpd.client_seconds = 30                            # an honest request is not raced against 1.5 s
+        self.served()                                             # (that others are served MEANWHILE is the first test's)
 
     def test_a_body_shorter_than_it_said_is_not_carried_out_and_not_answered(self):
         """A request is its whole body. A log-in that ends early is not a log-in, and not an internal error."""
@@ -249,10 +252,11 @@ class SilentConnectionTests(Case):
 
     def test_the_time_the_service_takes_is_not_the_clients(self):
         """A request that takes longer than the bound to answer (an endpoint call can take minutes) is answered."""
-        self.serve()
+        self.serve(client_seconds=30)                            # the request is read under 30 s, not raced against 1.5
         real = http_service.ApiHandler._request_id
 
         def slow(handler):
+            handler.server.client_seconds = CLIENT                # the bound is short from here on: the service's own time
             time.sleep(CLIENT * 1.6)
             return real(handler)
         with mock.patch.object(http_service.ApiHandler, '_request_id', slow):
@@ -268,15 +272,17 @@ class SilentConnectionTests(Case):
         page = b'<!doctype html><title>x</title>' + b'<!-- -->\n' * 400_000
         self.assertLess(len(page), http_service.STATIC_MAX_BYTES)
         (Path(web)/'index.html').write_bytes(page)
-        self.serve(web_root=web, margin=8)
+        self.serve(web_root=web, client_seconds=30, margin=8)
+        self.httpd.client_seconds = CLIENT                        # the short deadline is for the one that is cut off
         # Sixty requests for a page of 3.6 MB, and nothing is read: far more than both ends' buffers hold.
         deaf = self.silent()
         deaf.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
         deaf.sendall(b'GET / HTTP/1.1\r\nHost: x\r\n\r\n' * 60)
         self.counted(1)                                           # its thread is in a write
-        self.served()
         self.cut(1, within=CLIENT + 6)                            # by the reaper: before the socket's own timeout could end it
         self.settled()
+        self.httpd.client_seconds = 30                            # an honest request is not raced against 1.5 s
+        self.served()
         # It was a response that was being written: the client finds the beginning of one.
         deaf.settimeout(10)
         self.assertTrue(deaf.recv(4096).startswith(b'HTTP/1.1 200 '))
@@ -610,7 +616,7 @@ class SilentConnectionTests(Case):
 
     @unittest.skipUnless(has_ipv6(), 'no IPv6 loopback here')
     def test_an_ipv6_address_is_bound(self):
-        self.serve(host='::1')
+        self.serve(host='::1', client_seconds=30)
         self.assertEqual(self.httpd.socket.family, socket.AF_INET6)
         self.assertEqual(self.ask('GET', '/healthz')[0], 200)
 
@@ -733,7 +739,7 @@ class SilentTlsConnectionTests(Case):
         self.assertEqual(self.httpd.cut_off, 0)
 
     def test_the_secure_channel_is_still_seen_as_one(self):
-        self.serve()
+        self.serve(client_seconds=30)
         connection = self.client()
         connection.request('POST', '/v1/sessions', body=json.dumps({'username': ADMIN, 'password': PASSWORD}),
                            headers={'Content-Type': 'application/json'})
@@ -768,6 +774,47 @@ class SilentTlsConnectionTests(Case):
                     http_service.create_server(None, None, host='127.0.0.1', port=0, web_root=None,
                                                certfile=certfile, keyfile=keyfile)
         self.assertEqual(made, [])
+
+
+def a_deadline_is_as_long_as_it_was_asked_for(self):
+    """Review of kittrial-5bb.177, finding 1: nothing bounded a deadline from above; one twice as long passed
+    every test here. Races nothing: the deadline is read back the moment it is set."""
+    self.serve(client_seconds=30)
+    for seconds in (0.5, 1.5, 30, 600):
+        marker = object()
+        self.httpd.watch(marker, seconds)
+        left = self.httpd._deadlines[marker] - time.monotonic()
+        self.httpd.unwatch(marker)
+        self.assertNotIn(marker, self.httpd._deadlines)
+        self.assertGreater(left, seconds - 0.5)
+        self.assertLessEqual(left, seconds)
+
+
+def every_wait_for_a_client_is_armed_with_the_servers_bound(self):
+    """The same for every place that arms one: the read of a request, the read of its body, the write of the
+    answer, and with TLS the handshake. Each is armed with the server's bound and nothing longer."""
+    self.serve(client_seconds=30)
+    armed, real = [], self.httpd.watch
+
+    def watch(connection, seconds):
+        real(connection, seconds)
+        deadline = self.httpd._deadlines.get(connection)
+        armed.append((seconds, None if deadline is None else deadline - time.monotonic()))
+    with mock.patch.object(self.httpd, 'watch', watch):
+        status, body, _ = self.ask('POST', '/v1/sessions', {'username': ADMIN, 'password': PASSWORD})
+        self.assertEqual(status, 201, body)
+        self.settled()
+    self.assertGreaterEqual(len(armed), 4 if self.TLS else 3, armed)
+    for seconds, left in armed:
+        self.assertEqual(seconds, 30)
+        if left is not None:
+            self.assertGreater(left, 29.5)
+            self.assertLessEqual(left, 30)
+
+
+for case in (SilentConnectionTests, SilentTlsConnectionTests):
+    case.test_a_deadline_is_as_long_as_it_was_asked_for = a_deadline_is_as_long_as_it_was_asked_for
+    case.test_every_wait_for_a_client_is_armed_with_the_servers_bound = every_wait_for_a_client_is_armed_with_the_servers_bound
 
 
 if __name__ == '__main__':

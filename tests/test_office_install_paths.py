@@ -270,6 +270,19 @@ class OrdinaryKitTests(unittest.TestCase):
         self.assertIn('name the release that printed them', text)
         self.assertIn('again after an upgrade', text)
 
+    def test_each_of_the_two_sentences_says_it_by_itself(self):
+        """Review of kittrial-5bb.182 (mutants N10 and N13): 'again after an upgrade' stands in two sentences,
+        so either could lose it, or say the opposite, and the test above still found the words."""
+        text = self.text()
+        no_link = text[text.index('This installation has no install/current link'):]
+        no_link = ' '.join(no_link[:no_link.index(':\n')].split())
+        self.assertIn('name the release that printed them and must be printed again after an upgrade', no_link)
+        local = text[text.index('An agent that runs on the server itself'):]
+        local = ' '.join(local[:local.index(':\n')].split())
+        self.assertNotIn('follows an upgrade', local)
+        self.assertNotIn('install/current', local)
+        self.assertIn('name this release, so print them again after an upgrade', local)
+
 
 @unittest.skipUnless(POSIX_LINKS, 'the installation layout needs real symlinks')
 class ScheduledBackupLineTests(unittest.TestCase):
