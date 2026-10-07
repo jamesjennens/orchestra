@@ -865,6 +865,7 @@ for case in (SilentConnectionTests, SilentTlsConnectionTests):
     case.test_no_wait_for_a_client_is_left_armed_when_it_is_over = no_wait_for_a_client_is_left_armed_when_it_is_over
     case.test_a_deadline_is_as_long_as_it_was_asked_for = a_deadline_is_as_long_as_it_was_asked_for
     case.test_every_wait_for_a_client_is_armed_with_the_servers_bound = every_wait_for_a_client_is_armed_with_the_servers_bound
+del case                 # a name of the module that is a test class is loaded as one: the TLS class ran twice
 
 
 if __name__ == '__main__':
