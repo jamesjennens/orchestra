@@ -36,6 +36,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import actor_names
 import agent_prompts
+import bd_refusals
 import project_setup
 from coordination import MERGE_SLOT_SUFFIX, is_merge_slot, merge_slot_sentence
 from reserved_comments import (ANCHOR_READ_IDS_MAX, carries_record_label, hide_records,
@@ -450,13 +451,13 @@ class InProcessBackend:
         """Test hook: commit, then raise :class:`UncertainOutcome` for the next call(s)."""
         self.faults[route] = times
 
-    def actor_standing(self, project_id, names, rows=False):
+    def actor_standing(self, project_id, names, rows=False, own=()):
         """For each name: why a worker credential may not write under it, or None.
 
         This backend has no host, so no session actors, no operator list and no tracker rows:
         what is left of ``actor_names.collision`` is the shape of a session actor, a
-        look-alike name, and the namespace this service was started with (``rows`` is accepted
-        and ignored, so the routes need not know which backend they are on).
+        look-alike name, and the namespace this service was started with (``rows`` and ``own``
+        are accepted and ignored, so the routes need not know which backend they are on).
         """
         import actor_names
         service = (self.actor_namespace, actor_names.SERVICE_NAMESPACE)
@@ -597,11 +598,16 @@ class InProcessBackend:
 
     def _task_claim(self, principal, project_id, payload):
         task = self._task(project_id, payload.get('task_id'))
+        claimant = payload.get('actor') or principal.actor
         if task['status'] != 'open':
             raise conflict('Task is not open')
+        if task['assignee'] is not None and task['assignee'] == claimant:
+            # One's own task, claimed again: answered as a real installation answers it (bd's
+            # claim), 200 and nothing changed (kittrial-5bb.187). It was 409 here.
+            return dict(task)
         if task['assignee'] is not None:
             raise conflict('Task is already claimed')
-        task['assignee'] = payload.get('actor') or principal.actor
+        task['assignee'] = claimant
         task['version'] += 1
         self._event(project_id, task['id'], 'task-claimed', principal, task['assignee'])
         return dict(task)
@@ -1158,9 +1164,14 @@ def refuse_unknown_fields(payload, allowed, where, takes=None):
     unknown = sorted(str(name) for name in set(payload) - set(allowed))
     if not unknown:
         return
+    # The names in the detail are cut as the sentence cuts them (review of kittrial-5bb.181, done
+    # for a task change in kittrial-5bb.185 and here for every route that uses this): a name is
+    # given back only when it is a plain identifier, never a 300-character or a made-up one whole.
     raise invalid('%s does not take: %s. %s takes: %s'
                   % (where, unsupported_fields_text(unknown), where, ', '.join(named)),
-                  {'unsupported': unknown[:UNSUPPORTED_FIELDS_SHOWN], 'takes': list(named)})
+                  {'unsupported': [name if UNSUPPORTED_FIELD_NAME.match(name) else '<non-identifier name>'
+                                   for name in unknown[:UNSUPPORTED_FIELDS_SHOWN]],
+                   'takes': list(named)})
 
 
 def queue_order(item):
@@ -1311,21 +1322,28 @@ class EndpointBackend:
     # (kittrial-5bb.80). The HTTP project id is the canonical project name.
     PROJECT_CREATE = 'register'
 
-    def actor_standing(self, project_id, names, rows=False):
+    def actor_standing(self, project_id, names, rows=False, own=()):
         """For each name: why a worker credential may not write under it, or None (kittrial-5bb.184).
 
         One read through the endpoint, which owns the session registry, the operator and
         verifier lists and (when ``rows`` asks) the project's tracker rows, and answers with the
         rule, never with the names. ``rows`` is one ``bd export --all``: the issue route asks for
-        it, the credential listing does not (kittrial-5bb.188 item 1). This service's own
-        namespace is judged here, because only the service knows what it was started with.
+        it, the credential listing does not (kittrial-5bb.188 item 1). ``own`` are the lifetimes
+        of earlier credentials of the same name whose rows are not held against the one being
+        issued (item 3). This service's own namespace is judged here, because only the service
+        knows what it was started with.
         """
         import actor_names
         names = [name for name in names if isinstance(name, str) and name]
         if not names:
             return {}
+        # ``rows`` is True (every row) or the instant the credential was issued (the rows older
+        # than it); both travel as the endpoint's ``tracker`` value, which owns the distinction.
+        extra = {'tracker': rows} if rows else None
+        if rows and own:
+            extra['own'] = [list(window) for window in own]
         answer = self._run('actor-standing', project_id, self.actor_namespace + '/read', names,
-                           extra={'tracker': True} if rows else None)
+                           extra=extra)
         found = answer.get('names') if isinstance(answer, dict) else None
         if not isinstance(found, dict):
             raise uncertain('The host did not say which names are taken')
@@ -1465,7 +1483,8 @@ class EndpointBackend:
         reply = self._endpoint(action, project, actor, args, attachments,
                                operation_id=operation_id, authority=authority,
                                require_authority=require_authority, route=route, extra=extra)
-        return self._checked(reply, action)
+        # Without a descriptor the service only reads (every write it sends carries one).
+        return self._checked(reply, action, reading=authority is None)
 
     #: How much of a canonical refusal's last line is handed on. A checkpoint refusal lists
     #: every problem with the record (kittrial-5bb.113), so it gets room for all of them.
@@ -1496,8 +1515,14 @@ class EndpointBackend:
         return text if text is not None and BASE_REFUSAL.fullmatch(text) else None
 
     @classmethod
-    def _checked(cls, reply, action=None):
-        """The payload of one canonical reply, or the HttpError its return code means."""
+    def _checked(cls, reply, action=None, reading=False):
+        """The payload of one canonical reply, or the HttpError its return code means.
+
+        ``reading`` says that the request could not have written: its failure is then never
+        "the outcome may be unknown" (kittrial-5bb.185: a change of a task that does not exist
+        began with a read of it, bd said it found none, and the caller was told that the change
+        may have been made).
+        """
         code = reply.get('returncode') if isinstance(reply, dict) else None
         if code == 0 and isinstance(reply.get('server_time'), str):
             # The endpoint's time of the write it carried out, for the body of the answer of
@@ -1509,6 +1534,12 @@ class EndpointBackend:
             WRITTEN.at = False
         stderr = (reply.get('stderr') or '') if isinstance(reply, dict) else ''
         stdout = (reply.get('stdout') or '') if isinstance(reply, dict) else ''
+        if isinstance(reply, dict) and reply.get('fault') == 'tracker':
+            # The endpoint's export yielded no rows, so the project's tracker was not read
+            # (kittrial-5bb.188 item 1). The endpoint marks it a host fault, and the
+            # `reading` path above already decides what such a failure means: 503, nothing
+            # was changed, the key stays free. Never 422 "the request was rejected".
+            raise cls._unread()
         if code == 126:
             # The endpoint re-validated live authority immediately before the effect
             # and refused it. Nothing was written.
@@ -1517,6 +1548,8 @@ class EndpointBackend:
                 raise unauthenticated(detail or 'Authentication is no longer valid')
             raise forbidden(detail or 'Authority was revoked before the canonical write')
         if code == 124:
+            if reading:
+                raise cls._unread()
             raise uncertain('Canonical command timed out; outcome may be unknown')
         if code == 75:
             # The endpoint was occupied (a wait for a lock ran out): the request may simply be
@@ -1529,9 +1562,34 @@ class EndpointBackend:
             said = stderr.strip().splitlines()[-1] if stderr.strip() else None
             detail = said[:cls._detail_limit(action, said)] if said else None
             if code == 2:
+                if reply.get('refused') == 'not-found':
+                    # bd found no row of that name (bd_refusals): the thing asked about is not there.
+                    raise not_found('Task not found')
+                if reply.get('refused') == bd_refusals.CLAIMED:
+                    # bd's claim found the task in somebody else's hands. The route names the
+                    # holder as people know them; here it is the label the tracker has.
+                    held_by = bd_refusals.holder(detail)
+                    refusal = conflict('Task is already claimed', {'held_by': held_by})
+                    refusal.held_by = held_by             # None when the holder is not an actor label: nobody is named
+                    raise refusal
+                if reply.get('refused') == bd_refusals.NOT_CLAIMABLE:
+                    state = bd_refusals.status(detail)
+                    raise conflict('Task is not open%s' % (' (it is %s)' % state.replace('_', ' ') if state else ''),
+                                   {'status': state})
                 raise invalid('Canonical command rejected the request', detail)
+            if reading:
+                raise cls._unread()
             raise uncertain('Canonical command failed; outcome may be unknown')
         return _canonical_payload(stdout)
+
+    #: Said when a read of the tracker failed: nothing was changed, and nothing is to reconcile.
+    UNREAD = 'The tracker could not be read just now. Nothing was changed; try again shortly.'
+
+    @classmethod
+    def _unread(cls):
+        failure = HttpError(503, 'unavailable', cls.UNREAD)
+        failure.nothing_done = True
+        return failure
 
     #: Said when the endpoint reports that the server's configuration file cannot be read.
     CONFIGURATION_UNREADABLE = ("The server's configuration cannot be read, so this request was not carried out. "
@@ -1543,6 +1601,60 @@ class EndpointBackend:
         said = (stderr or '').strip().splitlines()
         print('busy: the endpoint answered return code 75 for %s: %s'
               % (action or 'a request', ascii(said[-1][:400]) if said else '(nothing)'), file=sys.stderr, flush=True)
+
+    def _settle_actor_rows(self, principal, project_id):
+        """Judge an unmarked credential's name by the tracker once and keep the outcome.
+
+        Kittrial-5bb.188 item 5. A credential issued before the row rule has no
+        ``actor_rows_checked`` mark, so every one of its writes would read the whole tracker
+        (measured at 3,000 rows: 3.8-4.1 s against 0.6 s). At its first write through this
+        backend the name is judged against the rows older than its issuance, exactly as the
+        endpoint judges it, and the outcome is kept ON THE CREDENTIAL: ``actor_rows_checked``
+        when the name is free, or ``actor_rows_refused`` (the rule word) when it is held. Every
+        later write reads no tracker, and a refused one is refused without one.
+
+        The keeping is not reachable from a request: there is no credential-update route, the
+        issue route accepts no such field, and this method is the only writer of the two marks.
+        It runs from the service, which owns the state, never from the endpoint (the endpoint
+        only reads the state file; a write there would be lost by the next service save).
+        A concurrent first write may run the export twice and both answer the same way; the
+        mark written by either is the same, so the result is idempotent. A name a cheap rule (a
+        session, an operator, a verifier, the service's namespace, a look-alike) already refuses
+        is left unmarked: the endpoint decides it every write with no tracker read, and a mark
+        would wrongly say the row rule had been judged.
+        """
+        if getattr(principal, 'via', None) != 'credential':
+            return
+        import actor_names
+        credential_id = getattr(principal, 'credential_id', None)
+        with self.service.store.lock:
+            credential = self.service.state['credentials'].get(credential_id)
+            if not isinstance(credential, dict) or credential.get('actor_rows_checked') \
+                    or credential.get('actor_waived') or credential.get('actor_rows_refused'):
+                return
+            namespace = credential.get('actor')
+            if not isinstance(namespace, str) or not namespace:
+                return                          # writes under its issuer's own account id
+            issued = credential.get('created_at')
+            rows = issued if isinstance(issued, str) and issued else True
+            own = actor_names.own_intervals(self.service.state.get('credentials') or {}, namespace,
+                                            credential.get('user_id'), credential.get('project_id'),
+                                            exclude=credential_id)
+        if self.actor_standing(project_id, [namespace]).get(namespace) is not None:
+            return                              # a cheap rule decides it every write; no row read
+        reason = self.actor_standing(project_id, [namespace], rows=rows, own=own).get(namespace)
+        with self.service.store.lock:
+            credential = self.service.state['credentials'].get(credential_id)
+            if not isinstance(credential, dict) or credential.get('actor_rows_checked') \
+                    or credential.get('actor_waived') or credential.get('actor_rows_refused'):
+                return                          # another first write settled it meanwhile
+            if reason is None:
+                credential['actor_rows_checked'] = True
+            elif reason == actor_names.ROWS:
+                credential['actor_rows_refused'] = actor_names.ROWS
+            else:
+                return                          # a cheap rule again: leave it unmarked
+            self.service.store.save()
 
     # -- mutations -------------------------------------------------------------
     def invoke(self, route, principal, project_id, payload, key, target=None, authorize=None,
@@ -1562,6 +1674,10 @@ class EndpointBackend:
                 # Never the service's clock, which is the time of the retry (kittrial-5bb.97).
                 WRITTEN.at = self.service.result_written_at(result_key) or False
                 return self.service.result_get(result_key)
+        # The row rule for a credential issued before it is settled ONCE, here, before the
+        # write is sent: the credential then carries the outcome and no later write reads
+        # the tracker (kittrial-5bb.188 item 5).
+        self._settle_actor_rows(principal, project_id)
         # The durable canonical operation identity is the same deterministic digest as
         # the local result key, so an exact retry after a lost response carries the
         # identity the endpoint journaled with the effect.
@@ -1711,10 +1827,12 @@ class EndpointBackend:
                               'status, priority')
             return 'bd', project_id, args, attachments
         if route == 'tasks.claim':
-            actor = payload.get('actor') or self._actor(principal)
-            return ('bd', project_id,
-                    ['update', str(task_id), '--status', 'in_progress', '--assignee',
-                     str(actor), '--json'], {})
+            # bd's own claim, for the actor the request runs under (kittrial-5bb.187). It checks
+            # and writes in one step: a row that is somebody else's or is not open is refused,
+            # and of several claims of one free row exactly one is carried out. The plain update
+            # of status and assignee this sent before took the task from whoever held it and
+            # reopened a closed one.
+            return 'bd', project_id, ['update', str(task_id), '--claim', '--json'], {}
         if route == 'checkpoints.add':
             # A field left out is sent as left out: the canonical validator names it with
             # every other problem of the record, where refusing it here hid the rest
@@ -3398,7 +3516,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     TASK_CLAIM_FIELDS = ('actor',)
     CHECKPOINT_BODY_FIELDS = EndpointBackend.CHECKPOINT_FIELDS + ('actor',)
     MEMBER_FIELDS = ('role',)
-    CREDENTIAL_ISSUE_FIELDS = ('label', 'scopes', 'actor', 'allow_actor')
+    CREDENTIAL_ISSUE_FIELDS = ('label', 'scopes', 'actor', 'allow_actor', 'allow_actor_reason')
     AGENT_CREATE_FIELDS = ('name', 'tool', 'working_directory', 'machine', 'notes',
                            'projects', 'scopes')
     AGENT_UPDATE_FIELDS = ('name', 'tool', 'working_directory', 'machine', 'notes',
@@ -3429,8 +3547,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         if all(payload.get(name) is None for name in self.TASK_CHANGES):
             raise invalid('Nothing to change. %s' % takes, {'takes': list(self.TASK_CHANGES)})
         title, description, status, priority = (payload.get(name) for name in self.TASK_CHANGES)
-        if title is not None and (not isinstance(title, str) or not title.strip()):
-            raise invalid('Task title must be text and not empty')
+        if title is not None:
+            self._task_title(title)
         if description is not None and not isinstance(description, str):
             raise invalid('Task description must be text')
         if status is not None and status not in ('open', 'closed'):
@@ -3439,6 +3557,19 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise invalid('Task priority must be an integer 0-4')
         self._bind_task_actor(ctx, payload)
         return payload
+
+    #: bd's own limit for a title (bd 1.2.2: "title must be 500 characters or less"). A longer
+    #: one on a change is not even refused by bd's check: the database refuses it.
+    TASK_TITLE_MAX = 500
+
+    def _task_title(self, title):
+        """A task's title is text, not blank, and no longer than bd takes; else the refusal."""
+        # Not blank: at least one character that can be seen. A title of spaces, or of one control
+        # character (review of kittrial-5bb.185: bd stores it), is no title.
+        if not isinstance(title, str) or not any(ch.isprintable() and not ch.isspace() for ch in title):
+            raise invalid('Task title must be text and not empty')
+        if len(title) > self.TASK_TITLE_MAX:
+            raise invalid('Task title must be %d characters or less (it has %d)' % (self.TASK_TITLE_MAX, len(title)))
 
     def _bind_task_actor(self, ctx, payload):
         """An ``actor`` in the body of a task write is the caller's own label or it is refused.
@@ -4362,6 +4493,15 @@ class ApiHandler(BaseHTTPRequestHandler):
         named = sorted({item['actor'] for item in items if item.get('actor') and not item.get('revoked')})
         standing = self.backend.actor_standing(ctx.params['pid'], named) if named else {}
         for item in items:
+            waived = item.get('actor_waived')
+            if isinstance(waived, dict) and not item.get('revoked'):
+                # A superuser allowed this name on purpose (kittrial-5bb.188 item 4): it is not
+                # colliding and not refused, and the owner is told who allowed it and when.
+                who = waived.get('by_name') or waived.get('by') or 'a superuser'
+                when = waived.get('at') or 'an unrecorded date'
+                item['actor_refused'] = None
+                item['actor_allowed'] = 'allowed by %s on %s' % (who, when)
+                continue
             reason = standing.get(item.get('actor')) if not item.get('revoked') else None
             item['actor_refused'] = None if reason is None else actor_names.refusal(item['actor'], reason)
         return 200, self._paged(ctx, items, limit, state)
@@ -4375,23 +4515,44 @@ class ApiHandler(BaseHTTPRequestHandler):
         named = payload.get('actor')
         # An operator's allowance for a name the project's tracker already holds (kittrial-5bb.188
         # item 1): a superuser only, and only for the row rule -- never for a session, an
-        # operator, a verifier or the service's own namespace.
+        # operator, a verifier or the service's own namespace. The waiver must say why it was
+        # used (item 4): the reason travels to the audit entry, the stored record carries its
+        # own mark, and the owner's list and admin.py credential-actors show it as allowed.
         allowed = payload.get('allow_actor') is True
         if 'allow_actor' in payload and not isinstance(payload.get('allow_actor'), bool):
             raise invalid('allow_actor must be true or false')
-        if allowed and not ctx.principal.superuser:
-            raise forbidden('Only a superuser may allow a name the project\'s tracker already holds')
+        waiver = payload.get('allow_actor_reason')
+        if 'allow_actor_reason' in payload and waiver is not None and not isinstance(waiver, str):
+            raise invalid('allow_actor_reason must be a short text')
+        if not allowed and 'allow_actor_reason' in payload and waiver is not None:
+            raise invalid('allow_actor_reason is only for a superuser waiver; send allow_actor: true too')
+        if allowed:
+            if not ctx.principal.superuser:
+                raise forbidden('Only a superuser may allow a name the project\'s tracker already holds')
+            if not isinstance(waiver, str) or not waiver.strip():
+                raise invalid('allow_actor requires allow_actor_reason: say why the name is allowed')
+            if len(waiver.strip()) > 500:
+                raise invalid('allow_actor_reason must be at most 500 characters')
+            waiver = waiver.strip()
         checked = False
+        waived_mark = None
         if isinstance(named, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,63}', named):
             # A worker credential writes under this name, and the tracker's rows carry the name
             # and nothing else: under a host actor's name it IS that actor (kittrial-5bb.184).
             # A name the tracker already holds is refused too (kittrial-5bb.188 item 1), which is
             # one bd export for this project. Refused before the key is reserved; the endpoint
             # refuses the same again at use.
+            own = actor_names.own_intervals(self.service.state.get('credentials') or {}, named,
+                                            ctx.principal.user_id, ctx.params['pid'])
             reason = self.backend.actor_standing(ctx.params['pid'], [named],
-                                                 rows=self.backend.ACTOR_ROWS).get(named)
-            checked = self.backend.ACTOR_ROWS and (reason is None or (allowed and reason == actor_names.ROWS))
-            if reason is not None and not checked:
+                                                 rows=self.backend.ACTOR_ROWS, own=own).get(named)
+            if reason is None:
+                checked = self.backend.ACTOR_ROWS
+            elif allowed and reason == actor_names.ROWS:
+                # The waiver is its own mark, never actor_rows_checked: an honestly checked
+                # name and an allowed one are told apart on the record (item 4).
+                waived_mark = {'by': ctx.principal.user_id, 'reason': waiver}
+            else:
                 raise invalid(actor_names.refusal(named, reason, actor_names.CHOOSE), {'actor': named, 'rule': reason})
 
         def issue():
@@ -4403,14 +4564,17 @@ class ApiHandler(BaseHTTPRequestHandler):
                                                    scopes=payload.get('scopes'),
                                                    actor=payload.get('actor'),
                                                    request_id=ctx.request_id,
-                                                   actor_checked=checked)
+                                                   actor_checked=checked,
+                                                   actor_waived=waived_mark)
             public = {'operation': 'credentials.issue', 'credential': result}
             stored = {'operation': 'credentials.issue',
                       'credential': {k: v for k, v in result.items() if k != 'secret'},
                       'secret_available': False}
             return public, stored
+        audit_reason = None if waived_mark is None else \
+            'waiver used for worker credential actor %s: %s' % (named, waived_mark['reason'])
         return self._mutate(ctx, 'credentials.issue', ctx.params['pid'], issue, status=201,
-                            capability=CAP_PROJECT_ADMIN, replay_status=200)
+                            capability=CAP_PROJECT_ADMIN, replay_status=200, reason=audit_reason)
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/worker-credentials/'
                   r'(?P<cid>' + ID + r')/revoke')
@@ -4523,6 +4687,11 @@ class ApiHandler(BaseHTTPRequestHandler):
             # does. Only then is a field the route does not take refused, not dropped
             # (kittrial-5bb.183 item 2). This is the same lookup update_agent() makes.
             self.service.get_agent(ctx.principal, ctx.params['aid'])
+            if 'projects' in payload:
+                # And so is the grant (kittrial-5bb.183 review, P3): a project the agent's owner
+                # cannot see keeps the service's own 404 whether or not the body also carries a
+                # field the route does not take. Nothing is written by the check.
+                self.service.check_agent_grant(ctx.principal, payload.get('projects'), owner_id=record['owner'])
             refuse_unknown_fields(payload, self.AGENT_UPDATE_FIELDS, 'An agent change')
             result = self.service.update_agent(ctx.principal, ctx.params['aid'], payload)
             return result, result
@@ -5023,6 +5192,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         if priority is not None and (type(priority) is not int or not 0 <= priority <= 4):
             raise invalid('Task priority must be an integer 0-4')
         payload['attachments'] = validate_attachments(payload.get('attachments'))
+        # The title is checked here as on a change, before the key is reserved (kittrial-5bb.185):
+        # an empty one and one of 600 characters went to bd, which refused them, and the caller
+        # was told that the task may have been made. A blank one bd stored as it came.
+        self._task_title(payload.get('title'))
+        if payload.get('description') is not None and not isinstance(payload['description'], str):
+            raise invalid('Task description must be text')
         self._bind_task_actor(ctx, payload)
 
         def create():
@@ -5583,10 +5758,19 @@ class ApiHandler(BaseHTTPRequestHandler):
         payload['actor'] = actor
 
         def claim():
-            result = self.backend.invoke('tasks.claim', ctx.principal, ctx.params['pid'],
-                                         payload, ctx.idempotency_key,
-                                         target=ctx.route_target, authorize=ctx.authorize,
-                                         capability=CAP_TASKS)
+            try:
+                result = self.backend.invoke('tasks.claim', ctx.principal, ctx.params['pid'],
+                                             payload, ctx.idempotency_key,
+                                             target=ctx.route_target, authorize=ctx.authorize,
+                                             capability=CAP_TASKS)
+            except HttpError as refusal:
+                held_by = getattr(refusal, 'held_by', None)
+                if held_by is None:
+                    raise
+                # Somebody else has it. Nobody takes a task over through a claim, an owner
+                # included (kittrial-5bb.187); said with the holder's name as people know it.
+                shown = self.service.actor_names([held_by]).get(held_by) or held_by
+                raise conflict('Task is already claimed by %s' % shown, {'held_by': held_by}) from None
             return result, result
         return self._mutate(ctx, 'tasks.claim', ctx.params['pid'], claim,
                             capability=CAP_TASKS, serialize=False, canonical=True)

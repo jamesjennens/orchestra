@@ -1057,6 +1057,42 @@ idempotency record's (`IDEMPOTENCY_TTL_SECONDS`, 24 h). That record expires on t
 confirmed timeline (see the record store in section 8), so a clock jump never shortens
 it; a retry after the window is treated as a new request.
 
+### Claiming a task
+
+`POST /v1/projects/{id}/tasks/{task}/claim` takes a free, open task for the caller: it
+becomes `in_progress` and the caller its assignee. It is bd's own claim (`bd update
+ID --claim`), which checks and writes in one step, so:
+
+- a task that **somebody else holds** is refused: **409 "Task is already claimed by
+  NAME"**, with the holder's id in `error.detail.held_by`. That is so for every caller,
+  **the project's owner included: nobody takes a task over through a claim**;
+- a task that **is not open** (closed, blocked) is refused: **409 "Task is
+  not open (it is closed)"**, with the status in `error.detail.status`. A claim does
+  not reopen anything;
+- the caller's **own** claimed task, claimed again, answers 200 and changes nothing;
+- of **several claims of one free task at the same moment exactly one is carried
+  out**; the others are answered 409 naming the winner. There is no check followed by
+  a write for another claim to get between: bd does both in one transaction, and every
+  write through the endpoint holds the project's lock besides.
+
+A refusal keeps nothing: the idempotency key is free and no audit entry of outcome
+`unknown` is written.
+
+**Taking a task over** is a separate, explicit act and has no web route today. An
+owner who needs a task moved asks the project's coordinator, who reassigns it on the
+host route (`update TASK --assignee ACTOR --status in_progress`); that plain update
+is not a claim and is not refused.
+
+Before kittrial-5bb.187 this route sent bd that plain update of status and assignee,
+and bd carried it out whatever the row was: a second member's claim took the task
+from the first, with no word to either, and a claim of a closed task reopened it.
+Whoever claimed last then passed every rule that asks "is the caller the assignee"
+(contribute, respond, the checkpoint's directions). The host client's own claim
+(`update TASK --claim`) was bd's claim all along and never had the fault. The
+in-process backend (the tests' and the local preview's) refused both cases already;
+it refused a second claim by the SAME member too, and now answers it 200, unchanged,
+as a real installation does.
+
 ### The name a worker credential writes under
 
 A worker credential writes under the actor namespace its issuer chose (`actor` when it
@@ -1098,12 +1134,25 @@ told: a contributor is answered 403 and an outsider 404 whatever the name. If th
 cannot be asked, nothing is issued. **Cost of the row read:** judging a name by the
 project's rows is one `bd export --all` for that project (one bd process against its
 running database), paid once per issue attempt and never by an ordinary write: see
-"Credentials that already have such a name" below. A superuser may pass
-`"allow_actor": true` with the request to take a name the tracker already holds; only
-that rule is waived, never a session, an operator, a verifier or the service's
-namespace, and the allowance is recorded on the credential so the at-use rule does not
-undo it. Anybody else sending it is answered 403, and a value that is not true or false
-is 422.
+"Credentials that already have such a name" below. **An export that answers no rows at
+all is a host fault, not a tracker with no names** (kittrial-5bb.188 review of item 1):
+every project this kit makes holds at least the merge slot, so a `bd export --all` that
+exits 0 and prints nothing, or prints only text that is not rows, answers **503
+`unavailable`**, "The tracker could not be read just now. Nothing was changed; try again
+shortly.", and the idempotency key is free. A superuser may pass
+`"allow_actor": true` together with `"allow_actor_reason"` -- a short text saying WHY --
+to take a name the tracker already holds. Only that rule is waived, never a session, an
+operator, a verifier or the service's own namespace. Anybody else sending `allow_actor`
+is answered 403, a value that is not true or false is 422, a missing or empty reason is
+422, and a reason with no waiver is 422. The waiver is recorded on the credential as its
+own mark (`actor_waived`, holding `by`, `reason` and `at`) and **not** as
+`actor_rows_checked`; the audit entry is a `credentials.issue` whose reason says a waiver
+was used and why ("waiver used for worker credential actor NAME: WHY"), with the waiving
+account in the same entry; and the owner's credential list carries `actor_waived` and
+`actor_allowed` ("allowed by NAME on DATE"), with `actor_refused` null.
+`admin.py credential-actors` shows the same: `collides` null,
+`refused_when_it_writes` false, `waived` true and the who/why/when fields. A waived
+credential writes.
 
 **At use**, the endpoint itself refuses: a request the web service sends with its
 descriptor under a name that does not have the shape of a web id is written only by a
@@ -1118,13 +1167,50 @@ their own id as before; over SSH nothing changes.
 
 **A credential's own rows are not held against it.** A credential issued by this code
 records that the tracker was read and the name was free when it was issued (or that a
-superuser allowed it): from then on every row under that name is its own, and no write
-of its reads the tracker at all. A credential that carries no such record -- one issued
-by an earlier kit -- is judged against the tracker at each write, by the rows older than
-the moment it was issued (a row within five minutes of it counts as its own, because the
-credential's stamp is the web service's clock and a row's is the host's). That is one
-`bd export --all` per write for such a credential until it is reissued or revoked, which
-is the cost of the rule for the credentials that predate it.
+superuser waived the row rule): from then on every row under that name is its own, and no
+write of its reads the tracker at all. A credential that carries no such record -- one
+issued by an earlier kit -- is judged by the tracker **once, at its first write after the
+upgrade**, by the rows older than the moment it was issued (a row within five minutes of
+it counts as its own, because the credential's stamp is the web service's clock and a
+row's is the host's). The outcome is then kept ON THE CREDENTIAL: `actor_rows_checked`
+when the name was free, or `actor_rows_refused` (the rule word) when the tracker held it.
+Every later write reads no tracker, and a refused one is refused without one, so an old
+credential pays that one `bd export --all` once and not on every write. The marks are
+written by the service, which owns the state; there is no route that changes a credential
+(`PATCH`/`PUT` are 404) and the issue route takes no such field, so the keeping cannot be
+reached from a request. A **concurrent first write** may run the export twice; both
+answer the same way and write the same mark, so the outcome is idempotent. An export that
+answers no rows at all is the host fault above: 503, nothing written, and no mark kept.
+
+**Renewing a credential under its own name is not a collision** (kittrial-5bb.188 item
+3). The row rule above is about *somebody else's* rows; an owner renewing the name its own
+credential wrote as is not taking somebody else's name. Rows are therefore not held
+against a new credential of the same head, same owner and same project when they lie
+inside an earlier credential's own lifetime. How that is known: the state keeps each
+credential's issuer, namespace, project, issuance (`created_at`/`issued_raw`) and
+revocation time (`revoked_at`); an earlier credential lends the window from its issuance
+to its revocation, or to now when it was never revoked, and only when the row rule did
+not refuse it (`actor_rows_refused` absent). It **fails closed** when any of that cannot
+be read -- no predecessor, a different owner or project, an unreadable issuance, a
+revoked credential with no revocation time, or a predecessor the rule refused all lend
+nothing, so the rows stay somebody else's and the name is refused. A renewal is still
+refused when the tracker holds rows older than the predecessor (the host actor's own
+rows), because those are outside its lifetime.
+
+**What the rule does not hold, and does not cover.** Not held, by design: a name the
+tracker knows only from a task it **closed** or a task it **changed** (the tracker's
+events are not in `bd export --all`); rows in **another project** of the installation
+(the rule is per project); an old credential whose name the tracker holds only as an
+**assignee** on a row whose `updated_at` is after the credential was issued (an assignee
+is dated by `updated_at`, per `actor_names.tracker_marks`); and a row up to **300 s**
+older than an old credential, which counts as its own (the issuance-stamp allowance).
+These are stated, not closed. **Not covered** are the look-alike names that are still
+issued because they are neither a leading/trailing dot or dash nor an `@host`: a trailing
+underscore (`opus-worker-lane_`), a doubled dash or dot (`opus--worker-lane`,
+`opus..worker-lane`), a dash/underscore/dot swap (`opus_worker_lane`, `opus.worker.lane`),
+an added digit (`opus-worker-lane2`), a `0` for an `o` (`im2-coordinat0r`), and a label
+with a trailing dot under a good head (`night-crew/x.`). They are listed as not covered
+rather than refused, so an operator knows the rule's edge.
 
 **Before this**, a project owner could issue a credential named as the host
 coordinator's session and with it create a task, claim one, contribute, answer the
@@ -1161,18 +1247,22 @@ not collide, `tracker_rows` still says whether the tracker holds rows under it: 
 credential under that name wrote, or an actor from before sessions were registered. That
 is worth a look when nobody remembers issuing it.
 
-**Who may ask whether a name is taken.** The endpoint's `actor-standing` answers any
-caller, with the rule word only (`null`, or which rule) and never the host's names, no
-session id and no list contents. Asked with `tracker`, it also reads the project's rows
+**Who may ask whether a name is taken.** The endpoint's `actor-standing` answers a
+caller with the rule word only (`null`, or which rule) and never the host's names, no
+session id and no list contents. Asked with `tracker`, it ALSO reads the project's rows
 (one `bd export --all`); the answer is the same rule word either way, never a name from
-the rows. It is the read the endpoint's own at-use rule answers
-with and the read the owner's credential list is built from, which is why it exists at
-all. Over the web only somebody who may administer the project is told: a contributor is
-answered 403 and an outsider 404 whatever the name. kittrial-5bb.188 item 5 is the
-owner's question whether the host route should tell everybody; the recommendation left
-with that task is to keep it as it is, and, if it is narrowed, to gate it on the
-live-authority descriptor that only the web service presents, leaving the SSH path
-alone. No decision is built here.
+the rows. Because that read costs a whole export, **`tracker` is refused unless the
+caller is the web service**: the flag is read only when the endpoint was launched with
+the service's authority store, so a host client over SSH (whose wrapper refuses every
+launch flag) cannot make the endpoint read a tracker by sending it, and it is answered
+422 "actor-standing with rows is for the web service only; nothing was changed". The
+owner's own list and the issue route's row read are the service's, which is why the
+answer exists at all. Over the web only somebody who may administer the project is told:
+a contributor is answered 403 and an outsider 404 whatever the name. kittrial-5bb.188
+item 5 was the owner's question whether the host route should tell everybody; the
+recommendation left with that task is to keep the cheap answer as it is, and, if it is
+narrowed, to gate it on the live-authority descriptor that only the web service presents,
+leaving the SSH path alone. No decision is built here beyond the service-only rule read.
 
 
 ### What an agent needs to write a checkpoint
@@ -1270,6 +1360,43 @@ key does. Until then a DIFFERENT body under that key answers 409 "Idempotency ke
 reused with a different request payload": send the corrected request with a new
 key. An operator has nothing to clean up; the `unknown` audit entries of that time
 record requests that changed nothing.
+
+**A task's title**, on create and on a change, is text, not blank, and at most 500
+characters (bd's own limit). Anything else answers 422 before the key is looked at:
+"Task title must be text and not empty", "Task title must be 500 characters or less
+(it has 600)". A description that is not text is refused the same way.
+
+**When bd itself refuses** (kittrial-5bb.185). bd says no in several forms: a JSON
+object `{"error": ...}` with exit 1, a line `Error: ...` on standard error, and for a
+row it cannot find `Error resolving ID: no issue found matching ...`. The endpoint
+handed bd's exit code on as it came, everything that was not 0 was kept as an
+operation whose outcome is unknown, and the caller was told **503 "The operation may
+have committed; reconcile with the same idempotency key"** for an empty title, a
+title of 600 characters or a task that does not exist, with the key kept and an
+audit entry of outcome `unknown` each time. Now:
+
+- a refusal bd makes before it writes is a refusal: the endpoint answers return code
+  2 with bd's sentence and releases the operation identity; the service answers **404
+  "Task not found"** when bd found no row of that name and **422** with bd's sentence
+  otherwise. Nothing is kept, the key serves the corrected request, and no `unknown`
+  entry is written;
+- a refusal is recognised by its form AND its sentence together (`bd_refusals.py`):
+  "no issue found matching", "validation failed for issue", "... cannot be empty",
+  "invalid priority" and "invalid status", a title that "looks like a flag". A failure that merely has the form of a refusal (a JSON
+  error with another sentence, the database's own sentence) is **still an outcome
+  nobody knows**, as before: that is the side to err on. A bd that changes its
+  sentences falls back to that, and `tests/test_bd_refusals.py` notices it when it
+  runs against a real bd;
+- **a read is never said to "may have committed"**. A task that does not exist is 404
+  on every task route (read, change, claim, checkpoint, review); any other read of
+  the tracker that fails answers **503 `unavailable`**, "The tracker could not be
+  read just now. Nothing was changed; try again shortly.", and a key sent with it
+  is free.
+
+A key that was left reserved by such an answer before this: the same request is now
+answered 422 or 404 before the key is looked at; the key lapses a day after it was
+first used; until then a different body under it answers 409, and the corrected
+request goes with a new key.
 
 **The actor of a task write is the caller's own.** Task create and task change take
 an optional `actor`, the attribution label, under the rule of a claim, a checkpoint

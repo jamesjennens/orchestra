@@ -21,6 +21,7 @@ import sys
 import tempfile
 from pathlib import Path
 from admin import ConfigurationUnreadable,deployment_document,deployment_password,environment,project_dir,root_path,operators as configured_operators,verifiers as configured_verifiers,review_workflow_writes as configured_review_writes
+import bd_refusals
 import native
 from coordination import is_merge_slot, merge_slot_sentence
 from render import render
@@ -409,34 +410,41 @@ def configuration_fault(root,error):
     try:return Path(os.fsdecode(error.filename))==Path(root)/'deployment.private.json'
     except (TypeError,ValueError):return False       # it names no file, or a descriptor
 
-def tracker_actors(root,path,before=None):
+def tracker_actors(root,path,before=None,own=()):
     """The names this project's tracker already holds as an author or assignee, older than
     ``before`` (all of them when it is None); kittrial-5bb.188 item 1.
 
     One ``bd export --all`` for the project, through the same read ``admin.py
     credential-actors`` makes: a bd process that opens the project's database. That is the
     cost of judging a plain name by the rows it has, and it is paid where the rule is
-    applied, never by every write (docs/HTTP_DEPLOYMENT.md says so). A project whose
-    tracker cannot be read raises, so the caller refuses rather than reading it as empty."""
+    applied, never by every write (docs/HTTP_DEPLOYMENT.md says so). A tracker that cannot
+    be read raises, and so does an export that parses to no rows at all
+    (``actor_names.TrackerUnreadable``): every project this kit makes holds at least the
+    merge slot, so an empty answer is a host fault, not "the tracker holds no names"
+    (kittrial-5bb.188 review of item 1). ``own`` are the lifetimes of earlier credentials of
+    the same name whose rows are not held against this one (item 3)."""
     import actor_names
     from admin import run_bd
     text=run_bd(root,path.name,['export','--all'])
     rows=[record_json.loads(line) for line in text.splitlines() if line.strip()]
-    return actor_names.tracker_names(actor_names.tracker_marks(rows),before)
+    if not any(isinstance(row,dict) for row in rows):
+        raise actor_names.TrackerUnreadable()
+    return actor_names.tracker_names(actor_names.tracker_marks(rows),before,own)
 
-def reserved_actors(root,path,rows=False):
+def reserved_actors(root,path,rows=False,own=()):
     """The names a worker credential's namespace may not be, as this host has them: the
     project's registered session actors, the installation's operator and verifier lists, and
     (only when ``rows`` asks for it) the project's tracker rows.
 
     ``rows`` is False (no tracker read, the cheap rule), True (every row, for a name being
     issued) or the instant the credential was issued, so that a credential's own rows are
-    not held against it."""
+    not held against it. ``own`` are the earlier same-name credentials' lifetimes whose rows
+    are not held either (kittrial-5bb.188 item 3)."""
     from sessions import registered_actors
     names={'sessions':registered_actors(path),'operators':sorted(configured_operators(root)),
             'verifiers':sorted(configured_verifiers(root))}
     if rows:
-        names['authors']=sorted(tracker_actors(root,path,None if rows is True else rows))
+        names['authors']=sorted(tracker_actors(root,path,None if rows is True else rows,own))
     return names
 
 def execute(root,request,authority_config=None,require_authority=False):
@@ -468,7 +476,7 @@ def execute(root,request,authority_config=None,require_authority=False):
     if denied is not None:return denied
     # And a name WITHOUT that shape, sent by the web service with a descriptor, is written only
     # by a worker credential inside a namespace that is nobody else's (kittrial-5bb.184).
-    denied=descriptor_actor_denial(request,authority_config,lambda rows=False:reserved_actors(root,path,rows))
+    denied=descriptor_actor_denial(request,authority_config,lambda rows=False,own=():reserved_actors(root,path,rows,own))
     if denied is not None:return denied
     if request.get('action')=='session':
         from sessions import execute as session_execute
@@ -540,12 +548,20 @@ def execute(root,request,authority_config=None,require_authority=False):
         # not write under it, or null. The web service asks before it issues one and when it
         # lists them. The answer says which rule, never the host's names. No lock, no write.
         # With ``tracker`` set it also reads the project's rows, which is one bd export: the
-        # service asks for that only at issue (kittrial-5bb.188 item 1).
+        # service asks for that only at issue (kittrial-5bb.188 item 1), and only the service
+        # may ask (item 6): the flag is a launch-argument service, so a caller over SSH (no
+        # authority store) cannot make the endpoint read a tracker by sending it.
         import actor_names
         names=request.get('args',[])
         if not isinstance(names,list) or not 1<=len(names)<=200 or any(not isinstance(n,str) or not 0<len(n)<=96 or '\0' in n for n in names):
             raise ValueError('Use actor-standing with 1 to 200 names')
-        reserved=reserved_actors(root,path,bool(request.get('tracker')))
+        tracker=request.get('tracker')
+        if tracker and authority_config is None:
+            raise ValueError('actor-standing with rows is for the web service only; nothing was changed')
+        own=request.get('own') if tracker else None
+        own=own if isinstance(own,list) else ()
+        rows=tracker if isinstance(tracker,str) else bool(tracker)
+        reserved=reserved_actors(root,path,rows,own)
         return {'returncode':0,'stdout':json.dumps({'schema_version':1,'names':{n:actor_names.collision(n,**reserved) for n in names}})+'\n','stderr':''}
     if action=='setup-status':
         # Read-only (kittrial-5bb.118): what the host knows about this project's setup,
@@ -891,6 +907,11 @@ def execute(root,request,authority_config=None,require_authority=False):
             _guard_reserved_labels(root,path,args,actor)
             def bd_dispatch(argv):
                 p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*argv],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)
+                # When bd itself says no, before it writes, that is a refusal and not an outcome
+                # nobody knows (kittrial-5bb.185): the identity is released and the caller is told
+                # bd's sentence. Only what bd_refusals recognises; anything else is handed on as it came.
+                refused=bd_refusals.refusal(p.returncode,p.stdout,p.stderr)
+                if refused is not None:return bd_refusals.envelope(*refused)
                 return {'returncode':p.returncode,'stdout':p.stdout,'stderr':p.stderr}
             runner=NativeRunner(bd_dispatch)
             def bd_effect():return runner(final)
@@ -924,6 +945,12 @@ def main():
         answer={'returncode':75,'stdout':'','stderr':'Busy: %s. Nothing was done; try again shortly.\n'%waited}
     except Exception as e:
         answer={'returncode':2,'stdout':'','stderr':f'{type(e).__name__}: {e}\n'}
+        import actor_names
+        if isinstance(e,actor_names.TrackerUnreadable):
+            # The export answered no rows: a host fault, not a refusal of the request. The
+            # service reads this mark and answers 503 "nothing was changed" (kittrial-5bb.188
+            # item 1); `fault` is how it tells a read the service may retry from a rejection.
+            answer['fault']='tracker'
         if configuration_fault(a.root,e):
             # Not a fault of the request: the server's own configuration file cannot be read.
             # The line names the file, as it does for the operator; `fault` lets the web service

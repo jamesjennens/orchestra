@@ -4572,9 +4572,17 @@ def credential_actors(root,state_path,service_namespace=None):
     was already holding before the credential was issued is refused when it writes, and the
     credential is listed here. A credential issued after that rule carries
     ``actor_rows_checked`` and is judged only against the rows older than its own issuance, so
-    the rows it wrote itself are not held against it. ``service_namespace`` is the namespace
-    the web service was started with (its ``--actor-namespace``), when the operator says so:
-    a credential named under it is refused at use too (kittrial-5bb.188 item 3).
+    the rows it wrote itself are not held against it. A credential issued before the rule is
+    judged by the rows once, and the outcome is kept on it (``actor_rows_checked`` or
+    ``actor_rows_refused``; item 5). A name a superuser waived carries ``actor_waived``
+    (item 4): it is listed as allowed -- ``collides`` null, ``refused_when_it_writes`` false,
+    with ``waived``, ``waived_by_username``, ``waived_at``, ``waived_reason`` and an
+    ``actor_allowed`` sentence -- because it writes. Rows inside an earlier same-name,
+    same-owner credential's lifetime are not held either (item 3). An export that answers no
+    rows is said as ``tracker_rows`` null, not false: the tracker was not read.
+    ``service_namespace`` is the namespace the web service was started with (its
+    ``--actor-namespace``), when the operator says so: a credential named under it is refused
+    at use too (kittrial-5bb.188 item 3).
     """
     import actor_names
     from datetime import datetime,timezone
@@ -4602,6 +4610,8 @@ def credential_actors(root,state_path,service_namespace=None):
                 found['sessions']=registered_actors(path)
                 try:
                     rows=[json.loads(line) for line in run_bd(root,name,['export','--all']).splitlines() if line.strip()]
+                    if not any(isinstance(row,dict) for row in rows):
+                        raise ValueError('the export answered no rows')
                     found['marks']=actor_names.tracker_marks(rows)
                 except (subprocess.CalledProcessError,OSError,ValueError,RecursionError):
                     found['marks']=None                # the tracker could not be read: said as null, not as "no rows"
@@ -4623,13 +4633,28 @@ def credential_actors(root,state_path,service_namespace=None):
                                      service=(service_namespace,actor_names.SERVICE_NAMESPACE)
                                      if service_namespace else actor_names.SERVICE_NAMESPACE)
         issuer=users.get(credential.get('user_id')) if isinstance(users.get(credential.get('user_id')),dict) else {}
-        out.append({'credential':identifier,'project':name,'project_on_host':host['on_host'],'label':credential.get('label'),
-                    'actor':namespace,'collides':reason,'revoked':bool(credential.get('revoked')),
-                    'refused_when_it_writes':reason is not None,
-                    'tracker_rows':None if host['marks'] is None else actor_names.head(namespace) in {n for n,_ in host['marks']},
-                    'issued_by':credential.get('user_id'),'issued_by_username':issuer.get('username'),
-                    'created_at':moment(credential.get('created_at')),'last_used':moment(credential.get('last_used')),
-                    'expires_at':moment(credential.get('expires_at'))})
+        waived=credential.get('actor_waived') if isinstance(credential.get('actor_waived'),dict) else None
+        if waived is not None:
+            # A superuser allowed this name on purpose (kittrial-5bb.188 item 4): it is not
+            # colliding and it is not refused when it writes; the listing says who allowed it
+            # and when, in plain words as well as in fields.
+            reason=None
+        item={'credential':identifier,'project':name,'project_on_host':host['on_host'],'label':credential.get('label'),
+              'actor':namespace,'collides':reason,'revoked':bool(credential.get('revoked')),
+              'refused_when_it_writes':reason is not None,
+              'tracker_rows':None if host['marks'] is None else actor_names.head(namespace) in {n for n,_ in host['marks']},
+              'issued_by':credential.get('user_id'),'issued_by_username':issuer.get('username'),
+              'created_at':moment(credential.get('created_at')),'last_used':moment(credential.get('last_used')),
+              'expires_at':moment(credential.get('expires_at'))}
+        if waived is not None:
+            item['waived']=True
+            item['waived_by']=waived.get('by')
+            item['waived_by_username']=issuer.get('username')
+            item['waived_at']=moment(waived.get('at'))
+            item['waived_reason']=waived.get('reason')
+            item['actor_allowed']='allowed by %s on %s' % (issuer.get('username') or waived.get('by') or 'a superuser',
+                                                            item['waived_at'] or 'an unrecorded date')
+        out.append(item)
     colliding=[item for item in out if item['collides'] is not None and not item['revoked']]
     return {'schema_version':1,'state':str(source),'worker_credentials_with_a_name':len(out),
             'colliding_and_not_revoked':len(colliding),'credentials':out}

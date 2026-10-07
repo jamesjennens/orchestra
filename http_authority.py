@@ -1993,15 +1993,20 @@ def descriptor_actor_denial(request, authority_config, reserved):
     A credential issued before kittrial-5bb.188 carries no ``actor_rows_checked`` mark, so
     it is judged again by the project's own tracker rows (one bd export): a name the
     tracker was already holding before the credential existed is somebody else's, and the
-    write is refused. A credential issued by this code has the mark -- the tracker was
-    read and the name was free (or a superuser allowed it) when it was issued -- so its
-    own rows are never held against it and an ordinary write reads no tracker at all.
+    write is refused. Rows inside the lifetime of an earlier credential of the SAME name,
+    issued by the same owner for the same project and not itself refused by the row rule,
+    are not held against it (kittrial-5bb.188 item 3); a credential the kit has since
+    judged (``actor_rows_checked`` or ``actor_rows_refused``) or a superuser waived
+    (``actor_waived``) carries a settled outcome and is not read against the tracker again
+    (items 4 and 5). An export that yields no rows at all is a host fault answered
+    ``fault: "tracker"`` (item 1), never "the tracker holds nothing".
 
     ``reserved`` is called only when a namespace has to be judged and returns the host's
     names (``sessions``, ``operators``, ``verifiers``, and ``authors`` from the tracker
-    when asked with ``rows=``). A request without a descriptor is not judged here: on the
-    SSH path there is none, and the service's own reads carry none; a write the service
-    sends without one is refused by ``run_guarded``.
+    when asked with ``rows=`` and the earlier credentials' lifetimes with ``own=``). A
+    request without a descriptor is not judged here: on the SSH path there is none, and the
+    service's own reads carry none; a write the service sends without one is refused by
+    ``run_guarded``.
     """
     if authority_config is None:
         return None
@@ -2028,11 +2033,27 @@ def descriptor_actor_denial(request, authority_config, reserved):
     service = getattr(authority_config, 'service_namespace', actor_names.SERVICE_NAMESPACE)
     service = (service, actor_names.SERVICE_NAMESPACE)
     reason = actor_names.collision(namespace, service=service, **reserved())
-    if reason is None and not credential.get('actor_rows_checked'):
-        # Issued before the row rule: the project's own rows still decide (kittrial-5bb.188).
+    if reason is None and credential.get('actor_rows_refused'):
+        # Judged by the rows at an earlier write and refused then: refuse again without a
+        # read (kittrial-5bb.188 item 5). The stored reason is the kit's own rule word.
+        stored = credential.get('actor_rows_refused')
+        reason = stored if isinstance(stored, str) and stored else actor_names.ROWS
+    elif reason is None and not (credential.get('actor_rows_checked') or credential.get('actor_waived')):
+        # Issued before the row rule, or never judged: the project's own rows decide
+        # (kittrial-5bb.188 items 1 and 5). Rows inside an earlier same-name credential's own
+        # lifetime that the row rule did not refuse are not held against this one (item 3);
+        # a superuser's waiver (item 4) is its own settled mark and skips this.
         issued = credential.get('created_at')
-        reason = actor_names.collision(namespace, service=service,
-                                       **reserved(rows=issued if isinstance(issued, str) and issued else True))
+        own = actor_names.own_intervals(state.get('credentials') or {}, namespace,
+                                        credential.get('user_id'), credential.get('project_id'),
+                                        exclude=authority.get('credential_id'))
+        try:
+            reason = actor_names.collision(namespace, service=service,
+                                           **reserved(rows=issued if isinstance(issued, str) and issued else True,
+                                                      own=own))
+        except actor_names.TrackerUnreadable as unreadable:
+            # Not a refusal of the request: the tracker could not be read (item 1).
+            return _envelope(2, stderr='%s\n' % unreadable, fault='tracker')
     if reason is not None:
         return _envelope(126, stderr='%s\n' % actor_names.refusal(namespace, reason), authority_status=403)
     return None

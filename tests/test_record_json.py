@@ -191,6 +191,7 @@ class NoUnguardedParseTests(unittest.TestCase):
                          '(kittrial-5bb.184) reads the web state and an export and catches RecursionError itself'),
         'artifacts.py': (1, 'the artifact index the kit writes'),
         'bootstrap.py': (2, 'bd output on the host'),
+        'bd_refusals.py': (1, "bd's own answer to one command; it catches RecursionError itself"),
         'briefing.py': (3, 'bd comment-write receipt and the snapshot files the kit writes; exports use the guard'),
         'capabilities.py': (1, "a graph.json in the caller's own checkout; it catches RecursionError itself"),
         'capability_misses.py': (1, 'the telemetry file the kit writes; any failure starts a new log'),

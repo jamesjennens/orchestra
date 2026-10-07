@@ -112,6 +112,18 @@ class AddressCase(Case):
             time.sleep(0.02)
         self.assertEqual(self.httpd.open_connections(address), count)
 
+    def requests_being_served(self, expected, within=30.0):
+        """The requests counted per forwarded address, once the server has given back the ones it answered.
+
+        A request's place is given back when its handler returns, a moment after the client has
+        its answer: read at once, the count still held it (seen on Windows in CI, {'203.0.113.9': 1}
+        for {}).
+        """
+        until = time.monotonic() + within
+        while time.monotonic() < until and self.httpd._requests_by_address != expected:
+            time.sleep(0.02)
+        self.assertEqual(self.httpd._requests_by_address, expected)
+
     def turned_away_at_once(self, address):
         extra = self.silent_from(address)
         self.assertLess(self.closed_by_the_server(extra, 1.0), 1.0)
@@ -326,7 +338,7 @@ class ProxyTests(AddressCase):
         with contextlib.redirect_stderr(logged):
             self.serve(client_seconds=30, address_limit=2, trusted_proxies=(PROXY,))
             self.assertEqual(self.forwarded(FAR)[0], 200)
-            self.assertEqual(self.httpd._requests_by_address, {})               # served and given back
+            self.requests_being_served({})               # served and given back
             # Two of its requests are being served (held here, as a slow action would hold them).
             self.assertTrue(self.httpd.request_begins(FAR))
             self.assertTrue(self.httpd.request_begins(FAR))
@@ -344,12 +356,12 @@ class ProxyTests(AddressCase):
             self.assertEqual(self.forwarded(OTHER)[0], 200)
             self.assertEqual(self.get(PROXY)[0], 200)
             self.assertEqual(self.forwarded('not an address')[0], 200)
-            self.assertEqual(self.httpd._requests_by_address, {FAR: 2})
+            self.requests_being_served({FAR: 2})
             self.assertEqual((self.httpd.turned_away, self.httpd.turned_away_for_address), (0, 2))
             self.httpd.request_ends(FAR)
             self.assertEqual(self.forwarded(FAR)[0], 200)
             self.httpd.request_ends(FAR)
-            self.assertEqual(self.httpd._requests_by_address, {})
+            self.requests_being_served({})
         said = logged.getvalue()
         self.assertEqual(said.count("connections: '203.0.113.9' has 2 requests being served, the limit for one address; "
                                     "further ones from it are answered 503"), 1, said)
@@ -374,7 +386,7 @@ class ProxyTests(AddressCase):
             self.assertEqual(self.get(B)[0], 200)                                # not through the proxy: not counted
         self.assertEqual(seen, [{FAR: 1}, {'2001:db8:1:2::/64': 1}, {FAR: 1}, {}])
         self.settled()
-        self.assertEqual(self.httpd._requests_by_address, {})
+        self.requests_being_served({})
 
     @needs_addresses
     def test_a_request_over_the_limit_is_not_carried_out(self):

@@ -34,10 +34,31 @@ The head and the case are what the review workflow's own comparison uses
 author. A name with the shape of a web account or agent id is not this module's business:
 ``http_authority.http_actor_denial`` and ``Service.issue_credential`` hold those.
 
+Rows inside an earlier credential's own lifetime are not held against a renewal under the
+same name by the same owner (kittrial-5bb.188 item 3, :func:`own_intervals`), and a
+credential is judged by the rows once, with the outcome kept on it, not on every write
+(item 5, ``http_service.EndpointBackend``). An export that yields no rows at all is a
+failure, never "the tracker holds nothing" (item 1, :class:`TrackerUnreadable`).
+
 Pure and without imports of the kit, so the web service uses it on every platform.
 """
 import datetime
 import re
+
+
+class TrackerUnreadable(ValueError):
+    """An export that yielded no rows at all: not a tracker that was read.
+
+    Every project this kit makes holds at least the merge slot, so an export that parses
+    to zero rows did not answer with the tracker (kittrial-5bb.188 item 1: the reviewer
+    made ``bd export`` exit 0 and print nothing, and the empty answer read as "the tracker
+    holds no names", which opened the rule). It is a host fault, not a refusal of the
+    request: the caller answers 503 and nothing was changed.
+    """
+
+    MESSAGE = ("The project's tracker answered no rows, and every project this kit makes holds "
+               "at least the merge slot. Nothing was changed; try again shortly.")
+
 
 #: The shape of the actors ``sessions.py`` makes.
 SESSION_ACTOR = re.compile(r'session-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
@@ -182,7 +203,7 @@ def later(one, other):
     return max(one, other)
 
 
-def tracker_names(marks, before=None):
+def tracker_names(marks, before=None, own=()):
     """The heads among ``marks`` that were writing before ``before``; every one when it is None.
 
     ``before`` is the instant the credential was issued (an ISO-8601 stamp or seconds): a name
@@ -192,11 +213,21 @@ def tracker_names(marks, before=None):
     the credential's own, so the credential's issuance stamp (the web service's clock) and its
     first row (the host's clock) need not agree to the second. ``before`` that cannot be read
     at all is treated as "no boundary", which is the strict reading.
+
+    ``own`` are ``(start, end)`` lifetimes (seconds; ``end`` None is open) of earlier
+    credentials of the SAME name issued by the SAME owner for the SAME project which the row
+    rule did not refuse (:func:`own_intervals`). A mark inside such a lifetime is that
+    earlier credential's own row and is not held against this one (kittrial-5bb.188 item 3),
+    even though it is older than ``before``. A mark with no readable time cannot be placed in
+    a lifetime and stays somebody else's.
     """
     names = set()
     boundary = None if before is None else instant(before)
+    windows = [window for window in (own or ()) if isinstance(window, (tuple, list)) and len(window) == 2]
     for name, when in marks or ():
         if not isinstance(name, str) or not name:
+            continue
+        if when is not None and inside_own(when, windows):
             continue
         if before is None or boundary is None or when is None:
             names.add(name)
@@ -204,3 +235,60 @@ def tracker_names(marks, before=None):
         if when < boundary - OWN_ROWS_SKEW_SECONDS:
             names.add(name)
     return names
+
+
+def inside_own(when, windows):
+    """Whether a row instant lies inside any own-lifetime window, within the skew allowance."""
+    if when is None:
+        return False
+    for start, end in windows:
+        if not isinstance(start, (int, float)) or isinstance(start, bool):
+            continue
+        if when < start - OWN_ROWS_SKEW_SECONDS:
+            continue
+        if end is not None and (not isinstance(end, (int, float)) or isinstance(end, bool)):
+            continue
+        if end is None or when <= end + OWN_ROWS_SKEW_SECONDS:
+            return True
+    return False
+
+
+def own_intervals(credentials, namespace, user_id, project_id, exclude=None):
+    """The lifetimes of earlier credentials whose rows this name may claim (kittrial-5bb.188 item 3).
+
+    ``credentials`` maps credential id -> record. An earlier credential is a predecessor when
+    it has the SAME head (compared as :func:`head`, i.e. case-folded and before the first
+    ``/``), the SAME issuer (``user_id``) and the SAME project, and the row rule did not
+    refuse it: a record carrying ``actor_rows_refused`` is not a predecessor, so its rows are
+    held. A predecessor's lifetime runs from its issuance (``issued_raw`` when it is a number,
+    else ``created_at``) to its ``revoked_at`` when it is revoked, or is open at the end when
+    it is not. A predecessor whose issuance -- or, when revoked, whose revocation -- cannot be
+    read contributes nothing: the kit cannot show the rows are the credential's own, so they
+    stay somebody else's, which is the fail-closed reading. The judge's own record is skipped
+    by ``exclude``. Returns a list of ``(start, end)`` in seconds; ``end`` None is open.
+    """
+    mine = head(namespace)
+    if not mine or not isinstance(user_id, str) or not user_id or not isinstance(project_id, str):
+        return []
+    windows = []
+    for identifier, credential in (credentials or {}).items():
+        if not isinstance(credential, dict) or identifier == exclude:
+            continue
+        if credential.get('user_id') != user_id or credential.get('project_id') != project_id:
+            continue
+        if head(credential.get('actor')) != mine:
+            continue
+        if credential.get('actor_rows_refused'):
+            continue                              # itself refused by the row rule: no claim to its rows
+        start = credential.get('issued_raw')
+        if not isinstance(start, (int, float)) or isinstance(start, bool):
+            start = instant(credential.get('created_at'))
+        if start is None:
+            continue                              # fail closed: no issuance, no lifetime
+        end = None
+        if credential.get('revoked'):
+            end = instant(credential.get('revoked_at'))
+            if end is None:
+                continue                          # fail closed: revoked with no readable time
+        windows.append((float(start), None if end is None else float(end)))
+    return windows

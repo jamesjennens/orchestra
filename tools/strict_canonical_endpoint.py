@@ -110,6 +110,11 @@ class Canonical:
                 description = source.read_text(encoding='utf-8') if source.exists() else ''
             labels = [label for label in option('--labels', '').split(',') if label]
             issue_type = option('--type', 'task')
+            # As bd 1.2.2 refuses a title (measured, kittrial-5bb.185): exit 1, the sentence on standard error.
+            if not title:
+                return 1, '', 'Error: validation failed for issue : title is required\n'
+            if len(title) > 500:
+                return 1, '', 'Error: validation failed for issue : title must be 500 characters or less (got %d)\n' % len(title)
             # bd stores priority as a number and defaults to 2 (kittrial-5bb.183).
             priority = option('--priority', '2')
             if '--dry-run' in rest:
@@ -152,7 +157,9 @@ class Canonical:
                 return 0, json.dumps(found), ''
             row = next((r for r in self.rows() if r['id'] == (rest[0] if rest else '')), None)
             if row is None:
-                return 2, '', 'task not found'
+                # As bd 1.2.2 answers a show of a row it cannot find (measured, kittrial-5bb.185).
+                return 1, json.dumps({'error': 'no issues found matching the provided IDs', 'schema_version': 1}, indent=2) + '\n', \
+                    'Error fetching %s: no issue found matching "%s"\n' % ((rest[0] if rest else ''), (rest[0] if rest else ''))
             return 0, json.dumps(row), ''
         if command == 'close':
             task = rest[0] if rest else ''
@@ -167,6 +174,29 @@ class Canonical:
             return 0, text, ''
         if command == 'update':
             task = rest[0] if rest else ''
+            if '--claim' in rest:
+                # bd's own claim, as bd 1.2.2 answers it (measured, kittrial-5bb.187): for the
+                # actor of the command; refused when the row is somebody else's or is not open.
+                held = next((r for r in self.rows() if r['id'] == task), None)
+                if held is not None:
+                    if held.get('assignee') and held['assignee'] != self.actor:
+                        return 1, '', 'Error claiming %s: issue already claimed by %s\n' % (task, held['assignee'])
+                    if held.get('status') not in ('open', 'in_progress'):
+                        return 1, '', 'Error claiming %s: issue not claimable: status %s\n' % (task, held.get('status'))
+
+                    def claimed(state):
+                        row = self._row(state, task)
+                        row['assignee'], row['status'] = self.actor, 'in_progress'
+                        return row
+                    return 0, json.dumps([self._mutate(claimed)]), ''
+            if '--title' in rest and rest.index('--title') + 1 < len(rest):
+                # As bd 1.2.2 (measured, kittrial-5bb.185): an empty title is refused in bd's JSON
+                # form; one over 500 characters is refused by the DATABASE, a bare sentence.
+                wanted = rest[rest.index('--title') + 1]
+                if not wanted:
+                    return 1, json.dumps({'error': 'title cannot be empty', 'schema_version': 1}, indent=2) + '\n', ''
+                if len(wanted) > 500:
+                    return 1, '', "%s' is too large for column 'title'\n" % wanted
             if not [token for token in rest[1:] if token != '--json']:
                 # As bd 1.2.2 does (measured, kittrial-5bb.181): an update that names no
                 # change is answered with these words and exit 0, and nothing is written.
@@ -291,6 +321,11 @@ def dispatch(canonical, request, tmp, run=None):
             raise ValueError('Command is outside the contributor interface')
         final = materialize(args, attachments, tmp)
         code, stdout, stderr = canonical.bd(final)
+        # endpoint.py's reading of a refusal bd makes before it writes (kittrial-5bb.185).
+        import bd_refusals
+        refused = bd_refusals.refusal(code, stdout, stderr)
+        if refused is not None:
+            return bd_refusals.envelope(*refused)
         return envelope(code, stdout, stderr)
     if action == 'checkpoint':
         from briefing import execute as briefing_execute
@@ -557,22 +592,29 @@ def main():
             print(json.dumps(denied))
             return
         # endpoint.py's rule for a name WITHOUT the shape of a web id (kittrial-5bb.184), with the
-        # project's tracker rows (kittrial-5bb.188 item 1). This stub has no session registry, no
-        # deployment file and no bd: the names its host "has" are read from
+        # project's tracker rows (kittrial-5bb.188 items 1 and 3). This stub has no session
+        # registry, no deployment file and no bd: the names its host "has" are read from
         # <root>/reserved-actors.json when a test put one there. `author-rows` is a planted list
-        # of {"name": ..., "when": ...} and stands in for one bd export; `authors` is the plain
-        # list a test that does not care about the boundary can plant instead.
-        def reserved(rows=False):
+        # of {"name": ..., "when": ...} and stands in for one bd export (and lets the renewal
+        # lifetimes be exercised); `authors` is the plain list a test that does not care about the
+        # boundary can plant instead. `"tracker": "unreadable"` stands in for an export that
+        # answers no rows.
+        def reserved(rows=False, own=()):
             planted = root / 'reserved-actors.json'
             names = json.loads(planted.read_text(encoding='utf-8')) if planted.is_file() else {}
             found = {key: names.get(key, []) for key in ('sessions', 'operators', 'verifiers')}
             if rows:
                 import actor_names
+                if names.get('tracker') == 'unreadable':
+                    raise actor_names.TrackerUnreadable()
                 marks = [(str(item.get('name') or ''), actor_names.instant(item.get('when')))
                          for item in (names.get('author-rows') or names.get('author_rows') or [])
                          if isinstance(item, dict)]
+                windows = [window for window in (own or ())
+                           if isinstance(window, (list, tuple)) and len(window) == 2]
                 if marks:
-                    found['authors'] = sorted(actor_names.tracker_names(marks, None if rows is True else rows))
+                    found['authors'] = sorted(actor_names.tracker_names(marks, None if rows is True else rows,
+                                                                        windows))
                 else:
                     found['authors'] = names.get('authors', [])
             return found
@@ -583,8 +625,17 @@ def main():
             return
         if request.get('action') == 'actor-standing':
             import actor_names
+            if request.get('tracker') and config is None:
+                # Only the service (launched with an authority store) may make the endpoint
+                # read the tracker (kittrial-5bb.188 item 6).
+                print(json.dumps(envelope(2, stderr='ValueError: actor-standing with rows is for the '
+                                                    'web service only\n')))
+                return
+            own = request.get('own') if request.get('tracker') else ()
+            rows = request.get('tracker')
+            rows = rows if isinstance(rows, str) else bool(rows)
             print(json.dumps(envelope(0, stdout=json.dumps({'schema_version': 1, 'names': {
-                name: actor_names.collision(name, **reserved(bool(request.get('tracker'))))
+                name: actor_names.collision(name, **reserved(rows, own))
                 for name in request.get('args') or []}}))))
             return
         if request.get('action') == 'set-onboarding':
@@ -608,6 +659,11 @@ def main():
             answer = dispatch(canonical, request, tmp, run_callable)
     except Exception as error:  # noqa: BLE001 - report, never traceback
         answer = envelope(2, stderr='%s: %s\n' % (type(error).__name__, error))
+        import actor_names                    # a local import elsewhere in main() shadows the module name
+        if isinstance(error, actor_names.TrackerUnreadable):
+            # As endpoint.main does: an export that answered no rows is a host fault the
+            # service reads as 503 "nothing was changed" (kittrial-5bb.188 item 1).
+            answer['fault'] = 'tracker'
     print(json.dumps(answer, ensure_ascii=False))
 
 
