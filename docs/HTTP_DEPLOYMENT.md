@@ -1090,8 +1090,70 @@ Whoever claimed last then passed every rule that asks "is the caller the assigne
 (contribute, respond, the checkpoint's directions). The host client's own claim
 (`update TASK --claim`) was bd's claim all along and never had the fault. The
 in-process backend (the tests' and the local preview's) refused both cases already;
-it also refuses a second claim by the SAME member with 409, where a real installation
-answers 200.
+it refused a second claim by the SAME member too, and now answers it 200, unchanged,
+as a real installation does.
+
+### The name a worker credential writes under
+
+A worker credential writes under the actor namespace its issuer chose (`actor` when it
+is issued): `NAME`, or a label `NAME/...`. The tracker's rows carry that name and
+nothing else, and the review workflow asks "is the caller the assignee, is it the
+author" of the name. So the name must be nobody else's (kittrial-5bb.184). A namespace
+is refused when its head, the part before the first `/`, compared without regard to
+case, is the head of:
+
+- a session actor registered in the project;
+- any name with the shape of a session actor (`session-<uuid>`), registered or not: the
+  server makes those;
+- a name on the operator list or the verifier list of the installation;
+- the web service's own namespace (`http`, or what `--actor-namespace` set).
+
+A name with the shape of another account's or agent's id was already refused. A
+credential without `actor` writes under its issuer's own account id, as before.
+
+**At issue**, `POST /v1/projects/{id}/worker-credentials` answers 422, "A worker
+credential cannot write as NAME: that is a name on the operator list. Choose another
+name.", with the rule in `error.detail` and never another name of the host's. Nothing
+is kept, the idempotency key included. Only somebody who may issue a credential is
+told: a contributor is answered 403 and an outsider 404 whatever the name. If the host
+cannot be asked, nothing is issued.
+
+**At use**, the endpoint itself refuses: a request the web service sends with its
+descriptor under a name that does not have the shape of a web id is written only by a
+worker credential, inside that credential's own namespace, and only when the namespace
+passes the rule above, read from the host at that moment. Otherwise the write answers
+403 with the sentence and what to do ("Revoke it and issue one under another name."),
+and nothing is written or reserved. So a credential issued before this rule stops
+writing with the upgrade, and so does one whose name is put on the operator or verifier
+list afterwards (and it writes again when the name is taken off). It still READS:
+reads carry no name into the tracker. A signed-in account and an agent write under
+their own id as before; over SSH nothing changes.
+
+**Before this**, a project owner could issue a credential named as the host
+coordinator's session and with it create a task, claim one, contribute, answer the
+changes requested of the coordinator on the coordinator's own task and write its
+checkpoint: every rule decided by "is the caller the assignee or the author". Approval
+was refused, as it is for every credential. The rows such a credential wrote cannot be
+told from the real actor's by the rows; the web audit log names the credential, and
+the operation journal keeps the credential's id beside the actor for about 30 days.
+
+**Credentials that already have such a name.** The list of a project's credentials
+(`GET .../worker-credentials`) carries `actor_refused` for each: `null`, or the
+sentence. The owner revokes it and issues one under another name. For the whole
+installation an operator runs, on the host:
+
+```sh
+python3 admin.py --root /path/to/runtime credential-actors --state /path/to/http-state.json
+```
+
+It reads and changes nothing. For every worker credential with a name it prints the
+project, the label, the name, who issued it, when it was last used, `collides` (the
+rule, or `null`), and `tracker_rows`: whether the project's tracker already has rows
+under that name. For a name that collides those rows may be the real actor's or the
+credential's. For a name that does not, they are what a credential under that name
+wrote, or an actor from before sessions were registered: the kit does not refuse such
+a name (a credential reissued under its own earlier name must still work, and the rows
+cannot tell the two apart), so it is worth a look when nobody remembers issuing it.
 
 ### What an agent needs to write a checkpoint
 

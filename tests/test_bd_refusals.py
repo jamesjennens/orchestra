@@ -140,8 +140,18 @@ class RecogniserTests(unittest.TestCase):
                                   'refused': INVALID})
 
 
+def without_inherited_tests(cls):
+    """The real-bd fixture is a TestCase with tests of its own; a class that only borrows its
+    runtime does not run them a second time."""
+    for name in dir(rb.RealBdLabelAliasTests):
+        if name.startswith('test_') and name not in cls.__dict__:
+            setattr(cls, name, None)
+    return cls
+
+
 @unittest.skipIf(rb.endpoint is None, 'endpoint imports fcntl (POSIX-only)')
 @unittest.skipIf(rb.BD is None, 'no real bd binary (set ORCHESTRA_BD_BIN or put bd on PATH)')
+@without_inherited_tests
 class RealBdTests(rb.RealBdLabelAliasTests):
     """The table against the real binary: what it says, and that the tracker is as it was."""
 

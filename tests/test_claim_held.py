@@ -306,6 +306,30 @@ class StubCase(Members, fixes.EndpointCase):
                          (refused.status, message(refused), refused.data['error']['detail']))
 
 
+class InProcessCase(Members, fixes.Harness):
+    """The backend of the tests and the local preview: the same answers, by its own check."""
+
+    def test_a_held_task_a_closed_one_and_ones_own(self):
+        admin = self.admin_token()
+        self.members(self.create_project(admin, 'Alpha'))
+        task = self.new()
+        first = self.claim('casey', task)
+        self.assertEqual((200, self.ids['casey']), (first.status, first.data['assignee']), first.data)
+        # One's own again: 200 and nothing changed, as on a real installation (it was 409 here).
+        again = self.claim('casey', task)
+        self.assertEqual(200, again.status, again.data)
+        self.assertEqual((first.data['assignee'], first.data['version']), (again.data['assignee'], again.data['version']))
+        for who in ('drew', 'alex'):
+            refused = self.claim(who, task)
+            self.assertEqual((409, 'Task is already claimed'), (refused.status, message(refused)), refused.data)
+        closed = self.new('closed')
+        current = self.request('GET', '%s/%s' % (self.tasks, closed), token=self.tokens['alex']).data
+        done = self.request('PATCH', '%s/%s' % (self.tasks, closed), {'status': 'closed', 'version': current['version']},
+                            token=self.tokens['alex'])
+        self.assertEqual(200, done.status, done.data)
+        self.assertEqual((409, 'Task is not open'), (self.claim('drew', closed).status, message(self.claim('drew', closed))))
+
+
 class CheckedTests(unittest.TestCase):
     checked = staticmethod(lambda reply, **more: http_service.EndpointBackend._checked(reply, 'bd', **more))
 

@@ -1960,6 +1960,59 @@ def http_actor_denial(request, authority_config):
     return None
 
 
+def descriptor_actor_denial(request, authority_config, reserved):
+    """Why a request the web service sent under a name that is NOT a web id is refused, or None.
+
+    ``http_actor_denial`` judges an actor with the shape of an account or agent id. Every
+    other name went through unjudged, so the web service could be made to write under a
+    host actor's name: by a member, with an ``actor`` in the body of a task write
+    (kittrial-5bb.181, closed in the routes), and by a project owner, with a worker
+    credential ISSUED under that name (kittrial-5bb.184). The tracker's rows carry the name
+    and nothing else, and "is the caller the assignee, is it the author" is asked of the
+    name, so such a credential was that actor.
+
+    Launched by the service, with the live-authority descriptor, a name without the shape
+    of a web id is written only
+
+    * by a worker credential (the one the descriptor names, read from the live store),
+    * inside that credential's own namespace (``NAME`` or ``NAME/...``),
+    * when the namespace is nobody else's (``actor_names.collision``): not a session actor
+      of the project or a name of that shape, not a name on the operator or verifier
+      list, not the service's own namespace.
+
+    ``reserved`` is called only when a namespace has to be judged and returns the host's
+    names (``sessions``, ``operators``, ``verifiers``). A request without a descriptor is
+    not judged here: on the SSH path there is none, and the service's own reads carry
+    none; a write the service sends without one is refused by ``run_guarded``.
+    """
+    if authority_config is None:
+        return None
+    authority = request.get('authority')
+    actor = request.get('actor')
+    if not isinstance(authority, dict) or http_actor_id(actor) is not None:
+        return None
+    if isinstance(actor, str) and actor and actor == authority.get('user_id'):
+        return None                                  # the account itself, whatever its id looks like
+    import actor_names
+    try:
+        state = read_state(authority_config.store)
+    except AuthorityDenied as denied:
+        return _envelope(126, stderr='%s\n' % denied.message, authority_status=denied.status)
+    credential = (state.get('credentials') or {}).get(authority.get('credential_id')) \
+        if authority.get('via') == 'credential' and authority.get('credential_id') else None
+    if not isinstance(credential, dict) or credential.get('agent_id'):
+        return _envelope(126, stderr='The actor is not the account or agent the live-authority descriptor '
+                                     'names\n', authority_status=403)
+    namespace = credential.get('actor')
+    if not actor_names.inside(actor, namespace):
+        return _envelope(126, stderr='The actor is outside the namespace of the credential the live-authority '
+                                     'descriptor names\n', authority_status=403)
+    reason = actor_names.collision(namespace, **reserved())
+    if reason is not None:
+        return _envelope(126, stderr='%s\n' % actor_names.refusal(namespace, reason), authority_status=403)
+    return None
+
+
 def run_guarded(request, journal_path, effect, authority_config=None,
                 require_authority=False, runner=None, journal_options=None):
     """Run one canonical mutation through the live-authority and identity boundary.
