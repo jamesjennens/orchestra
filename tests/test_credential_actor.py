@@ -287,6 +287,17 @@ class IssueCase(HostNames, fixes.EndpointCase):
         self.assertEqual(201, self.request('POST', self.credentials, {'actor': own}, token=self.alex).status)
         self.assertEqual(422, self.request('POST', self.credentials, {'actor': self.casey_id}, token=self.alex).status)
 
+    def test_a_service_started_with_another_namespace_keeps_that_one_too(self):
+        self.project()
+        self.host()
+        with mock.patch.object(self.backend, 'actor_namespace', 'web'):
+            for name in ('web', 'web/read', 'WEB/x', 'http/read'):
+                with self.subTest(name=name):
+                    refused = self.request('POST', self.credentials, {'actor': name}, token=self.alex)
+                    self.assertEqual(422, refused.status, refused.data)
+                    self.assertIn(actor_names.SERVICE, message(refused))
+            self.assertEqual(201, self.request('POST', self.credentials, {'actor': 'webmaster'}, token=self.alex).status)
+
     def test_only_who_may_issue_one_is_told_whether_a_name_is_taken(self):
         """A member who may not issue a credential is refused as that, whatever the name: no probing of the lists."""
         self.project()
