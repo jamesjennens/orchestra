@@ -9,6 +9,7 @@ stays within Python 3.6.
 import ast
 import io
 import json
+import shutil
 import struct
 import subprocess
 import sys
@@ -304,6 +305,153 @@ class BuildCheckTests(ReleaseFixture):
         refused, _ = self.try_build('neither')
         self.assertIn('office-release: bd archive differs from versions.json pin', refused.stderr)
 
+    def test_a_missing_archive_path_is_a_sentence_not_a_bare_errno_line(self):
+        """kittrial-5bb.166 item 4: a mistyped path printed `[Errno 2] No such file or directory` alone."""
+        output = self.base/'missing-input.tar.gz'
+        arguments = ['build', '--repo', self.repo, '--commit', 'HEAD', '--build-id', 'missing-input',
+                     '--python-archive', self.python_archive,
+                     '--python-sha256', sha(self.python_archive.read_bytes()),
+                     '--python-executable', 'bin/python3', '--bd-archive', self.bd_archive,
+                     '--dolt-archive', self.dolt_archive, '--output', output]
+        for option in ('--bd-archive', '--dolt-archive'):
+            with self.subTest(option=option):
+                missing = str(self.base/('no-such' + option.replace('--', '-') + '.tar.gz'))
+                attempt = list(arguments)
+                attempt[attempt.index(option)+1] = missing
+                refused = self.run_tool(*attempt)
+                self.assertEqual(refused.returncode, 1)
+                self.assertIn('office-release: The %s file does not exist: %s' % (option, missing), refused.stderr)
+                self.assertNotIn('Errno', refused.stderr)
+                self.assertFalse(output.exists())
+
+    #: A stub bd that behaves like bd's detached usage-metrics child: a tight writer keeps
+    #: refilling its event lock so the run check's scratch fills again while it is being removed
+    #: (kittrial-5bb.166). A separate killer stops the writer after about two seconds, so the
+    #: writer is tight enough to make the old single removal fail deterministically and still
+    #: stops well inside the retry budget; both children discard their stdio, so the build does
+    #: not wait for them, and the marker outside HOME proves the writer ran.
+    KEEPS_WRITING = (b'#!/bin/sh\n'
+                     b'echo "bd version 1.2.2 (writes its event lock)"\n'
+                     b'if [ -n "$K166_MARKER" ]; then : > "$K166_MARKER"; fi\n'
+                     b'(\n'
+                     b'  while :; do\n'
+                     b'    [ -d "$HOME/.beads/eventsData" ] || mkdir -p "$HOME/.beads/eventsData"\n'
+                     b'    : > "$HOME/.beads/eventsData/eventkit.lock"\n'
+                     b'  done\n'
+                     b') >/dev/null 2>&1 &\n'
+                     b'WRITER=$!\n'
+                     b'( sleep 2; kill "$WRITER" 2>/dev/null; sleep 1; kill -9 "$WRITER" 2>/dev/null ) '
+                     b'>/dev/null 2>&1 &\n'
+                     b'exit 0\n')
+
+    def test_a_run_check_that_keeps_writing_its_event_lock_neither_fails_nor_litters(self):
+        import os
+        from unittest import mock
+        self.bundle('bd', self.KEEPS_WRITING)
+        marker = self.base/'writer-ran'
+        prefix = 'office-release-check-'
+        before = set(Path(tempfile.gettempdir()).glob(prefix+'*'))
+        with mock.patch.dict(os.environ, {'K166_MARKER': str(marker)}):
+            done, output = self.try_build('leaves-an-event-lock')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.strip(), '%s  %s' % (sha(output.read_bytes()), output))
+        self.assertTrue(marker.exists(), 'the stub bd did not run its writer')
+        self.assertEqual(set(Path(tempfile.gettempdir()).glob(prefix+'*')) - before, set())
+
+    def test_a_scratch_that_cannot_be_removed_is_said_and_still_builds(self):
+        """kittrial-5bb.166 item 4: cleanup never fails a build, but the build must say it stayed."""
+        import argparse
+        from unittest import mock
+        output = self.base/'says-so.tar.gz'
+        args = argparse.Namespace(
+            repo=str(self.repo), commit='HEAD', build_id='says-so',
+            python_archive=str(self.python_archive), python_sha256=sha(self.python_archive.read_bytes()),
+            python_executable='bin/python3', bd_archive=str(self.bd_archive),
+            dolt_archive=str(self.dolt_archive), output=str(output), target_glibc=None, no_run_check=False)
+        scratch = self.base/'office-release-check-says-so'
+
+        def mkdtemp(prefix='', dir=None):
+            scratch.mkdir(parents=True, exist_ok=True)
+            return str(scratch)
+        said, printed = io.StringIO(), io.StringIO()
+        with mock.patch.object(tool.tempfile, 'mkdtemp', mkdtemp), \
+                mock.patch.object(tool, 'remove_scratch', lambda path: False), \
+                mock.patch.object(sys, 'stderr', printed), mock.patch.object(sys, 'stdout', said):
+            self.assertIsNone(tool.build(args))
+        self.assertIn('office-release: could not remove the run-check scratch directory %s' % scratch,
+                      printed.getvalue())
+        self.assertTrue(output.exists())
+
+    def test_the_run_check_starts_every_binary_with_metrics_off(self):
+        """Each program's own switch stops its detached child; both were measured (kittrial-5bb.166)."""
+        from unittest import mock
+
+        class Said:
+            returncode, stdout = 0, b'bd version 1.2.2\n'
+
+        seen = {}
+
+        def fake_run(command, **options):
+            seen.update(options.get('env') or {})
+            return Said()
+        with mock.patch.object(tool.subprocess, 'run', fake_run):
+            self.assertEqual(tool.starts('bd', '/bin/true', ['--version'], self.base), 'bd version 1.2.2')
+        self.assertEqual(seen.get('BD_DISABLE_METRICS'), '1')
+        # dolt re-executes itself as `dolt send-metrics` after `dolt version` returns unless this is set.
+        self.assertEqual(seen.get('DOLT_DISABLE_EVENT_FLUSH'), '1')
+        self.assertEqual(seen.get('HOME'), str(self.base))
+
+
+@unittest.skipUnless(LINUX, 'the scratch removers are exercised on Linux')
+class RemoveScratchTests(unittest.TestCase):
+    """`remove_scratch` keeps looking and reports the truth (kittrial-5bb.166 item 4 mutants).
+
+    Five mutants of the run check's scratch removal survived revision 1: not looking again
+    after the first removal, stopping at the first look, always reporting success, losing the
+    "could not remove" line in `build`, and `verify` no longer removing its scratch. Each test
+    here pins one of those, so a mutation of that bookkeeping fails.
+    """
+
+    def scratch(self):
+        made = Path(tempfile.mkdtemp(prefix='k166-remove-'))
+        self.addCleanup(shutil.rmtree, str(made), True)
+        return made
+
+    def removals(self, recreate_on=()):
+        """Do the real removals, and put the scratch back after the 1-based calls named."""
+        from unittest import mock
+        real, seen = shutil.rmtree, []
+
+        def rmtree(path, **options):
+            real(path, **options)
+            seen.append(str(path))
+            if len(seen) in recreate_on:
+                Path(path).mkdir()
+                (Path(path)/'late').write_text('x', encoding='utf-8')
+        patcher = mock.patch.object(tool.shutil, 'rmtree', rmtree)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return seen
+
+    def test_it_keeps_looking_until_the_scratch_stays_gone(self):
+        from unittest import mock
+        scratch = self.scratch()
+        seen = self.removals(recreate_on=(1, 2))          # a late writer undoes the first two removals
+        with mock.patch.object(tool, 'SCRATCH_PAUSE', 0):
+            self.assertTrue(tool.remove_scratch(scratch))
+        self.assertFalse(scratch.exists())
+        # It may only say success after a removal that then stayed gone for a whole quiet pause
+        # (SCRATCH_QUIET = 2): the third removal is the first quiet one, the fourth confirms it.
+        self.assertEqual(len(seen), 4)
+
+    def test_it_reports_failure_when_the_scratch_never_stays_gone(self):
+        from unittest import mock
+        scratch = self.scratch()
+        self.removals(recreate_on=range(1, 20))           # a writer that refills it after every removal
+        with mock.patch.object(tool, 'SCRATCH_TRIES', 3), mock.patch.object(tool, 'SCRATCH_PAUSE', 0):
+            self.assertFalse(tool.remove_scratch(scratch))
+        self.assertTrue(scratch.exists())
+
 
 @unittest.skipUnless(LINUX, 'Linux release install only')
 class InstallCheckTests(ReleaseFixture):
@@ -407,6 +555,16 @@ class InstallCheckTests(ReleaseFixture):
         failed = self.run_tool('verify', '--install-root', root)
         self.assertEqual(failed.returncode, 1)
         self.assertIn('office-release: bd cannot start on this host (exit code 1)', failed.stderr)
+
+    def test_verify_removes_its_own_scratch_directory(self):
+        """kittrial-5bb.166 item 4: verify must remove the scratch it made, not only the one inside it."""
+        root = self.base/'installation'
+        self.assertEqual(self.install(self.build('verify-scratch'), root).returncode, 0)
+        prefix = 'office-release-verify-'
+        before = set(Path(tempfile.gettempdir()).glob(prefix+'*'))
+        verified = self.run_tool('verify', '--install-root', root)
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+        self.assertEqual(set(Path(tempfile.gettempdir()).glob(prefix+'*')) - before, set())
 
 
 @unittest.skipUnless(LINUX, 'bootstrap installs Linux binaries only')
@@ -545,6 +703,73 @@ class VerifyRecordTests(unittest.TestCase):
         (self.root/'bin'/'bd').unlink()
         missing = self.verify.bundled_bd(self.root, self.kit)
         self.assertEqual((missing['starts'], bool(missing['says'])), (False, True))
+
+
+@unittest.skipUnless(LINUX, 'reads an installed release and starts a stand-in program')
+class VerifyMainWiringTests(unittest.TestCase):
+    """`office_verify.main` puts `bundled_bd` in the record and its outcome in the exit status.
+
+    `bundled_bd` itself is covered above; kittrial-5bb.166 item 3: two mutations survived
+    because only the function was tested, not its wiring into the entry point the operator
+    runs — dropping the `bd` entry from the record, and main ignoring a bd that cannot start.
+    """
+
+    def setUp(self):
+        import office_verify
+        self.verify = office_verify
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        base = Path(self.tmp.name)
+        self.root = base/'runtime'
+        self.install = base/'installation'
+        (self.root/'bin').mkdir(parents=True)
+        release = self.install/'releases'/'build-1'
+        kit = release/'kit'
+        kit.mkdir(parents=True)
+        contents = {'client.py': b'pass\n'}
+        for name, data in contents.items():
+            (kit/name).write_bytes(data)
+        (kit/'VERSION').write_text('0.1.0\n', encoding='utf-8')
+        (kit/'provenance.json').write_text(json.dumps({
+            'schema_version': 1, 'component': 'orchestra-kit', 'version': '0.1.0',
+            'source_commit': 'unknown', 'build_id': 'build-1',
+            'files': {name: sha(data) for name, data in contents.items()}}), encoding='utf-8')
+        (kit/'versions.json').write_text(json.dumps({'bd': {'sha256': 'a' * 64}}), encoding='utf-8')
+        (release/'manifest.json').write_text(json.dumps(
+            {'build_id': 'build-1', 'source_commit': 'unknown'}), encoding='utf-8')
+        (self.install/'current').symlink_to('releases/build-1')
+
+    def carry(self, script):
+        program = self.root/'bin'/'bd'
+        program.write_bytes(script)
+        program.chmod(0o755)
+        (self.root/'bin'/'bd.receipt.json').write_text(json.dumps({'archive_sha256': 'a' * 64}),
+                                                       encoding='utf-8')
+
+    def run_main(self):
+        from unittest import mock
+        import office_service
+        printed = io.StringIO()
+        # main's tools/office_verify.py calls health(root, port, settings) since kittrial-5bb.163;
+        # a two-argument stub raises TypeError on the merge even though it passes on the old base.
+        healthy = lambda root, port, settings=None: ('version=0.1.0 db=up web=up backup=complete backup_at=x', 0)
+        with mock.patch.object(office_service, 'health', healthy), mock.patch.object(sys, 'stdout', printed):
+            code = self.verify.main(['--install-root', str(self.install), '--root', str(self.root), '--port', '1'])
+        return code, json.loads(printed.getvalue())
+
+    def test_a_bd_that_cannot_start_is_in_the_record_and_makes_main_exit_nonzero(self):
+        self.carry(b'#!/bin/sh\necho "bd: /lib64/libc.so.6: version \\`GLIBC_2.34\' not found" >&2\nexit 1\n')
+        code, record = self.run_main()
+        self.assertEqual(record['bd']['pin'], 'bd')
+        self.assertFalse(record['bd']['starts'])
+        self.assertIn("GLIBC_2.34' not found", record['bd']['says'])
+        self.assertEqual(code, 1)
+
+    def test_a_bd_that_starts_is_in_the_record_and_main_exits_zero(self):
+        self.carry(b'#!/bin/sh\necho "bd version 1.2.2 (6c124203e)"\n')
+        code, record = self.run_main()
+        self.assertEqual(record['bd'], {'pin': 'bd', 'starts': True, 'says': 'bd version 1.2.2 (6c124203e)'})
+        self.assertEqual(code, 0)
 
 
 if __name__ == '__main__':

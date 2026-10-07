@@ -11,16 +11,30 @@ set `ORCHESTRA_BD_BIN` to the bd binary (a sibling `dolt` is copied too), or
 have `bd` on PATH. Without one the class skips and the stub-backed
 endpoint/reserved_comments tests still cover the same spellings. The suite is
 POSIX-only because endpoint.py imports fcntl.
+
+The tracker is made in SERVER mode (kittrial-5bb.166). A bare `bd init` is
+embedded mode, which the static bd does not have, so these three tests skipped
+whenever `ORCHESTRA_BD_BIN` was the static bd. The fixture now starts a scratch
+Dolt SQL server from the `dolt` binary beside bd and initializes the tracker
+against it, in the mode the kit itself uses; with no `dolt` beside bd the class
+skips and says so. The server runs with HOME, DOLT_ROOT_PATH and XDG_CONFIG_HOME
+inside the fixture, so its writes stay there and never touch the runner's own
+`~/.dolt`, and the class stops it on SIGTERM/SIGINT as well as at the end
+(kittrial-5bb.166 item 2).
 """
+import csv
+import io
 import json
 import os
 import shutil
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
-from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -51,46 +65,138 @@ RESERVED_VALUES = ('requirement', 'requirement:draft', 'requirement:accepted',
 class RealBdLabelAliasTests(unittest.TestCase):
     """Every accepted create/update label spelling, driven through endpoint."""
 
+    #: The scratch deployment password, matching the one the fixture puts on the Dolt root.
+    PASSWORD = 'x'
+    READY_TRIES, READY_PAUSE = 120, 0.5
+
+    @classmethod
+    def _free_port(cls):
+        with socket.socket() as probe:
+            probe.bind(('127.0.0.1', 0))
+            return probe.getsockname()[1]
+
+    @classmethod
+    def _stop_server(cls):
+        server = getattr(cls, 'server', None)
+        if server is None:
+            return
+        server.terminate()
+        try:
+            server.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            server.wait(timeout=15)
+
+    @classmethod
+    def _signalled(cls, signum, frame):
+        """A test process stopped with SIGTERM must not leave the scratch server or its folder.
+
+        kittrial-5bb.166 item 2: the fixture's Dolt server is a child of the test process, so
+        stopping the runner used to leave both the server and its ``bd-alias-*`` folder behind.
+        ``tearDownClass`` cannot run on a signal, so the handler does its work and re-raises.
+        """
+        cls._stop_server()
+        cls._tmp.cleanup()
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    @classmethod
+    def _watch_signals(cls):
+        """Stop the server on SIGTERM/SIGINT as well as at the end of the class.
+
+        Only the main thread may set a handler; a run that is not in it simply keeps the
+        normal cleanup path.
+        """
+        cls._signals = {}
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            try:
+                cls._signals[signum] = signal.signal(signum, cls._signalled)
+            except ValueError:
+                pass
+
+    @classmethod
+    def _await_server(cls):
+        """Wait until the scratch Dolt server answers; connect with the fresh root's empty password."""
+        for _ in range(cls.READY_TRIES):
+            try:
+                admin.sql(cls.root, 'SELECT 1;', password='')
+                return
+            except (subprocess.CalledProcessError, OSError):
+                time.sleep(cls.READY_PAUSE)
+        raise unittest.SkipTest('the scratch Dolt server did not become ready')
+
+    @classmethod
+    def _set_root_password(cls):
+        """Give the scratch server the same root password `admin.environment` will send."""
+        users = admin.sql(cls.root, 'SELECT User,Host FROM mysql.user;', password='')
+        changes = ["ALTER USER '%s'@'%s' IDENTIFIED BY '%s';"
+                   % (row['User'].replace("'", "''"), row['Host'].replace("'", "''"), cls.PASSWORD)
+                   for row in csv.DictReader(io.StringIO(users)) if row.get('User') == 'root']
+        if not changes:
+            raise unittest.SkipTest('the scratch Dolt server has no root account')
+        admin.sql(cls.root, '\n'.join(changes), password='')
+
     @classmethod
     def setUpClass(cls):
         cls._tmp = tempfile.TemporaryDirectory(prefix='bd-alias-')
+        cls._watch_signals()
         cls.root = Path(cls._tmp.name)
         (cls.root / 'bin').mkdir()
+        for name in ('home', 'config', 'dolt-home', 'data'):
+            (cls.root / name).mkdir()
         cls.bd_path = cls.root / 'bin' / 'bd'
         shutil.copy(str(BD), str(cls.bd_path))
         sibling = BD.with_name('dolt')
-        if sibling.is_file():
-            shutil.copy(str(sibling), str(cls.root / 'bin' / 'dolt'))
+        if not sibling.is_file():
+            cls._tmp.cleanup()
+            raise unittest.SkipTest('no dolt binary beside bd: a server-mode tracker needs one')
+        shutil.copy(str(sibling), str(cls.root / 'bin' / 'dolt'))
+        cls.port = cls._free_port()
         (cls.root / 'deployment.private.json').write_text(
-            '{"password": "x", "unit": "none", "port": "1"}', encoding='utf-8')
+            json.dumps({'password': cls.PASSWORD, 'unit': 'none', 'port': str(cls.port)}), encoding='utf-8')
         cls.project = cls.root / 'projects' / 'pp'
         cls.project.mkdir(parents=True)
-        cls._home = mock.patch.dict(os.environ, {'HOME': str(cls.root)})
-        cls._home.start()
-        env = admin.environment(cls.root)
-        env['HOME'] = str(cls.root)
-        init = subprocess.run(
-            [str(cls.bd_path), 'init', '--prefix', 'pp', '--skip-agents',
-             '--skip-hooks', '--non-interactive'],
-            cwd=cls.project, env=env, capture_output=True, text=True)
-        if init.returncode:
-            cls._home.stop()
+        # A HOME, DOLT_ROOT_PATH and XDG_CONFIG_HOME inside the fixture: the scratch server keeps
+        # its global config and event data under cls.root and never writes the runner's real
+        # ~/.dolt (kittrial-5bb.166 item 2). The kit's client credential variables are
+        # deliberately NOT passed: `dolt sql-server` reads DOLT_CLI_PASSWORD at startup and
+        # refuses to run with "a password is provided, a user must also be provided".
+        server_env = dict(os.environ, HOME=str(cls.root / 'home'),
+                          DOLT_ROOT_PATH=str(cls.root / 'dolt-home'),
+                          XDG_CONFIG_HOME=str(cls.root / 'config'))
+        cls.server = subprocess.Popen(
+            [str(cls.root / 'bin' / 'dolt'), 'sql-server', '-H', '127.0.0.1', '-P', str(cls.port),
+             '--data-dir', str(cls.root / 'data')],
+            cwd=str(cls.root), env=server_env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            cls._await_server()
+            cls._set_root_password()
+            init = subprocess.run(
+                [str(cls.bd_path), 'init', '--server', '--external', '--server-host', '127.0.0.1',
+                 '--server-port', str(cls.port), '--server-user', 'root', '--prefix', 'pp',
+                 '--database', 'pp', '--skip-agents', '--skip-hooks', '--non-interactive'],
+                cwd=str(cls.project), env=admin.environment(cls.root), capture_output=True, text=True)
+            if init.returncode:
+                raise unittest.SkipTest('bd server-mode init failed: %s'
+                                        % (init.stderr or init.stdout).strip()[:200])
+        except BaseException:
+            cls._stop_server()
             cls._tmp.cleanup()
-            raise unittest.SkipTest('bd init failed: %s'
-                                    % (init.stderr or init.stdout).strip()[:200])
+            raise
 
     @classmethod
     def tearDownClass(cls):
-        cls._home.stop()
+        for signum, previous in getattr(cls, '_signals', {}).items():
+            signal.signal(signum, previous)
+        cls._signals = {}
+        cls._stop_server()
         cls._tmp.cleanup()
 
     def bd(self, *args, actor='op'):
-        env = admin.environment(self.root)
-        env['HOME'] = str(self.root)
         return subprocess.run(
-            [str(self.bd_path), '--directory', str(self.project), '--sandbox',
-             '--actor', actor, *args],
-            env=env, capture_output=True, text=True)
+            [str(self.bd_path), '--directory', str(self.project), '--sandbox', '--actor', actor, *args],
+            env=admin.environment(self.root), capture_output=True, text=True)
 
     def export_rows(self):
         result = self.bd('export', '--all')

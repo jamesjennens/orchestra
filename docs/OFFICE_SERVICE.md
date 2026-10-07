@@ -66,11 +66,11 @@ directing the user to server mode". This kit only ever runs bd against its own
 Dolt server (`bd init --server --external`) and uses neither `bd doctor` nor
 `bd federation`. The kit's real use of bd was run with both binaries and gave
 the same answers (kittrial-5bb.161). In one sentence: **the `bd_static` build
-has no embedded Dolt, and the kit only uses server mode.** The one place this
-shows is in the kit's own tests: `tests/test_bd_label_aliases.py` makes its
-tracker with a bare `bd init` (embedded mode), so its three tests are skipped
-when the suite is run with `ORCHESTRA_BD_BIN` set to the static bd; the same
-three tests pass with it against a tracker the kit made in server mode.
+has no embedded Dolt, and the kit only uses server mode.** The kit's own tests
+follow that: `tests/test_bd_label_aliases.py` starts a scratch Dolt SQL server
+from the `dolt` binary beside bd and makes its tracker with
+`bd init --server --external`, so its three tests run with either binary; they
+skip, with that reason, only when no `dolt` is beside bd.
 
 `build` accepts either pinned bd archive for `--bd-archive`, says which entry it
 is, and records it in the manifest (`pins`). Name the target's glibc and the
@@ -87,7 +87,28 @@ python3 tools/office_release.py build ... --bd-archive <BD_STATIC_TARBALL>   --d
   and is recorded in the manifest (`binaries`), whether or not a target is named.
 - `build` also starts bd and dolt once on the build host (`bd --version`,
   `dolt version`). `--no-run-check` skips that, for a build host that cannot run
-  the target's binaries.
+  the target's binaries. The check only starts each program and reads what it
+  says: it does not identify the program, so a shell script named `bd` that
+  prints a version would pass it. The digest pin in `versions.json` is what
+  guarantees which bd is bundled (`pin_of` refuses an archive that is neither
+  pinned entry), not the run check. Neither program is expected to leave nothing
+  behind, so each is started with its own metrics-off switch (kittrial-5bb.166).
+  bd is started with `BD_DISABLE_METRICS=1`, the guard the runtime sets
+  (`admin.environment`), because it otherwise leaves a detached child that queues
+  its usage-metrics event kit (`$HOME/.config/bd/config.yaml`,
+  `$HOME/.beads/eventsData/`) just after `bd --version` returns. dolt is started
+  with `DOLT_DISABLE_EVENT_FLUSH=1`, which stops the detached `dolt send-metrics`
+  child it re-executes after `dolt version` returns; without that variable dolt
+  still makes that child even when `metrics.disabled` is set in its global config
+  (measured on koopa with `strace -f -e trace=execve`, 1 exec without the
+  variable and 0 with it). `dolt version` itself still writes its global config,
+  a version-check file and an event lock under `$HOME/.dolt/`
+  (`config_global.json`, `version_check.txt`, `disable_version_check.txt`,
+  `eventsData/dolt.lock`). Those late writes used to make the run check's scratch
+  directory fail to remove itself (`[Errno 39] Directory not empty`, about one
+  build in three, kittrial-5bb.166), so the scratch is also removed with errors
+  ignored and retried until it stays gone; no `office-release-check-*` directory
+  is left in TMPDIR.
 - `install` starts the bundled Python, bd and dolt on the target itself before it
   switches `current`. One that cannot start refuses the install and nothing is
   switched; the refusal names the program, what the loader said, what the file
@@ -124,6 +145,16 @@ release active. Rollback switches code and interpreter; it never rolls back
 the mutable runtime. Preserve a verified backup before any upgrade whose state
 format changes. The support team's release record should include artifact
 digest, source commit, UAT verification output and the previous release ID.
+
+Binary pins on rollback. Roll back only to a release that knows both pinned bd
+archives. A release built before kittrial-5bb.161 knows only the `bd` (upstream)
+pin: its `prepare` compares an existing runtime bd with that one pin, so a
+runtime carrying `bd_static` (installed by a newer release) stops with
+`Binary/pin mismatch; use a new deployment root for upgrade: <RUNTIME>/bin/bd`
+on the next `prepare` after the rollback. Nothing is replaced and the runtime is
+otherwise untouched; a new deployment root is the documented way forward. That
+release's installer is readable as `git show 87a356c^1:bootstrap.py`. A rollback
+that stays within releases that know both pins has no such step.
 
 ## Prepare a private runtime
 
