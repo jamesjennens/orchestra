@@ -5435,6 +5435,9 @@ def build_handler(service, backend, *, trusted_proxies=(), max_body=MAX_BODY_BYT
 SOCKET_GONE = frozenset({errno.EBADF, errno.ENOTSOCK, errno.ENOTCONN, errno.ECONNRESET, errno.ECONNABORTED, errno.EPIPE})
 #: How the error of a connection whose set-up failed for a reason of the server's own begins.
 SETUP_FAILED = 'connection set-up failed: '
+#: The exit status of ``main`` when the port to listen on is taken. The office supervisor
+#: reads it to say so in one line (``office_service.WEB_PORT_TAKEN`` is the same number).
+EXIT_PORT_TAKEN = 4
 
 #: How long a client may take over each thing the service waits for from it: completing the
 #: TLS handshake, sending a request (its line and headers; then its body), and taking a
@@ -5491,6 +5494,10 @@ class GuardedServer(ThreadingHTTPServer):
     TLS_LINE_EVERY = 5.0
 
     def __init__(self, *args, **kwargs):
+        # Before the base class binds: when the bind fails it closes the server, and
+        # ``server_close`` must find what it reads. Made after the bind, the missing field
+        # turned "Address already in use" into an AttributeError (kittrial-5bb.180).
+        self._stopping = threading.Event()
         super().__init__(*args, **kwargs)
         self._guard = threading.Lock()
         self._deadlines = {}
@@ -5502,7 +5509,6 @@ class GuardedServer(ThreadingHTTPServer):
         self._begun = set()              # of those threads, the ones start() has returned for
         self._tls_said, self._tls_unsaid = None, 0
         self._setup_said, self._setup_unsaid = None, 0
-        self._stopping = threading.Event()
         self._reaper = threading.Thread(target=self._reap, name='connection-reaper', daemon=True)
         self._reaper.start()
 
@@ -5647,6 +5653,8 @@ class GuardedServer(ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
     def server_close(self):
+        # Also for a server that never finished starting (the base class calls this when its
+        # bind fails): nothing here may need a field that is made later.
         self._stopping.set()
         super().server_close()
 
@@ -5838,11 +5846,22 @@ def main(argv=None):
     backend = build_backend(service, args)
     for line in operator_allowlist_warnings(args.root if args.backend == 'endpoint' else None):
         print(line, file=sys.stderr)
-    httpd = create_server(service, backend, host=args.host, port=args.port,
-                          trusted_proxies=trusted, max_body=args.max_body,
-                          certfile=args.cert, keyfile=args.key,
-                          allow_plaintext_non_loopback=args.allow_plaintext_on_network,
-                          web_root=None if args.no_web else args.web_root)
+    try:
+        httpd = create_server(service, backend, host=args.host, port=args.port,
+                              trusted_proxies=trusted, max_body=args.max_body,
+                              certfile=args.cert, keyfile=args.key,
+                              allow_plaintext_non_loopback=args.allow_plaintext_on_network,
+                              web_root=None if args.no_web else args.web_root)
+    except OSError as failed:
+        # On Windows a port another program holds for itself alone is refused as "access", not "in use".
+        if failed.errno != errno.EADDRINUSE and getattr(failed, 'winerror', None) != 10013:
+            raise
+        # One line and a status of its own, not a traceback: the commonest reason a service
+        # does not start, and the operator must be able to read it.
+        print('orchestra-http: port %d on %s is taken: something else is listening on it, so the web service did '
+              'not start. Stop that, or start this service on another port.' % (args.port, args.host),
+              file=sys.stderr, flush=True)
+        return EXIT_PORT_TAKEN
     if args.host not in LOOPBACK and not args.cert:
         print('WARNING: serving plain HTTP on %s:%d. Passwords and session cookies cross the network unencrypted. '
               'Use --cert and --key for HTTPS.' % (args.host, httpd.server_address[1]), file=sys.stderr, flush=True)
