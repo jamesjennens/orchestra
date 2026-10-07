@@ -10,10 +10,17 @@ The rule is ``actor_names.collision``. It is applied where a credential is issue
 route asks the host through the backend) and where it is used (the endpoint, for every
 request the web service sends with a descriptor), so a credential issued before the rule,
 or a name that was put on a list afterwards, is refused when it writes.
+
+kittrial-5bb.188 adds three things to the same rule and the same two places: a name the
+project's tracker already holds as an author or assignee (item 1), a name that reads as
+another (a leading or trailing dot or dash, an ``@host``; item 2), and the service's own
+namespace as it was started (``--actor-namespace``; item 3). The in-process backend, which
+has no endpoint, applies the same rule at use too (item 4).
 """
 import io
 import json
 import os
+import subprocess
 import sys
 import time
 import unittest
@@ -26,6 +33,7 @@ sys.path.insert(0, str(KIT))
 sys.path.insert(0, str(KIT / 'tests'))
 import actor_names
 import http_authority
+import http_service
 import sessions
 import test_http_review_fixes as fixes
 
@@ -49,12 +57,29 @@ TAKEN = (
     ("the service's namespace", 'http', actor_names.SERVICE),
     ("the service's read actor", 'http/read', actor_names.SERVICE),
     ("the service's namespace in capitals", 'HTTP', actor_names.SERVICE),
+    # kittrial-5bb.188 item 2: names that read as another, which the review workflow reads as
+    # authors other than their head. The route's own shape rule takes a name that starts with
+    # a dot or a dash before the rule is asked (`_rotate` below pins those on the pure rule).
+    ('a trailing dot', 'ops-lead.', actor_names.LOOKALIKE),
+    ('a trailing dash', 'ops-lead-', actor_names.LOOKALIKE),
+    ('an @host', 'ops-lead@desk', actor_names.LOOKALIKE),
 )
+#: Look-alikes the credential route refuses for their shape before the rule is consulted, so
+#: they are pinned on ``actor_names.collision`` itself.
+LOOKALIKE_HEADS = ('.ops-lead', '-ops-lead', '-ops-lead/night', 'ops-lead..', 'ops..lead-',
+                   'ops-lead@', '@ops-lead')
 #: The operator list itself takes no name with a slash (`recovery.identity`), so on a real host
 #: the two rows about `team/alice` cannot arise; the rule is tested with them all the same.
 REAL_TAKEN = tuple(row for row in TAKEN if not row[1].casefold().startswith('team'))
 FREE = ('worker-a', 'worker-a/sub', 'ops-lead2', 'ops', 'verity.b', 'httpx', 'session-1', 'session', 'teams/alice',
         'session-11111111-2222-3333-4444-55555555555', 'xsession-11111111-2222-3333-4444-555555555555')
+#: What the project's tracker holds in these tests (kittrial-5bb.188 item 1); `bd export --all`
+#: answers rows, and ``actor_names.tracker_marks`` turns them into these.
+TRACKER_ROWS = ({'id': 'probe-1', 'created_by': 'opus-worker-lane', 'created_at': '2026-10-06T00:00:00Z',
+                 'updated_at': '2026-10-06T00:00:00Z'},
+                {'id': 'probe-2', 'assignee': 'night-shift', 'created_at': '2026-10-06T01:00:00Z',
+                 'updated_at': '2026-10-06T01:00:00Z',
+                 'comments': [{'author': 'commenter', 'created_at': '2026-10-06T02:00:00Z'}]})
 
 
 def message(response):
@@ -101,12 +126,142 @@ class RuleTests(unittest.TestCase):
 
     def test_the_sentence_fits_what_the_service_hands_on_and_names_no_other_name(self):
         longest = 'a' * 64
-        for rule in (actor_names.SESSION, actor_names.SESSION_SHAPED, actor_names.OPERATOR, actor_names.VERIFIER, actor_names.SERVICE):
+        for rule in (actor_names.SESSION, actor_names.SESSION_SHAPED, actor_names.OPERATOR, actor_names.VERIFIER,
+                     actor_names.SERVICE, actor_names.ROWS, actor_names.LOOKALIKE):
             said = actor_names.refusal(longest, rule)
             self.assertLessEqual(len(said), 200)
             self.assertTrue(said.endswith(actor_names.REVOKE))
         self.assertIn('that name', actor_names.refusal('x\ny', actor_names.OPERATOR))
         self.assertNotIn('\n', actor_names.refusal('x\ny', actor_names.OPERATOR))
+
+    def test_a_name_that_reads_as_another_is_refused(self):
+        """kittrial-5bb.188 item 2: no normal form is chosen; the look-alike is refused."""
+        for name in LOOKALIKE_HEADS + tuple(row[1] for row in TAKEN if row[2] == actor_names.LOOKALIKE):
+            with self.subTest(name=name):
+                self.assertEqual(actor_names.LOOKALIKE, actor_names.collision(name))
+                self.assertEqual(actor_names.LOOKALIKE, actor_names.collision(name, **HOST))
+
+    def test_a_name_the_trackers_rows_already_hold_is_somebody_elses(self):
+        """kittrial-5bb.188 item 1: a plain name that already writes rows is taken."""
+        for name in ('opus-worker-lane', 'Opus-Worker-Lane', 'opus-worker-lane/x'):
+            with self.subTest(name=name):
+                self.assertEqual(actor_names.ROWS, actor_names.collision(name, authors=['opus-worker-lane']))
+        self.assertIsNone(actor_names.collision('free-lane', authors=['opus-worker-lane']))
+        # The host's lists and sessions are asked first, so their own rule is what is said.
+        self.assertEqual(actor_names.OPERATOR,
+                         actor_names.collision('ops-lead', authors=['ops-lead'], **HOST))
+        self.assertEqual(actor_names.SESSION,
+                         actor_names.collision(SESSION_A, authors=[SESSION_A], **HOST))
+        # A look-alike is refused before any list is consulted.
+        self.assertEqual(actor_names.LOOKALIKE,
+                         actor_names.collision('ops-lead.', authors=['ops-lead.'], **HOST))
+
+    def test_the_tracker_rows_are_read_as_authors_assignees_and_commenters(self):
+        marks = actor_names.tracker_marks(TRACKER_ROWS)
+        self.assertEqual({'opus-worker-lane', 'night-shift', 'commenter'},
+                         actor_names.tracker_names(marks))
+        # The boundary is the instant the credential was issued: a row older than that is
+        # somebody else's, a row written after it (within the skew allowance) is its own.
+        issued = '2026-10-06T00:30:00Z'
+        self.assertEqual({'opus-worker-lane'}, actor_names.tracker_names(marks, before=issued))
+        self.assertEqual(set(), actor_names.tracker_names(marks, before='2026-10-06T00:03:00Z'))
+        self.assertEqual({'opus-worker-lane', 'night-shift'},
+                         actor_names.tracker_names(marks, before='2026-10-06T02:05:00Z'))
+        self.assertEqual(actor_names.tracker_names(marks, before=issued),
+                         actor_names.tracker_names(marks, before=actor_names.instant(issued)))
+        # A boundary that cannot be read at all is the strict reading: every name is taken.
+        self.assertEqual({'opus-worker-lane', 'night-shift', 'commenter'},
+                         actor_names.tracker_names(marks, before='not a time'))
+        # A row with no readable time cannot be shown to be the credential's own, so it counts
+        # as somebody else's; with no boundary at all every name is taken.
+        undated = actor_names.tracker_marks([{'created_by': 'lane'}])
+        self.assertEqual({'lane'}, actor_names.tracker_names(undated, '2026-10-06T00:00:00Z'))
+        self.assertEqual({'lane'}, actor_names.tracker_names(undated))
+
+    def test_an_instant_is_read_without_datetime_fromisoformat(self):
+        """A host's Python 3.6 has no ``datetime.fromisoformat`` (kittrial-5bb.182 item 2)."""
+        midnight = actor_names.instant('2026-10-06T00:00:00Z')
+        for said in ('2026-10-06T00:00:00Z', '2026-10-06T00:00:00+00:00', '2026-10-06T01:00:00+01:00',
+                     '2026-10-06 00:00:00', '2026-10-06T00:00:00.000000Z'):
+            with self.subTest(said=said):
+                self.assertEqual(midnight, actor_names.instant(said))
+        self.assertEqual(midnight + 0.5, actor_names.instant('2026-10-06T00:00:00.500000Z'))
+        self.assertEqual(midnight, actor_names.instant(midnight))
+        for bad in ('', 'yesterday', '2026-13-06T00:00:00Z', None, [], True):
+            with self.subTest(bad=bad):
+                self.assertIsNone(actor_names.instant(bad))
+
+    def test_rows_inside_an_earlier_same_name_credentials_lifetime_are_its_own(self):
+        """kittrial-5bb.188 item 3: a renewal is not held by the rows its predecessor wrote."""
+        marks = [('lane', actor_names.instant('2026-06-01T00:00:00Z'))]
+        # Without a predecessor the older row is somebody else's.
+        self.assertEqual({'lane'}, actor_names.tracker_names(marks, before='2026-10-01T00:00:00Z'))
+        # Inside a live predecessor's own lifetime it is not.
+        live = (actor_names.instant('2026-01-01T00:00:00Z'), None)
+        self.assertEqual(set(), actor_names.tracker_names(marks, before='2026-10-01T00:00:00Z', own=[live]))
+        # A revoked predecessor loans only up to its revocation.
+        revoked = (actor_names.instant('2026-01-01T00:00:00Z'), actor_names.instant('2026-05-01T00:00:00Z'))
+        self.assertEqual({'lane'}, actor_names.tracker_names(marks, before='2026-10-01T00:00:00Z', own=[revoked]))
+        # The 300 s allowance is only for the START of a life (kittrial-5bb.188 revision-3 item 1):
+        # a row 200 s before the window opened may be its own ...
+        near = [('lane', actor_names.instant('2026-01-01T00:00:00Z') - 200)]
+        self.assertEqual(set(), actor_names.tracker_names(near, before='2026-10-01T00:00:00Z', own=[live]))
+        # ... and one 200 s AFTER the window closed is somebody else's, with no allowance at the end.
+        after = [('lane', actor_names.instant('2026-05-01T00:00:00Z') + 200)]
+        self.assertEqual({'lane'}, actor_names.tracker_names(after, before='2026-10-01T00:00:00Z', own=[revoked]))
+        # A row with no readable time is never placed in a lifetime.
+        self.assertEqual({'lane'}, actor_names.tracker_names([('lane', None)], before='2026-10-01T00:00:00Z',
+                                                             own=[live]))
+
+    def test_own_intervals_only_a_settled_same_owner_same_name_same_project_predecessor(self):
+        """kittrial-5bb.188 item 3: exactly which earlier credential lends its lifetime."""
+        credentials = {
+            'a': {'user_id': 'usr_a', 'project_id': 'probe', 'actor': 'Lane/x',
+                  'created_at': '2026-01-01T00:00:00Z', 'revoked': False},
+            'b': {'user_id': 'usr_a', 'project_id': 'probe', 'actor': 'lane', 'created_at': '2026-02-01T00:00:00Z',
+                  'revoked': True, 'revoked_at': '2026-03-01T00:00:00Z'},
+            'other-owner': {'user_id': 'usr_b', 'project_id': 'probe', 'actor': 'lane',
+                            'created_at': '2026-01-01T00:00:00Z'},
+            'other-project': {'user_id': 'usr_a', 'project_id': 'elsewhere', 'actor': 'lane',
+                              'created_at': '2026-01-01T00:00:00Z'},
+            'refused': {'user_id': 'usr_a', 'project_id': 'probe', 'actor': 'lane',
+                        'created_at': '2026-01-01T00:00:00Z', 'actor_rows_refused': actor_names.ROWS},
+            'unreadable': {'user_id': 'usr_a', 'project_id': 'probe', 'actor': 'lane', 'created_at': 'not a time'},
+            'self': {'user_id': 'usr_a', 'project_id': 'probe', 'actor': 'lane',
+                     'created_at': '2026-09-01T00:00:00Z'},
+        }
+        self.assertEqual([(actor_names.instant('2026-01-01T00:00:00Z'), None),
+                          (actor_names.instant('2026-02-01T00:00:00Z'), actor_names.instant('2026-03-01T00:00:00Z'))],
+                         sorted(actor_names.own_intervals(credentials, 'lane', 'usr_a', 'probe', exclude='self')))
+        # A different owner, a different project or a different head lends nothing.
+        self.assertEqual([], actor_names.own_intervals({'x': credentials['other-owner']}, 'lane', 'usr_a', 'probe'))
+        self.assertEqual([], actor_names.own_intervals({'x': credentials['other-project']}, 'lane', 'usr_a', 'probe'))
+        self.assertEqual([], actor_names.own_intervals({'a': credentials['a']}, 'other', 'usr_a', 'probe'))
+        # A refused or unreadable predecessor fails closed: it lends nothing.
+        self.assertEqual([], actor_names.own_intervals({'x': credentials['refused']}, 'lane', 'usr_a', 'probe'))
+        self.assertEqual([], actor_names.own_intervals({'x': credentials['unreadable']}, 'lane', 'usr_a', 'probe'))
+        # A revoked record with no readable revocation time fails closed too.
+        stale = dict(credentials['b'], revoked_at=None)
+        self.assertEqual([], actor_names.own_intervals({'x': stale}, 'lane', 'usr_a', 'probe'))
+
+    def test_own_intervals_end_at_the_earlier_of_revocation_and_expiry(self):
+        """kittrial-5bb.188 revision-3 item 1: an expired predecessor stops lending its name."""
+        start = actor_names.instant('2026-01-01T00:00:00Z')
+        expiry = actor_names.instant('2026-02-01T00:00:00Z')
+        expired = {'user_id': 'usr_a', 'project_id': 'probe', 'actor': 'lane',
+                   'created_at': '2026-01-01T00:00:00Z', 'expires_at': '2026-02-01T00:00:00Z'}
+        # Never revoked: the lifetime still ends at the expiry, not never.
+        self.assertEqual([(start, expiry)], actor_names.own_intervals({'x': expired}, 'lane', 'usr_a', 'probe'))
+        # Revoked before the expiry: the revocation ends it.
+        early = dict(expired, revoked=True, revoked_at='2026-01-15T00:00:00Z')
+        self.assertEqual([(start, actor_names.instant('2026-01-15T00:00:00Z'))],
+                         actor_names.own_intervals({'x': early}, 'lane', 'usr_a', 'probe'))
+        # Revoked after the expiry: the expiry is the earlier end.
+        late = dict(expired, revoked=True, revoked_at='2026-03-01T00:00:00Z')
+        self.assertEqual([(start, expiry)], actor_names.own_intervals({'x': late}, 'lane', 'usr_a', 'probe'))
+        # An expiry that is present but unreadable is not an open lifetime: fail closed.
+        broken = dict(expired, expires_at='not a time')
+        self.assertEqual([], actor_names.own_intervals({'x': broken}, 'lane', 'usr_a', 'probe'))
 
 
 class DenialTests(unittest.TestCase):
@@ -117,18 +272,34 @@ class DenialTests(unittest.TestCase):
         self.addCleanup(fixes.shutil.rmtree, self.tmp, ignore_errors=True)
         state = fixes.authority_state(project='probe')
         state['credentials'] = {
-            'cred_w': {'user_id': 'usr_a', 'project_id': 'probe', 'actor': 'worker-a', 'revoked': False},
-            'cred_ops': {'user_id': 'usr_a', 'project_id': 'probe', 'actor': 'ops-lead', 'revoked': False},
-            'cred_none': {'user_id': 'usr_a', 'project_id': 'probe', 'actor': None, 'revoked': False},
+            # Issued under the rule: the name was free at issue, so no write of its own reads
+            # the tracker again (kittrial-5bb.188 item 1).
+            'cred_w': {'user_id': 'usr_a', 'project_id': 'probe', 'actor': 'worker-a', 'revoked': False,
+                       'actor_rows_checked': True},
+            'cred_ops': {'user_id': 'usr_a', 'project_id': 'probe', 'actor': 'ops-lead', 'revoked': False,
+                         'actor_rows_checked': True},
+            'cred_none': {'user_id': 'usr_a', 'project_id': 'probe', 'actor': None, 'revoked': False,
+                          'actor_rows_checked': True},
             'cred_agent': {'user_id': 'usr_a', 'agent_id': 'agent_0123456789abcdef', 'actor': 'worker-a', 'revoked': False},
+            # Issued before the rule: no mark, and it was issued at this instant.
+            'cred_old': {'user_id': 'usr_a', 'project_id': 'probe', 'actor': 'opus-worker-lane', 'revoked': False,
+                         'created_at': '2026-10-07T00:00:00Z'},
         }
         (self.tmp / 'authority.json').write_text(json.dumps(state), encoding='utf-8')
         self.config = http_authority.AuthorityConfig(str(self.tmp / 'authority.json'))
         self.asked = 0
+        #: What this "host" holds as tracker rows, older than the credential at `self.before`.
+        self.authors = ['opus-worker-lane']
+        self.before = None
 
-    def reserved(self):
+    def reserved(self, rows=False, own=()):
         self.asked += 1
-        return dict(HOST)
+        found = dict(HOST)
+        if rows:
+            self.before = rows
+            self.own = own
+            found['authors'] = list(self.authors)
+        return found
 
     def denial(self, actor, credential=None, config='live', authority='given'):
         descriptor = {'via': 'credential' if credential else 'session', 'user_id': 'usr_a', 'session_hash': 'sess_a',
@@ -149,6 +320,7 @@ class DenialTests(unittest.TestCase):
         for actor in ('worker-a', 'worker-a/sub'):
             self.assertIsNone(self.denial(actor, 'cred_w'))
         self.assertEqual(self.asked, 2)
+        self.assertIsNone(self.before, 'a credential issued under the rule read the tracker')
 
     def test_a_credential_under_a_taken_name_is_refused_with_what_to_do(self):
         for actor in ('ops-lead', 'ops-lead/night'):
@@ -157,6 +329,31 @@ class DenialTests(unittest.TestCase):
                                  'Revoke it and issue one under another name.')
             self.assertNotIn('team/alice', answer['stderr'])
             self.assertNotIn('verity', answer['stderr'])
+
+    def test_a_look_alike_is_refused_with_nothing_run(self):
+        state = json.loads((self.tmp / 'authority.json').read_text(encoding='utf-8'))
+        state['credentials']['cred_dot'] = {'user_id': 'usr_a', 'project_id': 'probe', 'actor': 'ops-lead.',
+                                            'revoked': False, 'actor_rows_checked': True}
+        (self.tmp / 'authority.json').write_text(json.dumps(state), encoding='utf-8')
+        for actor in ('ops-lead.', 'ops-lead-', 'ops-lead@desk'):
+            with self.subTest(actor=actor):
+                state['credentials']['cred_dot']['actor'] = actor
+                (self.tmp / 'authority.json').write_text(json.dumps(state), encoding='utf-8')
+                self.refused(self.denial(actor, 'cred_dot'),
+                             'that is a name that reads as another. Revoke it and issue one under another name.')
+
+    def test_a_credential_issued_before_the_rule_is_judged_by_the_trackers_rows(self):
+        """kittrial-5bb.188 item 1: the reviewer's legacy `opus-worker-lane` credential stops."""
+        self.refused(self.denial('opus-worker-lane', 'cred_old'),
+                     'A worker credential cannot write as opus-worker-lane: that is a name this project\'s '
+                     'tracker already holds. Revoke it and issue one under another name.')
+        # It said so from the rows older than the credential, which is what it asked for.
+        self.assertEqual('2026-10-07T00:00:00Z', self.before)
+
+    def test_an_old_credential_whose_rows_are_its_own_goes_on_writing(self):
+        self.authors = []                      # nothing older than it: the rows are its own
+        self.assertIsNone(self.denial('opus-worker-lane', 'cred_old'))
+        self.assertEqual('2026-10-07T00:00:00Z', self.before)
 
     def test_a_name_outside_the_credentials_namespace_is_refused_and_the_host_is_not_asked(self):
         for actor, credential in (('ops-lead', 'cred_w'), ('worker-ab', 'cred_w'), ('worker', 'cred_w'), ('Worker-a', 'cred_w'),
@@ -192,6 +389,45 @@ class DenialTests(unittest.TestCase):
         (self.tmp / 'authority.json').write_text('not json', encoding='utf-8')
         answer = self.denial('worker-a', 'cred_w')
         self.assertEqual(126, answer['returncode'], answer)
+
+    def test_an_empty_export_is_a_tracker_fault_not_an_open_rule(self):
+        """kittrial-5bb.188 item 1: an export that answers no rows is not "nothing is taken"."""
+        def unreadable(rows=False, own=()):
+            if rows:
+                raise actor_names.TrackerUnreadable()
+            return dict(HOST)
+        answer = http_authority.descriptor_actor_denial(
+            {'project': 'probe', 'actor': 'opus-worker-lane', 'action': 'bd', 'args': ['create', 'x'],
+             'authority': {'via': 'credential', 'user_id': 'usr_a', 'credential_id': 'cred_old',
+                           'session_hash': 'sess_a', 'project': 'probe', 'capability': 'tasks.write'}},
+            self.config, unreadable)
+        self.assertEqual((2, 'tracker'), (answer['returncode'], answer.get('fault')), answer)
+        self.assertNotEqual(126, answer['returncode'])
+
+    def test_a_settled_credential_is_not_read_against_the_tracker_again(self):
+        """Items 4 and 5: checked, waived and refused marks each answer without an export."""
+        state = json.loads((self.tmp / 'authority.json').read_text(encoding='utf-8'))
+        state['credentials']['cred_marked'] = {'user_id': 'usr_a', 'project_id': 'probe',
+                                               'actor': 'opus-worker-lane', 'revoked': False,
+                                               'actor_rows_checked': True}
+        state['credentials']['cred_waived'] = {'user_id': 'usr_a', 'project_id': 'probe',
+                                               'actor': 'opus-worker-lane', 'revoked': False,
+                                               'actor_waived': {'by': 'usr_a', 'reason': 'the lane owns it',
+                                                                'at': '2026-10-07T00:00:00Z'}}
+        (self.tmp / 'authority.json').write_text(json.dumps(state), encoding='utf-8')
+        self.assertIsNone(self.denial('opus-worker-lane/x', 'cred_marked'))
+        self.assertIsNone(self.denial('opus-worker-lane/y', 'cred_waived'))
+        self.assertIsNone(self.before, 'a settled credential read the tracker')
+
+    def test_a_refused_mark_refuses_without_a_read(self):
+        """Item 5: the outcome kept on a credential is honoured before any export."""
+        state = json.loads((self.tmp / 'authority.json').read_text(encoding='utf-8'))
+        state['credentials']['cred_stopped'] = {'user_id': 'usr_a', 'project_id': 'probe',
+                                                'actor': 'opus-worker-lane', 'revoked': False,
+                                                'actor_rows_refused': actor_names.ROWS}
+        (self.tmp / 'authority.json').write_text(json.dumps(state), encoding='utf-8')
+        self.refused(self.denial('opus-worker-lane', 'cred_stopped'), actor_names.ROWS)
+        self.assertIsNone(self.before, 'a refused credential read the tracker')
 
 
 class RegistryTests(unittest.TestCase):
@@ -236,6 +472,10 @@ class HostNames:
         self.assertEqual(200, answer.status, answer.data)
         return answer.data['items']
 
+    def listed_without_asking(self):
+        """The service's own credential records, without the list route's host read."""
+        return [c for c in self.service.state['credentials'].values() if c.get('project_id') == self.pid]
+
 
 class IssueCase(HostNames, fixes.EndpointCase):
     def test_a_name_that_is_somebody_elses_is_refused_and_nothing_is_kept(self):
@@ -263,6 +503,205 @@ class IssueCase(HostNames, fixes.EndpointCase):
         self.assertEqual(422, refused.status)
         for name in ('alice', 'ops-lead', 'verity', SESSION_A):
             self.assertNotIn(name, json.dumps(refused.data))
+
+    def test_a_name_the_trackers_rows_already_hold_is_refused_and_a_superuser_may_allow_it(self):
+        """kittrial-5bb.188 items 1 and 4 at issue: the reviewer's `opus-worker-lane` case."""
+        self.project()
+        self.host(authors=['opus-worker-lane'])
+        refused = self.request('POST', self.credentials, {'actor': 'opus-worker-lane'}, token=self.alex, key='rows-name-1')
+        self.assertEqual(422, refused.status, refused.data)
+        self.assertEqual({'actor': 'opus-worker-lane', 'rule': actor_names.ROWS}, refused.data['error']['detail'])
+        self.assertIn(actor_names.ROWS, message(refused))
+        self.assertEqual([], [c for c in self.listed_without_asking() if c.get('actor') == 'opus-worker-lane'])
+        # The owner (not a superuser) may not override it, and the key is not spent.
+        denied = self.request('POST', self.credentials,
+                              {'actor': 'opus-worker-lane', 'allow_actor': True,
+                               'allow_actor_reason': 'the lane owns this name'}, token=self.alex, key='rows-name-1')
+        self.assertEqual(403, denied.status, denied.data)
+        self.assertEqual([], [c for c in self.listed_without_asking() if c.get('actor') == 'opus-worker-lane'])
+        # A superuser must SAY WHY the waiver is used; a reason with no waiver is refused too.
+        admin = self.admin_token()
+        silent = self.request('POST', self.credentials,
+                              {'actor': 'opus-worker-lane', 'allow_actor': True}, token=admin)
+        self.assertEqual(422, silent.status, silent.data)
+        self.assertIn('allow_actor_reason', message(silent))
+        orphan = self.request('POST', self.credentials,
+                              {'actor': 'opus-worker-lane', 'allow_actor_reason': 'no waiver'}, token=admin)
+        self.assertEqual(422, orphan.status, orphan.data)
+        # A superuser may, the reason is kept, and it is its OWN mark -- never actor_rows_checked.
+        allowed = self.request('POST', self.credentials,
+                               {'actor': 'opus-worker-lane', 'allow_actor': True,
+                                'allow_actor_reason': 'the lane owns this name'}, token=admin, key='rows-name-1')
+        self.assertEqual(201, allowed.status, allowed.data)
+        credential_id = allowed.data['credential']['id']
+        record = self.service.state['credentials'][credential_id]
+        self.assertEqual('the lane owns this name', record['actor_waived']['reason'])
+        self.assertEqual(record['user_id'], record['actor_waived']['by'])
+        self.assertTrue(record['actor_waived']['at'])
+        self.assertFalse(record.get('actor_rows_checked'))
+        self.assertEqual(record['actor_waived'], allowed.data['credential']['actor_waived'])
+        # The audit entry says a waiver was used, by whom and why.
+        audit = self.request('GET', '/v1/projects/%s/audit?limit=100' % self.pid, token=self.alex).data['items']
+        waiver_entry = [e for e in audit if e['action'] == 'credentials.issue' and e.get('reason')
+                        and 'waiver used' in e['reason']][-1]
+        self.assertIn('the lane owns this name', waiver_entry['reason'])
+        self.assertEqual(record['user_id'], waiver_entry['user_id'])
+        # The owner's list shows it as allowed, by NAME on DATE, and not as colliding.
+        item = [c for c in self.listed() if c['id'] == credential_id][0]
+        self.assertIsNone(item['actor_refused'])
+        self.assertIn('allowed by root-admin on', item['actor_allowed'])
+        self.assertEqual('the lane owns this name', item['actor_waived']['reason'])
+        # It writes: the waiver is not undone at use.
+        secret = allowed.data['credential']['secret']
+        self.assertEqual(201, self.request('POST', self.tasks, {'title': 'allowed'}, token=secret).status)
+        # The allowance covers the row rule only, never the host's own rules.
+        for name, rule in (('ops-lead', actor_names.OPERATOR), (SESSION_A, actor_names.SESSION), ('http', actor_names.SERVICE)):
+            with self.subTest(name=name):
+                other = self.request('POST', self.credentials,
+                                     {'actor': name, 'allow_actor': True, 'allow_actor_reason': 'why not'}, token=admin)
+                self.assertEqual(422, other.status, other.data)
+                self.assertEqual(rule, other.data['error']['detail']['rule'])
+        # `allow_actor` is a field the route takes from a superuser and refuses from anyone else.
+        strange = self.request('POST', self.credentials, {'actor': 'plain-lane', 'allow_actor': 'yes'}, token=admin)
+        self.assertEqual(422, strange.status, strange.data)
+        self.assertEqual(201, self.request('POST', self.credentials, {'actor': 'plain-lane'}, token=admin).status)
+
+    def test_a_waiver_reason_with_hidden_characters_or_over_500_is_refused(self):
+        """kittrial-5bb.188 revision-3 item 3(2): the reason passes the kit's plain-text rule
+        (the one `guidance` applies), and its 500-character bound is pinned (reviewer mutant W2)."""
+        self.project()
+        self.host(authors=['opus-worker-lane'])
+        admin = self.admin_token()
+        for label, reason in (('a bidi override', 'the lane\u202e owns this'),
+                              ('a control character', 'the lane\x1b[31m owns this'),
+                              ('a zero-width space', 'the lane\u200b owns this'),
+                              ('a tag character', 'the lane\U000E0041 owns this')):
+            with self.subTest(bad=label):
+                refused = self.request('POST', self.credentials,
+                                       {'actor': 'opus-worker-lane', 'allow_actor': True,
+                                        'allow_actor_reason': reason}, token=admin)
+                self.assertEqual(422, refused.status, refused.data)
+                self.assertIn('plain text', message(refused))
+        too_long = self.request('POST', self.credentials,
+                                {'actor': 'opus-worker-lane', 'allow_actor': True,
+                                 'allow_actor_reason': 'x' * 501}, token=admin)
+        self.assertEqual(422, too_long.status, too_long.data)
+        self.assertIn('at most 500 characters', message(too_long))
+        # None of them was kept, and the bound itself is allowed through.
+        self.assertEqual([], [c for c in self.listed_without_asking() if c.get('actor') == 'opus-worker-lane'])
+        allowed = self.request('POST', self.credentials,
+                               {'actor': 'opus-worker-lane', 'allow_actor': True,
+                                'allow_actor_reason': 'x' * 500}, token=admin, key='waiver-500')
+        self.assertEqual(201, allowed.status, allowed.data)
+        self.assertEqual('x' * 500, allowed.data['credential']['actor_waived']['reason'])
+
+    def test_a_name_the_tracker_does_not_hold_is_issued_and_the_rows_were_read(self):
+        self.project()
+        with mock.patch.object(self.backend, 'actor_standing', wraps=self.backend.actor_standing) as asked:
+            issued = self.request('POST', self.credentials, {'actor': 'fresh-lane'}, token=self.alex)
+            self.assertEqual(201, issued.status, issued.data)
+            self.assertEqual(1, asked.call_count)
+            self.assertIs(True, asked.call_args.kwargs['rows'])
+            self.assertEqual([], asked.call_args.kwargs['own'])
+
+    def test_a_renewal_under_its_own_name_is_not_held_by_the_predecessors_rows(self):
+        """kittrial-5bb.188 item 3: the same owner renews the name its own credential wrote as."""
+        self.project()
+        self.host()
+        issued = self.request('POST', self.credentials, {'actor': 'renew-lane'}, token=self.alex)
+        self.assertEqual(201, issued.status, issued.data)
+        start = '2026-01-01T00:00:00Z'
+        with self.service.store.lock:
+            record = self.service.state['credentials'][issued.data['credential']['id']]
+            record['created_at'] = start
+            record['issued_raw'] = actor_names.instant(start)
+            self.service.store.save()
+        # A row the predecessor wrote inside its own lifetime is not held against the renewal.
+        self.host(author_rows=[{'name': 'renew-lane', 'when': '2026-06-01T00:00:00Z'}])
+        again = self.request('POST', self.credentials, {'actor': 'renew-lane'}, token=self.alex)
+        self.assertEqual(201, again.status, again.data)
+        # A row older than the predecessor is somebody else's: the renewal is refused.
+        self.host(author_rows=[{'name': 'renew-lane', 'when': '2025-01-01T00:00:00Z'}])
+        refused = self.request('POST', self.credentials, {'actor': 'renew-lane'}, token=self.alex)
+        self.assertEqual(422, refused.status, refused.data)
+        self.assertEqual(actor_names.ROWS, refused.data['error']['detail']['rule'])
+
+    def test_an_expired_predecessor_does_not_lend_its_name_for_ever(self):
+        """kittrial-5bb.188 revision-3 item 1: a lifetime ends at the earlier of revocation and expiry."""
+        self.project()
+        self.host()
+        issued = self.request('POST', self.credentials, {'actor': 'expired-lane'}, token=self.alex)
+        self.assertEqual(201, issued.status, issued.data)
+        with self.service.store.lock:
+            record = self.service.state['credentials'][issued.data['credential']['id']]
+            record['created_at'] = '2026-01-01T00:00:00Z'
+            record['issued_raw'] = actor_names.instant('2026-01-01T00:00:00Z')
+            record['expires_at'] = '2026-02-01T00:00:00Z'      # expired, and never revoked
+            self.service.store.save()
+        # A row the predecessor wrote inside its own lifetime is still its own.
+        self.host(author_rows=[{'name': 'expired-lane', 'when': '2026-01-15T00:00:00Z'}])
+        self.assertEqual(201, self.request('POST', self.credentials,
+                                           {'actor': 'expired-lane'}, token=self.alex).status)
+        # A host lane's row after the expiry is somebody else's: the renewal is refused.
+        self.host(author_rows=[{'name': 'expired-lane', 'when': '2026-03-01T00:00:00Z'}])
+        refused = self.request('POST', self.credentials, {'actor': 'expired-lane'}, token=self.alex)
+        self.assertEqual(422, refused.status, refused.data)
+        self.assertEqual(actor_names.ROWS, refused.data['error']['detail']['rule'])
+
+    def test_a_lane_row_after_a_lifetime_ends_is_never_the_predecessors_own(self):
+        """kittrial-5bb.188 revision-3 item 1: the 300 s allowance is only for the start of a life."""
+        self.project()
+        self.host()
+        issued = self.request('POST', self.credentials, {'actor': 'skew-lane'}, token=self.alex)
+        self.assertEqual(201, issued.status, issued.data)
+        start = actor_names.instant('2026-01-01T00:00:00Z')
+        end = actor_names.instant('2026-02-01T00:00:00Z')
+        with self.service.store.lock:
+            record = self.service.state['credentials'][issued.data['credential']['id']]
+            record['created_at'] = '2026-01-01T00:00:00Z'
+            record['issued_raw'] = start
+            record['revoked'] = True
+            record['revoked_at'] = '2026-02-01T00:00:00Z'
+            self.service.store.save()
+        # 200 s after the revocation: inside the old allowance, and no longer its own.
+        self.host(author_rows=[{'name': 'skew-lane', 'when': end + 200}])
+        refused = self.request('POST', self.credentials, {'actor': 'skew-lane'}, token=self.alex)
+        self.assertEqual(422, refused.status, refused.data)
+        self.assertEqual(actor_names.ROWS, refused.data['error']['detail']['rule'])
+        # 200 s after the start, still inside the life: the start allowance and the window both hold.
+        self.host(author_rows=[{'name': 'skew-lane', 'when': start + 200}])
+        self.assertEqual(201, self.request('POST', self.credentials,
+                                           {'actor': 'skew-lane'}, token=self.alex).status)
+
+    def test_a_renewal_by_another_owner_is_still_refused(self):
+        """kittrial-5bb.188 item 3: the exemption is the SAME owner's, and fails closed otherwise."""
+        self.project()
+        self.host()
+        issued = self.request('POST', self.credentials, {'actor': 'renew-lane'}, token=self.alex)
+        self.assertEqual(201, issued.status, issued.data)
+        start = '2026-01-01T00:00:00Z'
+        with self.service.store.lock:
+            record = self.service.state['credentials'][issued.data['credential']['id']]
+            record['user_id'] = 'usr_somebody_else'          # not the issuer asking now
+            record['created_at'] = start
+            record['issued_raw'] = actor_names.instant(start)
+            self.service.store.save()
+        self.host(author_rows=[{'name': 'renew-lane', 'when': '2026-06-01T00:00:00Z'}])
+        refused = self.request('POST', self.credentials, {'actor': 'renew-lane'}, token=self.alex)
+        self.assertEqual(422, refused.status, refused.data)
+        self.assertEqual(actor_names.ROWS, refused.data['error']['detail']['rule'])
+
+    def test_an_export_that_answers_no_rows_issues_nothing(self):
+        """kittrial-5bb.188 item 1 at issue: nothing was changed, and the key stays free."""
+        self.project()
+        self.host(tracker='unreadable')
+        refused = self.request('POST', self.credentials, {'actor': 'lane-empty'}, token=self.alex, key='empty-key-1')
+        self.assertEqual(503, refused.status, refused.data)
+        self.assertIn('Nothing was changed', message(refused))
+        self.assertEqual([], self.listed_without_asking())
+        self.host()
+        self.assertEqual(201, self.request('POST', self.credentials, {'actor': 'lane-empty'},
+                                           token=self.alex, key='empty-key-1').status)
 
     def test_a_name_that_is_nobodys_is_issued_and_writes(self):
         self.project()
@@ -348,14 +787,11 @@ class IssueCase(HostNames, fixes.EndpointCase):
                 self.assertEqual(503, refused.status, refused.data)
         self.assertEqual([], self.listed_without_asking())
 
-    def listed_without_asking(self):
-        return [c for c in self.service.state['credentials'].values() if c.get('project_id') == self.pid]
-
 
 class UseCase(HostNames, fixes.EndpointCase):
     """A credential that has such a name already: issued before the rule, or the name was listed afterwards."""
 
-    def old_credential(self, name):
+    def old_credential(self, name, checked=None):
         self.host(sessions=[], operators=[], verifiers=[])
         issued = self.request('POST', self.credentials, {'label': 'old', 'actor': name}, token=self.alex)
         if issued.status != 201:
@@ -364,6 +800,11 @@ class UseCase(HostNames, fixes.EndpointCase):
             self.assertEqual(201, issued.status, issued.data)
             with self.service.store.lock:
                 self.service.state['credentials'][issued.data['credential']['id']]['actor'] = name
+                self.service.store.save()
+        if checked is not None:
+            # As a kit before kittrial-5bb.188 left it: no `actor_rows_checked` mark.
+            with self.service.store.lock:
+                self.service.state['credentials'][issued.data['credential']['id']]['actor_rows_checked'] = checked
                 self.service.store.save()
         self.host()
         return issued.data['credential']
@@ -428,6 +869,44 @@ class UseCase(HostNames, fixes.EndpointCase):
             self.assertEqual([None], [item['actor_refused'] for item in self.listed()])
             self.assertEqual(0, asked.call_count)
 
+    def test_a_credential_that_predates_the_row_rule_stops_where_the_tracker_holds_the_name(self):
+        """kittrial-5bb.188 item 1 at use: the rows decide, bounded by the credential's issue."""
+        self.project()
+        # Two records as an older kit left them: issued under a free name, then renamed, and
+        # with no `actor_rows_checked` mark.
+        legacy = self.old_credential('opus-worker-lane', checked=False)
+        honest = self.old_credential('night-shift', checked=False)
+        self.host(author_rows=[{'name': 'opus-worker-lane',
+                                'when': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() - 86400))},
+                               {'name': 'night-shift',
+                                'when': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() + 600))}])
+        said = 'A worker credential cannot write as opus-worker-lane: that is %s. Revoke it and issue one under another name.' \
+            % actor_names.ROWS
+        task = self.create_task(self.alex, self.pid, 'a task').data['id']
+        for what, method, where, body in (('create', 'POST', self.tasks, {'title': 'forged'}),
+                                          ('claim', 'POST', self.tasks + '/' + task + '/claim', {})):
+            with self.subTest(write=what):
+                refused = self.request(method, where, body, token=legacy['secret'], key='rows-%s' % what)
+                self.assertEqual(403, refused.status, (what, refused.data))
+                self.assertEqual(said, message(refused))
+        self.assertEqual([], [row for row in self.canonical_rows() if row['title'] == 'forged'])
+        # The same kind of record under a name whose rows came after it was issued goes on
+        # writing: a credential is not refused for its own rows.
+        self.assertEqual(201, self.request('POST', self.tasks, {'title': 'mine'}, token=honest['secret']).status)
+        self.assertIn('mine', [row['title'] for row in self.canonical_rows()])
+        # And a credential issued now under that name is refused at issue: the rows are there.
+        refused = self.request('POST', self.credentials, {'actor': 'opus-worker-lane'}, token=self.alex)
+        self.assertEqual(422, refused.status, refused.data)
+        self.assertEqual(actor_names.ROWS, refused.data['error']['detail']['rule'])
+
+    def test_a_credential_issued_under_the_rule_reads_no_tracker_at_use(self):
+        self.project()
+        self.host()
+        issued = self.request('POST', self.credentials, {'actor': 'night-shift'}, token=self.alex).data['credential']
+        with mock.patch.object(self.backend, '_run', wraps=self.backend._run) as asked:
+            self.assertEqual(201, self.request('POST', self.tasks, {'title': 'one'}, token=issued['secret']).status)
+            self.assertEqual([], [call.args[0] for call in asked.call_args_list if call.args and call.args[0] == 'actor-standing'])
+
     def test_a_signed_in_account_and_an_agent_are_untouched(self):
         self.project()
         self.host()
@@ -439,16 +918,144 @@ class UseCase(HostNames, fixes.EndpointCase):
         agent = made.data['credential']['secret']
         self.assertEqual(201, self.request('POST', self.tasks, {'title': 'by an agent'}, token=agent).status)
 
+    def counted(self, seen):
+        real = self.backend.actor_standing
+
+        def counted(project_id, names, rows=False, own=()):
+            seen.append(bool(rows))
+            return real(project_id, names, rows=rows, own=own)
+        return counted
+
+    def test_an_unmarked_credential_is_judged_by_the_rows_once_and_the_outcome_kept(self):
+        """kittrial-5bb.188 item 5: one export at the first write, and none after it."""
+        self.project()
+        legacy = self.old_credential('slow-lane', checked=False)
+        self.host(author_rows=[{'name': 'slow-lane', 'when': '2026-01-01T00:00:00Z'}])
+        seen = []
+        with mock.patch.object(self.backend, 'actor_standing', self.counted(seen)):
+            refused = self.request('POST', self.tasks, {'title': 'first'}, token=legacy['secret'])
+            self.assertEqual(403, refused.status, refused.data)
+            self.assertEqual([False, True], seen)       # the cheap rule, then ONE row read
+            record = self.service.state['credentials'][legacy['id']]
+            self.assertEqual(actor_names.ROWS, record.get('actor_rows_refused'))
+            self.assertFalse(record.get('actor_rows_checked'))
+            again = self.request('POST', self.tasks, {'title': 'second'}, token=legacy['secret'])
+            self.assertEqual(403, again.status, again.data)
+            self.assertEqual([False, True], seen)       # nothing read again
+        self.assertEqual([], [row for row in self.canonical_rows() if row['title'] in ('first', 'second')])
+        # The owner's list reads the kept mark, so it shows the refusal without asking the host
+        # for the rows again (kittrial-5bb.188 revision-3 item 3(3)).
+        mine = [item for item in self.listed() if item['id'] == legacy['id']][0]
+        self.assertEqual(actor_names.refusal('slow-lane', actor_names.ROWS), mine['actor_refused'])
+
+    def test_the_settle_honours_an_earlier_same_name_lifetimes_own_rows(self):
+        """kittrial-5bb.188 revision-3 item 3(4), reviewer mutant J5: the settle that keeps the
+        outcome also passes the earlier own-lifetimes, so a row inside a predecessor's life is
+        not held against an unjudged credential whose only excuse is that lifetime."""
+        self.project()
+        first = self.old_credential('settle-lane', checked=True)
+        with self.service.store.lock:
+            record = self.service.state['credentials'][first['id']]
+            record['created_at'] = '2026-01-01T00:00:00Z'
+            record['issued_raw'] = actor_names.instant('2026-01-01T00:00:00Z')
+            self.service.store.save()
+        legacy = self.old_credential('settle-lane', checked=False)
+        self.host(author_rows=[{'name': 'settle-lane', 'when': '2026-06-01T00:00:00Z'}])
+        seen = []
+        with mock.patch.object(self.backend, 'actor_standing', self.counted(seen)):
+            made = self.request('POST', self.tasks, {'title': 'mine'}, token=legacy['secret'])
+            self.assertEqual(201, made.status, made.data)
+            self.assertEqual([False, True], seen)       # the cheap rule, then ONE row read
+        record = self.service.state['credentials'][legacy['id']]
+        self.assertTrue(record.get('actor_rows_checked'))
+        self.assertNotIn('actor_rows_refused', record)
+
+    def test_an_unmarked_credential_whose_own_rows_are_newer_is_checked_once_and_writes_after(self):
+        """kittrial-5bb.188 item 5: the honest pre-upgrade credential pays the read once."""
+        self.project()
+        legacy = self.old_credential('honest-old', checked=False)
+        when = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() + 600))
+        self.host(author_rows=[{'name': 'honest-old', 'when': when}])
+        seen = []
+        with mock.patch.object(self.backend, 'actor_standing', self.counted(seen)):
+            made = self.request('POST', self.tasks, {'title': 'mine'}, token=legacy['secret'])
+            self.assertEqual(201, made.status, made.data)
+            self.assertEqual([False, True], seen)
+            record = self.service.state['credentials'][legacy['id']]
+            self.assertTrue(record.get('actor_rows_checked'))
+            self.assertNotIn('actor_rows_refused', record)
+            # A later write reads no tracker, even one that cannot be read at all.
+            self.host(tracker='unreadable')
+            self.assertEqual(201, self.request('POST', self.tasks, {'title': 'again'}, token=legacy['secret']).status)
+            self.assertEqual([False, True], seen)
+
+    def test_an_unmarked_credential_is_not_let_through_when_the_export_answers_nothing(self):
+        """kittrial-5bb.188 item 1 at use: a host fault, nothing written, no mark kept."""
+        self.project()
+        legacy = self.old_credential('lane-empty', checked=False)
+        self.host(tracker='unreadable')
+        refused = self.request('POST', self.tasks, {'title': 'nope'}, token=legacy['secret'])
+        self.assertEqual(503, refused.status, refused.data)
+        self.assertEqual([], [row for row in self.canonical_rows() if row['title'] == 'nope'])
+        record = self.service.state['credentials'][legacy['id']]
+        self.assertFalse(record.get('actor_rows_checked'))
+        self.assertNotIn('actor_rows_refused', record)
+
+    def test_every_broken_tracker_answer_is_unavailable_and_changes_nothing(self):
+        """kittrial-5bb.188 revision-3 item 3(1): a cut line, a nonzero bd, words that are not
+        rows and a tracker without its merge slot are host faults answered 503, not 422, at
+        issue and at use."""
+        self.project()
+        for mode in ('unreadable', 'cut', 'exit1', 'words', 'no-slot'):
+            with self.subTest(tracker=mode):
+                self.host(tracker=mode)
+                refused = self.request('POST', self.credentials, {'actor': 'lane-%s' % mode},
+                                       token=self.alex, key='bad-tracker-%s' % mode)
+                self.assertEqual(503, refused.status, refused.data)
+                self.assertIn('Nothing was changed', message(refused))
+        self.assertEqual([], self.listed_without_asking())
+        # At use, an unjudged credential's first write is the same host fault, with no mark.
+        legacy = self.old_credential('lane-old', checked=False)
+        self.host(tracker='cut')
+        refused = self.request('POST', self.tasks, {'title': 'nope'}, token=legacy['secret'])
+        self.assertEqual(503, refused.status, refused.data)
+        record = self.service.state['credentials'][legacy['id']]
+        self.assertFalse(record.get('actor_rows_checked'))
+        self.assertNotIn('actor_rows_refused', record)
+
+    def test_the_kept_outcome_cannot_be_sent_in_a_request(self):
+        """kittrial-5bb.188 item 5: the keeping is not reachable from a request."""
+        self.project()
+        self.host()
+        for body in ({'actor': 'lane-c', 'actor_rows_checked': True},
+                     {'actor': 'lane-d', 'actor_rows_refused': actor_names.ROWS},
+                     {'actor': 'lane-e', 'actor_waived': {'by': 'usr_a', 'reason': 'x'}}):
+            refused = self.request('POST', self.credentials, body, token=self.alex)
+            self.assertEqual(422, refused.status, refused.data)
+            self.assertEqual([], [c for c in self.listed_without_asking() if c.get('actor') == body['actor']])
+        issued = self.request('POST', self.credentials, {'actor': 'lane-f'}, token=self.alex).data['credential']
+        for method in ('PATCH', 'PUT'):
+            self.assertEqual(404, self.request(method, '%s/%s' % (self.credentials, issued['id']),
+                                               {'actor_rows_checked': True}, token=self.alex).status)
+        record = self.service.state['credentials'][issued['id']]
+        self.assertTrue(record.get('actor_rows_checked'))
+        self.assertNotIn('actor_waived', record)
+        self.assertNotIn('actor_rows_refused', record)
+
 
 class InProcessCase(fixes.Harness):
-    """Without a host there are no lists: the shape of a session actor and the service's namespace are left."""
+    """Without a host there are no lists: the shape of a session actor, a look-alike and the
+    service's namespace are left, and the same rule is applied at use (kittrial-5bb.188 item 4)."""
 
-    def test_issue(self):
+    def project_with_alex(self):
         admin = self.admin_token()
         self.create_account(admin, 'alex', 'alex-password-1')
         alex = self.login('alex', 'alex-password-1')[0]
         pid = self.create_project(alex, 'Alpha')
-        path = '/v1/projects/%s/worker-credentials' % pid
+        return alex, '/v1/projects/%s/worker-credentials' % pid, '/v1/projects/%s/tasks' % pid
+
+    def test_issue(self):
+        alex, path, _ = self.project_with_alex()
         for name, rule in ((SESSION_A, actor_names.SESSION_SHAPED), ('http/read', actor_names.SERVICE)):
             refused = self.request('POST', path, {'actor': name}, token=alex)
             self.assertEqual(422, refused.status, refused.data)
@@ -457,6 +1064,38 @@ class InProcessCase(fixes.Harness):
             self.assertEqual(201, self.request('POST', path, {'actor': name}, token=alex).status)
         listed = self.request('GET', path, token=alex).data['items']
         self.assertEqual([None, None], [item['actor_refused'] for item in listed])
+
+    def test_an_earlier_credential_under_a_refused_name_stops_writing(self):
+        """There is no endpoint here, so an old credential under a refused name wrote on."""
+        alex, path, tasks = self.project_with_alex()
+        issued = self.request('POST', path, {'actor': 'legacy-lane'}, token=alex)
+        self.assertEqual(201, issued.status, issued.data)
+        secret = issued.data['credential']['secret']
+        credential_id = issued.data['credential']['id']
+        self.assertEqual(201, self.request('POST', tasks, {'title': 'before'}, token=secret).status)
+        for name, rule in ((SESSION_A, actor_names.SESSION_SHAPED), ('http', actor_names.SERVICE),
+                           ('lane.', actor_names.LOOKALIKE)):
+            with self.subTest(name=name):
+                with self.service.store.lock:                       # as an older kit left the record
+                    self.service.state['credentials'][credential_id]['actor'] = name
+                    self.service.store.save()
+                refused = self.request('POST', tasks, {'title': 'after'}, token=secret)
+                self.assertEqual(403, refused.status, refused.data)
+                self.assertIn(rule, message(refused))
+        self.assertEqual(['before'], [item['title'] for item in self.request('GET', tasks, token=alex).data['items']])
+
+    def test_a_service_started_with_another_namespace_keeps_that_one_at_use_too(self):
+        alex, path, tasks = self.project_with_alex()
+        issued = self.request('POST', path, {'actor': 'legacy-lane'}, token=alex).data['credential']
+        self.backend.actor_namespace = 'web'
+        for name in ('web', 'http'):
+            with self.subTest(name=name):
+                with self.service.store.lock:
+                    self.service.state['credentials'][issued['id']]['actor'] = name
+                    self.service.store.save()
+                refused = self.request('POST', tasks, {'title': 'x'}, token=issued['secret'])
+                self.assertEqual(403, refused.status, refused.data)
+                self.assertIn(actor_names.SERVICE, message(refused))
 
 
 @unittest.skipUnless(os.name == 'posix', 'endpoint.py and admin.py import fcntl; POSIX only')
@@ -479,9 +1118,9 @@ class RealEndpointCase(unittest.TestCase):
         (self.project / '.sessions.json').write_text(json.dumps(
             {'schema_version': 1, 'records': {record['request_id']: record}}), encoding='utf-8')
         self.marker = self.tmp / 'bd-ran'
-        bd = self.root / 'bin' / 'bd'
-        bd.write_text('#!/bin/sh\necho ran >> %s\necho \'{"id":"probe-1","title":"x"}\'\nexit 0\n' % self.marker, encoding='utf-8')
-        bd.chmod(0o755)
+        # The default tracker answer is a whole one: a row plus the project's merge slot
+        # (kittrial-5bb.188 revision-3 item 3(1)), so the free-name writes below still run.
+        self.set_bd([{'id': 'probe-1', 'title': 'x'}])
         spec = importlib.util.spec_from_file_location('real_endpoint_184', str(KIT / 'endpoint.py'))
         self.endpoint = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.endpoint)
@@ -489,18 +1128,56 @@ class RealEndpointCase(unittest.TestCase):
         self.config_path = self.tmp / 'authority.json'
         self.config = http_authority.AuthorityConfig(str(self.config_path))
 
-    def credential(self, name):
+    def credential(self, name, rows_checked=None, created_at=None):
         self.state['credentials'] = {'cred_x': {
             'id': 'cred_x', 'user_id': 'usr_a', 'project_id': 'probe', 'actor': name, 'revoked': False,
             'scopes': ['tasks', 'checkpoints', 'reviews', 'feedback'], 'expires_at': time.time() + 3600}}
+        if rows_checked is not None:
+            self.state['credentials']['cred_x']['actor_rows_checked'] = rows_checked
+        if created_at is not None:
+            self.state['credentials']['cred_x']['created_at'] = created_at
         self.config_path.write_text(json.dumps(self.state), encoding='utf-8')
         return {'via': 'credential', 'user_id': 'usr_a', 'credential_id': 'cred_x', 'project': 'probe',
                 'capability': 'tasks.write', 'now': time.time() + 5}
+
+    def set_bd(self, rows, slot=True):
+        """What this host's ``bd export --all`` answers: the rows the tracker holds.
+
+        A whole tracker always carries the project's merge slot, so the stub answers it too
+        (kittrial-5bb.188 revision-3 item 3(1)); ``slot=False`` plants rows without it, and
+        ``set_bd_raw`` writes the shell script itself for an answer that is not rows at all.
+        """
+        rows = list(rows)
+        if slot:
+            rows.append({'id': 'probe-merge-slot', 'issue_type': 'merge-slot', 'title': 'the merge slot',
+                         'created_at': '2026-01-01T00:00:00Z', 'updated_at': '2026-01-01T00:00:00Z'})
+        lines = '\n'.join('echo %s' % json.dumps(json.dumps(row)) for row in rows)
+        self.set_bd_raw('#!/bin/sh\necho ran >> %s\n%s\nexit 0\n' % (self.marker, lines))
+
+    def set_bd_raw(self, script):
+        """The exact shell script this host's ``bd`` runs, for an answer that is not a tracker."""
+        bd = self.root / 'bin' / 'bd'
+        bd.write_text(script, encoding='utf-8')
+        bd.chmod(0o755)
 
     def write(self, actor, descriptor, number):
         request = {'project': 'probe', 'actor': actor, 'action': 'bd', 'args': ['create', 'x'],
                    'operation_id': 'op-184-%s' % number, 'authority': descriptor}
         return self.endpoint.execute(self.root, request, authority_config=self.config, require_authority=True)
+
+    def run_main(self, request, argv_extra=()):
+        """One request through the endpoint's own CLI, argparse wiring included.
+
+        ``execute`` is called directly everywhere else; this is the seam the reviewers'
+        ``--service-namespace`` mutant (U6) lives at, so it goes through ``main``.
+        """
+        out = io.StringIO()
+        argv = ['endpoint.py', '--root', str(self.root)] + list(argv_extra)
+        with mock.patch.object(sys, 'argv', argv), \
+                mock.patch.object(sys, 'stdin', io.StringIO(json.dumps(request))), \
+                redirect_stdout(out), redirect_stderr(io.StringIO()):
+            self.endpoint.main()
+        return json.loads(out.getvalue())
 
     def test_the_host_says_which_names_are_taken_and_never_which_names_it_has(self):
         names = [name for _, name, _ in REAL_TAKEN] + list(FREE)
@@ -546,6 +1223,133 @@ class RealEndpointCase(unittest.TestCase):
             done = self.endpoint.execute(self.root, {'project': 'probe', 'actor': actor, 'action': 'bd', 'args': ['create', 'x']})
             self.assertEqual(0, done['returncode'], done)
 
+    def test_a_plain_name_the_tracker_holds_is_refused_at_use(self):
+        """kittrial-5bb.188 item 1 on the endpoint: the reviewer's `opus-worker-lane` credential."""
+        self.set_bd([{'id': 'probe-1', 'created_by': 'opus-worker-lane',
+                      'created_at': '2026-01-01T00:00:00Z', 'updated_at': '2026-01-01T00:00:00Z'}])
+        refused = self.write('opus-worker-lane', self.credential('opus-worker-lane', rows_checked=False,
+                                                                 created_at='2026-10-07T00:00:00Z'), 'rows')
+        self.assertEqual((126, 403), (refused['returncode'], refused.get('authority_status')), refused)
+        self.assertEqual('A worker credential cannot write as opus-worker-lane: that is %s. Revoke it and issue one '
+                         'under another name.\n' % actor_names.ROWS, refused['stderr'])
+        self.assertFalse((self.project / '.http-operations.sqlite3').exists(), 'an operation identity was reserved')
+        # A credential issued under the rule carries the mark and is not judged by the rows again:
+        # every row under the name from now on is its own.
+        self.marker.unlink()
+        done = self.write('opus-worker-lane', self.credential('opus-worker-lane', rows_checked=True), 'marked')
+        self.assertEqual(0, done['returncode'], done)
+        self.assertTrue(self.marker.exists())
+
+    def test_actor_standing_reads_the_rows_only_when_it_is_asked_for_them(self):
+        self.set_bd([{'id': 'probe-1', 'assignee': 'opus-worker-lane', 'created_at': '2026-01-01T00:00:00Z',
+                      'updated_at': '2026-01-01T00:00:00Z'}])
+        plain = self.endpoint.execute(self.root, {'project': 'probe', 'actor': 'http/read',
+                                                  'action': 'actor-standing', 'args': ['opus-worker-lane', 'worker-a']},
+                                      authority_config=self.config)
+        self.assertEqual({'opus-worker-lane': None, 'worker-a': None}, json.loads(plain['stdout'])['names'])
+        self.assertFalse(self.marker.exists(), 'the tracker was asked without being asked')
+        asked = self.endpoint.execute(self.root, {'project': 'probe', 'actor': 'http/read', 'action': 'actor-standing',
+                                                  'args': ['opus-worker-lane', 'worker-a'], 'tracker': True},
+                                      authority_config=self.config)
+        self.assertEqual({'opus-worker-lane': actor_names.ROWS, 'worker-a': None},
+                         json.loads(asked['stdout'])['names'])
+        self.assertTrue(self.marker.exists())
+
+    def test_an_export_that_answers_no_rows_is_a_tracker_fault_not_empty(self):
+        """kittrial-5bb.188 item 1 on the endpoint: zero rows is a host fault, at use and at issue."""
+        self.set_bd([], slot=False)
+        with self.assertRaises(actor_names.TrackerUnreadable):
+            self.endpoint.tracker_actors(self.root, self.project)
+        # At use, the descriptor path answers the host fault, not "nothing is taken".
+        answer = self.write('opus-worker-lane', self.credential('opus-worker-lane', rows_checked=False,
+                                                                created_at='2026-10-07T00:00:00Z'), 'empty')
+        self.assertEqual((2, 'tracker'), (answer['returncode'], answer.get('fault')), answer)
+        self.assertFalse((self.project / '.http-operations.sqlite3').exists(), 'an operation identity was reserved')
+        # The service's own read of the rows answers the same marked host fault.
+        told = self.run_main({'project': 'probe', 'actor': 'http/read', 'action': 'actor-standing',
+                              'args': ['opus-worker-lane'], 'tracker': True},
+                             ['--authority-store', str(self.config_path)])
+        self.assertEqual((2, 'tracker'), (told['returncode'], told.get('fault')), told)
+
+    def test_an_answer_without_the_merge_slot_or_not_rows_at_all_is_a_host_fault(self):
+        """kittrial-5bb.188 revision-3 item 3(1): a whole read requires the merge slot, and an
+        answer that is a cut line, a nonzero bd or words that are not rows is a host fault."""
+        row = json.dumps(json.dumps({'id': 'probe-1', 'created_by': 'opus-worker-lane',
+                                     'created_at': '2026-01-01T00:00:00Z'}))
+        shapes = (
+            ('rows but no merge slot', '#!/bin/sh\necho %s\nexit 0\n' % row),
+            ('the last line cut short', '#!/bin/sh\necho %s\necho \'{"id": "probe-2", "created_\'\nexit 0\n' % row),
+            ('exit 1 with an error line', '#!/bin/sh\necho "bd: the database is locked" >&2\nexit 1\n'),
+            ('words that are not rows', '#!/bin/sh\necho "not a row at all"\nexit 0\n'),
+        )
+        for number, (label, script) in enumerate(shapes):
+            with self.subTest(answer=label):
+                self.set_bd_raw(script)
+                with self.assertRaises(actor_names.TrackerUnreadable):
+                    self.endpoint.tracker_actors(self.root, self.project)
+                answer = self.write('worker-a', self.credential('worker-a', rows_checked=False,
+                                                                created_at='2026-10-07T00:00:00Z'), 'bad-%d' % number)
+                self.assertEqual((2, 'tracker'), (answer['returncode'], answer.get('fault')), answer)
+                self.assertFalse((self.project / '.http-operations.sqlite3').exists(),
+                                 'an operation identity was reserved')
+
+    def test_the_endpoint_cli_carries_the_service_namespace_it_was_launched_with(self):
+        """kittrial-5bb.188 item 6: mutant U6 (main drops --service-namespace) must fail here."""
+        descriptor = self.credential('web/read', rows_checked=True)
+        answer = self.run_main({'project': 'probe', 'actor': 'web/read', 'action': 'bd', 'args': ['create', 'x'],
+                                'operation_id': 'op-cli-web', 'authority': descriptor},
+                               ['--authority-store', str(self.config_path), '--require-authority',
+                                '--service-namespace', 'web'])
+        self.assertEqual((126, 403), (answer['returncode'], answer.get('authority_status')), answer)
+        self.assertIn(actor_names.SERVICE, answer['stderr'])
+        self.assertFalse(self.marker.exists(), 'the native command ran')
+
+    def test_only_the_service_may_make_the_endpoint_read_the_tracker(self):
+        """kittrial-5bb.188 item 6: `actor-standing` with rows is the service's, not any caller's."""
+        self.set_bd([{'id': 'probe-1', 'created_by': 'opus-worker-lane', 'created_at': '2026-01-01T00:00:00Z'}])
+        request = {'project': 'probe', 'actor': 'http/read', 'action': 'actor-standing',
+                   'args': ['opus-worker-lane'], 'tracker': True}
+        answer = self.run_main(request)                       # no authority store: the SSH path
+        self.assertEqual(2, answer['returncode'], answer)
+        self.assertIn('web service only', answer['stderr'])
+        self.assertFalse(self.marker.exists(), 'a caller without the service read the tracker')
+        told = self.run_main(request, ['--authority-store', str(self.config_path)])
+        self.assertEqual(0, told['returncode'], told)
+        self.assertEqual({'opus-worker-lane': actor_names.ROWS}, json.loads(told['stdout'])['names'])
+        self.assertTrue(self.marker.exists())
+
+    def test_the_credential_actors_command_line_carries_the_service_namespace(self):
+        """kittrial-5bb.188 item 6: mutant L2 (the CLI drops --service-namespace) must fail here."""
+        import admin
+        rows = [{'id': 'probe-1', 'created_by': 'web/read', 'created_at': '2026-11-01T00:00:00Z',
+                 'updated_at': '2026-11-01T00:00:00Z'}]      # newer than the credential: not held
+        path = self.tmp / 'state.json'
+        path.write_text(json.dumps({'users': {}, 'credentials': {
+            'cred_w': {'user_id': 'usr_a', 'project_id': 'probe', 'label': 'w', 'actor': 'web/read',
+                       'revoked': False, 'created_at': '2026-10-01T00:00:00Z'}}}), encoding='utf-8')
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(admin, 'run_bd', return_value='\n'.join(json.dumps(row) for row in rows)), \
+                mock.patch.object(sys, 'argv', ['admin.py', '--root', str(self.root), 'credential-actors',
+                                                '--state', str(path), '--service-namespace', 'web']), \
+                redirect_stdout(out), redirect_stderr(err):
+            admin.main()
+        item = [c for c in json.loads(out.getvalue())['credentials'] if c['credential'] == 'cred_w'][0]
+        self.assertEqual(actor_names.SERVICE, item['collides'])
+
+    def test_the_service_namespace_it_was_launched_with_is_judged_at_use(self):
+        """kittrial-5bb.188 item 3: `--actor-namespace web` at issue, and now at use too."""
+        for namespace in (None, 'web'):
+            with self.subTest(namespace=namespace):
+                self.config = http_authority.AuthorityConfig(str(self.config_path), None, namespace)
+                descriptor = self.credential('web/read', rows_checked=False, created_at='2026-10-07T00:00:00Z')
+                answer = self.write('web/read', descriptor, 'web-%s' % namespace)
+                if namespace is None:
+                    self.assertEqual(0, answer['returncode'], answer)
+                    self.marker.unlink()
+                else:
+                    self.assertEqual((126, 403), (answer['returncode'], answer.get('authority_status')), answer)
+                    self.assertIn(actor_names.SERVICE, answer['stderr'])
+
     def test_a_registry_that_cannot_be_read_refuses_the_credential_and_not_the_account(self):
         (self.project / '.sessions.json').write_text('not json', encoding='utf-8')
         with self.assertRaises(ValueError):
@@ -571,21 +1375,63 @@ class RealEndpointCase(unittest.TestCase):
         self.assertEqual(before, {p: p.stat().st_mtime_ns for p in list(self.root.rglob('*')) + [path] if p.is_file()})
         found = {item['credential']: item for item in report['credentials']}
         self.assertEqual(sorted(found), ['cred_1', 'cred_2', 'cred_3', 'cred_6'])
-        self.assertEqual((4, 2), (report['worker_credentials_with_a_name'], report['colliding_and_not_revoked']))
+        self.assertEqual((4, 3), (report['worker_credentials_with_a_name'], report['colliding_and_not_revoked']))
         self.assertEqual((actor_names.OPERATOR, True, True, 'alex', '2026-10-03T04:00:00Z'),
                          tuple(found['cred_1'][key] for key in ('collides', 'refused_when_it_writes', 'tracker_rows',
                                                                 'issued_by_username', 'last_used')))
-        self.assertEqual((None, False, True), tuple(found['cred_2'][key] for key in ('collides', 'refused_when_it_writes', 'tracker_rows')))
+        # A plain name the tracker holds, with no issuance stamp to bound the rows: refused when it writes.
+        self.assertEqual((actor_names.ROWS, True, True),
+                         tuple(found['cred_2'][key] for key in ('collides', 'refused_when_it_writes', 'tracker_rows')))
         self.assertEqual((actor_names.SESSION, True), (found['cred_3']['collides'], found['cred_3']['revoked']))
         # A project that is not on this host: the lists still apply; its tracker cannot be read, and that is said.
         self.assertEqual((actor_names.VERIFIER, False, None, None),
                          tuple(found['cred_6'][key] for key in ('collides', 'project_on_host', 'tracker_rows', 'issued_by_username')))
+        # The service namespace the command was told about is judged too (kittrial-5bb.188 item 3):
+        # without `--service-namespace web`, `web/read` is not marked, which is the review's finding.
+        state['credentials']['cred_7'] = {'user_id': 'usr_a', 'project_id': 'probe', 'label': 'seven',
+                                          'actor': 'web/read', 'revoked': False,
+                                          'created_at': '2026-10-01T00:00:00Z'}
+        path.write_text(json.dumps(state), encoding='utf-8')
+        with mock.patch.object(admin, 'run_bd', return_value=''):
+            told = {item['credential']: item['collides']
+                    for item in admin.credential_actors(self.root, path, 'web')['credentials']}
+            untold = {item['credential']: item['collides']
+                      for item in admin.credential_actors(self.root, path)['credentials']}
+        self.assertEqual(actor_names.SERVICE, told['cred_7'])
+        self.assertIsNone(untold['cred_7'])
+        state['credentials']['cred_7']['actor'] = 'http/read'
+        path.write_text(json.dumps(state), encoding='utf-8')
+        with mock.patch.object(admin, 'run_bd', return_value=''):
+            both = {item['credential']: item['collides']
+                    for item in admin.credential_actors(self.root, path, 'web')['credentials']}
+        self.assertEqual(actor_names.SERVICE, both['cred_7'])
         for missing in (self.tmp / 'nothing.json', self.root):
             with self.assertRaises(ValueError):
                 admin.credential_actors(self.root, missing)
         path.write_text('[]', encoding='utf-8')
         with self.assertRaises(ValueError):
             admin.credential_actors(self.root, path)
+
+    def test_the_host_command_shows_a_waived_name_as_allowed(self):
+        """kittrial-5bb.188 item 4: a waived credential is allowed, not colliding/refused."""
+        import admin
+        path = self.tmp / 'waived-state.json'
+        path.write_text(json.dumps({'users': {'usr_a': {'id': 'usr_a', 'username': 'root-admin'}},
+                                    'credentials': {
+            'cred_w': {'user_id': 'usr_a', 'project_id': 'probe', 'label': 'waived',
+                       'actor': 'opus-worker-lane', 'revoked': False, 'created_at': '2026-10-01T00:00:00Z',
+                       'actor_waived': {'by': 'usr_a', 'reason': 'the lane owns it',
+                                        'at': '2026-10-07T00:00:00Z'}}}}), encoding='utf-8')
+        rows = [{'id': 'probe-1', 'created_by': 'opus-worker-lane', 'created_at': '2026-01-01T00:00:00Z'}]
+        with mock.patch.object(admin, 'run_bd', return_value='\n'.join(json.dumps(row) for row in rows)):
+            report = admin.credential_actors(self.root, path)
+        item = [c for c in report['credentials'] if c['credential'] == 'cred_w'][0]
+        self.assertIsNone(item['collides'])
+        self.assertFalse(item['refused_when_it_writes'])
+        self.assertTrue(item['waived'])
+        self.assertEqual('allowed by root-admin on 2026-10-07T00:00:00Z', item['actor_allowed'])
+        self.assertEqual('the lane owns it', item['waived_reason'])
+        self.assertEqual(0, report['colliding_and_not_revoked'])
 
     def test_the_command_line_prints_the_list_and_says_how_many(self):
         import admin
@@ -600,6 +1446,54 @@ class RealEndpointCase(unittest.TestCase):
         self.assertEqual(1, json.loads(out.getvalue())['colliding_and_not_revoked'])
         self.assertIn('1 worker credential(s) write under a name', err.getvalue())
         self.assertIn('Nothing was changed', err.getvalue())
+
+
+class TrackerFaultTests(unittest.TestCase):
+    """kittrial-5bb.188 item 1: the endpoint's no-rows fault is a host fault, never a 422."""
+
+    def test_the_tracker_fault_is_unavailable_and_nothing_was_changed(self):
+        for reading in (True, False):
+            with self.subTest(reading=reading):
+                with self.assertRaises(http_service.HttpError) as failed:
+                    http_service.EndpointBackend._checked(
+                        {'returncode': 2, 'stdout': '', 'stderr': 'ValueError: no rows\n', 'fault': 'tracker'},
+                        'actor-standing', reading=reading)
+                error = failed.exception
+                self.assertEqual((503, 'unavailable', http_service.EndpointBackend.UNREAD, True),
+                                 (error.status, error.code, error.message,
+                                  getattr(error, 'nothing_done', False)))
+
+    def test_an_ordinary_code_two_reading_refusal_is_still_422(self):
+        """The endpoint's own guard refusals stay 422 on the reading path (main's rule)."""
+        with self.assertRaises(http_service.HttpError) as failed:
+            http_service.EndpointBackend._checked(
+                {'returncode': 2, 'stdout': '', 'stderr': 'ValueError: Refusing update\n'},
+                'actor-standing', reading=True)
+        self.assertEqual(422, failed.exception.status)
+
+
+class LaunchWiringTests(unittest.TestCase):
+    """kittrial-5bb.188 item 6: the --service-namespace launch wiring mutant S5 must fail here."""
+
+    def backend(self, namespace='web2'):
+        service = mock.Mock()
+        service.store.path = os.path.join(os.sep, 'tmp', 'state.json')
+        return http_service.EndpointBackend(sys.executable, 'endpoint.py', os.path.join(os.sep, 'root'),
+                                            service=service, actor_namespace=namespace)
+
+    def test_the_service_hands_its_namespace_to_the_endpoint_launch(self):
+        backend = self.backend()
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured['argv'] = list(argv)
+            return subprocess.CompletedProcess(argv, 0,
+                                               json.dumps({'returncode': 0, 'stdout': '{}\n', 'stderr': ''}), '')
+        with mock.patch.object(subprocess, 'run', fake_run):
+            backend._ask('actor-standing', 'probe', 'web2/read', ['worker'], None, None, None, None,
+                         False, None, False, None)
+        self.assertIn('--service-namespace', captured['argv'])
+        self.assertEqual('web2', captured['argv'][captured['argv'].index('--service-namespace') + 1])
 
 
 if __name__ == '__main__':

@@ -6,7 +6,9 @@ service adds ``--authority-store``/``--authority-lock`` (and ``--require-authori
 for mutations) to the launch command; those are server-side configuration and are
 never taken from the request body. An SSH-shaped request therefore cannot choose the
 live-authority document or the lock path, and can only omit the check because it has
-no HTTP principal at all.
+no HTTP principal at all. ``--service-namespace`` is the web service's own actor
+namespace (``http`` unless it was started with another): at use the endpoint refuses a
+credential named under it, and only its launcher knows it (kittrial-5bb.188 item 3).
 """
 import argparse
 import fcntl
@@ -408,12 +410,50 @@ def configuration_fault(root,error):
     try:return Path(os.fsdecode(error.filename))==Path(root)/'deployment.private.json'
     except (TypeError,ValueError):return False       # it names no file, or a descriptor
 
-def reserved_actors(root,path):
+def tracker_actors(root,path,before=None,own=()):
+    """The names this project's tracker already holds as an author or assignee, older than
+    ``before`` (all of them when it is None); kittrial-5bb.188 item 1.
+
+    One ``bd export --all`` for the project, through the same read ``admin.py
+    credential-actors`` makes: a bd process that opens the project's database. That is the
+    cost of judging a plain name by the rows it has, and it is paid where the rule is
+    applied, never by every write (docs/HTTP_DEPLOYMENT.md says so). A tracker that cannot
+    be read raises, and so does an answer that is not a whole tracker -- an export that
+    parses to no rows, that fails partway (a cut line, a non-JSON word, a bd that exits
+    nonzero), or that carries rows but not the project's merge slot
+    (``actor_names.TrackerUnreadable``): every project this kit makes holds that slot, so an
+    answer without it did not come from a whole read and is a host fault, not "the tracker
+    holds no names" (kittrial-5bb.188 review of item 1, revision-3 item 3). ``own`` are the
+    lifetimes of earlier credentials of the same name whose rows are not held against this
+    one (item 3)."""
+    import actor_names
+    from admin import run_bd
+    try:
+        text=run_bd(root,path.name,['export','--all'])
+        rows=[record_json.loads(line) for line in text.splitlines() if line.strip()]
+    except (subprocess.SubprocessError,OSError,ValueError,RecursionError):
+        # bd could not answer, or answered something that is not rows: a host fault, never an
+        # empty tracker and never a rejection of the caller's request.
+        raise actor_names.TrackerUnreadable()
+    if not any(isinstance(row,dict) for row in rows) or not any(is_merge_slot(row) for row in rows):
+        raise actor_names.TrackerUnreadable()
+    return actor_names.tracker_names(actor_names.tracker_marks(rows),before,own)
+
+def reserved_actors(root,path,rows=False,own=()):
     """The names a worker credential's namespace may not be, as this host has them: the
-    project's registered session actors and the installation's operator and verifier lists."""
+    project's registered session actors, the installation's operator and verifier lists, and
+    (only when ``rows`` asks for it) the project's tracker rows.
+
+    ``rows`` is False (no tracker read, the cheap rule), True (every row, for a name being
+    issued) or the instant the credential was issued, so that a credential's own rows are
+    not held against it. ``own`` are the earlier same-name credentials' lifetimes whose rows
+    are not held either (kittrial-5bb.188 item 3)."""
     from sessions import registered_actors
-    return {'sessions':registered_actors(path),'operators':sorted(configured_operators(root)),
+    names={'sessions':registered_actors(path),'operators':sorted(configured_operators(root)),
             'verifiers':sorted(configured_verifiers(root))}
+    if rows:
+        names['authors']=sorted(tracker_actors(root,path,None if rows is True else rows,own))
+    return names
 
 def execute(root,request,authority_config=None,require_authority=False):
     # Two actions exist only for the web service and name no existing project
@@ -444,7 +484,7 @@ def execute(root,request,authority_config=None,require_authority=False):
     if denied is not None:return denied
     # And a name WITHOUT that shape, sent by the web service with a descriptor, is written only
     # by a worker credential inside a namespace that is nobody else's (kittrial-5bb.184).
-    denied=descriptor_actor_denial(request,authority_config,lambda:reserved_actors(root,path))
+    denied=descriptor_actor_denial(request,authority_config,lambda rows=False,own=():reserved_actors(root,path,rows,own))
     if denied is not None:return denied
     if request.get('action')=='session':
         from sessions import execute as session_execute
@@ -515,11 +555,21 @@ def execute(root,request,authority_config=None,require_authority=False):
         # Read-only (kittrial-5bb.184): for each name asked about, why a worker credential may
         # not write under it, or null. The web service asks before it issues one and when it
         # lists them. The answer says which rule, never the host's names. No lock, no write.
+        # With ``tracker`` set it also reads the project's rows, which is one bd export: the
+        # service asks for that only at issue (kittrial-5bb.188 item 1), and only the service
+        # may ask (item 6): the flag is a launch-argument service, so a caller over SSH (no
+        # authority store) cannot make the endpoint read a tracker by sending it.
         import actor_names
         names=request.get('args',[])
         if not isinstance(names,list) or not 1<=len(names)<=200 or any(not isinstance(n,str) or not 0<len(n)<=96 or '\0' in n for n in names):
             raise ValueError('Use actor-standing with 1 to 200 names')
-        reserved=reserved_actors(root,path)
+        tracker=request.get('tracker')
+        if tracker and authority_config is None:
+            raise ValueError('actor-standing with rows is for the web service only; nothing was changed')
+        own=request.get('own') if tracker else None
+        own=own if isinstance(own,list) else ()
+        rows=tracker if isinstance(tracker,str) else bool(tracker)
+        reserved=reserved_actors(root,path,rows,own)
         return {'returncode':0,'stdout':json.dumps({'schema_version':1,'names':{n:actor_names.collision(n,**reserved) for n in names}})+'\n','stderr':''}
     if action=='setup-status':
         # Read-only (kittrial-5bb.118): what the host knows about this project's setup,
@@ -883,10 +933,13 @@ def main():
     p.add_argument('--authority-lock',help='server-side authority lock (defaults to STORE.lock)')
     p.add_argument('--require-authority',action='store_true',
                    help='refuse a mutation that omits the live-authority descriptor')
+    p.add_argument('--service-namespace',
+                   help="the web service's own actor namespace (default http): a name the "
+                        'service was started under is refused at use too (kittrial-5bb.188 item 3)')
     a=p.parse_args()
     authority_config=None
     if a.authority_store:
-        authority_config=AuthorityConfig(a.authority_store,a.authority_lock)
+        authority_config=AuthorityConfig(a.authority_store,a.authority_lock,a.service_namespace)
     try:
         text=sys.stdin.read(2_000_001)
         if len(text)>2_000_000:raise ValueError('Request exceeds 2 MB')
@@ -900,6 +953,12 @@ def main():
         answer={'returncode':75,'stdout':'','stderr':'Busy: %s. Nothing was done; try again shortly.\n'%waited}
     except Exception as e:
         answer={'returncode':2,'stdout':'','stderr':f'{type(e).__name__}: {e}\n'}
+        import actor_names
+        if isinstance(e,actor_names.TrackerUnreadable):
+            # The export answered no rows: a host fault, not a refusal of the request. The
+            # service reads this mark and answers 503 "nothing was changed" (kittrial-5bb.188
+            # item 1); `fault` is how it tells a read the service may retry from a rejection.
+            answer['fault']='tracker'
         if configuration_fault(a.root,e):
             # Not a fault of the request: the server's own configuration file cannot be read.
             # The line names the file, as it does for the operator; `fault` lets the web service
