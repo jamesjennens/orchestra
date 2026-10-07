@@ -34,7 +34,9 @@ allowlisted operator (the reserved-prefix guard keeps contributors from writing 
 record raw). Attribution beyond operators arrives with kittrial-5bb.68 (.58's actor
 map, and HTTP once the actor is bound to the principal), which will also set
 `submitted_by_agent` (always `false` until then).
-There is no demotion in slice 1a: .60 section 4's "demote" is covered by retire.
+There is no demotion: an accepted revision is never weakened or withdrawn in place. The
+operator either supersedes the key with a named successor (`admin.py capability-retire`) or
+accepts a later revision of it (.60 section 4).
 
 Verification (slice 1b, kittrial-5bb.69) lives in `capability_verification.py`: the
 record, the two write routes and the trust rules. This module reads those records
@@ -881,7 +883,9 @@ def find(rows, phrase, operators, limit=5, trust=None):
             'hint': None if exact else 'An operator must reconcile the duplicate anchors before any write.'
             if conflicted else ('No capability record matches exactly. If one of the candidates is what you '
                                          'were looking for, run capability propose-alias KEY "%s"; if none is, '
-                                         'capability propose a draft with the pointers you found.' % text[:80]),
+                                         'write the payload file (capability-proposals/<key>.json) with the '
+                                         'pointers you found and carry it in your delivery; do not run '
+                                         'capability propose.' % text[:80]),
             'coverage': KIND.coverage(entries, incomplete, 'records only; capability lookup with --config also '
                                                            'searches the code')}
 

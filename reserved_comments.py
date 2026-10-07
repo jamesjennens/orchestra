@@ -1342,6 +1342,23 @@ def status_change_targets(args):
     return (command, targets or None)
 
 
+def title_change_targets(args):
+    """The ids an `update` that changes a title names, for the record-anchor guard (kittrial-5bb.97).
+
+    ``None`` when the invocation is not an `update` with `--title` (bd 1.2.2 has no short
+    flag for it). Otherwise the positional ids; or the string ``'unnamed'`` when the scan
+    is ambiguous (an unknown flag) or names no row: bd would then act on the row it touched
+    last, which the guard cannot check, so the caller fails closed.
+    """
+    if not isinstance(args, list) or not args or args[0] != 'update':
+        return None
+    flags, operands, unknown = _bd_scan(args, 'update')
+    if not any(name == '--title' for name, _ in flags):
+        return None
+    targets = [token for token in operands if not token.startswith('@attachment:')]
+    return 'unnamed' if unknown or not targets else targets
+
+
 # ---------------------------------------------------------------------------
 # The rows a contributor write names (kittrial-5bb.113, reviews 01a109cc and 01a10c0b).
 #

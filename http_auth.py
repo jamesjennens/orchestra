@@ -2815,14 +2815,42 @@ class Service:
             })
         return digest
 
-    def idempotency_commit(self, digest, status, response):
+    def idempotency_commit(self, digest, status, response, written_at=None):
+        """Keep the answer of a committed write for a retry; ``written_at`` is the server's time of the write.
+
+        The time is kept beside the answer and not only in it, because an answer that is a
+        JSON list or empty has no field for it and its retry must carry the same header
+        (kittrial-5bb.97).
+        """
         if digest is None:
             return
         with self.store.lock:
             record = self.store.records.get('idempotency', digest)
             if record is not None:
                 record.update(state='committed', status=status, response=response)
+                if written_at is not None:
+                    record['written_at'] = written_at
                 self.store.records.put('idempotency', digest, record)
+
+    def idempotency_written_at(self, principal, project_id, route, key):
+        """The server's time kept with the committed answer of this request, or None.
+
+        An answer stored before the time was kept beside it has it only in its body, when
+        that is an object with ``server_time``.
+        """
+        if key is None:
+            return None
+        digest = self._idempotency_key(principal, project_id, route, key)
+        with self.store.lock:
+            record = self.store.records.get('idempotency', digest)
+        if not isinstance(record, dict) or record.get('state') != 'committed':
+            return None
+        kept = record.get('written_at')
+        if isinstance(kept, str):
+            return kept
+        body = record.get('response')
+        inside = body.get('server_time') if isinstance(body, dict) else None
+        return inside if isinstance(inside, str) else None
 
     def idempotency_unknown(self, digest):
         if digest is None:
@@ -2851,10 +2879,23 @@ class Service:
         """Whether the record store holds a result for ``key`` (a stored ``None`` counts)."""
         return self.store.records.get('result', key) is not None
 
-    def result_put(self, key, value):
-        """Record one committed canonical result with time-only retention."""
-        self.store.records.put('result', key, {'result': value},
-                              ttl=self.result_retention)
+    def result_put(self, key, value, written_at=None):
+        """Record one committed canonical result with time-only retention.
+
+        ``written_at`` is the server's time of the write, kept with the result: a retry
+        that is answered from this row (its idempotency row gone, or never committed) must
+        carry the time of the write and not the time of the retry (kittrial-5bb.97).
+        """
+        record = {'result': value}
+        if isinstance(written_at, str):
+            record['written_at'] = written_at
+        self.store.records.put('result', key, record, ttl=self.result_retention)
+
+    def result_written_at(self, key):
+        """The server's time kept with the result for ``key``; None when there is no row or it kept none."""
+        record = self.store.records.get('result', key)
+        kept = record.get('written_at') if isinstance(record, dict) else None
+        return kept if isinstance(kept, str) else None
 
     # -- HTTP-facing copies (never expose secrets) -----------------------------
     def export_state(self):
