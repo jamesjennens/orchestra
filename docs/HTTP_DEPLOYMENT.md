@@ -1196,17 +1196,19 @@ agent can write its first one from the brief alone.
 
 ### What a task change takes
 
-`PATCH /v1/projects/{id}/tasks/{task}` changes a task's `title`, `description` and
-`status` (`open` or `closed`), and nothing else. Its body may also carry `version`
-(the in-process backend of the tests and the local preview checks it; the endpoint
-backend does not read it) and `actor` (below). Anything else is refused, not
-dropped:
+`PATCH /v1/projects/{id}/tasks/{task}` changes a task's `title`, `description`, `status`
+(`open` or `closed`) and `priority` (an integer 0 to 4), and nothing else. Its body may also
+carry `version` (the in-process backend of the tests and the local preview checks it; the
+endpoint backend does not read it) and `actor` (below). `priority` is taken for real: the
+endpoint is asked for `--priority N`, a value that is not an integer 0 to 4 answers 422
+"Task priority must be an integer 0-4", and a change that carries none keeps the priority the
+task had. Anything else is refused, not dropped:
 
-- a field the route does not take (`priority`, `assignee`, `labels`, any other
-  name) answers **422 `invalid_payload`**, "A task change does not take: priority.
-  A task change takes: title, description, status", with the names again in
-  `error.detail` (`unsupported`, `takes`). So does a body that takes one field and
-  not another: the whole change is refused, not half of it carried out;
+- a field the route does not take (`assignee`, `labels`, any other name) answers **422
+  `invalid_payload`**, "A task change does not take: assignee. A task change takes: title,
+  description, status, priority", with the names again in `error.detail` (`unsupported`,
+  `takes`). So does a body that takes one field and not another: the whole change is refused,
+  not half of it carried out;
 - a body that would change nothing (no field, only nulls, only `version`) answers
   422 "Nothing to change";
 - a `status` other than `open` and `closed`, a `title` that is empty or not text
@@ -1215,8 +1217,25 @@ dropped:
 
 Such a refusal comes before the idempotency key is looked at: nothing is reserved,
 nothing is sent to the endpoint, nothing is audited as uncertain, and **the same
-key serves the corrected request**. To give a task a priority, an assignee other
-than the caller or a label there is no web route today.
+key serves the corrected request**. An assignee other than the caller and a label
+still have no web route today; a priority now does.
+
+**Task create takes a priority too.** `POST /v1/projects/{id}/tasks` takes `title`,
+`description`, `priority` (an integer 0 to 4; bd's default 2 applies when it is absent) and the
+optional `attachments` and `actor`, which is what the new-task form sends
+(`web/js/views/task.js`). A field outside that set answers 422 "A task creation does not take:
+X. A task creation takes: title, description, priority, attachments, actor". A `priority: null`
+is read as absent on both backends, so it makes the default 2 rather than a refusal.
+
+**Eight more write routes refuse a field they do not take, the same way.** Task create, claim,
+checkpoint, member change, worker credential issue, agent create, agent change and account
+create answer a body that carries a field the route does not take with **422 `invalid_payload`**,
+naming the field and the fields the route does take, with the names again in `error.detail`
+(`unsupported`, `takes`); nothing is written and the idempotency key is not reserved. A field
+whose value is null is treated as absent, and every body the released web and Python clients
+send (`web/js/api.js`, `http_client.py`) is inside the route's set. Every one of these routes
+judges the caller's right first, so a caller with no right keeps its 401, 403 or 404 instead of
+being shown the route's field list.
 
 Before this (kittrial-5bb.181) a change that carried none of the three fields was
 sent to bd as an update with nothing in it. bd answers that with the words "No

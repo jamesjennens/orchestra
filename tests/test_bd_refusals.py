@@ -118,6 +118,29 @@ class RecogniserTests(unittest.TestCase):
             with self.subTest(code=code, stdout=str(stdout)[:40], stderr=str(stderr)[:40]):
                 self.assertIsNone(bd_refusals.refusal(code, stdout, stderr))
 
+    def test_not_found_is_bds_whole_sentence_and_not_the_words_somewhere(self):
+        """Review of kittrial-5bb.185: 'failed to commit: no issue found matching' must read unknown."""
+        for sentence in ('no issue found matching "pp-1"', 'resolving pp-1: no issue found matching "pp-1"',
+                         'resolving ID pp-1: no issue found matching "pp-1"', 'no issues found matching the provided IDs'):
+            with self.subTest(sentence=sentence):
+                self.assertEqual(bd_refusals.refusal(1, json_error(sentence), ''), (NOT_FOUND, sentence))
+                self.assertEqual(bd_refusals.refusal(1, '', 'Error: %s\n' % sentence), (NOT_FOUND, sentence))
+        for sentence in ('failed to commit: no issue found matching "pp-1"',
+                         'wrote pp-2; then no issue found matching "pp-1"',
+                         'no issue found matching "pp-1"; rolled back half',
+                         'no issue found matching pp-1', 'no issue found matching',
+                         'resolving pp-1 and pp-2: no issue found matching "pp-1" after the write',
+                         'the row was not found', 'not found', 'issue pp-1 not found', 'no such issue'):
+            with self.subTest(sentence=sentence):
+                self.assertIsNone(bd_refusals.refusal(1, json_error(sentence), ''))
+                self.assertIsNone(bd_refusals.refusal(1, '', 'Error: %s\n' % sentence))
+
+    def test_a_sentence_of_several_lines_is_not_a_refusal(self):
+        for sentence in ('title cannot be empty\nand the row was written', 'no issue found matching "pp-1"\nfailed to commit',
+                         'validation failed for issue : x\ny'):
+            with self.subTest(sentence=sentence):
+                self.assertIsNone(bd_refusals.refusal(1, json_error(sentence), ''))
+
     def test_a_sentence_that_only_contains_one_of_bds_is_judged_by_where_it_stands(self):
         self.assertIsNone(bd_refusals.refusal(1, '', 'Error: could not write: validation failed for issue\n'))
         self.assertIsNone(bd_refusals.refusal(1, '', 'Error: commit failed after invalid status was set\n'))
@@ -199,6 +222,93 @@ class RealBdTests(rb.RealBdLabelAliasTests):
         self.assertNotEqual(0, again['returncode'], 'an identity whose outcome is unknown was used again')
 
 
+@unittest.skipUnless(os.name == 'posix', 'endpoint.py imports fcntl; POSIX only')
+class EndpointWithAStandInBdTests(unittest.TestCase):
+    """The endpoint's own three lines (review of kittrial-5bb.185: the tests against a real bd are skipped
+    in CI, which has none). A stand-in ``bd`` says what the test tells it to; the endpoint is the real one."""
+
+    def setUp(self):
+        import importlib.util
+        self.tmp = fixes.unique_dir('bd-refusal-endpoint-')
+        self.addCleanup(fixes.shutil.rmtree, self.tmp, ignore_errors=True)
+        self.root = self.tmp / 'root'
+        (self.root / 'bin').mkdir(parents=True)
+        (self.root / 'projects' / 'probe' / '.beads').mkdir(parents=True)
+        (self.root / 'projects' / 'probe' / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+        (self.root / 'deployment.private.json').write_text(json.dumps({'password': 'probe'}), encoding='utf-8')
+        self.script = self.tmp / 'answer.json'
+        self.ran = self.tmp / 'ran.txt'
+        bd = self.root / 'bin' / 'bd'
+        # Reads answer by answer from a file the test writes: {"code", "stdout", "stderr"} for a write;
+        # the endpoint's own reads before a write (show, list, export) are answered as an empty tracker.
+        bd.write_text('#!%s\nimport json, sys\nargv = sys.argv[1:]\n'
+                      'words = [a for a in argv if not a.startswith("-")]\n'
+                      'if not any(w in ("create", "update", "close") for w in words):\n'
+                      '    print("[]"); sys.exit(0)\n'
+                      'open(%r, "a").write("ran\\n")\n'
+                      'answer = json.load(open(%r))\n'
+                      'sys.stdout.write(answer["stdout"]); sys.stderr.write(answer["stderr"]); sys.exit(answer["code"])\n'
+                      % (sys.executable, str(self.ran), str(self.script)), encoding='utf-8')
+        bd.chmod(0o755)
+        spec = importlib.util.spec_from_file_location('endpoint_for_bd_refusals', str(KIT / 'endpoint.py'))
+        self.endpoint = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.endpoint)
+
+    def ask(self, code, stdout, stderr, operation='op-1', args=('create', 'a title', '--json')):
+        self.script.write_text(json.dumps({'code': code, 'stdout': stdout, 'stderr': stderr}), encoding='utf-8')
+        return self.endpoint.execute(self.root, {'project': 'probe', 'actor': 'worker', 'action': 'bd', 'args': list(args),
+                                                 'attachments': {}, 'operation_id': operation})
+
+    def test_what_bd_said_reaches_the_caller_as_what_it_is(self):
+        """Every row of the table, through the real endpoint: a refusal is 2 with its kind and bd's sentence."""
+        for number, (label, argv, code, stdout, stderr, kind) in enumerate(BD_SAID):
+            with self.subTest(case=label):
+                answer = self.ask(code, stdout, stderr, operation='op-table-%d' % number)
+                if kind is None:
+                    self.assertEqual((code, stdout), (answer['returncode'], answer['stdout']), answer)
+                    self.assertNotIn('refused', answer)
+                else:
+                    self.assertEqual((2, kind, ''), (answer['returncode'], answer.get('refused'), answer['stdout']), answer)
+                    self.assertEqual('ValueError: bd refused: %s\n' % bd_refusals.refusal(code, stdout, stderr)[1], answer['stderr'])
+                    self.assertNotIn('server_time', answer)
+        self.assertEqual(len(BD_SAID), len(self.ran.read_text().splitlines()))
+
+    def test_a_failure_that_is_not_one_of_bds_refusals_is_handed_on_and_its_identity_is_kept(self):
+        """The dangerous direction: the endpoint must not take every failure of bd for a refusal."""
+        for number, (code, stdout, stderr) in enumerate((
+                (1, json_error('failed to commit transaction'), ''),
+                (1, '', 'Error: failed to commit: no issue found matching "pp-1"\n'),
+                (1, '', "xxxx' is too large for column 'title'\n"),
+                (1, 'Created issue probe-1\n', 'Error: title cannot be empty\n'),
+                (3, json_error('title cannot be empty'), ''),
+                (1, '', ''))):
+            with self.subTest(said=(stdout or stderr)[:40]):
+                operation = 'op-unknown-%d' % number
+                answer = self.ask(code, stdout, stderr, operation=operation)
+                self.assertEqual((code, stdout, stderr), (answer['returncode'], answer['stdout'], answer['stderr']), answer)
+                self.assertNotIn('refused', answer)
+                # The identity is kept as an outcome nobody knows: the same one is not carried out again.
+                ran = len(self.ran.read_text().splitlines())
+                again = self.ask(0, '{"id": "probe-1", "title": "x"}\n', '', operation=operation)
+                self.assertEqual(124, again['returncode'], again)
+                self.assertEqual(ran, len(self.ran.read_text().splitlines()), 'bd was asked again')
+
+    def test_a_refusal_releases_its_identity(self):
+        refused = self.ask(1, json_error('title cannot be empty'), '', operation='op-released')
+        self.assertEqual((2, INVALID), (refused['returncode'], refused.get('refused')), refused)
+        done = self.ask(0, '{"id": "probe-1", "title": "x"}\n', '', operation='op-released')
+        self.assertEqual(0, done['returncode'], done)
+        self.assertIn('server_time', done)
+
+    def test_what_bd_wrote_is_never_answered_as_a_refusal(self):
+        """Exit 0 is a write, whatever is printed beside it."""
+        for stdout, stderr in (('{"id": "probe-1", "title": "x"}\n', 'Error: title cannot be empty\n'),
+                               (json_error('title cannot be empty'), '')):
+            answer = self.ask(0, stdout, stderr, operation='op-wrote-%d' % len(stdout))
+            self.assertEqual(0, answer['returncode'], answer)
+            self.assertNotIn('refused', answer)
+
+
 def message(response):
     return (response.data.get('error') or {}).get('message', '') if isinstance(response.data, dict) else ''
 
@@ -222,6 +332,8 @@ class Project:
 
 class TitleCase(Project, fixes.EndpointCase):
     BAD = (('no title', {}, 'Task title must be text and not empty'),
+           ('a title of one control character', {'title': '\x01'}, 'Task title must be text and not empty'),
+           ('a title of control characters and spaces', {'title': ' \x00\x1f\t\n\x7f '}, 'Task title must be text and not empty'),
            ('an empty title', {'title': ''}, 'Task title must be text and not empty'),
            ('a blank title', {'title': '   \t'}, 'Task title must be text and not empty'),
            ('a title that is null', {'title': None}, 'Task title must be text and not empty'),
@@ -399,32 +511,80 @@ class ReadInsideAWriteCase(Project, fixes.EndpointCase):
 class SmallOnesCase(Project, fixes.EndpointCase):
     """From the review of kittrial-5bb.181."""
 
-    def test_the_sentence_of_a_task_change_lists_the_three_fields_and_ends_there(self):
+    def test_the_sentence_of_a_task_change_lists_what_a_change_may_change_and_ends_there(self):
+        """Priority is one of them since kittrial-5bb.183; version and actor are carried, not changed."""
         self.project()
-        takes = 'A task change takes: title, description, status'
-        for body in ({'priority': 1}, {}, {'title': None}, {'version': 1}, {'priority': 1, 'title': 'x'}):
+        takes = 'A task change takes: title, description, status, priority'
+        for body in ({'assignee': 'x'}, {}, {'title': None}, {'version': 1}, {'assignee': 'x', 'title': 'x'}):
             with self.subTest(body=body):
                 refused = self.request('PATCH', self.path, body, token=self.alex)
                 self.assertEqual(422, refused.status, refused.data)
                 self.assertTrue(message(refused).endswith(takes), message(refused))
-                self.assertEqual(['title', 'description', 'status'], refused.data['error']['detail']['takes'])
+                self.assertEqual(['title', 'description', 'status', 'priority'], refused.data['error']['detail']['takes'])
                 self.assertNotIn('version', message(refused))
                 self.assertNotIn('actor', message(refused))
 
     def test_a_long_or_odd_field_name_is_not_handed_back_in_the_detail_either(self):
         self.project()
         long, odd = 'k' * 300, '<script>alert(1)</script>'
-        refused = self.request('PATCH', self.path, {long: 1, odd: 2, 'priority': 3, 'title': 'x'}, token=self.alex)
+        refused = self.request('PATCH', self.path, {long: 1, odd: 2, 'assignee': 3, 'title': 'x'}, token=self.alex)
         self.assertEqual(422, refused.status, refused.data)
         whole = json.dumps(refused.data)
         self.assertNotIn(long, whole)
         self.assertNotIn('alert', whole)
         self.assertEqual(sorted(refused.data['error']['detail']['unsupported']),
-                         ['<non-identifier name>', '<non-identifier name>', 'priority'])
+                         ['<non-identifier name>', '<non-identifier name>', 'assignee'])
         many = {'field_%02d' % n: n for n in range(40)}
         refused = self.request('PATCH', self.path, many, token=self.alex)
         self.assertEqual(http_service.UNSUPPORTED_FIELDS_SHOWN, len(refused.data['error']['detail']['unsupported']))
 
+    def test_the_same_on_every_route_that_refuses_a_field_it_does_not_take(self):
+        """The refusal is one function for nine routes (kittrial-5bb.183): none of them hands a name back whole."""
+        self.project()
+        long, odd = 'k' * 300, '<script>alert(1)</script>'
+        user = self.request('GET', '/v1/sessions/current', token=self.alex).data['user']['id']
+        for what, method, where, body in (
+                ('task create', 'POST', self.tasks, {'title': 'x'}),
+                ('claim', 'POST', self.path + '/claim', {}),
+                ('member', 'PUT', '/v1/projects/%s/members/%s' % (self.pid, user), {'role': 'owner'}),
+                ('worker credential', 'POST', '/v1/projects/%s/worker-credentials' % self.pid, {'label': 'w'}),
+                ('agent', 'POST', '/v1/agents', {'name': 'Kestrel'}),
+                ('account', 'POST', '/v1/accounts', {'username': 'somebody'})):
+            with self.subTest(route=what):
+                token = self.admin_token() if what == 'account' else self.alex
+                refused = self.request(method, where, dict(body, **{long: 1, odd: 2, 'colour': 3}), token=token)
+                self.assertEqual(422, refused.status, refused.data)
+                whole = json.dumps(refused.data)
+                self.assertNotIn(long, whole)
+                self.assertNotIn('alert', whole)
+                self.assertEqual(sorted(refused.data['error']['detail']['unsupported']),
+                                 ['<non-identifier name>', '<non-identifier name>', 'colour'])
+                self.assertIn('colour', message(refused))
+
+
+class AgentGrantCase(fixes.Harness):
+    """From the review of kittrial-5bb.183 (P3): on an agent CHANGE too, the grant is judged before the field list."""
+
+    def test_a_grant_the_owner_cannot_make_keeps_the_404_whatever_else_the_body_carries(self):
+        admin = self.admin_token()
+        for name in ('alex', 'casey'):
+            self.create_account(admin, name, name + '-password-1')
+        alex, casey = (self.login(name, name + '-password-1')[0] for name in ('alex', 'casey'))
+        hidden = self.create_project(casey, 'Hidden')
+        made = self.request('POST', '/v1/agents', {'name': 'Kestrel'}, token=alex)
+        self.assertEqual(201, made.status, made.data)
+        path = '/v1/agents/%s' % made.data['agent']['id']
+        plain = self.request('PATCH', path, {'projects': [hidden]}, token=alex)
+        guessing = self.request('PATCH', path, {'projects': [hidden], 'surprise': 1}, token=alex)
+        self.assertEqual(404, plain.status, plain.data)
+        self.assertEqual((plain.status, message(plain)), (guessing.status, message(guessing)), guessing.data)
+        self.assertNotIn('does not take', message(guessing))
+        # A grant the owner may make, with a field the route does not take: the field list, as before.
+        own = self.create_project(alex, 'Own')
+        refused = self.request('PATCH', path, {'projects': [own], 'surprise': 1}, token=alex)
+        self.assertEqual(422, refused.status, refused.data)
+        self.assertIn('An agent change does not take: surprise', message(refused))
+        self.assertEqual([], self.request('GET', path, token=alex).data.get('projects') or [])
 
 if __name__ == '__main__':
     unittest.main()

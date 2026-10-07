@@ -1976,7 +1976,7 @@ class HeldLockTests(Case):
         digest = self.session_of(self.admin)
         self.held = True
         self.logged(lambda: self.request('GET', '/v1/projects', token=self.admin))
-        answer, _ = self.logged(lambda: self.request('POST', '/v1/accounts', {'username': 'zoe', 'password': 'zoe-password-1',
+        answer, _ = self.logged(lambda: self.request('POST', '/v1/accounts', {'username': 'zoe',
                                                                               'display_name': 'Zoe'}, token=self.admin))
         self.assertEqual(self.said(answer), (503, 'uncertain', self.NO_KEY))
         self.held = False

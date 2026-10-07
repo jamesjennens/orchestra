@@ -51,11 +51,21 @@ class SentenceTests(unittest.TestCase):
             with self.subTest(said=stderr[-40:]):
                 self.assertEqual(bd_refusals.refusal(1, '', stderr), (kind, sentence))
 
+    def test_a_holder_that_is_not_an_actor_label_is_a_holder_all_the_same(self):
+        """Review of kittrial-5bb.187: a task assigned on the host route to "Alex Smith" is held; with only
+        a label allowed, its claim read as an outcome nobody knows (503, the key kept)."""
+        for name in ('Alex Smith', 'alex and then lost', 'Åsa', 'a' * 150, 'x;y', '"quoted"'):
+            with self.subTest(holder=name):
+                found = bd_refusals.refusal(1, '', 'Error claiming pp-1: issue already claimed by %s\n' % name)
+                self.assertEqual(found, (CLAIMED, 'issue already claimed by %s' % name))
+                # ...and it is not named to a caller: it is somebody's text, not an actor.
+                self.assertIsNone(bd_refusals.holder('ValueError: bd refused: issue already claimed by %s' % name))
+        self.assertEqual(bd_refusals.holder('ValueError: bd refused: issue already claimed by worker-a/night'), 'worker-a/night')
+
     def test_what_only_looks_like_one_is_not(self):
         for code, stdout, stderr in (
                 (0, '', 'Error claiming pp-1: issue already claimed by alex\n'),
                 (1, '[{"id": "pp-1"}]\n', 'Error claiming pp-1: issue already claimed by alex\n'),
-                (1, '', 'Error claiming pp-1: issue already claimed by alex and then lost\n'),
                 (1, '', 'Error claiming pp-1: issue already claimed by \n'),
                 (1, '', 'Error claiming pp-1: the issue already claimed by alex\n'),
                 (1, '', 'Error claiming pp-1: issue not claimable: status\n'),
@@ -330,6 +340,99 @@ class InProcessCase(Members, fixes.Harness):
         self.assertEqual((409, 'Task is not open'), (self.claim('drew', closed).status, message(self.claim('drew', closed))))
 
 
+class HeldByFreeTextCase(Members, fixes.EndpointCase):
+    def test_a_task_assigned_to_a_name_with_a_space_is_refused_as_held_and_nobody_is_named(self):
+        alex, project = self.setup_project()
+        self.tokens = {'alex': alex}
+        self.ids = {'alex': self.request('GET', '/v1/sessions/current', token=alex).data['user']['id']}
+        self.members(project)
+        task = self.new()
+        # Assigned on the host route, as the coordinator's plain update does it.
+        path = self.canonical_root / 'canonical.json'
+        state = json.loads(path.read_text(encoding='utf-8'))
+        next(row for row in state['rows'] if row['id'] == task)['assignee'] = 'Alex Smith'
+        path.write_text(json.dumps(state), encoding='utf-8')
+        for who in ('casey', 'alex'):
+            with self.subTest(claimant=who):
+                key = 'free-text-%s' % who
+                refused = self.claim(who, task, key=key)
+                again = self.claim(who, task, key=key)
+                self.assertEqual((409, 409), (refused.status, again.status), refused.data)
+                self.assertEqual(('conflict', 'Task is already claimed', {'held_by': None}),
+                                 (refused.data['error']['code'], message(refused), refused.data['error']['detail']))
+                self.assertNotIn('Alex Smith', json.dumps(refused.data))
+                self.assertEqual(200, self.claim(who, self.new('free for ' + who), key=key).status)
+        self.assertEqual('Alex Smith', next(row for row in self.canonical_rows() if row['id'] == task)['assignee'])
+        self.assertNotIn('unknown', self.outcomes())
+
+
+@unittest.skipUnless(os.name == 'posix', 'endpoint.py imports fcntl; POSIX only')
+class EndpointWithAStandInBdTests(unittest.TestCase):
+    """The real endpoint with a stand-in ``bd`` that answers a claim as the test tells it to (review of
+    kittrial-5bb.187: the tests against a real bd are skipped in CI, which has none)."""
+
+    def setUp(self):
+        import importlib.util
+        self.tmp = fixes.unique_dir('claim-endpoint-')
+        self.addCleanup(fixes.shutil.rmtree, self.tmp, ignore_errors=True)
+        self.root = self.tmp / 'root'
+        (self.root / 'bin').mkdir(parents=True)
+        (self.root / 'projects' / 'probe' / '.beads').mkdir(parents=True)
+        (self.root / 'projects' / 'probe' / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+        (self.root / 'deployment.private.json').write_text(json.dumps({'password': 'probe'}), encoding='utf-8')
+        self.script, self.ran = self.tmp / 'answer.json', self.tmp / 'ran.txt'
+        bd = self.root / 'bin' / 'bd'
+        # A read of the row a write names finds it; any other read finds nothing; the write is
+        # answered from the file and noted with the actor it ran under.
+        bd.write_text('#!%s\nimport json, sys\nargv = sys.argv[1:]\n'
+                      'if "--claim" not in argv:\n'
+                      '    print(json.dumps([{"id": "probe-1", "title": "x", "status": "open"}]) if "show" in argv else "[]")\n'
+                      '    sys.exit(0)\n'
+                      'open(%r, "a").write(argv[argv.index("--actor") + 1] + "\\n")\n'
+                      'answer = json.load(open(%r))\n'
+                      'sys.stdout.write(answer["stdout"]); sys.stderr.write(answer["stderr"]); sys.exit(answer["code"])\n'
+                      % (sys.executable, str(self.ran), str(self.script)), encoding='utf-8')
+        bd.chmod(0o755)
+        spec = importlib.util.spec_from_file_location('endpoint_for_claims', str(KIT / 'endpoint.py'))
+        self.endpoint = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.endpoint)
+
+    def claim(self, code, stdout, stderr, operation, actor='casey'):
+        self.script.write_text(json.dumps({'code': code, 'stdout': stdout, 'stderr': stderr}), encoding='utf-8')
+        return self.endpoint.execute(self.root, {'project': 'probe', 'actor': actor, 'action': 'bd', 'attachments': {},
+                                                 'args': ['update', 'probe-1', '--claim', '--json'], 'operation_id': operation})
+
+    def test_bds_answers_to_a_claim_reach_the_caller_as_what_they_are(self):
+        row = '[{"id": "probe-1", "status": "in_progress", "assignee": "casey"}]\n'
+        done = self.claim(0, row, '', 'op-claim-1')
+        self.assertEqual((0, row), (done['returncode'], done['stdout']), done)
+        self.assertIn('server_time', done)
+        for number, (stderr, kind) in enumerate((
+                ('Error claiming probe-1: issue already claimed by alex\n', CLAIMED),
+                ('Error claiming probe-1: issue already claimed by Alex Smith\n', CLAIMED),
+                (rb_warning() + 'Error claiming probe-1: issue not claimable: status closed\n', NOT_CLAIMABLE))):
+            with self.subTest(said=stderr[-40:]):
+                operation = 'op-claim-refused-%d' % number
+                refused = self.claim(1, '', stderr, operation)
+                self.assertEqual((2, kind), (refused['returncode'], refused.get('refused')), refused)
+                self.assertTrue(refused['stderr'].startswith('ValueError: bd refused: issue '), refused)
+                self.assertNotIn('server_time', refused)
+                # Released: the same identity carries the claim when the task is free again.
+                self.assertEqual(0, self.claim(0, row, '', operation)['returncode'])
+        self.assertEqual(['casey'] * 7, self.ran.read_text().splitlines())          # each ran once, under the caller's actor
+
+    def test_a_claim_that_failed_in_another_way_is_an_outcome_nobody_knows(self):
+        for number, stderr in enumerate(('Error claiming probe-1: could not write the claim\n',
+                                         'Error claiming probe-1: failed to commit: issue already claimed by alex\n',
+                                         'Error claiming probe-1: issue not claimable: status closed; rolled back\n', '')):
+            with self.subTest(said=stderr[-40:]):
+                operation = 'op-claim-unknown-%d' % number
+                failed = self.claim(1, '', stderr, operation)
+                self.assertEqual(1, failed['returncode'], failed)
+                self.assertNotIn('refused', failed)
+                self.assertEqual(124, self.claim(0, '[]\n', '', operation)['returncode'])
+
+
 class CheckedTests(unittest.TestCase):
     checked = staticmethod(lambda reply, **more: http_service.EndpointBackend._checked(reply, 'bd', **more))
 
@@ -343,6 +446,11 @@ class CheckedTests(unittest.TestCase):
                 self.checked(bd_refusals.envelope(NOT_CLAIMABLE, 'issue not claimable: status %s' % said))
             self.assertEqual((409, shown, {'status': said}), (closed.exception.status, closed.exception.message, closed.exception.detail))
             self.assertFalse(hasattr(closed.exception, 'held_by'))
+        # A holder that is not an actor label: held, and nobody is named.
+        with self.assertRaises(http_service.HttpError) as text:
+            self.checked(bd_refusals.envelope(CLAIMED, 'issue already claimed by Alex Smith'))
+        self.assertEqual((409, 'Task is already claimed', None, {'held_by': None}),
+                         (text.exception.status, text.exception.message, text.exception.held_by, text.exception.detail))
 
 
 if __name__ == '__main__':

@@ -115,6 +115,8 @@ class Canonical:
                 return 1, '', 'Error: validation failed for issue : title is required\n'
             if len(title) > 500:
                 return 1, '', 'Error: validation failed for issue : title must be 500 characters or less (got %d)\n' % len(title)
+            # bd stores priority as a number and defaults to 2 (kittrial-5bb.183).
+            priority = option('--priority', '2')
             if '--dry-run' in rest:
                 # bd's own preflight (the record core runs it before a real create): no row.
                 return 0, json.dumps({'dry_run': True}), ''
@@ -125,6 +127,7 @@ class Canonical:
                 state['rows'].append({
                     'id': task_id, 'title': title, 'description': description, 'status': 'open',
                     'assignee': None, 'issue_type': issue_type, 'comments': [],
+                    'priority': int(priority),
                     'labels': labels, 'dependencies': [], 'created_at': '2026-01-01T00:00:00Z',
                     # As bd does: the row says under which actor it was made.
                     'created_by': self.actor or 'emulated',
@@ -210,10 +213,17 @@ class Canonical:
                         row['labels'] = labels + ([label] if flag == '--add-label' else [])
                         index += 2
                         continue
-                    if flag in ('--status', '--assignee', '--title', '--description'):
+                    if flag in ('--status', '--assignee', '--title', '--description', '--priority'):
                         if index + 1 >= len(rest):
                             raise ValueError('Missing value for %s' % flag)
-                        row[flag[2:].replace('-', '_')] = rest[index + 1]
+                        if flag == '--priority':
+                            # bd stores priority as a number, not the text of one.
+                            try:
+                                row['priority'] = int(rest[index + 1])
+                            except ValueError:
+                                raise ValueError('priority must be a whole number') from None
+                        else:
+                            row[flag[2:].replace('-', '_')] = rest[index + 1]
                         index += 2
                         continue
                     if flag == '--body-file':

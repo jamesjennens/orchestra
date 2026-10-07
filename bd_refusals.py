@@ -24,13 +24,21 @@ NOT_FOUND, INVALID = 'not-found', 'invalid'
 #: (kittrial-5bb.187). bd checks and writes a claim in one step, so of several claims of one
 #: free row exactly one is carried out and the others are told who has it.
 CLAIMED, NOT_CLAIMABLE = 'claimed', 'not-claimable'
-HOLDER = re.compile(r'^issue already claimed by (?P<holder>[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95})$')
+#: The holder is whatever the row's assignee is, and on the host route that is free text: a task
+#: assigned to "Alex Smith" is held all the same (review of kittrial-5bb.187: with only an actor
+#: label allowed here, a claim of such a task read as an outcome nobody knows, 503, key kept).
+HOLDER = re.compile(r'^issue already claimed by (?P<holder>\S[^\n]{0,199})$')
+#: A holder is NAMED to a caller only when it is an actor label; anything else is somebody's text.
+LABEL = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}\Z')
 STATUS = re.compile(r'^issue not claimable: status (?P<status>[a-z_]{1,40})$')
 #: bd's own sentences for a refusal it makes before writing, as bd 1.2.2 prints them.
 SENTENCES = (
-    (NOT_FOUND, re.compile(r'\bno issues? found matching\b')),
     (CLAIMED, HOLDER),
     (NOT_CLAIMABLE, STATUS),
+    # The whole sentence, as bd says it in its three places (review of kittrial-5bb.185): the words
+    # somewhere in another sentence ("failed to commit: no issue found matching ...") are not this.
+    (NOT_FOUND, re.compile(r'^(?:resolving (?:ID )?[^\s:]{1,200}: )?no issues? found matching '
+                           r'(?:"[^"\n]{0,200}"|the provided IDs)$')),
     (INVALID, re.compile(r'^validation failed for issue\b')),
     (INVALID, re.compile(r'\bcannot be empty$')),
     (INVALID, re.compile(r'^invalid (?:priority|status) ')),
@@ -84,9 +92,13 @@ def refusal(returncode, stdout, stderr):
 
 
 def holder(detail):
-    """Who has the row, from the last line of a ``CLAIMED`` refusal as the endpoint hands it on, or None."""
+    """Who has the row, from the last line of a ``CLAIMED`` refusal as the endpoint hands it on.
+
+    None when the line is not such a refusal, and None when the holder is not an actor label
+    (free text put there on the host route): the task is held, and nobody is named.
+    """
     found = HOLDER.match(str(detail or '').rpartition('bd refused: ')[2].strip())
-    return found.group('holder') if found else None
+    return found.group('holder') if found and LABEL.match(found.group('holder')) else None
 
 
 def status(detail):
