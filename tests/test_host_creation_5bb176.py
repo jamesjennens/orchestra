@@ -39,7 +39,7 @@ POSIX = os.name == 'posix'
 ALICE = 'usr_' + 'a' * 16
 
 
-def patch_creation(module, run_bd):
+def patch_creation(run_bd):
     """The stand-ins every ``add_project`` test needs, so only the work is real."""
     return [
         mock.patch.object(admin, 'config', return_value={'port': 13317}),
@@ -89,11 +89,11 @@ class CreationRecordCase(unittest.TestCase):
         (self.root / 'projects').mkdir(parents=True)
 
     def add(self, name='alpha', run_bd=bd_that_works):
-        with patched(*patch_creation(admin, run_bd)):
+        with patched(*patch_creation(run_bd)):
             admin.add_project(self.root, name)
 
     def add_expecting(self, name='alpha', run_bd=bd_that_fails_after_init):
-        with patched(*patch_creation(admin, run_bd)), contextlib.redirect_stdout(io.StringIO()):
+        with patched(*patch_creation(run_bd)), contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaises(BaseException) as caught:
                 admin.add_project(self.root, name)
         return caught.exception
@@ -127,7 +127,7 @@ class FailureAfterInitTests(CreationRecordCase):
     @unittest.skipUnless(POSIX, 'the creation lock needs fcntl')
     def test_finish_project_completes_it(self):
         self.add_expecting()
-        with patched(*patch_creation(admin, bd_that_works)):
+        with patched(*patch_creation(bd_that_works)):
             result = pc.finish(self.root, 'alpha')
         self.assertEqual((result['state'], result['effective']), ('created', 'created'))
         self.assertEqual(pc.read_record(self.root, 'alpha')['finished_by'], 'operator')
@@ -164,7 +164,7 @@ class NothingMadeTests(CreationRecordCase):
     def test_a_refusal_before_anything_is_made_leaves_no_record(self):
         (self.root / 'projects' / 'alpha' / 'keep.txt').parent.mkdir(parents=True)
         (self.root / 'projects' / 'alpha' / 'keep.txt').write_text('mine', encoding='utf-8')
-        with patched(*patch_creation(admin, bd_that_works)):
+        with patched(*patch_creation(bd_that_works)):
             with self.assertRaisesRegex(ValueError, 'Project already exists'):
                 admin.add_project(self.root, 'alpha')
         self.assertIsNone(pc.read_record(self.root, 'alpha'))
