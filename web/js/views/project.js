@@ -164,9 +164,20 @@ export async function reviews(ctx, { pid }) {
 export async function feedback(ctx, { pid }) {
   const project = await load(ctx, pid);
   const list = h('div', { class: 'panel' });
+  const adding = h('div');
   async function draw() {
     let data;
-    try { data = await ctx.api.feedback(pid); } catch (error) { list.replaceChildren(errorState(error, draw)); return; }
+    try { data = await ctx.api.feedback(pid); } catch (error) {
+      if (error && error.status === 501) {
+        // A server that keeps no feedback answers 501 to reading and to sending it. That is
+        // not a fault to try again: say that it is not there, and offer no form that can only fail.
+        adding.replaceChildren();
+        list.replaceChildren(h('div', { role: 'status' }, empty('Feedback is not available on this server',
+          'This Orchestra server does not keep feedback yet, so none can be read or sent from this page. Until it does, write what you found on the task it concerns, or tell the people who run the project.')));
+        return;
+      }
+      list.replaceChildren(errorState(error, draw)); return;
+    }
     list.replaceChildren(data.items.length ? h('ul', { class: 'timeline panel-body', 'aria-label': 'Feedback' }, data.items.map((f) => h('li', null,
       h('span', { class: 'dot ' + (f.status === 'resolved' ? 'ok' : 'warn'), 'aria-hidden': 'true' }),
       h('div', null,
@@ -176,7 +187,6 @@ export async function feedback(ctx, { pid }) {
         f.triage ? h('p', { class: 'small muted' }, 'Triage: ', f.triage) : null)))) :
       empty('No feedback yet', 'Problems, ideas and friction reported by the team appear here.'));
   }
-  draw();
   const form = h('form', { class: 'form', novalidate: true },
     field({ id: 'fb-text', label: 'What happened, or what would help?', type: 'textarea', maxlength: 2000, hint: 'Up to 2,000 characters. Visible to project members.' }),
     h('div', null, h('button', { type: 'submit', class: 'primary' }, 'Submit feedback')));
@@ -188,9 +198,11 @@ export async function feedback(ctx, { pid }) {
     const saved = await act(form.querySelector('button'), () => ctx.api.addFeedback(pid, { text }), { success: 'Feedback submitted' });
     if (saved) { form.reset(); draw(); }
   });
+  if (canWrite(project) && !project.archived) adding.replaceChildren(h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Add feedback')), h('div', { class: 'panel-body' }, form)));
+  draw();
   return h('div', { class: 'stack' },
     pageHead({ crumbs: crumbs(ctx, project, 'Feedback'), title: 'Feedback', lede: 'Reading feedback does not resolve it. Open items stay open until someone triages them.' }),
-    canWrite(project) && !project.archived ? h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Add feedback')), h('div', { class: 'panel-body' }, form)) : null,
+    adding,
     list);
 }
 

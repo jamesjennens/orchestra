@@ -121,6 +121,8 @@ class Canonical:
                     'id': task_id, 'title': title, 'description': description, 'status': 'open',
                     'assignee': None, 'issue_type': issue_type, 'comments': [],
                     'labels': labels, 'dependencies': [], 'created_at': '2026-01-01T00:00:00Z',
+                    # As bd does: the row says under which actor it was made.
+                    'created_by': self.actor or 'emulated',
                 })
                 return task_id
             task_id = self._mutate(change)
@@ -162,6 +164,10 @@ class Canonical:
             return 0, text, ''
         if command == 'update':
             task = rest[0] if rest else ''
+            if not [token for token in rest[1:] if token != '--json']:
+                # As bd 1.2.2 does (measured, kittrial-5bb.181): an update that names no
+                # change is answered with these words and exit 0, and nothing is written.
+                return 0, 'No updates specified\n', ''
 
             def change(state):
                 row = self._row(state, task)

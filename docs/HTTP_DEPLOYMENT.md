@@ -196,6 +196,14 @@ contribution review and feedback. Requirements, decisions and records are hidden
 from its navigation (the service has no routes for them yet) and a direct link
 shows "not available on this server".
 
+**Feedback is not built on the endpoint backend**, which is the backend of every
+real installation: reading and sending it (`GET` and `POST
+/v1/projects/{id}/feedback`) answer `501 not_implemented`, nothing is kept and no
+idempotency key is held. The Feedback page says so ("Feedback is not available on
+this server") and shows no form. Until it is built, what somebody found goes on the
+task it concerns or to the people who run the project; a worker with the client has
+`feedback` over SSH.
+
 ### Projects on the endpoint backend
 
 With `--backend endpoint`, a project's tasks live in a canonical Beads project under
@@ -1087,6 +1095,58 @@ agent can write its first one from the brief alone.
     `_`, `.` and `-`. Any other name is shown as a quoted string with control, bidi and
     non-ASCII characters and square brackets escaped, so a name cannot break the line
     or pass for another numbered problem.
+
+### What a task change takes
+
+`PATCH /v1/projects/{id}/tasks/{task}` changes a task's `title`, `description` and
+`status` (`open` or `closed`), and nothing else. Its body may also carry `version`
+(the in-process backend of the tests and the local preview checks it; the endpoint
+backend does not read it) and `actor` (below). Anything else is refused, not
+dropped:
+
+- a field the route does not take (`priority`, `assignee`, `labels`, any other
+  name) answers **422 `invalid_payload`**, "A task change does not take: priority.
+  A task change takes: title, description, status", with the names again in
+  `error.detail` (`unsupported`, `takes`). So does a body that takes one field and
+  not another: the whole change is refused, not half of it carried out;
+- a body that would change nothing (no field, only nulls, only `version`) answers
+  422 "Nothing to change";
+- a `status` other than `open` and `closed`, a `title` that is empty or not text
+  and a `description` that is not text answer 422 with one sentence each. A claim
+  is what sets a task in progress (`POST .../tasks/{task}/claim`).
+
+Such a refusal comes before the idempotency key is looked at: nothing is reserved,
+nothing is sent to the endpoint, nothing is audited as uncertain, and **the same
+key serves the corrected request**. To give a task a priority, an assignee other
+than the caller or a label there is no web route today.
+
+Before this (kittrial-5bb.181) a change that carried none of the three fields was
+sent to bd as an update with nothing in it. bd answers that with the words "No
+updates specified"; the service could not read them and answered **503 "The
+operation may have committed; reconcile with the same idempotency key"** for a
+change that had not been made, kept the key, and answered the same to every retry,
+with an audit entry of outcome `unknown` each time. A field beside one the route
+takes was dropped without a word. A key that was left reserved that way on an
+installation is not held for ever: the same request under it is now answered 422
+like any other, and the key itself lapses a day after it was first used, as every
+key does. Until then a DIFFERENT body under that key answers 409 "Idempotency key
+reused with a different request payload": send the corrected request with a new
+key. An operator has nothing to clean up; the `unknown` audit entries of that time
+record requests that changed nothing.
+
+**The actor of a task write is the caller's own.** Task create and task change take
+an optional `actor`, the attribution label, under the rule of a claim, a checkpoint
+and a review: a signed-in member may name only their own account; a worker
+credential a label inside its own namespace (`NAME` or `NAME/...`); an agent its
+own id. Any other name answers 403 and nothing is written. Before kittrial-5bb.181
+these two routes handed the name on as it came, so a member could have a task made
+(`created_by`) or changed under any name that does not have the shape of a web
+account, a host session's included; a name with that shape was already refused by
+the endpoint. Such a row cannot be told from a host actor's own by the row alone.
+Two records can tell: the project's audit log has a `tasks.create` or
+`tasks.update` entry with the real account at that second, and, when the request
+carried an idempotency key, the project's operation journal has its row with both
+names (`principal` `user:usr_...` and an `actor` that is not that account).
 
 ### The merge slot is not a task
 
