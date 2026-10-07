@@ -255,7 +255,7 @@ class SilentConnectionTests(Case):
         self.serve()
         waiting, request = threading.Thread(target=lambda: None), mock.Mock()
         with self.httpd._guard:
-            self.httpd._serving[waiting] = request
+            self.httpd._serving[waiting] = (request, None)
             self.httpd._open += 1
         time.sleep(self.httpd.REAP_EVERY * 4)
         self.assertEqual((self.httpd.open_connections(), self.httpd.turned_away), (1, 0))

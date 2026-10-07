@@ -31,6 +31,7 @@ that.
 """
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -238,12 +239,84 @@ def now_iso(timestamp):
     return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(timestamp))
 
 
+def address_group(address):
+    """What the limit per address counts as one client.
+
+    An IPv4 address is itself; an IPv6 address is its /64, because one line is given a whole
+    /64 and its holder can use any address in it; an IPv4 address written as IPv6
+    (``::ffff:a.b.c.d``) is that IPv4 address. Anything that is not an address is itself.
+    """
+    text = str(address)
+    try:
+        parsed = ipaddress.ip_address(text.split('%', 1)[0])
+    except ValueError:
+        return text
+    if parsed.version == 6:
+        if parsed.ipv4_mapped is not None:
+            return str(parsed.ipv4_mapped)
+        return str(ipaddress.ip_network((int(parsed) >> 64 << 64, 64)))
+    return str(parsed)
+
+
 # ------------------------------------------------------------------- password verifier
+class _PasswordWorker:
+    """Every scrypt computation of the process runs in this one long-lived thread (kittrial-5bb.170).
+
+    One computation takes 16 MiB. The web service serves each connection in a thread of
+    its own, and the C allocator keeps a freed block of that size in the arena of the
+    thread that asked for it: 190 log-in attempts on 190 connections left 3 GB resident
+    (measured; with one arena, 71 MB), although the checks ran one after another. With
+    one thread asking, one arena holds it: what stays is one computation's worth, however
+    many connections ask and whatever the allocator's settings are.
+
+    The caller waits for its own result; an error of the computation is raised in the
+    caller, as if it had computed there. A process that forks gets a new worker.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._jobs = None
+        self._thread = None
+        self._pid = None
+
+    def _start(self):
+        import queue
+        self._jobs = queue.Queue()
+        self._pid = os.getpid()
+        self._thread = threading.Thread(target=self._run, args=(self._jobs,), name='password-worker', daemon=True)
+        self._thread.start()
+
+    @staticmethod
+    def _run(jobs):
+        while True:
+            arguments, done = jobs.get()
+            try:
+                done['result'] = hashlib.scrypt(arguments[0], **arguments[1])
+            except BaseException as error:  # noqa: BLE001 - handed to the caller, which raises it
+                done['error'] = error
+            done['event'].set()
+
+    def scrypt(self, password, **parameters):
+        with self._lock:
+            if self._thread is None or self._pid != os.getpid() or not self._thread.is_alive():
+                self._start()
+            jobs = self._jobs
+        done = {'event': threading.Event()}
+        jobs.put(((password, parameters), done))
+        done['event'].wait()
+        if 'error' in done:
+            raise done['error']
+        return done['result']
+
+
+_PASSWORD_WORKER = _PasswordWorker()
+
+
 def hash_password(password, *, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P):
     _validate_password(password)
     salt = os.urandom(SCRYPT_SALT)
-    derived = hashlib.scrypt(password.encode('utf-8'), salt=salt, n=n, r=r, p=p,
-                             dklen=SCRYPT_DKLEN)
+    derived = _PASSWORD_WORKER.scrypt(password.encode('utf-8'), salt=salt, n=n, r=r, p=p,
+                                      dklen=SCRYPT_DKLEN)
     return 'scrypt$%d$%d$%d$%s$%s' % (n, r, p, salt.hex(), derived.hex())
 
 
@@ -255,8 +328,8 @@ def verify_password(verifier, password):
         if scheme != 'scrypt':
             return False
         salt_bytes, expected = bytes.fromhex(salt), bytes.fromhex(digest)
-        derived = hashlib.scrypt(password.encode('utf-8'), salt=salt_bytes, n=int(n),
-                                 r=int(r), p=int(p), dklen=len(expected))
+        derived = _PASSWORD_WORKER.scrypt(password.encode('utf-8'), salt=salt_bytes, n=int(n),
+                                          r=int(r), p=int(p), dklen=len(expected))
     except (ValueError, TypeError, MemoryError, OverflowError):
         return False
     return hmac.compare_digest(derived, expected)
@@ -838,6 +911,13 @@ class Service:
         #: setup/resume snippets. It is deployment configuration, never request data.
         self.public_url = (public_url or '').rstrip('/') or None
         self._failures = {}
+        self._logins_guard = threading.Lock()
+        self._logins_room = threading.Condition(self._logins_guard)   # told whenever a log-in ends
+        self._logins_waiting = {}        # address group -> its log-ins waiting for one of its places
+        self._logins = 0
+        self._logins_by_address = {}     # address group -> its log-ins in flight
+        self.logins_turned_away = 0
+        self.logins_turned_away_for_address = 0
         self.lookup_max = lookup_max
         self.lookup_window = lookup_window
         self._lookups = {}
@@ -1250,8 +1330,98 @@ class Service:
         key = self._throttle_key(username, source)
         self._failures.setdefault(key, []).append(self._now())
 
-    def login(self, username, password, source='local', request_id=None):
-        """Uniform failure response; never reveals whether the account exists."""
+    #: Log-in attempts in flight at once: one being checked and the rest waiting their turn
+    #: (the check is made under the state lock, one at a time, about 0.1 s each). One more is
+    #: answered busy at once, before any check, so that a flood of attempts costs neither
+    #: memory nor a queue without end (kittrial-5bb.170).
+    LOGINS_AT_ONCE = 16
+    LOGIN_BUSY = 'Too many people are logging in at this moment. Try again in a few seconds.'
+    #: Of those places, how many one client address may hold (its ``address_group``; the
+    #: address is the forwarded one only when a trusted proxy sent it). Without it about 20
+    #: looping connections from one address, with no credentials, held all 16 places and
+    #: kept every log-in out for as long as they ran (review of kittrial-5bb.170). A quarter:
+    #: whatever one address sends, twelve places are left to the others, somebody with a
+    #: place waits behind at most fifteen checks, and it takes four addresses acting
+    #: together to fill them all. (Half was tried and measured: two addresses were then
+    #: enough, and a person at another address waited several seconds to not at all behind
+    #: one flooding address with a full audit log.) 0: no share per address (the service's
+    #: own settings do not offer it: they take 1 to LOGINS_AT_ONCE).
+    LOGINS_PER_ADDRESS = 4
+    #: A log-in over its address's share is not turned away at once: it waits this long for
+    #: one of its address's places. An office behind one router is one address, and its
+    #: people logging in together at nine in the morning are each checked in a tenth of a
+    #: second: the fifth to the tenth wait a moment and get in, where an instant refusal sent
+    #: six of ten away. A flooding address gains nothing: it still holds four places and no
+    #: more. After the wait the answer is the refusal it always was.
+    LOGIN_WAIT_SECONDS = 2.0
+    #: How many log-ins of one address may wait like that at once; one more is refused at
+    #: once. Each waiter holds its connection's thread, so this bounds what a flooding
+    #: address can park: 4 in flight and 12 waiting, however many connections it has.
+    LOGIN_WAITERS_PER_ADDRESS = 12
+    LOGIN_BUSY_ADDRESS = ('Too many log-ins from your address are being checked at this moment. '
+                          'Try again in a few seconds.')
+
+    def login(self, username, password, source='local', request_id=None, shared_source=False):
+        """Uniform failure response; never reveals whether the account exists.
+
+        ``shared_source``: the source is not one client's address but the address everybody
+        arrives from (a trusted proxy that forwarded no address: the SSH tunnel of the
+        first install). Such a log-in has no share per address to be held to, as its
+        connection has no limit per address; the places in all still bound it.
+        """
+        group = None if shared_source else address_group(source or 'local')
+        with self._logins_room:
+            until, waiting = None, False
+            while True:
+                mine = self._logins_by_address.get(group, 0)
+                if group is not None and self.LOGINS_PER_ADDRESS and mine >= self.LOGINS_PER_ADDRESS:
+                    # Over its address's share: a short wait for one of that address's places.
+                    if until is None:
+                        until = time.monotonic() + self.LOGIN_WAIT_SECONDS
+                        waiting = self._logins_waiting.get(group, 0) < self.LOGIN_WAITERS_PER_ADDRESS
+                        if waiting:
+                            self._logins_waiting[group] = self._logins_waiting.get(group, 0) + 1
+                    left = until - time.monotonic()
+                    if waiting and left > 0:
+                        self._logins_room.wait(left)
+                        continue
+                    refused = self.LOGIN_BUSY_ADDRESS
+                    self.logins_turned_away_for_address += 1
+                elif self._logins >= self.LOGINS_AT_ONCE:
+                    refused = self.LOGIN_BUSY
+                else:
+                    refused = None
+                    self._logins += 1
+                    if group is not None:
+                        self._logins_by_address[group] = mine + 1
+                break
+            if waiting:
+                parked = self._logins_waiting.get(group, 0) - 1
+                if parked > 0:
+                    self._logins_waiting[group] = parked
+                else:
+                    self._logins_waiting.pop(group, None)
+            if refused:
+                self.logins_turned_away += 1
+        if refused:
+            # Nothing was checked and nothing is counted against the name or the address, and
+            # no count is cleared either. Not audited per attempt: a flood must not fill the
+            # audit log.
+            raise busy(refused, retry_after=5)
+        try:
+            return self._login(username, password, source, request_id)
+        finally:
+            with self._logins_room:
+                self._logins -= 1
+                if group is not None:
+                    left = self._logins_by_address.get(group, 0) - 1
+                    if left > 0:
+                        self._logins_by_address[group] = left
+                    else:
+                        self._logins_by_address.pop(group, None)
+                self._logins_room.notify_all()            # a place is free: whoever waits for one of this address's looks again
+
+    def _login(self, username, password, source, request_id):
         try:
             self._check_throttle(username, source)
         except HttpError:
