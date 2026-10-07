@@ -254,8 +254,12 @@ class SilentConnectionTests(Case):
         """A request that takes longer than the bound to answer (an endpoint call can take minutes) is answered."""
         self.serve(client_seconds=30)                            # the request is read under 30 s, not raced against 1.5
         real = http_service.ApiHandler._request_id
+        watched = []
 
         def slow(handler):
+            # No clock in this: read under 30 s, a watch left on would not fire in the 2.4 s below, and the
+            # test passed with the unwatch in _dispatch taken out (review of kittrial-5bb.186).
+            watched.append(handler.connection in handler.server._deadlines)
             handler.server.client_seconds = CLIENT                # the bound is short from here on: the service's own time
             time.sleep(CLIENT * 1.6)
             return real(handler)
@@ -264,6 +268,9 @@ class SilentConnectionTests(Case):
         self.assertEqual(status, 200)
         self.assertGreater(seconds, CLIENT * 1.5)
         self.assertEqual(self.httpd.cut_off, 0)
+        self.assertEqual(watched, [False])                        # the service's time is under no client deadline
+        self.settled()
+        self.assertEqual(self.httpd._deadlines, {})               # and none is left when the connection is gone
 
     def test_a_client_that_does_not_take_its_response_is_cut_off(self):
         """The wait is in the WRITE: every request is already there, so the service never waits to read one."""
@@ -731,6 +738,7 @@ class SilentTlsConnectionTests(Case):
             plain = self.silent(b'GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n')
             self.assertLess(self.closed_by_the_server(plain, 10), 10)         # refused at once, not at the 30 s deadline
             self.settled()
+            self.assertEqual(self.httpd._deadlines, {})           # the handshake's own watch went with it
             self.served()
         said = logged.getvalue()
         self.assertNotIn('Traceback', said)
@@ -812,7 +820,49 @@ def every_wait_for_a_client_is_armed_with_the_servers_bound(self):
             self.assertLessEqual(left, 30)
 
 
+def no_wait_for_a_client_is_left_armed_when_it_is_over(self):
+    """Review of kittrial-5bb.186: with every honest request read under 30 s, a watch that was not taken off
+    no longer fired in any test. No clock here: whether the connection is watched is read at the moments when
+    it must not be. A log-in (a body is read, an answer written) and a read, each on a connection of its own."""
+    self.serve(client_seconds=30)
+    seen = []
+    handler_class = http_service.ApiHandler
+    real_id, real_body, real_dispatch = handler_class._request_id, handler_class._read_body, handler_class._dispatch
+
+    def watched(handler, where):
+        seen.append((where, handler.connection in handler.server._deadlines))
+
+    def request_id(handler):
+        watched(handler, 'the request is read')                   # the service's time begins
+        return real_id(handler)
+
+    def read_body(handler):
+        body = real_body(handler)
+        watched(handler, 'the body is read')
+        return body
+
+    def dispatch(handler, method):
+        try:
+            return real_dispatch(handler, method)
+        finally:
+            watched(handler, 'the answer is written')
+    with mock.patch.object(handler_class, '_request_id', request_id), \
+            mock.patch.object(handler_class, '_read_body', read_body), \
+            mock.patch.object(handler_class, '_dispatch', dispatch):
+        status, body, _ = self.ask('POST', '/v1/sessions', {'username': ADMIN, 'password': PASSWORD})
+        self.assertEqual(status, 201, body)
+        self.settled()
+        self.assertEqual(self.httpd._deadlines, {})               # the wait for a next request went with the connection
+        self.assertEqual(self.ask('GET', '/healthz')[0], 200)
+        self.settled()
+        self.assertEqual(self.httpd._deadlines, {})
+    self.assertEqual(seen, [(where, False) for where in ('the request is read', 'the body is read', 'the answer is written',
+                                                         'the request is read', 'the body is read', 'the answer is written')])
+    self.assertEqual(self.httpd.cut_off, 0)
+
+
 for case in (SilentConnectionTests, SilentTlsConnectionTests):
+    case.test_no_wait_for_a_client_is_left_armed_when_it_is_over = no_wait_for_a_client_is_left_armed_when_it_is_over
     case.test_a_deadline_is_as_long_as_it_was_asked_for = a_deadline_is_as_long_as_it_was_asked_for
     case.test_every_wait_for_a_client_is_armed_with_the_servers_bound = every_wait_for_a_client_is_armed_with_the_servers_bound
 
