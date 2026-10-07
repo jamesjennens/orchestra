@@ -61,6 +61,14 @@ SSH remains the default configuration:
 {"host":"beads-team","endpoint":"/home/beads/beads-team-kit/endpoint.py","root":"/home/beads/beads-runtime"}
 ```
 
+`python` is optional and names one interpreter executable. Over SSH it is the interpreter that runs the endpoint **on the server**, not one on your machine; without it the server's `python3` is used. The endpoint needs Python 3.10 or newer, and on RHEL 8 the host's `python3` is 3.6, so a configuration for an office installation names the bundled interpreter through `install/current` (`add-project` prints exactly this, with the real paths):
+
+```json
+{"host":"beads-team","python":"<INSTALL_ROOT>/current/python-runtime/<PATH>","endpoint":"<INSTALL_ROOT>/current/kit/endpoint.py","root":"<RUNTIME_ROOT>"}
+```
+
+`host` is an SSH alias or `user@host` that resolves **from your machine**: a server's own host name may not resolve from another network. An endpoint started with an interpreter that is too old says so and does nothing, and the client shows it: `SSH failed (2); ... endpoint.py needs Python 3.10 or newer and was started with Python 3.6.8 (/usr/bin/python3). Nothing was carried out. Set "python" in the client configuration ...`. `client.py`, `admin.py` and `office_service.py` say the same of themselves.
+
 For a terminal already on the Linux coordination server, explicitly select local transport:
 
 ```json

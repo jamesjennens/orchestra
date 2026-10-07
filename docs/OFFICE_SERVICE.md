@@ -286,7 +286,16 @@ are printed through it, so an upgrade needs no change to a configuration printed
 by this release or later. An installation with no `current` link (the live kits
 keep `<BASE>/kit -> <BASE>/releases/<ID>`) prints the release spelling instead,
 and says so: print that configuration again after an upgrade or it keeps running
-the release that printed it. A
+the release that printed it. In that
+configuration `python` names the interpreter that runs the endpoint on this
+server when a worker on another machine reaches it over SSH (and the same
+interpreter for the local transport): the bundled one. `host` is the worker's
+to fill in and must be a name or address the worker's machine can reach; this
+server's own host name may not resolve from the worker's network. `add-project
+--office-config <OFFICE_CONFIG>` reads `public_url` from the office service
+configuration and names its host in the printed text as the address clients
+reach (the file is read before anything is created; one that cannot be read is
+refused). A
 project made on the host is not on the web yet: nothing of it appears in the web
 interface until a superuser registers it there (New project, with this name, or
 `POST /v1/projects` without `create`).
@@ -310,7 +319,15 @@ A configuration or key line that already names `<INSTALL_ROOT>/current/...`
 needs nothing: the link moves with the upgrade. A bare `python3` in an old
 client config is the other half of the same problem: on RHEL 8 it is
 platform-python 3.6, which cannot run the endpoint, and a host with no `python3`
-on PATH fails outright, so name the bundled interpreter instead.
+on PATH fails outright, so name the bundled interpreter instead. Since
+kittrial-5bb.191 an interpreter older than 3.10 is told so before anything is
+imported: `endpoint.py`, `client.py`, `admin.py` and `office_service.py` each
+print one line (`endpoint.py needs Python 3.10 or newer and was started with
+Python 3.6.8 (/usr/bin/python3). Nothing was carried out. ...` and what to do)
+and exit 2, where the endpoint used to die in a regular-expression traceback.
+That includes `office_service.py health`, which happened to run under 3.6.
+`tools/office_release.py` has no such check: its `install`, `verify`, `rollback`
+and `activate` run under the host's Python 3.6.
 
 The client half of those lines is a change in this kit's `client.py`: it runs the
 interpreter the config names, where older clients ran a literal `python3` on the

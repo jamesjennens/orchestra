@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-c58c70e0069d4d858b2735091afccd33",
+  "key": "kit.minimum-python",
+  "name": "An interpreter too old for the kit is told so before anything is imported",
+  "aliases": [
+    "python too old",
+    "python 3.6",
+    "platform-python",
+    "needs Python 3.10",
+    "unbalanced parenthesis",
+    "interpreter version check",
+    "minimum python"
+  ],
+  "summary": "endpoint.py, client.py, admin.py and office_service.py check the interpreter before any other import: started with Python older than 3.10 each writes one line to stderr and exits 2, naming the program, the version needed, the version and path of the interpreter found, that nothing was carried out, and what to do (endpoint: set \"python\" in the client configuration to an interpreter of 3.10 or newer on the server, on an office installation the bundled one through install/current; the others: run with 3.10 or newer, on an office installation the bundled interpreter). Before, the endpoint died under Python 3.6 with a regular-expression traceback from an import. The check is the first statement after the docstring and `import sys`, is written out in each file (client.py is copied alone) and the files stay readable by Python 3.6. tools/office_release.py and ssh_forced_command.py have no such check: they run under 3.6. Over SSH the \"python\" key of the client configuration names the interpreter on the server.",
+  "requirements": [],
+  "anchors": [
+    "docs/OPERATIONAL_WORKFLOW.md#connect-and-refresh"
+  ],
+  "code": [
+    "endpoint.py::main",
+    "client.py::main",
+    "admin.py::main",
+    "office_service.py::main",
+    "admin.py::worker_client_setup",
+    "client.py::_python"
+  ],
+  "tests": [
+    "tests/test_old_interpreter.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "operations",
+    "office",
+    "client"
+  ]
+}

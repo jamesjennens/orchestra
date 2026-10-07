@@ -7,6 +7,14 @@ explicit opt-in (config "transport": "local") for a Linux endpoint on this machi
 it runs the same endpoint as an argv list with shell=False. Both transports send the
 byte-identical JSON envelope, so attachments and actor semantics do not vary.
 """
+import sys
+if sys.version_info < (3, 10):
+    # Before every other import, and in syntax Python 3.6 reads: an older interpreter failed in
+    # an import further down, with a traceback that hid the cause (kittrial-5bb.191).
+    sys.stderr.write('client.py needs Python 3.10 or newer and was started with Python %d.%d.%d (%s). '
+                     'Nothing was carried out. Run the client with Python 3.10 or newer; the beads.cmd and beads.sh wrappers take the interpreter from BEADS_PYTHON.\n'
+                     % (sys.version_info[0], sys.version_info[1], sys.version_info[2], sys.executable))
+    sys.exit(2)
 import argparse
 import hashlib
 import json
