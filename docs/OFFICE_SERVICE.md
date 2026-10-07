@@ -325,31 +325,44 @@ service bounds what such a connection costs, in all three shapes:
   and the log says so the first time (`connections: the limit of 200 open
   connections was reached ...`). So 200 silent connections stop the web
   interface for up to 30 seconds, and `health` reads `web=down` meanwhile.
-- Of those, at most **50** are from one client address. One more from it is
+- Of those, at most **100** are from one client address. One more from it is
   closed at once, before a thread or a handshake is spent on it, and the log
-  says so (`connections: 'ADDRESS' has 50 connections open, the limit for one
-  address; further ones from it are closed at once`), at most one such line a
-  minute; the next one says how many were not shown. So one address that
-  keeps reopening silent connections holds 50 places and no more, and every
-  other address is served meanwhile. What it does not stop: four or more
-  addresses acting together can still take all 200; and the clients of the
-  address that is at its limit, honest ones included, are closed with it
-  until it lets go. An IPv6 address is counted with its whole /64.
+  says so (`connections: 'ADDRESS' has 100 connections open, the limit for
+  one address; further ones from it are closed at once`), at most one such
+  line a minute; the next one says how many were not shown. So one address
+  that keeps reopening silent connections holds 100 places and no more, and
+  every other address is served meanwhile (measured: other clients answered
+  70 times of 70; without the limit, 0 of 70). An IPv6 address is counted
+  with its whole /64. What it does not stop, measured: **two addresses
+  acting together can take all 200** (115 silent connections each: other
+  clients answered 0 of 30); and the clients of an address that is at its
+  limit, honest ones included, are closed with it until it lets go.
   `"connections_per_address": N` in the service configuration changes the
-  number; 0 means no limit per address. Clients that share an address (an
-  office behind one router, agents on the service's own host) share its 50: a
-  browser keeps about six connections and the worker client one for the time
-  of a command, so raise the number only where that is not enough.
+  number (1 to 200). It is half and not less because people who share an
+  address share it: an office behind one router is ONE address. A browser
+  uses up to six connections while a page loads and lets them go within 30
+  seconds; the page keeps none open; the worker client uses one for the
+  time of a command. So 100 is about sixteen browsers loading at the same
+  moment. A lower number protects better against one address and reaches an
+  office's own people sooner; a higher one the other way round, and each
+  silent connection costs the service a thread (with 100 held by one address
+  the web process peaked at about 240 MB with a new state document).
 - **Behind the approved proxy** every connection comes from the proxy, so an
   address named in `trusted_proxies` is not limited as an address. The limit
   is then on requests: one forwarded address (the last `X-Forwarded-For`
-  element, the one the proxy itself added) has at most 50 requests being
+  element, the one the proxy itself added) has at most 100 requests being
   served at once, and one more is answered `503 busy` with `Retry-After: 1`
   before anything is carried out. Silent connections are then held at the
   proxy and never reach the service, so bounding those per address is the
   proxy's business (for nginx: `limit_conn`). A proxy in front that is NOT
-  named in `trusted_proxies` makes all its clients one address with 50
+  named in `trusted_proxies` makes all its clients one address with 100
   connections between them: name it.
+- **Through the SSH tunnel** (or any client on the service's own host)
+  everybody arrives from 127.0.0.1 and cannot be told apart. With
+  `trusted_proxies: ["127.0.0.1"]`, as in the configuration shown above,
+  that address is not limited at all for connections; without it, it is one
+  address with 100. Either way the people behind it are NOT one client for
+  logging in (below).
 - A handshake that fails is one line in the http log (`tls: 'ADDRESS': 'TLS
   handshake not completed: ...'`), at most one such line every 5 seconds; the
   next one says how many were not shown. A browser that has not accepted a
@@ -381,47 +394,70 @@ taking the memory of the host or the log-in of everybody else:
   in a few seconds.", whatever the user name: nothing is checked, nothing is
   counted against the name, and no count is cleared.
 - Of those 16 places **one client address holds at most 4** (an IPv6 address
-  with its /64; behind the approved proxy the forwarded address, as for the
-  connections above). One more from it is answered in the same way, with "Too
-  many log-ins from your address are being checked at this moment. Try again
-  in a few seconds." So whatever one address sends, twelve places are left to
-  everybody else, and somebody at another address waits behind a few checks.
+  with its /64; behind the approved proxy the forwarded address). A log-in
+  over its address's share is not turned away at once: **it waits up to 2
+  seconds for one of that address's places**, and only then is answered 503
+  in the same way, with "Too many log-ins from your address are being checked
+  at this moment. Try again in a few seconds." At most 12 log-ins of one
+  address wait like that at once (one more is refused at once), so an address
+  parks at most 12 of the service's threads however many connections it has.
+  `"logins_per_address": N` in the service configuration changes the share
+  (1 to 16); the 2 seconds and the 12 are fixed.
 
-Measured on koopa over HTTPS with the real service, made-up user names sent
-in a loop from ONE address by 20, 40 and 100 clients for 45 seconds each,
-while a person at another address logs in with the right password (told to
-try again, they wait the 5 seconds and do):
+**People who share an address.** An office behind one router is one client
+address. Its people logging in together at nine in the morning each need a
+tenth of a second of checking; with the wait all of them get in: ten at the
+same moment from one address, all ten in at the first try, the slowest
+answered after about half a second (about two seconds with the audit log
+full). Without the wait six of the ten would be told to try again.
+**Through the SSH tunnel**, and for anything else that arrives from the
+service's own host or from a trusted proxy that forwards no address,
+everybody comes from the same address and nobody can be told apart: such a
+log-in has no share per address at all and is held to the 16 places only.
+Ten at the same moment through the tunnel: all ten in, with
+`trusted_proxies: ["127.0.0.1"]` and without it. The price, said plainly:
+somebody who floods log-ins THROUGH the tunnel keeps everybody out for as
+long as they do (measured: not in within a minute); they already have a
+log-in on the server.
 
-| State document | Clients | The person gets in after | Web process, peak |
+Measured over HTTPS with the real service in a container of its own (the
+release's Python 3.12; made-up user names sent in a loop, a new connection
+each time, 45 seconds each), while a person at another address logs in with
+the right password and somebody already logged in reads a page once a second:
+
+| Who floods | The person gets in after | A logged-in read, median | Web process, peak |
 |---|---|---|---|
-| new (no audit entries) | 20 / 40 / 100 | 0.7 s / 1.0 s / 0.7 s | 88 / 119 / 147 MB |
-| 2.8 MB (audit log full: 10,000 entries) | 20 / 40 / 100 | 5.5 s / 1.5 s / 3.0 s | 230 / 343 / 397 MB |
+| one address, 20 / 40 / 100 clients | 0.3 / 0.4 / 0.7 s | 0.4 / 0.8 / 1.0 s | 100 / 138 / 238 MB |
+| the same with the audit log full (2.8 MB state) | 4.4 / 1.3 / 1.5 s | 1.3 / 1.7 / 1.7 s | 224 / 338 / 590 MB |
+| two addresses together, 20 clients each | 1.3 s (2.7 s) | 1.4 s (2.9 s) | |
+| three addresses together | 2.2 s (3.7 s) | 2.3 s (4.8 s) | |
+| four addresses together | not within a minute | 3.4 s (5.6 s) | |
 
-(Before any of this, with the full audit log: 5.8 s, 11.5 s and not within a
-minute, and a peak of 2.5 GB.) The process starts at 38 MB (51 MB with the
-full audit log).
+(In brackets: with the audit log full. Before any of this, with the audit log
+full and one address flooding with 100 clients: not in within a minute, and a
+peak of 2.5 GB.) The process starts at about 45 MB (57 MB with the audit log
+full).
 
 What this does not do, measured in the same runs:
 
-- **A person at the flooding address itself is kept out** for as long as the
-  flood runs (12 tries in 60 seconds, all told to try again): its four places
-  are always taken. An office behind one router whose own machine floods the
-  service shuts its own people out of logging in, and nobody else.
-- **Four or more addresses acting together can still take all 16 places.**
-- **Somebody who is already logged in is slowed down.** Their read took a
-  median of 1.5 to 3.4 seconds during the flood with a new state document and
-  5 to 15 seconds with the full audit log (0.1 to 0.2 seconds without a
-  flood): the web process is busy with the flood's connections and TLS
-  handshakes, and every failed log-in that is checked is audited and rewrites
-  the whole state document under the state lock.
+- **Four addresses acting together take all 16 places** and keep everybody
+  else out of logging in. Three do not.
+- **A person at the flooding address itself** shares its four places with the
+  flood: they got in after about half a minute (five tries), not at once.
+- **Ten people at ANOTHER address during a 100-client flood** from one: eight
+  in at the first try and two told to try again (seven and three once), the
+  slowest answer after 3 to 6 seconds: the checks are slower under the flood
+  and two of the ten wait longer than the 2 seconds.
+- **Somebody who is already logged in is slowed down**, as the table shows,
+  but far less than a flood without the wait would slow them: a refused
+  attempt now holds its connection for 2 seconds, which slows the flood
+  itself (with a full audit log every checked failed log-in is also audited
+  and rewrites the whole state document under the state lock).
 - **Memory is not flat under a sustained flood.** The checks keep 16 MiB; the
-  rest of the peak above is the state document being written again for every
-  checked attempt, in the thread of each connection. It grows with the size
-  of the state document, and it stays resident afterwards (160 MB and 398 MB
-  after these runs).
-- How many checks a second the service makes depends on the state document:
-  7 to 11 with a new one and about 3 with the full audit log. The lockout
-  per user name and address is unchanged.
+  rest of the peak is the state document being written again for every
+  checked attempt, in the thread of each connection, and it stays resident
+  afterwards (445 MB and 723 MB after all the runs above).
+- The lockout per user name and address is unchanged.
 
 ## External scheduler commands
 

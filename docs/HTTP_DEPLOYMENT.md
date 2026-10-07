@@ -110,16 +110,24 @@ forwarded headers the service will believe. A reverse proxy on the same host is
 forwarded headers from any other peer are ignored, so a client cannot spoof the
 throttle key or claim `https`.
 
-`--connections-per-address N` (default 50; 0: no limit per address) is how many
-of the service's 200 connections one client address may have open at once; one
-more from it is closed at once. An IPv6 address is counted with its /64. A peer
-named by `--trusted-proxy` is not limited as an address, because every client
-behind it arrives from it: for the requests it forwards, N is how many requests
-of one forwarded address are served at once, and one more is answered
-`503 busy` with `Retry-After: 1` and `Connection: close` before its route
-begins. A forwarded header from any other peer does not change which address a
-connection is counted for. See docs/OFFICE_SERVICE.md ("Connections that say
-nothing") for what the limit stops and what it does not.
+`--connections-per-address N` (default 100; 1 to 200) is how many of the
+service's 200 connections one client address may have open at once; one more
+from it is closed at once. An IPv6 address is counted with its /64. A peer named
+by `--trusted-proxy` is not limited as an address, because every client behind
+it arrives from it: for the requests it forwards, N is how many requests of one
+forwarded address are served at once, and one more is answered `503 busy` with
+`Retry-After: 1` and `Connection: close` before its route begins. A forwarded
+header from any other peer does not change which address a connection is
+counted for.
+
+`--logins-per-address N` (default 4; 1 to 16) is how many of the 16 log-ins in
+flight one client address may have. A log-in over it waits up to 2 seconds for
+one of its address's places (at most 12 of one address wait at once) and is then
+answered `503 busy` with `Retry-After: 5`. A log-in that arrives from the
+service's own host, or from a trusted proxy that forwarded no address (an SSH
+tunnel), is not held to a share: everybody arrives from that address. See
+docs/OFFICE_SERVICE.md ("Connections that say nothing" and the paragraphs about
+log-ins) for what the limits stop, what they do not, and the measurements.
 
 That last point is what makes browser cookies safe under the documented TLS
 deployment. TLS terminates at the proxy, so the loopback connection to the
