@@ -34,6 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+import actor_names
 import agent_prompts
 import project_setup
 from coordination import MERGE_SLOT_SUFFIX, is_merge_slot, merge_slot_sentence
@@ -443,6 +444,15 @@ class InProcessBackend:
     def fail_next(self, route, times=1):
         """Test hook: commit, then raise :class:`UncertainOutcome` for the next call(s)."""
         self.faults[route] = times
+
+    def actor_standing(self, project_id, names):
+        """For each name: why a worker credential may not write under it, or None.
+
+        This backend has no host, so no session actors and no operator list: what is left of
+        ``actor_names.collision`` is the shape of a session actor and the service's namespace.
+        """
+        import actor_names
+        return {name: actor_names.collision(name) for name in names}
 
     @property
     def state(self):
@@ -1245,6 +1255,24 @@ class EndpointBackend:
     # the host (admin.py add-project), so the HTTP route only REGISTERS an existing one
     # (kittrial-5bb.80). The HTTP project id is the canonical project name.
     PROJECT_CREATE = 'register'
+
+    def actor_standing(self, project_id, names):
+        """For each name: why a worker credential may not write under it, or None (kittrial-5bb.184).
+
+        One read through the endpoint, which owns the session registry and the operator and
+        verifier lists and answers with the rule, never with the names. This service's own
+        namespace is judged here, because only the service knows what it was started with.
+        """
+        import actor_names
+        names = [name for name in names if isinstance(name, str) and name]
+        if not names:
+            return {}
+        answer = self._run('actor-standing', project_id, self.actor_namespace + '/read', names)
+        found = answer.get('names') if isinstance(answer, dict) else None
+        if not isinstance(found, dict):
+            raise uncertain('The host did not say which names are taken')
+        return {name: found.get(name) or actor_names.collision(name, service=(self.actor_namespace, actor_names.SERVICE_NAMESPACE))
+                for name in names}
 
     def project_exists(self, project):
         """Whether the canonical project `project` exists and is initialized on the host.
@@ -4266,11 +4294,30 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._project(ctx, CAP_PROJECT_ADMIN)
         limit, state = self._page(ctx, ctx.query)
         items = self.service.list_worker_credentials(ctx.principal, ctx.params['pid'])
+        # A credential issued, before kittrial-5bb.184, under a name that is somebody else's on
+        # the host is refused when it writes. The list says so, with what to do, so that its
+        # owner need not find out from a worker's failure. `actor_refused` is the reason or null.
+        named = sorted({item['actor'] for item in items if item.get('actor') and not item.get('revoked')})
+        standing = self.backend.actor_standing(ctx.params['pid'], named) if named else {}
+        for item in items:
+            reason = standing.get(item.get('actor')) if not item.get('revoked') else None
+            item['actor_refused'] = None if reason is None else actor_names.refusal(item['actor'], reason)
         return 200, self._paged(ctx, items, limit, state)
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/worker-credentials')
     def credential_issue(self, ctx):
         payload = ctx.payload or {}
+        # Only who may issue one is told whether a name is taken: the answer says that a name
+        # is an operator's or a session's, which is not for every member to probe.
+        self._project(ctx, CAP_PROJECT_ADMIN)
+        named = payload.get('actor')
+        if isinstance(named, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,63}', named):
+            # A worker credential writes under this name, and the tracker's rows carry the name
+            # and nothing else: under a host actor's name it IS that actor (kittrial-5bb.184).
+            # Refused before the key is reserved; the endpoint refuses the same again at use.
+            reason = self.backend.actor_standing(ctx.params['pid'], [named]).get(named)
+            if reason is not None:
+                raise invalid(actor_names.refusal(named, reason, actor_names.CHOOSE), {'actor': named, 'rule': reason})
 
         def issue():
             self._require_usable(ctx.params['pid'])

@@ -187,7 +187,8 @@ class NoUnguardedParseTests(unittest.TestCase):
 
     ALLOWED = {
         'activity.py': (2, "the tracker export, and a cursor file on the caller's own machine"),
-        'admin.py': (28, 'bd output and files on the coordination host, in operator commands'),
+        'admin.py': (30, 'bd output and files on the coordination host, in operator commands; credential-actors '
+                         '(kittrial-5bb.184) reads the web state and an export and catches RecursionError itself'),
         'artifacts.py': (1, 'the artifact index the kit writes'),
         'bootstrap.py': (2, 'bd output on the host'),
         'bd_refusals.py': (1, "bd's own answer to one command; it catches RecursionError itself"),
@@ -218,7 +219,7 @@ class NoUnguardedParseTests(unittest.TestCase):
         'project_creation.py': (2, 'the creation record and the failure note the kit writes on the coordination host; a note that cannot be parsed, however deep, is ignored'),
         'review_recommendations.py': (1, 'bd output (the answer of comments add)'),
         'review_workflow.py': (4, 'bd output and the revert journal the kit writes'),
-        'sessions.py': (2, 'bd output'),
+        'sessions.py': (3, 'bd output, and the session registry the kit writes (registered_actors catches RecursionError)'),
         'version.py': (1, "the kit's own version file"),
         'work.py': (4, 'bd output and the request files the kit writes'),
         'worker.py': (2, "the endpoint's answer, on the caller's machine"),
