@@ -522,6 +522,49 @@ def _current(root, name):
     return target
 
 
+RESTART = 'Restart the supervised service after this release switch; running processes must not mix revisions.'
+
+
+def _starts_as_installed(release, manifest):
+    """Start an INSTALLED release's interpreter and its bundled bd and dolt, as `install` starts a new
+    one before it switches to it. Raises ValueError with the reason when one does not start."""
+    executable = release/'python-runtime'/_safe_path(manifest['python_executable'])
+    if not executable.is_file():
+        raise ValueError('Bundled Python executable missing')
+    # Everything is started from a scratch directory of its own (it is HOME and the working
+    # directory of what is started): nothing is written into the installed release.
+    scratch = Path(tempfile.mkdtemp(prefix='office-release-verify-'))
+    try:
+        result = starts('The bundled Python', executable, ['--version'], scratch)
+        if not re.search(r'Python 3\.(1[0-9]|[2-9][0-9])\.', result):
+            raise ValueError('Bundled interpreter must be Python 3.10 or newer')
+        start_vendored(release/'kit', scratch/'start-check')
+    finally:
+        remove_scratch(scratch)
+
+
+def _switch_to_installed(root, build_id, manifest, compared):
+    """Make an already installed release the current one (kittrial-5bb.189).
+
+    After `rollback` the release that was rolled back FROM is still installed, and `install` of
+    its archive answered "Release ID already installed": an operator who had gone back could not
+    go forward again without building the same thing under a new id. ``compared`` says what the
+    release was compared with, for the line that is printed.
+    """
+    target = 'releases/'+build_id
+    old = _current(root, 'current')
+    if old == target:
+        print('Release %s is already installed and is the current one; nothing was changed.' % build_id)
+        return
+    _starts_as_installed(root/target, manifest)
+    if old:
+        _link(root, 'previous', old)
+    _link(root, 'current', target)
+    print('Current release is now %s (it was installed already; %s) source=%s previous=%s'
+          % (build_id, compared, manifest.get('source_commit'), old or 'none'))
+    print(RESTART)
+
+
 def install(args):
     archive = Path(args.archive)
     if digest(archive.read_bytes()) != args.sha256:
@@ -533,7 +576,17 @@ def install(args):
     releases.mkdir(exist_ok=True)
     final = releases/manifest['build_id']
     if final.exists():
-        raise ValueError('Release ID already installed')
+        # The same release again (the way forward after a rollback): switched to, not unpacked a
+        # second time, and only when it IS the same: the installed manifest is this archive's,
+        # byte for byte, so the build id, the source and the interpreter digests are these.
+        installed = final/'manifest.json'
+        if final.is_symlink() or not final.is_dir() or not installed.is_file() \
+                or installed.read_bytes() != contents['manifest.json']:
+            raise ValueError('Release ID already installed, and what is installed under it is not this archive '
+                             '(the manifests differ, or the installed release is incomplete). A different build '
+                             'needs a build id of its own')
+        _switch_to_installed(root, manifest['build_id'], manifest, 'its manifest is this archive\'s')
+        return
     staged = Path(tempfile.mkdtemp(prefix='.office-release-', dir=str(releases)))
     try:
         safe_extract(contents['source.tar'], staged/'kit')
@@ -557,7 +610,22 @@ def install(args):
     _link(root, 'current', 'releases/'+manifest['build_id'])
     print('Installed %s source=%s previous=%s' % (manifest['build_id'],
                                                   manifest['source_commit'], old or 'none'))
-    print('Restart the supervised service after this release switch; running processes must not mix revisions.')
+    print(RESTART)
+
+
+def activate(args):
+    """Switch to a release that is installed, by its build id, when there is no archive at hand."""
+    root = Path(args.install_root).expanduser().resolve()
+    if not ID.match(args.release or ''):
+        raise ValueError('Not a release id: name the folder under releases/')
+    final = root/'releases'/args.release
+    if final.is_symlink() or not final.is_dir() or not (final/'manifest.json').is_file():
+        raise ValueError('No installed release %s under %s' % (args.release, root/'releases'))
+    manifest = json.loads((final/'manifest.json').read_text(encoding='utf-8'))
+    if manifest.get('build_id') != args.release:
+        raise ValueError('The release installed under %s says it is %s' % (args.release, manifest.get('build_id')))
+    _switch_to_installed(root, args.release, manifest,
+                         'not compared with an archive: `install` of its archive does that')
 
 
 def rollback(args):
@@ -571,6 +639,10 @@ def rollback(args):
         _link(root, 'previous', current)
     print('Current release is now ' + prior)
     print('Restart the supervised service after rollback; running processes must not mix revisions.')
+    if current:
+        # The release that was left is still installed (kittrial-5bb.189).
+        print('To go forward again to %s: install its archive again, or `activate --release %s`.'
+              % (current, current.rpartition('/')[2]))
 
 
 def verify(args):
@@ -617,9 +689,12 @@ def main(argv=None):
     a.add_argument('--install-root', required=True)
     for action in ('rollback', 'verify'):
         sub.add_parser(action).add_argument('--install-root', required=True)
+    a = sub.add_parser('activate', help='switch to a release that is already installed (after a rollback, forward again)')
+    a.add_argument('--install-root', required=True)
+    a.add_argument('--release', required=True, help='its build id: the folder name under releases/')
     args = parser.parse_args(argv)
     if not args.action:
-        parser.error('Choose build, install, rollback or verify')
+        parser.error('Choose build, install, activate, rollback or verify')
     try:
         globals()[args.action](args)
     except (OSError, ValueError, subprocess.CalledProcessError, tarfile.TarError) as error:
