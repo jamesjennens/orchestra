@@ -1602,6 +1602,37 @@ line separately and unconfined.
   a row past its bound, has `review_state: null` and no next action, and the list
   reports `review_states_complete: false`; it never guesses "claim" or "deliver" for
   work that may be under review.
+- **A row that is not read** (kittrial-5bb.169). The kit does not read a tracker row
+  whose JSON nests deeper than 750 levels (`record_json.ROW_NESTING_MAX`; deep
+  metadata is enough). The rule is counted, not tried: it is the same on every Python
+  (3.10 cannot parse about a thousand levels, 3.13 parses several thousand), and it is
+  the rule the endpoint's own readers get with kittrial-5bb.141, from the same
+  constant. The service takes an answer of the tracker that holds such a row apart row
+  by row, so one such row does not fail the rest:
+  - `GET /v1/projects/{id}/tasks` answers 200 with every readable row. The other is in
+    `items` as `{"id", "status": "unknown", "unreadable": true, "malformed": true,
+    "error": "Malformed issue row"}`: its id and nothing else of it (not its title,
+    which is stored text nobody has read). The answer names it in `unreadable: [ids]`,
+    on every page and under every filter. The field is absent when every row is
+    readable. The page marks the row "Cannot be read" and says how many there are.
+  - An answer that holds a deep element and is not a single row or a clean list of
+    rows (text between the rows that JSON does not allow, a deep element that is not
+    an object or has no id of a tracker id's shape, such as a deep error object) is
+    refused as an answer that cannot be read, as a malformed answer always was.
+  - The page, brief and history of that row, and a change or claim of it, answer 409
+    `unreadable_row`: "Task ID exists, but its row cannot be read (it is malformed or
+    nested too deeply). Ask an operator of the server to repair it." Nothing of the
+    row is shown or changed through the service.
+  - The review states come from a second read of the endpoint (`work`). An endpoint
+    that cannot read such a row itself fails that read; the list is then still
+    answered, with `review_states_unavailable: true`, `review_states_complete: false`
+    and no review states. With every row readable a failure of that read is an error,
+    as before.
+  - What still depends on the endpoint: the brief of a READABLE task, the queue and My
+    work ask the endpoint's `brief` and `work`, which must themselves cope with the
+    row (kittrial-5bb.141). Until the endpoint does, those answer 503 while such a row
+    exists; they never answered 500.
+  - Repair is on the host (for deep metadata: `bd update ID --unset-metadata KEY`).
 - **Reference catalog reads.** The routes are `GET /v1/projects/{id}/references` and
   `GET /v1/projects/{id}/references/{key}`, available to any project member
   (`CAP_READ`). They are the .41 slice 1, kittrial-5bb.66.
