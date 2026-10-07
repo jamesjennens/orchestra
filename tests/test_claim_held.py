@@ -187,6 +187,19 @@ class RealStackTests(Members, fixes.Harness, rb.RealBdLabelAliasTests):
         self.members('pp')
 
     @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # The fixture makes its project with a plain `bd init`; a project the kit makes also has
+        # its merge slot, and since kittrial-5bb.188 a tracker read without it counts as a read
+        # that failed (issuing a worker credential then answers 503). Made the way the kit makes
+        # it. What a real project without a slot is told is kittrial-5bb.202.
+        try:
+            rb.admin.provision_merge_slot(cls.root, 'pp')
+        except BaseException:
+            cls.tearDownClass()
+            raise
+
+    @classmethod
     def tearDownClass(cls):
         # The fixture's own, spelled out: `Harness._stop_server` (the web server of one test) has the
         # name of the fixture's class method that stops the scratch Dolt server.
