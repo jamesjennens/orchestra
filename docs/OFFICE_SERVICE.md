@@ -176,8 +176,23 @@ links back but which nothing mentioned, or a new build of the same source under
 another ID.) What these do not check: an installed release is not hashed file by
 file, because nothing but its manifest was stored to compare with; a release
 whose files were changed after it was installed is caught only if its interpreter,
-bd or dolt no longer start. As with every switch: stop the supervised process
-first and start it from the new `current`; `add-project`'s printed paths name a
+bd or dolt no longer start. `activate` compares nothing but the build ID the
+stored manifest states with the folder name: a `source_commit` edited in an
+installed manifest is what `verify` then prints as the release's source. Only
+`install` of the archive compares the whole manifest. A stored manifest the tool
+cannot read (not JSON, not an object, no build ID or interpreter named) is
+refused by `activate` and `verify` with a sentence that names the file.
+
+A switch is two links, `previous` and then `current`, and a run can be killed
+between them. Nothing that is served has changed by then: `current` still names
+the old release, and running the same command again completes the switch. Until
+then `previous` names the current release too, and `rollback` refuses: `previous
+and current both name releases/<ID>: a switch was interrupted between its two
+links`, with the installed releases and what to run (`activate --release <ID>`,
+or `install` of the archive, for the release that should be current). A
+`rollback` killed between its own two links has gone back and left the same
+state; a second `rollback` is refused the same way. As with every switch: stop
+the supervised process first and start it from the new `current`; `add-project`'s printed paths name a
 release where there is no `install/current` link and must be printed again.
 
 Binary pins on rollback. Roll back only to a release that knows both pinned bd

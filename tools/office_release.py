@@ -495,7 +495,15 @@ def _read_package(path):
             contents[item.name] = package.extractfile(item).read()
     if set(contents) != {'manifest.json', 'source.tar', 'python.tar.gz'}:
         raise ValueError('Incomplete release package')
-    manifest = json.loads(contents['manifest.json'].decode('utf-8'))
+    try:
+        manifest = json.loads(contents['manifest.json'].decode('utf-8'))
+    except ValueError:
+        raise ValueError('Release manifest is not JSON') from None
+    # What the rest reads from it is asked for here: a manifest that is not an object, or that
+    # lacks one of these, was a traceback further on (kittrial-5bb.190).
+    if not isinstance(manifest, dict) or not all(isinstance(manifest.get(field), str) and manifest[field]
+                                                 for field in ('build_id', 'python_executable')):
+        raise ValueError('Release manifest is not an object that names its build_id and python_executable')
     if (manifest.get('schema_version') != 1 or not ID.match(manifest.get('build_id', '')) or
             digest(contents['source.tar']) != manifest.get('source_sha256') or
             digest(contents['python.tar.gz']) != manifest.get('python_sha256')):
@@ -523,6 +531,41 @@ def _current(root, name):
 
 
 RESTART = 'Restart the supervised service after this release switch; running processes must not mix revisions.'
+
+
+def _installed_manifest(release):
+    """The manifest stored in an installed release, as far as this tool reads it.
+
+    A release folder is the operator's to look into, and its manifest was read as whatever the
+    JSON happened to be: `[]` in it, or an object without its interpreter, answered a Python
+    traceback from `activate` and `verify` (kittrial-5bb.190). Raises ValueError with a sentence.
+    """
+    path = release/'manifest.json'
+    try:
+        manifest = json.loads(path.read_text(encoding='utf-8'))
+    except ValueError:
+        raise ValueError('%s is not JSON: the release cannot be read' % path) from None
+    if not isinstance(manifest, dict):
+        raise ValueError('%s is not a JSON object: the release cannot be read' % path)
+    for field in ('build_id', 'python_executable'):
+        if not isinstance(manifest.get(field), str) or not manifest[field]:
+            raise ValueError('%s does not name its %s: the release cannot be read' % (path, field))
+    return manifest
+
+
+def _switch(root, old, target):
+    """The two links of a switch: `previous` first, then `current`.
+
+    They are two renames and a run can be killed between them. In this order nothing that is
+    served has changed by then (`current` still names the old release, which is whole) and the
+    same command again completes the switch; `previous` names the old release too, which
+    `rollback` refuses with a sentence. The other order would leave `current` on the new release
+    and `previous` on whatever it named before: `rollback` would then go, without a word, to a
+    release that was never the one before this (kittrial-5bb.190).
+    """
+    if old:
+        _link(root, 'previous', old)
+    _link(root, 'current', target)
 
 
 def _starts_as_installed(release, manifest):
@@ -557,9 +600,7 @@ def _switch_to_installed(root, build_id, manifest, compared):
         print('Release %s is already installed and is the current one; nothing was changed.' % build_id)
         return
     _starts_as_installed(root/target, manifest)
-    if old:
-        _link(root, 'previous', old)
-    _link(root, 'current', target)
+    _switch(root, old, target)
     print('Current release is now %s (it was installed already; %s) source=%s previous=%s'
           % (build_id, compared, manifest.get('source_commit'), old or 'none'))
     print(RESTART)
@@ -605,11 +646,9 @@ def install(args):
         shutil.rmtree(str(staged), ignore_errors=True)
         raise
     old = _current(root, 'current')
-    if old:
-        _link(root, 'previous', old)
-    _link(root, 'current', 'releases/'+manifest['build_id'])
+    _switch(root, old, 'releases/'+manifest['build_id'])
     print('Installed %s source=%s previous=%s' % (manifest['build_id'],
-                                                  manifest['source_commit'], old or 'none'))
+                                                  manifest.get('source_commit'), old or 'none'))
     print(RESTART)
 
 
@@ -621,7 +660,7 @@ def activate(args):
     final = root/'releases'/args.release
     if final.is_symlink() or not final.is_dir() or not (final/'manifest.json').is_file():
         raise ValueError('No installed release %s under %s' % (args.release, root/'releases'))
-    manifest = json.loads((final/'manifest.json').read_text(encoding='utf-8'))
+    manifest = _installed_manifest(final)
     if manifest.get('build_id') != args.release:
         raise ValueError('The release installed under %s says it is %s' % (args.release, manifest.get('build_id')))
     _switch_to_installed(root, args.release, manifest,
@@ -634,6 +673,15 @@ def rollback(args):
     current = _current(root, 'current')
     if not prior or not (root/prior).is_dir():
         raise ValueError('No installed previous release')
+    if current and (root/prior).resolve() == (root/current).resolve():
+        # What a switch (or a rollback) leaves when it is killed between its two links. Going
+        # "back" to the current release printed "Current release is now ..." and changed nothing.
+        installed = sorted(entry.name for entry in (root/'releases').iterdir()
+                           if entry.is_dir() and not entry.is_symlink() and ID.match(entry.name))
+        raise ValueError('previous and current both name %s: a switch was interrupted between its two links, so '
+                         'the release to go back to is not recorded. Nothing was changed. Installed: %s. Make the '
+                         'one you want the current release with `activate --release ID`, or install its archive '
+                         'again' % (current, ', '.join(installed)))
     _link(root, 'current', prior)
     if current:
         _link(root, 'previous', current)
@@ -651,7 +699,7 @@ def verify(args):
     if not current:
         raise ValueError('No current release')
     release = root/current
-    manifest = json.loads((release/'manifest.json').read_text(encoding='utf-8'))
+    manifest = _installed_manifest(release)
     python = release/'python-runtime'/_safe_path(manifest['python_executable'])
     subprocess.check_call([str(python), '-c', 'import admin, office_service, http_service'],
                           cwd=str(release/'kit'))
@@ -661,7 +709,7 @@ def verify(args):
     finally:
         remove_scratch(scratch)
     print('release=%s source=%s python=%s' % (manifest['build_id'],
-                                             manifest['source_commit'], python))
+                                             manifest.get('source_commit'), python))
     for name, _ in BINARIES:
         print('%s starts on this host: %s' % (name, (said[name].splitlines() or [''])[0][:120]))
 
