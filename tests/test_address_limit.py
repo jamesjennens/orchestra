@@ -447,6 +447,33 @@ class ProxyTests(AddressCase):
         self.assertEqual((status, answer['error']['message']), (503, self.service.LOGIN_BUSY_ADDRESS))
         self.assertEqual(self.forwarded(OTHER, method='POST', path='/v1/sessions', body=body)[0], 201)
 
+    def test_which_sources_are_shared_and_which_are_one_clients(self):
+        """Asked of the handler itself, for peers that a test on one machine cannot connect from: a trusted proxy
+        that is NOT on the service's own host."""
+        handler_class = http_service.build_handler(mock.Mock(), mock.Mock(), trusted_proxies=('10.0.0.1', '2001:db8::/64'), web_root=None)
+
+        def shared(peer, forwarded=None):
+            handler = object.__new__(handler_class)
+            handler.client_address = (peer, 4000)
+            handler.headers = {} if forwarded is None else {'X-Forwarded-For': forwarded}
+            return handler._source_is_shared()
+        # A trusted proxy that forwards no usable address: everybody behind it arrives from it.
+        self.assertTrue(shared('10.0.0.1'))
+        self.assertTrue(shared('10.0.0.1', 'not an address'))
+        self.assertTrue(shared('2001:db8::7'))
+        # With a forwarded address the source is that client's.
+        self.assertFalse(shared('10.0.0.1', FAR))
+        self.assertFalse(shared('10.0.0.1', OTHER + ', ' + FAR))
+        # Any other peer off the host is a client address of its own, whatever header it sends.
+        self.assertFalse(shared('10.0.0.2'))
+        self.assertFalse(shared('10.0.0.2', FAR))
+        self.assertFalse(shared('192.0.2.7'))
+        # The service's own host, named as a proxy or not, with a header (not believed) or without.
+        for peer in ('127.0.0.1', '127.0.0.9', '::1'):
+            self.assertTrue(shared(peer))
+            self.assertTrue(shared(peer, FAR))
+        self.assertFalse(shared(''))
+
     @needs_addresses
     def test_with_no_proxy_named_the_services_own_host_is_shared_and_ten_at_once_get_in(self):
         """The loopback default with no trusted_proxies at all: the other shape of a first install."""

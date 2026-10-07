@@ -443,7 +443,8 @@ What this does not do, measured in the same runs:
 - **Four addresses acting together take all 16 places** and keep everybody
   else out of logging in. Three do not.
 - **A person at the flooding address itself** shares its four places with the
-  flood: they got in after about half a minute (five tries), not at once.
+  flood: they got in after half a minute to a minute (five to ten tries), not
+  at once.
 - **Ten people at ANOTHER address during a 100-client flood** from one: eight
   in at the first try and two told to try again (seven and three once), the
   slowest answer after 3 to 6 seconds: the checks are slower under the flood
