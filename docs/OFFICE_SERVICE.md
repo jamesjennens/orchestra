@@ -229,10 +229,47 @@ selected by
 the supervisor and operates against this runtime's canonical project data.
 Start the service once, then run `<PYTHON> <KIT>/admin.py --root <RUNTIME_ROOT>
 add-project <PROJECT>` before scheduling `backup --all`. A new empty runtime
-has no initialized project to back up. `add-project` prints a worker client
-endpoint under that release's exact path. Regenerate each worker's client
-configuration after install or rollback if its endpoint still points to an
-older release.
+has no initialized project to back up. `add-project` prints the worker client
+configuration, the bootstrap command and a second, local-transport example for
+an agent that runs on the server itself. Where the installation has an
+`<INSTALL_ROOT>/current` link, the endpoint and the interpreter in those lines
+are printed through it, so an upgrade needs no change to a configuration printed
+by this release or later. An installation with no `current` link (the live kits
+keep `<BASE>/kit -> <BASE>/releases/<ID>`) prints the release spelling instead,
+and says so: print that configuration again after an upgrade or it keeps running
+the release that printed it. A
+project made on the host is not on the web yet: nothing of it appears in the web
+interface until a superuser registers it there (New project, with this name, or
+`POST /v1/projects` without `create`).
+
+**What must be regenerated after an upgrade.** A client configuration or
+`authorized_keys` line printed by a release *before* this one names
+`releases/<ID>` rather than `current`. The old folder stays on the host, so
+those clients keep running the kit of that release against the new runtime while
+the service runs the new one. After `install` or `rollback`, for every worker
+whose configuration or key line names a `releases/<ID>` path:
+
+- change `endpoint` to `<INSTALL_ROOT>/current/kit/endpoint.py` and `python` to
+  the bundled interpreter, `<INSTALL_ROOT>/current/python-runtime/<PATH>` (the
+  `add-project` output of this release has both);
+- re-run `admin.py --root <RUNTIME_ROOT> authorized-keys --key-file <KEY.pub>`
+  and replace that contributor's `authorized_keys` entry with the printed line.
+  A confined key's `--endpoint` is compared as one token against the `endpoint`
+  in that contributor's client config, so those two change together.
+
+A configuration or key line that already names `<INSTALL_ROOT>/current/...`
+needs nothing: the link moves with the upgrade. A bare `python3` in an old
+client config is the other half of the same problem: on RHEL 8 it is
+platform-python 3.6, which cannot run the endpoint, and a host with no `python3`
+on PATH fails outright, so name the bundled interpreter instead.
+
+The client half of those lines is a change in this kit's `client.py`: it runs the
+interpreter the config names, where older clients ran a literal `python3` on the
+server and ignored the `python` key. A worker therefore needs the `client.py` of
+this release or later for a printed `python` to take effect; an older client with
+the new config still runs `python3` on the server, which on a host without one
+fails with `python3: command not found` (observed after a rollback,
+kittrial-5bb.182 item 5).
 
 ## How the web interface is reached: three shapes
 

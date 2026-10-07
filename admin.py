@@ -1693,6 +1693,70 @@ WantedBy=default.target
         raise RuntimeError('Initialization failed; service stopped. Preserve runtime and inspect journal; do not overwrite the deployment.') from None
     print(f'Installed {unit}, authenticated loopback port {port}')
 
+def install_current_link(path):
+    """The ``current`` link that exposes ``path``, or None when this install has none.
+
+    A release is a folder under a folder literally named ``releases`` whose sibling
+    ``current`` link resolves to it. Both the path itself and every parent are tested:
+    with the kit at a release root (``X/releases/R1`` plus ``X/current -> releases/R1``)
+    the path IS the release directory, and a scan of ``Path.parents`` alone never tests
+    it, so add-project and authorized-keys would disagree on that layout
+    (kittrial-5bb.182 items 1 and 3). Only a folder named ``releases`` counts, so a
+    folder that merely has a sibling ``current`` link is never rewritten.
+    """
+    resolved=Path(os.path.realpath(str(path)))
+    for release in (resolved,*resolved.parents):
+        install=release.parent
+        if install.name!='releases':continue
+        link=install.parent/'current'
+        if link.is_symlink() and Path(os.path.realpath(str(link)))==release:
+            return link
+    return None
+
+def install_current_path(path):
+    """``path`` as this installation's ``current`` link exposes it, or unchanged.
+
+    An office installation keeps every release under ``releases/<ID>`` and points
+    ``current`` at the one in use. ``__file__`` and ``sys.executable`` resolve that
+    link, so a client config printed from them pins the worker to the release that
+    printed it: after an upgrade the old ``releases/<ID>`` folder remains, and
+    ``endpoint.py`` run from it is the OLD kit against the new runtime
+    (kittrial-5bb.182). Print the ``current`` spelling whenever the path lies inside
+    a release this installation's ``current`` link names, so an upgrade moves the
+    printed line with the service. A path that is not such a release (a plain
+    checkout, ``/usr/bin/python3``) comes back exactly as it was given.
+    """
+    link=install_current_link(path)
+    if link is None:return Path(str(path))
+    resolved=Path(os.path.realpath(str(path)))
+    return link/resolved.relative_to(Path(os.path.realpath(str(link))))
+
+def office_bundled_python():
+    """The bundled interpreter of the office installation this kit belongs to, or None.
+
+    The release manifest names the interpreter's path inside ``python-runtime``
+    (``office_release`` writes it at build and verifies it at install). Returning it
+    through :func:`install_current_path` means a printed client config or forced
+    command follows an upgrade instead of naming the release that printed it. None
+    outside an office installation, where there is no manifest and no bundled
+    interpreter. Read through ``record_json.loads``: a manifest made unreadable or
+    nested too deeply is a reason to fall back, not a traceback from add-project.
+    """
+    release=Path(os.path.realpath(__file__)).parent.parent
+    manifest=release/'manifest.json'
+    if not manifest.is_file():return None
+    try:
+        document=record_json.loads(manifest.read_text(encoding='utf-8'))
+    except (OSError,UnicodeError,ValueError):
+        return None
+    relative=document.get('python_executable') if isinstance(document,dict) else None
+    if not isinstance(relative,str) or not relative:return None
+    inside=Path(relative)
+    if inside.is_absolute() or '..' in inside.parts:return None
+    executable=release/'python-runtime'/inside
+    if not executable.is_file():return None
+    return install_current_path(executable)
+
 def worker_client_setup(root,name):
     """Exact worker client configuration and bootstrap command for one project.
 
@@ -1700,14 +1764,46 @@ def worker_client_setup(root,name):
     module), which serves every project of the deployment. The host is a
     placeholder because the kit is public and each worker supplies its own SSH
     alias; never point a new project at a project-specific wrapper endpoint.
+
+    The endpoint and the interpreter are printed through the installation's
+    ``current`` link where it has one, and ``python`` names the interpreter that
+    runs the endpoint on the server: a bare ``python3`` is platform-python 3.6 on
+    RHEL 8, which cannot run the endpoint, and a host with no python3 on PATH fails
+    outright (kittrial-5bb.182). A second example uses the local transport, for an
+    agent that runs on the server itself.
+
+    The sentence that introduces each example says what was ACTUALLY printed: on an
+    installation with no ``current`` link (the live kits keep
+    ``<base>/kit -> <base>/releases/<ID>``) the printed paths name the release, so the
+    text says they must be printed again after an upgrade instead of claiming an
+    upgrade moves them (kittrial-5bb.182 item 1).
     """
-    endpoint=Path(__file__).resolve().with_name('endpoint.py')
-    config=json.dumps({'host':'WORKER_SSH_HOST','endpoint':str(endpoint),'root':str(root)},indent=2)
+    source=Path(__file__).resolve().with_name('endpoint.py')
+    endpoint=install_current_path(source)
+    python=str(office_bundled_python() or default_authorized_key_python())
+    config=json.dumps({'host':'WORKER_SSH_HOST','endpoint':str(endpoint),'root':str(root),
+                       'python':python},indent=2)
+    local=json.dumps({'transport':'local','python':python,'endpoint':str(endpoint),
+                      'root':str(root)},indent=2)
+    if install_current_link(source) is not None:
+        endpoint_note=('The endpoint and the interpreter go through install/current, so an upgrade '
+                       'moves them with the service')
+        local_note='the same install/current paths, so it also follows an upgrade'
+    else:
+        endpoint_note=('This installation has no install/current link, so the endpoint and the '
+                       'interpreter below name the release that printed them and must be printed '
+                       'again after an upgrade')
+        local_note=('the same paths, which name this release, so print them again after an upgrade')
     return (f'Worker client configuration for {name} (save as client.local.json in the worker\'s own\n'
             f'directory and replace WORKER_SSH_HOST with that worker\'s SSH alias; this kit endpoint serves\n'
-            f'every project, so do not point it at a project-specific wrapper):\n{config}\n'
+            f'every project, so do not point it at a project-specific wrapper). {endpoint_note}:\n{config}\n'
             f'Bootstrap command (replace ACTOR with the actor returned by worker.py start or session\n'
-            f'register):\n  python client.py --config client.local.json --project {name} --actor ACTOR -- onboard')
+            f'register):\n  python client.py --config client.local.json --project {name} --actor ACTOR -- onboard\n'
+            f'An agent that runs on the server itself uses the local transport instead (no SSH and no\n'
+            f'host; {local_note}):\n{local}\n'
+            f'Host project not on the web yet: nothing of {name} appears in the web interface until a\n'
+            f'superuser registers it there (New project, with this name, or POST /v1/projects without\n'
+            f'"create").')
 
 #: Set by ``environment`` to the account's home when it scopes HOME into the runtime.
 ACCOUNT_HOME_ENV='ORCHESTRA_ACCOUNT_HOME'
@@ -1747,8 +1843,17 @@ def scheduled_backup_unit_paths():
         return []
 
 def scheduled_backup_execstart(root):
-    """The exact ``ExecStart`` line that covers every project of this runtime."""
-    return (f'ExecStart={sys.executable} {Path(__file__).resolve()} '
+    """The exact ``ExecStart`` line that covers every project of this runtime.
+
+    The interpreter and this module are both printed through the installation's
+    ``install/current`` link where it has one, so an upgrade moves the schedule with the
+    service. A line whose interpreter came through ``current`` but whose ``admin.py``
+    named ``releases/<ID>`` kept running the release that printed it after the next
+    upgrade (kittrial-5bb.182 item 2).
+    """
+    python=install_current_path(sys.executable)
+    module=install_current_path(Path(__file__).resolve())
+    return (f'ExecStart={python} {module} '
             f'--root {root} backup --all')
 
 def _execstart_values(text):
@@ -4348,11 +4453,14 @@ def default_authorized_key_python():
 
     Absolute on purpose. A bare `python3` is resolved by the account shell through PATH,
     which PermitUserEnvironment or an AcceptEnv forwarding the caller's PATH can move, so
-    the printed line names the interpreter the deployment actually tested.
+    the printed line names the interpreter the deployment actually tested. Inside an
+    office installation the path goes through `install/current`, so an upgrade moves the
+    line with the service instead of leaving it on the release that printed it
+    (kittrial-5bb.182).
     """
     executable=getattr(sys,'executable','') or ''
     if executable.startswith('/') and AUTHORIZED_KEY_PYTHON.fullmatch(executable):
-        return executable
+        return str(install_current_path(executable))
     return '/usr/bin/python3'
 
 def _authorized_key_python(value):
@@ -4402,8 +4510,14 @@ def authorized_key_lines(root,kit,key_type,key_body,key_comment='',comment=None,
             'contributor':contributor,'operator':key}
 
 def authorized_keys(root,key_file,role='both',python=None,comment=None):
-    """Print the installable lines for one public key as JSON (see authorized_key_lines)."""
-    kit=Path(__file__).resolve().parent
+    """Print the installable lines for one public key as JSON (see authorized_key_lines).
+
+    The kit directory is taken through the installation's `install/current` link where it
+    has one: a forced command that names `releases/<ID>` keeps running the old kit after an
+    upgrade while the service runs the new one, and its exact `--endpoint` string is what
+    the wrapper compares the caller's config against (kittrial-5bb.182).
+    """
+    kit=install_current_path(Path(__file__).resolve().parent)
     for name in ('ssh_forced_command.py','endpoint.py'):
         if not (kit/name).is_file():
             raise ValueError('This kit copy has no %s; run the helper from the installed kit directory'%name)
@@ -4425,7 +4539,11 @@ def authorized_keys(root,key_file,role='both',python=None,comment=None):
                       'still self-declares its actor on every request, and what it protects is the '
                       'operator-gated and reserved operations, not the actor name.',
                       'Install one entry per key: both lines are alternatives for different keys, '
-                      'never two entries for the same key.']}
+                      'never two entries for the same key.',
+                      'The endpoint in the contributor line goes through the installation\'s '
+                      'install/current link where it has one. Put that exact path in the contributor\'s '
+                      'client config: the wrapper compares it as one token, and a releases/<ID> spelling '
+                      'would keep that key on the release that printed it.']}
     if role in ('contributor','both'):payload['contributor']=lines['contributor']
     if role in ('operator','both'):payload['operator']=lines['operator']
     print(json.dumps(payload,ensure_ascii=True,indent=2))

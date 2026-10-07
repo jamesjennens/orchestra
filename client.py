@@ -100,7 +100,12 @@ def _ssh_argv(config):
     if _forced_command(config):
         command = shlex.quote(endpoint)
     else:
-        command = ' '.join(shlex.quote(x) for x in ['python3',endpoint,'--root',root])
+        # The interpreter runs on the SERVER. A bare python3 is platform-python 3.6 on
+        # RHEL 8, which cannot run the endpoint, and a host with no python3 on PATH fails
+        # outright, so the config may name the deployment's own interpreter (an office
+        # install prints its bundled one). No "python" key keeps python3 exactly
+        # (kittrial-5bb.182).
+        command = ' '.join(shlex.quote(x) for x in [_python(config),endpoint,'--root',root])
     return ['ssh','-o','BatchMode=yes','-o','ConnectTimeout=10',host,command],'SSH'
 
 def _local_argv(config):
