@@ -4483,7 +4483,7 @@ def credential_actors(root,state_path):
                         for comment in row.get('comments') or []:
                             if isinstance(comment,dict) and isinstance(comment.get('author'),str):names.add(actor_names.head(comment['author']))
                     found['names']=names
-                except (subprocess.CalledProcessError,OSError,ValueError):
+                except (subprocess.CalledProcessError,OSError,ValueError,RecursionError):
                     found['names']=None                # the tracker could not be read: said as null, not as "no rows"
             projects[name]=found
         return projects[name]

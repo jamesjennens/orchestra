@@ -335,6 +335,19 @@ class IssueCase(HostNames, fixes.EndpointCase):
         self.host()
         self.assertEqual(201, self.request('POST', self.credentials, {'actor': 'worker-a'}, token=self.alex, key='cannot-say-1').status)
 
+    def test_an_answer_of_the_host_that_is_not_one_issues_nothing(self):
+        self.project()
+        self.host()
+        real = self.backend._run
+
+        def odd(action, *args, **kwargs):
+            return ['not', 'an', 'answer'] if action == 'actor-standing' else real(action, *args, **kwargs)
+        with mock.patch.object(self.backend, '_run', odd):
+            for name in ('ops-lead', 'worker-a'):
+                refused = self.request('POST', self.credentials, {'actor': name}, token=self.alex)
+                self.assertEqual(503, refused.status, refused.data)
+        self.assertEqual([], self.listed_without_asking())
+
     def listed_without_asking(self):
         return [c for c in self.service.state['credentials'].values() if c.get('project_id') == self.pid]
 
