@@ -41,9 +41,12 @@ Every request is one JSON object on stdin; every response is one JSON object on 
     a known time), and neither does a read, including the reads of an action that can
     also write (`work`, `review TASK`, `brief`, `handoff TASK`), a `--dry-run`, and the
     help of a command (`create --help`). Help is a help flag that is ON: bare, or with a
-    value bd reads as true. `--help=false` (also `--help=0`, `-h=false`) is a flag bd
-    accepts and then carries the command out, so such a request is a write like any
-    other: stamped, and its outcome kept as unknown when it fails after bd was called;
+    value bd reads as true; given more than once, the last one decides, as in bd.
+    `--help=false` (also `--help=0`, `-h=false`) is a flag bd accepts and then carries
+    the command out, so such a request is a write like any other: stamped, and its
+    outcome kept as unknown when it fails after bd was called. A flag between a verb and
+    its subcommand changes nothing: `comments --json add ID TEXT` is the write that
+    `comments add ID TEXT --json` is;
   - the writes are: every bd write (`create`, `update`, `close`, `reopen`, `comments
     add`, `dep add`, `remove`, `relate` and `unrelate`, ...), `review --file`, `handoff`
     with a payload (a request, an acceptance, a decline), `checkpoint`, the lifecycle,

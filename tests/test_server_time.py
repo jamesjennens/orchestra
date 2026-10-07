@@ -89,15 +89,19 @@ class WhichCallsWriteTests(unittest.TestCase):
                      ['create', '--title', 'x', '--help=false'], ['create', '--title', 'x', '--help=f'],
                      ['dep', 'add', 'pp-1', 'pp-2', '--help=false'], ['dep', 'pp-1', '--blocks', 'pp-2', '-h=false'],
                      ['merge-slot', 'acquire', '--help=false'],
-                     # several: one that is off is enough; and a value bd cannot read is not "on"
-                     ['create', '--title', 'x', '--help', '--help=false'], ['create', '--title', 'x', '--help=false', '--help'],
+                     # several: the last one decides, as in bd; and a value bd cannot read is not "on"
+                     ['create', '--title', 'x', '--help', '--help=false'], ['create', '--title', 'x', '--help=true', '-h=0'],
                      ['create', '--title', 'x', '-h', '-h=false'], ['create', '--title', 'x', '--help=maybe'],
+                     ['create', '--title', 'x', '--help', '--help=maybe'],
                      ['create', '--title', 'x', '--help='], ['update', 'pp-1', '-qh=false']):
             with self.subTest(argv=argv):
                 self.assertTrue(writes(argv))
         # On, in the spellings bd reads as true: help, and nothing is written.
         for argv in (['create', '--title', 'x', '--help=true'], ['create', '--help=1'], ['update', 'pp-1', '-h=true'],
-                     ['close', 'pp-1', '--help=T'], ['update', 'pp-1', '-qh'], ['create', '--help', '-h', '--help=true']):
+                     ['close', 'pp-1', '--help=T'], ['update', 'pp-1', '-qh'], ['create', '--help', '-h', '--help=true'],
+                     # given more than once with the LAST one on: bd prints help and writes nothing (64 of 64 in the review)
+                     ['create', '--title', 'x', '--help=false', '--help'], ['update', 'pp-1', '-h=false', '-h'],
+                     ['close', 'pp-1', '--help=0', '--help=1'], ['comments', 'add', 'pp-1', 'text', '--help=false', '--help=true']):
             with self.subTest(argv=argv):
                 self.assertFalse(writes(argv))
         # A read stays a read with the flag off.
@@ -121,6 +125,70 @@ class WhichCallsWriteTests(unittest.TestCase):
                      ['dep', 'add', 'pp-1', 'pp-2', '--', '--help']):
             with self.subTest(argv=argv):
                 self.assertTrue(writes(argv))
+
+    def test_a_flag_between_comments_and_add_does_not_hide_the_write(self):
+        """Review of revision 3 (and the same on main): the test was whether the token right after `comments`
+        is `add`. bd accepts flags there and writes the comment; a failure after it released the operation's
+        identity, and the same request ran again: the comment twice."""
+        writes = http_authority.is_mutating_invocation
+        for argv in (['comments', '--help=false', 'add', 'pp-1', 'text'], ['comments', '--help=0', 'add', 'pp-1', 'text'],
+                     ['comments', '-h=false', 'add', 'pp-1', 'text'], ['comments', '--help', '--help=false', 'add', 'pp-1', 'text'],
+                     ['comments', '--json', 'add', 'pp-1', 'text'], ['comments', '-q', 'add', 'pp-1', 'text'],
+                     ['comments', '--quiet', 'add', 'pp-1', 'text'], ['comments', '--json=false', 'add', 'pp-1', 'text'],
+                     ['comments', '--verbose', 'add', 'pp-1', 'text'], ['comments', '--json', '-q', 'add', 'pp-1', 'text'],
+                     ['comments', 'add', 'pp-1', 'text'], ['comments', 'add', '--json', 'pp-1', 'text'],
+                     # what cannot be resolved could hide the subcommand: a write
+                     ['comments', '--bogus', 'add', 'pp-1', 'text'], ['comments', '--bogus', 'pp-1']):
+            with self.subTest(argv=argv):
+                self.assertTrue(writes(argv))
+        # The reads stay reads, flags or not: the shorthand for the list, and a task that is named `add` nowhere.
+        for argv in (['comments', 'pp-1'], ['comments', 'pp-1', '--json'], ['comments', '--json', 'pp-1'], ['comments', '-q', 'pp-1'],
+                     ['comments', 'list', 'pp-1'], ['comments', '--json', 'list', 'pp-1'], ['comments'],
+                     ['comments', 'pp-1', 'add'],                       # the subcommand is the FIRST operand
+                     ['comments', '--help', 'add', 'pp-1', 'text'], ['comments', '--help=false', '--help', 'add', 'pp-1', 'text']):
+            with self.subTest(argv=argv):
+                self.assertFalse(writes(argv))
+        import reserved_comments
+        with mock.patch.object(reserved_comments, '_comments_parts', side_effect=RuntimeError('broken')):
+            self.assertTrue(writes(['comments', 'pp-1']))              # a reader that fails never makes a read of it
+
+    def test_the_runner_records_such_a_comment_as_an_attempted_write(self):
+        """What keeps the operation's identity when a failure follows the write: without it the same request,
+        sent again with the same identity, was carried out again and the task had the comment twice."""
+        for argv, attempted in ((['comments', '--json', 'add', 'pp-1', 'text'], True), (['comments', '--help=false', 'add', 'pp-1', 'text'], True),
+                                (['comments', '-q', 'add', 'pp-1', 'text'], True), (['comments', '--json', 'pp-1'], False),
+                                (['comments', '--help', 'add', 'pp-1', 'text'], False)):
+            with self.subTest(argv=argv):
+                runner = http_authority.NativeRunner(lambda sent: 'answer')
+                self.assertEqual(runner(argv), 'answer')
+                self.assertEqual(runner.attempted_write, attempted)
+
+    def test_the_other_verbs_with_subcommands_resolve_the_first_operand_too(self):
+        """`dep` is the only other one a caller may run; it is resolved by the kit's table of writing commands."""
+        writes = http_authority.is_mutating_invocation
+        for argv in (['dep', '--json', 'add', 'pp-1', 'pp-2'], ['dep', '-q', 'remove', 'pp-1', 'pp-2'],
+                     ['dep', '--help=false', 'add', 'pp-1', 'pp-2'], ['dep', '--type', 'blocks', 'add', 'pp-1', 'pp-2']):
+            with self.subTest(argv=argv):
+                self.assertTrue(writes(argv))
+        for argv in (['dep', '--json', 'list', 'pp-1'], ['dep', '-q', 'tree', 'pp-1'], ['dep', '--json', 'cycles']):
+            with self.subTest(argv=argv):
+                self.assertFalse(writes(argv))
+        # The verbs a caller may run, read from the endpoint's source (it does not import on Windows): a new
+        # verb with subcommands must be looked at here.
+        import ast
+        allowed = re.search(r'^ALLOWED=(\{[^}]*\})', (KIT / 'endpoint.py').read_text(encoding='utf-8'), re.M)
+        self.assertEqual(ast.literal_eval(allowed.group(1)), {'list', 'show', 'ready', 'search', 'count', 'create', 'update', 'close',
+                                                              'reopen', 'comments', 'dep', 'state', 'lint'})
+
+    def test_the_letters_after_a_short_value_flag_are_its_value(self):
+        """`-dh` is `-d` with the value `h`, not `-d` and help (a mutant of the review)."""
+        writes = http_authority.is_mutating_invocation
+        for argv in (['create', '--title', 'x', '-dh'], ['update', 'pp-1', '-dh'], ['create', '--title', 'x', '-d=h'],
+                     ['comments', 'add', 'pp-1', '-ah'], ['dep', 'add', 'pp-1', 'pp-2', '-th']):
+            with self.subTest(argv=argv):
+                self.assertTrue(writes(argv))
+        self.assertEqual(http_authority._help_flags(['create', '--title', 'x', '-dh']), [])
+        self.assertEqual(http_authority._help_flags(['update', 'pp-1', '-qh']), [True])        # after a bool flag it IS the flag
 
     def test_what_cannot_be_resolved_is_not_help(self):
         writes = http_authority.is_mutating_invocation

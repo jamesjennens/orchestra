@@ -777,14 +777,17 @@ def _asks_for_help(argv):
     ``-h=false``) is a flag bd accepts and then carries the command out (review of
     kittrial-5bb.97, revision 2: every such spelling of a write was taken for a read, so it
     was not stamped and a failure after it released the operation's identity). So: help only
-    when every help flag is on, bare or with a value bd reads as true. Anything else, and
-    anything that cannot be resolved, is judged as if no help had been asked: a help
-    request taken for a write is stamped needlessly; a write taken for help is the fault.
+    when the help flag is on, bare or with a value bd reads as true; given more than once,
+    the last one decides, as in bd (``--help=false --help`` prints help, ``--help
+    --help=false`` carries the command out). Anything else, and anything that cannot be
+    resolved, is judged as if no help had been asked: a help request taken for a write is
+    stamped needlessly; a write taken for help is the fault.
     """
     try:
         from reserved_comments import _parse_go_bool
         found = _help_flags(argv)
-        return bool(found) and all(_parse_go_bool(value) is True for value in found)
+        # bd takes the last one where the flag is given more than once.
+        return bool(found) and _parse_go_bool(found[-1]) is True
     except Exception:  # noqa: BLE001 - what cannot be scanned stays what it was
         return False
 
@@ -796,6 +799,24 @@ def _writes_rows(argv):
         return write_targets(list(argv), {}) is not None
     except Exception:  # noqa: BLE001
         return True
+
+
+def _comments_writes(argv):
+    """Whether a ``bd comments`` invocation adds a comment: its subcommand is ``add``.
+
+    The subcommand is the first operand, not the second token: bd accepts flags between
+    the two (``comments --json add ID text``, ``comments --help=false add ID text``), and
+    a test of the token right after ``comments`` took each of those writes for a read
+    (review of kittrial-5bb.97, revision 3; the same on main). The kit's own reader of a
+    ``comments`` invocation resolves it, as ``dep`` is resolved; what it cannot resolve
+    (a flag it does not know, which could hide the subcommand) is a write.
+    """
+    try:
+        from reserved_comments import _comments_parts
+        parts = _comments_parts(list(argv))
+    except Exception:  # noqa: BLE001 - ambiguous: never mistaken for a read
+        return True
+    return parts is None or parts[0] == 'add'
 
 
 def is_mutating_invocation(argv):
@@ -820,7 +841,7 @@ def is_mutating_invocation(argv):
         # from it is a clean pre-effect failure, not an uncertain write.
         return False
     if verb == 'comments':
-        return len(argv) > 1 and argv[1] == 'add'
+        return _comments_writes(argv)
     if verb == 'merge-slot':
         return not (len(argv) > 1 and argv[1] == 'check')
     return True
