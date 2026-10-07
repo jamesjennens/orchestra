@@ -342,9 +342,16 @@ class ProxyTests(AddressCase):
             # Two of its requests are being served (held here, as a slow action would hold them).
             self.assertTrue(self.httpd.request_begins(FAR))
             self.assertTrue(self.httpd.request_begins(FAR))
-            status, body, response = self.forwarded(FAR)
+            real, watched = http_service.ApiHandler._request_id, []
+
+            def request_id(handler):
+                watched.append(handler.connection in handler.server._deadlines)
+                return real(handler)
+            with mock.patch.object(http_service.ApiHandler, '_request_id', request_id):
+                status, body, response = self.forwarded(FAR)
             self.assertEqual((status, body['error']['code'], body['error']['message']),
                              (503, 'busy', http_service.ADDRESS_BUSY))
+            self.assertEqual(watched, [False])           # refused after its request was read: no client deadline on it
             self.assertEqual(response.getheader('Retry-After'), '1')
             self.assertEqual(response.getheader('Connection'), 'close')
             self.assertEqual(response.getheader('X-Request-Id'), body['request_id'])

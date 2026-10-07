@@ -484,6 +484,58 @@ class WaitTests(Held):
         for thread in threads:
             thread.join(30)
 
+    def test_a_waiter_that_wakes_with_every_place_taken_is_refused_and_is_never_a_seventeenth(self):
+        """Review of kittrial-5bb.170 (mutant W10). A waiter wakes because a place of ITS ADDRESS was given
+        up; if somebody else has taken that place meanwhile, all 16 are in flight and it is told that too many
+        people are logging in, as anybody would be: it is not let in as a 17th."""
+        service = self.service
+        self.assertEqual((service.LOGINS_AT_ONCE, service.LOGINS_PER_ADDRESS), (16, 4))
+        service.LOGIN_WAIT_SECONDS = 30
+        others = ('192.0.2.11', '192.0.2.12', '192.0.2.13')
+        # All 16 places are in flight: four of ONE's, twelve of three other addresses.
+        with service._logins_room:
+            service._logins = 16
+            service._logins_by_address.update({self.ONE: 4, **{address: 4 for address in others}})
+
+        def emptied():
+            with service._logins_room:
+                service._logins = 0
+                service._logins_by_address.clear()
+                service._logins_room.notify_all()
+        self.addCleanup(emptied)
+        checked, most, took = [], [], []
+        real = http_auth._PASSWORD_WORKER.scrypt
+
+        def seen(password, **parameters):
+            checked.append(password)
+            most.append(service._logins)
+            return real(password, **parameters)
+
+        def waiter():
+            started = time.monotonic()
+            try:
+                service.login('nobody-waiting', 'a wrong password', source=self.ONE)
+                took.append((200, '', time.monotonic() - started))
+            except HttpError as error:
+                took.append((error.status, error.message, time.monotonic() - started))
+        with mock.patch.object(http_auth._PASSWORD_WORKER, 'scrypt', seen):
+            thread = threading.Thread(target=waiter)
+            thread.start()
+            self.parked(self.ONE, 1)
+            with service._logins_room:
+                # One of ONE's places is given up and taken by another address in the same instant: there is
+                # no moment with a free place, and everybody who waits is told to look again.
+                service._logins_by_address[self.ONE] = 3
+                service._logins_by_address[self.OTHER] = 1
+                service._logins_room.notify_all()
+            thread.join(20)
+        self.assertFalse(thread.is_alive(), 'the waiter did not wake')
+        self.assertEqual(took[0][:2], (503, service.LOGIN_BUSY))             # the general sentence: its address is under its share
+        self.assertLess(took[0][2], 15)                                      # it woke; its 30 seconds did not run out
+        self.assertEqual((checked, most), ([], []))                          # nothing was checked for it
+        self.assertEqual((service._logins, service._logins_by_address[self.ONE], service._logins_waiting), (16, 3, {}))
+        self.assertEqual((service.logins_turned_away, service.logins_turned_away_for_address), (1, 0))
+
     def test_only_so_many_of_one_address_wait_and_one_more_is_refused_at_once(self):
         self.service.LOGINS_PER_ADDRESS = 2
         self.service.LOGIN_WAITERS_PER_ADDRESS = 3
