@@ -6683,7 +6683,14 @@ def main(argv=None):
             print('Refusing to bootstrap %s: --root must name an existing runtime directory, and %s is not one.'
                   % (args.bootstrap_user, args.root), file=sys.stderr)
             return 1
-        lock_fd = runtime_service_lock(args.root)
+        try:
+            lock_fd = runtime_service_lock(args.root)
+        except ValueError as error:
+            # A host without fcntl (Windows): one sentence instead of a traceback, before the
+            # state store is opened (kittrial-5bb.176 item 2).
+            print('Refusing to bootstrap %s: %s. Run this command on the POSIX host that runs the service.'
+                  % (args.bootstrap_user, error), file=sys.stderr)
+            return 1
         if lock_fd is None:
             print('Refusing to bootstrap %s: a service is running for runtime %s (it holds '
                   'office-service.lock). Stop the service and bootstrap while it is stopped; a running '
@@ -6695,6 +6702,12 @@ def main(argv=None):
             store = Store(args.state)
             password = getpass.getpass('New superuser password: ')
             Service.bootstrap_superuser(store, args.bootstrap_user, password)
+        except HttpError as error:
+            # A second bootstrap, or a name the kit refuses: one sentence, not a traceback
+            # (kittrial-5bb.176 item 2).
+            print('Refusing to bootstrap %s: %s. Add this person as an account inside the service instead.'
+                  % (args.bootstrap_user, error.message), file=sys.stderr)
+            return 1
         finally:
             import fcntl
             fcntl.flock(lock_fd, fcntl.LOCK_UN)

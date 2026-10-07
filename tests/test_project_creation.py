@@ -559,19 +559,26 @@ class AddProjectStillTests(unittest.TestCase):
 
     def test_the_command_runs_initialize_then_prints(self):
         calls = []
-        saved = (admin.initialize_project, admin.scheduled_backup_coverage, admin.worker_client_setup)
+        saved = (admin.initialize_project, admin.scheduled_backup_coverage, admin.worker_client_setup,
+                 admin.require_bd_init_tools)
         admin.initialize_project = lambda root, name, stage=None: calls.append(('initialize', name, stage))
         admin.scheduled_backup_coverage = lambda root, name: (True, 'SCHEDULE TEXT')
         admin.worker_client_setup = lambda root, name: 'CLIENT TEXT'
+        admin.require_bd_init_tools = lambda root: None
         try:
             import contextlib
             import io
-            out = io.StringIO()
-            with contextlib.redirect_stdout(out):
-                admin.add_project(Path('/srv/rt'), 'alpha')
+            with tempfile.TemporaryDirectory() as tmp:
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    admin.add_project(Path(tmp), 'alpha')
+                written = pc.read_record(Path(tmp), 'alpha')
         finally:
-            admin.initialize_project, admin.scheduled_backup_coverage, admin.worker_client_setup = saved
-        self.assertEqual(calls, [('initialize', 'alpha', None)])
+            (admin.initialize_project, admin.scheduled_backup_coverage, admin.worker_client_setup,
+             admin.require_bd_init_tools) = saved
+        # The work runs once, with a stage callback so a stop is recorded (kittrial-5bb.176).
+        self.assertEqual([(name, stage is not None) for _, name, stage in calls], [('alpha', True)])
+        self.assertEqual((written['state'], written['by']), ('created', pc.HOST))
         self.assertEqual(out.getvalue(), 'Created project alpha\nSCHEDULE TEXT\nCLIENT TEXT\n')
 
     def test_initialize_runs_the_five_stages_in_order(self):

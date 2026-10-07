@@ -73,6 +73,9 @@ ERROR_LIMIT = 300
 #: One sentence for a name that cannot be used, whatever the reason (taken by a project,
 #: held by another creation, or retired), so the answer does not say which.
 NOT_AVAILABLE = 'Project name %s is not available: choose another name'
+#: The ``by`` of a creation an operator made with ``admin.py add-project``. No web account
+#: made it, so it is never counted toward an account's limit (kittrial-5bb.176).
+HOST = 'host'
 
 
 class NothingMade(ValueError):
@@ -455,6 +458,71 @@ def incomplete_message(name):
     return ('Project %s was started on the server and did not finish. Nothing is registered in the web '
             'interface, and the name is held. An operator must finish it (admin.py finish-project %s) or '
             'remove it (admin.py remove-creation %s --actor OPERATOR --reason REASON).' % (name, name, name))
+
+
+def host_create(root, name, initialize, guards):
+    """``admin.py add-project``'s path: the operator's route keeps the web route's record.
+
+    ``guards`` refuses a name that cannot be used before anything is written, so a refusal
+    still leaves no directory, no database and no record. A record already there in state
+    ``started`` - an earlier ``add-project`` that stopped, or a web request that stalled -
+    is reused rather than overwritten, so the run that finishes is the record that was
+    begun, with the account that began it.
+
+    A failure that made nothing deletes the record this call wrote, so a refusal still
+    leaves nothing behind. A failure after something was made leaves the record
+    ``incomplete``, which ``finish-project`` and ``remove-creation`` act on
+    (kittrial-5bb.176). The directory is never removed here: ``admin.initialize_project``
+    explains why (without the creation lock this run's empty directory cannot be told from
+    a concurrent creation's).
+
+    Returns the finished record. Raises what ``guards`` or the work raised, with the record
+    left to match what is on the host.
+    """
+    guards(root, name)
+    record = read_record(root, name)
+    if record is None or record['state'] != 'started':
+        record = {'project': name, 'by': HOST, 'state': 'started', 'stage': None, 'started_at': _stamp()}
+
+    def stage(label):
+        record['stage'] = label
+        write_record(root, name, record)
+
+    record['stage'] = None
+    write_record(root, name, record)
+    try:
+        initialize(root, name, stage)
+    except BaseException as error:
+        if made(root, name) == 'nothing':
+            delete_record(root, name)
+        else:
+            record.update(state='incomplete', stopped_at=_stamp(), error=_bounded(error))
+            write_record(root, name, record)
+        raise
+    record.update(state='created', stage=None, completed_at=_stamp())
+    write_record(root, name, record)
+    return record
+
+
+def unfinished_sentence(root, name):
+    """What ``add-project`` adds when the name is held by a creation that did not finish.
+
+    ``''`` when there is no readable unfinished record, or when the creation finished or
+    was removed. ``add-project`` appends this to "Project already exists" so a re-run names
+    the commands that act on the leftover instead of being a dead end (kittrial-5bb.176).
+    Never raises: a record it cannot read is not its business.
+    """
+    try:
+        record = read_record(root, name)
+        effective = None if record is None else effective_state(root, record, running_name(root))
+    except (ValueError, OSError):
+        return ''
+    if effective in (None, 'created', 'removed', 'damaged', NOT_A_RECORD):
+        return ''
+    if effective == RUNNING:
+        return ('A project creation for %s is running on this server right now; wait for it to finish and run '
+                'this command again.' % name)
+    return incomplete_message(name)
 
 
 def _coverage(root, name):
