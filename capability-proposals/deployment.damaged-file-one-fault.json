@@ -6,7 +6,7 @@
   "key": "deployment.damaged-file-one-fault",
   "name": "One configuration fault for a damaged deployment file",
   "aliases": [],
-  "summary": "The deployment configuration file is read ahead of whatever stands at its name, and a damaged file gives one configuration fault to every route, including a project creation, instead of a different error per caller.",
+  "summary": "The deployment configuration file is read only when a regular file stands at its name: a FIFO or directory in its place is refused at once. A damaged file gives one configuration fault to every route, including a project creation, instead of a different error per caller.",
   "requirements": [],
   "anchors": [],
   "code": [

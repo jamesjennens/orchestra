@@ -6,7 +6,7 @@
   "key": "office.release-bd-glibc-target",
   "name": "Static bd and the glibc target for office releases",
   "aliases": [],
-  "summary": "The office release bundles a statically linked bd - the archive versions.json pins as bd_static - not a bd built for the target's glibc. It reads each bundled binary's required glibc from the file, checks it against the target named with --target-glibc, and refuses a release whose bd cannot start there, so a bundle that would not run on the target fails the build instead of shipping.",
+  "summary": "For a target with an older glibc the office release bundles a statically linked bd - the archive versions.json pins as bd_static - not a bd built for the target's glibc. It reads each bundled binary's required glibc from the file, checks it against the target named with --target-glibc, and refuses a release whose bd cannot start there, so a bundle that would not run on the target fails the build instead of shipping.",
   "requirements": [],
   "anchors": [],
   "code": [

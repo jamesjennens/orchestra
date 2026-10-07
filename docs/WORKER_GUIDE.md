@@ -108,10 +108,12 @@ checkout:
 b capability check --repo .
 ```
 
-It lists every recorded pointer that no longer resolves, and writes nothing. If a pointer
-moved and the entry is still a draft you may revise that draft; if the entry is accepted,
-state the change in your delivery with the revised payload file (below) and the coordinator
-revises it at release. `capability check --repo . --record` files your result as a report
+It lists every recorded pointer that no longer resolves, and writes nothing. A pointer that
+moved is a change to the index's promise: state it in your delivery with the revised payload
+file (below), whether the entry is a draft or accepted. The endpoint accepts `capability
+revise` from a contributor, but the process does not use a live write from a lane: the reviewer
+judges the payload with the change, and the coordinator revises the entry at release.
+`capability check --repo . --record` files your result as a report
 (from a clean, committed checkout). A report is never `verified`: only an operator or listed
 verifier confirms a check, and a failing report makes the capability read `drifted` until
 they do.
@@ -139,7 +141,8 @@ reads `drifted` at every release cut before its work lands.
 - **The check proves location, not meaning.** `code`, `tests` and `anchors` are the pointers
   `capability check` resolves, so cite pointers that exist at your delivered commit — never a
   file that only exists in a branch still under review — and make `tests` include a test that
-  fails when the capability breaks, so a regression moves a pointer.
+  fails when the capability breaks. A regression then fails that test; the check still passes,
+  because the check proves only that the pointers resolve.
 - **The reviewer judges the claim with the change.** The reviewer decides whether the
   sentence says what the change does and whether the pointers and their test are the right
   ones. The coordinator writes the payload into the index after integration and accepts the

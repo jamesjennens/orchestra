@@ -145,7 +145,8 @@ evidence. The reviewer's part is:
    says what the change actually does, and whether the capability is worth claiming at all.
 3. **Check the pointers are the right ones.** They must exist at the delivered commit, never
    on a branch still under review, and `tests` must include a test that fails when the
-   capability breaks, so a regression moves a pointer. Approval rests on the change plus
+   capability breaks. A regression fails that test; the check still passes, because the check
+   proves location only. Approval rests on the change plus
    that test, not on a green check.
 4. **Check the payload's field set.** It is exactly `key`, `name`, `aliases`, `summary`,
    `requirements`, `anchors`, `code`, `tests`, `owner`, `tags`, plus `schema_version`,
@@ -153,8 +154,11 @@ evidence. The reviewer's part is:
    refused, so a payload carrying a "check" or a commit is malformed: the check records the
    commit it was run at, and the coordinator writes the record only after integration.
 5. **A removal or weakening is not a contributor's write.** Retiring is
-   `admin.py capability-retire`, operator-only, and it needs a successor key; a contributor
-   may only propose or revise a draft, and this kit has no demotion. The delivery must
+   `admin.py capability-retire`, operator-only, and it needs a successor key. The endpoint
+   accepts a contributor's `capability propose` or `capability revise` payload, but the process
+   does not use a live write from a lane: the worker carries the payload as a file in the
+   delivery, the reviewer judges it, and the coordinator writes it at release. This kit has no
+   demotion. The delivery must
    therefore *state* that the entry is to be revised or retired and carry the revised
    payload file or the successor key, for the coordinator to carry out. A delivery that
    silently drops a capability is a change to the index's promise and belongs in the review.

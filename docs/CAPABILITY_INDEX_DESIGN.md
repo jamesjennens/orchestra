@@ -211,7 +211,7 @@ the payload.
 
 | Action | Who | Route |
 | --- | --- | --- |
-| propose or revise a draft | any contributor, including agents | `capability propose` / `capability revise --file` (endpoint, under the project lock) |
+| propose or revise a draft | any contributor, including agents | `capability propose` / `capability revise --file` (endpoint, under the project lock). The endpoint accepts a live propose or revise, but the process does not use one from a lane: the worker carries the payload as a file in the delivery, the reviewer judges it, and the coordinator writes it after integration (§13.1) |
 | accept | allowlisted operator only, with F3 `decision_id` and `evidence` | `admin.py capability-apply`, as .41's `reference-apply` (.41 §4) |
 | report a verification | any contributor, attributed (§3.3) | `capability check --record` → endpoint `capability verify` |
 | make a verification count as `verified` | allowlisted operator, or an actor on the deployment's `verifiers` list | the host command `admin.py capability-verify`, fed by `capability check --payloads FILE` (revision 2.2). The endpoint route never writes `verified`, because its actor is self-declared; trust never comes from the payload |
@@ -441,8 +441,11 @@ b capability propose-alias KEY "reserved label guard" [--evidence POINTER]
      delivery (§13.1); the worker does not run `capability propose`, because a record written
      from a lane is in the release check set while its work is still in review. With no
      delivery in flight, hand the payload to the coordinator.
-4. **Check.** `capability check --record` reports on the new pointers. CI or an
-   operator turns that into `verified`.
+4. **Check, once the record is written.** Nothing step 3 produces is in the index yet, so
+   there is nothing to check there while the payload is a file. After integration the
+   coordinator writes the payload into the index (§13.1); only then does
+   `capability check --record` report on the new pointers, at the integrated commit. CI or an
+   operator turns that report into `verified`.
 5. **Accept.** The coordinator accepts the meaning and folds aliases, in batches.
 
 The worker guide and prompt text that .61 adds ("note misses in your checkpoint")
@@ -682,13 +685,8 @@ the commit it is run at, and it records that commit itself.
 - A failing **draft** does not fail the release. It cannot: no reviewer has accepted its
   meaning and the coordinator has not written it into the index. It is listed in the release
   record with its key, the pointers that did not resolve and an owner — the durable owner the
-  payload names — and left to that owner.
-
-Two live examples of the difference: `agents.current-attention` is a draft whose one missing
-pointer is `tests/test_agent_attention_followups.py`, a file that is not on main (it exists
-only on an un-integrated branch); `records.native-membership` is a draft whose six missing
-pointers come from kittrial-5bb.141, which is not integrated. Both are drafts, both are
-listed with their owner, and neither holds up a release. The accepted entries all pass.
+  payload names — and left to that owner. List it rather than carrying it release after
+  release: a check that always fails teaches everyone to ignore the result.
 
 ### 13.2 What an entry must NOT claim
 
@@ -715,7 +713,7 @@ Unchanged from §4, repeated here as the boundary:
 
 | Action | Who |
 | --- | --- |
-| propose a draft, or revise an existing draft | any contributor, including agents |
+| propose a draft, or revise an existing draft | any contributor, including agents. The endpoint accepts a live propose or revise, but the process does not use one from a lane: the worker carries the payload as a file in the delivery, the reviewer judges it, and the coordinator writes it after integration (§13.1) |
 | carry a delivery's payload file (state it in the delivery; do not write the index) | any contributor, including agents |
 | report a check | any contributor (always `unverified` over the endpoint) |
 | write a delivery's payload into the index (`capability propose` / `capability revise`) | the coordinator, after integration |
@@ -726,8 +724,11 @@ Unchanged from §4, repeated here as the boundary:
 An agent never accepts and never verifies, and a passing check never accepts a draft.
 **Retiring is `admin.py capability-retire`**, and it is operator-only: it supersedes the
 newest revision of a key by a `successor` key the operator names, and a key without a
-successor cannot be retired. **This kit has no demotion.** A contributor may propose a draft
-or revise an existing draft; nothing else in the index is a contributor's to write.
+successor cannot be retired. **This kit has no demotion.** The endpoint accepts a
+contributor's propose or revise payload, but the process does not use a live write from a
+lane: the worker carries the payload as a file in the delivery, the reviewer judges it, and
+the coordinator writes it after integration (§13.1). Nothing else in the index is a
+contributor's to write.
 
 ### 13.4 After a rollback
 

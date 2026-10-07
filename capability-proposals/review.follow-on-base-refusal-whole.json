@@ -6,7 +6,7 @@
   "key": "review.follow-on-base-refusal-whole",
   "name": "The follow-on base rule and its whole refusal over HTTP",
   "aliases": [],
-  "summary": "A follow-on contribution may be based on the prior integration commit or any integration the project recorded later. A base that does not meet the rule is refused, and the whole refusal sentence reaches an HTTP caller instead of a generic error.",
+  "summary": "A follow-on contribution may be based on the prior integration commit, or on any integration the project recorded later that was recorded by a listed operator and not reverted (kittrial-5bb.155). A base that does not meet the rule is refused, and the whole refusal sentence reaches an HTTP caller instead of a generic error.",
   "requirements": [],
   "anchors": [],
   "code": [

@@ -6,7 +6,7 @@
   "key": "office.install-guards",
   "name": "Office install guards",
   "aliases": [],
-  "summary": "The office install refuses a prepare whose bundled bd cannot start, refuses add-project when git is not on the runtime's bin and the caller's PATH, and refuses bootstrap while a service holds the runtime lock. The git and bootstrap checks refuse before anything is created; the bd check runs at the end of prepare, after the pinned binaries are installed, so the loader's own reason is reported.",
+  "summary": "The office install refuses a prepare whose bundled bd cannot start, refuses add-project when git is not on the runtime's bin and the caller's PATH, and refuses bootstrap while a service holds the runtime lock. The git and bootstrap checks refuse before anything is created; the bd check runs after the pinned binaries are installed, so the loader's own reason is reported.",
   "requirements": [],
   "anchors": [],
   "code": [

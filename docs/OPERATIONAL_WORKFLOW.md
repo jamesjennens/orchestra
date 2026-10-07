@@ -276,11 +276,7 @@ The capability index is kept true at delivery and release, not left to a separat
 **A release is not finished until `capability-verify` passes for every accepted entry.** A
 failing **draft** does not fail the release — nobody has accepted its meaning and it is not
 in the index the release speaks for — but it is listed in the release record with its key,
-the pointers that did not resolve and an owner, and left to that owner. Two live examples of
-the difference: `agents.current-attention` is a draft whose one missing pointer,
-`tests/test_agent_attention_followups.py`, is not on main, and `records.native-membership` is
-a draft whose six missing pointers come from kittrial-5bb.141, which is not integrated;
-neither holds up a release, and each is listed with its owner. A check that always fails
+the pointers that did not resolve and an owner, and left to that owner. A check that always fails
 teaches everyone to ignore the result, so list the entry and its owner in the release record
 rather than carrying it release after release. What an entry may claim, who may propose and
 accept, and what a rollback does to entries are in the
