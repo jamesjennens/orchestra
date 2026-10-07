@@ -511,6 +511,15 @@ class ClosureAttackTests(unittest.TestCase):
                                         state='resolved', resolved_by=rcid, submitted_by=fx.block(OPERATOR)))
         self.assert_open('not the unchanged revision after the one answered')
 
+    def test_a_later_reopen_withdraws_an_otherwise_sound_closure(self):
+        # The writer posts the reopen resolution before the reopened revision; a stop
+        # between the two leaves the closing revision newest, and the reopen still wins.
+        self.ledger.close(self.rid, self.question, self.cid)
+        self.ledger.post(self.rid, oi.ITEM_RESOLUTION_PREFIX,
+                         fx.resolution_record(self.rid, 2, disposition='reopened', evidence='answer:%s' % self.cid,
+                                              by=fx.block(OPERATOR), serial=8))
+        self.assert_open('a later reopen withdrew this closure')
+
     def test_a_planted_closing_revision_with_other_text(self):
         resolution = fx.resolution_record(self.rid, 1, answer=self.cid, by=fx.block(OPERATOR), serial=9)
         rcid = self.ledger.post(self.rid, oi.ITEM_RESOLUTION_PREFIX, resolution)
@@ -681,6 +690,15 @@ class BriefTests(unittest.TestCase):
         self.assertTrue(all(i['id'].startswith('oth-') for i in other_result['attention']))
         self.assertNotIn('open_items_cut', result)
 
+    def test_an_item_moved_to_another_task_leaves_the_brief(self):
+        ledger = Ledger()
+        rid = ledger.anchor()
+        ledger.post(rid, oi.OPEN_ITEM_PREFIX, fx.item_record(rid, task='trial-task', submitted_by=fx.block(OPERATOR)))
+        ledger.post(rid, oi.OPEN_ITEM_PREFIX, fx.item_record(rid, revision=2, task='other-task',
+                                                             submitted_by=fx.block(OPERATOR)))
+        result = oi.brief_attention(ledger.sink.all_rows(), {'id': 'trial-task'}, (OPERATOR,), None, TODAY)
+        self.assertEqual((result['attention'], result['attention_total']), ([], 0))
+
     def test_a_cut_read_is_said_in_the_brief(self):
         import briefing
         import test_briefing as tb
@@ -815,12 +833,15 @@ class FixtureGeneratorTests(unittest.TestCase):
                 self.assertEqual(fx.main(argv), 0)            # one failure, retried
                 self.assertIn('database is locked', err.getvalue())
                 first_rows = counter['rows']
-                fail_at.update(range(counter['calls'] + 1, counter['calls'] + 10))
+                # The second run gets four calls through, then three failures in a row.
+                fail_at.update(range(counter['calls'] + 5, counter['calls'] + 14))
                 state = root / 'open_items_fixture.trial.state.json'
                 state.unlink()
                 with self.assertRaises(SystemExit) as stop:   # three failures in a row stop it
                     fx.main(argv)
                 self.assertIn('resume', str(stop.exception.code))
+                created_before_the_stop = counter['rows'] - first_rows
+                self.assertGreater(created_before_the_stop, 0)
                 fail_at.clear()
                 self.assertEqual(fx.main(argv), 0)            # the same command resumes
             recorded = json.loads(state.read_text(encoding='utf-8'))
