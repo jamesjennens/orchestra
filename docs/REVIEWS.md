@@ -126,6 +126,44 @@ Integration is decided per scope (ANY-scope, any-pass-wins), so recording a newe
 
 `follows` asserts that the new change builds on the prior revision rather than retracting it: what stays visible for the prior contribution is its **record, commit and relation** in `review TASK`/`brief` under `prior_contributions`, where each replaced revision carries the `relation` (`follows` or `supersedes`) that replaced it as current. Every prior entry also carries the same additive `integration` block as the current contribution, computed from that entry's own FULL commit over the same scopes, so the read says whether the replaced revision is integrated. Its scoped lifecycle facts are not re-scoped: they are valid only under their own lifecycle scope, stay recorded in lifecycle history and `show`/`history`, and disappear from the top-level `lifecycle`/`lifecycle_scope` of `brief`/`work` once the follow-on records its own scope (the per-scope `review.integration` view still sees them). `brief` embeds only a bounded recent slice of `prior_contributions` (a total count plus the last few entries carrying comment_id, commit, relation, timestamp and that `integration` block); read `review TASK` for the complete list. `follows` and `supersedes` are mutually exclusive, and the field is optional so payloads and chains written before it existed keep validating; a first contribution sets both to null. Record the exact new branch/bundle path, commit, base and checksum in every case, even when only the bundle filename changed. Old delivery records remain in history. A new contribution does not resolve feedback automatically.
 
+## The reviewer's part in a capability proposal (kittrial-5bb.179)
+
+A contribution that adds or changes something a user or an agent can rely on carries a
+capability **proposal payload file** in its delivery, named in the contribution summary
+(conventionally `capability-proposals/<key>.json`, one file per record). The worker does
+**not** run `capability propose`: a record written from a lane is in every release's check
+set while its work is still in review, so it is checked against main, its pointers are
+missing, and it reads `drifted`. The reviewer reads the payload with the change, and the
+coordinator writes and accepts it at release, after integration, with the release as
+evidence. The reviewer's part is:
+
+1. **Read the named payload files with the diff.** A delivery that claims a new or changed
+   capability and names no payload file is incomplete; ask for it rather than approving.
+2. **Judge the claim, not the pointers.** The check proves **location only**: that the
+   `code`, `tests` and `anchors` pointers resolve at the commit the check runs at. It never
+   proves that the sentence is true. The reviewer judges the meaning — whether the summary
+   says what the change actually does, and whether the capability is worth claiming at all.
+3. **Check the pointers are the right ones.** They must exist at the delivered commit, never
+   on a branch still under review, and `tests` must include a test that fails when the
+   capability breaks, so a regression moves a pointer. Approval rests on the change plus
+   that test, not on a green check.
+4. **Check the payload's field set.** It is exactly `key`, `name`, `aliases`, `summary`,
+   `requirements`, `anchors`, `code`, `tests`, `owner`, `tags`, plus `schema_version`,
+   `operation_id` and (for a revision) `revision` and `expected_sha256`. Any other field is
+   refused, so a payload carrying a "check" or a commit is malformed: the check records the
+   commit it was run at, and the coordinator writes the record only after integration.
+5. **A removal or weakening is not a contributor's write.** Retiring is
+   `admin.py capability-retire`, operator-only, and it needs a successor key; a contributor
+   may only propose or revise a draft, and this kit has no demotion. The delivery must
+   therefore *state* that the entry is to be revised or retired and carry the revised
+   payload file or the successor key, for the coordinator to carry out. A delivery that
+   silently drops a capability is a change to the index's promise and belongs in the review.
+6. **A failing draft does not hold up a release; a failing accepted entry does.** When the
+   release is cut, the release is unfinished until `capability-verify` passes for every
+   accepted entry; a failing draft is listed in the release record with its key, the missing
+   pointers and an owner. Reviewers should not demand that a draft's pointers resolve before
+   its work is integrated, and should not accept a draft as if it settled the claim.
+
 ## Rollback compatibility of the approve snapshot
 
 An `approve` record may carry an additive `assignee_at_approval` field: the task assignee as it was when the approval was written, stamped server-side so a caller-supplied value is overwritten and the field cannot be forged to open the follow-on gate. It fixes two follow-on-gate defects: an approval that was an assignee self-approval stays refused after the task is handed off, and a reviewer who genuinely approved before later becoming the assignee can still follow on. A record with no usable snapshot — absent, because it was written before the field existed, or an explicit null written while the task was unassigned — falls back to the current assignee, which is the pre-snapshot, fail-closed reading.

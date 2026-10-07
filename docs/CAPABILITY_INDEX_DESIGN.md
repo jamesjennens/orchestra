@@ -33,10 +33,10 @@ and the boundaries a reader may rely on are written down.
 
 | Finding | Change | Where |
 | --- | --- | --- |
-| A feature was released with no entry | A delivery that adds or changes something a user or an agent can rely on carries a capability proposal draft in the same delivery; the reviewer judges the claim with the change; the coordinator accepts the meaning at release with the release as evidence; the release is unfinished until `capability-verify` passes for every accepted entry or the failing entry is named with a reason and an owner; a removal or weakening revises or retires the entry in the same delivery. | §13.1 |
+| A feature was released with no entry | A delivery that adds or changes something a user or an agent can rely on carries a capability proposal **payload file** in the same delivery, named in the contribution summary; the worker does not write the index. The reviewer judges the claim with the change; the coordinator writes and accepts the meaning at release, after integration, with the release as evidence; the release is unfinished until `capability-verify` passes for every accepted entry, while a failing draft is listed in the release record with its key, the missing pointers and an owner; a removal or weakening states the revised payload or the successor key in the same delivery, for the coordinator to carry out. | §13.1 |
 | Entries claimed too much | What an entry must NOT claim: nothing unverified on the installation, nothing about work in review, no authority it does not have, no private detail. | §13.2 |
 | Who may do what was spread out | One boundary table for propose/report/accept/retire/verify. | §13.3 |
-| Rollback effects were unstated | A rollback retires nothing; a verification at a reverted commit stops counting and the entry reads `drifted` again until a live trusted pass; a removed capability is revised or retired in the next delivery. | §13.4 |
+| Rollback effects were unstated | A rollback retires nothing; a verification at a reverted commit stops counting and the entry reads `drifted` again until a live trusted pass; a removed capability is stated for revision or retirement in the next delivery, for the coordinator to carry out. | §13.4 |
 | The release payload was assumed hand-kept | It is generated from the records: run `capability check --payloads` with no `--key`, and a newly recorded key enters the file with no edit. A test pins it. | §13.5 |
 | Per-installation questions were open | One index per project, not per installation; records are not release-scoped, so an installation one release behind answers from its own checkout's check, not from the entry text. | §13.6 |
 
@@ -145,7 +145,7 @@ These values follow the .41 §3.2–§3.7 pattern exactly:
 | alias prefix | `Kind: capability-alias-v1\n` (§6; new) |
 | journal | `.capability-requests/`, with the receipt schema of .41 §10.3 (§9) |
 | key | the .41 §3.3 regex, e.g. `review.structured-contribution`; immutable and unique; a slug collision is refused at propose time |
-| retire | `capability retire KEY --successor KEY2`, operator-only (.41 §3.5) |
+| retire | `admin.py capability-retire PROJECT --actor OPERATOR --file retire.json`, operator-only, needs a successor key (.41 §3.5; §4) |
 
 ### 3.2 Revision fields: a closed set, `-v1`
 
@@ -212,12 +212,12 @@ the payload.
 | Action | Who | Route |
 | --- | --- | --- |
 | propose or revise a draft | any contributor, including agents | `capability propose` / `capability revise --file` (endpoint, under the project lock) |
-| accept or demote | allowlisted operator only, with F3 `decision_id` and `evidence` | `admin.py capability-apply`, as .41's `reference-apply` (.41 §4) |
+| accept | allowlisted operator only, with F3 `decision_id` and `evidence` | `admin.py capability-apply`, as .41's `reference-apply` (.41 §4) |
 | report a verification | any contributor, attributed (§3.3) | `capability check --record` → endpoint `capability verify` |
 | make a verification count as `verified` | allowlisted operator, or an actor on the deployment's `verifiers` list | the host command `admin.py capability-verify`, fed by `capability check --payloads FILE` (revision 2.2). The endpoint route never writes `verified`, because its actor is self-declared; trust never comes from the payload |
 | propose an alias | any contributor, including agents, within the caps in §6 | `capability propose-alias` |
 | fold or reject an alias | allowlisted operator | the next accepted revision, or `capability alias-reject` |
-| retire | allowlisted operator | `capability retire` |
+| retire | allowlisted operator | `admin.py capability-retire PROJECT --actor OPERATOR --file retire.json` |
 
 - **Revisions:** a revision carries the exact next `revision` and `expected_sha256`
   (compare-and-swap, .41 §3.5). This is a new core option, and it must leave
@@ -237,6 +237,10 @@ the payload.
   - A passing check does not accept a draft.
   - A failing check does not demote an accepted revision. It makes that revision read
     `drifted` and raises attention for its owner and the operators (§8).
+- **There is no demotion.** An accepted revision is not weakened or withdrawn in place:
+  the operator supersedes the key with a successor (`admin.py capability-retire`, §13.3),
+  or accepts a later revision of it. A contributor cannot do either; a contributor's
+  route back is a draft (§13.1).
 - **Agents never accept or verify.** Session actors are never owners, approvers or
   trusted verifiers (.41 §4).
 
@@ -433,7 +437,10 @@ b capability propose-alias KEY "reserved label guard" [--evidence POINTER]
 2. **On a miss,** it follows the candidates or searches by hand.
 3. **Record what it found:**
    - **If a capability exists:** `propose-alias` with the phrase that missed.
-   - **If none exists:** `capability propose` a draft with the pointers it found.
+   - **If none exists:** write the entry as a proposal **payload file** and carry it in the
+     delivery (§13.1); the worker does not run `capability propose`, because a record written
+     from a lane is in the release check set while its work is still in review. With no
+     delivery in flight, hand the payload to the coordinator.
 4. **Check.** `capability check --record` reports on the new pointers. CI or an
    operator turns that into `verified`.
 5. **Accept.** The coordinator accepts the meaning and folds aliases, in batches.
@@ -634,29 +641,67 @@ others.
 Revision 3 adds no record shape and changes no code: it makes the existing slices part of
 delivery and release and fixes the boundaries a reader may rely on.
 
-### 13.1 A delivery carries the claim
+### 13.1 A delivery carries the claim; the coordinator writes it
 
 A contribution that adds or changes something a user or an agent can rely on carries a
-`capability propose` draft **in the same delivery**: the key, a one-sentence claim of
-what the installation can now do, the check that proves it there (§5.1), and the commit.
-The reviewer judges the claim with the change. The coordinator accepts the meaning at
-release, with the release as its evidence (§4, `admin.py capability-apply`), and the
-release is not finished until `capability-verify` passes for every accepted entry or the
-coordinator names the failing entry with a reason and an owner. A delivery that removes
-or weakens a capability revises or retires its entry in the same delivery, so the index
-never promises more than the installation does. The worker and coordinator texts are in
-`docs/WORKER_GUIDE.md`, `docs/OPERATIONAL_WORKFLOW.md`, `templates/WORKER_PROMPT.md` and
-`templates/COORDINATOR_PROMPT.md`.
+capability **proposal payload file in the same delivery** — conventionally
+`capability-proposals/<key>.json`, one file per record — and names those files in the
+contribution summary. **The worker does not run `capability propose` and does not write the
+index.** The reason is the fault this process exists to end: a record written from a lane is
+in the release set (with no `--key`, `capability check --payloads` covers every accepted and
+draft record) while its work is still in review, so every release cut before that work is
+integrated checks the draft against main, its pointers are missing, and it reads `drifted`.
+A delivery that carries the payload as a file has no such window.
+
+The payload file is the exact `propose` or `revise` payload. Its content is the closed
+record set of §3.2 — `key`, `name`, `aliases`, `summary`, `requirements`, `anchors`, `code`,
+`tests`, `owner`, `tags` — plus the writer's own fields (`schema_version`, `operation_id`,
+and for a revision `revision` and `expected_sha256`); the command supplies `operation`, so
+the file must not set it. Any other field is refused: in particular there is no field for
+"the check that proves it" and none for the commit. The check of §5.1 is run later, against
+the commit it is run at, and it records that commit itself.
+
+- **The reviewer judges the claim with the change.** The reviewer reads the payload file
+  with the diff, judges whether the claim says what the change does and whether the pointers
+  and their test are the right ones (`docs/REVIEWS.md`), and records that judgement on the
+  contribution.
+- **The coordinator writes it at release, after integration, with the release as evidence.**
+  Once the delivery is integrated the coordinator runs `capability propose` or
+  `capability revise` for the payload file — or writes nothing, if the reviewer rejected it —
+  and then accepts the meaning at release (`admin.py capability-apply`, §4). An agent never
+  accepts and never verifies, and a passing check never accepts a draft.
+- **A change that removes or weakens a capability** does not let a contributor retire
+  anything. The delivery **states** that the entry must be revised or retired and gives the
+  coordinator what is needed to carry it out: the revised payload file, or the successor key
+  for `admin.py capability-retire` (§4, §13.3).
+
+**A release, an accepted entry and a failing draft are three different things.**
+
+- The release is **not finished until `capability-verify` passes for every accepted entry**
+  (§5.2).
+- A failing **draft** does not fail the release. It cannot: no reviewer has accepted its
+  meaning and the coordinator has not written it into the index. It is listed in the release
+  record with its key, the pointers that did not resolve and an owner — the durable owner the
+  payload names — and left to that owner.
+
+Two live examples of the difference: `agents.current-attention` is a draft whose one missing
+pointer is `tests/test_agent_attention_followups.py`, a file that is not on main (it exists
+only on an un-integrated branch); `records.native-membership` is a draft whose six missing
+pointers come from kittrial-5bb.141, which is not integrated. Both are drafts, both are
+listed with their owner, and neither holds up a release. The accepted entries all pass.
 
 ### 13.2 What an entry must NOT claim
 
-- **Nothing unverified on the installation.** A claim is what the check in §5.1 proves
-  against a checkout at a named commit. A pointer that resolves nowhere, or a claim no
-  check can decide, is not an entry; revise the draft until the check is real.
-- **Nothing about work in review.** `code`, `tests` and `anchors` point at the delivered
-  commit only. A file that exists only on an un-integrated contribution branch is not a
-  pointer: the check runs against an installation and reads `drifted`. If the capability
-  needs that file, the entry waits for the commit that carries it.
+- **Nothing unverified on the installation.** A claim is what the check in §5.1 resolves
+  against a checkout at a named commit. A pointer that resolves nowhere, or a claim no check
+  can decide, is not an entry; revise the payload until the check is real.
+- **Nothing about work in review.** The `code`, `tests` and `anchors` pointers must exist at
+  the commit the check runs against — the integrated commit — so a file that exists only on
+  an un-integrated contribution branch is not a pointer: the check runs against an
+  installation and reads `drifted`. That is why the payload travels as a file and the
+  coordinator writes it only after integration (§13.1), and why a draft must not be written
+  from a lane: it would read `drifted` at every release cut before its work lands, and a
+  check that always fails is a check nobody reads.
 - **No authority it does not have.** A draft is not authoritative text (§5.3 shows drafts
   as counts and keys only), a `reported` pass is never `verified` (§5.2), and `verified`
   is not acceptance. An entry never claims that an installation runs a release it has not
@@ -670,12 +715,19 @@ Unchanged from §4, repeated here as the boundary:
 
 | Action | Who |
 | --- | --- |
-| propose or revise a draft (including a delivery's draft) | any contributor, including agents |
+| propose a draft, or revise an existing draft | any contributor, including agents |
+| carry a delivery's payload file (state it in the delivery; do not write the index) | any contributor, including agents |
 | report a check | any contributor (always `unverified` over the endpoint) |
-| accept, demote, retire, fold or reject an alias | allowlisted operator |
+| write a delivery's payload into the index (`capability propose` / `capability revise`) | the coordinator, after integration |
+| accept, retire, fold or reject an alias | allowlisted operator |
 | make a check count as `verified` | allowlisted operator or a listed verifier, through the host command |
+| state that an entry must be revised or retired, with the revised payload or the successor key | any contributor, in the delivery; only an allowlisted operator carries it out |
 
 An agent never accepts and never verifies, and a passing check never accepts a draft.
+**Retiring is `admin.py capability-retire`**, and it is operator-only: it supersedes the
+newest revision of a key by a `successor` key the operator names, and a key without a
+successor cannot be retired. **This kit has no demotion.** A contributor may propose a draft
+or revise an existing draft; nothing else in the index is a contributor's to write.
 
 ### 13.4 After a rollback
 
@@ -684,24 +736,29 @@ It does not retire, unaccept or delete an entry, and this design adds no rollbac
 its own:
 
 - **Acceptance stands.** The meaning was accepted; removing it is a deliberate
-  `capability retire` or a revised entry, never a side effect of a rollback.
+  `admin.py capability-retire` by an operator, with a successor key, or a later accepted
+  revision — never a side effect of a rollback.
 - **A verification at a reverted commit stops counting.** §5.2 already treats a commit
   named by an honoured integration revert as not integrated, so a pass that only cleared
   drift at that commit no longer clears it and the entry reads `drifted` again until a
   trusted pass at a live integrated commit. Nothing is deleted; re-integrating the commit
   makes the pass count again.
-- **A capability the rollback removes** is revised or retired in the next delivery
-  (§13.1), so the index converges on what the installation really does.
+- **A capability the rollback removes** is stated for revision or retirement in the next
+  delivery (§13.1): the delivery carries the revised payload file or the successor key, and
+  the coordinator carries it out, so the index converges on what the installation really
+  does.
 
 ### 13.5 The release check payload is generated
 
 The coordinator's release payload is **derived from the records**, never kept by hand.
 `client.py::_capability_check` pages `capability list --state all --pointers` and, with no
 `--key`, selects every record whose state is `accepted` or `draft-only`; `--payloads FILE`
-writes one payload per selected record. The release step therefore uses no `--key` and
-needs no edit when a capability is proposed or accepted. A test pins that a newly recorded
-key enters the file with no flag, file or code change, and that `--key` only narrows the
-generated set for one run.
+then writes one payload per selected record **whose check the checkout can decide**. A
+record whose pointers the local resolver cannot decide at all — every one of them `unknown`
+— gets none and reads `not-recordable`: there is nothing to verify there, and a payload of
+unknowns would only fail. The release step therefore uses no `--key` and needs no edit when
+a capability is proposed or accepted. A test pins the rule written here, including the
+unknown-check case, so this section and the client cannot drift apart.
 
 ### 13.6 One index per project; what each installation reads
 

@@ -237,16 +237,28 @@ When a selected target's `source_commit` is not the task's current contribution 
 ## Register capabilities with the release
 
 The capability index is kept true at delivery and release, not left to a separate sweep
-(kittrial-5bb.179). Two steps belong to the release:
+(kittrial-5bb.179). Three steps:
 
-1. **The delivery carried the claim.** A contribution that adds or changes something a
-   user or an agent can rely on carries a `capability propose` draft in the same
-   delivery: the key, a one-sentence claim, the check that proves it on an installation,
-   and the commit. The reviewer judges that claim with the change. The coordinator
-   accepts the meaning at release, with the release as its evidence
-   (`admin.py capability-apply`). A delivery that removes or weakens a capability
-   revises or retires its entry in the same delivery.
-2. **The release verifies the index.** In a clean checkout at the integrated commit:
+1. **The delivery carries the payload file, and the worker does not write the index.** A
+   contribution that adds or changes something a user or an agent can rely on carries its
+   capability proposal payload as a file in the delivery — conventionally
+   `capability-proposals/<key>.json`, one file per record — named in the contribution
+   summary. The payload is the closed record set of the design: a key, a name, aliases, a
+   one-sentence `summary`, requirements, anchors, `code`, `tests`, an owner and tags. There
+   is no "check" field and no commit field in it; the check records the commit it was run
+   at. The reviewer judges that claim with the change. A delivery that removes or weakens a
+   capability states in the same delivery that its entry must be revised or retired, and
+   carries either the revised payload file or the successor key: retiring is
+   `admin.py capability-retire`, operator-only, and it needs a successor key. This kit has
+   no demotion.
+2. **The coordinator writes the payload and accepts the meaning at release, after
+   integration.** Once the delivery is integrated the coordinator runs `capability propose`
+   or `capability revise` for the payload file, then accepts the meaning at release
+   (`admin.py capability-apply`), with the release as its evidence. Writing the record only
+   after integration is the point: a record written from a lane is in the release check set
+   while its work is still in review, so a release cut before that work lands checks the
+   draft against main, its pointers are missing, and it reads `drifted`.
+3. **The release verifies the index.** In a clean checkout at the integrated commit:
 
    ```sh
    python client.py --config client.local.json --project example --actor alex/session1 -- \
@@ -256,15 +268,22 @@ The capability index is kept true at delivery and release, not left to a separat
 
    The payload file is **generated from the records, never kept by hand**. With no
    `--key`, `capability check` pages every capability the endpoint holds and writes one
-   payload per accepted or draft record, so a record proposed or accepted after this
-   kit was built is covered with no new flag, file or edit. `--key` narrows the
-   generated set for one run only; the release step uses no `--key`.
+   payload per accepted or draft record **whose check the checkout can decide**: a record
+   whose pointers are all `unknown` gets none and reads `not-recordable`, so a record
+   proposed or accepted after this kit was built is covered with no new flag, file or edit.
+   `--key` narrows the generated set for one run only; the release step uses no `--key`.
 
-**A release is not finished until `capability-verify` passes for every accepted entry,
-or the coordinator names the failing entry with a reason and an owner.** A check that
-always fails teaches everyone to ignore the result, so name the entry and its owner in
-the release record rather than carrying it release after release. What an entry may
-claim, who may propose and accept, and what a rollback does to entries are in the
+**A release is not finished until `capability-verify` passes for every accepted entry.** A
+failing **draft** does not fail the release — nobody has accepted its meaning and it is not
+in the index the release speaks for — but it is listed in the release record with its key,
+the pointers that did not resolve and an owner, and left to that owner. Two live examples of
+the difference: `agents.current-attention` is a draft whose one missing pointer,
+`tests/test_agent_attention_followups.py`, is not on main, and `records.native-membership` is
+a draft whose six missing pointers come from kittrial-5bb.141, which is not integrated;
+neither holds up a release, and each is listed with its owner. A check that always fails
+teaches everyone to ignore the result, so list the entry and its owner in the release record
+rather than carrying it release after release. What an entry may claim, who may propose and
+accept, and what a rollback does to entries are in the
 [capability design](CAPABILITY_INDEX_DESIGN.md#13-registration-with-delivery-and-release-kittrial-5bb179).
 
 ## Read what a deployed release still owes

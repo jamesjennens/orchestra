@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "operation_id": "caprev-fc7b91dedc49c4b5f37c917515ac5285",
+  "revision": 2,
+  "expected_sha256": "7b6c9859c880f4a81d499748d704fd1ce91d0480a94f6c7ab253626e2fc3fa22",
+  "key": "office.release-bd-glibc-target",
+  "name": "Static bd and the glibc target for office releases",
+  "aliases": [],
+  "summary": "The office release bundles a statically linked bd - the archive versions.json pins as bd_static - not a bd built for the target's glibc. It reads each bundled binary's required glibc from the file, checks it against the target named with --target-glibc, and refuses a release whose bd cannot start there, so a bundle that would not run on the target fails the build instead of shipping.",
+  "requirements": [],
+  "anchors": [],
+  "code": [
+    "tools/office_release.py::elf_needs",
+    "tools/office_release.py::pin_of",
+    "tools/office_release.py::start_vendored",
+    "office_service.py::_verify_bd_starts"
+  ],
+  "tests": [
+    "tests/test_bundled_binaries.py",
+    "tests/test_office_release.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "office",
+    "release",
+    "glibc"
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "operation_id": "caprev-c4086064cfb5f451fb495aff4a34250e",
+  "revision": 2,
+  "expected_sha256": "c299f7bfaff5aa9d26197b725bcc19103f825d48ba2fcbd2567456501f4c06c7",
+  "key": "release.group-size-from-writes",
+  "name": "Release group sizes derived from write counts",
+  "aliases": [],
+  "summary": "A release request's target group is derived from the native writes each target needs: a first deployment keeps the larger group, a release of already-labelled targets uses a smaller one, and the time estimate counts those native writes.",
+  "requirements": [],
+  "anchors": [],
+  "code": [
+    "lifecycle.py::release_planned_native_writes",
+    "lifecycle.py::release_default_chunk",
+    "lifecycle.py::release_page_writes_per_target"
+  ],
+  "tests": [
+    "tests/test_lifecycle_release.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "release",
+    "lifecycle",
+    "groups"
+  ]
+}

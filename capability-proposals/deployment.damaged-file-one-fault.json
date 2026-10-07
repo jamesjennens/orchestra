@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "operation_id": "caprev-368ae8fc77f51005aedc270db3704977",
+  "revision": 2,
+  "expected_sha256": "c86f18d9b50331132afbeda0c8dea8c83eba1854c8722b5c049211a1d93a1afb",
+  "key": "deployment.damaged-file-one-fault",
+  "name": "One configuration fault for a damaged deployment file",
+  "aliases": [],
+  "summary": "The deployment configuration file is read ahead of whatever stands at its name, and a damaged file gives one configuration fault to every route, including a project creation, instead of a different error per caller.",
+  "requirements": [],
+  "anchors": [],
+  "code": [
+    "admin.py::deployment_document",
+    "admin.py::ConfigurationUnreadable",
+    "endpoint.py::configuration_fault"
+  ],
+  "tests": [
+    "tests/test_endpoint_busy.py",
+    "tests/test_http_project_create.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "deployment",
+    "configuration",
+    "http"
+  ]
+}

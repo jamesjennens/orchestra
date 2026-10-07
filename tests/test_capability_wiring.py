@@ -285,29 +285,42 @@ class ClientCheckTests(ClientCase):
         self.assertEqual(len(capability_verification.validate_batch(written)), 2)
         self.assertEqual(json.loads(out)['recording'], 'payloads')
 
-    def test_the_release_payload_set_is_generated_from_the_records_not_kept_by_hand(self):
-        """kittrial-5bb.179: the coordinator's release check set is derived, never hand-kept.
+    def test_the_release_payload_rule_is_the_documented_one(self):
+        """kittrial-5bb.179: the release check set is derived, and the rule is the written one.
 
-        With no `--key`, `check --payloads` writes one payload for every accepted or draft
-        record the endpoint holds. A capability recorded after this kit was built is
-        therefore checked with no new flag, file or code change; `--key` only narrows the
-        generated set for that one run.
+        `docs/CAPABILITY_INDEX_DESIGN.md` section 13.5 promises the coordinator's release
+        payload is generated from the records: with no `--key`, `check --payloads` writes one
+        payload for every accepted or draft record **whose check the checkout can decide**, and
+        a record whose pointers are all `unknown` gets none and reads `not-recordable`. This
+        test reads that document and then pins the same behaviour, so the section and the
+        client cannot drift apart.
         """
+        prose = ' '.join((KIT / 'docs' / 'CAPABILITY_INDEX_DESIGN.md').read_text(encoding='utf-8').split())
+        self.assertIn('writes one payload per selected record **whose check the checkout can decide**', prose)
+        self.assertIn('gets none and reads `not-recordable`', prose)
         self.commit()
         target = self.root / 'payloads.json'
         grown = self.ITEMS + [list_item('recorded.later', code=['review_workflow.py::execute'])]
-        code, _, _, _ = self.check('--payloads', str(target), items=grown)
+        code, out, _, _ = self.check('--payloads', str(target), items=grown)
         self.assertEqual(code, 0)
         written = json.loads(target.read_text(encoding='utf-8'))
+        # The documented set: accepted and draft-only, covered with no flag and no new file.
         self.assertEqual([item['key'] for item in written['items']],
                          ['review.flow', 'review.gone', 'recorded.later'])
-        self.assertEqual(json.loads(target.read_text(encoding='utf-8'))['items'][-1]['commit'],
-                         self.git('rev-parse', 'HEAD'))
-        # The same generated set, narrowed by a key that was never in this test's list.
+        # Every payload names the commit the check ran at; the document says the payload has
+        # no commit field of its own, so the check supplies it.
+        self.assertEqual({item['commit'] for item in written['items']}, {self.git('rev-parse', 'HEAD')})
+        # The documented exclusion: a record whose check the checkout cannot decide gets no
+        # payload, and the run says so instead of writing a payload full of unknowns.
+        rows = {row['key']: row for row in json.loads(out)['capabilities']}
+        self.assertIsNone(rows['other.lang']['passed'])
+        self.assertEqual(rows['other.lang']['recorded'], 'not-recordable')
+        self.assertNotIn('other.lang', [item['key'] for item in written['items']])
+        # `--key` only narrows the generated set for that one run.
         code, _, _, _ = self.check('--key', 'recorded.later', '--payloads', str(target), items=grown)
         self.assertEqual(code, 0)
-        written = json.loads(target.read_text(encoding='utf-8'))
-        self.assertEqual([item['key'] for item in written['items']], ['recorded.later'])
+        self.assertEqual([item['key'] for item in json.loads(target.read_text(encoding='utf-8'))['items']],
+                         ['recorded.later'])
 
     def test_the_payloads_file_is_private_and_replaced_whole(self):
         """Review 01a0fe9e `smaller` (a)."""
