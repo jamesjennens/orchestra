@@ -531,7 +531,12 @@ class InProcessBackend:
         description = payload.get('description') or ''
         if not isinstance(description, str) or len(description) > 20000:
             raise invalid('Task description is too long')
-        priority = payload.get('priority', 2)
+        # A null priority is absent, not a value (kittrial-5bb.183 review item 4): the route
+        # guard and the endpoint backend already read it that way, and every released client
+        # sends null where it has no value, so bd's default 2 applies on both backends.
+        priority = payload.get('priority')
+        if priority is None:
+            priority = 2
         if type(priority) is not int or not 0 <= priority <= 4:
             raise invalid('Task priority must be an integer 0-4')
         task_id = 'task_' + secrets.token_hex(6)
@@ -554,7 +559,7 @@ class InProcessBackend:
         if not isinstance(version, int) or version != task['version']:
             raise conflict('Task was modified; reread it before updating',
                            {'expected_version': task['version']})
-        for field in ('title', 'description', 'status'):
+        for field in ('title', 'description', 'status', 'priority'):
             if field in payload and payload[field] is not None:
                 value = payload[field]
                 if field == 'title' and (not isinstance(value, str) or not value.strip() or len(value) > 200):
@@ -563,6 +568,8 @@ class InProcessBackend:
                     raise invalid('Task description is too long')
                 if field == 'status' and value not in ('open', 'closed'):
                     raise invalid('Task status must be open or closed')
+                if field == 'priority' and (type(value) is not int or not 0 <= value <= 4):
+                    raise invalid('Task priority must be an integer 0-4')
                 task[field] = value.strip() if isinstance(value, str) else value
         task['version'] += 1
         self._event(project_id, task['id'], 'task-updated', principal)
@@ -1112,6 +1119,30 @@ def unsupported_fields_text(keys):
     return ', '.join(shown)
 
 
+def refuse_unknown_fields(payload, allowed, where, takes=None):
+    """Refuse a body field the route does not take, in the task-change shape (kittrial-5bb.183).
+
+    Several write routes accepted a request with a field they do not take and dropped the
+    field silently (task create, claim, checkpoint, member, worker credential, agent and
+    account). Every route that takes a caller body now refuses such a field with 422,
+    naming it and the fields the route does take, exactly as a task change has since
+    kittrial-5bb.181. ``where`` names the route in a sentence, ``allowed`` is the set it
+    accepts and ``takes`` the (usually equal) list the refusal names -- a task change takes
+    ``version`` and ``actor`` as transport fields but does not name them as its fields.
+    The caller runs this after authorization and before the effect, so nothing is reserved
+    and the answer is never 5xx or "may have committed".
+    """
+    if not isinstance(payload, dict):
+        raise invalid('%s must be a JSON object' % where)
+    named = tuple(allowed if takes is None else takes)
+    unknown = sorted(str(name) for name in set(payload) - set(allowed))
+    if not unknown:
+        return
+    raise invalid('%s does not take: %s. %s takes: %s'
+                  % (where, unsupported_fields_text(unknown), where, ', '.join(named)),
+                  {'unsupported': unknown[:UNSUPPORTED_FIELDS_SHOWN], 'takes': list(named)})
+
+
 def queue_order(item):
     # Among contributions that await review, one a reviewer recommends approving comes
     # first: it is the one an owner can act on at once (kittrial-5bb.115).
@@ -1598,13 +1629,20 @@ class EndpointBackend:
                 # The title is a positional argument of the native create: a leading dash
                 # would be read as a flag, a leading @ as the attachment transport.
                 raise invalid('A task title cannot start with "-" or "@"')
+            args = ['create', title, '--json']
+            if payload.get('priority') is not None:
+                # The priority the caller chose is taken for real (kittrial-5bb.183 item 1):
+                # it used to be dropped here and the task was made with bd's default. bd's
+                # own default still applies when the caller sends none.
+                args[-1:-1] = ['--priority', str(payload['priority'])]
             description = payload.get('description')
             if description and str(description).strip():
                 # A blank description is no description (as PATCH treats it as "clear"):
                 # the endpoint refuses an empty body file.
-                return ('bd', project_id, ['create', title, '@attachment:0', '--json'],
+                args[-1:-1] = ['@attachment:0']
+                return ('bd', project_id, args,
                         {'0': {'flag': '--body-file', 'text': description}})
-            return 'bd', project_id, ['create', title, '--json'], {}
+            return 'bd', project_id, args, {}
         if route == 'tasks.update':
             args = ['update', str(task_id), '--json']
             if str(payload.get('title') or '').startswith(('-', '@')):
@@ -1626,13 +1664,18 @@ class EndpointBackend:
                 # ("@attachment:0") is stored as written whatever the native parser does.
                 args[2:2] = ['@attachment:0']
                 attachments = {'0': {'flag': '--body-file', 'text': str(payload['description'])}}
+            if payload.get('priority') is not None:
+                # Priority is a change like any other (kittrial-5bb.183 item 1). Kept beside
+                # --json, as every other flag, so the native parser reads it as a flag.
+                args[-1:-1] = ['--priority', str(payload['priority'])]
             if len(args) == 3:
                 # Nothing to change: bd answers `update ID --json` with the words "No updates
                 # specified" and exit 0, which is not an answer this service can read, so it
                 # was taken for a write that may have been made (kittrial-5bb.181). The route
                 # refuses such a body with the fields it takes; this is the same refusal for
                 # any other caller of the backend. Nothing is sent.
-                raise invalid('Nothing to change. A task change takes: title, description, status')
+                raise invalid('Nothing to change. A task change takes: title, description, '
+                              'status, priority')
             return 'bd', project_id, args, attachments
         if route == 'tasks.claim':
             actor = payload.get('actor') or self._actor(principal)
@@ -3311,10 +3354,28 @@ class ApiHandler(BaseHTTPRequestHandler):
         payload['task_id'] = ctx.params['tid']
         return payload
 
+    #: ONE TABLE of what each write route takes from the caller's own body (kittrial-5bb.183
+    #: item 2). A field outside the route's set is refused with 422, naming it and the fields
+    #: the route takes, exactly as a task change has since kittrial-5bb.181 -- it is never
+    #: dropped silently and never answered 5xx or "may have committed". Each set is what the
+    #: named clients in this repository send today (web/js/api.js, http_client.py), so no
+    #: client that exists here is broken by the refusal. These sets are the whole table; the
+    #: review, project PATCH, onboarding and proposals routes already refuse the same way.
+    TASK_CREATE_FIELDS = ('title', 'description', 'priority', 'attachments', 'actor')
+    TASK_CLAIM_FIELDS = ('actor',)
+    CHECKPOINT_BODY_FIELDS = EndpointBackend.CHECKPOINT_FIELDS + ('actor',)
+    MEMBER_FIELDS = ('role',)
+    CREDENTIAL_ISSUE_FIELDS = ('label', 'scopes', 'actor')
+    AGENT_CREATE_FIELDS = ('name', 'tool', 'working_directory', 'machine', 'notes',
+                           'projects', 'scopes')
+    AGENT_UPDATE_FIELDS = ('name', 'tool', 'working_directory', 'machine', 'notes',
+                           'projects', 'enabled')
+    ACCOUNT_CREATE_FIELDS = ('username', 'display_name')
+
     #: What a task change may change, and what else its body may carry: ``version`` is the
     #: in-process backend's check that the task was not changed meanwhile (the endpoint backend
     #: has none and does not read it), ``actor`` the attribution label, bound as on a claim.
-    TASK_CHANGES = ('title', 'description', 'status')
+    TASK_CHANGES = ('title', 'description', 'status', 'priority')
     TASK_CHANGE_FIELDS = TASK_CHANGES + ('version', 'actor')
 
     def _task_change(self, ctx):
@@ -3329,21 +3390,20 @@ class ApiHandler(BaseHTTPRequestHandler):
         key, for ever.
         """
         payload = self._task_payload(ctx)
-        unknown = set(payload) - set(self.TASK_CHANGE_FIELDS) - {'task_id'}
+        refuse_unknown_fields({name: value for name, value in payload.items() if name != 'task_id'},
+                              self.TASK_CHANGE_FIELDS, 'A task change', self.TASK_CHANGES)
         takes = 'A task change takes: %s' % ', '.join(self.TASK_CHANGES)
-        if unknown:
-            raise invalid('A task change does not take: %s. %s' % (unsupported_fields_text(unknown), takes),
-                          {'unsupported': sorted(str(name) for name in unknown)[:UNSUPPORTED_FIELDS_SHOWN],
-                           'takes': list(self.TASK_CHANGES)})
         if all(payload.get(name) is None for name in self.TASK_CHANGES):
             raise invalid('Nothing to change. %s' % takes, {'takes': list(self.TASK_CHANGES)})
-        title, description, status = (payload.get(name) for name in self.TASK_CHANGES)
+        title, description, status, priority = (payload.get(name) for name in self.TASK_CHANGES)
         if title is not None and (not isinstance(title, str) or not title.strip()):
             raise invalid('Task title must be text and not empty')
         if description is not None and not isinstance(description, str):
             raise invalid('Task description must be text')
         if status is not None and status not in ('open', 'closed'):
             raise invalid('Task status must be open or closed')
+        if priority is not None and (type(priority) is not int or not 0 <= priority <= 4):
+            raise invalid('Task priority must be an integer 0-4')
         self._bind_task_actor(ctx, payload)
         return payload
 
@@ -3616,6 +3676,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                             idempotent=bool(ctx.idempotency_key))
 
     def _account_created(self, ctx, payload):
+        # A field the route does not take is refused, not dropped (kittrial-5bb.183 item 2).
+        refuse_unknown_fields(payload, self.ACCOUNT_CREATE_FIELDS, 'An account creation')
         user = self.service.create_user(ctx.principal, payload.get('username'),
                                         payload.get('display_name'))
         return user, user
@@ -4229,6 +4291,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         payload = ctx.payload or {}
 
         def set_member():
+            # A field the route does not take is refused, not dropped (kittrial-5bb.183 item 2).
+            refuse_unknown_fields(payload, self.MEMBER_FIELDS, 'A member change')
             self._require_usable(ctx.params['pid'])
             result = self.service.set_member(ctx.principal, ctx.params['pid'],
                                              ctx.params['uid'], payload.get('role'),
@@ -4285,6 +4349,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 raise invalid(actor_names.refusal(named, reason, actor_names.CHOOSE), {'actor': named, 'rule': reason})
 
         def issue():
+            # A field the route does not take is refused, not dropped (kittrial-5bb.183 item 2).
+            refuse_unknown_fields(payload, self.CREDENTIAL_ISSUE_FIELDS, 'A worker credential issue')
             self._require_usable(ctx.params['pid'])
             result = self.service.issue_credential(ctx.principal, ctx.params['pid'],
                                                    label=payload.get('label'),
@@ -4348,7 +4414,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         payload = dict(ctx.payload or {})
 
         def create():
+            # The caller's right over every named project is judged before the route's
+            # field list is answered (kittrial-5bb.183 review item 1): a project the
+            # caller cannot see keeps the service's own 404, exactly as the same body
+            # without the unknown field does. Only then is a field the route does not
+            # take refused, not dropped (kittrial-5bb.183 item 2).
             self._require_grantable(ctx.principal, payload.get('projects'), ())
+            self.service.check_agent_grant(ctx.principal, payload.get('projects'))
+            refuse_unknown_fields(payload, self.AGENT_CREATE_FIELDS, 'An agent creation')
             result = self.service.create_agent(
                 ctx.principal, name=payload.get('name'), tool=payload.get('tool'),
                 working_directory=payload.get('working_directory'),
@@ -4397,6 +4470,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._require_grantable(ctx.principal, payload.get('projects'),
                                         record.get('projects') or (),
                                         owner_id=record.get('owner'))
+            # The record's ownership is judged before the route's field list is answered
+            # (kittrial-5bb.183 review item 1): a caller who may not change the agent gets
+            # the service's own 404, exactly as the same body without the unknown field
+            # does. Only then is a field the route does not take refused, not dropped
+            # (kittrial-5bb.183 item 2). This is the same lookup update_agent() makes.
+            self.service.get_agent(ctx.principal, ctx.params['aid'])
+            refuse_unknown_fields(payload, self.AGENT_UPDATE_FIELDS, 'An agent change')
             result = self.service.update_agent(ctx.principal, ctx.params['aid'], payload)
             return result, result
         return self._mutate(ctx, 'agents.update', None, update, capability=CAP_AGENTS)
@@ -4890,6 +4970,11 @@ class ApiHandler(BaseHTTPRequestHandler):
     def tasks_create(self, ctx):
         self._project(ctx, CAP_TASKS)
         payload = dict(ctx.payload or {})
+        # A field this route does not take is refused, not dropped (kittrial-5bb.183 item 2).
+        refuse_unknown_fields(payload, self.TASK_CREATE_FIELDS, 'A task creation')
+        priority = payload.get('priority')
+        if priority is not None and (type(priority) is not int or not 0 <= priority <= 4):
+            raise invalid('Task priority must be an integer 0-4')
         payload['attachments'] = validate_attachments(payload.get('attachments'))
         self._bind_task_actor(ctx, payload)
 
@@ -5442,8 +5527,11 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/claim')
     def tasks_claim(self, ctx):
         self._project(ctx, CAP_TASKS)
+        payload = dict(ctx.payload or {})
+        # A field the route does not take is refused, not dropped (kittrial-5bb.183 item 2).
+        refuse_unknown_fields(payload, self.TASK_CLAIM_FIELDS, 'A task claim')
         self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']), write=True)
-        payload = self._task_payload(ctx)
+        payload['task_id'] = ctx.params['tid']
         actor = self.service.bind_actor(ctx.principal, payload.pop('actor', None))
         payload['actor'] = actor
 
@@ -5459,8 +5547,11 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/checkpoints')
     def checkpoints_add(self, ctx):
         self._project(ctx, CAP_CHECKPOINTS)
+        payload = dict(ctx.payload or {})
+        # A field the record does not carry is refused, not dropped (kittrial-5bb.183 item 2).
+        refuse_unknown_fields(payload, self.CHECKPOINT_BODY_FIELDS, 'A checkpoint')
         self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']), write=True)
-        payload = self._task_payload(ctx)
+        payload['task_id'] = ctx.params['tid']
         payload.setdefault('schema_version', 1)
         # Over HTTP these four may be left out (kittrial-5bb.113): an agent with no commit
         # yet, or nothing unresolved, need not send empty values. The canonical record is
