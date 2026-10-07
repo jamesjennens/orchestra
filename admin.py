@@ -1693,6 +1693,26 @@ WantedBy=default.target
         raise RuntimeError('Initialization failed; service stopped. Preserve runtime and inspect journal; do not overwrite the deployment.') from None
     print(f'Installed {unit}, authenticated loopback port {port}')
 
+def install_current_link(path):
+    """The ``current`` link that exposes ``path``, or None when this install has none.
+
+    A release is a folder under a folder literally named ``releases`` whose sibling
+    ``current`` link resolves to it. Both the path itself and every parent are tested:
+    with the kit at a release root (``X/releases/R1`` plus ``X/current -> releases/R1``)
+    the path IS the release directory, and a scan of ``Path.parents`` alone never tests
+    it, so add-project and authorized-keys would disagree on that layout
+    (kittrial-5bb.182 items 1 and 3). Only a folder named ``releases`` counts, so a
+    folder that merely has a sibling ``current`` link is never rewritten.
+    """
+    resolved=Path(os.path.realpath(str(path)))
+    for release in (resolved,*resolved.parents):
+        install=release.parent
+        if install.name!='releases':continue
+        link=install.parent/'current'
+        if link.is_symlink() and Path(os.path.realpath(str(link)))==release:
+            return link
+    return None
+
 def install_current_path(path):
     """``path`` as this installation's ``current`` link exposes it, or unchanged.
 
@@ -1706,14 +1726,10 @@ def install_current_path(path):
     printed line with the service. A path that is not such a release (a plain
     checkout, ``/usr/bin/python3``) comes back exactly as it was given.
     """
+    link=install_current_link(path)
+    if link is None:return Path(str(path))
     resolved=Path(os.path.realpath(str(path)))
-    for release in resolved.parents:
-        install=release.parent
-        if install.name!='releases':continue
-        link=install.parent/'current'
-        if link.is_symlink() and Path(os.path.realpath(str(link)))==release:
-            return link/resolved.relative_to(release)
-    return Path(str(path))
+    return link/resolved.relative_to(Path(os.path.realpath(str(link))))
 
 def office_bundled_python():
     """The bundled interpreter of the office installation this kit belongs to, or None.
@@ -1755,21 +1771,36 @@ def worker_client_setup(root,name):
     RHEL 8, which cannot run the endpoint, and a host with no python3 on PATH fails
     outright (kittrial-5bb.182). A second example uses the local transport, for an
     agent that runs on the server itself.
+
+    The sentence that introduces each example says what was ACTUALLY printed: on an
+    installation with no ``current`` link (the live kits keep
+    ``<base>/kit -> <base>/releases/<ID>``) the printed paths name the release, so the
+    text says they must be printed again after an upgrade instead of claiming an
+    upgrade moves them (kittrial-5bb.182 item 1).
     """
-    endpoint=install_current_path(Path(__file__).resolve().with_name('endpoint.py'))
+    source=Path(__file__).resolve().with_name('endpoint.py')
+    endpoint=install_current_path(source)
     python=str(office_bundled_python() or default_authorized_key_python())
     config=json.dumps({'host':'WORKER_SSH_HOST','endpoint':str(endpoint),'root':str(root),
                        'python':python},indent=2)
     local=json.dumps({'transport':'local','python':python,'endpoint':str(endpoint),
                       'root':str(root)},indent=2)
+    if install_current_link(source) is not None:
+        endpoint_note=('The endpoint and the interpreter go through install/current, so an upgrade '
+                       'moves them with the service')
+        local_note='the same install/current paths, so it also follows an upgrade'
+    else:
+        endpoint_note=('This installation has no install/current link, so the endpoint and the '
+                       'interpreter below name the release that printed them and must be printed '
+                       'again after an upgrade')
+        local_note=('the same paths, which name this release, so print them again after an upgrade')
     return (f'Worker client configuration for {name} (save as client.local.json in the worker\'s own\n'
             f'directory and replace WORKER_SSH_HOST with that worker\'s SSH alias; this kit endpoint serves\n'
-            f'every project, so do not point it at a project-specific wrapper). The endpoint and the\n'
-            f'interpreter go through install/current, so an upgrade moves them with the service:\n{config}\n'
+            f'every project, so do not point it at a project-specific wrapper). {endpoint_note}:\n{config}\n'
             f'Bootstrap command (replace ACTOR with the actor returned by worker.py start or session\n'
             f'register):\n  python client.py --config client.local.json --project {name} --actor ACTOR -- onboard\n'
             f'An agent that runs on the server itself uses the local transport instead (no SSH and no\n'
-            f'host; the same install/current paths, so it also follows an upgrade):\n{local}\n'
+            f'host; {local_note}):\n{local}\n'
             f'Host project not on the web yet: nothing of {name} appears in the web interface until a\n'
             f'superuser registers it there (New project, with this name, or POST /v1/projects without\n'
             f'"create").')
@@ -1812,8 +1843,17 @@ def scheduled_backup_unit_paths():
         return []
 
 def scheduled_backup_execstart(root):
-    """The exact ``ExecStart`` line that covers every project of this runtime."""
-    return (f'ExecStart={sys.executable} {Path(__file__).resolve()} '
+    """The exact ``ExecStart`` line that covers every project of this runtime.
+
+    The interpreter and this module are both printed through the installation's
+    ``install/current`` link where it has one, so an upgrade moves the schedule with the
+    service. A line whose interpreter came through ``current`` but whose ``admin.py``
+    named ``releases/<ID>`` kept running the release that printed it after the next
+    upgrade (kittrial-5bb.182 item 2).
+    """
+    python=install_current_path(sys.executable)
+    module=install_current_path(Path(__file__).resolve())
+    return (f'ExecStart={python} {module} '
             f'--root {root} backup --all')
 
 def _execstart_values(text):

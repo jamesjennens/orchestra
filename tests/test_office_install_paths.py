@@ -56,6 +56,74 @@ def worker_text(root):
         return admin.worker_client_setup(root, 'alpha')
 
 
+def no_current_install(root):
+    """The live ordinary layout: ``root/kit -> root/releases/build-a``, no ``current``.
+
+    ``admin.__file__`` is reached through the ``kit`` link, exactly as the live
+    installations reach it. ``install_current_path`` leaves the release spelling alone, so
+    the sentence add-project prints must say the paths name the release (item 1).
+    """
+    release = root / 'releases' / 'build-a'
+    kit = release / 'kit'
+    kit.mkdir(parents=True)
+    for name in ('admin.py', 'endpoint.py', 'ssh_forced_command.py'):
+        (kit / name).write_text('', encoding='utf-8')
+    interpreter = release / 'python-runtime' / 'bin' / 'python3'
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text('', encoding='utf-8')
+    (release / 'manifest.json').write_text(
+        json.dumps({'schema_version': 1, 'python_executable': 'bin/python3'}), encoding='utf-8')
+    (root / 'kit').symlink_to('releases/build-a')
+    return release, kit, interpreter
+
+
+def release_root_install(root):
+    """``root/releases/build-a`` IS the kit and ``root/current`` points at it.
+
+    A live-style install plus a ``current`` link somebody added: the path add-project
+    resolves is the release directory itself, which ``resolved.parents`` alone never tested
+    (item 3).
+    """
+    release = root / 'releases' / 'build-a'
+    release.mkdir(parents=True)
+    for name in ('admin.py', 'endpoint.py', 'ssh_forced_command.py'):
+        (release / name).write_text('', encoding='utf-8')
+    interpreter = release / 'python-runtime' / 'bin' / 'python3'
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text('', encoding='utf-8')
+    (release / 'manifest.json').write_text(
+        json.dumps({'schema_version': 1, 'python_executable': 'bin/python3'}), encoding='utf-8')
+    (root / 'current').symlink_to('releases/build-a')
+    return release, interpreter
+
+
+def ssh_config(text):
+    """The SSH client config JSON block add-project prints, parsed.
+
+    The local-transport example also carries a ``python`` key, so a test that searches the
+    whole text for ``"python":`` passes when the key is removed from THIS config alone
+    (review mutant M6). Read the first JSON block instead: it is the SSH config.
+    """
+    start = text.index('{\n')
+    end = text.index('\n}', start) + 2
+    return json.loads(text[start:end])
+
+
+def authorized_keys_payload(root, admin_file, interpreter, role='contributor'):
+    """Run the real ``authorized-keys`` CLI and return its parsed JSON payload."""
+    key_file = root / 'lane.pub'
+    key_file.write_text(KEY_LINE + '\n', encoding='utf-8')
+    out = io.StringIO()
+    argv = ['admin.py', '--root', str(root / 'runtime'), 'authorized-keys',
+            '--key-file', str(key_file), '--role', role]
+    with patch.object(sys, 'argv', argv), patch('sys.stdout', out), \
+            patch('sys.stderr', io.StringIO()), \
+            patch.object(sys, 'executable', str(interpreter)), \
+            patch.object(admin, '__file__', str(admin_file)):
+        admin.main()
+    return json.loads(out.getvalue())
+
+
 @unittest.skipUnless(POSIX_LINKS, 'the installation layout needs real symlinks')
 class CurrentPathTests(unittest.TestCase):
     def setUp(self):
@@ -77,6 +145,21 @@ class CurrentPathTests(unittest.TestCase):
         other = self.root / 'releases' / 'build-b' / 'kit' / 'endpoint.py'
         self.assertEqual(admin.install_current_path(other), other)
 
+    def test_only_a_folder_named_releases_is_rewritten(self):
+        # Mutant M2: any folder whose parent has a sibling `current` link pointing at it
+        # counts, not only a folder named `releases`. The link the code consults is the
+        # sibling of the release's PARENT (`install.parent/'current'`), so build a release
+        # one level deeper: `outer/current -> inner/build-a`, where `inner` is the folder
+        # that must NOT be treated as `releases`. Nothing under it may be rewritten.
+        inner = self.root / 'outer' / 'inner'
+        release = inner / 'build-a'
+        (release / 'kit').mkdir(parents=True)
+        path = release / 'kit' / 'endpoint.py'
+        path.write_text('', encoding='utf-8')
+        (inner.parent / 'current').symlink_to('inner/build-a')
+        self.assertEqual(admin.install_current_path(path), path)
+        self.assertIsNone(admin.install_current_link(path))
+
     def test_the_bundled_interpreter_is_found_through_current(self):
         with patch.object(admin, '__file__', str(self.kit / 'admin.py')):
             self.assertEqual(admin.office_bundled_python(),
@@ -86,12 +169,20 @@ class CurrentPathTests(unittest.TestCase):
         text = worker_text(self.root)
         endpoint = self.current / 'kit' / 'endpoint.py'
         interpreter = self.current / 'python-runtime' / 'bin' / 'python3'
-        self.assertIn('"endpoint": ' + json.dumps(str(endpoint)), text)
-        self.assertIn('"python": ' + json.dumps(str(interpreter)), text)
-        self.assertIn('"root": ' + json.dumps(str(self.root)), text)
+        # The SSH config ITSELF must carry the interpreter key. The local-transport example
+        # below also has a `python` key, so searching the whole text does not catch the key
+        # being removed from this config (item 4, mutant M6): parse the first JSON block.
+        config = ssh_config(text)
+        self.assertEqual(config['host'], 'WORKER_SSH_HOST')
+        self.assertEqual(config['endpoint'], str(endpoint))
+        self.assertEqual(config['python'], str(interpreter))
+        self.assertEqual(config['root'], str(self.root))
         # The release spelling the link resolves to must never be printed.
         self.assertNotIn('releases', text)
         self.assertNotIn(str(self.release), text)
+        # The sentence says what was really printed: here, the install has a current link.
+        self.assertIn('go through install/current, so an upgrade moves them', text)
+        self.assertIn('the same install/current paths, so it also follows an upgrade', text)
 
     def test_worker_client_setup_prints_a_local_transport_example(self):
         text = worker_text(self.root)
@@ -142,6 +233,87 @@ class CurrentPathTests(unittest.TestCase):
             admin.main()
         self.assertIn(json.dumps(json.loads(out.getvalue())['endpoint']),
                       worker_text(self.root))
+
+
+@unittest.skipUnless(POSIX_LINKS, 'the installation layout needs real symlinks')
+class OrdinaryKitTests(unittest.TestCase):
+    """The live layout ``kit -> releases/<ID>`` with no ``current`` link (item 1)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name) / 'install'
+        self.root.mkdir()
+        self.release, self.kit, self.interpreter = no_current_install(self.root)
+
+    def text(self):
+        # Reached through the `kit` link, exactly as the live installations reach it.
+        with patch.object(admin, '__file__', str(self.root / 'kit' / 'admin.py')):
+            return admin.worker_client_setup(self.root, 'alpha')
+
+    def test_the_printed_paths_name_the_release(self):
+        text = self.text()
+        config = ssh_config(text)
+        # An ordinary kit is not an office release, so there is no bundled-interpreter
+        # manifest and `python` falls back to this interpreter (the reviewer's
+        # sim-ordinary-kit.log shows /usr/bin/python3). What matters here is that the
+        # endpoint names the release and no current spelling is printed.
+        self.assertEqual(config['endpoint'], str(self.release / 'endpoint.py'))
+        self.assertNotIn('/current/', config['python'])
+        self.assertNotIn('/current/kit', text)
+        self.assertNotIn('/current/python-runtime', text)
+
+    def test_the_sentence_says_the_paths_name_the_release(self):
+        text = self.text()
+        self.assertNotIn('go through install/current', text)
+        self.assertIn('no install/current link', text)
+        self.assertIn('name the release that printed them', text)
+        self.assertIn('again after an upgrade', text)
+
+
+@unittest.skipUnless(POSIX_LINKS, 'the installation layout needs real symlinks')
+class ScheduledBackupLineTests(unittest.TestCase):
+    """The printed schedule follows an upgrade like the client lines (item 2)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name) / 'install'
+        self.root.mkdir()
+        self.release, self.kit, self.interpreter = office_install(self.root)
+        self.current = self.root / 'current'
+
+    def test_the_backup_line_names_admin_py_and_the_interpreter_through_current(self):
+        with patch.object(admin, '__file__', str(self.kit / 'admin.py')), \
+                patch.object(sys, 'executable', str(self.interpreter)):
+            line = admin.scheduled_backup_execstart(self.root)
+        self.assertIn(str(self.current / 'python-runtime' / 'bin' / 'python3'), line)
+        self.assertIn(str(self.current / 'kit' / 'admin.py'), line)
+        self.assertNotIn(str(self.release), line)
+
+
+@unittest.skipUnless(POSIX_LINKS, 'the installation layout needs real symlinks')
+class ReleaseRootKitTests(unittest.TestCase):
+    """The kit IS the release root with a sibling ``current`` link (item 3)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name) / 'install'
+        self.root.mkdir()
+        self.release, self.interpreter = release_root_install(self.root)
+        self.current = self.root / 'current'
+
+    def test_add_project_and_authorized_keys_resolve_to_the_same_endpoint(self):
+        # The forced-command wrapper compares the endpoint as one token, so the config
+        # add-project prints and the line authorized-keys prints must agree exactly.
+        payload = authorized_keys_payload(self.root, self.release / 'admin.py', self.interpreter)
+        with patch.object(admin, '__file__', str(self.release / 'admin.py')):
+            text = admin.worker_client_setup(self.root, 'alpha')
+        self.assertEqual(payload['kit'], str(self.current))
+        self.assertEqual(payload['endpoint'], str(self.current / 'endpoint.py'))
+        self.assertIn(json.dumps(payload['endpoint']), text)
+        self.assertNotIn(str(self.release / 'endpoint.py'), text)
 
 
 class PlainCheckoutTests(unittest.TestCase):
