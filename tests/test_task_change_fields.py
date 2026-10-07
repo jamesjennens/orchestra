@@ -3,12 +3,13 @@
 Two faults of ``PATCH /v1/projects/P/tasks/ID`` and ``POST /v1/projects/P/tasks``, found by
 running an office installation:
 
-* a change that carried none of title, description and status (a priority, an assignee, a
+* a change that carried none of title, description, status and priority (an assignee, a
   status other than open and closed, nothing at all) made the endpoint backend send bd an
   update with nothing in it. bd answers that with the words "No updates specified" and exit
   0; the service could not read the words, said "the operation may have committed; reconcile
   with the same idempotency key", kept the key, and answered the same for every retry. A
-  field the route does not take beside one it takes was dropped without a word;
+  field the route does not take beside one it takes was dropped without a word (kittrial-5bb.183
+  made priority a field the route does take, so it left this refused set);
 * both routes handed an ``actor`` from the body to the endpoint as it came, so a member's
   task was made, or changed, under any name without the shape of a web account.
 
@@ -28,18 +29,19 @@ sys.path.insert(0, str(KIT / 'tests'))
 import http_service
 import test_http_review_fixes as fixes
 
-TAKES = 'A task change takes: title, description, status'
+TAKES = 'A task change takes: title, description, status, priority'
 #: Bodies the route cannot carry out, with what the refusal must say.
 REFUSED = (
-    ('a priority alone', {'priority': 1}, 'does not take: priority. ' + TAKES),
     ('an assignee alone', {'assignee': 'somebody'}, 'does not take: assignee. ' + TAKES),
     ('labels alone', {'labels': ['a']}, 'does not take: labels. ' + TAKES),
-    ('a title and a priority', {'title': 'renamed', 'priority': 1}, 'does not take: priority. ' + TAKES),
-    ('two fields it does not take', {'priority': 1, 'assignee': 'x', 'title': 'renamed'},
-     'does not take: assignee, priority. ' + TAKES),
+    ('two fields it does not take', {'assignee': 'x', 'labels': ['a'], 'title': 'renamed'},
+     'does not take: assignee, labels. ' + TAKES),
     ('an empty object', {}, 'Nothing to change. ' + TAKES),
     ('a title that is null', {'title': None}, 'Nothing to change. ' + TAKES),
     ('only the version', {'version': 1}, 'Nothing to change. ' + TAKES),
+    ('a priority above four', {'priority': 5}, 'Task priority must be an integer 0-4'),
+    ('a priority below zero', {'priority': -1}, 'Task priority must be an integer 0-4'),
+    ('a priority that is not a whole number', {'priority': '1'}, 'Task priority must be an integer 0-4'),
     ('a status that is neither open nor closed', {'status': 'in_progress'}, 'Task status must be open or closed'),
     ('another such status', {'status': 'done'}, 'Task status must be open or closed'),
     ('a status that is not text', {'status': 1}, 'Task status must be open or closed'),
@@ -118,12 +120,14 @@ class RefusedChangeCase(Project, fixes.EndpointCase):
 
     def test_the_refusal_names_the_fields_as_a_list_too(self):
         self.project()
-        refused = self.request('PATCH', self.path, {'priority': 1, 'labels': [], 'title': 'x'}, token=self.alex)
+        refused = self.request('PATCH', self.path, {'assignee': 'x', 'labels': [], 'title': 'x'}, token=self.alex)
         self.assertEqual(422, refused.status)
-        self.assertEqual({'unsupported': ['labels', 'priority'], 'takes': ['title', 'description', 'status']},
+        self.assertEqual({'unsupported': ['assignee', 'labels'],
+                          'takes': ['title', 'description', 'status', 'priority']},
                          refused.data['error']['detail'])
         nothing = self.request('PATCH', self.path, {}, token=self.alex)
-        self.assertEqual({'takes': ['title', 'description', 'status']}, nothing.data['error']['detail'])
+        self.assertEqual({'takes': ['title', 'description', 'status', 'priority']},
+                         nothing.data['error']['detail'])
 
     def test_a_field_name_that_is_not_a_plain_word_is_not_said_back(self):
         self.project()
@@ -165,7 +169,8 @@ class RefusedChangeCase(Project, fixes.EndpointCase):
     def test_without_the_route_check_the_backend_refuses_and_the_key_is_free(self):
         self.project()
         with mock.patch.object(http_service.ApiHandler, '_task_change', http_service.ApiHandler._task_payload):
-            refused = self.request('PATCH', self.path, {'priority': 1}, token=self.alex, key='below-the-route-1')
+            refused = self.request('PATCH', self.path, {'status': 'in_progress'}, token=self.alex,
+                                   key='below-the-route-1')
         self.assertEqual(422, refused.status, refused.data)
         self.assertIn('Nothing to change', message(refused))
         corrected = self.request('PATCH', self.path, {'title': 'afterwards'}, token=self.alex, key='below-the-route-1')
@@ -181,9 +186,9 @@ class RefusedChangeCase(Project, fixes.EndpointCase):
     def test_a_refusal_comes_before_the_task_is_looked_for(self):
         self.project()
         missing = '/v1/projects/%s/tasks/%s' % (self.pid, 'kittrial-5bb.999')
-        refused = self.request('PATCH', missing, {'priority': 1}, token=self.alex)
+        refused = self.request('PATCH', missing, {'assignee': 'x'}, token=self.alex)
         self.assertEqual(422, refused.status)
-        self.assertIn('does not take: priority', message(refused))
+        self.assertIn('does not take: assignee', message(refused))
         # A body the route takes goes on to the task, which is not there.
         unknown = self.request('PATCH', missing, {'title': 'x'}, token=self.alex)
         self.assertGreaterEqual(unknown.status, 400)
