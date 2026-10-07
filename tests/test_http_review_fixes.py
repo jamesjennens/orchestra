@@ -2383,7 +2383,7 @@ class RealEndpointAuthorityCase(unittest.TestCase):
         canary_lock = self.tmp / 'http-caller' / 'nested' / 'x.lock'
         canary_store = self.tmp / 'http-canary.json'
         canary_store.write_text('CANARY-NOT-JSON', encoding='utf-8')
-        request = {'project': 'probe', 'actor': 'attacker', 'action': 'bd', 'args': ['create', 'x'],
+        request = {'project': 'probe', 'actor': 'usr_a', 'action': 'bd', 'args': ['create', 'x'],
                    'operation_id': 'op-endpoint-configured',
                    'authority': {'via': 'session', 'user_id': 'usr_a',
                                  'session_hash': 'sess_a', 'project': 'probe',
@@ -2393,6 +2393,10 @@ class RealEndpointAuthorityCase(unittest.TestCase):
                                        require_authority=True)
         self.assertEqual(0, result['returncode'], result)
         self.assertFalse(canary_lock.exists())
+        # The account's descriptor does not carry another name (kittrial-5bb.184): nothing runs.
+        named = dict(request, actor='attacker', operation_id='op-endpoint-named')
+        refused = self.endpoint.execute(self.root, named, authority_config=self.config, require_authority=True)
+        self.assertEqual((126, 403), (refused['returncode'], refused.get('authority_status')), refused)
         # A descriptor-less mutation through the trusted launch is refused.
         bare = {'project': 'probe', 'actor': 'attacker', 'action': 'bd', 'args': ['create', 'x'],
                 'operation_id': 'op-endpoint-bare'}
@@ -2414,7 +2418,7 @@ class RealEndpointAuthorityCase(unittest.TestCase):
 
         self.endpoint.subprocess.run = fake_run
         try:
-            request = {'project': 'probe', 'actor': 'attacker', 'action': 'bd',
+            request = {'project': 'probe', 'actor': 'usr_a', 'action': 'bd',
                        'args': ['create', 'x'], 'operation_id': 'op-endpoint-timeout',
                        'authority': authority_descriptor('usr_a', 'sess_a', project='probe')}
             first = self.endpoint.execute(self.root, request, authority_config=self.config,

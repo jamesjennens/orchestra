@@ -30,7 +30,7 @@ from reserved_comments import (carries_record_label, check_raw_request, comment_
                                is_merge_slot_id, shown_token, write_targets, MERGE_SLOT_LABEL, MERGE_SLOT_SUFFIX,
                                reserved_label_in_args, refuse_http_actor, status_change_targets, title_change_targets,
                                unresolved_bd_flags)
-from http_authority import AuthorityConfig, NativeRunner, CAP_PROJECT_ADMIN, http_actor_denial, journal_path, run_guarded, stamp_write
+from http_authority import AuthorityConfig, NativeRunner, CAP_PROJECT_ADMIN, descriptor_actor_denial, http_actor_denial, journal_path, run_guarded, stamp_write
 
 ALLOWED={'list','show','ready','search','count','create','update','close','reopen','comments','dep','state','lint'}
 # Legacy name kept for operators reading this file; enforcement is the
@@ -407,6 +407,13 @@ def configuration_fault(root,error):
     try:return Path(os.fsdecode(error.filename))==Path(root)/'deployment.private.json'
     except (TypeError,ValueError):return False       # it names no file, or a descriptor
 
+def reserved_actors(root,path):
+    """The names a worker credential's namespace may not be, as this host has them: the
+    project's registered session actors and the installation's operator and verifier lists."""
+    from sessions import registered_actors
+    return {'sessions':registered_actors(path),'operators':sorted(configured_operators(root)),
+            'verifiers':sorted(configured_verifiers(root))}
+
 def execute(root,request,authority_config=None,require_authority=False):
     # Two actions exist only for the web service and name no existing project
     # (kittrial-5bb.118 part 2); project_creation holds them, with what stops other callers.
@@ -433,6 +440,10 @@ def execute(root,request,authority_config=None,require_authority=False):
     # Launched by the HTTP service, an HTTP-shaped actor still needs the verified
     # descriptor on every action, with or without --require-authority (review 01a10262).
     denied=http_actor_denial(request,authority_config)
+    if denied is not None:return denied
+    # And a name WITHOUT that shape, sent by the web service with a descriptor, is written only
+    # by a worker credential inside a namespace that is nobody else's (kittrial-5bb.184).
+    denied=descriptor_actor_denial(request,authority_config,lambda:reserved_actors(root,path))
     if denied is not None:return denied
     if request.get('action')=='session':
         from sessions import execute as session_execute
@@ -499,6 +510,16 @@ def execute(root,request,authority_config=None,require_authority=False):
     if action in ('onboard','docs'):
         from onboarding import execute as onboard
         return {'returncode':0,'stdout':onboard(Path(__file__).resolve().parent,path,name,actor,action,request.get('args',[]),endpoint=Path(__file__).resolve()),'stderr':''}
+    if action=='actor-standing':
+        # Read-only (kittrial-5bb.184): for each name asked about, why a worker credential may
+        # not write under it, or null. The web service asks before it issues one and when it
+        # lists them. The answer says which rule, never the host's names. No lock, no write.
+        import actor_names
+        names=request.get('args',[])
+        if not isinstance(names,list) or not 1<=len(names)<=200 or any(not isinstance(n,str) or not 0<len(n)<=96 or '\0' in n for n in names):
+            raise ValueError('Use actor-standing with 1 to 200 names')
+        reserved=reserved_actors(root,path)
+        return {'returncode':0,'stdout':json.dumps({'schema_version':1,'names':{n:actor_names.collision(n,**reserved) for n in names}})+'\n','stderr':''}
     if action=='setup-status':
         # Read-only (kittrial-5bb.118): what the host knows about this project's setup,
         # for the web setup page. States, versions and times only; never guidance or

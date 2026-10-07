@@ -9,6 +9,25 @@ from requirements import content_hash
 
 UUID = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
 
+def registered_actors(path):
+    """The session actors registered in the project at ``path``. Reads the registry; writes nothing.
+
+    A registry that cannot be read as one raises ``ValueError``: whoever asks which names
+    are taken must not be told "none" by a damaged file (kittrial-5bb.184).
+    """
+    from pathlib import Path
+    file = Path(path) / '.sessions.json'
+    if file.is_symlink():
+        raise ValueError('Session registry paths must not be symlinks')
+    if not file.exists():
+        return []
+    try:
+        data = validate(json.loads(file.read_text(encoding='utf-8')))
+    except (OSError, UnicodeDecodeError, RecursionError) as error:
+        raise ValueError('The session registry cannot be read: %s' % type(error).__name__) from None
+    return sorted(record['actor'] for record in data['records'].values())
+
+
 def validate(data):
     if not isinstance(data,dict) or not {'schema_version','records'}.issubset(data) or set(data)-{'schema_version','records','resumes','runs'} or type(data['schema_version']) is not int or data['schema_version']!=1 or not isinstance(data['records'],dict):
         raise ValueError('Invalid session registry')

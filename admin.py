@@ -4551,6 +4551,81 @@ def authorized_keys(root,key_file,role='both',python=None,comment=None):
         print('warning: the operator line is unrestricted service-account shell access; '+OPERATOR_KEY_NOTE,
               file=sys.stderr)
 
+def credential_actors(root,state_path):
+    """Every worker credential of the web service with the name it writes under, and whether
+    that name is somebody else's on this host (kittrial-5bb.184). Reads; changes nothing.
+
+    A worker credential writes under the actor namespace its issuer chose. Before
+    kittrial-5bb.184 an owner could choose a registered session actor, a name on the operator
+    or verifier list or the service's own namespace, and the credential then acted as that
+    actor. Such a credential is refused when it writes from that kit on; this lists them, so
+    an operator can tell their owners. Nothing is revoked here: revoking is the owner's, in
+    the web interface.
+
+    ``tracker_rows`` says whether the project's tracker already has rows under the name (an
+    assignee, a creator, a comment author). For a name that collides they may be the real
+    actor's or the credential's: the rows cannot tell. For a name that does not, they are
+    what a credential under that name wrote, or an old actor from before sessions were
+    registered: worth a look when nobody remembers issuing it.
+    """
+    import actor_names
+    from datetime import datetime,timezone
+    from sessions import registered_actors
+    source=Path(state_path)
+    if not source.is_file():raise ValueError('No web service state at %s'%source)
+    try:state=json.loads(source.read_text(encoding='utf-8'))
+    except (ValueError,RecursionError):raise ValueError('The web service state at %s is not readable as JSON'%source) from None
+    if not isinstance(state,dict) or not isinstance(state.get('credentials'),dict):
+        raise ValueError('The file at %s is not a web service state document'%source)
+    users=state.get('users') if isinstance(state.get('users'),dict) else {}
+    listed_operators,listed_verifiers=sorted(operators(root)),sorted(verifiers(root))
+    def moment(value):
+        if isinstance(value,(int,float)) and not isinstance(value,bool):
+            return datetime.fromtimestamp(value,timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        return value if isinstance(value,str) else None
+    projects={}
+    def project(name):
+        if name not in projects:
+            found={'on_host':False,'sessions':[],'names':None}
+            try:path=project_dir(root,name)
+            except ValueError:path=None
+            if path is not None and (path/'.beads/metadata.json').is_file():
+                found['on_host']=True
+                found['sessions']=registered_actors(path)
+                try:
+                    rows=[json.loads(line) for line in run_bd(root,name,['export','--all']).splitlines() if line.strip()]
+                    names=set()
+                    for row in rows:
+                        for key in ('assignee','created_by'):
+                            if isinstance(row.get(key),str):names.add(actor_names.head(row[key]))
+                        for comment in row.get('comments') or []:
+                            if isinstance(comment,dict) and isinstance(comment.get('author'),str):names.add(actor_names.head(comment['author']))
+                    found['names']=names
+                except (subprocess.CalledProcessError,OSError,ValueError,RecursionError):
+                    found['names']=None                # the tracker could not be read: said as null, not as "no rows"
+            projects[name]=found
+        return projects[name]
+    out=[]
+    for identifier in sorted(state['credentials']):
+        credential=state['credentials'][identifier]
+        if not isinstance(credential,dict) or credential.get('agent_id'):continue
+        namespace=credential.get('actor')
+        if not isinstance(namespace,str) or not namespace:continue         # it writes under its issuer's own account id
+        name=credential.get('project_id')
+        host=project(name) if isinstance(name,str) else {'on_host':False,'sessions':[],'names':None}
+        reason=actor_names.collision(namespace,sessions=host['sessions'],operators=listed_operators,verifiers=listed_verifiers)
+        issuer=users.get(credential.get('user_id')) if isinstance(users.get(credential.get('user_id')),dict) else {}
+        out.append({'credential':identifier,'project':name,'project_on_host':host['on_host'],'label':credential.get('label'),
+                    'actor':namespace,'collides':reason,'revoked':bool(credential.get('revoked')),
+                    'refused_when_it_writes':reason is not None,
+                    'tracker_rows':None if host['names'] is None else actor_names.head(namespace) in host['names'],
+                    'issued_by':credential.get('user_id'),'issued_by_username':issuer.get('username'),
+                    'created_at':moment(credential.get('created_at')),'last_used':moment(credential.get('last_used')),
+                    'expires_at':moment(credential.get('expires_at'))})
+    colliding=[item for item in out if item['collides'] is not None and not item['revoked']]
+    return {'schema_version':1,'state':str(source),'worker_credentials_with_a_name':len(out),
+            'colliding_and_not_revoked':len(colliding),'credentials':out}
+
 def main():
     p=argparse.ArgumentParser();p.add_argument('--root',required=True)
     sub=p.add_subparsers(dest='command',required=True)
@@ -4701,6 +4776,8 @@ def main():
     a.add_argument('--any-actor',action='store_true',dest='any_actor',
                    help='with --disposition released (or failed on a receipt with no recorded actor), open the request ID to any actor')
     a=sub.add_parser('service');a.add_argument('action',choices=['start','stop','restart','status'])
+    a=sub.add_parser('credential-actors',help='list the web service\'s worker credentials and whether the name each writes under is somebody else\'s on this host (reads only)')
+    a.add_argument('--state',required=True,help='the web service state document (the --state of http_service.py)')
     a=sub.add_parser('record-store')
     a.add_argument('--state',required=True,
                    help='the HTTP service state document (its --state); the record store is '
@@ -4848,6 +4925,13 @@ def main():
             guidance_report=guidance_status(path,args.actor,operators(root,strict=True),host=True)
         print(json.dumps(guidance_report,sort_keys=True,indent=2))
     elif args.command=='service':print(service(root,args.action))
+    elif args.command=='credential-actors':
+        report=credential_actors(root,args.state)
+        print(json.dumps(report,indent=2,sort_keys=True))
+        if report['colliding_and_not_revoked']:
+            print('%d worker credential(s) write under a name that is somebody else\'s on this host. Each is refused '
+                  'when it writes; its owner revokes it in the web interface and issues one under another name. '
+                  'Nothing was changed by this command.'%report['colliding_and_not_revoked'],file=sys.stderr)
     elif args.command=='record-store':
         try:
             report=record_store_reset(args.state) if args.reset_high_water \
