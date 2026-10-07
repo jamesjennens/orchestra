@@ -550,6 +550,23 @@ def main():
         if denied is not None:
             print(json.dumps(denied))
             return
+        # endpoint.py's rule for a name WITHOUT the shape of a web id (kittrial-5bb.184). This
+        # stub has no session registry and no deployment file: the names its host "has" are
+        # read from <root>/reserved-actors.json when a test put one there.
+        def reserved():
+            planted = root / 'reserved-actors.json'
+            names = json.loads(planted.read_text(encoding='utf-8')) if planted.is_file() else {}
+            return {key: names.get(key, []) for key in ('sessions', 'operators', 'verifiers')}
+        denied = http_authority.descriptor_actor_denial(request, config, reserved) \
+            if http_authority is not None and hasattr(http_authority, 'descriptor_actor_denial') else None
+        if denied is not None:
+            print(json.dumps(denied))
+            return
+        if request.get('action') == 'actor-standing':
+            import actor_names
+            print(json.dumps(envelope(0, stdout=json.dumps({'schema_version': 1, 'names': {
+                name: actor_names.collision(name, **reserved()) for name in request.get('args') or []}}))))
+            return
         if request.get('action') == 'set-onboarding':
             # endpoint.py's service-only action (kittrial-5bb.118 part 2): the kit's own
             # rules, which run their own guarded section.

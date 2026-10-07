@@ -341,8 +341,12 @@ class SilentConnectionTests(Case):
         waited = []
 
         def start_and_wait(thread):
+            # Asked BEFORE the thread is started: a thread that has ended has dropped its target
+            # (`Thread.run` deletes it), and this test is about threads that end before start()
+            # returns. Asked afterwards, a quick one was not counted: four for five, on Linux in CI.
+            serves = getattr(getattr(thread, '_target', None), '__name__', '') == 'process_request_thread'
             real(thread)
-            if getattr(getattr(thread, '_target', None), '__name__', '') == 'process_request_thread':
+            if serves:
                 thread.join(60)
                 waited.append(thread.is_alive())
         with mock.patch.object(threading.Thread, 'start', start_and_wait):
