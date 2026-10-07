@@ -4492,6 +4492,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         # owner need not find out from a worker's failure. `actor_refused` is the reason or null.
         named = sorted({item['actor'] for item in items if item.get('actor') and not item.get('revoked')})
         standing = self.backend.actor_standing(ctx.params['pid'], named) if named else {}
+        # A credential a first write already settled as refused by the row rule carries the mark
+        # on its record; the list reads it, so the owner is told without a second tracker read
+        # (kittrial-5bb.188 revision-3 item 3(3)).
+        stored = self.service.state.get('credentials') if isinstance(self.service.state, dict) else {}
         for item in items:
             waived = item.get('actor_waived')
             if isinstance(waived, dict) and not item.get('revoked'):
@@ -4503,6 +4507,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                 item['actor_allowed'] = 'allowed by %s on %s' % (who, when)
                 continue
             reason = standing.get(item.get('actor')) if not item.get('revoked') else None
+            if reason is None and not item.get('revoked'):
+                record = stored.get(item.get('id')) if isinstance(stored, dict) else None
+                mark = record.get('actor_rows_refused') if isinstance(record, dict) else None
+                if isinstance(mark, str) and mark:
+                    reason = mark
             item['actor_refused'] = None if reason is None else actor_names.refusal(item['actor'], reason)
         return 200, self._paged(ctx, items, limit, state)
 
@@ -4531,9 +4540,19 @@ class ApiHandler(BaseHTTPRequestHandler):
                 raise forbidden('Only a superuser may allow a name the project\'s tracker already holds')
             if not isinstance(waiver, str) or not waiver.strip():
                 raise invalid('allow_actor requires allow_actor_reason: say why the name is allowed')
-            if len(waiver.strip()) > 500:
-                raise invalid('allow_actor_reason must be at most 500 characters')
             waiver = waiver.strip()
+            if len(waiver) > 500:
+                raise invalid('allow_actor_reason must be at most 500 characters')
+            # The reason is shown to other people (the audit entry, the record, the owner's list
+            # and the operator's listing), so it passes the kit's plain-text rule -- the same one
+            # `guidance` applies: no control, bidi, zero-width, C1, tag or variation-selector
+            # characters (kittrial-5bb.188 revision-3 item 3(2)). Tab, newline and carriage
+            # return stay allowed, exactly as the guidance rule allows them.
+            from review_workflow import plain_text
+            try:
+                plain_text(waiver, 'allow_actor_reason')
+            except ValueError as error:
+                raise invalid(str(error))
         checked = False
         waived_mark = None
         if isinstance(named, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,63}', named):

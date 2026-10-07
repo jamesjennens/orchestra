@@ -418,16 +418,24 @@ def tracker_actors(root,path,before=None,own=()):
     credential-actors`` makes: a bd process that opens the project's database. That is the
     cost of judging a plain name by the rows it has, and it is paid where the rule is
     applied, never by every write (docs/HTTP_DEPLOYMENT.md says so). A tracker that cannot
-    be read raises, and so does an export that parses to no rows at all
-    (``actor_names.TrackerUnreadable``): every project this kit makes holds at least the
-    merge slot, so an empty answer is a host fault, not "the tracker holds no names"
-    (kittrial-5bb.188 review of item 1). ``own`` are the lifetimes of earlier credentials of
-    the same name whose rows are not held against this one (item 3)."""
+    be read raises, and so does an answer that is not a whole tracker -- an export that
+    parses to no rows, that fails partway (a cut line, a non-JSON word, a bd that exits
+    nonzero), or that carries rows but not the project's merge slot
+    (``actor_names.TrackerUnreadable``): every project this kit makes holds that slot, so an
+    answer without it did not come from a whole read and is a host fault, not "the tracker
+    holds no names" (kittrial-5bb.188 review of item 1, revision-3 item 3). ``own`` are the
+    lifetimes of earlier credentials of the same name whose rows are not held against this
+    one (item 3)."""
     import actor_names
     from admin import run_bd
-    text=run_bd(root,path.name,['export','--all'])
-    rows=[record_json.loads(line) for line in text.splitlines() if line.strip()]
-    if not any(isinstance(row,dict) for row in rows):
+    try:
+        text=run_bd(root,path.name,['export','--all'])
+        rows=[record_json.loads(line) for line in text.splitlines() if line.strip()]
+    except (subprocess.SubprocessError,OSError,ValueError,RecursionError):
+        # bd could not answer, or answered something that is not rows: a host fault, never an
+        # empty tracker and never a rejection of the caller's request.
+        raise actor_names.TrackerUnreadable()
+    if not any(isinstance(row,dict) for row in rows) or not any(is_merge_slot(row) for row in rows):
         raise actor_names.TrackerUnreadable()
     return actor_names.tracker_names(actor_names.tracker_marks(rows),before,own)
 

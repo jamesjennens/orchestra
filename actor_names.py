@@ -37,8 +37,9 @@ author. A name with the shape of a web account or agent id is not this module's 
 Rows inside an earlier credential's own lifetime are not held against a renewal under the
 same name by the same owner (kittrial-5bb.188 item 3, :func:`own_intervals`), and a
 credential is judged by the rows once, with the outcome kept on it, not on every write
-(item 5, ``http_service.EndpointBackend``). An export that yields no rows at all is a
-failure, never "the tracker holds nothing" (item 1, :class:`TrackerUnreadable`).
+(item 5, ``http_service.EndpointBackend``). An export that yields no rows at all -- or a
+result that does not carry the project's merge slot -- is a failure, never "the tracker
+holds nothing" (item 1, :class:`TrackerUnreadable`).
 
 Pure and without imports of the kit, so the web service uses it on every platform.
 """
@@ -238,7 +239,15 @@ def tracker_names(marks, before=None, own=()):
 
 
 def inside_own(when, windows):
-    """Whether a row instant lies inside any own-lifetime window, within the skew allowance."""
+    """Whether a row instant lies inside any own-lifetime window, within the skew allowance.
+
+    The allowance is only for the START of a life: the credential's issuance stamp is the web
+    service's clock and its first row's is the host's, so a row slightly earlier than the
+    lifetime's start may still be its own. At the end there is no such clock difference to
+    forgive -- the lifetime ends at a time both sides can read -- so a row after the end is
+    never counted as that credential's own (kittrial-5bb.188 revision-3 item 1: a lane row
+    200 s after a revocation passed as the revoked credential's own).
+    """
     if when is None:
         return False
     for start, end in windows:
@@ -248,7 +257,7 @@ def inside_own(when, windows):
             continue
         if end is not None and (not isinstance(end, (int, float)) or isinstance(end, bool)):
             continue
-        if end is None or when <= end + OWN_ROWS_SKEW_SECONDS:
+        if end is None or when <= end:
             return True
     return False
 
@@ -261,11 +270,14 @@ def own_intervals(credentials, namespace, user_id, project_id, exclude=None):
     ``/``), the SAME issuer (``user_id``) and the SAME project, and the row rule did not
     refuse it: a record carrying ``actor_rows_refused`` is not a predecessor, so its rows are
     held. A predecessor's lifetime runs from its issuance (``issued_raw`` when it is a number,
-    else ``created_at``) to its ``revoked_at`` when it is revoked, or is open at the end when
-    it is not. A predecessor whose issuance -- or, when revoked, whose revocation -- cannot be
-    read contributes nothing: the kit cannot show the rows are the credential's own, so they
-    stay somebody else's, which is the fail-closed reading. The judge's own record is skipped
-    by ``exclude``. Returns a list of ``(start, end)`` in seconds; ``end`` None is open.
+    else ``created_at``) to the EARLIER of its revocation (``revoked_at`` when it is revoked)
+    and its expiry (``expires_at``), or is open at the end when it has neither: a credential
+    that merely expired stops lending its name at the expiry, so a row a host lane writes
+    afterwards is somebody else's (kittrial-5bb.188 revision-3 item 1). A predecessor whose
+    issuance, revocation, or a present ``expires_at`` cannot be read contributes nothing: the
+    kit cannot show the rows are the credential's own, so they stay somebody else's, which is
+    the fail-closed reading. The judge's own record is skipped by ``exclude``. Returns a list
+    of ``(start, end)`` in seconds; ``end`` None is open.
     """
     mine = head(namespace)
     if not mine or not isinstance(user_id, str) or not user_id or not isinstance(project_id, str):
@@ -290,5 +302,11 @@ def own_intervals(credentials, namespace, user_id, project_id, exclude=None):
             end = instant(credential.get('revoked_at'))
             if end is None:
                 continue                          # fail closed: revoked with no readable time
+        expires = credential.get('expires_at')
+        if expires is not None:
+            expiry = instant(expires)
+            if expiry is None:
+                continue                          # fail closed: a present but unreadable expiry is no open lifetime
+            end = expiry if end is None else min(end, expiry)
         windows.append((float(start), None if end is None else float(end)))
     return windows

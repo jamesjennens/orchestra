@@ -1141,17 +1141,21 @@ told: a contributor is answered 403 and an outsider 404 whatever the name. If th
 cannot be asked, nothing is issued. **Cost of the row read:** judging a name by the
 project's rows is one `bd export --all` for that project (one bd process against its
 running database), paid once per issue attempt and never by an ordinary write: see
-"Credentials that already have such a name" below. **An export that answers no rows at
-all is a host fault, not a tracker with no names** (kittrial-5bb.188 review of item 1):
-every project this kit makes holds at least the merge slot, so a `bd export --all` that
-exits 0 and prints nothing, or prints only text that is not rows, answers **503
-`unavailable`**, "The tracker could not be read just now. Nothing was changed; try again
-shortly.", and the idempotency key is free. A superuser may pass
-`"allow_actor": true` together with `"allow_actor_reason"` -- a short text saying WHY --
-to take a name the tracker already holds. Only that rule is waived, never a session, an
-operator, a verifier or the service's own namespace. Anybody else sending `allow_actor`
-is answered 403, a value that is not true or false is 422, a missing or empty reason is
-422, and a reason with no waiver is 422. The waiver is recorded on the credential as its
+"Credentials that already have such a name" below. **An answer that is not a whole
+tracker is a host fault, not a tracker with no names** (kittrial-5bb.188 review of item 1;
+revision-3 item 3(1)): every project this kit makes holds at least the merge slot, so a
+`bd export --all` that exits 0 and prints nothing, a line cut short, a nonzero exit, text
+that is not rows, or rows **without the merge-slot row** answers **503 `unavailable`**,
+"The tracker could not be read just now. Nothing was changed; try again shortly.", and the
+idempotency key is free. The same broken answer at use is the same 503, never 422. A
+superuser may pass `"allow_actor": true` together with `"allow_actor_reason"` -- 1 to 500
+characters saying WHY, which must pass the kit's plain-text rule (`guidance`'s: no control,
+bidi, zero-width, C1, tag or variation-selector character; a tab, newline or carriage
+return is allowed) -- to take a name the tracker already holds. Only that rule is waived,
+never a session, an operator, a verifier or the service's own namespace. Anybody else
+sending `allow_actor` is answered 403, a value that is not true or false is 422, a missing,
+empty, longer-than-500 or hidden-character reason is 422, and a reason with no waiver is
+422. The waiver is recorded on the credential as its
 own mark (`actor_waived`, holding `by`, `reason` and `at`) and **not** as
 `actor_rows_checked`; the audit entry is a `credentials.issue` whose reason says a waiver
 was used and why ("waiver used for worker credential actor NAME: WHY"), with the waiving
@@ -1187,22 +1191,29 @@ written by the service, which owns the state; there is no route that changes a c
 (`PATCH`/`PUT` are 404) and the issue route takes no such field, so the keeping cannot be
 reached from a request. A **concurrent first write** may run the export twice; both
 answer the same way and write the same mark, so the outcome is idempotent. An export that
-answers no rows at all is the host fault above: 503, nothing written, and no mark kept.
+answers no rows at all is the host fault above: 503, nothing written, and no mark kept. A
+credential the settle marked refused is shown as refused in the owner's list even though
+that list reads no rows from the host: it reads the stored `actor_rows_refused` mark
+(revision-3 item 3(3)).
 
 **Renewing a credential under its own name is not a collision** (kittrial-5bb.188 item
 3). The row rule above is about *somebody else's* rows; an owner renewing the name its own
 credential wrote as is not taking somebody else's name. Rows are therefore not held
 against a new credential of the same head, same owner and same project when they lie
 inside an earlier credential's own lifetime. How that is known: the state keeps each
-credential's issuer, namespace, project, issuance (`created_at`/`issued_raw`) and
-revocation time (`revoked_at`); an earlier credential lends the window from its issuance
-to its revocation, or to now when it was never revoked, and only when the row rule did
-not refuse it (`actor_rows_refused` absent). It **fails closed** when any of that cannot
-be read -- no predecessor, a different owner or project, an unreadable issuance, a
-revoked credential with no revocation time, or a predecessor the rule refused all lend
-nothing, so the rows stay somebody else's and the name is refused. A renewal is still
-refused when the tracker holds rows older than the predecessor (the host actor's own
-rows), because those are outside its lifetime.
+credential's issuer, namespace, project, issuance (`created_at`/`issued_raw`), revocation
+time (`revoked_at`) and expiry (`expires_at`); an earlier credential lends the window from
+its issuance to the **earlier of its revocation and its expiry**, and only when the row
+rule did not refuse it (`actor_rows_refused` absent). A predecessor that merely EXPIRED
+therefore stops lending its name at the expiry, even though it was never revoked
+(revision-3 item 1), and the five-minute clock allowance is only for the START of the
+life: a row after the lifetime ends is never that credential's own (revision-3 item 1).
+It **fails closed** when any of that cannot be read -- no predecessor, a different owner
+or project, an unreadable issuance, a revoked credential with no revocation time, a
+present-but-unreadable expiry, or a predecessor the rule refused all lend nothing, so the
+rows stay somebody else's and the name is refused. A renewal is still refused when the
+tracker holds rows older than the predecessor (the host actor's own rows), because those
+are outside its lifetime.
 
 **What the rule does not hold, and does not cover.** Not held, by design: a name the
 tracker knows only from a task it **closed** or a task it **changed** (the tracker's

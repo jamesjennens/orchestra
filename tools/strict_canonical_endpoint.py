@@ -605,7 +605,11 @@ def main():
             found = {key: names.get(key, []) for key in ('sessions', 'operators', 'verifiers')}
             if rows:
                 import actor_names
-                if names.get('tracker') == 'unreadable':
+                if names.get('tracker') in ('unreadable', 'cut', 'exit1', 'words', 'no-slot'):
+                    # The shapes endpoint.tracker_actors turns into one host fault: an export
+                    # that answered no rows, a cut line, a bd that exited nonzero, words that
+                    # are not rows, or rows without the project's merge slot
+                    # (kittrial-5bb.188 item 1; revision-3 item 3(1)).
                     raise actor_names.TrackerUnreadable()
                 marks = [(str(item.get('name') or ''), actor_names.instant(item.get('when')))
                          for item in (names.get('author-rows') or names.get('author_rows') or [])

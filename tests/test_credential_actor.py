@@ -202,9 +202,13 @@ class RuleTests(unittest.TestCase):
         # A revoked predecessor loans only up to its revocation.
         revoked = (actor_names.instant('2026-01-01T00:00:00Z'), actor_names.instant('2026-05-01T00:00:00Z'))
         self.assertEqual({'lane'}, actor_names.tracker_names(marks, before='2026-10-01T00:00:00Z', own=[revoked]))
-        # The same 300 s allowance applies at both ends of the window.
+        # The 300 s allowance is only for the START of a life (kittrial-5bb.188 revision-3 item 1):
+        # a row 200 s before the window opened may be its own ...
         near = [('lane', actor_names.instant('2026-01-01T00:00:00Z') - 200)]
         self.assertEqual(set(), actor_names.tracker_names(near, before='2026-10-01T00:00:00Z', own=[live]))
+        # ... and one 200 s AFTER the window closed is somebody else's, with no allowance at the end.
+        after = [('lane', actor_names.instant('2026-05-01T00:00:00Z') + 200)]
+        self.assertEqual({'lane'}, actor_names.tracker_names(after, before='2026-10-01T00:00:00Z', own=[revoked]))
         # A row with no readable time is never placed in a lifetime.
         self.assertEqual({'lane'}, actor_names.tracker_names([('lane', None)], before='2026-10-01T00:00:00Z',
                                                              own=[live]))
@@ -239,6 +243,25 @@ class RuleTests(unittest.TestCase):
         # A revoked record with no readable revocation time fails closed too.
         stale = dict(credentials['b'], revoked_at=None)
         self.assertEqual([], actor_names.own_intervals({'x': stale}, 'lane', 'usr_a', 'probe'))
+
+    def test_own_intervals_end_at_the_earlier_of_revocation_and_expiry(self):
+        """kittrial-5bb.188 revision-3 item 1: an expired predecessor stops lending its name."""
+        start = actor_names.instant('2026-01-01T00:00:00Z')
+        expiry = actor_names.instant('2026-02-01T00:00:00Z')
+        expired = {'user_id': 'usr_a', 'project_id': 'probe', 'actor': 'lane',
+                   'created_at': '2026-01-01T00:00:00Z', 'expires_at': '2026-02-01T00:00:00Z'}
+        # Never revoked: the lifetime still ends at the expiry, not never.
+        self.assertEqual([(start, expiry)], actor_names.own_intervals({'x': expired}, 'lane', 'usr_a', 'probe'))
+        # Revoked before the expiry: the revocation ends it.
+        early = dict(expired, revoked=True, revoked_at='2026-01-15T00:00:00Z')
+        self.assertEqual([(start, actor_names.instant('2026-01-15T00:00:00Z'))],
+                         actor_names.own_intervals({'x': early}, 'lane', 'usr_a', 'probe'))
+        # Revoked after the expiry: the expiry is the earlier end.
+        late = dict(expired, revoked=True, revoked_at='2026-03-01T00:00:00Z')
+        self.assertEqual([(start, expiry)], actor_names.own_intervals({'x': late}, 'lane', 'usr_a', 'probe'))
+        # An expiry that is present but unreadable is not an open lifetime: fail closed.
+        broken = dict(expired, expires_at='not a time')
+        self.assertEqual([], actor_names.own_intervals({'x': broken}, 'lane', 'usr_a', 'probe'))
 
 
 class DenialTests(unittest.TestCase):
@@ -543,6 +566,35 @@ class IssueCase(HostNames, fixes.EndpointCase):
         self.assertEqual(422, strange.status, strange.data)
         self.assertEqual(201, self.request('POST', self.credentials, {'actor': 'plain-lane'}, token=admin).status)
 
+    def test_a_waiver_reason_with_hidden_characters_or_over_500_is_refused(self):
+        """kittrial-5bb.188 revision-3 item 3(2): the reason passes the kit's plain-text rule
+        (the one `guidance` applies), and its 500-character bound is pinned (reviewer mutant W2)."""
+        self.project()
+        self.host(authors=['opus-worker-lane'])
+        admin = self.admin_token()
+        for label, reason in (('a bidi override', 'the lane\u202e owns this'),
+                              ('a control character', 'the lane\x1b[31m owns this'),
+                              ('a zero-width space', 'the lane\u200b owns this'),
+                              ('a tag character', 'the lane\U000E0041 owns this')):
+            with self.subTest(bad=label):
+                refused = self.request('POST', self.credentials,
+                                       {'actor': 'opus-worker-lane', 'allow_actor': True,
+                                        'allow_actor_reason': reason}, token=admin)
+                self.assertEqual(422, refused.status, refused.data)
+                self.assertIn('plain text', message(refused))
+        too_long = self.request('POST', self.credentials,
+                                {'actor': 'opus-worker-lane', 'allow_actor': True,
+                                 'allow_actor_reason': 'x' * 501}, token=admin)
+        self.assertEqual(422, too_long.status, too_long.data)
+        self.assertIn('at most 500 characters', message(too_long))
+        # None of them was kept, and the bound itself is allowed through.
+        self.assertEqual([], [c for c in self.listed_without_asking() if c.get('actor') == 'opus-worker-lane'])
+        allowed = self.request('POST', self.credentials,
+                               {'actor': 'opus-worker-lane', 'allow_actor': True,
+                                'allow_actor_reason': 'x' * 500}, token=admin, key='waiver-500')
+        self.assertEqual(201, allowed.status, allowed.data)
+        self.assertEqual('x' * 500, allowed.data['credential']['actor_waived']['reason'])
+
     def test_a_name_the_tracker_does_not_hold_is_issued_and_the_rows_were_read(self):
         self.project()
         with mock.patch.object(self.backend, 'actor_standing', wraps=self.backend.actor_standing) as asked:
@@ -573,6 +625,53 @@ class IssueCase(HostNames, fixes.EndpointCase):
         refused = self.request('POST', self.credentials, {'actor': 'renew-lane'}, token=self.alex)
         self.assertEqual(422, refused.status, refused.data)
         self.assertEqual(actor_names.ROWS, refused.data['error']['detail']['rule'])
+
+    def test_an_expired_predecessor_does_not_lend_its_name_for_ever(self):
+        """kittrial-5bb.188 revision-3 item 1: a lifetime ends at the earlier of revocation and expiry."""
+        self.project()
+        self.host()
+        issued = self.request('POST', self.credentials, {'actor': 'expired-lane'}, token=self.alex)
+        self.assertEqual(201, issued.status, issued.data)
+        with self.service.store.lock:
+            record = self.service.state['credentials'][issued.data['credential']['id']]
+            record['created_at'] = '2026-01-01T00:00:00Z'
+            record['issued_raw'] = actor_names.instant('2026-01-01T00:00:00Z')
+            record['expires_at'] = '2026-02-01T00:00:00Z'      # expired, and never revoked
+            self.service.store.save()
+        # A row the predecessor wrote inside its own lifetime is still its own.
+        self.host(author_rows=[{'name': 'expired-lane', 'when': '2026-01-15T00:00:00Z'}])
+        self.assertEqual(201, self.request('POST', self.credentials,
+                                           {'actor': 'expired-lane'}, token=self.alex).status)
+        # A host lane's row after the expiry is somebody else's: the renewal is refused.
+        self.host(author_rows=[{'name': 'expired-lane', 'when': '2026-03-01T00:00:00Z'}])
+        refused = self.request('POST', self.credentials, {'actor': 'expired-lane'}, token=self.alex)
+        self.assertEqual(422, refused.status, refused.data)
+        self.assertEqual(actor_names.ROWS, refused.data['error']['detail']['rule'])
+
+    def test_a_lane_row_after_a_lifetime_ends_is_never_the_predecessors_own(self):
+        """kittrial-5bb.188 revision-3 item 1: the 300 s allowance is only for the start of a life."""
+        self.project()
+        self.host()
+        issued = self.request('POST', self.credentials, {'actor': 'skew-lane'}, token=self.alex)
+        self.assertEqual(201, issued.status, issued.data)
+        start = actor_names.instant('2026-01-01T00:00:00Z')
+        end = actor_names.instant('2026-02-01T00:00:00Z')
+        with self.service.store.lock:
+            record = self.service.state['credentials'][issued.data['credential']['id']]
+            record['created_at'] = '2026-01-01T00:00:00Z'
+            record['issued_raw'] = start
+            record['revoked'] = True
+            record['revoked_at'] = '2026-02-01T00:00:00Z'
+            self.service.store.save()
+        # 200 s after the revocation: inside the old allowance, and no longer its own.
+        self.host(author_rows=[{'name': 'skew-lane', 'when': end + 200}])
+        refused = self.request('POST', self.credentials, {'actor': 'skew-lane'}, token=self.alex)
+        self.assertEqual(422, refused.status, refused.data)
+        self.assertEqual(actor_names.ROWS, refused.data['error']['detail']['rule'])
+        # 200 s after the start, still inside the life: the start allowance and the window both hold.
+        self.host(author_rows=[{'name': 'skew-lane', 'when': start + 200}])
+        self.assertEqual(201, self.request('POST', self.credentials,
+                                           {'actor': 'skew-lane'}, token=self.alex).status)
 
     def test_a_renewal_by_another_owner_is_still_refused(self):
         """kittrial-5bb.188 item 3: the exemption is the SAME owner's, and fails closed otherwise."""
@@ -844,6 +943,32 @@ class UseCase(HostNames, fixes.EndpointCase):
             self.assertEqual(403, again.status, again.data)
             self.assertEqual([False, True], seen)       # nothing read again
         self.assertEqual([], [row for row in self.canonical_rows() if row['title'] in ('first', 'second')])
+        # The owner's list reads the kept mark, so it shows the refusal without asking the host
+        # for the rows again (kittrial-5bb.188 revision-3 item 3(3)).
+        mine = [item for item in self.listed() if item['id'] == legacy['id']][0]
+        self.assertEqual(actor_names.refusal('slow-lane', actor_names.ROWS), mine['actor_refused'])
+
+    def test_the_settle_honours_an_earlier_same_name_lifetimes_own_rows(self):
+        """kittrial-5bb.188 revision-3 item 3(4), reviewer mutant J5: the settle that keeps the
+        outcome also passes the earlier own-lifetimes, so a row inside a predecessor's life is
+        not held against an unjudged credential whose only excuse is that lifetime."""
+        self.project()
+        first = self.old_credential('settle-lane', checked=True)
+        with self.service.store.lock:
+            record = self.service.state['credentials'][first['id']]
+            record['created_at'] = '2026-01-01T00:00:00Z'
+            record['issued_raw'] = actor_names.instant('2026-01-01T00:00:00Z')
+            self.service.store.save()
+        legacy = self.old_credential('settle-lane', checked=False)
+        self.host(author_rows=[{'name': 'settle-lane', 'when': '2026-06-01T00:00:00Z'}])
+        seen = []
+        with mock.patch.object(self.backend, 'actor_standing', self.counted(seen)):
+            made = self.request('POST', self.tasks, {'title': 'mine'}, token=legacy['secret'])
+            self.assertEqual(201, made.status, made.data)
+            self.assertEqual([False, True], seen)       # the cheap rule, then ONE row read
+        record = self.service.state['credentials'][legacy['id']]
+        self.assertTrue(record.get('actor_rows_checked'))
+        self.assertNotIn('actor_rows_refused', record)
 
     def test_an_unmarked_credential_whose_own_rows_are_newer_is_checked_once_and_writes_after(self):
         """kittrial-5bb.188 item 5: the honest pre-upgrade credential pays the read once."""
@@ -872,6 +997,28 @@ class UseCase(HostNames, fixes.EndpointCase):
         refused = self.request('POST', self.tasks, {'title': 'nope'}, token=legacy['secret'])
         self.assertEqual(503, refused.status, refused.data)
         self.assertEqual([], [row for row in self.canonical_rows() if row['title'] == 'nope'])
+        record = self.service.state['credentials'][legacy['id']]
+        self.assertFalse(record.get('actor_rows_checked'))
+        self.assertNotIn('actor_rows_refused', record)
+
+    def test_every_broken_tracker_answer_is_unavailable_and_changes_nothing(self):
+        """kittrial-5bb.188 revision-3 item 3(1): a cut line, a nonzero bd, words that are not
+        rows and a tracker without its merge slot are host faults answered 503, not 422, at
+        issue and at use."""
+        self.project()
+        for mode in ('unreadable', 'cut', 'exit1', 'words', 'no-slot'):
+            with self.subTest(tracker=mode):
+                self.host(tracker=mode)
+                refused = self.request('POST', self.credentials, {'actor': 'lane-%s' % mode},
+                                       token=self.alex, key='bad-tracker-%s' % mode)
+                self.assertEqual(503, refused.status, refused.data)
+                self.assertIn('Nothing was changed', message(refused))
+        self.assertEqual([], self.listed_without_asking())
+        # At use, an unjudged credential's first write is the same host fault, with no mark.
+        legacy = self.old_credential('lane-old', checked=False)
+        self.host(tracker='cut')
+        refused = self.request('POST', self.tasks, {'title': 'nope'}, token=legacy['secret'])
+        self.assertEqual(503, refused.status, refused.data)
         record = self.service.state['credentials'][legacy['id']]
         self.assertFalse(record.get('actor_rows_checked'))
         self.assertNotIn('actor_rows_refused', record)
@@ -971,9 +1118,9 @@ class RealEndpointCase(unittest.TestCase):
         (self.project / '.sessions.json').write_text(json.dumps(
             {'schema_version': 1, 'records': {record['request_id']: record}}), encoding='utf-8')
         self.marker = self.tmp / 'bd-ran'
-        bd = self.root / 'bin' / 'bd'
-        bd.write_text('#!/bin/sh\necho ran >> %s\necho \'{"id":"probe-1","title":"x"}\'\nexit 0\n' % self.marker, encoding='utf-8')
-        bd.chmod(0o755)
+        # The default tracker answer is a whole one: a row plus the project's merge slot
+        # (kittrial-5bb.188 revision-3 item 3(1)), so the free-name writes below still run.
+        self.set_bd([{'id': 'probe-1', 'title': 'x'}])
         spec = importlib.util.spec_from_file_location('real_endpoint_184', str(KIT / 'endpoint.py'))
         self.endpoint = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.endpoint)
@@ -993,11 +1140,24 @@ class RealEndpointCase(unittest.TestCase):
         return {'via': 'credential', 'user_id': 'usr_a', 'credential_id': 'cred_x', 'project': 'probe',
                 'capability': 'tasks.write', 'now': time.time() + 5}
 
-    def set_bd(self, rows):
-        """What this host's ``bd export --all`` answers: the rows the tracker holds."""
-        bd = self.root / 'bin' / 'bd'
+    def set_bd(self, rows, slot=True):
+        """What this host's ``bd export --all`` answers: the rows the tracker holds.
+
+        A whole tracker always carries the project's merge slot, so the stub answers it too
+        (kittrial-5bb.188 revision-3 item 3(1)); ``slot=False`` plants rows without it, and
+        ``set_bd_raw`` writes the shell script itself for an answer that is not rows at all.
+        """
+        rows = list(rows)
+        if slot:
+            rows.append({'id': 'probe-merge-slot', 'issue_type': 'merge-slot', 'title': 'the merge slot',
+                         'created_at': '2026-01-01T00:00:00Z', 'updated_at': '2026-01-01T00:00:00Z'})
         lines = '\n'.join('echo %s' % json.dumps(json.dumps(row)) for row in rows)
-        bd.write_text('#!/bin/sh\necho ran >> %s\n%s\nexit 0\n' % (self.marker, lines), encoding='utf-8')
+        self.set_bd_raw('#!/bin/sh\necho ran >> %s\n%s\nexit 0\n' % (self.marker, lines))
+
+    def set_bd_raw(self, script):
+        """The exact shell script this host's ``bd`` runs, for an answer that is not a tracker."""
+        bd = self.root / 'bin' / 'bd'
+        bd.write_text(script, encoding='utf-8')
         bd.chmod(0o755)
 
     def write(self, actor, descriptor, number):
@@ -1097,7 +1257,7 @@ class RealEndpointCase(unittest.TestCase):
 
     def test_an_export_that_answers_no_rows_is_a_tracker_fault_not_empty(self):
         """kittrial-5bb.188 item 1 on the endpoint: zero rows is a host fault, at use and at issue."""
-        self.set_bd([])
+        self.set_bd([], slot=False)
         with self.assertRaises(actor_names.TrackerUnreadable):
             self.endpoint.tracker_actors(self.root, self.project)
         # At use, the descriptor path answers the host fault, not "nothing is taken".
@@ -1110,6 +1270,28 @@ class RealEndpointCase(unittest.TestCase):
                               'args': ['opus-worker-lane'], 'tracker': True},
                              ['--authority-store', str(self.config_path)])
         self.assertEqual((2, 'tracker'), (told['returncode'], told.get('fault')), told)
+
+    def test_an_answer_without_the_merge_slot_or_not_rows_at_all_is_a_host_fault(self):
+        """kittrial-5bb.188 revision-3 item 3(1): a whole read requires the merge slot, and an
+        answer that is a cut line, a nonzero bd or words that are not rows is a host fault."""
+        row = json.dumps(json.dumps({'id': 'probe-1', 'created_by': 'opus-worker-lane',
+                                     'created_at': '2026-01-01T00:00:00Z'}))
+        shapes = (
+            ('rows but no merge slot', '#!/bin/sh\necho %s\nexit 0\n' % row),
+            ('the last line cut short', '#!/bin/sh\necho %s\necho \'{"id": "probe-2", "created_\'\nexit 0\n' % row),
+            ('exit 1 with an error line', '#!/bin/sh\necho "bd: the database is locked" >&2\nexit 1\n'),
+            ('words that are not rows', '#!/bin/sh\necho "not a row at all"\nexit 0\n'),
+        )
+        for number, (label, script) in enumerate(shapes):
+            with self.subTest(answer=label):
+                self.set_bd_raw(script)
+                with self.assertRaises(actor_names.TrackerUnreadable):
+                    self.endpoint.tracker_actors(self.root, self.project)
+                answer = self.write('worker-a', self.credential('worker-a', rows_checked=False,
+                                                                created_at='2026-10-07T00:00:00Z'), 'bad-%d' % number)
+                self.assertEqual((2, 'tracker'), (answer['returncode'], answer.get('fault')), answer)
+                self.assertFalse((self.project / '.http-operations.sqlite3').exists(),
+                                 'an operation identity was reserved')
 
     def test_the_endpoint_cli_carries_the_service_namespace_it_was_launched_with(self):
         """kittrial-5bb.188 item 6: mutant U6 (main drops --service-namespace) must fail here."""
