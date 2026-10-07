@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -274,6 +275,207 @@ class OfficeReleaseTests(ReleaseFixture):
         self.assertEqual(self.run_tool('activate', '--install-root', root, '--release', 'build-b').returncode, 0)
         self.assertEqual(list(self.scratch.iterdir()), [])                 # the tool's scratch is this folder (setUp)
         self.assertFalse((root/'releases'/'build-b'/'.dolt').exists())
+
+    # -- a manifest that is not what the tool reads; a switch that is killed (kittrial-5bb.190) --
+
+    #: Runs the tool's own main() in a child that is KILLED at a chosen link: before the link
+    #: numbered ``step`` is made ("between"), or inside it, when its temporary link exists and
+    #: has not been renamed yet ("inside").
+    KILLED = """
+import os, sys
+sys.path.insert(0, sys.argv[1])
+import office_release as tool
+step, inside, made, real = int(sys.argv[2]), sys.argv[3] == 'inside', [0], tool._link
+def link(root, name, target):
+    made[0] += 1
+    if made[0] == step:
+        if not inside:
+            os._exit(137)
+        os.replace = lambda *names: os._exit(137)
+    return real(root, name, target)
+tool._link = link
+sys.exit(tool.main(sys.argv[4:]))
+"""
+
+    def killed(self, step, where, *args):
+        done = subprocess.run([sys.executable, '-c', self.KILLED, str(SCRIPT.parent), str(step), where, *map(str, args)],
+                              capture_output=True, text=True, env=dict(os.environ, TMPDIR=str(self.scratch)))
+        self.assertEqual(done.returncode, 137, done.stderr + done.stdout)
+        return done
+
+    def a_sentence(self, done):
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertNotIn('Traceback', done.stderr)
+        self.assertTrue(done.stderr.startswith('office-release: '), done.stderr)
+        self.assertEqual(len(done.stderr.strip().splitlines()), 1, done.stderr)
+        return done.stderr
+
+    UNREADABLE = (('[]', 'is not a JSON object'), ('"text"', 'is not a JSON object'), ('null', 'is not a JSON object'),
+                  ('7', 'is not a JSON object'), ('not json', 'is not JSON'), ('', 'is not JSON'),
+                  ('{"build_id": "build-b"}', 'does not name its python_executable'),
+                  ('{"build_id": "build-b", "python_executable": 7}', 'does not name its python_executable'),
+                  ('{"build_id": "build-b", "python_executable": ""}', 'does not name its python_executable'),
+                  ('{"python_executable": "bin/python3"}', 'does not name its build_id'),
+                  ('{"build_id": ["build-b"], "python_executable": "bin/python3"}', 'does not name its build_id'))
+
+    def test_activate_on_a_stored_manifest_it_cannot_read_answers_a_sentence_and_switches_nothing(self):
+        """`[]` in it, or no interpreter named, was a Python traceback (AttributeError, KeyError)."""
+        root, first, second = self.two_installed()
+        self.run_tool('rollback', '--install-root', root)
+        stored = root/'releases'/'build-b'/'manifest.json'
+        for text, said in self.UNREADABLE:
+            with self.subTest(manifest=text):
+                stored.write_text(text, encoding='utf-8')
+                refused = self.a_sentence(self.run_tool('activate', '--install-root', root, '--release', 'build-b'))
+                self.assertIn(said, refused)
+                self.assertIn(str(stored), refused)
+                self.assertEqual(self.links(root), ('build-a', 'build-b'))
+                # Its archive: what is installed under the id is not that archive.
+                refused = self.a_sentence(self.install(second, root, expect=1))
+                self.assertIn('what is installed under it is not this archive', refused)
+                self.assertEqual(self.links(root), ('build-a', 'build-b'))
+
+    def test_verify_on_a_stored_manifest_it_cannot_read_answers_a_sentence(self):
+        root, first, second = self.two_installed()
+        self.assertEqual(self.run_tool('verify', '--install-root', root).returncode, 0)
+        stored = root/'releases'/'build-b'/'manifest.json'
+        for text, said in self.UNREADABLE:
+            with self.subTest(manifest=text):
+                stored.write_text(text, encoding='utf-8')
+                self.assertIn(said, self.a_sentence(self.run_tool('verify', '--install-root', root)))
+
+    def repackaged(self, archive, manifest):
+        """``archive`` with its manifest replaced by the bytes ``manifest`` (the inner archives as they were)."""
+        with tarfile.open(str(archive), mode='r:gz') as package:
+            contents = {item.name: package.extractfile(item).read() for item in package}
+        contents['manifest.json'] = manifest
+        other = self.base/'repackaged.tar.gz'
+        with tarfile.open(str(other), mode='w:gz') as package:
+            for name in ('manifest.json', 'source.tar', 'python.tar.gz'):
+                item = tarfile.TarInfo(name)
+                item.size = len(contents[name])
+                package.addfile(item, io.BytesIO(contents[name]))
+        return other, json.loads(contents['manifest.json'].decode('utf-8')) if manifest[:1] == b'{' else None
+
+    def test_an_archive_whose_manifest_cannot_be_read_is_refused_with_a_sentence(self):
+        archive = self.build('build-a')
+        with tarfile.open(str(archive), mode='r:gz') as package:
+            real = json.loads(package.extractfile('manifest.json').read().decode('utf-8'))
+        without = dict(real)
+        del without['python_executable']
+        root = self.base/'installation'
+        for manifest, said in ((b'[]', 'not an object that names'), (b'"text"', 'not an object that names'),
+                               (b'not json', 'is not JSON'),
+                               (json.dumps(dict(real, build_id=7)).encode(), 'not an object that names'),
+                               (json.dumps(without).encode(), 'not an object that names'),
+                               (json.dumps(dict(real, python_executable=None)).encode(), 'not an object that names')):
+            with self.subTest(manifest=manifest[:40]):
+                other, _ = self.repackaged(archive, manifest)
+                self.assertIn(said, self.a_sentence(self.install(other, root, expect=1)))
+                self.assertFalse((root/'current').exists())
+                self.assertEqual(list((root/'releases').iterdir()) if (root/'releases').exists() else [], [])
+        # The check is of the shape only: the archive as it was built installs.
+        same, _ = self.repackaged(archive, json.dumps(real, sort_keys=True, separators=(',', ':')).encode() + b'\n')
+        self.install(same, root)
+        self.assertEqual(self.links(root), ('build-a', None))
+
+    def refuses_to_go_back(self, root, both, installed):
+        before = self.links(root)
+        refused = self.a_sentence(self.run_tool('rollback', '--install-root', root))
+        self.assertIn('previous and current both name releases/%s: a switch was interrupted between its two links' % both,
+                      refused)
+        self.assertIn('Nothing was changed. Installed: %s. ' % ', '.join(installed), refused)
+        self.assertIn('`activate --release ID`, or install its archive again', refused)
+        self.assertEqual(self.links(root), before)
+
+    def test_an_install_killed_between_its_two_links_changes_nothing_served_and_the_same_command_completes_it(self):
+        root, first, second = self.two_installed()
+        (self.repo/'client.py').write_text('print(3)\n', encoding='utf-8')
+        self.commit()
+        third = self.build('build-c')
+        self.killed(2, 'between', 'install', '--archive', third, '--sha256', sha(third.read_bytes()), '--install-root', root)
+        self.assertEqual(self.links(root), ('build-b', 'build-b'))        # previous was written, current was not
+        self.assertEqual(self.run_tool('verify', '--install-root', root).returncode, 0)
+        # It printed "Current release is now releases/build-b", exit 0, and changed nothing.
+        self.refuses_to_go_back(root, 'build-b', ['build-a', 'build-b', 'build-c'])
+        self.install(third, root)
+        self.assertEqual(self.links(root), ('build-c', 'build-b'))
+        back = self.run_tool('rollback', '--install-root', root)
+        self.assertEqual(back.returncode, 0, back.stderr)
+        self.assertEqual(self.links(root), ('build-b', 'build-c'))
+
+    def test_an_activate_killed_between_its_two_links_is_completed_by_the_same_command(self):
+        root, first, second = self.two_installed()
+        self.run_tool('rollback', '--install-root', root)
+        self.killed(2, 'between', 'activate', '--install-root', root, '--release', 'build-b')
+        self.assertEqual(self.links(root), ('build-a', 'build-a'))
+        # What else lies under releases/ is not named as a release: a file, a link, a folder a killed install left.
+        (root/'releases'/'notes.txt').write_text('x', encoding='utf-8')
+        (root/'releases'/'linked').symlink_to(root/'releases'/'build-a')
+        (root/'releases'/'.office-release-left').mkdir()
+        self.refuses_to_go_back(root, 'build-a', ['build-a', 'build-b'])
+        self.assertEqual(self.run_tool('activate', '--install-root', root, '--release', 'build-b').returncode, 0)
+        self.assertEqual(self.links(root), ('build-b', 'build-a'))
+
+    def test_a_rollback_killed_between_its_two_links_has_gone_back_and_a_second_one_is_refused(self):
+        root, first, second = self.two_installed()
+        self.killed(2, 'between', 'rollback', '--install-root', root)
+        self.assertEqual(self.links(root), ('build-a', 'build-a'))        # it went back; what it left is not recorded
+        self.assertEqual(self.run_tool('verify', '--install-root', root).returncode, 0)
+        self.refuses_to_go_back(root, 'build-a', ['build-a', 'build-b'])
+        self.assertEqual(self.run_tool('activate', '--install-root', root, '--release', 'build-b').returncode, 0)
+        self.assertEqual(self.links(root), ('build-b', 'build-a'))
+
+    def test_a_temporary_link_left_by_a_killed_run_does_not_stop_the_next_switch(self):
+        root, first, second = self.two_installed()
+        for step, left, links in ((1, '.previous.new', ('build-a', 'build-b')), (2, '.current.new', ('build-a', 'build-a'))):
+            with self.subTest(left=left):
+                self.assertEqual(self.run_tool('rollback', '--install-root', root).returncode, 0)
+                self.assertEqual(self.links(root), ('build-a', 'build-b'))
+                self.killed(step, 'inside', 'activate', '--install-root', root, '--release', 'build-b')
+                self.assertTrue((root/left).is_symlink())
+                self.assertEqual(self.links(root), links)
+                self.assertEqual(self.run_tool('activate', '--install-root', root, '--release', 'build-b').returncode, 0)
+                self.assertEqual(self.links(root), ('build-b', 'build-a'))
+                self.assertEqual(sorted(entry.name for entry in root.iterdir()), ['current', 'previous', 'releases'])
+
+    def test_a_link_planted_under_a_release_id_is_not_followed_by_install(self):
+        """A folder elsewhere with the archive's very manifest, linked under the id: not an installed release."""
+        first = self.build('build-a')
+        root = self.base/'installation'
+        self.install(first, root)
+        (self.repo/'client.py').write_text('print(2)\n', encoding='utf-8')
+        self.commit()
+        second = self.build('build-b')
+        with tarfile.open(str(second), mode='r:gz') as package:
+            manifest = package.extractfile('manifest.json').read()
+        elsewhere = self.base/'elsewhere'
+        shutil.copytree(str(root/'releases'/'build-a'), str(elsewhere), symlinks=True)
+        (elsewhere/'manifest.json').write_bytes(manifest)
+        (root/'releases'/'build-b').symlink_to(elsewhere)
+        refused = self.a_sentence(self.install(second, root, expect=1))
+        self.assertIn('what is installed under it is not this archive', refused)
+        self.assertEqual(self.links(root), ('build-a', None))
+        # The same folder as a real one under the id is the release: the link was what was refused.
+        (root/'releases'/'build-b').unlink()
+        shutil.copytree(str(elsewhere), str(root/'releases'/'build-b'), symlinks=True)
+        self.install(second, root)
+        self.assertEqual(self.links(root), ('build-b', 'build-a'))
+
+    def test_an_installed_release_whose_interpreter_is_too_old_is_not_switched_to(self):
+        root, first, second = self.two_installed()
+        self.run_tool('rollback', '--install-root', root)
+        interpreter = root/'releases'/'build-b'/'python-runtime'/'bin'/'python3'
+        for version in ('3.9.18', '2.7.18', '3.1.5'):
+            with self.subTest(version=version):
+                interpreter.write_bytes(b'#!/bin/sh\necho Python %s\n' % version.encode())
+                self.assertIn('Bundled interpreter must be Python 3.10 or newer', self.a_sentence(self.install(second, root, expect=1)))
+                refused = self.a_sentence(self.run_tool('activate', '--install-root', root, '--release', 'build-b'))
+                self.assertIn('Bundled interpreter must be Python 3.10 or newer', refused)
+                self.assertEqual(self.links(root), ('build-a', 'build-b'))
+        interpreter.write_bytes(b'#!/bin/sh\necho Python 3.12.4\n')
+        self.install(second, root)
+        self.assertEqual(self.links(root), ('build-b', 'build-a'))
 
     def test_bad_digest_cannot_switch_current(self):
         archive = self.build('build-a')
