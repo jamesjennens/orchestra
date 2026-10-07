@@ -673,7 +673,10 @@ anchors: `bd list --label` 0.25 / 0.43 s; `bd show --include-comments` of every 
 1.8 s, the same rows with labels and comments, closed anchors included. So `items list|get` and
 `questions --for|get` each make exactly one `bd export --all` call (the read `brief` already makes),
 and `items get ONE` costs the same as a list. The endpoint passes the export's raw stdout to the
-reader, which parses it line by line under a fixed depth rule (§13, slice 1). A standalone `items list` /
+reader, which parses it line by line under a fixed depth rule (§13, slice 1). The reader's CPU after
+that call, on mock exports holding only the anchors (best of 5, Python 3.11): 39 ms for `items list`,
+38 ms for `items get` and 48 ms for `questions --for` at 400 anchors (594 kB); 250, 238 and 248 ms
+at 2,000 (2.9 MB). A real project's export also carries its other rows. A standalone `items list` /
 `questions --for` costs one labelled `bd list` of the item anchors plus one `bd show` of their
 comments. A standalone `decisions list` is a **different** read: it costs one full
 `bd list --all --limit 0` of the project's rows, filtered to the decision issues by the predicate in
