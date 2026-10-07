@@ -1598,6 +1598,13 @@ class EndpointBackend:
                 # ("@attachment:0") is stored as written whatever the native parser does.
                 args[2:2] = ['@attachment:0']
                 attachments = {'0': {'flag': '--body-file', 'text': str(payload['description'])}}
+            if len(args) == 3:
+                # Nothing to change: bd answers `update ID --json` with the words "No updates
+                # specified" and exit 0, which is not an answer this service can read, so it
+                # was taken for a write that may have been made (kittrial-5bb.181). The route
+                # refuses such a body with the fields it takes; this is the same refusal for
+                # any other caller of the backend. Nothing is sent.
+                raise invalid('Nothing to change. A task change takes: title, description, status')
             return 'bd', project_id, args, attachments
         if route == 'tasks.claim':
             actor = payload.get('actor') or self._actor(principal)
@@ -3276,6 +3283,56 @@ class ApiHandler(BaseHTTPRequestHandler):
         payload['task_id'] = ctx.params['tid']
         return payload
 
+    #: What a task change may change, and what else its body may carry: ``version`` is the
+    #: in-process backend's check that the task was not changed meanwhile (the endpoint backend
+    #: has none and does not read it), ``actor`` the attribution label, bound as on a claim.
+    TASK_CHANGES = ('title', 'description', 'status')
+    TASK_CHANGE_FIELDS = TASK_CHANGES + ('version', 'actor')
+
+    def _task_change(self, ctx):
+        """The body of a task change, or the refusal that says what is wrong with it.
+
+        Refused here, before the idempotency key is reserved and before anything is sent to
+        the backend, so the same key serves the corrected request (kittrial-5bb.181). A field
+        the route does not take was dropped silently, and a body that changed nothing made
+        the endpoint backend send bd an update with nothing in it: bd answers that with a
+        sentence, the sentence was read as an answer that could not be understood, and the
+        caller was told that the change may have been made and to try again with the same
+        key, for ever.
+        """
+        payload = self._task_payload(ctx)
+        unknown = set(payload) - set(self.TASK_CHANGE_FIELDS) - {'task_id'}
+        takes = 'A task change takes: %s' % ', '.join(self.TASK_CHANGES)
+        if unknown:
+            raise invalid('A task change does not take: %s. %s' % (unsupported_fields_text(unknown), takes),
+                          {'unsupported': sorted(str(name) for name in unknown)[:UNSUPPORTED_FIELDS_SHOWN],
+                           'takes': list(self.TASK_CHANGES)})
+        if all(payload.get(name) is None for name in self.TASK_CHANGES):
+            raise invalid('Nothing to change. %s' % takes, {'takes': list(self.TASK_CHANGES)})
+        title, description, status = (payload.get(name) for name in self.TASK_CHANGES)
+        if title is not None and (not isinstance(title, str) or not title.strip()):
+            raise invalid('Task title must be text and not empty')
+        if description is not None and not isinstance(description, str):
+            raise invalid('Task description must be text')
+        if status is not None and status not in ('open', 'closed'):
+            raise invalid('Task status must be open or closed')
+        self._bind_task_actor(ctx, payload)
+        return payload
+
+    def _bind_task_actor(self, ctx, payload):
+        """An ``actor`` in the body of a task write is the caller's own label or it is refused.
+
+        The canonical write runs under ``payload['actor']`` when there is one. Task create and
+        task change handed the caller's value over as it came, so a member could have a task
+        made, or changed, under any name that does not have the shape of a web account: a host
+        session's, an operator's (kittrial-5bb.181). Bound as a claim, a checkpoint and a
+        review bind it.
+        """
+        if 'actor' in payload:
+            bound = self.service.bind_actor(ctx.principal, payload.pop('actor'))
+            if bound is not None:
+                payload['actor'] = bound
+
     def _paged(self, ctx, items, limit, state, **extra):
         """One bounded page of an in-memory list, with a cursor bound to this query."""
         offset = state['o']
@@ -4787,6 +4844,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._project(ctx, CAP_TASKS)
         payload = dict(ctx.payload or {})
         payload['attachments'] = validate_attachments(payload.get('attachments'))
+        self._bind_task_actor(ctx, payload)
 
         def create():
             result = self.backend.invoke('tasks.create', ctx.principal, ctx.params['pid'],
@@ -4800,8 +4858,8 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('PATCH', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')')
     def tasks_update(self, ctx):
         self._project(ctx, CAP_TASKS)
+        payload = self._task_change(ctx)
         self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']), write=True)
-        payload = self._task_payload(ctx)
 
         def update():
             result = self.backend.invoke('tasks.update', ctx.principal, ctx.params['pid'],
