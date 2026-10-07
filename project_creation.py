@@ -421,6 +421,15 @@ def work(root, name, initialize=None):
             delete_record(root, name)
             if isinstance(error, Exception):
                 note_failure(root, name, record.get('by'), error)
+                try:
+                    missing = admin.missing_bd_init_tools(root)
+                except Exception:                                    # noqa: BLE001
+                    missing = []
+                if missing:
+                    # The program's name is not host-private detail, and naming it is what lets the
+                    # person who asked tell an operator what to look at, instead of the reason
+                    # living only in project-creations/last-failure.txt (kittrial-5bb.176 item 3).
+                    raise NothingMade(missing_tools_message(missing)) from None
                 raise NothingMade(COULD_NOT) from None
             raise
         # The detail (which may name host paths and commands) stays in the record, for the operator.
@@ -850,6 +859,16 @@ def note_failure(root, name, account, error, step=None):
 
 COULD_NOT = ('The project could not be created and nothing was made. Try again; if it fails again, ask an '
              'operator of the server.')
+#: One sentence for a program ``bd init`` needs and this host has not got. The program's name is not
+#: host-private detail, and the person who asked can pass it to an operator (kittrial-5bb.176 item 3).
+MISSING_TOOLS = ('The server has no %s, which bd init needs to create a project; nothing was made. Ask an operator '
+                 'of the server to install it and try again.')
+
+
+def missing_tools_message(missing):
+    """One sentence naming the programs a creation needs and this host has not got."""
+    return MISSING_TOOLS % ' and '.join(missing)
+
 MADE_NOT_REGISTERED = ('Project %s was made on the server, but it could not be registered in the web interface. Ask '
                        'an operator of the server to look at it. When that is repaired, create it again with the '
                        'same name: nothing is made twice, it is only registered. Do not create it under another name.')
@@ -868,7 +887,13 @@ def _sentence_patterns():
                      'are not finished)'),
              escaped(AT_SERVER_LIMIT), escaped(AT_SERVER_LIMIT + ' Project %s was made on the server and is not registered.'),
              escaped(COULD_NOT), escaped(MADE_NOT_REGISTERED), escaped(NAME_RULE), incomplete]
-    return [re.compile(text) for text in texts]
+    patterns = [re.compile(text) for text in texts]
+    # The missing-tools sentence (item 3) names one or more programs joined by ' and '. Each is a
+    # plain program name, never a path, so the recognised sentence stays free of host detail.
+    tool = r'[a-z][a-z0-9+-]{0,23}'
+    patterns.append(re.compile(re.escape(MISSING_TOOLS).replace(
+        '%s', '(?:%s)(?: and (?:%s))*' % (tool, tool))))
+    return patterns
 
 
 def creation_sentence(line):

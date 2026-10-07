@@ -7,9 +7,11 @@ second ``add-project`` only said "Project already exists". These tests pin the r
 operator's route now keeps, the two commands that act on it, and the re-run sentence.
 
 Item 2: ``http_service.py --bootstrap-user`` prints one sentence instead of a traceback on
-a host without ``fcntl`` and when a superuser already exists. Item 5's two uncaught
-mutants: the git check must read the runtime's own ``bin``, and the state store must not be
-opened before the runtime lock is checked.
+a host without ``fcntl`` and when a superuser already exists. Item 3: a creation on a host
+without git says so in the answer, not only in ``project-creations/last-failure.txt``. Item
+4: the unmanaged-binary refusal says the prepared-looking root must be discarded. Item 5's
+two uncaught mutants: the git check must read the runtime's own ``bin``, and the state store
+must not be opened before the runtime lock is checked.
 
 The creation lock and the bootstrap lock need ``fcntl``; those classes are skipped where
 it is absent. Everything else runs on both hosts.
@@ -18,6 +20,7 @@ import contextlib
 import io
 import json
 import os
+import platform
 import subprocess
 import sys
 import tempfile
@@ -173,7 +176,8 @@ class RecordReuseTests(CreationRecordCase):
 
     def test_the_account_that_began_it_stays_on_the_finished_record(self):
         pc.write_record(self.root, 'alpha', {'project': 'alpha', 'by': ALICE, 'operation_id': 'op-alpha',
-                                             'state': 'started', 'stage': None, 'started_at': 'then'})
+                                             'state': 'started', 'stage': None,
+                                             'started_at': '2000-01-01T00:00:00Z'})
         self.add()
         record = pc.read_record(self.root, 'alpha')
         self.assertEqual((record['state'], record['by'], record['operation_id']), ('created', ALICE, 'op-alpha'))
@@ -200,6 +204,51 @@ class GitCheckReadsTheRuntimeBinTests(unittest.TestCase):
             empty.mkdir()
             with mock.patch.dict(os.environ, {'PATH': ''}):
                 self.assertEqual(admin.missing_bd_init_tools(empty), ['git'])
+
+
+class MissingToolsSentenceTests(unittest.TestCase):
+    """Item 3: a host without git says so in the answer, not only in last-failure.txt."""
+
+    def test_the_sentence_is_one_the_service_passes_on(self):
+        for missing in (['git'], ['git', 'make']):
+            sentence = pc.missing_tools_message(missing)
+            self.assertIn(missing[0], sentence)
+            self.assertEqual(pc.creation_sentence('ValueError: ' + sentence), sentence)
+            self.assertEqual(pc.creation_sentence(sentence), sentence)
+
+    def test_a_path_is_still_not_a_creation_sentence(self):
+        self.assertIsNone(pc.creation_sentence(
+            'ValueError: The server has no /etc/passwd, which bd init needs to create a project; nothing was made. '
+            'Ask an operator of the server to install it and try again.'))
+
+    @unittest.skipUnless(POSIX, 'the creation lock needs fcntl')
+    def test_a_creation_without_git_answers_with_the_program_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'runtime'
+            (root / 'projects').mkdir(parents=True)
+            with mock.patch.dict(os.environ, {'PATH': ''}):
+                with self.assertRaises(pc.NothingMade) as caught:
+                    pc.create(root, 'alpha', ALICE, 'op-alpha')
+            self.assertEqual(str(caught.exception), pc.missing_tools_message(['git']))
+            self.assertFalse((root / 'projects' / 'alpha').exists())
+            self.assertIsNone(pc.read_record(root, 'alpha'))
+
+
+@unittest.skipUnless(sys.platform.startswith('linux') and platform.machine() in ('x86_64', 'amd64'),
+                     'the binary installer supports Linux x86-64 only')
+class UnmanagedBinarySentenceTests(unittest.TestCase):
+    """Item 4: the refusal says the prepared-looking root must be discarded."""
+
+    def test_an_unmanaged_binary_says_discard_the_root(self):
+        import bootstrap
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'runtime'
+            (root / 'bin').mkdir(parents=True)
+            (root / 'bin' / 'bd').write_bytes(b'not the pinned bd')
+            with self.assertRaises(SystemExit) as caught:
+                bootstrap.install(root)
+        self.assertIn('Refusing to replace unmanaged binary', str(caught.exception))
+        self.assertIn('discard this deployment root', str(caught.exception))
 
 
 class BootstrapSentenceTests(unittest.TestCase):
