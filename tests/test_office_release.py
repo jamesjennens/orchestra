@@ -49,6 +49,12 @@ class ReleaseFixture(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.base = Path(self.tmp.name)
+        # The tool's own scratch folders go here and not into the host's shared temporary
+        # directory: the tests that count what a run leaves behind listed /tmp before and after,
+        # and failed whenever anybody else ran the tool on the same host meanwhile
+        # (kittrial-5bb.189: seen twice on koopa, beside another suite).
+        self.scratch = self.base/'scratch'
+        self.scratch.mkdir()
         self.repo = self.base/'source'
         self.repo.mkdir()
         subprocess.check_call(['git', 'init', '-q', str(self.repo)])
@@ -79,7 +85,7 @@ class ReleaseFixture(unittest.TestCase):
 
     def run_tool(self, *args):
         return subprocess.run([sys.executable, str(SCRIPT), *map(str, args)],
-                              capture_output=True, text=True)
+                              capture_output=True, text=True, env=dict(os.environ, TMPDIR=str(self.scratch)))
 
     def try_build(self, build_id, *more):
         output = self.base/(build_id+'.tar.gz')
@@ -262,12 +268,11 @@ class OfficeReleaseTests(ReleaseFixture):
     def test_no_scratch_folder_is_left_by_the_start_check(self):
         root, first, second = self.two_installed()
         self.run_tool('rollback', '--install-root', root)
-        scratch = Path(tempfile.gettempdir())
-        before = set(scratch.glob('office-release-verify-*'))
+        self.assertEqual(list(self.scratch.iterdir()), [])
         self.install(second, root)
         self.run_tool('rollback', '--install-root', root)
         self.assertEqual(self.run_tool('activate', '--install-root', root, '--release', 'build-b').returncode, 0)
-        self.assertEqual(set(scratch.glob('office-release-verify-*')) - before, set())
+        self.assertEqual(list(self.scratch.iterdir()), [])                 # the tool's scratch is this folder (setUp)
         self.assertFalse((root/'releases'/'build-b'/'.dolt').exists())
 
     def test_bad_digest_cannot_switch_current(self):
