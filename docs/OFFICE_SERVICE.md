@@ -226,8 +226,11 @@ action, which runs the same work) checks for git **before** creating anything
 and refuses with a plain sentence when it is missing, so a host without git
 gets that sentence instead of a half-made `projects/NAME`. Nothing is removed
 after that check: a creation that fails later leaves `projects/NAME` exactly
-as the failure left it, for an operator to finish or remove (the web creation
-path keeps its own record and names `finish-project` / `remove-creation`).
+as the failure left it, for an operator to finish or remove. `add-project` keeps the
+same `project-creations/NAME.json` record the web creation path keeps, so
+`finish-project` and `remove-creation` act on a stopped CLI creation too, and a second
+`add-project` that meets the leftover names those two commands instead of only saying
+"Project already exists" (kittrial-5bb.176).
 The host's packaged git is not required: any git on PATH will do
 (`export PATH=<DIR_WITH_GIT>:$PATH` in the shell or the scheduler's entry
 that starts the service and runs the admin commands). git 2.21.0 is known to
